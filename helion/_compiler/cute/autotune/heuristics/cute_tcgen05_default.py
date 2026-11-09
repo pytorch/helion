@@ -14,9 +14,11 @@ epilogue-issued TMA ring (``_epi_tma_aux_values``), and a grid with fewer
 128x128 tiles than SMs takes the 128-row pair seed with the fewest waves
 (``_small_grid_pair_default``). Plain GEMMs only the edge + K-tail family
 runs (a 16-bit K tail on whole M and N tiles, or a K tail with ragged M and
-N) take that family's CLC pair seed. A kernel with an atomic keeps the flat
-base default: codegen refuses atomics beside the pairs' shared tiles and the
-persistent CTAs' warp roles.
+N) take that family's CLC pair seed. A small grid no pair serves splits K on
+a one-CTA 64x64 tile (``_split_k_default``). A transcendental epilogue runs two
+epilogue warp groups (``_transcendental_epilogue_values``). A kernel with an
+atomic keeps the flat base default: codegen refuses atomics beside the pairs'
+shared tiles and the persistent CTAs' warp roles.
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ from ...tcgen05_config import repair
 from ...tcgen05_config import seeds
 from ...tcgen05_config import smem
 from ...tcgen05_config import surface
+from ...tcgen05_config.knobs import long_n_sweep_l2_grouping
 from ...tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
 from ...tcgen05_constants import TCGEN05_AUX_LOAD_MODE_EPI_TMA
 from ...tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
@@ -49,9 +52,11 @@ from ...tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
 from ...tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_DEFAULT
 from ...tcgen05_constants import TCGEN05_AUX_STAGES_CONFIG_KEY
 from ...tcgen05_constants import TCGEN05_EPI_TMA_AUX_STAGE_COUNT_CHOICES
+from ...tcgen05_constants import TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY
 from ...tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from ...tcgen05_constants import TCGEN05_LONG_N_SWEEP_L2_GROUPING
-from ...tcgen05_constants import TCGEN05_LONG_N_SWEEP_MIN_TILES
+from ...tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
+from ...tcgen05_constants import TCGEN05_SPLIT_K_MIN_SLICE_K_TILES
 from ...tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from ...tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from ...tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
@@ -62,6 +67,8 @@ from ...tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 if TYPE_CHECKING:
     import torch
 
+    from .....autotuner.config_spec import ConfigSpec
+    from .....runtime.config import PidTypeLiteral
     from ....compile_environment import CompileEnvironment
     from ....device_ir import DeviceIR
     from ...radix_store import RadixStoreLayout
@@ -101,9 +108,11 @@ def _aligned_n_efficiency(cluster_m: int, bm: int, width: int) -> float | None:
     return low + (high - low) * (width - 128) / (TCGEN05_TWO_CTA_BLOCK_N - 128)
 
 
-# Tiles per CTA (waves) from which an output-edge bias GEMM's default takes
-# the hybrid TMA store (``post_acc_wait``, or a staged ``pre_acc_wait`` row on
-# epilogue-bound pairs) over the SIMT store (see ``_pick``).
+# Tiles per CTA (waves) from which a bias GEMM's default stages a promoted
+# row on an epilogue-bound pair (``pre_acc_wait`` beside the hybrid TMA
+# store) or moves a row it cannot stage to ``post_acc_wait``'s hybrid TMA
+# store, over the SIMT store; an output edge's partial-output store, where
+# its rings hold the row stages, applies at any tile count (see ``_pick``).
 _TMA_STORE_MIN_WAVES = 16
 # K tiles per output tile up to which the epilogue bounds a pair GEMM, so its
 # default stages promoted bias rows (``pre_acc_wait``; see ``_pick``).
@@ -123,6 +132,14 @@ _ONE_CTA_N_EDGE_EXACT_AUX_MIN_K_TILES = 8
 # K blocks from which a narrow batched GEMM's default runs the persistent loop
 # at four AB stages (``_narrow_batched_default``).
 _NARROW_BATCHED_PERSISTENT_MIN_K_TILES = 8
+# The split-K default's tile edge, the AB stages it keeps at most and the
+# CTAs per SM it launches at most (see ``_split_k_default``).
+_SPLIT_K_TILE = 64
+_SPLIT_K_AB_STAGES = 4
+_SPLIT_K_MAX_CTAS_PER_SM = 3
+# The shortest K loop (in k-blocks) the split-K default splits; see
+# ``_split_k_default``.
+_SPLIT_K_MIN_K_TILES = 32
 # A candidate replaces the FFI default only below this fraction of its cost.
 _FFI_REPLACEMENT_MARGIN = 0.9
 
@@ -159,6 +176,37 @@ def _batched_radix_store(device_ir: DeviceIR) -> tuple[RadixStoreLayout, int] | 
                 tensor = cast("torch.fx.Node", node.args[0]).meta["val"]
                 return layout, tensor.element_size()
     return None
+
+
+def _one_cta_config(
+    block_sizes: list[int],
+    *,
+    pid_type: PidTypeLiteral,
+    ab_stages: int,
+    split_k: int | None = None,
+) -> Config:
+    """A one-CTA tcgen05 config: ``block_sizes`` at ``ab_stages`` AB stages,
+    two accumulator and two C stages, and ``split_k`` K slices if given."""
+    values: dict[str, Any] = {
+        "block_sizes": block_sizes,
+        "pid_type": pid_type,
+        "tcgen05_cluster_m": 1,
+        "tcgen05_cluster_n": 1,
+        "tcgen05_ab_stages": ab_stages,
+        "tcgen05_acc_stages": 2,
+        "tcgen05_c_stages": 2,
+    }
+    if split_k is not None:
+        values[TCGEN05_SPLIT_K_CONFIG_KEY] = split_k
+    return Config(**values)
+
+
+def _rendered_values(spec: ConfigSpec, values: dict[str, Any]) -> dict[str, Any]:
+    """``values`` as ``default_config()`` renders them: promoted onto the
+    base default and repaired by the search fixups."""
+    projected = spec.promoted_default_values(values)
+    spec.normalize(projected, _fix_invalid=True)
+    return projected
 
 
 def _promoted_values(seed: Config) -> dict[str, Any]:
@@ -258,14 +306,8 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         stages = smem.max_ab_stages_that_fit(state, bm=bm, bn=bn, bk=bk, cluster_m=1)
         if block_sizes is None or stages < 2 or "flat" not in spec.allowed_pid_types:
             return None
-        return Config(
-            block_sizes=block_sizes,
-            pid_type="flat",
-            tcgen05_cluster_m=1,
-            tcgen05_cluster_n=1,
-            tcgen05_ab_stages=min(stages, k // bk),
-            tcgen05_acc_stages=2,
-            tcgen05_c_stages=2,
+        return _one_cta_config(
+            block_sizes, pid_type="flat", ab_stages=min(stages, k // bk)
         )
 
     @staticmethod
@@ -436,6 +478,84 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         return Config(**values)
 
     @staticmethod
+    def _split_k_default(
+        env: CompileEnvironment, m: int, n: int, k: int
+    ) -> Config | None:
+        """A small grid no 128-row pair serves (a 64-row M, a K tail the
+        pair families do not take, a K loop past the pairs' envelope): the
+        flat one-CTA 64x64x64 tile at four AB stages (as many as K holds, at
+        least two), splitting K (``tcgen05_split_k``) over a K loop of at
+        least ``_SPLIT_K_MIN_K_TILES`` k-blocks into the most slices of at
+        least four k-blocks whose CTAs three per SM hold; unsplit over a
+        shorter loop, where no split qualifies, or where the tiles cannot
+        split (``split_k_tiles_supported``: whole tiles only without the
+        flat-edge TMA path). A kernel off the split-K search surface
+        (``split_k_search_choices``) keeps the base default. Each axis takes
+        the 64 nearest its block-size range (a narrower N its width, a pinned
+        K block its depth), and the slices are counted on that tile.
+
+        A split pays the exchange: the partial slabs, the last arriver's
+        reduction and the workspace counters' memset, which a CUDA graph
+        replays with every launch (~1.6 us). B200, Inductor corpus, of the
+        ATen GEMM, CUDA graphs with L2 flushed (4 rounds x 4 placements),
+        unsplit -> split: 16 k-blocks lose, 128x4096x1000 0.96 -> 0.77 (two
+        slices), 512x1280x1000 + mask 0.90 -> 0.64 (two), 64x4096x1000 + two
+        operands 0.80 -> 0.66 (four), 128x512x1000 FP32 out 0.83 -> 0.71
+        (four), 32x1280x1000 0.64 -> 0.57 (four), 128x1000x768 (12) 0.73 ->
+        0.56 (two); long loops gain, 1000x32x2880 (45 k-blocks) 0.55 -> 0.78
+        (eight), 64x4096x4096 (64) 0.59 -> 0.69 (four), 256x512x197952 0.11
+        -> 0.62 (eight). The base default ran a 64x16 SIMT tile (0.01-0.35).
+        Outside a CUDA graph a split launch also costs ~40-80 us more host
+        time: its exchange workspace keeps it off the fast relaunch
+        (``_cute_build_fast_relaunch`` refuses launcher-owned tensors)."""
+        spec = env.config_spec
+        state = spec._cute_tcgen05_config
+        choices = surface.split_k_search_choices(state)
+        fragments = facts._matmul_block_fragments(state)
+        # Off the split-K search surface (a body past one plain store, a
+        # leading passthrough axis: ``split_k_search_choices``) the kernel
+        # keeps the base default.
+        if not choices or fragments is None:
+            return None
+        # The slices are counted on the tile that runs: 64 on each axis,
+        # within its block-size range (a narrow N tiles at its width).
+        bm, bn, bk = (
+            min(max(_SPLIT_K_TILE, fragment.low), fragment.high)
+            for fragment in fragments
+        )
+        block_sizes = facts._matmul_seed_block_sizes(state, bm=bm, bn=bn, bk=bk)
+        k_tiles = cdiv(k, bk)
+        ab_stages = max(2, min(_SPLIT_K_AB_STAGES, k_tiles))
+        if (
+            bm != _SPLIT_K_TILE
+            or block_sizes is None
+            or "flat" not in spec.allowed_pid_types
+            or smem.max_ab_stages_that_fit(state, bm=bm, bn=bn, bk=bk, cluster_m=1)
+            < ab_stages
+        ):
+            return None
+        # A short K loop, or ragged tiles off the flat-edge TMA path
+        # (``split_k_tiles_supported``), runs the tile unsplit.
+        tiles = cdiv(m, bm) * cdiv(n, bn)
+        splittable = (
+            k_tiles >= _SPLIT_K_MIN_K_TILES
+            and surface.split_k_tiles_supported(state, bm=bm, bn=bn, bk=bk)
+        )
+        split = max(
+            (
+                choice
+                for choice in choices
+                if splittable
+                and tiles * choice <= _SPLIT_K_MAX_CTAS_PER_SM * state.device_sm_count
+                and k_tiles >= TCGEN05_SPLIT_K_MIN_SLICE_K_TILES * choice
+            ),
+            default=1,
+        )
+        return _one_cta_config(
+            block_sizes, pid_type="flat", ab_stages=ab_stages, split_k=split
+        )
+
+    @staticmethod
     def _narrow_batched_default(
         env: CompileEnvironment,
         m: int,
@@ -488,14 +608,10 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             < stages
         ):
             return None
-        return Config(
-            block_sizes=block_sizes,
+        return _one_cta_config(
+            block_sizes,
             pid_type="persistent_blocked" if persistent else "flat",
-            tcgen05_cluster_m=1,
-            tcgen05_cluster_n=1,
-            tcgen05_ab_stages=stages,
-            tcgen05_acc_stages=2,
-            tcgen05_c_stages=2,
+            ab_stages=stages,
         )
 
     @staticmethod
@@ -596,21 +712,15 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             bk=bk,
             min_ab_stages=2,
         )
-        projected: dict[str, Any] | None = None
-        if values is not None and bk != 64:
-            spec = env.config_spec
-            projected = spec.promoted_default_values(values)
-            spec.normalize(projected, _fix_invalid=True)
         if bk != 64 and (
             # a registered K block size range without the shallower tile
             values is None
             # the projection left register loads (no AB ring fits beside the
             # operands' rings)
-            or (
-                projected is not None
-                and projected.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
-                != TCGEN05_AUX_LOAD_MODE_TMA
+            or _rendered_values(env.config_spec, values).get(
+                TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
             )
+            != TCGEN05_AUX_LOAD_MODE_TMA
         ):
             # 64-deep k-blocks
             values = cls._persistent_tile_values(
@@ -688,8 +798,7 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         # partial-output store (``_fix_one_cta_n_edge_rings_search_config``; bf16
         # 25216x576x768 + bias: ab=3). Promote the projected rings, where
         # the sample stays persistent on that store.
-        projected = spec.promoted_default_values(values)
-        spec.normalize(projected, _fix_invalid=True)
+        projected = _rendered_values(spec, values)
         if projected.get(
             "pid_type"
         ) != "persistent_interleaved" or not smem.one_cta_n_edge_partial_output(
@@ -738,8 +847,10 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             return cls._narrow_batched_default(env, m, n, k, radix)
         if small_grid:
             # Fewer 128x128 tiles than SMs: the 128-row pair with the fewest
-            # waves, then the most CTAs (``_small_grid_pair_default``).
-            return cls._small_grid_pair_default(env, m, n, k, batch)
+            # waves, then the most CTAs (``_small_grid_pair_default``); where
+            # no pair serves, the one-CTA tile splitting K.
+            pair = cls._small_grid_pair_default(env, m, n, k, batch)
+            return pair if pair is not None else cls._split_k_default(env, m, n, k)
         constraints = state.cluster_m2_search_constraints
         if (
             constraints is not None
@@ -892,16 +1003,19 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             # With at most two K tiles per output tile the epilogue bounds the
             # pair, and loading a bias row from global memory per subtile
             # leaves its latency on every subtile; ``pre_acc_wait`` stages the
-            # promoted row once per tile. Beside a row stage the hybrid TMA
-            # store is admitted through ``c_stages_fits`` alone
-            # (``output_edge_tma_store_smem_fits`` refuses row stages, see
-            # below), which costs one AB stage: the deepest ring it admits
-            # that also fits the stage. Inductor corpus on B200, 256x256x64
-            # pairs + bf16 bias, post ab6 -> pre ab5: 4096x30000x128 (26
-            # tiles per pair) 136 -> 98 us, 32768x30528x128 746 -> 596 us; at
-            # K=768 the shallower ring costs 0-4%, and below 16 tiles per pair
-            # the SIMT store wins (32768x576x128: 36.9 us SIMT, 51.3 staged
-            # beside the TMA store).
+            # promoted row once per tile (the partial-output check above
+            # skips static full tiles, so they reach this too). Beside a row
+            # stage the hybrid TMA store is admitted through ``c_stages_fits``
+            # alone (``output_edge_tma_store_smem_fits`` refuses row stages),
+            # which costs one AB stage: the deepest ring it admits that also
+            # fits the stage. Inductor corpus on B200, 256x256x64 pairs + bf16
+            # bias, post ab6 -> pre ab5 (measured before the partial-output
+            # store took the edge tiles): 4096x30000x128 (26 tiles per pair)
+            # 136 -> 98 us, 32768x30528x128 746 -> 596 us; static full
+            # 256x128 tiles, post ab8 -> pre ab7: promoted bias 65536x1152x128
+            # 44.3 -> 42.0 us; at K=768 the shallower ring costs 0-4%, and
+            # below 16 tiles per pair the SIMT store wins (32768x576x128: 36.9
+            # us SIMT, 51.3 staged beside the TMA store).
             c_stages = cast("int", values.get("tcgen05_c_stages", 2))
             for depth in range(cast("int", values.get("tcgen05_ab_stages", 2)), 1, -1):
                 fits = {"bm": bm, "bn": bn, "bk": bk, "cluster_m": 2}
@@ -926,20 +1040,18 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             and all(row.itemsize == 2 for row in pipeline_facts.rows)
             and not facts._static_full_tiles(state, bm=bm, bn=bn, bk=bk)
         ):
-            # On an output edge a ``pre_acc_wait`` bias row at the seed's deep
-            # ring keeps every tile on the predicated SIMT store
-            # (``output_edge_tma_store_smem_fits`` refuses the hybrid TMA
-            # store beside row stages, and ``c_stages_fits`` does not admit it
-            # at that ring); ``post_acc_wait`` stores every tile through TMA
-            # where the arena holds the row stage (the partial-output store,
-            # ``cute_mma``), else the full tiles. Measured against the full-
-            # tile split, before the partial-output store took the fringe
-            # tiles too, the TMA store won from 16 tiles per CTA (pair) on and
-            # the SIMT store below. Inductor corpus, 256x256x64 ab6 pairs +
-            # bf16 bias, of cuBLAS, SIMT -> full-tile TMA store:
-            # 104 tiles per pair (16384x30528x768) 0.63 -> 0.92, 26
-            # (4096x30000x128) 0.41 -> 0.52; 13 (25216x2304x768) 0.67 -> 0.61,
-            # 6 (32768x576x192) 0.50 -> 0.29, 4 (2048x8008x2560) 1.06 -> 0.86.
+            # On an output edge a ``pre_acc_wait`` bias row the partial-output
+            # store does not fit (five or more unpromoted 16-bit rows: 512 B a
+            # row beside the 256x256x64 pair's six stages) keeps every tile on
+            # the predicated SIMT store (``output_edge_tma_store_smem_fits``
+            # refuses the hybrid TMA store beside row stages); ``post_acc_wait``
+            # stores the full tiles through TMA. The TMA store wins from 16
+            # tiles per CTA (pair) on: ``acc + r0..r4[cols]`` 16384x30528x768
+            # 3284 -> 2539 us; 256x256x64 ab6 pairs + bf16 bias, of cuBLAS,
+            # SIMT -> full-tile TMA store: 104 tiles per pair
+            # (16384x30528x768) 0.63 -> 0.92, 26 (4096x30000x128) 0.41 ->
+            # 0.52; 13 (25216x2304x768) 0.67 -> 0.61, 6 (32768x576x192) 0.50
+            # -> 0.29.
             values[TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY] = (
                 TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
             )
@@ -985,10 +1097,8 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             groupings: list[object] = list(
                 values.get("l2_groupings") or [1] * len(spec.l2_groupings)
             )
-            grouping = (
-                TCGEN05_LONG_N_SWEEP_L2_GROUPING
-                if cdiv(n, bn) >= TCGEN05_LONG_N_SWEEP_MIN_TILES
-                else _SHORT_N_SWEEP_L2_GROUPING
+            grouping = long_n_sweep_l2_grouping(
+                cdiv(n, bn), short=_SHORT_N_SWEEP_L2_GROUPING
             )
             groupings[
                 spec.l2_groupings.block_id_to_index(state.matmul_block_ids[0])
@@ -997,26 +1107,55 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         elif (
             waves > 1
             and len(spec.l2_groupings) == 1
-            and values.get("l2_groupings", [1]) == [1]
+            and values.get("l2_groupings", [1])
+            in ([1], [TCGEN05_TWO_CTA_SEED_L2_GROUPING])
         ):
-            # The proved-schedule seeds walk the grid ungrouped; a multi-wave
-            # default needs the grouped raster so concurrent tiles share their
-            # A/B panels in L2 (bf16 10240x2560x4096 on 256x128 pair tiles:
-            # 0.80 -> 1.05 of cuBLAS), and a long N sweep groups 32 M tiles
-            # (bf16 8192x32000x1024 + bias on 256x256 pairs: 0.95 grouped by
-            # 8, 1.00 by 32): the group's A panels stay resident in L2. Staged
-            # exact-shape operands stream through L2 beside them, so such a
-            # sweep groups 8 (eleven residuals on 256x128 pairs, grouped by
-            # 32 / 8: 16384x4096x4096 0.74 / 0.85, 4096x16384x4096 0.80 /
-            # 0.83, 4096^3 0.85 / 0.86; three, 4096^3: 1.01 / 1.00).
-            long_sweep = (
-                _STAGED_AUX_LONG_N_SWEEP_L2_GROUPING
-                if staged_aux
-                else TCGEN05_LONG_N_SWEEP_L2_GROUPING
-            )
+            # The proved-schedule seeds walk the grid ungrouped or by the
+            # seed grouping; a multi-wave default needs the grouped raster so
+            # concurrent tiles share their A/B panels in L2 (bf16
+            # 10240x2560x4096 on 256x128 pair tiles: 0.80 -> 1.05 of cuBLAS),
+            # and a long N sweep groups 32 M tiles
+            # (``long_n_sweep_l2_grouping``; plain 16384x30528x768, which
+            # takes this branch: 0.92 grouped by 4, 0.96 by 32; the direct
+            # entry's 8192x32000x1024 + bias: 0.95 by 8, 1.00 by 32): the
+            # group's A panels stay resident in L2. Staged exact-shape operands stream through
+            # L2 beside them, so such a sweep groups 8 (eleven residuals on
+            # 256x128 pairs, grouped by 32 / 8: 16384x4096x4096 0.74 / 0.85,
+            # 4096x16384x4096 0.80 / 0.83, 4096^3 0.85 / 0.86; three, 4096^3:
+            # 1.01 / 1.00).
             values["l2_groupings"] = [
-                long_sweep
-                if cdiv(n, bn) >= TCGEN05_LONG_N_SWEEP_MIN_TILES
-                else TCGEN05_TWO_CTA_SEED_L2_GROUPING
+                long_n_sweep_l2_grouping(
+                    cdiv(n, bn),
+                    short=TCGEN05_TWO_CTA_SEED_L2_GROUPING,
+                    long=_STAGED_AUX_LONG_N_SWEEP_L2_GROUPING
+                    if staged_aux
+                    else TCGEN05_LONG_N_SWEEP_L2_GROUPING,
+                )
             ]
+        if pipeline_facts.epilogue_transcendental:
+            values = cls._transcendental_epilogue_values(env, values)
         return Config(**values)
+
+    @staticmethod
+    def _transcendental_epilogue_values(
+        env: CompileEnvironment, values: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Two epilogue warp groups for an epilogue with a transcendental op
+        (``epilogue_transcendental``: erf, exp, tanh, ...), at the deepest AB
+        ring that fits beside their C rings, where the search fixups keep
+        them (the standard static-full TMA-store epilogue).
+
+        One warp per scheduler issues the exact erf/exp polynomials one
+        dependent step at a time, so such an epilogue outlasts the tile's
+        MMA; a second group overlaps two subtiles' math. B200, GELU backward
+        (erf, exp), 16384x4096x1024 on the 256x256 pair, of the ATen GEMM:
+        one group 0.33, two 1.02 (ab 6 -> 5; ab 4 1.03, three groups at ab 4
+        0.75, four at ab 3 0.64)."""
+        spec = env.config_spec
+        two = {**values, TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY: 2}
+        projected = _rendered_values(spec, two)
+        if projected.get(TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY) != 2:
+            return values
+        two["tcgen05_ab_stages"] = projected["tcgen05_ab_stages"]
+        two["tcgen05_c_stages"] = projected["tcgen05_c_stages"]
+        return two

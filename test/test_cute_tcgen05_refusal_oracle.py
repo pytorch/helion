@@ -480,6 +480,14 @@ CORPUS: list[Refusal] = [
         FLAT_SPLIT,
         SPLIT_STRICT,
     ),
+    # ``epi_warp_groups_refusal``: the role-local epilogue that runs the
+    # groups exists only on a persistent pid type.
+    Refusal(
+        "epi_warp_groups_on_a_flat_pid",
+        lambda: bind(plain_single),
+        base_config({GROUPS: 2}, pid_type="flat"),
+        "epilogue warp groups require a persistent pid type",
+    ),
     # ``_normalize_aux_producer_ab_stages``: the C-input warp, or the store
     # warp staging the auxiliary ring through TMA, beside six AB stages on a
     # kernel with an exact-shape auxiliary operand (the arena model,
@@ -624,13 +632,6 @@ LIVE: list[tuple[str, Callable[[], Any], dict[str, Any], type[Exception], str]] 
         base_config(tcgen05_cluster_m=2, tcgen05_cluster_n=2, tcgen05_c_stages=2),
         BackendUnsupported,
         r"tcgen05_cluster_n=2 requires tcgen05_cluster_m=2 with use_2cta=True \(bm=256\)",
-    ),
-    (
-        "epi_warp_groups_on_a_flat_pid",
-        lambda: bind(plain_single),
-        base_config({GROUPS: 2}, pid_type="flat"),
-        InvalidConfig,
-        "epi_warp_groups=2 needs the standard role-local TMA-store epilogue",
     ),
     (
         "prefetch_ring_on_a_flat_pid",

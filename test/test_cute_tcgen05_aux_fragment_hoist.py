@@ -562,15 +562,15 @@ def test_smem_model_charges_one_c_ring_per_output() -> None:
     # ab=6 + c=4 fits one ring (224 KiB) but not two (256 KiB): the sampled
     # rings are shallowed to the deepest AB depth the two rings leave.
     sample = base_config(tcgen05_ab_stages=6, tcgen05_c_stages=4)
-    repair._fix_multi_output_ring_search_config(state, sample)
+    repair._fix_c_ring_search_config(state, sample)
     assert (sample["tcgen05_ab_stages"], sample["tcgen05_c_stages"]) == (5, 4)
     sample = base_config(tcgen05_ab_stages=6, tcgen05_c_stages=2)
-    repair._fix_multi_output_ring_search_config(state, sample)
+    repair._fix_c_ring_search_config(state, sample)
     assert (sample["tcgen05_ab_stages"], sample["tcgen05_c_stages"]) == (6, 2)
     # A single-output kernel is untouched by this gate.
     single = state_of(bind(residual_single))
     sample = base_config(tcgen05_ab_stages=6, tcgen05_c_stages=4)
-    repair._fix_multi_output_ring_search_config(single, sample)
+    repair._fix_c_ring_search_config(single, sample)
     assert (sample["tcgen05_ab_stages"], sample["tcgen05_c_stages"]) == (6, 4)
     # An explicit config is refused where its two rings provably overflow
     # (128x128x128: ab=3 is 192 KiB, two 4-stage C rings 64 KiB more -- the
@@ -587,6 +587,31 @@ def test_smem_model_charges_one_c_ring_per_output() -> None:
     assert normalized(bound, deep | {"tcgen05_c_stages": 2})["tcgen05_c_stages"] == 2
     repaired = normalized(bound, deep, fix_invalid=True)
     assert (repaired["tcgen05_ab_stages"], repaired["tcgen05_c_stages"]) == (3, 2)
+
+
+def test_smem_model_charges_each_epilogue_groups_c_ring() -> None:
+    """Each epilogue warp group keeps its own ``c_stages`` stages of the C
+    ring, which the single-output gates do not price: the arena judges a
+    two-group config's rings, shallowing a sample's AB ring and refusing an
+    explicit config that overflows (the one-CTA 128x256x64 tile at ab=4 beside
+    two groups' (128, 64) rings: 262 KB of 232, which NVVM refused)."""
+    bound = bind(residual_single)
+    deep = base_config(
+        block_sizes=[128, 256, 64],
+        tcgen05_ab_stages=4,
+        tcgen05_c_stages=2,
+        tcgen05_epi_warp_groups=2,
+    )
+    with pytest.raises(InvalidConfig, match="overflows the per-CTA SMEM budget"):
+        normalized(bound, deep)
+    repaired = normalized(bound, deep, fix_invalid=True)
+    assert (repaired["tcgen05_ab_stages"], repaired["tcgen05_epi_warp_groups"]) == (
+        3,
+        2,
+    )
+    # One group's ring leaves room for the fourth stage.
+    one_group = normalized(bound, deep | {"tcgen05_epi_warp_groups": 1})
+    assert one_group["tcgen05_ab_stages"] == 4
 
 
 def _group(bound: BoundKernel[Any], key: str) -> Any:

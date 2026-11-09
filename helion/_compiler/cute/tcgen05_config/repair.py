@@ -973,7 +973,8 @@ def _normalize_split_k(
     state: CuteTcgen05Config, config: dict[str, object], *, fix_invalid: bool
 ) -> None:
     """Keep ``tcgen05_split_k`` at 1 unless the sampled config is a flat
-    one-CTA GEMM whose K loop has at least ``split`` tiles.
+    one-CTA GEMM whose K loop has at least ``split`` tiles, on whole tiles
+    or the flat-edge TMA path (``split_k_flat_edge_tma``).
 
     The strict pass (``fix_invalid=False``) refuses an explicit split on the
     facts it shares with the split-K pipeline's envelope in ``cute_mma``:
@@ -1015,8 +1016,8 @@ def _normalize_split_k(
     )
     if valid:
         assert view is not None and extents is not None
-        block_sizes, m_index, _n_index, k_index = view
-        bm, bk = block_sizes[m_index], block_sizes[k_index]
+        block_sizes, m_index, n_index, k_index = view
+        bm, bn, bk = (block_sizes[index] for index in (m_index, n_index, k_index))
         k = cast("tuple[int, int, int]", extents)[2]
         valid = (
             # The tile must run the one-CTA tcgen05 MMA (a 256-row flat
@@ -1025,6 +1026,9 @@ def _normalize_split_k(
             and isinstance(bk, int)
             and bk > 0
             and -(-k // bk) >= split
+            and isinstance(bm, int)
+            and isinstance(bn, int)
+            and surface.split_k_tiles_supported(state, bm=bm, bn=bn, bk=bk)
         )
     if not valid:
         if searched:
@@ -1046,13 +1050,27 @@ def _split_k_refusal(
         and extents is not None
         and config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY) is None
     ):
-        bk = view[0][view[3]]
+        blocks, m_index, n_index, k_index = view
+        bm, bn, bk = blocks[m_index], blocks[n_index], blocks[k_index]
         k = cast("tuple[int, int, int]", extents)[2]
         if type(bk) is int and bk > 0 and isinstance(k, int) and k > 0:
             k_tiles = -(-k // bk)
+        if (
+            type(bm) is int
+            and type(bn) is int
+            and type(bk) is int
+            and not surface.split_k_tiles_supported(state, bm=bm, bn=bn, bk=bk)
+        ):
+            return (
+                f"{TCGEN05_SPLIT_K_CONFIG_KEY}={split} splits whole tiles only "
+                "without the flat-edge TMA path (cute_flat_edge_tma), which "
+                "stores the partial tiles' K tails and edges"
+            )
     if (
         config.get("pid_type", "flat") == "flat"
         and state.split_k_plain_body
+        # a batched GEMM (a batch of one too) leaves the search's choices
+        and not state.matmul_has_leading_passthrough
         and k_tiles >= split
     ):
         return None
@@ -1719,7 +1737,7 @@ def epilogue_fanout_refusal(
     outputs of the 256-row pair tile (the codegen store protocol's fact)
     at one of the backend's pair N tiles and leave room for one AB stage
     next to both outputs' C rings in the static arena; the ring depth
-    itself is judged by ``_normalize_multi_output_rings``.
+    itself is judged by ``_normalize_c_rings``.
     """
     if not state.epilogue_fanout_plans or not fanout_schedule_supported(config):
         return "the fanout needs the standard role-local TMA epilogue schedule"
@@ -3101,6 +3119,16 @@ def epi_warp_groups_refusal(
     reason = _standard_tma_epilogue_schedule_refusal(state, config, region=region)
     if reason is not None:
         return f"epilogue warp groups {reason}"
+    pid_type = config.get("pid_type", "flat")
+    if not (isinstance(pid_type, str) and pid_type.startswith("persistent")):
+        # Codegen runs the groups on the role-local epilogue, which only a
+        # persistent kernel's role launch has (``tcgen05_use_role_local_epi``):
+        # a flat tile (the small-grid default's one-CTA 64x64 tile, split K
+        # included) keeps one group.
+        return (
+            "epilogue warp groups require a persistent pid type (the "
+            "role-local epilogue)"
+        )
     if config.get(
         TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY, TCGEN05_C_ACQUIRE_PLACEMENT_PRE_LOOP
     ) not in (
@@ -3308,24 +3336,28 @@ def _normalize_epilogue_groups(
         )
 
 
-def _fix_multi_output_ring_search_config(
+def _fix_c_ring_search_config(
     state: CuteTcgen05Config, config: dict[str, object]
 ) -> None:
-    """Shallow a multi-output sample's rings to the whole static arena."""
-    _normalize_multi_output_rings(state, config, fix_invalid=True)
+    """Shallow the rings of a sample with several C rings (outputs or
+    epilogue warp groups) to the whole static arena."""
+    _normalize_c_rings(state, config, fix_invalid=True)
 
 
-def _normalize_multi_output_rings(
+def _normalize_c_rings(
     state: CuteTcgen05Config, config: dict[str, object], *, fix_invalid: bool
 ) -> None:
-    """Judge a multi-output config's rings against the whole static arena.
+    """Judge the rings of a config with several C rings against the whole
+    static arena.
 
     The single-output gates above calibrate AB + one C ring; a kernel
     with several output stores allocates one C ring per output
-    (``Tcgen05RowvecAuxFacts.output_count``), so a config they admit can
-    still overflow (128x128x64 fp16 with two outputs: ab=6 + c=4 is
-    192 KiB + 64 KiB; 128x128x128 ab=3 + c=4 is 192 KiB + 64 KiB too) and
-    die in the NVVM backend. Judge the final rings with
+    (``Tcgen05RowvecAuxFacts.output_count``), and each epilogue warp group
+    its own ``c_stages`` stages, so a config they admit can still
+    overflow (128x128x64 fp16 with two outputs: ab=6 + c=4 is 192 KiB +
+    64 KiB; 128x128x128 ab=3 + c=4 is 192 KiB + 64 KiB too; the one-CTA
+    128x256x64 tile at ab=4 beside two groups' (128, 64) rings is 262 KB
+    of 232) and die in the NVVM backend. Judge the final rings with
     ``default_layout_smem_fits`` (which charges every ring): a sample
     (``fix_invalid``) takes the deepest AB ring that fits, at the sampled
     C depth first and at the shallow C ring otherwise; an explicit config
@@ -3333,18 +3365,25 @@ def _normalize_multi_output_rings(
     is proved and the config is left alone.
     """
     rowvec_facts = state.rowvec_aux_facts
+    groups = epi_warp_groups_knob(config)
     if (
         not state.search_enabled
         or state.ab_stages_three_search_constraints is None
         or rowvec_facts is None
-        or rowvec_facts.output_count < 2
+        or (rowvec_facts.output_count < 2 and groups < 2)
     ):
         return
-    if config.get(
-        TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY,
-        Tcgen05LayoutStrategy.DEFAULT.value,
-    ) != Tcgen05LayoutStrategy.DEFAULT.value or config.get(
-        TCGEN05_GROUPED_MODE_CONFIG_KEY
+    if (
+        config.get(
+            TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY,
+            Tcgen05LayoutStrategy.DEFAULT.value,
+        )
+        != Tcgen05LayoutStrategy.DEFAULT.value
+        or config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+        # The aligned-N plan prices a single output's groups and subtile
+        # at the physical width (``dense_aligned_n``); the public carrier
+        # tile would overcharge it.
+        or (config.get(TILE_N_KEY) and rowvec_facts.output_count < 2)
     ):
         return
     config_view = facts._matmul_config_view(state, config)
@@ -3381,8 +3420,9 @@ def _normalize_multi_output_rings(
     if not fix_invalid:
         raise InvalidConfig(
             f"tcgen05_ab_stages={ab_stages} with tcgen05_c_stages={c_stages} "
-            f"overflows the per-CTA SMEM budget at a {bm}x{bn}x{bk} tile: the "
-            f"kernel's {rowvec_facts.output_count} output stores keep one C ring each"
+            f"overflows the per-CTA SMEM budget at a {bm}x{bn}x{bk} tile beside "
+            f"{rowvec_facts.output_count * groups} C rings (one per output store and "
+            f"epilogue warp group: {rowvec_facts.output_count} x {groups})"
         )
     for c in dict.fromkeys((cast("int", c_stages), 2)):
         for ab in range(cast("int", ab_stages), 0, -1):
@@ -5782,10 +5822,11 @@ def _fix_search_config_body(
     # feed (a (128, 32) subtile halves each ring; a second group doubles
     # the stages).
     _normalize_epilogue_groups(state, config, fix_invalid=True)
-    # A kernel with several output stores keeps one C ring per output;
-    # judge the final rings against the whole arena and shallow them
-    # where the extra rings overflow.
-    _fix_multi_output_ring_search_config(state, config)
+    # A kernel with several output stores keeps one C ring per output,
+    # each epilogue warp group its own stages; judge the final rings
+    # against the whole arena and shallow them where the extra rings
+    # overflow.
+    _fix_c_ring_search_config(state, config)
     # The epilogue-issued ring was judged before the projections above
     # moved the tile (a C-input warp's neighbour of the ``epi_tma``
     # default widens the pair to ``cta_group="auto"``); re-judge its AB
@@ -6011,10 +6052,11 @@ def normalize_strategy(
     # ring pricing (a dropped second group halves the C rings, a lone
     # group's one-stage ring deepens to two).
     _normalize_epilogue_groups(state, config, fix_invalid=fix_invalid)
-    # A kernel with several output stores keeps one C ring per output;
-    # the search's fix pass shallowed its samples above, so this refuses
-    # only an explicit config whose rings provably overflow the arena.
-    _normalize_multi_output_rings(state, config, fix_invalid=fix_invalid)
+    # A kernel with several output stores keeps one C ring per output,
+    # each epilogue warp group its own stages; the search's fix pass
+    # shallowed its samples above, so this refuses only an explicit config
+    # whose rings provably overflow the arena.
+    _normalize_c_rings(state, config, fix_invalid=fix_invalid)
     if (
         fix_invalid
         and config.get(TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY) is True

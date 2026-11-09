@@ -78,6 +78,8 @@ from ..tcgen05_constants import TCGEN05_GROUPED_WORKLIST_MMA_M_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_GROUPED_WORKLIST_MMA_N_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
+from ..tcgen05_constants import TCGEN05_LONG_N_SWEEP_L2_GROUPING
+from ..tcgen05_constants import TCGEN05_LONG_N_SWEEP_MIN_TILES
 from ..tcgen05_constants import TCGEN05_REGION_AB_STAGES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_REGION_C_STAGES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_REGION_PID_TYPES_CONFIG_KEY
@@ -429,3 +431,14 @@ def _stored_block_n(config: Mapping[str, object], bn: int) -> int:
     behind its power-of-two carrier ``bn``, else ``bn``."""
     width = config.get(TILE_N_KEY, 0)
     return width if type(width) is int and width > 0 else bn
+
+
+def long_n_sweep_l2_grouping(
+    n_tiles: int, *, short: int, long: int = TCGEN05_LONG_N_SWEEP_L2_GROUPING
+) -> int:
+    """The M tiles a grouped raster walks per group over ``n_tiles`` N
+    tiles: ``long`` on a long N sweep (at least
+    ``TCGEN05_LONG_N_SWEEP_MIN_TILES`` N tiles: the group's A panels stay
+    resident in L2 while it sweeps N, so B is re-read once per group),
+    ``short`` otherwise."""
+    return long if n_tiles >= TCGEN05_LONG_N_SWEEP_MIN_TILES else short

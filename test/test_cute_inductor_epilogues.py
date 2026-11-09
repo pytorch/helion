@@ -8,12 +8,15 @@ the same forms against torch.
 
 from __future__ import annotations
 
+import random
 import re
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
 import torch
+
+from test.cute_population_contracts import checked_initial_population
 
 import helion
 from helion import exc
@@ -23,6 +26,8 @@ from helion._testing.cute_dense_tcgen05 import cpu_codegen_target
 from helion._testing.cute_inductor_epilogues import INDUCTOR_EPILOGUES
 from helion._testing.cute_inductor_epilogues import InductorEpilogue
 from helion._testing.cute_inductor_epilogues import inductor_epilogue_args
+from helion.autotuner.effort_profile import get_effort_profile
+from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -72,6 +77,7 @@ def test_inductor_pointwise_epilogues_join_the_chain(
     code = bound.to_code(config)
     assert config.block_sizes[:2] == [256, 256]
     assert re.search(epilogue.step, code, re.MULTILINE), epilogue.step
+    assert ("tcgen05_epi_group = " in code) is epilogue.two_epilogue_groups
     # one load per auxiliary tensor, however often the epilogue reads it (a
     # rank-0 scalar binds once per tile instead)
     loads = set(re.findall(r"\btcgen05_aux_loaded(?:_\d+)*\b", code))
@@ -379,3 +385,107 @@ def test_boolean_mask_on_tma_store_edge_tiles_reads_its_int8_storage() -> None:
     assert "_edge_atom" not in code
     assert re.search(r"cute\.make_rmem_tensor\([^\n]*, cutlass\.Int8\)", code)
     assert re.search(r"= tcgen05_aux_rmem(?:_\d+)*\.load\(\) != 0$", code, re.MULTILINE)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fp32_erf_mm(
+    a: torch.Tensor, b: torch.Tensor, x: torch.Tensor, out: torch.Tensor
+) -> None:
+    """``acc * erf(x)`` into an FP32 output: no aux hoist at FP32, so the
+    L2 swizzle's coverage carriers come from the seeds."""
+    m, k = a.shape
+    n = b.shape[1]
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        out[rows, cols] = acc * torch.erf(x[rows, cols])
+
+
+def test_flat_tile_keeps_one_epilogue_warp_group() -> None:
+    """The small-grid default's flat 64x64 tile (split K) has no role-local
+    epilogue, where codegen runs the epilogue warp groups: a second group is
+    refused there, and a search sample drops it instead of failing to
+    compile."""
+    (form,) = [e for e in INDUCTOR_EPILOGUES if e.name == "gelu_grad"]
+    bound = form.kernel._bind_isolated(
+        inductor_epilogue_args(form, 64, 4096, 4096, device=CPU_DEVICE, random=False)
+    )
+    default = bound.config_spec.default_config()
+    assert default.config["pid_type"] == "flat"
+    sample = helion.Config(**{**default.config, "tcgen05_epi_warp_groups": 2})
+    with pytest.raises(exc.InvalidConfig, match="persistent pid type"):
+        bound.config_spec.normalize(helion.Config(**sample.config))
+    bound.config_spec.normalize(sample, _fix_invalid=True)
+    assert sample.config.get("tcgen05_epi_warp_groups", 1) == 1
+
+
+# One-CTA two-group defaults whose coverage carriers come from the aux-hoist
+# witnesses (GELU backward, two geometries) or from the seeds (FP32 erf).
+@pytest.mark.parametrize(
+    ("kernel", "shape"),
+    (
+        ("gelu_grad", (6272, 4096, 1024)),
+        ("gelu_grad", (25216, 768, 192)),
+        ("fp32_erf", (6272, 4096, 1024)),
+    ),
+)
+def test_two_group_default_keeps_the_coverage_population(
+    kernel: str, shape: tuple[int, int, int]
+) -> None:
+    """The default's two epilogue warp groups stay out of the coverage
+    carriers drawn from the seeds (``coverage_seed_carriers``): a carrier
+    holds every group it does not declare at its legacy mode, or the
+    population step refuses its witnesses (both aux-hoist witnesses and the
+    swizzle's seed carriers were refused). The hoist stays off where one
+    group does not admit it, and every declared witness reaches the initial
+    population."""
+    m, n, k = shape
+    if kernel == "gelu_grad":
+        (form,) = [e for e in INDUCTOR_EPILOGUES if e.name == "gelu_grad"]
+        args = inductor_epilogue_args(form, m, n, k, device=CPU_DEVICE, random=False)
+        bound = form.kernel._bind_isolated(args)
+    else:
+        args = (
+            torch.empty((m, k), dtype=torch.bfloat16),
+            torch.empty((k, n), dtype=torch.bfloat16),
+            torch.empty((m, n), dtype=torch.float32),
+            torch.empty((m, n), dtype=torch.float32),
+        )
+        bound = _fp32_erf_mm._bind_isolated(args)
+    spec = bound.config_spec
+    default = spec.default_config()
+    assert default.config["tcgen05_epi_warp_groups"] == 2
+    if kernel == "gelu_grad" and shape == (6272, 4096, 1024):
+        # The one-CTA AB envelope prices one group's C ring: beside two
+        # groups' rings the 128x256 tile keeps the three 64-deep AB stages
+        # the arena fits (four need 262 KB of the 232 KB B200 cap, which
+        # NVVM refused).
+        assert default.block_sizes[:2] == [128, 256]
+        assert default.config["tcgen05_ab_stages"] == 3
+        code = bound.to_code(default)
+        assert (
+            "tcgen05_ab_pipeline = cutlass.pipeline.PipelineTmaUmma.create("
+            "num_stages=3," in code
+        )
+        assert "tcgen05_epi_group = " in code
+    groups = {group.key: group for group in spec.compiler_coverage_groups}
+    assert "tcgen05_aux_fragment_hoist" not in groups
+    assert all(
+        witness.carrier.config.get("tcgen05_epi_warp_groups", 1) == 1
+        for witness in groups["tcgen05_l2_swizzle_size"].witnesses
+    )
+    state = random.getstate()
+    try:
+        with bound.env:
+            search = LFBOTreeSearch(
+                bound,
+                args,
+                **LFBOTreeSearch.get_kwargs_from_profile(
+                    get_effort_profile("full"), bound.settings
+                ),
+            )
+            random.seed(2026091539)
+            checked_initial_population(search)
+    finally:
+        random.setstate(state)

@@ -802,8 +802,10 @@ def output_edge_tma_store_smem_fits(
         # store's edge tiles read them from global memory beside the full
         # tiles' staged row; the two-stage route,
         # ``TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES``, and
-        # ``c_stages_fits`` still take the hybrid store for them). The default
-        # relies on this refusal to keep few-tile bias GEMMs on the SIMT
+        # ``c_stages_fits`` still take the hybrid store for them). The
+        # defaults store an output edge's bias rows after the accumulator
+        # wait (the partial-output store) where it holds them, and rely on
+        # this refusal to keep few-tile rows it does not hold on the SIMT
         # store, which wins there (32768x576x128 + bias: 36.9 us, against
         # 51.3 with the staged row beside the TMA store; see
         # ``CuteTcgen05DefaultTileHeuristic._pick``).

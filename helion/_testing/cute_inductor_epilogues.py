@@ -221,6 +221,29 @@ def gelu_tanh_grad_mm_into(
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def gelu_grad_mm_into(
+    a: torch.Tensor, b: torch.Tensor, x: torch.Tensor, out: torch.Tensor
+) -> None:
+    """GELU (erf) backward of ``x``: ``acc * (cdf(x) + x * pdf(x))``, an erf
+    and an exp per element."""
+    m, k = a.shape
+    n = b.shape[1]
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        v = x[rows, cols].to(torch.float32)
+        rsqrt2 = hl.full([], 0.7071067811865476, dtype=torch.float32)
+        one = hl.full([], 1.0, dtype=torch.float32)
+        half = hl.full([], 0.5, dtype=torch.float32)
+        neg_half = hl.full([], -0.5, dtype=torch.float32)
+        rsqrt2pi = hl.full([], 0.3989422804014327, dtype=torch.float32)
+        cdf = (torch.erf(v * rsqrt2) + one) * half
+        pdf = torch.exp(v * v * neg_half) * rsqrt2pi
+        out[rows, cols] = (acc * (cdf + v * pdf)).to(out.dtype)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def selu_grad_mm_into(
     a: torch.Tensor, b: torch.Tensor, x: torch.Tensor, out: torch.Tensor
 ) -> None:
@@ -367,6 +390,10 @@ class InductorEpilogue:
     # The output's dtype (an FP32 store under 16-bit operands traces the
     # epilogue to its store).
     out_dtype: torch.dtype = torch.bfloat16
+    # Whether the pair default runs two epilogue warp groups: a transcendental
+    # op in the chain (``epilogue_transcendental``) on the static full-tile
+    # TMA-store epilogue.
+    two_epilogue_groups: bool = False
 
 
 INDUCTOR_EPILOGUES: tuple[InductorEpilogue, ...] = (
@@ -451,6 +478,15 @@ INDUCTOR_EPILOGUES: tuple[InductorEpilogue, ...] = (
         ("tile",),
         lambda acc, x: _gelu_tanh_grad(acc, x.float()),
         r"= tcgen05_chain_step(?:_\d+)* \+ tcgen05_chain_step(?:_\d+)*$",
+        two_epilogue_groups=True,
+    ),
+    InductorEpilogue(
+        "gelu_grad",
+        gelu_grad_mm_into,
+        ("tile",),
+        lambda acc, x: acc * _gelu_grad_factor(x.float()),
+        r"= tcgen05_acc_loaded(?:_\d+)* \* tcgen05_aux_expr(?:_\d+)*$",
+        two_epilogue_groups=True,
     ),
     InductorEpilogue(
         "selu_grad",
@@ -463,6 +499,7 @@ INDUCTOR_EPILOGUES: tuple[InductorEpilogue, ...] = (
         ),
         r"= cute\.where\(tcgen05_aux_expr(?:_\d+)*, tcgen05_chain_step(?:_\d+)*, "
         r"tcgen05_chain_step(?:_\d+)*\)$",
+        two_epilogue_groups=True,
     ),
     InductorEpilogue(
         "hardswish_grad",
@@ -518,6 +555,11 @@ def _gelu_tanh_grad(acc: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     t = torch.tanh((x + 0.044715 * x * x * x) * 0.7978845608028654)
     inner = acc * (x * 0.5) * (1.0 - t * t) * 0.7978845608028654
     return inner + inner * 0.044715 * (x * x * 3.0) + acc * (t + 1.0) * 0.5
+
+
+def _gelu_grad_factor(x: torch.Tensor) -> torch.Tensor:
+    cdf = (torch.erf(x * 0.7071067811865476) + 1.0) * 0.5
+    return cdf + x * torch.exp(x * x * -0.5) * 0.3989422804014327
 
 
 def _hardswish_grad(grad: torch.Tensor, x: torch.Tensor) -> torch.Tensor:

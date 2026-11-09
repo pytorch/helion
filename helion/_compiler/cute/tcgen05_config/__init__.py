@@ -115,6 +115,9 @@ class CuteTcgen05Config:
         # guards that store alone. Set at bind; a spec that never went
         # through bind keeps the knob off.
         self.split_k_plain_body: bool = False
+        # Split-K runs whole tiles or the flat-edge TMA path: the
+        # ``cute_flat_edge_tma`` setting, recorded at bind.
+        self.split_k_flat_edge_tma: bool = True
         # The device program runs an ``hl.atomic_*`` (``DeviceIR.has_atomic_ops``):
         # codegen refuses it beside the CtaGroup.TWO pair's shared tiles
         # (``reject_atomics_beside_warp_roles``). Set at bind.

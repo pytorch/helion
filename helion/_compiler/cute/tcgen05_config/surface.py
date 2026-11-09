@@ -525,6 +525,8 @@ def split_k_search_choices(state: CuteTcgen05Config) -> tuple[int, ...]:
         or extents is None
         or fragments is None
         or state.matmul_leading_work_multiplier != 1
+        # a batch of one: codegen splits no leading passthrough axis
+        or state.matmul_has_leading_passthrough
         or state.grouped_worklist_smem_facts is not None
         or any(value is None or value <= 0 for value in extents)
     ):
@@ -541,6 +543,17 @@ def split_k_search_choices(state: CuteTcgen05Config) -> tuple[int, ...]:
     k_tiles = -(-k // fragments[2].low)
     return tuple(
         split for split in TCGEN05_SPLIT_K_SEARCH_CHOICES if 1 < split <= k_tiles
+    )
+
+
+def split_k_tiles_supported(
+    state: CuteTcgen05Config, *, bm: int, bn: int, bk: int
+) -> bool:
+    """Whether split-K runs ``bm x bn x bk`` tiles: whole tiles, or any on
+    the flat-edge TMA path (``split_k_flat_edge_tma``, recorded at bind:
+    the partial tiles' K tails and edges store through it)."""
+    return state.split_k_flat_edge_tma or facts._static_full_tiles(
+        state, bm=bm, bn=bn, bk=bk
     )
 
 
@@ -809,15 +822,19 @@ def allow_deep_direct_entry_validation(
 def epilogue_group_search_enabled(state: CuteTcgen05Config) -> bool:
     """Whether the epilogue subtile and warp-group knobs are searched.
 
-    Both act on a heavy epilogue -- several output stores or an
-    exact-shape auxiliary read -- whose per-subtile chain a one-tile
-    per-CTA grid leaves exposed; a plain store's search keeps its
-    surface (an explicit config is validated everywhere).
+    Both act on a heavy epilogue -- several output stores, an exact-shape
+    auxiliary read or a transcendental op (whose default runs two groups,
+    ``CuteTcgen05DefaultTileHeuristic._transcendental_epilogue_values``)
+    -- whose per-subtile chain a one-tile per-CTA grid leaves exposed; a
+    plain store's search keeps its surface (an explicit config is
+    validated everywhere).
     """
     facts = state.rowvec_aux_facts
+    pipeline = state.pipeline_smem_facts
     return state.search_enabled and (
         state.exact_shape_aux_kernel_detected
         or (facts is not None and facts.output_count >= 2)
+        or (pipeline is not None and pipeline.epilogue_transcendental)
     )
 
 
@@ -1493,9 +1510,10 @@ def optional_fragments(
     if not for_search or epilogue_group_search_enabled(state):
         # The epilogue subtile width and the epilogue warp groups of the
         # role-local TMA-store epilogue: searched on kernels whose
-        # epilogue is heavy (two outputs or an exact-shape auxiliary
-        # read), validated everywhere. Plain enum fields: the coverage
-        # group ``cute.epi_warp_groups`` owns the groups coordinate.
+        # epilogue is heavy (two outputs, an exact-shape auxiliary read or
+        # a transcendental step), validated everywhere. Plain enum fields:
+        # the coverage group ``cute.epi_warp_groups`` owns the groups
+        # coordinate.
         fragments[TCGEN05_EPI_SUBTILE_N_CONFIG_KEY] = EnumFragment(
             TCGEN05_EPI_SUBTILE_N_CHOICES
         )
