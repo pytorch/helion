@@ -15,6 +15,7 @@ from .cute_mma_dag import MMA_DAG_AUX_REGISTER
 from .cute_mma_dag import MMA_DAG_CLUSTER_KEY
 from .cute_mma_dag import MMA_DAG_DERIVED_EXCHANGE
 from .cute_mma_dag import MMA_DAG_DERIVED_KEY
+from .cute_mma_dag import MMA_DAG_EARLY_TMEM_RETIREMENT_KEY
 from .cute_mma_dag import MMA_DAG_EPILOGUE_KEY
 from .cute_mma_dag import MMA_DAG_EPILOGUE_ROW
 from .cute_mma_dag import MMA_DAG_EXCHANGE_AUTO
@@ -104,6 +105,11 @@ def paged_attention_config_reason(
         sleep_waits and pass_warps != MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
     ):
         return f"{MMA_DAG_SLEEP_WAITS_KEY} requires the paired schedule and a bool"
+    early_tmem_retirement = config.get(MMA_DAG_EARLY_TMEM_RETIREMENT_KEY, False)
+    if type(early_tmem_retirement) is not bool or (
+        early_tmem_retirement and pass_warps != MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
+    ):
+        return f"{MMA_DAG_EARLY_TMEM_RETIREMENT_KEY} requires the paired schedule and a bool"
     query_tma = config.get(MMA_DAG_QUERY_TMA_KEY, False)
     if type(query_tma) is not bool or (
         query_tma

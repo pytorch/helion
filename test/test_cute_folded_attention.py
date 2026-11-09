@@ -20,6 +20,7 @@ from helion._compiler.cute.paged_attention_transport import (
 from helion._testing import cpu_render_target
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_folded_attention import folded_paged_attention
+from helion._testing.cute_paged_v_lag import without_retirement_seeds
 import helion.language as hl
 from helion.language import tile_ops
 from helion.language.memory_ops import load
@@ -221,6 +222,7 @@ def test_folded_attention_exposes_only_implemented_mma_seeds() -> None:
         seeds = MmaDagSeedPlanner(
             facts, bound.config_spec, occupancy_key="cute_min_blocks_per_mp"
         ).configs([])
+        seeds = without_retirement_seeds(seeds)
         assert [
             (
                 seed.get("cute_mma_dag_pass_warps"),

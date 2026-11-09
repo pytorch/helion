@@ -22,6 +22,7 @@ from .cute_paged_attention_schedule import paged_attention_args
 from .cute_paged_base2 import base2_attention_fixture
 from .cute_paged_reference import reference_attention_fixture
 import helion
+from helion._compiler.cute.cute_mma_dag import MMA_DAG_V_LAG_CHOICES
 
 if TYPE_CHECKING:
     from helion.runtime.kernel import BoundKernel
@@ -49,6 +50,25 @@ def paired_v_lag_config(lag: object) -> helion.Config:
     return config
 
 
+def without_retirement_seeds(seeds: list[helion.Config]) -> list[helion.Config]:
+    """Check the independent retirement suffix and return the prior seed prefix."""
+    count = len(MMA_DAG_V_LAG_CHOICES)
+    assert len(seeds) > count
+    prefix, suffix = seeds[:-count], seeds[-count:]
+    key = "cute_mma_dag_early_tmem_retirement"
+    assert not any(seed.get(key, False) for seed in prefix)
+    assert all(seed.get(key) is True for seed in suffix)
+    assert (
+        tuple(seed.get("cute_mma_dag_v_lag", 0) for seed in suffix)
+        == MMA_DAG_V_LAG_CHOICES
+    )
+    assert all(
+        seed.get("cute_mma_dag_probability_schedule", "serial") == "serial"
+        for seed in suffix
+    )
+    return prefix
+
+
 def check_paired_v_lag_replay(
     lag: int,
     form: str,
@@ -59,6 +79,7 @@ def check_paired_v_lag_replay(
     device: torch.device | str,
     *,
     heads: int = 2,
+    early_tmem_retirement: bool = False,
 ) -> None:
     if base2:
         kernel, args = base2_attention_fixture(form, query_len, True, device)
@@ -78,8 +99,12 @@ def check_paired_v_lag_replay(
     )
     config = paired_v_lag_config(lag)
     config.config["block_sizes"] = [helion.next_power_of_2(query_len * 8)]
+    if early_tmem_retirement:
+        config.config["cute_mma_dag_early_tmem_retirement"] = True
     source = bound.to_code(config)
     assert "paged_attention_paired_body(" in source
+    assert ("early_tmem_retirement=True" in source) == early_tmem_retirement
+    assert "probability_schedule=" not in source
     assert (f"v_lag={lag}" in source) == (lag > 0)
     assert ("base2_scores=True" in source) == base2
     assert ("reflected_dtype=" in source) == reverse

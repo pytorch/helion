@@ -21,6 +21,7 @@ from helion._compiler.cute.row_matrix_transport_codegen import row_matrix_module
 from helion._compiler.cute.row_resident import ROW_RESIDENT_KEY
 from helion._compiler.cute.row_resident import ROW_RESIDENT_MODES
 from helion._compiler.cute.row_resident import prove_row_resident
+from helion._testing.cute_codegen import check_config_compile_options
 from helion.exc import InvalidConfig
 import helion.language as hl
 
@@ -344,6 +345,8 @@ def test_typed_admission_additive_config_and_complete_source(function):
     source = bound.to_code(config)
     device = _device(source)
     assert device == row_matrix_module(found, 1)
+    if function is materialized_pair:
+        check_config_compile_options(bound, config)
     assert device.count("cute.arch.sync_threads()") == len(ROW_MATRIX_BARRIERS) == 8
     assert "block=(256, 1, 1)" in source and "(9, 1, 1)" in source
     assert (

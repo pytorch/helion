@@ -37,12 +37,70 @@ from helion._testing.cute_fragment_arena import (
 from helion._testing.cute_fragment_branch_lifetimes import branch_scans
 from helion._testing.cute_fragment_layout import _fragment_singleton_scan
 from helion._testing.cute_fragment_loop_captures import loop_tensor_bound
+from helion._testing.cute_output_addresses import generated_output_address_coverage
+from helion._testing.cute_repeated_axes import full_slice_add
+from helion._testing.cute_repeated_axes import full_slice_row_sum
+from helion._testing.cute_repeated_axes import grid_full_slice_add
 from helion._testing.tunable_fragments import load_host_function
 import helion.language as hl
 from helion.runtime.ref_mode import RefMode
 
 if TYPE_CHECKING:
     from helion._compiler.generate_ast import GenerateAST
+
+
+@pytest.mark.parametrize("size", [16, 40])
+def test_full_slice_pointwise_strided_native_values(size):
+    backing = torch.arange(
+        3 * size * (2 * size + 3), dtype=torch.float32, device=DEVICE
+    ).reshape(3, size, 2 * size + 3)
+    before = backing.clone()
+    x = backing[:, :, 1 : 2 * size + 1 : 2]
+    assert x.shape == (3, size, size) and not x.is_contiguous()
+    bound = full_slice_add.bind((x,))
+    config = bound.config_spec.default_config()
+    assert "fragment_thread" in bound.to_code(config)
+    actual = bound.compile_config(config)(x)
+    torch.testing.assert_close(actual, x + 1.0, rtol=0, atol=0)
+    assert torch.equal(backing, before)
+
+
+@pytest.mark.parametrize("size", [16, 40])
+def test_repeated_axis_row_sum_dynamic_strided_native_values(size):
+    backing = (torch.arange(3 * size * (2 * size + 3), device=DEVICE) % 97 - 48).to(
+        torch.float32
+    ).reshape(3, size, 2 * size + 3) * 0.25
+    x = backing[:, :, 1 : 2 * size + 1 : 2]
+    bound = full_slice_row_sum.bind((x,))
+    assert "input_tensor_metadata" in bound.env.compiler_fact_specialization_facts
+    config = bound.config_spec.default_config()
+    assert "fragment_thread" in bound.to_code(config)
+    compiled = bound.compile_config(config)
+    for increment in (0.0, 0.375):
+        backing.add_(increment)
+        before = backing.clone()
+        actual = compiled(x)
+        torch.testing.assert_close(actual, (x * 2.0).sum(-1), rtol=0, atol=0)
+        assert torch.equal(backing, before)
+
+
+@pytest.mark.parametrize(
+    "threads,register_loads", [(64, False), (256, False), (128, True)]
+)
+def test_grid_full_slice_pointwise_config_native_values(threads, register_loads):
+    backing = torch.arange(3 * 16 * 35, device=DEVICE, dtype=torch.float32).reshape(
+        3, 16, 35
+    )
+    before = backing.clone()
+    x = backing[:, :, 1:33:2]
+    bound = grid_full_slice_add.bind((x,))
+    config = bound.config_spec.default_config()
+    config.config.update(
+        cute_fragment_threads=threads, cute_fragment_register_loads=register_loads
+    )
+    actual = bound.compile_config(config)(x)
+    torch.testing.assert_close(actual, x + 1.0, rtol=0, atol=0)
+    assert torch.equal(backing, before)
 
 
 @helion.kernel(backend="cute", autotune_effort="none")
@@ -880,114 +938,6 @@ def test_fragment_dynamic_capacity_replay(kind):
         torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
-def _generated_output_address_coverage(
-    source: str, output_name: str, blocks: int, threads: int
-):
-    tree = ast.parse(source)
-    function = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name.startswith("_helion_")
-    )
-    assignments = {
-        node.targets[0].id: node.value
-        for node in ast.walk(
-            ast.Module(
-                body=[n for n in tree.body if isinstance(n, ast.Assign)]
-                + function.body,
-                type_ignores=[],
-            )
-        )
-        if isinstance(node, ast.Assign)
-        and len(node.targets) == 1
-        and isinstance(node.targets[0], ast.Name)
-    }
-    stores = []
-
-    def visit(node, loops=(), guards=()):
-        if isinstance(node, ast.For):
-            for child in node.body:
-                visit(child, (*loops, node), guards)
-            return
-        if isinstance(node, ast.If):
-            for child in node.body:
-                visit(child, loops, (*guards, node.test))
-            for child in node.orelse:
-                visit(
-                    child,
-                    loops,
-                    (*guards, ast.UnaryOp(op=ast.Not(), operand=node.test)),
-                )
-            return
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "store"
-            and any(
-                isinstance(n, ast.Name) and n.id == output_name
-                for n in ast.walk(node.func.value)
-            )
-        ):
-            stores.append((node.func.value, loops, guards))
-        for child in ast.iter_child_nodes(node):
-            visit(child, loops, guards)
-
-    visit(function)
-    assert len(stores) == 1
-    pointer, loops, guards = stores[0]
-    assert len(loops) == 1
-    loop = loops[0]
-    assert isinstance(loop.target, ast.Name)
-    result = Counter()
-    for block in range(blocks):
-        for thread in range(threads):
-            env = {
-                "cutlass": SimpleNamespace(
-                    Int32=int, Int64=int, Uint32=int, Uint64=int
-                ),
-                "cute": SimpleNamespace(
-                    arch=SimpleNamespace(
-                        thread_idx=lambda thread=thread: (thread, 0, 0),
-                        block_idx=lambda block=block: (block, 0, 0),
-                    )
-                ),
-                "range": range,
-                output_name: SimpleNamespace(
-                    iterator=0, layout=SimpleNamespace(stride=(1,))
-                ),
-            }
-
-            def value(expression, env=env):
-                for node in ast.walk(expression):
-                    if (
-                        isinstance(node, ast.Name)
-                        and isinstance(node.ctx, ast.Load)
-                        and node.id not in env
-                    ):
-                        assert node.id in assignments, node.id
-                        env[node.id] = value(assignments[node.id])
-                return eval(
-                    compile(
-                        ast.fix_missing_locations(ast.Expression(expression)),
-                        "<generated-address>",
-                        "eval",
-                    ),
-                    {"__builtins__": {}},
-                    env,
-                )
-
-            iterations = value(loop.iter)
-            for position in iterations:
-                # Local scalar assignments must be re-evaluated at every loop
-                # iteration; retain only the external primitive environment.
-                for name in assignments:
-                    env.pop(name, None)
-                env[loop.target.id] = position
-                if all(value(guard) for guard in guards):
-                    result[int(value(pointer))] += 1
-    return dict(sorted(result.items()))
-
-
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def _fragment_grid_origin_scan(x: torch.Tensor, begin: hl.constexpr):
     out = torch.full((x.size(0),), -1, dtype=torch.int64, device=x.device)
@@ -1016,7 +966,7 @@ def test_fragment_grid_origins_cover_each_output_once(block_rows, begin, mode):
         config.config["block_sizes"][0] = block_rows
         config.config["cute_fragment_scan"] = mode
         source = bound.to_code(config)
-    counts = _generated_output_address_coverage(
+    counts = generated_output_address_coverage(
         source, "out", (37 - begin + block_rows - 1) // block_rows, 128
     )
     assert counts == dict.fromkeys(range(begin, 37), 1)
@@ -3087,7 +3037,7 @@ def test_free_iota_reduction_complete_producer_values(chunk, reduction, kind):
     _simulate_independent_fragment(source, {"x": x}, {"out": actual}, actual.numel())
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     torch.testing.assert_close(x, before, rtol=0, atol=0)
-    coverage = _generated_output_address_coverage(source, "out", actual.numel(), 128)
+    coverage = generated_output_address_coverage(source, "out", actual.numel(), 128)
     assert coverage == dict.fromkeys(range(actual.numel()), 1)
 
 

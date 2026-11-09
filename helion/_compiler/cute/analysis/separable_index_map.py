@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import operator
 from typing import TYPE_CHECKING
+from typing import Protocol
 from typing import cast
 
 import sympy
@@ -30,10 +31,30 @@ from ..cute_mma_dag import _NotMine
 from ..fx_matcher import _is_call
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from torch.fx import Node
 
     from ..cute_mma_dag import Axis
-    from ..cute_mma_dag import _Matcher
+
+
+class IndexMapContext(Protocol):
+    """Coordinate facts supplied by a separately proved complete root owner.
+
+    This interface does not admit a root or relax the index grammar. The
+    original MMA matcher and structured owners must provide the same exact
+    capture, logical-axis and bounded uniform-coordinate facts.
+    """
+
+    def resolve(self, node: Node, /) -> Node: ...
+
+    def shape_axes(self, node: Node) -> tuple[Axis | None, ...]: ...
+
+    def lead_coordinate(self, origin: object) -> bool: ...
+
+    def axis_of_block(self, block_id: int) -> Axis: ...
+
+    def uniform_expr(self, node: Node, /) -> tuple[sympy.Expr, tuple[int, ...]]: ...
 
 
 @dataclasses.dataclass(frozen=True)
@@ -77,7 +98,7 @@ class _UnsupportedIndexMap(Exception):
 
 
 class _IndexMapProof:
-    def __init__(self, matcher: _Matcher) -> None:
+    def __init__(self, matcher: IndexMapContext) -> None:
         self.matcher = matcher
         self.noncanonical = (
             HostFunction.current().device_ir.noncanonical_task_origin_block_ids
@@ -259,7 +280,7 @@ class _IndexMapProof:
 
 
 def prove_separable_index_map(
-    matcher: _Matcher, node: Node, storage_extent: int
+    matcher: IndexMapContext, node: Node, storage_extent: int
 ) -> SeparableIndexMap | None:
     """Prove a rank-one or rank-two integer recipe over root/iota axes."""
     fake = node.meta.get("val")
@@ -304,5 +325,90 @@ def prove_separable_index_map(
         if bounds.lower < 0 or bounds.upper >= storage_extent:
             return None
         return SeparableIndexMap(base, mapped, expression, fake.dtype)
+    except (_UnsupportedIndexMap, _NotMine):
+        return None
+
+
+def prove_strided_index_map(
+    matcher: IndexMapContext,
+    indices: Sequence[object],
+    sizes: Sequence[int],
+    strides: Sequence[int],
+    logical_shape: Sequence[int],
+) -> SeparableIndexMap | None:
+    """Compose checked logical indices with positive physical tensor strides.
+
+    Each original index operation retains its integer-width proof. Dimensions
+    are checked separately before physical composition, so an out-of-range
+    index cannot borrow space from an adjacent dimension. Broadcast axes must
+    have identical producer provenance, not merely the same extent.
+    """
+    if (
+        len(indices) != len(sizes)
+        or len(sizes) != len(strides)
+        or not sizes
+        or len(logical_shape) not in (1, 2)
+        or any(type(n) is not int or n <= 0 for n in (*sizes, *strides, *logical_shape))
+    ):
+        return None
+    proof = _IndexMapProof(matcher)
+    axes: list[Axis | None] = [None] * len(logical_shape)
+    expression = sympy.Integer(0)
+    try:
+        for index, size, stride in zip(indices, sizes, strides, strict=True):
+            part = proof.expression(index)
+            bounds = proof.bounds(part)
+            if bounds.lower < 0 or bounds.upper >= size:
+                return None
+            if isinstance(index, torch.fx.Node):
+                fake = matcher.resolve(index).meta.get("val")
+                if isinstance(fake, torch.Tensor):
+                    current = matcher.shape_axes(index)
+                    if len(current) > len(axes):
+                        return None
+                    aligned = (None,) * (len(axes) - len(current)) + current
+                    for position, axis in enumerate(aligned):
+                        if axis is None:
+                            continue
+                        if axis.extent != logical_shape[position] or axes[
+                            position
+                        ] not in (None, axis):
+                            return None
+                        axes[position] = axis
+            expression = sympy.Add(expression, sympy.Mul(stride, part))
+        if any(axis is None or axis not in proof.symbols for axis in axes):
+            return None
+        complete = tuple(axis for axis in axes if axis is not None)
+        if len(set(complete)) != len(complete):
+            return None
+        expression = sympy.expand(expression)
+        symbols = {proof.symbols[axis]: 0 for axis in complete}
+        base = expression.xreplace(symbols)
+        mapped = tuple(
+            proof.folded_axis(
+                axis,
+                expression.xreplace(
+                    {symbol: 0 for symbol in symbols if symbol != proof.symbols[axis]}
+                )
+                - base,
+            )
+            for axis in complete
+        )
+        if (
+            sympy.expand(
+                sympy.Add(
+                    base,
+                    *(part.expression for part in mapped),
+                    sympy.Mul(-1, expression),
+                )
+            )
+            != 0
+        ):
+            return None
+        # Conservatively bound the composed element offset to int32,
+        # independently of every original index calculation's width.
+        if proof.bounds(expression).upper > torch.iinfo(torch.int32).max:
+            return None
+        return SeparableIndexMap(base, mapped, expression, torch.int64)
     except (_UnsupportedIndexMap, _NotMine):
         return None

@@ -2,10 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
-import inspect
 import itertools
-from typing import TYPE_CHECKING
-from typing import cast
 import unittest
 from unittest.mock import patch
 
@@ -28,9 +25,6 @@ _fixed_token_rank1_recurrence = importlib.import_module(
 )
 _MAX_TOKENS = _fixed_token_rank1_recurrence._MAX_TOKENS
 _MIN_TOKENS = _fixed_token_rank1_recurrence._MIN_TOKENS
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
 
 
 def _config(
@@ -118,7 +112,7 @@ class TestCuteFixedTokenRank1Recurrence(unittest.TestCase):
         self.assertIn("for fixed_rank1_token in cutlass.range_constexpr(3)", code)
         self.assertIn("cute.arch.sync_threads()", code)
         self.assertIn("block=(64, 1, 1)", code)
-        self.assertIn("_helion_cute_preferred_smem_carveout = 25", code)
+        self.assertNotIn("_helion_cute_preferred_smem_carveout", code)
         self.assertIn("alignment=16", code)
         self.assertIn(
             "fixed_rank1_value_head = cutlass.Int32(cute.arch.block_idx()[0])",
@@ -213,15 +207,6 @@ class TestCuteFixedTokenRank1Recurrence(unittest.TestCase):
             "fixed_rank1_sequence = cutlass.Int32(cute.arch.block_idx()[1])",
             code,
         )
-
-    def test_runtime_wrapper_applies_preferred_smem_carveout(self) -> None:
-        from helion.runtime.cute import launcher
-
-        cute_kernel = type("DummyCuteKernel", (), {})()
-        cute_kernel._helion_cute_preferred_smem_carveout = 25
-        wrapper = launcher._create_cute_wrapper(cute_kernel, (), (128, 1, 1))
-        source = inspect.getsource(cast("Callable[..., object]", wrapper))
-        self.assertIn("preferred_smem_carveout=25", source)
 
     def test_negative_state_slots_use_predicated_unsigned_bounds(self) -> None:
         code = self._code()

@@ -91,8 +91,19 @@ def paged_attention_partial_body(
     output_scale_log2: cutlass.Constexpr = 0,
     tma_load_hints: cutlass.Constexpr = ("", "", "", ""),
     value_positive_zero: cutlass.Constexpr = False,
+    rowwise_rescale_threshold: cutlass.Constexpr = None,
+    headwide_rescale: cutlass.Constexpr = False,
 ) -> None:
+    assert cutlass.const_expr(rowwise_rescale_threshold is None or reference_scores)
     assert cutlass.const_expr(not base2_scores or reference_scores)
+    assert cutlass.const_expr(
+        not headwide_rescale
+        or (
+            rowwise_rescale_threshold is not None
+            and reference_scores
+            and query_rows == query_columns
+        )
+    )
     thread = cute.arch.thread_idx()[0]
     warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     lane = thread % 32
@@ -225,6 +236,8 @@ def paged_attention_partial_body(
                     coordinate_dtype,
                     query_columns,
                     base2_scores,
+                    rowwise_rescale_threshold=rowwise_rescale_threshold,
+                    headwide_rescale=headwide_rescale,
                 )
             else:
                 maximum_changed = online_softmax_per_key(

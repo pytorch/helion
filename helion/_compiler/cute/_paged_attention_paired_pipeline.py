@@ -7,6 +7,8 @@ Physical warp modulo four selects the TMEM row quarter, so all eight converter
 warps keep their full groups. Named barriers 1/2 and 3/4 belong to the separate
 compute groups. Register quotas stay inside disjoint role branches: 144 for
 compute, 72 for conversion and 48 for all four control warps (61,440 total).
+Optional barrier 5 retires the allocation before output stores: both 128-thread
+compute groups arrive after their final reads and the 32-thread QK role frees it.
 """
 
 from __future__ import annotations
@@ -96,6 +98,9 @@ def _compute_head(
     coefficients_capped: cutlass.Constexpr,
     probability_schedule: cutlass.Constexpr,
     output_offset: cutlass.Constexpr,
+    rowwise_rescale_threshold: cutlass.Constexpr,
+    early_tmem_retirement: cutlass.Constexpr,
+    headwide_rescale: cutlass.Constexpr,
 ) -> None:
     cute.arch.setmaxregister_increase(144)
     thread = cute.arch.thread_idx()[0] % 128
@@ -157,6 +162,8 @@ def _compute_head(
                 previous_phase=(step - 1) & 1,
                 have_previous=step > 0,
                 previous_sleep=sleep_waits,
+                rowwise_rescale_threshold=rowwise_rescale_threshold,
+                headwide_rescale=headwide_rescale,
             )
         else:
             # Only reference-score publication opts out here. Keep the per-key
@@ -237,6 +244,11 @@ def _compute_head(
     cute.arch.barrier(barrier_id=1 + pair_head * 2, number_of_threads=128)
     result = load_query_panel(output_address, query_columns)
     prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+    if cutlass.const_expr(early_tmem_retirement):
+        # Both heads finish their last PV and O reads before either slab is
+        # freed. Output math/stores use only the retained register copy.
+        prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+        prims.barrier_cta_arrive(5, thread_count=288)
     # All global stores of this audited schedule are below this point. Even an
     # empty attention interval reaches it. Other roles only read global memory.
     if capture_pdl_wait_mode != 0:
@@ -489,7 +501,11 @@ def paged_attention_paired_body(
     value_positive_zero: cutlass.Constexpr = False,
     value_metadata_scales: cute.Tensor | None = None,
     value_metadata_read_overlap: cutlass.Constexpr = False,
+    rowwise_rescale_threshold: cutlass.Constexpr = None,
+    early_tmem_retirement: cutlass.Constexpr = False,
+    headwide_rescale: cutlass.Constexpr = False,
 ) -> None:
+    assert cutlass.const_expr(rowwise_rescale_threshold is None or reference_scores)
     assert cutlass.const_expr(v_lag in (0, 1, 2, 3))
     assert cutlass.const_expr(query_columns in (8, 32, 40))
     assert cutlass.const_expr(
@@ -514,6 +530,14 @@ def paged_attention_paired_body(
     else:
         assert cutlass.const_expr(not coefficients_capped)
         assert cutlass.const_expr(not base2_scores or reference_scores)
+    assert cutlass.const_expr(
+        not headwide_rescale
+        or (
+            rowwise_rescale_threshold is not None
+            and reference_scores
+            and query_rows == query_columns
+        )
+    )
     assert cutlass.const_expr(probability_schedule in ("serial", "early", "early_tmem"))
     assert cutlass.const_expr(probability_schedule == "serial" or reference_scores)
     # The early_tmem layout packs S/O/L after K[0:64], V[64:128], fitting each
@@ -710,6 +734,9 @@ def paged_attention_paired_body(
             coefficients_capped,
             probability_schedule,
             output_offset,
+            rowwise_rescale_threshold,
+            early_tmem_retirement,
+            headwide_rescale,
         )
     elif warp < 12:
         cute.arch.setmaxregister_decrease(72)
@@ -808,6 +835,17 @@ def paged_attention_paired_body(
                         prims.tcgen05_commit(
                             key_free + head, group=prims.CTAGroup.CTA_1
                         )
+            if cutlass.const_expr(early_tmem_retirement):
+                # One allocation-wide phase: two compute groups plus this warp.
+                # Keep zero-page tiles and the full final CTA join unchanged.
+                prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+                prims.barrier_cta_sync(5, thread_count=288)
+                prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+                prims.tcgen05_dealloc(
+                    cutlass.inttoptr(base, 6, cutlass.Int32),
+                    512,
+                    group=prims.CTAGroup.CTA_1,
+                )
         elif warp == 17:
             if lane == 0:
                 if cutlass.const_expr(v_lag == 0):
@@ -976,8 +1014,11 @@ def paged_attention_paired_body(
                             read_overlap=value_metadata_read_overlap,
                         )
     cute.arch.barrier()
-    if warp == 16:
-        prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-        prims.tcgen05_dealloc(
-            cutlass.inttoptr(base, 6, cutlass.Int32), 512, group=prims.CTAGroup.CTA_1
-        )
+    if cutlass.const_expr(not early_tmem_retirement):
+        if warp == 16:
+            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+            prims.tcgen05_dealloc(
+                cutlass.inttoptr(base, 6, cutlass.Int32),
+                512,
+                group=prims.CTAGroup.CTA_1,
+            )

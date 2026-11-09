@@ -29,6 +29,7 @@ def check_probability_schedule_replay(
     device: torch.device | str,
     *,
     capture_overlap: bool = False,
+    early_tmem_retirement: bool = False,
 ) -> None:
     fixture = base2_attention_fixture if base2 else reference_attention_fixture
     kernel, initial = fixture(form, query_len, return_lse, device)
@@ -51,9 +52,12 @@ def check_probability_schedule_replay(
             cute_pdl=True,
             cute_pdl_capture_overlap=True,
         )
+    if early_tmem_retirement:
+        config.config["cute_mma_dag_early_tmem_retirement"] = True
     source = bound.to_code(config)
     assert "paged_attention_paired_body(" in source
     assert f"probability_schedule={schedule!r}" in source
+    assert ("early_tmem_retirement=True" in source) == early_tmem_retirement
     if capture_overlap:
         assert "query_map=" in source
         assert "capture_pdl_wait_mode=capture_pdl_wait_mode" in source

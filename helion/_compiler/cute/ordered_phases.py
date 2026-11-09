@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING
 import torch
 
 from ... import exc
-from ...autotuner import config_fragment
 from ...autotuner.config_fragment import ConfigSpecFragment
 from ...language import _tracing_ops
 from ...language.constexpr import specialize
@@ -34,6 +33,7 @@ from ..type_info import TypeInfo
 from .materialized_fission import MaterializedFissionPlan
 from .materialized_fission import _shape_only
 from .materialized_fission_codegen import generate_materialized_fission
+from .promote_output_axis import _PURE_FRAGMENT_CONSTRUCTORS
 from .promote_output_axis import _fresh_tensors
 from .promote_output_axis import _integer_metadata_call
 from .promote_output_axis import _pure_scalar_call
@@ -82,15 +82,6 @@ def _pure_metadata_type(info: TypeInfo | None, *, allow_fragment: bool = False) 
         torch.dtype,
         torch.device,
     )
-
-
-_PURE_FRAGMENT_CONSTRUCTORS = tuple(
-    value
-    for value in vars(config_fragment).values()
-    if isinstance(value, type)
-    and issubclass(value, ConfigSpecFragment)
-    and value.__module__ == config_fragment.__name__
-)
 
 
 def _pure_fragment_binding(node: ExtendedAST) -> bool:

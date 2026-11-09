@@ -141,6 +141,7 @@ def _reference_values(
     coordinate_dtype: cutlass.Constexpr,
     query_columns: cutlass.Constexpr,
     apply_mask: cutlass.Constexpr,
+    rowwise_rescale_threshold: cutlass.Constexpr = None,
 ) -> cutlass.Boolean:
     """Center scores and vote without per-element masking on proved interior tiles."""
     local_maxima = cute.make_rmem_tensor((4,), cutlass.Float32)
@@ -183,6 +184,14 @@ def _reference_values(
     maximum01 = cute.arch.fmax(local_maxima[0], local_maxima[1], nan=True)
     maximum23 = cute.arch.fmax(local_maxima[2], local_maxima[3], nan=True)
     local_maximum = cute.arch.fmax(maximum01, maximum23, nan=True)
+    if cutlass.const_expr(rowwise_rescale_threshold is not None):
+        # The source retains each old maximum when all row predicates are false.
+        # Its reference then equals old, so shift=0 and alpha=1 even for 0 < x <= T.
+        return (
+            maximum_invalid
+            | (local_maximum > cutlass.Float32(rowwise_rescale_threshold))
+            | (local_maximum != local_maximum)
+        )
     # A false vote proves reference == old maximum >= 0 and every
     # visible x <= 0. Therefore shift == 0 and alpha == 1 exactly.
     return maximum_invalid | (local_maximum > 0) | (local_maximum != local_maximum)
@@ -218,6 +227,8 @@ def online_softmax_reference(
     previous_phase: cutlass.Int32 | cutlass.Int64 = cutlass.Int32(0),  # noqa: B008
     have_previous: cutlass.Boolean = cutlass.Boolean(False),  # noqa: B008
     previous_sleep: cutlass.Constexpr = False,
+    rowwise_rescale_threshold: cutlass.Constexpr = None,
+    headwide_rescale: cutlass.Constexpr = False,
 ) -> tuple[cutlass.Boolean, cutlass.Boolean]:
     """Consume the separately proved reference-score recurrence.
 
@@ -280,6 +291,7 @@ def online_softmax_reference(
             coordinate_dtype,
             query_columns,
             apply_mask=False,
+            rowwise_rescale_threshold=rowwise_rescale_threshold,
         )
     else:
         if cutlass.const_expr(convergent_branches):
@@ -300,6 +312,7 @@ def online_softmax_reference(
             coordinate_dtype,
             query_columns,
             apply_mask=True,
+            rowwise_rescale_threshold=rowwise_rescale_threshold,
         )
     maximum_changed = prims.barrier_cta_red(
         needs_update, barrier_id, "or", thread_count=128
@@ -320,6 +333,17 @@ def online_softmax_reference(
                     delta, cutlass.Float32(scratch[w, thread]), nan=True
                 )
             maximum = cute.arch.fmax(previous, delta + reference, nan=True)
+            if cutlass.const_expr(
+                rowwise_rescale_threshold is not None and not headwide_rescale
+            ):
+                # A true head vote does not imply that this row requested rescaling.
+                row_rescale = (
+                    (delta > cutlass.Float32(rowwise_rescale_threshold))
+                    | (not ((previous >= 0) & (previous < float("inf"))))
+                    | (delta != delta)
+                )
+                if not row_rescale:
+                    maximum = previous
             safe_maximum = maximum
             if maximum == float("-inf"):
                 safe_maximum = cutlass.Float32(0.0)

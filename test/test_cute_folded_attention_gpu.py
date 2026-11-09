@@ -16,10 +16,22 @@ from helion._testing.cute_optional_lse import initialize_paged_attention_inputs
 
 @skipIfNotCUDA()
 @pytest.mark.parametrize(
-    "query_len,fast_math,min_blocks", [(1, False, 1), (4, False, 1), (5, True, 2)]
+    "query_len,fast_math,min_blocks,paired_retirement",
+    [
+        (1, False, 1, False),
+        (4, False, 1, False),
+        (5, True, 2, False),
+        (4, False, 1, True),
+    ],
 )
-def test_folded_attention_layout_and_replay(query_len, fast_math, min_blocks):
-    """Three representative roots replay empty, changed and nonfinite inputs."""
+def test_folded_attention_layout_and_replay(
+    query_len, fast_math, min_blocks, paired_retirement
+):
+    """Replay ordinary roots and a paired serial folded-output retirement.
+
+    The fourth case covers the seeded non-reference paired body with folded
+    output addressing; all cases replay empty/changed/nonfinite inputs.
+    """
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("the attention transport uses SM100 tensor memory")
     args = folded_attention_args(query_len, device=DEVICE)
@@ -37,15 +49,23 @@ def test_folded_attention_layout_and_replay(query_len, fast_math, min_blocks):
         cute_mma_dag="tcgen05",
         cute_mma_dag_warps=4,
         cute_mma_dag_stages=2,
-        cute_mma_dag_pass_warps="attention",
+        cute_mma_dag_pass_warps="attention_paired"
+        if paired_retirement
+        else "attention",
         cute_min_blocks_per_mp=min_blocks,
         cute_pdl=False,
+        cute_mma_dag_early_tmem_retirement=paired_retirement,
     )
     with bound.env:
         config = bound.config_spec.normalized_config(config)
     source = bound.to_code(config)
     assert source.count("@cute.kernel") == 1
     assert "io_layouts=" in source
+    assert ("early_tmem_retirement=True" in source) == paired_retirement
+    if paired_retirement:
+        assert "paged_attention_paired_body(" in source
+        assert "maximum_output=" not in source
+        assert "probability_schedule=" not in source
     compiled = bound.compile_config(config)
     compiled(*args)
     graph = torch.cuda.CUDAGraph()

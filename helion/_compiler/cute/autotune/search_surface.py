@@ -45,6 +45,7 @@ from ..cute_flash_bwd_row_mma import flash_bwd_row_search_grid
 from ..cute_mma_dag import MMA_DAG_AUX_KEY
 from ..cute_mma_dag import MMA_DAG_CLUSTER_KEY
 from ..cute_mma_dag import MMA_DAG_DERIVED_KEY
+from ..cute_mma_dag import MMA_DAG_EARLY_TMEM_RETIREMENT_KEY
 from ..cute_mma_dag import MMA_DAG_EPILOGUE_KEY
 from ..cute_mma_dag import MMA_DAG_EXCHANGE_KEY
 from ..cute_mma_dag import MMA_DAG_KEY
@@ -146,6 +147,8 @@ from .config_keys import CUTE_AFFINE_SCAN_SCHEDULE_KEY
 from .config_keys import CUTE_CHUNK_PREPARE_SCHEDULE_KEY
 from .config_keys import CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY
 from .config_keys import CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY
+from .config_keys import CUTE_COMPILER_PIPELINE_CHOICES
+from .config_keys import CUTE_COMPILER_PIPELINE_KEY
 from .config_keys import CUTE_CONFIG_KEYS
 from .config_keys import CUTE_DEBUG_KEYS
 from .config_keys import CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY
@@ -246,6 +249,9 @@ _CUTE_MXFP8_ROOT_LOWERING_KEYS = frozenset(
         "epilogue_subtile",
     }
 )
+
+
+_COMPILER_PIPELINE_FRAGMENT = EnumFragment(choices=CUTE_COMPILER_PIPELINE_CHOICES)
 
 
 def _fragment_threads(config: Mapping[str, object]) -> int:
@@ -1989,6 +1995,13 @@ def normalize_entry(
     config_spec: ConfigSpec, config: dict[str, object], *, fix_invalid: bool
 ) -> None:
     _normalize_cute_mxfp8_root_lowering(config_spec, config)
+    if CUTE_COMPILER_PIPELINE_KEY in config:
+        _normalize_enum_fragment(
+            config,
+            CUTE_COMPILER_PIPELINE_KEY,
+            _COMPILER_PIPELINE_FRAGMENT,
+            fix_invalid=fix_invalid,
+        )
 
     if config.get("cute_fragment_producer_cache") is True and (
         config.get("cute_fragment_register_loads") is True
@@ -3587,6 +3600,9 @@ def cute_flat_fields(
         sleep_fragment = config_spec.cute_mma_dag_sleep_waits
         if sleep_fragment is not None:
             fields[MMA_DAG_SLEEP_WAITS_KEY] = sleep_fragment
+        retirement_fragment = config_spec.cute_mma_dag_early_tmem_retirement
+        if retirement_fragment is not None:
+            fields[MMA_DAG_EARLY_TMEM_RETIREMENT_KEY] = retirement_fragment
         query_fragment = config_spec.cute_mma_dag_query_tma
         if query_fragment is not None:
             fields[MMA_DAG_QUERY_TMA_KEY] = query_fragment
@@ -3703,12 +3719,15 @@ def cute_flat_fields(
             (key, EnumFragment(choices=choices))
             for key, choices in RADIX_PIPELINE_CHOICES.items()
         )
+    fields[CUTE_COMPILER_PIPELINE_KEY] = _COMPILER_PIPELINE_FRAGMENT
     return fields
 
 
 def flatten_missing_field_default(
     config_spec: ConfigSpec, key: str, config: dict[str, object]
 ) -> tuple[bool, object]:
+    if key == CUTE_COMPILER_PIPELINE_KEY:
+        return True, CUTE_COMPILER_PIPELINE_CHOICES[0]
     if key == RADIX_ALGORITHM_KEY:
         return True, "legacy"
     if key == RADIX_HISTOGRAM_KEY:

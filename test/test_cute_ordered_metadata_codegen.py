@@ -15,6 +15,7 @@ from helion._testing.cute_codegen import cpu_target
 from helion._testing.cute_codegen import load_generated_module
 from helion._testing.cute_codegen import stage_sources
 from helion._testing.cute_ordered_metadata import computed_metadata_phases
+from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import PowerOfTwoFragment
 import helion.language as hl
 
@@ -227,6 +228,177 @@ def _bound_registered_metadata_phases(x: torch.Tensor) -> torch.Tensor:
     for i in hl.tile(n):
         output[i] = temporary[i] * 2
     return output
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _computed_enum_metadata_phases(x: torch.Tensor) -> torch.Tensor:
+    n = x.numel()
+    parts = hl.register_tunable("parts", EnumFragment((min(n, 4), min(n, 8))))
+    temporary = torch.empty_like(x)
+    output = torch.empty_like(x)
+    for i in hl.tile(n):
+        temporary[i] = x[i] + parts
+    hl.barrier()
+    for i in hl.tile(n):
+        output[i] = temporary[i] * parts
+    return output
+
+
+def test_computed_enum_metadata_is_shared_by_ordered_stages():
+    with cpu_target():
+        bound = cpu_bind(_computed_enum_metadata_phases, (torch.ones(16),))
+        assert bound.config_spec.user_defined_tunables["parts"].choices == (4, 8)
+        sources = []
+        for parts in (4, 8):
+            config = dict(bound.config_spec.default_config()) | {
+                "pid_type": "flat",
+                "parts": parts,
+            }
+            stages = stage_sources(bound.to_code(helion.Config.from_dict(config)))
+            assert len(stages) == 2
+            assert all(f"parts = {parts}" in stage for stage in stages)
+            sources.append(stages)
+        assert all(a != b for a, b in zip(*sources, strict=True))
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _list_and_nested_enum_metadata_phases(x: torch.Tensor) -> torch.Tensor:
+    n = x.numel()
+    # Nested/string choices are valid fragment metadata, but register_tunable
+    # requires a numeric default. Keep this fragment in the host prelude.
+    _nested = EnumFragment(((min(n, 4), "short"), [min(n, 8), "long"]))
+    parts = hl.register_tunable("parts", EnumFragment([min(n, 4), min(n, 8)]))
+    temporary = torch.empty_like(x)
+    output = torch.empty_like(x)
+    for i in hl.tile(n):
+        temporary[i] = x[i] + parts
+    hl.barrier()
+    for i in hl.tile(n):
+        output[i] = temporary[i] * parts
+    return output
+
+
+def test_exact_list_and_nested_enum_metadata_remain_supported():
+    with cpu_target():
+        bound = cpu_bind(_list_and_nested_enum_metadata_phases, (torch.ones(16),))
+        assert bound.config_spec.user_defined_tunables["parts"].choices == [4, 8]
+        sources = []
+        for parts in (4, 8):
+            config = dict(bound.config_spec.default_config()) | {
+                "pid_type": "flat",
+                "parts": parts,
+            }
+            source = bound.to_code(helion.Config.from_dict(config))
+            stages = stage_sources(source)
+            assert len(stages) == 2
+            assert all(f"parts = {parts}" in stage for stage in stages)
+            assert "_nested = EnumFragment" in source
+            assert "'short'" in source and "'long'" in source
+            sources.append(stages)
+        assert all(a != b for a, b in zip(*sources, strict=True))
+
+
+def _opaque_enum_choices(n):
+    _HOST_EFFECTS.append("opaque enum choices")
+    return (min(n, 4), min(n, 8))
+
+
+class _EffectfulTupleChoices(tuple):
+    __slots__ = ()
+
+    def __iter__(self):
+        _HOST_EFFECTS.append("tuple enum choices")
+        return super().__iter__()
+
+
+class _EffectfulListChoices(list):
+    def __iter__(self):
+        _HOST_EFFECTS.append("list enum choices")
+        return super().__iter__()
+
+
+_tuple_enum_choices = _EffectfulTupleChoices((4, 8))
+_list_enum_choices = _EffectfulListChoices([4, 8])
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _opaque_enum_metadata_phases(x: torch.Tensor) -> torch.Tensor:
+    n = x.numel()
+    parts = hl.register_tunable("parts", EnumFragment(_opaque_enum_choices(n)))
+    temporary = torch.empty_like(x)
+    output = torch.empty_like(x)
+    for i in hl.tile(n):
+        temporary[i] = x[i] + parts
+    hl.barrier()
+    for i in hl.tile(n):
+        output[i] = temporary[i] * parts
+    return output
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _tuple_enum_metadata_phases(x: torch.Tensor) -> torch.Tensor:
+    _fragment = EnumFragment(_tuple_enum_choices)
+    temporary = torch.empty_like(x)
+    output = torch.empty_like(x)
+    for i in hl.tile(x.numel()):
+        temporary[i] = x[i] + 2
+    hl.barrier()
+    for i in hl.tile(x.numel()):
+        output[i] = temporary[i] * 2
+    return output
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _list_enum_metadata_phases(x: torch.Tensor) -> torch.Tensor:
+    _fragment = EnumFragment(_list_enum_choices)
+    temporary = torch.empty_like(x)
+    output = torch.empty_like(x)
+    for i in hl.tile(x.numel()):
+        temporary[i] = x[i] + 2
+    hl.barrier()
+    for i in hl.tile(x.numel()):
+        output[i] = temporary[i] * 2
+    return output
+
+
+@pytest.mark.parametrize(
+    "kernel,effect",
+    [
+        (_opaque_enum_metadata_phases, "opaque enum choices"),
+        (_tuple_enum_metadata_phases, "tuple enum choices"),
+        (_list_enum_metadata_phases, "list enum choices"),
+    ],
+)
+def test_opaque_and_custom_enum_sequences_are_not_replayed(kernel, effect, tmp_path):
+    with cpu_target():
+        initial_calls = _HOST_EFFECTS.count(effect)
+        bound = cpu_bind(kernel, (torch.ones(16),))
+        assert _HOST_EFFECTS.count(effect) > initial_calls
+        config = dict(bound.config_spec.default_config()) | {"pid_type": "flat"}
+        effects = list(_HOST_EFFECTS)
+        if kernel is _opaque_enum_metadata_phases:
+            with pytest.raises(helion.exc.BackendUnsupported, match="shape-only|pure"):
+                bound.to_code(helion.Config.from_dict(config))
+        else:
+            # Binding iterates the custom source. The exact EnumFragment
+            # constructor only stores it; execute every emitted host to prove
+            # that accepting this prelude does not replay the custom protocol.
+            source = bound.to_code(helion.Config.from_dict(config))
+            path = tmp_path / "custom_sequence_generated.py"
+            path.write_text(source)
+            module = load_generated_module(path)
+            assert module._source_module._HOST_EFFECTS is _HOST_EFFECTS
+            calls = []
+
+            def launch(*args, **kwargs):
+                calls.append((args, kwargs))
+
+            output = getattr(module, kernel.fn.__name__)(
+                torch.ones(16), _launcher=launch
+            )
+            assert len(calls) == 2
+            assert output.shape == (16,)
+        assert effects == _HOST_EFFECTS
 
 
 class _EffectfulFragmentInit(PowerOfTwoFragment):

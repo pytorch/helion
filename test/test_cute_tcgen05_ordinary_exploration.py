@@ -251,6 +251,7 @@ def test_non_ffi_sibling_survives_flat_transfer(grouping: int) -> None:
             tcgen05_acc_stages=2,
             tcgen05_c_stages=2,
             tcgen05_tvm_ffi_launch=False,
+            cute_compiler_pipeline="default",
         )
         normalized = bound.config_spec.normalized_config(config)
         generator = ConfigGeneration(bound.config_spec)

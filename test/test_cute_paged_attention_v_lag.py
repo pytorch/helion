@@ -13,6 +13,7 @@ pytestmark = pytest.mark.cpu_only
 LAG = "cute_mma_dag_v_lag"
 SLEEP = "cute_mma_dag_sleep_waits"
 QUERY = "cute_mma_dag_query_tma"
+RETIREMENT = "cute_mma_dag_early_tmem_retirement"
 
 
 def _paired_config(key, value):
@@ -23,8 +24,10 @@ def _paired_config(key, value):
 
 @pytest.mark.parametrize(
     "key,value",
+    # Each lag is a distinct compiled drain; both Boolean endpoints cover
+    # omitted/default and enabled code generation independently for each knob.
     [(LAG, lag) for lag in range(4)]
-    + [(key, value) for key in (SLEEP, QUERY) for value in (False, True)],
+    + [(key, value) for key in (SLEEP, QUERY, RETIREMENT) for value in (False, True)],
 )
 def test_paired_knob_roundtrip_and_codegen(key, value):
     bound = paired_v_lag_bound()
@@ -35,6 +38,7 @@ def test_paired_knob_roundtrip_and_codegen(key, value):
             LAG: bound.config_spec.cute_mma_dag_v_lag,
             SLEEP: bound.config_spec.cute_mma_dag_sleep_waits,
             QUERY: bound.config_spec.cute_mma_dag_query_tma,
+            RETIREMENT: bound.config_spec.cute_mma_dag_early_tmem_retirement,
         }[key]
         assert fragment is not None and fields[key] is fragment
         assert fragment.choices == ((0, 1, 2, 3) if key == LAG else (False, True))
@@ -55,7 +59,11 @@ def test_paired_knob_roundtrip_and_codegen(key, value):
     marker = (
         f"v_lag={value}"
         if key == LAG
-        else ("sleep_waits=True" if key == SLEEP else "query_map=pa_query_map")
+        else {
+            SLEEP: "sleep_waits=True",
+            QUERY: "query_map=pa_query_map",
+            RETIREMENT: "early_tmem_retirement=True",
+        }[key]
     )
     assert (marker in source) == bool(value)
 
@@ -65,7 +73,11 @@ def test_paired_knob_roundtrip_and_codegen(key, value):
     # Pin both lag endpoints and all rejected scalar types. In particular,
     # Python bool/int equality must not make either knob accept the other type.
     [(LAG, value) for value in (-1, 4, True, 0.0, "1", None)]
-    + [(key, value) for key in (SLEEP, QUERY) for value in (1, 0, "True", None)],
+    + [
+        (key, value)
+        for key in (SLEEP, QUERY, RETIREMENT)
+        for value in (1, 0, "True", None)
+    ],
 )
 def test_paired_knob_rejects_invalid_values(key, value):
     bound = paired_v_lag_bound()
@@ -79,13 +91,16 @@ def test_paired_knob_rejects_invalid_values(key, value):
 
 
 @pytest.mark.parametrize("heads,per_key", [(3, True), (2, False)])
-@pytest.mark.parametrize("key,value", [(LAG, 3), (SLEEP, True), (QUERY, True)])
+@pytest.mark.parametrize(
+    "key,value", [(LAG, 3), (SLEEP, True), (QUERY, True), (RETIREMENT, True)]
+)
 def test_paired_knob_requires_paired_transport(heads, per_key, key, value):
     bound = paired_v_lag_bound(heads=heads, per_key=per_key)
     assert {
         LAG: bound.config_spec.cute_mma_dag_v_lag,
         SLEEP: bound.config_spec.cute_mma_dag_sleep_waits,
         QUERY: bound.config_spec.cute_mma_dag_query_tma,
+        RETIREMENT: bound.config_spec.cute_mma_dag_early_tmem_retirement,
     }[key] is None
     assert bound.host_function is not None
     with bound.env, bound.host_function:
@@ -97,7 +112,13 @@ def test_paired_knob_requires_paired_transport(heads, per_key, key, value):
 
 
 @pytest.mark.parametrize(
-    "key,value,default", [(LAG, 3, 0), (SLEEP, True, False), (QUERY, True, False)]
+    "key,value,default",
+    [
+        (LAG, 3, 0),
+        (SLEEP, True, False),
+        (QUERY, True, False),
+        (RETIREMENT, True, False),
+    ],
 )
 def test_nonpaired_schedule_pins_inert_knobs(key, value, default):
     bound = paired_v_lag_bound()
@@ -114,7 +135,13 @@ def test_nonpaired_schedule_pins_inert_knobs(key, value, default):
 
 
 @pytest.mark.parametrize(
-    "key,value,default", [(LAG, 3, 0), (SLEEP, True, False), (QUERY, True, False)]
+    "key,value,default",
+    [
+        (LAG, 3, 0),
+        (SLEEP, True, False),
+        (QUERY, True, False),
+        (RETIREMENT, True, False),
+    ],
 )
 def test_failed_mapped_repair_pins_inert_knobs(key, value, default):
     kernel, args = optional_lse_fixture("mapped", True, query_len=5)

@@ -18,6 +18,7 @@ from ..device_ir import ForLoopGraphInfo
 
 if TYPE_CHECKING:
     from ..aten_lowering import LoweringContext
+    from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
     from ..helper_function import CodegenInterface
 
@@ -83,7 +84,7 @@ def _fp32_shape(node: Node) -> tuple[object, ...] | None:
 
 
 def match_matmul_sum_path(
-    cg: GenerateAST, producer: Node, n_block_id: int, n_extent: int
+    graphs: list[GraphInfo], producer: Node, n_block_id: int, n_extent: int
 ) -> MatmulSumPath | None:
     """Prove one zero-initialized FP32 carry reaches only its final N sum.
 
@@ -130,7 +131,7 @@ def match_matmul_sum_path(
         or _fp32_shape(placeholder) != shape
     ):
         return None
-    bodies = [info for info in cg.codegen_graphs if info.graph is producer.graph]
+    bodies = [info for info in graphs if info.graph is producer.graph]
     if len(bodies) != 1 or not isinstance(bodies[0], ForLoopGraphInfo):
         return None
     body = bodies[0]
@@ -149,7 +150,7 @@ def match_matmul_sum_path(
         return None
     callers = [
         node
-        for info in cg.codegen_graphs
+        for info in graphs
         for node in info.graph.nodes
         if node.op == "call_function"
         and _tracing_ops.is_for_loop_target(node.target)
@@ -268,7 +269,7 @@ def record_completed_matmul_sum(
     from ..generate_ast import GenerateAST
 
     assert isinstance(cg, GenerateAST)
-    path = match_matmul_sum_path(cg, producer, n_block_id, n_extent)
+    path = match_matmul_sum_path(cg.codegen_graphs, producer, n_block_id, n_extent)
     if path is not None:
         cg.device_function.cute_state.lanes.completed_matmul_sums[path.consumer] = (
             CompletedMatmulSum(cg, path, expression)
@@ -289,7 +290,9 @@ def completed_matmul_sum_input(ctx: LoweringContext, node: Node) -> ast.AST | No
     if (
         path.consumer is not node
         or path.producer.meta.get("codegen") is not completed.expression
-        or match_matmul_sum_path(cg, path.producer, path.n_block_id, path.n_extent)
+        or match_matmul_sum_path(
+            cg.codegen_graphs, path.producer, path.n_block_id, path.n_extent
+        )
         != path
     ):
         return None

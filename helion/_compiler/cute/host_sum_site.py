@@ -19,6 +19,9 @@ typed ``sum(0).to(dtype)`` recognizer (:func:`sum_cast_value`), the
 temporary-naming helpers and the :class:`HostSumSite` record one guarded
 rewrite is emitted from.  The device kernels stay separate
 (:mod:`helion.runtime.cute.paired_sum`, ``single_sum``, ``full_sum``).
+These runtime helpers choose fixed kernel plans from the actual tensor metadata;
+their calls do not carry a Config or its compiler options. They retain the SDK
+defaults independently of the enclosing generated kernel's pipeline choice.
 """
 
 from __future__ import annotations
