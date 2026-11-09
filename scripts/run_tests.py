@@ -376,9 +376,14 @@ def read_junit(path: Path, root: Path = REPO_ROOT) -> Junit:
 # --changed: the test modules a diff touches
 
 
-def git_output(*args: str) -> str:
+def git_output(*args: str, stdin: str | None = None) -> str:
     return subprocess.run(
-        ["git", *args], cwd=REPO_ROOT, capture_output=True, text=True, check=True
+        ["git", *args],
+        cwd=REPO_ROOT,
+        input=stdin,
+        capture_output=True,
+        encoding="utf-8",
+        check=True,
     ).stdout
 
 
@@ -494,6 +499,28 @@ def explicit_gpus(args: argparse.Namespace) -> list[str]:
         ) from None
 
 
+def publish_board_copy(board: gpu_board.BoardDir) -> None:
+    """Publish this checkout's gpu_board.py and its AGENTS.md on the board for
+    other projects' agents (``gpu_board.publish_bootstrap``: only the board's
+    owner does) when the script is the reviewed one on origin/main, never a
+    branch's; nothing is published when git cannot tell."""
+    if board.owner != board.me:
+        return
+    try:
+        # Read once: the bytes hashed (as they are, not as clean filters or
+        # eol conversion would store them) are the bytes published.
+        with open(gpu_board.__file__, encoding="utf-8", newline="") as file:
+            source = file.read()
+        ours = git_output("hash-object", "--no-filters", "--stdin", stdin=source)
+        main = git_output("rev-parse", "refs/remotes/origin/main:scripts/gpu_board.py")
+    except (OSError, subprocess.CalledProcessError):
+        return
+    # The same VERSION as the module imported: its AGENTS.md text is the one
+    # published with these bytes (VERSION changes with every change).
+    if ours == main and gpu_board.version_of(source) == gpu_board.VERSION:
+        gpu_board.publish_bootstrap(board, source)
+
+
 def acquire_gpus(
     args: argparse.Namespace,
     purpose: str,
@@ -504,7 +531,8 @@ def acquire_gpus(
     ``stack`` closes: the explicit GPUs (refused when another account claims
     them, they are busy, or another account's processes sit on them without
     ``--shared``, unless ``--force``), else ``-n`` free GPUs picked and
-    claimed under the board lock."""
+    claimed under the board lock. The board's owner also publishes the
+    script on the way (publish_board_copy)."""
     explicit = explicit_gpus(args)
     if explicit and args.no_board:
         return explicit
@@ -514,6 +542,8 @@ def acquire_gpus(
         # no board, no claims.
         return explicit or ["0"]
     try:
+        with contextlib.closing(gpu_board.BoardDir(gpu_board.board_dir())) as directory:
+            publish_board_copy(directory)
         if explicit:
             board, claim, problems = gpu_board.claim_gpus(
                 [int(g) for g in explicit],

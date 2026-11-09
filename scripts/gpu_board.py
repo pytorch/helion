@@ -62,7 +62,10 @@ person rather than work around it. Other accounts' odd files are ignored and
 listed as notices in ``status``.
 
 The directory's owner publishes a copy of this script and a self-contained
-``AGENTS.md`` into it for other projects' agents. That copy is as untrusted as
+``AGENTS.md`` into it for other projects' agents: its ``scripts/run_tests.py``
+does, from a checkout whose script is the one on ``origin/main`` (the script
+cannot tell reviewed code from a branch's without reading git, which its own
+audit rules forbid, so it never publishes itself). That copy is as untrusted as
 the rest of the board: agents with a Helion checkout run its
 ``scripts/gpu_board.py``, and others fetch the script from the canonical
 source or verify the copy before running it (the AGENTS.md says how).
@@ -139,7 +142,7 @@ if TYPE_CHECKING:
 # The script's version: an ISO date, with ".N" for later changes on the same
 # day. Bump it with every change: the published copy is only replaced by a
 # strictly newer version.
-VERSION = "2026-11-09"
+VERSION = "2026-11-09.1"
 # The version of the file formats; see "Compatibility" above.
 PROTOCOL = 1
 DEFAULT_BOARD = Path("/tmp/gpu-board")
@@ -478,6 +481,18 @@ def owner_of(info: os.stat_result) -> str:
     return name_of_uid(info.st_uid)
 
 
+def authenticity_problems(info: os.stat_result) -> list[str]:
+    """Why a regular file cannot speak for its owner: more than one link (a
+    hard link of another file would borrow that file's owner) or writable by
+    someone else."""
+    problems = []
+    if info.st_nlink != 1:
+        problems.append(f"has {info.st_nlink} hard links")
+    if stat.S_IMODE(info.st_mode) & 0o022:
+        problems.append("is writable by other accounts")
+    return problems
+
+
 def clean(text: object, limit: int) -> str:
     """Text from the board made safe to show to people and agents: control,
     format (bidirectional overrides among them) and other non-printing
@@ -702,11 +717,7 @@ class BoardDir:
         """Whether a regular file can speak for its owner: one link (a hard
         link of another file would borrow that file's owner) and writable by
         nobody else."""
-        problems = []
-        if info.st_nlink != 1:
-            problems.append(f"has {info.st_nlink} hard links")
-        if stat.S_IMODE(info.st_mode) & 0o022:
-            problems.append("is writable by other accounts")
+        problems = authenticity_problems(info)
         if problems:
             self.finding(
                 owner_of(info) == self.me or self.mine(name),
@@ -933,19 +944,46 @@ class BoardDir:
     # -- published files -------------------------------------------------------
 
     def check_published(self) -> None:
-        """Published files that the board's owner did not write are notices:
-        nobody running this script reads them, but other projects' agents
-        should not use them."""
+        """Published files that the board's owner did not write, or that other
+        accounts could have changed or linked in (hard links, write bits), so
+        nobody can trust them to be what the owner published: notices
+        (nobody running this script reads them, but other projects' agents
+        should not use them), except that in this account's own board a file
+        someone else wrote is an alert. Republishing replaces such a copy of
+        the owner's unless a newer version is published."""
+        mine = self.owner == self.me
         for name in PUBLISHED:
             try:
                 info = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
             except FileNotFoundError:
                 continue
-            if not stat.S_ISREG(info.st_mode) or owner_of(info) != self.owner:
+            owner = owner_of(info)
+            if not stat.S_ISREG(info.st_mode) or owner != self.owner:
+                if mine:
+                    self.alerts.append(
+                        f"{name} in your board directory was created by {owner}"
+                    )
+                else:
+                    self.notices.append(
+                        f"{name} on the board was not published by the board's "
+                        f"owner ({self.owner}; it is a "
+                        f"{stat.filemode(info.st_mode)} entry of {owner}): "
+                        "do not use it"
+                    )
+                continue
+            problems = authenticity_problems(info)
+            if problems and mine:
                 self.notices.append(
-                    f"{name} on the board was not published by the board's owner "
-                    f"({self.owner}; it is a {stat.filemode(info.st_mode)} entry of "
-                    f"{owner_of(info)}): do not use it"
+                    f"{name} in your board directory "
+                    + " and ".join(problems)
+                    + ": republishing replaces it (scripts/run_tests.py does, "
+                    "from a checkout matching origin/main)"
+                )
+            elif problems:
+                self.notices.append(
+                    f"{name} on the board (published by {owner}) "
+                    + " and ".join(problems)
+                    + ": do not use it"
                 )
 
 
@@ -1015,11 +1053,11 @@ standard library; subprocesses run only `nvidia-smi` and the command you give
 `run` (which inherits your environment); no network use (`socket` only for
 `gethostname`); no builtin `eval`, `exec` or `compile` (`re.compile` is
 fine), no `pickle` or `marshal`, no decoding of embedded data (base64, zlib,
-codecs); it reads only the board ({root}, or `$GPU_BOARD_DIR`), `/proc`, the
-account database (`pwd`) and its own source (to publish it), and of the
-environment only `GPU_BOARD_DIR` and a session id (`GPU_BOARD_SESSION`,
-`CLAUDE_CODE_SESSION_ID`, `CODEX_THREAD_ID` or `CODEX_SESSION_ID`, written
-to the board only as a short hash); it writes only inside the board. Anything
+codecs); it reads only the board ({root}, or `$GPU_BOARD_DIR`), `/proc` and
+the account database (`pwd`), and of the environment only `GPU_BOARD_DIR`
+and a session id (`GPU_BOARD_SESSION`, `CLAUDE_CODE_SESSION_ID`,
+`CODEX_THREAD_ID` or `CODEX_SESSION_ID`, written to the board only as a
+short hash); it writes only inside the board. Anything
 else: do not run it, and report it to your user. Remember the sha256 of a
 copy you verified so an unchanged copy needs no second review, and verify
 again when it changes.
@@ -1120,21 +1158,19 @@ def published_version(board: BoardDir) -> str | None:
     if found is None:
         return None
     data, info = found
-    if (
-        owner_of(info) != board.owner
-        or info.st_nlink != 1
-        or stat.S_IMODE(info.st_mode) & 0o022
-    ):
+    if owner_of(info) != board.owner or authenticity_problems(info):
         return None
     return version_of(data.decode("utf-8", "replace"))
 
 
-def publish_bootstrap(board: BoardDir) -> None:
+def publish_bootstrap(board: BoardDir, source: str) -> None:
     """Put a copy of this script and a self-contained AGENTS.md into the board
     directory as a pointer for other projects' agents (which verify the copy
     before running it). Only the directory's owner publishes, under the board
     lock; a published copy is only replaced by a strictly newer version, and
-    missing files are filled in."""
+    missing files are filled in. ``source`` is the script to publish, its
+    own VERSION deciding: run_tests.py passes the bytes it found to match
+    origin/main, and nothing in this script calls this."""
     if board.owner != board.me:
         return
     try:
@@ -1142,22 +1178,26 @@ def publish_bootstrap(board: BoardDir) -> None:
         # can) would stall every command of the board's owner.
         held = contextlib.nullcontext() if board.locked else board.lock(timeout=0)
         with held:
-            _publish_locked(board)
+            _publish_locked(board, source)
     except LockTimeout:
         return
 
 
-def _publish_locked(board: BoardDir) -> None:
+def _publish_locked(board: BoardDir, source: str) -> None:
     """publish_bootstrap's work, with the board lock held."""
+    version = version_of(source)
+    if version is None:
+        return
     published = version_key(published_version(board))
-    newer = published is None or published < version_key(VERSION)
+    current = published == version_key(version)
+    newer = published is None or published < version_key(version)
     files = (
         (
             "AGENTS.md",
-            BOOTSTRAP_DOC.format(root=board.root, version=VERSION),
+            BOOTSTRAP_DOC.format(root=board.root, version=version),
             0o644,
         ),
-        ("gpu_board.py", Path(__file__).read_text(encoding="utf-8"), 0o755),
+        ("gpu_board.py", source, 0o755),
     )
     for name, content, mode in files:
         try:
@@ -1173,7 +1213,11 @@ def _publish_locked(board: BoardDir) -> None:
                 f"{name} in your board directory was created by {owner_of(info)}"
             )
             continue
-        if newer or info is None:
+        # An AGENTS.md others could have changed or linked in (a notice of
+        # check_published) is replaced as well, unless a newer version is
+        # published; such a gpu_board.py counts as unpublished (newer).
+        unsafe = info is not None and bool(authenticity_problems(info))
+        if newer or info is None or (unsafe and current):
             with contextlib.suppress(OSError):
                 board.write_own(board.fd, name, content.encode("utf-8"), mode)
     board.raise_alerts()
@@ -1677,7 +1721,6 @@ class Board:
         # Check the chat directory too: an alert there stops every command.
         chat_files(self.dir)
         self.dir.raise_alerts()
-        publish_bootstrap(self.dir)
         self.claims = prune_own(self.dir, claims, self.now)
         if self.gpus is None:
             # No nvidia-smi: show whatever GPUs the claims mention.
@@ -1860,7 +1903,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         notices = unique_notices(board.dir)
         if notices:
             print(
-                "board notices (other accounts' files, ignored; tell the user if they persist):"
+                "board notices (files the board ignores; tell the user if they persist):"
             )
             for notice in notices[:MAX_NOTICES_SHOWN]:
                 print(f"  {notice}")
