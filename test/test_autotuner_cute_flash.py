@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import replace
+import functools
 import inspect
 import math
 import os
@@ -48,6 +49,7 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessCuteAvailable
+from helion.autotuner import AccuracyCheck
 from helion.autotuner import DESurrogateHybrid
 from helion.autotuner import DifferentialEvolutionSearch
 from helion.autotuner import LFBOPatternSearch
@@ -72,7 +74,7 @@ from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.finite_search import FiniteSearch
 from helion.autotuner.local_cache import LocalAutotuneCache
 from helion.autotuner.local_cache import StrictLocalAutotuneCache
-from helion.autotuner.local_cache import _cute_flash_search_policy_hash
+from helion.autotuner.local_cache import _search_policy_hash
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.random_search import RandomSearch
 from helion.autotuner.search_space_logger import canonical_config_id
@@ -7377,8 +7379,10 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
         best_available_max_configs: int = 20,
         config_filter: object = None,
         baseline_fn: object = None,
+        accuracy_check_fn: object = None,
         baseline_atol: float | None = None,
         baseline_rtol: float | None = None,
+        fp8_accuracy: str = "ulp",
         best_of_k: int = 1,
         precompile_jobs: int | None = None,
         with_torch_compile_fusion: bool = False,
@@ -7394,8 +7398,10 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
             autotune_best_available_max_configs=best_available_max_configs,
             autotune_config_filter=config_filter,  # type: ignore[arg-type]
             autotune_baseline_fn=baseline_fn,  # type: ignore[arg-type]
+            autotune_baseline_accuracy_check_fn=accuracy_check_fn,  # type: ignore[arg-type]
             autotune_baseline_atol=baseline_atol,
             autotune_baseline_rtol=baseline_rtol,
+            autotune_fp8_accuracy=fp8_accuracy,  # type: ignore[arg-type]
             autotune_best_of_k=best_of_k,
             autotune_precompile_jobs=precompile_jobs,
             autotune_with_torch_compile_fusion=with_torch_compile_fusion,
@@ -7452,7 +7458,7 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
         return search
 
     def _hash(self, search: BaseSearch, *, enabled: bool = True) -> str:
-        return _cute_flash_search_policy_hash(
+        return _search_policy_hash(
             search,
             cute_flash_search_enabled=enabled,
         )
@@ -7687,6 +7693,67 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
         self.assertNotEqual(self._hash(identity), self._hash(increment))
         self.assertNotEqual(self._hash(identity), self._hash(atol))
         self.assertNotEqual(self._hash(identity), self._hash(rtol))
+
+    def test_fp8_accuracy_mode_changes_policy(self) -> None:
+        # The fp8 mode changes which configs the default check accepts.
+        ulp = self._search(fp8_accuracy="ulp")
+        bitwise = self._search(fp8_accuracy="bitwise")
+        self.assertNotEqual(self._hash(ulp), self._hash(bitwise))
+        # Explicit zero tolerances select bitwise whatever the setting says.
+        self.assertEqual(
+            self._search(
+                fp8_accuracy="ulp", baseline_atol=0.0, baseline_rtol=0.0
+            ).cache_policy()["settings"]["autotune_fp8_accuracy"],
+            "bitwise",
+        )
+        # An accuracy check carries its own fp8 mode.
+        check = AccuracyCheck(atol=0.02, rtol=0.0)
+        self.assertEqual(
+            self._hash(self._search(fp8_accuracy="ulp", accuracy_check_fn=check)),
+            self._hash(self._search(fp8_accuracy="bitwise", accuracy_check_fn=check)),
+        )
+
+    def test_accuracy_check_is_keyed_by_its_fields(self) -> None:
+        # Helion's own check keys the cache by plain data and replaces the
+        # tolerance settings; without a check the policy is unchanged. (Other
+        # kernels' keys: TestAccuracyCheck in test_autotuner_accuracy.py.)
+        def search(atol: float = 0.02):
+            return self._search(
+                accuracy_check_fn=AccuracyCheck(atol=atol, rtol=0.0, atol_scale="peak")
+            )
+
+        plain = self._search().cache_policy()["settings"]
+        self.assertNotIn("autotune_baseline_accuracy_check_fn", plain)
+        self.assertIn("autotune_baseline_atol", plain)
+        keyed = search().cache_policy()["settings"]
+        self.assertEqual(
+            keyed["autotune_baseline_accuracy_check_fn"],
+            search().settings.autotune_baseline_accuracy_check_fn.cache_policy(),
+        )
+        self.assertNotIn("autotune_baseline_atol", keyed)
+        self.assertNotIn("autotune_baseline_rtol", keyed)
+        self.assertNotIn("autotune_fp8_accuracy", keyed)
+        self.assertEqual(self._hash(search()), self._hash(search()))
+        self.assertNotEqual(self._hash(search()), self._hash(search(0.05)))
+        self.assertNotEqual(self._hash(search()), self._hash(self._search()))
+        cacheable = search()
+        self._hash(cacheable)
+        self.assertTrue(getattr(cacheable, "_search_policy_cacheable", True))
+
+    def test_other_accuracy_checks_are_one_shot(self) -> None:
+        # An arbitrary callback (or a subclass, which may override __call__)
+        # cannot be keyed.
+        class Subclass(AccuracyCheck):
+            pass
+
+        for custom in (
+            lambda actual, expected: None,
+            functools.partial(torch.testing.assert_close, atol=0.0, rtol=0.0),
+            Subclass(atol=0.02, rtol=0.0),
+        ):
+            one_shot = self._search(accuracy_check_fn=custom)
+            self._hash(one_shot)
+            self.assertIs(one_shot._search_policy_cacheable, False)
 
     def test_baseline_function_runtime_globals_change_policy(self) -> None:
         global _CACHE_POLICY_BASELINE_SCALE

@@ -1079,12 +1079,21 @@ class Settings(_Settings):
             "tolerance is set (the previous behavior). "
             "Explicit zero tolerances (autotune_baseline_atol=0 with autotune_baseline_rtol=0) "
             "ask for exact outputs and select 'bitwise' whatever this setting says. "
-            "Set HELION_AUTOTUNE_FP8_ACCURACY=bitwise to override."
+            "Set HELION_AUTOTUNE_FP8_ACCURACY=bitwise to override. "
+            "Ignored when autotune_baseline_accuracy_check_fn is set: that check replaces the default "
+            "one (an AccuracyCheck compares fp8 outputs by its own fp8_accuracy field)."
         ),
         "autotune_baseline_accuracy_check_fn": (
             "Custom accuracy check function for comparing autotuning candidate outputs against the baseline. "
             "Signature: (actual: object, expected: object) -> None. Should raise AssertionError on mismatch. "
-            "When set, replaces the default torch.testing.assert_close-based check (atol/rtol settings are ignored). "
+            "Helion's own ``helion.autotuner.AccuracyCheck(atol, rtol, atol_scale=None|'rms'|'peak', "
+            "fp8_accuracy='ulp'|'bitwise')`` runs the default check's comparison with its own tolerances "
+            "and fp8 mode, optionally scaling atol by each output's rms or peak; "
+            "the autotune cache keys it by its fields, so a tuned config is reused only under an equal check. "
+            "An arbitrary callback is not part of the cache key, and makes CuTe flash autotune results "
+            "one-shot (it cannot be keyed safely). "
+            "When set, replaces the default torch.testing.assert_close-based check (the "
+            "autotune_baseline_atol, autotune_baseline_rtol and autotune_fp8_accuracy settings are ignored). "
             "Useful for scenarios where a small fraction of elements may have large relative differences, "
             "e.g. checking that mismatch percentage < X AND max relative diff < Y. "
             "A built-in utility ``helion._testing.assert_close_with_mismatch_tolerance`` is provided "
@@ -1295,11 +1304,14 @@ class Settings(_Settings):
 
         # Only include fields that are meant to be public (repr=True)
         public_fields = {f.name for f in dataclasses.fields(self) if f.repr}
-        return {
-            k: shallow_copy(v)
-            for k, v in dataclasses.asdict(self).items()
-            if k in public_fields
-        }
+        values = dataclasses.asdict(self)
+        for name in public_fields:
+            # ``asdict`` turns a dataclass value (an ``AccuracyCheck``) into a
+            # plain dict; keep the object itself.
+            value = getattr(self, name)
+            if dataclasses.is_dataclass(value) and not isinstance(value, type):
+                values[name] = value
+        return {k: shallow_copy(v) for k, v in values.items() if k in public_fields}
 
     def check_autotuning_disabled(self) -> None:
         msg = None

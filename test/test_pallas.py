@@ -1125,7 +1125,7 @@ class TestPallas(TestCase):
             atol=1e-5,
             rtol=1e-5,
             chunk_size=1024,
-            scale_atol_by_expected_rms=True,
+            atol_scale="rms",
         )
 
         incorrect = expected.clone()

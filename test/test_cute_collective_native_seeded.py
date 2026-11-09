@@ -403,9 +403,7 @@ def test_seeded_native_original_mamba_strict_accuracy_and_mutated_graphs(
     bound.set_config(config)
 
     def compare(actual: torch.Tensor, expected: torch.Tensor) -> None:
-        _chunked_assert_close(
-            actual, expected, atol=0.01, rtol=0.01, scale_atol_by_expected_rms=True
-        )
+        _chunked_assert_close(actual, expected, atol=0.01, rtol=0.01, atol_scale="rms")
 
     def run() -> torch.Tensor:
         return bound(*arguments)

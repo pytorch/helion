@@ -358,9 +358,13 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
    Relative tolerance for baseline output comparison during autotune accuracy checks. Default is ``1e-2``.
 
+.. autoattribute:: Settings.autotune_baseline_accuracy_check_fn
+
+   Replaces the default accuracy check (and the ``autotune_baseline_atol`` / ``autotune_baseline_rtol`` tolerances and the ``autotune_fp8_accuracy`` mode) with ``check(actual, expected)``, which raises ``AssertionError`` to reject a candidate. :class:`helion.autotuner.AccuracyCheck` builds one from tolerances and an fp8 mode of its own (``fp8_accuracy``, ``"ulp"`` by default), optionally scaling ``atol`` by each output's rms or peak magnitude; the autotune cache keys it by its fields, so a tuned config is reused only under an equal check. An arbitrary callback is not part of the cache key, and makes CuTe flash autotune results one-shot. Default is ``None``.
+
 .. autoattribute:: Settings.autotune_fp8_accuracy
 
-   How autotune accuracy checks compare fp8 output tensors against the baseline. ``"ulp"`` (default) compares dequantized values: each element must lie within one fp8 ulp plus the tolerances, and the one-ulp differences must not be systematically one-directional. ``"bitwise"`` requires identical bytes whenever every output is fp8 and no explicit tolerance is set. Explicit zero tolerances (``autotune_baseline_atol=0`` with ``autotune_baseline_rtol=0``) select ``"bitwise"`` whatever this setting says. Controlled by ``HELION_AUTOTUNE_FP8_ACCURACY``.
+   How autotune accuracy checks compare fp8 output tensors against the baseline. ``"ulp"`` (default) compares dequantized values: each element must lie within one fp8 ulp plus the tolerances, and the one-ulp differences must not be systematically one-directional. ``"bitwise"`` requires identical bytes whenever every output is fp8 and no explicit tolerance is set. Explicit zero tolerances (``autotune_baseline_atol=0`` with ``autotune_baseline_rtol=0``) select ``"bitwise"`` whatever this setting says. Ignored when ``autotune_baseline_accuracy_check_fn`` is set: that check replaces the default one (an :class:`helion.autotuner.AccuracyCheck` compares fp8 outputs by its own ``fp8_accuracy``). Controlled by ``HELION_AUTOTUNE_FP8_ACCURACY``.
 
 .. autoattribute:: Settings.autotune_search_acf
 

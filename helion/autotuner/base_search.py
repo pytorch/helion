@@ -41,6 +41,8 @@ from ..runtime.structural_policy import StructuralConfig
 from ..runtime.structural_policy import StructuralPolicyError
 from ..runtime.structural_policy import bound_structural_policy
 from ..runtime.structural_policy import require_same_structural_policy
+from .accuracy import effective_fp8_accuracy
+from .accuracy import keyable_accuracy_check
 from .benchmark_provider import _COMPILER_SEED_TIMEOUT_RETRY_LIMIT
 from .benchmark_provider import BenchmarkProvider
 from .benchmark_provider import BenchmarkResult
@@ -514,6 +516,7 @@ class BaseSearch(BaseAutotuner):
             if settings.autotune_baseline_fn is None
             else _python_function_cache_policy(settings.autotune_baseline_fn)
         )
+        accuracy_check = keyable_accuracy_check(settings)
         if (
             algorithm is None
             or any(
@@ -521,8 +524,13 @@ class BaseSearch(BaseAutotuner):
                 for callback in (
                     settings.autotune_config_filter,
                     settings.autotune_benchmark_fn,
-                    settings.autotune_baseline_accuracy_check_fn,
                 )
+            )
+            # Of accuracy checks only Helion's own can be keyed: an arbitrary
+            # callback cannot be fingerprinted safely.
+            or (
+                settings.autotune_baseline_accuracy_check_fn is not None
+                and accuracy_check is None
             )
             or (
                 settings.autotune_baseline_fn is not None and baseline_fn_policy is None
@@ -566,8 +574,21 @@ class BaseSearch(BaseAutotuner):
                 "disable_autotuner_heuristics": settings.disable_autotuner_heuristics,
                 "autotune_accuracy_check": settings.autotune_accuracy_check,
                 "autotune_baseline_fn": baseline_fn_policy,
-                "autotune_baseline_atol": settings.autotune_baseline_atol,
-                "autotune_baseline_rtol": settings.autotune_baseline_rtol,
+                # What the default check accepts, or the AccuracyCheck that
+                # replaces it.
+                **(
+                    {
+                        "autotune_baseline_atol": settings.autotune_baseline_atol,
+                        "autotune_baseline_rtol": settings.autotune_baseline_rtol,
+                        "autotune_fp8_accuracy": effective_fp8_accuracy(settings),
+                    }
+                    if accuracy_check is None
+                    else {
+                        "autotune_baseline_accuracy_check_fn": (
+                            accuracy_check.cache_policy()
+                        )
+                    }
+                ),
                 "autotune_adaptive_timeout": settings.autotune_adaptive_timeout,
                 "autotune_compile_timeout": settings.autotune_compile_timeout,
                 "autotune_benchmark_subprocess": (

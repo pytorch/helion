@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import csv
+import dataclasses
 import itertools
+import json
 import logging
 import math
 import multiprocessing as mp
@@ -16,6 +18,7 @@ import unittest
 from unittest.mock import Mock
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -32,6 +35,7 @@ from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfXPU
+from helion.autotuner import AccuracyCheck
 from helion.autotuner import DifferentialEvolutionSearch
 from helion.autotuner import PatternSearch
 from helion.autotuner.accuracy import accuracy_poison_value
@@ -44,6 +48,7 @@ from helion.autotuner.benchmark_provider import _MAX_SAMPLED_BASELINE_ATTEMPTS
 from helion.autotuner.benchmark_provider import BASELINE_CONSISTENCY_MAX_RELATIVE_L2
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.finite_search import FiniteSearch
+from helion.autotuner.local_cache import _search_policy_hash
 from helion.autotuner.logger import AutotuneLogEntry
 from helion.autotuner.logger import AutotuningLogger
 from helion.autotuner.random_search import RandomSearch
@@ -631,6 +636,16 @@ class TestAutotunerAccuracy(AutotunerTestCase):
         nan[3] = float("nan")
         self.assertIsNone(relative_l2_disagreement(nan, nan.clone(), 0.05))
         self.assertIn("non-finite", relative_l2_disagreement(nan, a, 0.05) or "")
+        inf = torch.tensor([float("inf"), 1.0])
+        minus_inf = torch.tensor([float("-inf"), 1.0])
+        self.assertIn(
+            "non-finite", relative_l2_disagreement(inf, minus_inf, 0.05) or ""
+        )
+        # Large float64 values must not overflow to agreeing infinities.
+        big = torch.tensor([1e100], dtype=torch.float64)
+        self.assertIn(
+            "relative L2", relative_l2_disagreement(big, big * 1e-10, 0.05) or ""
+        )
         ints = torch.arange(8, device=DEVICE)
         self.assertIsNone(relative_l2_disagreement(ints, ints.clone(), 0.05))
         self.assertIn("differs", relative_l2_disagreement(ints, ints + 1, 0.05) or "")
@@ -2399,6 +2414,277 @@ class TestFp8UlpAccuracy(unittest.TestCase):
             assert_close(actual, expected, atol=1e-2, rtol=1e-2, fp8_accuracy="exact")
         with self.assertRaises(ValueError):
             helion.Settings(autotune_fp8_accuracy="exact")
+
+
+class TestAccuracyCheck(unittest.TestCase):
+    """``AccuracyCheck`` on CPU tensors (no kernel involved)."""
+
+    def test_peak_scale_is_relative_to_each_tensors_peak(self) -> None:
+        check = AccuracyCheck(atol=0.02, rtol=0.0, atol_scale="peak")
+        small = torch.tensor([0.0, 0.01, 1.0])
+        large = torch.tensor([0.0, 0.01, 100.0])
+        # 0.019 * peak on the near-zero element passes; 0.021 * peak fails.
+        check((small + torch.tensor([0.019, 0.0, 0.0]), large), (small, large))
+        with self.assertRaises(AssertionError):
+            check((small, large + torch.tensor([2.1, 0.0, 0.0])), (small, large))
+
+    def test_peak_scale_ignores_non_finite_baseline_elements(self) -> None:
+        check = AccuracyCheck(atol=0.02, rtol=0.0, atol_scale="peak")
+        lse = torch.tensor([float("-inf"), 1.0, 2.0])
+        check(lse.clone(), lse)
+        # A -inf row must stay -inf ...
+        with self.assertRaises(AssertionError):
+            check(torch.tensor([0.0, 1.0, 2.0]), lse)
+        # ... and does not make the finite elements' tolerance infinite.
+        with self.assertRaises(AssertionError):
+            check(torch.tensor([float("-inf"), 1.5, 2.0]), lse)
+
+    def test_peak_scale_of_all_zero_tensor_is_exact(self) -> None:
+        check = AccuracyCheck(atol=0.02, rtol=0.0, atol_scale="peak")
+        zeros = torch.zeros(4)
+        check(zeros.clone(), zeros)
+        with self.assertRaises(AssertionError):
+            check(torch.tensor([0.0, 1e-6, 0.0, 0.0]), zeros)
+
+    def test_peak_is_memoized_until_the_baseline_changes(self) -> None:
+        check = AccuracyCheck(atol=0.02, rtol=0.0, atol_scale="peak")
+        expected = torch.tensor([1.0, 2.0])
+        check(expected.clone(), expected)
+        self.assertEqual(expected._helion_accuracy_peak[1], 2.0)
+        expected.mul_(10)
+        with self.assertRaises(AssertionError):
+            check(torch.tensor([1.0, 2.0]), expected)
+        self.assertEqual(expected._helion_accuracy_peak[1], 20.0)
+
+    def test_peak_spans_chunks(self) -> None:
+        check = AccuracyCheck(atol=0.02, rtol=0.0, atol_scale="peak")
+        expected = torch.zeros(3 * 2**22 + 5)
+        expected[-1] = 100.0
+        actual = expected.clone()
+        actual[0] = 1.9
+        check(actual, expected)
+        actual[0] = 2.1
+        with self.assertRaises(AssertionError):
+            check(actual, expected)
+
+    def test_rms_scale_is_atol_times_rms_floored_at_one(self) -> None:
+        # rms 70.7: the near-zero element gets atol 0.707.
+        check = AccuracyCheck(atol=1e-2, rtol=1e-2, atol_scale="rms")
+        expected = torch.tensor([100.0, -100.0, 0.0, 0.0])
+        check(expected + torch.tensor([0.0, 0.0, 0.7, 0.0]), expected)
+        with self.assertRaises(AssertionError):
+            check(expected + torch.tensor([0.0, 0.0, 0.72, 0.0]), expected)
+        # Unscaled, it gets atol only; an rms below 1 never tightens it.
+        with self.assertRaises(AssertionError):
+            AccuracyCheck(atol=1e-2, rtol=1e-2)(
+                expected + torch.tensor([0.0, 0.0, 0.5, 0.0]), expected
+            )
+        small = torch.tensor([0.1, 0.0])
+        check(small + torch.tensor([0.0, 0.0099]), small)
+
+    def test_fp8_dtypes_must_match(self) -> None:
+        # e5m2 0.5 and e4m3fn 1.0 share the byte 0x38.
+        expected = torch.tensor([1.0]).to(torch.float8_e4m3fn)
+        for actual in (
+            torch.tensor([0.5]).to(torch.float8_e5m2),
+            expected.view(torch.uint8),
+        ):
+            for fp8_accuracy in ("bitwise", "ulp"):
+                with self.assertRaises(AssertionError):
+                    AccuracyCheck(atol=0.0, rtol=0.0, fp8_accuracy=fp8_accuracy)(
+                        actual, expected
+                    )
+
+    def test_e8m0_nan_is_not_one_byte_from_the_largest_value(self) -> None:
+        check = AccuracyCheck(atol=0.02, rtol=0.0)
+        largest = torch.tensor([0xFE], dtype=torch.uint8).view(torch.float8_e8m0fnu)
+        nan = torch.tensor([0xFF], dtype=torch.uint8).view(torch.float8_e8m0fnu)
+        check(nan.clone(), nan)
+        with self.assertRaises(AssertionError):
+            check(nan, largest)
+        with self.assertRaises(AssertionError):
+            check(largest, nan)
+
+    def test_integer_and_fp4_leaves_compare_exactly(self) -> None:
+        check = AccuracyCheck(atol=0.02, rtol=0.0, atol_scale="peak")
+        index = torch.tensor([3, 1, 2])
+        check(index.clone(), index)
+        with self.assertRaises(AssertionError):
+            check(torch.tensor([3, 1, 1]), index)
+        packed = torch.tensor([0x12, 0x34], dtype=torch.uint8).view(
+            torch.float4_e2m1fn_x2
+        )
+        check(packed.clone(), packed)
+        with self.assertRaises(AssertionError):
+            check(
+                torch.tensor([0x12, 0x35], dtype=torch.uint8).view(
+                    torch.float4_e2m1fn_x2
+                ),
+                packed,
+            )
+
+    def test_low_precision_tensors(self) -> None:
+        check = AccuracyCheck(atol=0.02, rtol=0.0, atol_scale="peak")
+        expected = torch.tensor([1.0, 2.0, 4.0], dtype=torch.bfloat16)
+        check(expected + torch.tensor([0.0, 0.0, 0.0625]).bfloat16(), expected)
+
+    def test_non_tensor_leaves_and_structure(self) -> None:
+        check = AccuracyCheck(atol=0.02, rtol=0.0, atol_scale="peak")
+        t = torch.ones(2)
+        check((t, 3, "group"), (t.clone(), 3, "group"))
+        with self.assertRaises(AssertionError):
+            check((t, "other"), (t, "group"))
+        with self.assertRaises(AssertionError):
+            check((t,), (t, t))
+        with self.assertRaises(AssertionError):
+            check((3,), (t,))
+        with self.assertRaises(AssertionError):
+            check((3,), ("group",))
+        with self.assertRaises(AssertionError):
+            check((3,), (len,))
+
+    def test_invalid_fields(self) -> None:
+        for bad in (-0.1, math.inf, math.nan, True, "0.1"):
+            with self.assertRaises(ValueError):
+                AccuracyCheck(atol=bad, rtol=0.0)
+            with self.assertRaises(ValueError):
+                AccuracyCheck(atol=0.0, rtol=bad)
+        with self.assertRaises(ValueError):
+            AccuracyCheck(atol=0.0, rtol=0.0, atol_scale="max")  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            AccuracyCheck(atol=0.0, rtol=0.0, fp8_accuracy="exact")  # type: ignore[arg-type]
+
+    def test_peak_scale_of_inference_tensors(self) -> None:
+        # Inference tensors have no version counter to key the memo by.
+        check = AccuracyCheck(atol=0.02, rtol=0.0, atol_scale="peak")
+        rms_check = AccuracyCheck(atol=1e-2, rtol=1e-2, atol_scale="rms")
+        with torch.inference_mode():
+            expected = torch.tensor([1.0, 2.0])
+            actual = expected + 0.01
+        check(actual, expected)
+        rms_check(actual, expected)
+        with self.assertRaises(AssertionError):
+            check(expected + 0.1, expected)
+
+    def test_fp8_infinite_baseline_must_match(self) -> None:
+        check = AccuracyCheck(atol=0.02, rtol=0.01, atol_scale="peak")
+        expected = torch.tensor([float("inf"), 1.0]).to(torch.float8_e5m2)
+        check(expected.clone(), expected)
+        for wrong in (1.0, float("-inf")):
+            with self.assertRaises(AssertionError):
+                check(torch.tensor([wrong, 1.0]).to(torch.float8_e5m2), expected)
+
+    def test_zero_tolerances_compare_fp8_bitwise(self) -> None:
+        expected = torch.tensor([1.0, 2.0]).to(torch.float8_e4m3fn)
+        one_ulp = (
+            expected.view(torch.uint8) + torch.tensor([0, 1], dtype=torch.uint8)
+        ).view(torch.float8_e4m3fn)
+        AccuracyCheck(atol=0.0, rtol=1e-6)(one_ulp, expected)
+        with self.assertRaises(AssertionError):
+            AccuracyCheck(atol=0.0, rtol=0.0)(one_ulp, expected)
+
+    def test_settings_to_dict_keeps_the_check(self) -> None:
+        check = AccuracyCheck(atol=0.02, rtol=0.0, atol_scale="peak")
+        settings = Settings(autotune_baseline_accuracy_check_fn=check)
+        self.assertIs(settings.to_dict()["autotune_baseline_accuracy_check_fn"], check)
+
+    def test_other_kernels_key_only_an_enabled_accuracy_check(self) -> None:
+        def key(check: object = None, *, enabled: bool = True) -> str:
+            settings = Settings(
+                autotune_baseline_accuracy_check_fn=check,  # type: ignore[arg-type]
+                autotune_accuracy_check=enabled,
+            )
+            return _search_policy_hash(
+                SimpleNamespace(settings=settings),  # type: ignore[arg-type]
+                cute_flash_search_enabled=False,
+            )
+
+        def peak(atol: float = 0.02) -> AccuracyCheck:
+            return AccuracyCheck(atol=atol, rtol=0.0, atol_scale="peak")
+
+        class Subclass(AccuracyCheck):
+            pass
+
+        self.assertEqual(key(), "")
+        self.assertNotEqual(key(peak()), "")
+        self.assertEqual(key(peak()), key(peak()))
+        self.assertNotEqual(key(peak()), key(peak(0.05)))
+        # A disabled check validates nothing; arbitrary callbacks keep the
+        # historical key.
+        self.assertEqual(key(peak(), enabled=False), "")
+        self.assertEqual(key(lambda actual, expected: None), "")
+        self.assertEqual(key(Subclass(atol=0.02, rtol=0.0)), "")
+
+    def test_bitwise_fp8_byte_tolerance_never_reaches_inf_or_nan(self) -> None:
+        check = AccuracyCheck(atol=0.02, rtol=0.02, fp8_accuracy="bitwise")
+        e5m2 = torch.tensor([float("inf"), 1.0]).to(torch.float8_e5m2)
+        check(e5m2.clone(), e5m2)
+        # 57344 (0x7B) is one byte below inf (0x7C).
+        with self.assertRaises(AssertionError):
+            check(torch.tensor([57344.0, 1.0]).to(torch.float8_e5m2), e5m2)
+        nan = torch.tensor([0xFF], dtype=torch.uint8).view(torch.float8_e8m0fnu)
+        largest = torch.tensor([0xFE], dtype=torch.uint8).view(torch.float8_e8m0fnu)
+        with self.assertRaises(AssertionError):
+            check(largest, nan)
+        # Finite elements still get the byte tolerance.
+        one_byte_up = torch.tensor([0, 1], dtype=torch.uint8)
+        check((e5m2.view(torch.uint8) + one_byte_up).view(torch.float8_e5m2), e5m2)
+
+    def test_leaves_torch_testing_cannot_compare_must_be_equal(self) -> None:
+        check = AccuracyCheck(atol=0.02, rtol=0.02)
+        t = torch.ones(2)
+        check((t, torch.float32, None), (t.clone(), torch.float32, None))
+        with self.assertRaises(AssertionError):
+            check((t, torch.float32), (t, torch.bfloat16))
+        with self.assertRaises(AssertionError):
+            check((t, None), (t, 3))
+        check((t, 1.0), (t, 1.001))
+
+    def test_wrong_shape_fp8_is_a_mismatch(self) -> None:
+        # The non-finite byte check must not index tensors of different shapes.
+        expected = torch.tensor([1.0, 2.0, 4.0]).to(torch.float8_e4m3fn)
+        for fp8_accuracy in ("bitwise", "ulp"):
+            check = AccuracyCheck(atol=0.01, rtol=0.01, fp8_accuracy=fp8_accuracy)
+            for length in (1, 2):
+                with self.assertRaises(AssertionError):
+                    check(expected[:length].clone(), expected)
+
+    def test_numpy_scalars_compare_with_tolerance(self) -> None:
+        check = AccuracyCheck(atol=0.02, rtol=0.02)
+        t = torch.ones(2)
+        check((t, np.float32(1.0)), (t, np.float32(1.001)))
+        check((t, np.int64(3)), (t, np.int64(3)))
+        with self.assertRaises(AssertionError):
+            check((t, np.float32(1.0)), (t, np.float32(2.0)))
+
+    def test_zero_tolerances_key_the_fp8_mode_they_run(self) -> None:
+        self.assertEqual(
+            AccuracyCheck(atol=0.0, rtol=0.0, fp8_accuracy="ulp").cache_policy(),
+            AccuracyCheck(atol=0.0, rtol=0.0, fp8_accuracy="bitwise").cache_policy(),
+        )
+
+    def test_cache_policy_names_every_field(self) -> None:
+        base = AccuracyCheck(atol=0.02, rtol=0.0, atol_scale="peak")
+        self.assertEqual(
+            base.cache_policy(),
+            {
+                "check": "accuracy_check",
+                "version": 1,
+                "atol": 0.02,
+                "rtol": 0.0,
+                "atol_scale": "peak",
+                "fp8_accuracy": "ulp",
+            },
+        )
+        variants = [
+            dataclasses.replace(base, atol=0.01),
+            dataclasses.replace(base, rtol=0.01),
+            dataclasses.replace(base, atol_scale="rms"),
+            dataclasses.replace(base, atol_scale=None),
+            dataclasses.replace(base, fp8_accuracy="bitwise"),
+        ]
+        policies = [base.cache_policy()] + [v.cache_policy() for v in variants]
+        self.assertEqual(len({json.dumps(p, sort_keys=True) for p in policies}), 6)
 
 
 if __name__ == "__main__":

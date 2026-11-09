@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from .accuracy import AccuracyCheck as AccuracyCheck
 from .aot_cache import AOTAutotuneCache as AOTAutotuneCache
 from .aot_kernel import aot_kernel as aot_kernel
 from .config_fragment import BooleanFragment as BooleanFragment

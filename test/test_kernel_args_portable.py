@@ -250,7 +250,7 @@ def test_accuracy_comparison_tolerates_function_leaves() -> None:
         assert_close(
             (torch.ones(2), epilogue), (torch.zeros(2), epilogue), atol=0, rtol=0
         )
-    with pytest.raises(AssertionError, match="Leaf type mismatch"):
+    with pytest.raises(AssertionError, match="(?i)leaf type mismatch"):
         assert_close((torch.ones(2), epilogue), (torch.ones(2), 3.0), atol=0, rtol=0)
 
 
