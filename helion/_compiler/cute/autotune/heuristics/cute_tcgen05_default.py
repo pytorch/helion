@@ -14,15 +14,19 @@ epilogue-issued TMA ring (``_epi_tma_aux_values``), and a grid with fewer
 128x128 tiles than SMs takes the 128-row pair seed with the fewest waves
 (``_small_grid_pair_default``). Plain GEMMs only the edge + K-tail family
 runs (a 16-bit K tail on whole M and N tiles, or a K tail with ragged M and
-N) take that family's CLC pair seed. A small grid no pair serves splits K on
-a one-CTA 64x64 tile (``_split_k_default``). A transcendental epilogue runs two
-epilogue warp groups (``_transcendental_epilogue_values``). A batched GEMM's
-pairs walk their batches slowest (``_batch_slowest``); per-batch matrices
-narrower than a pair tile, or not whole in its tiles, take a one-CTA tile
-(``_narrow_batched_default``), and so do many small matrices whose operands
-or output TMA cannot address (``_small_matrix_batch_default``). A kernel with
-an atomic keeps the flat base default: codegen refuses atomics beside the
-pairs' shared tiles and the persistent CTAs' warp roles.
+N) take that family's plain pair seed. A small grid no pair serves takes a
+one-CTA 64x64 tile, split over a long K loop (``_split_k_default``). A
+transcendental epilogue, or an exact-shape operand on the register loads
+over a CTA pair's short K loop, runs two epilogue warp groups (three over a
+capped short K loop) and reads the operand ahead in a register ring
+(``_multi_group_epilogue_values``). A batched GEMM's pairs walk their
+batches slowest (``_batch_slowest``); per-batch matrices narrower than a
+pair tile, or not whole in its tiles, take a one-CTA tile
+(``_narrow_batched_default``; its persistent loop walks the batches slowest
+too), and so do many small matrices whose operands or output TMA cannot
+address (``_small_matrix_batch_default``). A kernel with an atomic keeps the
+flat base default: codegen refuses atomics beside the pairs' shared tiles
+and the persistent CTAs' warp roles.
 """
 
 from __future__ import annotations
@@ -51,12 +55,15 @@ from ...tcgen05_config import surface
 from ...tcgen05_config.knobs import long_n_sweep_l2_grouping
 from ...tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
 from ...tcgen05_constants import TCGEN05_AUX_LOAD_MODE_EPI_TMA
+from ...tcgen05_constants import TCGEN05_AUX_LOAD_MODE_SIMT
 from ...tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
 from ...tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
 from ...tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
 from ...tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+from ...tcgen05_constants import TCGEN05_AUX_PREFETCH_SUBTILES_CONFIG_KEY
 from ...tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_DEFAULT
 from ...tcgen05_constants import TCGEN05_AUX_STAGES_CONFIG_KEY
+from ...tcgen05_constants import TCGEN05_EPI_SUBTILE_N_CONFIG_KEY
 from ...tcgen05_constants import TCGEN05_EPI_TMA_AUX_STAGE_COUNT_CHOICES
 from ...tcgen05_constants import TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY
 from ...tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
@@ -70,6 +77,7 @@ from ...tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from ...tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from ...tcgen05_constants import TCGEN05_TWO_CTA_NARROW_BLOCK_N
 from ...tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
+from ...tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -80,6 +88,7 @@ if TYPE_CHECKING:
     from .....runtime.config import PidTypeLiteral
     from ....compile_environment import CompileEnvironment
     from ....device_ir import DeviceIR
+    from ...pipeline_smem import Tcgen05PipelineSmemFacts
     from ...radix_store import RadixStoreLayout
     from ...tcgen05_config import CuteTcgen05Config
 
@@ -141,6 +150,20 @@ _ONE_CTA_N_EDGE_EXACT_AUX_MIN_K_TILES = 8
 # K blocks from which a narrow batched GEMM's default runs the persistent loop
 # at four AB stages (``_narrow_batched_default``).
 _NARROW_BATCHED_PERSISTENT_MIN_K_TILES = 8
+# The multi-group default's register prefetch ring: 32-column epilogue
+# subtiles read up to two ahead (see ``_multi_group_epilogue_values``),
+# and on a K loop of at most 16 k-blocks an AB ring within 96 KiB per CTA
+# (``_ring_ab_stage_cap``).
+_PREFETCH_EPI_SUBTILE_N = 32
+_PREFETCH_SUBTILES = 2
+_RING_SHORT_K_TILES = 16
+_RING_AB_BYTES = 96 * 1024
+# The epilogue warp groups the ring default runs where its AB ring is capped
+# (see ``_multi_group_epilogue_values``).
+_SHORT_K_EPI_WARP_GROUPS = 3
+# K blocks up to which an exact-shape operand on the register loads bounds a
+# CTA pair by its epilogue, which then runs two warp groups (see ``_pick``).
+_REGISTER_OPERAND_MAX_K_TILES = 16
 # The split-K default's tile edge, the AB stages it keeps at most and the
 # CTAs per SM it launches at most (see ``_split_k_default``).
 _SPLIT_K_TILE = 64
@@ -192,8 +215,9 @@ def _batch_slowest(
 ) -> dict[str, Any]:
     """``values`` walking a batched grid's batches slowest
     (``TCGEN05_BATCH_RASTER_CONFIG_KEY``), ungrouped
-    (``ungroup_batch_slowest_walk``): the CTA pairs share one batch's A and
-    B tiles at the same time, as cuBLAS's batched grids do. B200, of the
+    (``ungroup_batch_slowest_walk``): concurrent CTAs (pairs, or the narrow
+    default's persistent one-CTA tiles) share one batch's A and B tiles at
+    the same time, as cuBLAS's batched grids do. B200, of the
     ATen bmm, the 256x256 pair, batches fastest -> slowest: 256 x
     512x1024x64 0.78 -> 0.90, 256 x 512x512x64 0.86 -> 0.92, 192 x
     512x512x64 0.85 -> 0.90, 384 x 256x768x64 0.82 -> 0.87 (a batch of one
@@ -204,6 +228,64 @@ def _batch_slowest(
     }
     surface.ungroup_batch_slowest_walk(state, walked)
     return walked
+
+
+def _ring_ab_stage_cap(
+    state: CuteTcgen05Config,
+    pipeline_facts: Tcgen05PipelineSmemFacts,
+    values: Mapping[str, object],
+    *,
+    k: int,
+) -> int | None:
+    """The AB stages the multi-group ring default keeps at most on a short K
+    loop (at most ``_RING_SHORT_K_TILES`` k-blocks), else ``None``: the
+    stages within ``_RING_AB_BYTES`` per CTA, so the SMEM the ring does not
+    take stays L1 for the epilogue's global operand reads (B200, GELU
+    backward, of the ATen GEMM, two groups, the 256x256 pair at 5 -> 3 stages:
+    25088x2048x512 0.90 -> 0.93, 8192x4096x1024 1.10 -> 1.16,
+    100352x1024x256 0.96 -> 1.00; the 256x128 pair at 8 -> 4: 8192x3072x768
+    0.88 -> 0.91, 32768x384x192 0.76 -> 0.81; 16384x3072x768 1.01 -> 1.06,
+    25344x3072x768 0.99 -> 1.01; the one-CTA 128x256 tile at 3 -> 2:
+    25216x768x192 0.90 -> 0.95, 6272x4096x1024 0.95 -> 0.99,
+    25216x3072x768 1.07 -> 1.09; the one-CTA 128x128 tile of M <= 128,
+    indifferent: 128x51200x1024 at 6 -> 3 and 128x38400x256 at 4 -> 3 time
+    alike). A long K loop keeps the deepest ring the
+    arena fits (2048x10240x2560 on the 256x128 pair: 1.25 at 8 stages, 0.95
+    at 4)."""
+    view = facts._matmul_config_view(state, dict(values))
+    assert view is not None
+    blocks, mi, ni, ki = view
+    bm, bn, bk = (cast("int", blocks[index]) for index in (mi, ni, ki))
+    rings = len(pipeline_facts.ring_aux_itemsizes)
+    masks = len(pipeline_facts.exact_aux_itemsizes) - rings
+    if (
+        cdiv(k, bk) > _RING_SHORT_K_TILES
+        # a ring-staged operand beside a second exact-shape operand wants the
+        # deep ring on two groups (8192x4096x1024, one subtile ahead: GELU
+        # backward under a dropout mask 133 us on two groups at five stages,
+        # 139 us on three at three; beside a second bf16 operand 140 us
+        # against 161 us)
+        or (rings > 0 and rings + masks > 1)
+        # so does a lone boolean mask (a byte per element on the direct read)
+        # beside no transcendental op (8192x4096x1024: 1.26 at the five
+        # stages the two groups' rings leave, 1.12 at three, 1.10 on three
+        # groups); two masks keep the cap (8192x2048x512 on the 256x128
+        # pair: 1.00 on three groups at four stages, 0.92 on two at eight,
+        # 0.95 on two at four)
+        or (rings == 0 and masks == 1 and not pipeline_facts.epilogue_transcendental)
+        # (the ring default needs an exact-shape operand to prefetch)
+        or rings + masks == 0
+    ):
+        return None
+    stage_bytes = tcgen05_ab_smem_bytes_per_cta(
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        dtype_bytes=pipeline_facts.input_dtype_bytes,
+        ab_stages=1,
+        cluster_m=cast("int", values.get("tcgen05_cluster_m", 1)),
+    )
+    return max(2, _RING_AB_BYTES // stage_bytes)
 
 
 def _one_cta_config(
@@ -606,7 +688,7 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         its runs, ``RadixStoreLayout.one_cta_tile``), the deepest of 64-,
         32- or 16-deep k-blocks dividing K, else 64 (32 below 64); flat with
         two AB stages, the persistent loop with four from eight k-blocks on
-        over whole tiles.
+        over whole tiles, walking the batches slowest (``_batch_slowest``).
 
         The base default ran a 64x16 tile; B200, Inductor corpus, of the ATen
         GEMM (many batches of one or two tiles each): 1024 x 256x64x256
@@ -663,11 +745,19 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             < stages
         ):
             return None
-        return _one_cta_config(
+        config = _one_cta_config(
             block_sizes,
             pid_type="persistent_blocked" if persistent else "flat",
             ab_stages=stages,
         )
+        if persistent:
+            # The persistent CTAs walk the batches slowest, as the pairs do
+            # (``_batch_slowest``): concurrent tiles share one batch's A and
+            # B tiles. B200, of the ATen bmm, 128x64x64 tiles: 512 x
+            # 512x64x512 0.97 -> 1.17, 384 x 512x64x512 0.96 -> 1.10; 64x256
+            # tiles (one M tile per batch) ~8%.
+            return Config(**_batch_slowest(state, config.config))
+        return config
 
     @classmethod
     def _small_matrix_batch_default(cls, env: CompileEnvironment) -> Config | None:
@@ -1250,8 +1340,20 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
                     else TCGEN05_LONG_N_SWEEP_L2_GROUPING,
                 )
             ]
-        if pipeline_facts.epilogue_transcendental:
-            values = cls._transcendental_epilogue_values(env, values)
+        if pipeline_facts.epilogue_transcendental or (
+            # An exact-shape operand read on registers over a short K loop
+            # bounds the pair by its epilogue too (B200, of the ATen GEMM:
+            # 8192x4096x1024 + a boolean mask 1.13 -> 1.26, 8192x2048x512 +
+            # two masks 0.76 -> 0.94); over a long one the AB stages the
+            # second group's rings take cost more (32128x512x8192 + two FP32
+            # operands, one CTA: 0.91 -> 0.85).
+            pipeline_facts.exact_aux_itemsizes
+            and values.get("tcgen05_cluster_m", 1) == 2
+            and values.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+            in (None, TCGEN05_AUX_LOAD_MODE_SIMT)
+            and cdiv(k, bk) <= _REGISTER_OPERAND_MAX_K_TILES
+        ):
+            values = cls._multi_group_epilogue_values(env, values, pipeline_facts, k=k)
         if batch > 1 and values.get("tcgen05_cluster_m", 1) == 2:
             # (ungrouped: this overrides the M-tile grouping chosen above;
             # the small-grid pairs, about one wave, keep their walk)
@@ -1259,20 +1361,30 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         return Config(**values)
 
     @staticmethod
-    def _transcendental_epilogue_values(
-        env: CompileEnvironment, values: dict[str, Any]
+    def _multi_group_epilogue_values(
+        env: CompileEnvironment,
+        values: dict[str, Any],
+        pipeline_facts: Tcgen05PipelineSmemFacts,
+        *,
+        k: int,
     ) -> dict[str, Any]:
-        """Two epilogue warp groups for an epilogue with a transcendental op
-        (``epilogue_transcendental``: erf, exp, tanh, ...), at the deepest AB
-        ring that fits beside their C rings, where the search fixups keep
-        them (the standard static-full TMA-store epilogue).
+        """Two epilogue warp groups for an epilogue that outlasts the tile's
+        MMA -- a transcendental op (``epilogue_transcendental``: erf, exp,
+        tanh, ...), or an exact-shape operand on the register loads over a
+        short K loop (see ``_pick``) -- at the deepest AB ring that fits
+        beside their C rings, where the search fixups keep them (the
+        standard static-full TMA-store epilogue); beside an exact-shape
+        operand, 32-column subtiles whose operand a register ring reads
+        ahead, and over a short K loop the AB ring capped
+        (``_ring_ab_stage_cap``) and a third group
+        (``_SHORT_K_EPI_WARP_GROUPS``).
 
         One warp per scheduler issues the exact erf/exp polynomials one
-        dependent step at a time, so such an epilogue outlasts the tile's
-        MMA; a second group overlaps two subtiles' math. B200, GELU backward
-        (erf, exp), 16384x4096x1024 on the 256x256 pair, of the ATen GEMM:
-        one group 0.33, two 1.02 (ab 6 -> 5; ab 4 1.03, three groups at ab 4
-        0.75, four at ab 3 0.64)."""
+        dependent step at a time, and waits each subtile's operand load; a
+        second group overlaps two subtiles. B200, GELU backward (erf, exp),
+        16384x4096x1024 on the 256x256 pair, of the ATen GEMM, 64-column
+        subtiles without the ring: one group 0.33, two 1.02 (ab 6 -> 5; ab 4
+        1.03, three groups at ab 4 0.75, four at ab 3 0.64)."""
         spec = env.config_spec
         two = {**values, TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY: 2}
         projected = _rendered_values(spec, two)
@@ -1280,4 +1392,80 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             return values
         two["tcgen05_ab_stages"] = projected["tcgen05_ab_stages"]
         two["tcgen05_c_stages"] = projected["tcgen05_c_stages"]
-        return two
+
+        def admitted(
+            candidate: dict[str, Any], groups: int, cap: int | None
+        ) -> dict[str, Any] | None:
+            """``candidate`` at ``groups`` groups with the rings the search
+            fixups keep (the 32-column subtiles, ``pre_acc_wait``, at least
+            one subtile read ahead), its AB ring at most ``cap``; ``None``
+            where they drop any."""
+            candidate = {**candidate, TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY: groups}
+            rendered = _rendered_values(spec, candidate)
+            if not (
+                rendered.get(TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY) == groups
+                and rendered.get(TCGEN05_EPI_SUBTILE_N_CONFIG_KEY)
+                == _PREFETCH_EPI_SUBTILE_N
+                and rendered.get(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY)
+                == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+                and rendered.get(TCGEN05_AUX_PREFETCH_SUBTILES_CONFIG_KEY, 0) >= 1
+            ):
+                return None
+            for key in (TCGEN05_AUX_PREFETCH_SUBTILES_CONFIG_KEY, "tcgen05_c_stages"):
+                candidate[key] = rendered[key]
+            candidate["tcgen05_ab_stages"] = (
+                rendered["tcgen05_ab_stages"]
+                if cap is None
+                else min(rendered["tcgen05_ab_stages"], cap)
+            )
+            return candidate
+
+        # An exact-shape operand the chain reads per subtile: each group's
+        # read of it lands right before its first use, so the transcendental
+        # chain waits a global load per subtile (ncu: the first use of the
+        # loaded operand is the top stall). 32-column subtiles give each
+        # group four of a 256-column tile, and a register ring
+        # (``tcgen05_aux_prefetch_subtiles``) reads them ahead, from before
+        # the accumulator wait: two ahead under two transcendental ops, one
+        # under one or none (a boolean mask, 8192x4096x1024: 1.32 of the ATen
+        # GEMM one ahead, 1.28 unread ahead). B200, of the ATen GEMM, two
+        # groups: GELU backward (erf, exp) 32768x1024x256 0.78 -> 0.93 (a
+        # one-deep ring 0.85, three-deep 0.86), 25216x768x192 (one-CTA
+        # 128x256) 0.76 -> 0.88, 401408x512x128 0.82 -> 0.94, 6272x4096x1024
+        # 0.84 -> 0.95, 8192x4096x1024 0.97 -> 1.04; tanh-GELU backward
+        # 4096x8192x2048 1.23 -> 1.27 one-deep (1.19 two-deep), 8192x3072x768
+        # (256x128) 0.81 -> 0.92; SiLU backward (sigmoid) 32768x384x192 0.71
+        # -> 0.77.
+        ring: dict[str, Any] = {
+            **two,
+            TCGEN05_EPI_SUBTILE_N_CONFIG_KEY: _PREFETCH_EPI_SUBTILE_N,
+            TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY: TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT,
+            # one ahead beside a boolean mask (GELU backward under a dropout
+            # mask, 8192x4096x1024 on two groups: 133 us one ahead, 145 us
+            # two; beside a second bf16 operand instead two ahead keeps
+            # 140 us against 149 us)
+            TCGEN05_AUX_PREFETCH_SUBTILES_CONFIG_KEY: 1
+            if len(pipeline_facts.exact_aux_itemsizes)
+            > len(pipeline_facts.ring_aux_itemsizes)
+            else max(
+                1, min(_PREFETCH_SUBTILES, pipeline_facts.epilogue_transcendental_ops)
+            ),
+        }
+        if admitted(ring, 2, None) is None:
+            return two
+        cap = _ring_ab_stage_cap(spec._cute_tcgen05_config, pipeline_facts, ring, k=k)
+        two_groups = admitted(ring, 2, cap)
+        assert two_groups is not None
+        if cap is None:
+            return two_groups
+        # Where the capped AB ring leaves the MMA idle anyway (a short K
+        # loop: ``_ring_ab_stage_cap``), a third group overlaps a third
+        # subtile's math. B200, of the ATen GEMM, two -> three groups:
+        # GELU backward 25088x2048x512 0.93 -> 1.11, 100352x1024x256 1.00 ->
+        # 1.13, 401408x512x128 0.97 -> 1.14, 32768x1024x256 0.97 -> 1.05,
+        # one-CTA 25216x768x192 0.91 -> 1.00, 256x128 8192x3072x768 0.91 ->
+        # 0.98; SiLU backward 32768x384x192 0.82 -> 1.00. It costs 1-3% where
+        # the MMA weighs more: 16 k-blocks at N=4096 (16384x4096x1024 1.19 ->
+        # 1.16, 8192x4096x1024 1.16 -> 1.15), one-CTA 25216x3072x768 1.10 ->
+        # 1.06. Four groups: 0.89 at 25088x2048x512.
+        return admitted(two_groups, _SHORT_K_EPI_WARP_GROUPS, cap) or two_groups

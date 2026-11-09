@@ -824,7 +824,8 @@ def epilogue_group_search_enabled(state: CuteTcgen05Config) -> bool:
 
     Both act on a heavy epilogue -- several output stores, an exact-shape
     auxiliary read or a transcendental op (whose default runs two groups,
-    ``CuteTcgen05DefaultTileHeuristic._transcendental_epilogue_values``)
+    three over a CTA pair's short K loop,
+    ``CuteTcgen05DefaultTileHeuristic._multi_group_epilogue_values``)
     -- whose per-subtile chain a one-tile per-CTA grid leaves exposed; a
     plain store's search keeps its surface (an explicit config is
     validated everywhere).
