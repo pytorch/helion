@@ -11750,6 +11750,27 @@ class CuteTcgen05Config:
             if key.startswith("tcgen05_") or key == "epilogue_subtile":
                 config.pop(key, None)
 
+    def ungroup_batch_slowest_walk(self, config: dict[str, object]) -> None:
+        """Walk a batch-slowest grid ungrouped: on a batched grid the matmul's
+        L2 grouping groups the batch with the M tiles, so a grouping above 1
+        interleaves two batches' tiles into the walk ``batch_slowest`` orders
+        by batch, as its seeds' ungrouped walk does not (B200, the direct
+        entry over 256 x 512x1024x64 and 512 x 512x512x64: within 2% of the
+        grouping by 2)."""
+        assert self.matmul_block_ids is not None
+        groupings = config.get("l2_groupings")
+        if not isinstance(groupings, list):
+            # A pair seed carries no grouping: the base default's (the
+            # direct entry's 2) would apply under it.
+            groupings = [item._fill_missing() for item in self.config_spec.l2_groupings]
+        index = self.config_spec.l2_groupings.block_id_to_index(
+            self.matmul_block_ids[0]
+        )
+        config["l2_groupings"] = [
+            1 if position == index else value
+            for position, value in enumerate(groupings)
+        ]
+
     def _fix_target1_tvm_ffi_search_config(self, config: dict[str, object]) -> None:
         # The generalized direct-entry seed projects FFI-requesting search
         # candidates onto the validated CtaGroup.TWO envelope for ANY eligible
@@ -11778,6 +11799,7 @@ class CuteTcgen05Config:
                 config[key] = None
             return
         placement = config.get(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY)
+        raster = config.get(TCGEN05_BATCH_RASTER_CONFIG_KEY)
         self._clear_target1_tvm_ffi_promotion_surface(config)
         config.update(seed.config)
         if (
@@ -11787,6 +11809,12 @@ class CuteTcgen05Config:
             # The staged promoted bias row rides the direct entry's own rings
             # (``CuteTcgen05DefaultTileHeuristic._direct_entry_staged_row``).
             config[TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY] = placement
+        if raster is not None and self.matmul_has_leading_passthrough:
+            # A batched direct entry keeps its walk order (the defaults walk
+            # batches slowest, ``_batch_slowest``), ungrouped there.
+            config[TCGEN05_BATCH_RASTER_CONFIG_KEY] = raster
+            if raster == TCGEN05_BATCH_RASTER_SLOWEST:
+                self.ungroup_batch_slowest_walk(config)
 
     def promoted_row_epilogue(self) -> bool:
         """Whether every row-vector operand is a promoted 16-bit row (staged
