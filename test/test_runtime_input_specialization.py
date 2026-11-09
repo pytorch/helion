@@ -513,6 +513,7 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
             reusable_tensor_properties=frozenset(("data_ptr",)),
         )
         env = cast("CompileEnvironment", object.__new__(CompileEnvironment))
+        env.requires_fresh_binding = False
         env.runtime_input_specializations = {key: specialization}
         env.bound_runtime_input_specialization_results = {}
         env._runtime_arg_values_by_name = contextvars.ContextVar(
@@ -742,6 +743,7 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
             bind=lambda _args: replacement,
         )
         bound = cast("Any", object.__new__(BoundKernel))
+        bound._env = SimpleNamespace(requires_fresh_binding=False)
         bound.kernel = kernel
         bound._cache_managed = True
         bound._reset_generation = 1
@@ -759,6 +761,7 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
             _specialization_generation=0,
         )
         bound = cast("Any", object.__new__(BoundKernel))
+        bound._env = SimpleNamespace(requires_fresh_binding=False)
         bound.kernel = kernel
         bound._cache_managed = True
         bound._reset_generation = 0

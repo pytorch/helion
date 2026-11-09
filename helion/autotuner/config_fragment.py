@@ -5,6 +5,7 @@ import dataclasses
 import enum
 import math
 import random
+import struct
 from typing import TYPE_CHECKING
 from typing import Iterable
 from typing import TypeAlias
@@ -610,6 +611,22 @@ class ListOf(ConfigSpecFragment):
         return encoded
 
 
+_BUILTIN_TUNABLE_FRAGMENTS = (
+    BaseIntegerFragment,
+    IntegerFragment,
+    PowerOfTwoFragment,
+    BlockSizeFragment,
+    NumWarpsFragment,
+    BooleanFragment,
+    NumThreadsFragment,
+    EnumFragment,
+)
+
+_FRAGMENT_CHANGED_MESSAGE = (
+    "Config fragment changed during compilation; keep registered domains immutable."
+)
+
+
 def _fragment_domain_fields(
     fragment: ConfigSpecFragment,
 ) -> tuple[tuple[str, object], ...] | None:
@@ -626,19 +643,115 @@ def _fragment_domain_fields(
         )
     if isinstance(fragment, NumThreadsFragment):
         return (("high", fragment.high),)
+    if isinstance(fragment, BooleanFragment):
+        return ()
+    if isinstance(fragment, EnumFragment):
+        return (
+            ("choices", fragment.choices),
+            ("search_choices", fragment.search_choices),
+            ("coverage_choices", fragment.coverage_choices),
+        )
     return None
 
 
+def _plain_builtin_fragment_fields(
+    fragment: ConfigSpecFragment,
+) -> tuple[tuple[str, object], ...] | None:
+    """Complete domain fields for exact built-ins with no extra instance state.
+
+    Unlike persistent fingerprint fields, these fields can replace object
+    equality only when they describe the whole instance. Subclasses and
+    instances with additional state retain their existing equality policy.
+    Values are neither normalized nor copied here.
+    """
+    if type(fragment) not in _BUILTIN_TUNABLE_FRAGMENTS:
+        return None
+    fields = _fragment_domain_fields(fragment)
+    assert fields is not None
+    if set(vars(fragment)) != {name for name, _ in fields}:
+        return None
+    return fields
+
+
+def _plain_builtin_fragment_key(
+    fragment: ConfigSpecFragment,
+    *,
+    resolve: Callable[[object], object] | None = None,
+    for_identity_equality: bool = False,
+) -> Hashable | None:
+    """Canonical concrete domain shared by binding, revisits and constexpr keys.
+
+    A revisit may resolve a recorded literal before registration snapshots it.
+    Other callers already have concrete fields. Extra state and subclasses
+    continue to use their own equality rather than this value key. Identity
+    equality replacement is limited to the two built-ins without value equality
+    and their original concrete domains; constexpr keys encode all plain fields.
+    """
+    if for_identity_equality and type(fragment) not in (
+        BooleanFragment,
+        NumThreadsFragment,
+    ):
+        return None
+    fields = _plain_builtin_fragment_fields(fragment)
+    if fields is None:
+        return None
+    if resolve is not None:
+        fields = tuple((name, resolve(value)) for name, value in fields)
+    if (
+        for_identity_equality
+        and type(fragment) is NumThreadsFragment
+        and type(fields[0][1]) is not int
+    ):
+        return None
+    return _immutable_fragment_key(fields)
+
+
 def _scalar_fragment_key(value: object) -> Hashable | None:
-    """Exact built-in scalar type and value, including a float's zero sign."""
+    """Exact scalar type and value, including float zero signs and NaN bits."""
     kind = type(value)
     if kind in (bool, int):
         return kind, value
     if kind is float:
-        return float, cast("float", value).hex()
+        value = cast("float", value)
+        # hex() erases NaN signs and payloads. Keep all other encodings stable.
+        return float, struct.pack("!d", value) if math.isnan(value) else value.hex()
     return None
 
 
 def _same_scalar(left: object, right: object) -> bool:
     key = _scalar_fragment_key(left)
     return key is not None and key == _scalar_fragment_key(right)
+
+
+def _immutable_fragment_key(value: object) -> Hashable | None:
+    """Encode only plain immutable metadata; never retain opaque objects."""
+    kind = type(value)
+    if value is None:
+        return (type(None),)
+    if kind in (bool, int, float):
+        return _scalar_fragment_key(value)
+    if kind is str:
+        return str, value
+    if kind in (tuple, list):
+        result: list[Hashable] = []
+        for item in cast("tuple[object, ...] | list[object]", value):
+            key = _immutable_fragment_key(item)
+            if key is None:
+                return None
+            result.append(key)
+        return kind, tuple(result)
+    if kind is dict:
+        entries: list[tuple[str | int, Hashable]] = []
+        for item, field in cast("dict[object, object]", value).items():
+            if type(item) not in (str, int):
+                return None
+            key = _immutable_fragment_key(field)
+            if key is None:
+                return None
+            entries.append((cast("str | int", item), key))
+        try:
+            entries.sort()
+        except TypeError:
+            return None
+        return dict, tuple(entries)
+    return None

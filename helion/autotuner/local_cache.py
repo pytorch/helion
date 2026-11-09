@@ -14,6 +14,7 @@ from pathlib import Path
 import platform
 import textwrap
 from typing import TYPE_CHECKING
+from typing import cast
 import uuid
 
 import torch
@@ -29,6 +30,8 @@ from .accuracy import keyable_accuracy_check
 from .base_cache import AutotuneCacheBase
 from .base_cache import LooseAutotuneCacheKey
 from .base_cache import StrictAutotuneCacheKey
+from .base_cache import _requires_uncached_tuning
+from .base_cache import _UncachedAutotuneCache
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -250,7 +253,26 @@ class LocalAutotuneCache(AutotuneCacheBase):
     which takes into account device and source code properties, but does
     not account for library level code changes such as Triton, Helion or
     PyTorch. Use StrictLocalAutotuneCache to consider these properties.
+
+    Direct construction of either built-in local cache uses uncached trial
+    orchestration for bindings that require a fresh frontend trace, just like
+    Cache[Search]. Custom subclasses retain their own constructor behavior.
     """
+
+    def __new__(
+        cls, *args: object, **kwargs: object
+    ) -> LocalAutotuneCache | _UncachedAutotuneCache:
+        if cls is LocalAutotuneCache or cls is StrictLocalAutotuneCache:
+            autotuner = cast(
+                "BaseSearch | None", args[0] if args else kwargs.get("autotuner")
+            )
+            if autotuner is not None and _requires_uncached_tuning(
+                autotuner.kernel, autotuner.args
+            ):
+                return cast(
+                    "Callable[..., _UncachedAutotuneCache]", _UncachedAutotuneCache
+                )(*args, **kwargs)
+        return super().__new__(cls)
 
     def __init__(
         self,
@@ -401,14 +423,6 @@ class LocalAutotuneCache(AutotuneCacheBase):
         data["flat_config"] = json.dumps(config_gen.flatten(config))
 
         backend_cache_key = self.kernel.backend_cache_key(config)
-        if backend_cache_key is None:
-            # Config may have been minimized (default values stripped),
-            # so it won't match the full config in _compile_cache.
-            # Expand it back by merging with defaults.
-            default = self.kernel.config_spec.default_config()
-            # pyrefly: ignore [bad-argument-type]
-            full_config = Config(**(default.config | config.config))
-            backend_cache_key = self.kernel.backend_cache_key(full_config)
         if backend_cache_key is not None:
             data["backend_cache_key"] = backend_cache_key
 
@@ -479,7 +493,10 @@ def stable_autotune_hash(autotuner: BaseSearch) -> str | None:
     try:
         if not autotuner.kernel.is_cacheable():
             return None
-        return LocalAutotuneCache(autotuner)._generate_key().stable_hash()
+        cache = LocalAutotuneCache(autotuner)
+        if isinstance(cache, _UncachedAutotuneCache):
+            return None
+        return cache._generate_key().stable_hash()
     except Exception:
         log.debug("Could not compute autotune cache hash", exc_info=True)
         return None

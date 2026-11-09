@@ -22,6 +22,20 @@ from helion._testing import skipIfXPU
 import helion.language as hl
 
 
+@helion.kernel(autotune_effort="none")
+def constexpr_integer_fill(out: torch.Tensor, value: hl.constexpr) -> torch.Tensor:
+    for tile in hl.tile(out.numel()):
+        out[tile] = hl.full([tile], value, dtype=out.dtype)
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def runtime_integer_fill(out: torch.Tensor, value: float) -> torch.Tensor:
+    for tile in hl.tile(out.numel()):
+        out[tile] = hl.full([tile], value, dtype=out.dtype)
+    return out
+
+
 @helion.kernel(static_shapes=False, autotune_effort="none")
 def scalar_arith(x: torch.Tensor, scale: float) -> torch.Tensor:
     m, n = x.shape
@@ -89,6 +103,41 @@ def _scalar_arith_reference(x: torch.Tensor, scale: float) -> torch.Tensor:
 
 @onlyBackends(["triton", "cute"])
 class TestScalarFloatOpmath(TestCase):
+    @onlyBackends(["triton"])
+    def test_integer_fill_preserves_python_scalar_conversion(self) -> None:
+        # Fractional truncation, bool truth conversion, float32 precision, and
+        # float64 integer precision each need a distinct boundary witness.
+        for value, dtype in (
+            (0.5, torch.int32),
+            (-2.75, torch.int32),
+            (16777217.0, torch.int64),
+            (2**53 + 1, torch.int64),
+            (2**63 - 1, torch.int64),
+            (0.5, torch.bool),
+            (-0.0, torch.bool),
+            (float("nan"), torch.bool),
+        ):
+            with self.subTest(value=value, dtype=dtype):
+                out = torch.empty(33, device=DEVICE, dtype=dtype)
+                bound = constexpr_integer_fill.bind((out, value))
+                result = bound.compile_config(helion.Config(block_sizes=[32]))(
+                    out, value
+                )
+                torch.testing.assert_close(
+                    result, torch.full_like(out, value), rtol=0, atol=0
+                )
+
+    @onlyBackends(["triton"])
+    def test_integer_fill_runtime_scalar(self) -> None:
+        out = torch.empty(33, device=DEVICE, dtype=torch.int32)
+        bound = runtime_integer_fill.bind((out, 0.5))
+        compiled = bound.compile_config(helion.Config(block_sizes=[32]))
+        for value in (0.5, -2.75, 0.5):
+            with self.subTest(value=value):
+                torch.testing.assert_close(
+                    compiled(out, value), torch.full_like(out, value), rtol=0, atol=0
+                )
+
     def test_scalar_stays_float32_in_half_math(self) -> None:
         """Each op rounds only its result to the 16-bit dtype, bit for bit
         like eager, both for ``1.0 / n`` and for a float kernel argument."""

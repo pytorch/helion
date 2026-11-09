@@ -6,7 +6,6 @@ from typing import TypeVar
 
 import sympy
 import torch
-from torch._inductor.codegen.simd import constant_repr
 from torch.fx import has_side_effect
 from torch.fx.experimental.sym_node import SymNode
 
@@ -68,7 +67,28 @@ def _(state: CodegenState) -> ast.AST:
 
     assert isinstance(val, (torch.SymInt, torch.SymFloat, torch.SymBool)), val
     sym_expr = _val_to_sympy(val)
-    origin_info = HostFunction.current().expr_to_origin.get(sym_expr)
+    host = HostFunction.current()
+    origins = host.expr_to_origin
+    origin_info = origins.get(sym_expr)
+    # A nested graph can import a scalar registered in an outer device loop.
+    # It has config provenance, but no replayable host origin. Preserve its
+    # selected value and Python type instead of inventing a runtime argument.
+    if origin_info is None:
+        resolved = host.resolve_tunable_expr(sym_expr, state.config)
+        if isinstance(resolved, (int, float, bool)):
+            return expr_from_string(
+                CompileEnvironment.current().backend.scalar_literal_expr(resolved)
+            )
+        if resolved != sym_expr:
+            sym_expr = resolved
+            if not sym_expr.free_symbols:
+                # An integral zero can cancel the remaining runtime symbols.
+                # Retain the original expression's scalar type in that case.
+                selected = val.node.pytype(sym_expr)
+                return expr_from_string(
+                    CompileEnvironment.current().backend.scalar_literal_expr(selected)
+                )
+            origin_info = origins.get(sym_expr)
 
     if origin_info is not None and isinstance(origin_info.origin, BlockSizeOrigin):
         block_size_var = state.device_function.block_size_var(
@@ -113,10 +133,9 @@ def _(state: CodegenState) -> ast.AST:
     assert isinstance(dtype, torch.dtype)
     assert state.fx_node is not None
     shape = ["1"] * state.fx_node.meta["val"].ndim
+    backend = CompileEnvironment.current().backend
     return expr_from_string(
-        CompileEnvironment.current().backend.full_expr(
-            shape, constant_repr(value), dtype
-        )
+        backend.full_expr(shape, backend.scalar_literal_expr(value), dtype)
     )
 
 

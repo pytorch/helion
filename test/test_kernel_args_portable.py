@@ -349,6 +349,58 @@ def test_setup_serializes_callable_args_for_the_subprocess() -> None:
         provider._precompile_tmpdir.cleanup()
 
 
+def test_setup_preserves_mixed_dtype_storage_in_args_outputs_and_closures() -> None:
+    allocation = torch.arange(256, dtype=torch.uint8)
+    cache = allocation.view(torch.int8).as_strided((4, 16), (32, 1), 8)
+    scales = allocation.as_strided((4, 4), (32, 2), 24)
+    epilogue = _make_closure(scales, 1.0, 1.0)
+    args = (cache, scales, cache, epilogue)
+    provider = _provider_for_setup(args)
+    provider._baseline_output = (cache, scales)
+    provider._baseline_post_args = args
+    provider.mutated_arg_indices = [0]
+    provider.setup()
+    try:
+        assert not provider._args_unpicklable
+        assert provider._precompile_args_path is not None
+        assert provider._precompile_baseline_path is not None
+        assert provider._precompile_baseline_post_args_path is not None
+        for path, loader, expected_length in (
+            (provider._precompile_args_path, kernel_args.load_trusted_kernel_args, 4),
+            (
+                provider._precompile_baseline_path,
+                benchmark_job._load_trusted_baseline_output,
+                2,
+            ),
+            (
+                provider._precompile_baseline_post_args_path,
+                benchmark_job._load_trusted_baseline_output,
+                4,
+            ),
+        ):
+            loaded = loader(path)
+            assert len(loaded) == expected_length
+            for original, restored in zip(args[:expected_length], loaded, strict=True):
+                if isinstance(original, torch.Tensor):
+                    torch.testing.assert_close(original, restored)
+                    assert restored.stride() == original.stride()
+                    assert restored.storage_offset() == original.storage_offset()
+            assert (
+                loaded[0].untyped_storage()._cdata == loaded[1].untyped_storage()._cdata
+            )
+            if expected_length == 4:
+                assert loaded[0] is loaded[2]
+                # The closure must refer to the very same restored scale tensor.
+                assert any(
+                    cell.cell_contents is loaded[1] for cell in loaded[3].__closure__
+                )
+        provider.log.warning.assert_not_called()
+    finally:
+        kernel_args.load_trusted_kernel_args.cache_clear()
+        benchmark_job._load_trusted_baseline_output.cache_clear()
+        provider._precompile_tmpdir.cleanup()
+
+
 def test_setup_serializes_the_baseline_post_args_of_a_mutating_kernel() -> None:
     # An in-place kernel with an epilogue (``matmul(x, y, out, epilogue=...)``):
     # the baseline's post-call arguments hold the same function leaf as the

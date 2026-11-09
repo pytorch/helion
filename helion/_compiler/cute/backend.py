@@ -27,6 +27,7 @@ import contextlib
 import functools
 import hashlib
 from itertools import starmap
+import math
 import operator
 import os
 import re
@@ -140,6 +141,10 @@ if TYPE_CHECKING:
 
 # Integer dtypes narrower than the Int32 the DSL gives a Python int.
 _NARROW_INTEGER_DTYPES = (torch.int8, torch.int16, torch.uint8)
+
+
+def _is_negative_zero(value: float | bool) -> bool:
+    return type(value) is float and value == 0.0 and math.copysign(1.0, value) < 0
 
 
 def validate_thread_axis_accesses(statements: Sequence[ast.AST]) -> None:
@@ -2709,19 +2714,11 @@ class CuteBackend(Backend):
         compile-cache entries are kept so the winner launches without
         recompiling.
         """
-        from ...runtime.config import Config
-
-        compiled_fn = bound_kernel._compile_cache.get(config)
-        if compiled_fn is None:
-            # The autotuner may return a minimized config (default values
-            # stripped); the compiled entry is keyed by the full config.
-            default = bound_kernel.config_spec.default_config()
-            # pyrefly: ignore [bad-argument-type]
-            full_config = Config(**(default.config | config.config))
-            compiled_fn = bound_kernel._compile_cache.get(full_config)
-        if compiled_fn is None:
-            return
-        kernels = self._compiled_kernels(compiled_fn, bound_kernel.kernel.name)
+        kernels = tuple(
+            kernel
+            for _, compiled_fn in bound_kernel._matching_compiled_configs(config)
+            for kernel in self._compiled_kernels(compiled_fn, bound_kernel.kernel.name)
+        )
         if not kernels:
             return
         device_index = (
@@ -3097,6 +3094,10 @@ class CuteBackend(Backend):
                     return CuteDSLOpOverrides._cast_expr(repr(value), dtype)
                 if keeps_negative_nan_literal(value):
                     return "-float('nan')"
+                if _is_negative_zero(value):
+                    return CuteDSLOpOverrides._cast_expr(
+                        self.scalar_literal_expr(value), dtype
+                    )
                 return CuteDSLOpOverrides.constant(value, dtype)
 
             @staticmethod
@@ -3487,6 +3488,13 @@ class CuteBackend(Backend):
                 ):
                     return x
         return super().cast_ast(x, target_dtype)
+
+    def scalar_literal_expr(self, value: float | bool) -> str:
+        if _is_negative_zero(value):
+            # SDK arith.const caches by Python equality, aliasing +/-0. Emit
+            # the sign bit as an integer so no negative float enters that cache.
+            return "cutlass.Int32(-2147483648).bitcast(cutlass.Float32)"
+        return super().scalar_literal_expr(value)
 
     def scalar_float_operand_ast(
         self, x: ast.AST, value: torch.SymFloat, *, computes_in_float64: bool

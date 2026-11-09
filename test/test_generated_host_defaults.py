@@ -20,6 +20,7 @@ from helion._testing import import_path
 from helion._testing import matchesBackends
 from helion._testing import skipIfMetal
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.tunable_fragments import load_host_function
 from helion._testing.tunable_fragments import pallas_host_observer
 from helion.autotuner import EnumFragment
 from helion.autotuner.base_search import BaseSearch
@@ -56,6 +57,122 @@ def load_standalone(tmp_path):
 
 
 DEFAULT_CALLS = []
+
+
+@helion.kernel(autotune_effort="none")
+def _return_constexpr(x, value: hl.constexpr):
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        out[tile] = x[tile]
+    return out, value
+
+
+def _float_bits(value):
+    return struct.pack("!d", value).hex()
+
+
+@pytest.mark.parametrize(
+    "bits",
+    [
+        "7ff0000000000000",
+        "fff0000000000000",
+        "7ff8000000000001",
+        "fff8000000000002",
+        "7ff0000000000001",
+    ],
+)
+def test_nonfinite_constexpr_host_output_preserves_bits(bits):
+    value = struct.unpack("!d", bytes.fromhex(bits))[0]
+    tensor = torch.ones(8)
+    with cpu_render_target():
+        bound = cpu_bind(_return_constexpr, (tensor, value))
+        entry = load_host_function(
+            bound, bound.config_spec.default_config(), lambda *args, **kwargs: None
+        )
+        out, actual = entry(tensor, value)
+    assert out.shape == tensor.shape
+    assert _float_bits(actual) == bits
+
+
+@pytest.mark.parametrize("container", [tuple, list, dict])
+def test_nested_nonfinite_constexpr_host_output(container):
+    bits = "fff8000000000042"
+    nan = struct.unpack("!d", bytes.fromhex(bits))[0]
+    values = (nan, float("inf"), float("-inf"), -0.0)
+    nested = dict(enumerate(values)) if container is dict else container(values)
+    value = (nested, (nan,))
+    tensor = torch.ones(8)
+    with cpu_render_target():
+        bound = cpu_bind(_return_constexpr, (tensor, value))
+        entry = load_host_function(
+            bound, bound.config_spec.default_config(), lambda *args, **kwargs: None
+        )
+        _, actual = entry(tensor, value)
+    assert type(actual) is tuple
+    assert type(actual[0]) is container
+    leaves = actual[0].values() if container is dict else actual[0]
+    assert sorted(map(_float_bits, leaves)) == sorted(map(_float_bits, values))
+    assert _float_bits(actual[1][0]) == bits
+
+
+@pytest.mark.parametrize("container", [None, tuple])
+def test_nonfinite_constexpr_cached_bind_preserves_selected_bits(container):
+    kernel = helion.kernel(_return_constexpr.fn, autotune_effort="none")
+    tensor = torch.ones(8)
+    seen = {}
+    # Equal payloads must reuse, changed sign/payload must bind independently,
+    # and returning to the first value must reuse its original specialization.
+    with cpu_render_target():
+        for bits in (
+            "7ff8000000000001",
+            "7ff8000000000001",
+            "fff8000000000002",
+            "7ff8000000000001",
+        ):
+            nan = struct.unpack("!d", bytes.fromhex(bits))[0]
+            value = nan if container is None else container((nan,))
+            bound = kernel.bind((tensor, value))
+            if bits not in seen:
+                assert all(bound is not old for old, _ in seen.values())
+                entry = load_host_function(
+                    bound,
+                    bound.config_spec.default_config(),
+                    lambda *args, **kwargs: None,
+                )
+                seen[bits] = bound, entry
+            old, entry = seen[bits]
+            assert bound is old
+            _, actual = entry(tensor, value)
+            if container is not None:
+                actual = next(iter(actual))
+            assert _float_bits(actual) == bits
+
+
+@pytest.mark.parametrize("container", [set, frozenset])
+def test_nonfinite_constexpr_keeps_unsupported_container_refusal(container):
+    with cpu_render_target(), pytest.raises(helion.exc.UnsupportedPythonType):
+        cpu_bind(_return_constexpr, (torch.ones(8), container((float("nan"),))))
+
+
+@pytest.mark.parametrize("value", [-0.0, (1.5, [2, "nan"], {"x": -0.0})])
+def test_finite_constexpr_host_literal_is_unchanged(value):
+    tensor = torch.ones(8)
+    with cpu_render_target():
+        bound = cpu_bind(_return_constexpr, (tensor, value))
+        source = bound.to_code(bound.config_spec.default_config())
+    host = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == _return_constexpr.name
+    )
+    returned = next(
+        node.value for node in ast.walk(host) if isinstance(node, ast.Return)
+    )
+    assert isinstance(returned, ast.Tuple)
+    assert ast.dump(returned.elts[1]) == ast.dump(
+        ast.parse(repr(value), mode="eval").body
+    )
+    assert "import struct" not in source
 
 
 def _make_default():
@@ -369,6 +486,92 @@ def test_raw_source_preserves_complex_literal_default(value):
         assert default.imag.hex() == value.imag.hex()
 
 
+def _default_float_bits(value):
+    if type(value) is tuple:
+        return tuple(map(_default_float_bits, value))
+    if type(value) is complex:
+        return complex, _float_bits(value.real), _float_bits(value.imag)
+    assert type(value) is float
+    return float, _float_bits(value)
+
+
+# These axes interact: every signed quiet/signaling NaN or infinity must survive
+# each signature container and both independent host emitters. Pairwise cases
+# could miss a bit pattern canonicalized only in one container/emitter route.
+@pytest.mark.parametrize(
+    "bits",
+    [
+        "7ff8000000000042",
+        "fff8000000000043",
+        "7ff0000000000001",
+        "fff0000000000001",
+        "7ff0000000000000",
+        "fff0000000000000",
+    ],
+)
+@pytest.mark.parametrize("form", ["float", "tuple", "complex"])
+@pytest.mark.parametrize("standalone", [False, True])
+def test_raw_nonfinite_defaults_preserve_bits(bits, form, standalone, load_standalone):
+    if standalone and matchesBackends(["metal"]):
+        pytest.skip("Metal does not support dependency-free export")
+    value = struct.unpack("!d", bytes.fromhex(bits))[0]
+    if form == "complex":
+        value = complex(value, value)
+    elif form == "tuple":
+        value = (value, (complex(-0.0, value), value))
+    expected = _default_float_bits(value)
+    original = _complex_default.fn
+    fn = FunctionType(
+        original.__code__, original.__globals__, original.__name__, (value,)
+    )
+    tensor = torch.empty(17)
+    with (
+        cpu_render_target(),
+        patch(
+            "torch.cuda.get_device_properties",
+            return_value=SimpleNamespace(multi_processor_count=148),
+        ),
+    ):
+        kernel = helion.kernel(fn, autotune_effort="none")
+        # The explicitly bound scalar is unused. This tests the raw exported
+        # Python signature, without extending complex input tracing or attaching
+        # evaluated defaults through compile_config's private wrapper.
+        bound = kernel.bind((tensor, 0.0))
+        source = bound.to_code(
+            options=helion.OutputCodeOptions(allow_helion_deps=not standalone)
+        )
+        module = load_standalone(source) if standalone else PyCodeCache.load(source)
+        entry = getattr(module, kernel.name)
+        arguments = inspect.signature(entry).bind(tensor)
+        arguments.apply_defaults()
+        assert _default_float_bits(arguments.arguments["unused"]) == expected
+        if not standalone:
+            assert entry(tensor, _launcher=lambda *args, **kwargs: None) is tensor
+
+
+@helion.kernel(autotune_effort="none")
+def _float_unpack(x, value: hl.constexpr = 0.0):
+    for tile in hl.tile(x.numel()):
+        x[tile] = x[tile]
+    return x, value
+
+
+def test_nonfinite_literal_import_does_not_shadow_kernel_name():
+    value = struct.unpack("!d", bytes.fromhex("7ff8000000000042"))[0]
+    original = _float_unpack.fn
+    fn = FunctionType(
+        original.__code__, original.__globals__, original.__name__, (value,)
+    )
+    tensor = torch.ones(8)
+    with cpu_render_target():
+        kernel = helion.kernel(fn, autotune_effort="none")
+        bound = kernel.bind((tensor, value))
+        entry = getattr(PyCodeCache.load(bound.to_code()), kernel.name)
+        _, actual = entry(tensor, _launcher=lambda *args, **kwargs: None)
+        assert _float_bits(actual) == _float_bits(value)
+        assert _float_bits(entry.__defaults__[0]) == _float_bits(value)
+
+
 def test_tuple_with_mutable_element_remains_explicit_in_raw_source():
     tensor = torch.empty(17)
     original = _tuple_default.fn
@@ -488,67 +691,3 @@ def test_direct_search_preserves_multi_shape_carrier_and_provider():
             )
         finally:
             search.benchmark_provider.cleanup()
-
-
-def _float_bits(value):
-    return struct.pack("!d", value).hex()
-
-
-def _default_float_bits(value):
-    if type(value) is tuple:
-        return tuple(map(_default_float_bits, value))
-    if type(value) is complex:
-        return complex, _float_bits(value.real), _float_bits(value.imag)
-    assert type(value) is float
-    return float, _float_bits(value)
-
-
-@pytest.mark.parametrize(
-    "bits",
-    [
-        "7ff8000000000042",
-        "fff8000000000043",
-        "7ff0000000000001",
-        "fff0000000000001",
-        "7ff0000000000000",
-        "fff0000000000000",
-    ],
-)
-@pytest.mark.parametrize("form", ["float", "tuple", "complex"])
-@pytest.mark.parametrize("standalone", [False, True])
-def test_raw_nonfinite_defaults_preserve_bits(bits, form, standalone, load_standalone):
-    if standalone and matchesBackends(["metal"]):
-        pytest.skip("Metal does not support dependency-free export")
-    value = struct.unpack("!d", bytes.fromhex(bits))[0]
-    if form == "complex":
-        value = complex(value, value)
-    elif form == "tuple":
-        value = (value, (complex(-0.0, value), value))
-    expected = _default_float_bits(value)
-    original = _complex_default.fn
-    fn = FunctionType(
-        original.__code__, original.__globals__, original.__name__, (value,)
-    )
-    tensor = torch.empty(17)
-    with (
-        cpu_render_target(),
-        patch(
-            "torch.cuda.get_device_properties",
-            return_value=SimpleNamespace(multi_processor_count=148),
-        ),
-    ):
-        kernel = helion.kernel(fn, autotune_effort="none")
-        # The explicitly bound scalar is unused. This tests the raw exported
-        # Python signature, without extending complex input tracing or attaching
-        # evaluated defaults through compile_config's private wrapper.
-        bound = kernel.bind((tensor, 0.0))
-        source = bound.to_code(
-            options=helion.OutputCodeOptions(allow_helion_deps=not standalone)
-        )
-        module = load_standalone(source) if standalone else PyCodeCache.load(source)
-        entry = getattr(module, kernel.name)
-        arguments = inspect.signature(entry).bind(tensor)
-        arguments.apply_defaults()
-        assert _default_float_bits(arguments.arguments["unused"]) == expected
-        if not standalone:
-            assert entry(tensor, _launcher=lambda *args, **kwargs: None) is tensor

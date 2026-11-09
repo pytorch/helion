@@ -16,6 +16,7 @@ from typing import cast
 import unittest
 from unittest.mock import patch
 
+import pytest
 import sympy
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -14007,6 +14008,7 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("argreduce_valid_smem", emitted)
         self.assertIn("_cute_argreduce_index", emitted)
 
+    @pytest.mark.cpu_only
     def test_triton_argreduce_supports_dim_none_keepdim(self) -> None:
         graph = Graph()
         inp = graph.placeholder("inp")
@@ -14028,7 +14030,11 @@ class TestCuteLowerings(unittest.TestCase):
         emitted = ast.unparse(result)
         self.assertIn("tl.reshape(x, [16])", emitted)
         self.assertIn("axis=0", emitted)
-        self.assertIn("tl.full([1, 1]", emitted)
+        self.assertEqual(
+            emitted,
+            "helion_triton_helpers.integer_full([1, 1], "
+            "tl.argmax(tl.reshape(x, [16]), axis=0).to(tl.int64), tl.int64)",
+        )
 
     def test_triton_argreduce_preserves_keepdim(self) -> None:
         graph = Graph()

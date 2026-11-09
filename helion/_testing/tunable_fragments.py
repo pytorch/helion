@@ -8,16 +8,29 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 from typing import cast
+from unittest.mock import patch
 
 import torch
 
+from .._compiler.inductor_lowering import APIFuncLowering
+from ..autotuner.config_fragment import ConfigSpecFragment
+from ..language.tunable_ops import _get_tunable
 import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from .._compiler.aten_lowering import LoweringContext
     from ..runtime.config import Config
     from ..runtime.kernel import BoundKernel
+
+
+class IdentityFragment(ConfigSpecFragment):
+    def __init__(self, value: float | bool = 3) -> None:
+        self.value = value
+
+    def default(self) -> int | float | bool:
+        return self.value
 
 
 def host_functions(
@@ -32,6 +45,22 @@ def _host_functions(
     functions = [node for node in module.body if isinstance(node, ast.FunctionDef)]
     host = next(node for node in functions if node.name == name)
     return host, functions
+
+
+def host_assignment_values(
+    bound: BoundKernel[object], config: Config, *names: str
+) -> list[ast.expr]:
+    """Read selected-value assignments from the emitted host function."""
+    host, _ = host_functions(bound, config)
+    return [
+        node.value
+        for node in ast.walk(host)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id in names
+            for target in node.targets
+        )
+    ]
 
 
 def load_host_function(
@@ -143,3 +172,78 @@ def pallas_host_observer(observer: Callable[..., None]) -> Callable[..., object]
         return outputs or None
 
     return launch
+
+
+def check_host_selected_value(
+    bound: BoundKernel[object],
+    args: Sequence[object],
+    values: Sequence[int | float | bool],
+) -> None:
+    for value in values:
+        config = bound.config_spec.default_config()
+        config.config["value"] = value
+        launches = []
+
+        def observe_launch(
+            kernel: object,
+            grid: object,
+            x: torch.Tensor,
+            out: torch.Tensor,
+            *selected: float | bool,
+            records: list[tuple[int | float | bool, ...]] = launches,
+            expected: float | bool = value,
+            **kwargs: object,
+        ) -> None:
+            records.append(selected)
+            assert selected
+            assert all(
+                type(item) is type(expected) and item == expected for item in selected
+            )
+
+        # Execute actual emitted host selection and argument publication,
+        # replacing only the native launch. Both declarations select the same
+        # typed value, whether the launcher combines or separates their inputs.
+        load_host_function(bound, config, observe_launch)(*args)
+        assert len(launches) == 1
+
+
+def single_tunable_value(
+    bound: BoundKernel[object], name: str
+) -> torch.SymInt | torch.SymFloat | torch.SymBool:
+    """Require one symbolic value despite repeated visits to a declaration."""
+    (value,) = [
+        value
+        for (registered_name, _), value in bound.env.tunable_values.items()
+        if registered_name == name
+    ]
+    return value
+
+
+def render_tunable_config(
+    bound: BoundKernel[object], name: str, value: float | bool
+) -> str:
+    """Render a config and check the real lowering emits its typed constant."""
+    original = APIFuncLowering.codegen
+    emitted: list[object] = []
+
+    def observe(
+        self: APIFuncLowering, ctx: LoweringContext, node: torch.fx.Node
+    ) -> object:
+        result = original(self, ctx, node)
+        if node.target is _get_tunable and node.args == (name,):
+            emitted.append(result)
+        return result
+
+    config = bound.config_spec.default_config()
+    config.config[name] = value
+    with patch.object(APIFuncLowering, "codegen", observe):
+        source = bound.to_code(config)
+    assert emitted
+    assert all(
+        isinstance(result, ast.Constant)
+        and type(result.value) is type(value)
+        and result.value == value
+        for result in emitted
+    )
+    ast.parse(source)
+    return source

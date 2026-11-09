@@ -1,13 +1,109 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Iterator
 from collections.abc import Mapping
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import struct
+from typing import Hashable
 from typing import Literal
+from typing import TypeVar
 from typing import cast
 import uuid
+
+
+@dataclass(frozen=True, eq=False)
+class _ConfigObjectIdentity:
+    value: object
+
+    def __hash__(self) -> int:
+        return id(self.value)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _ConfigObjectIdentity) and self.value is other.value
+
+
+def _config_value_key(value: object) -> Hashable:
+    """In-memory identity for values that may affect generated code.
+
+    Preserve order in mappings and bits in floating-point values. Hashable
+    opaque objects retain their equality contract: this includes complex
+    numbers, frozensets, and numeric types that are not Python float subclasses.
+    Unhashable list and dict subclasses use identity plus their contents:
+    sharing less is safer than
+    dropping their custom equality or invoking arbitrary copy hooks. As with
+    other opaque tunables, mutation of custom attributes or external state is
+    outside the cache contract.
+    """
+    kind = type(value)
+    if kind is float:
+        return kind, struct.pack("!d", cast("float", value))
+    if isinstance(value, float):
+        return kind, struct.pack("!d", value), value
+    if kind in (list, tuple):
+        return kind, tuple(
+            _config_value_key(item)
+            for item in cast("list[object] | tuple[object, ...]", value)
+        )
+    if kind in (dict, OrderedDict):
+        return kind, tuple(
+            (_config_value_key(key), _config_value_key(item))
+            for key, item in cast("dict[object, object]", value).items()
+        )
+    if kind.__hash__ is None:
+        if isinstance(value, list):
+            return (
+                kind,
+                _ConfigObjectIdentity(value),
+                tuple(_config_value_key(item) for item in value),
+            )
+        if isinstance(value, dict):
+            return (
+                kind,
+                _ConfigObjectIdentity(value),
+                tuple(
+                    (_config_value_key(key), _config_value_key(item))
+                    for key, item in value.items()
+                ),
+            )
+    return kind, cast("Hashable", value)
+
+
+def _config_key(config: Config) -> Hashable:
+    """Ignore option order; preserve code-relevant identity within each value."""
+    return frozenset(
+        (name, _config_value_key(value)) for name, value in config.config.items()
+    )
+
+
+_ConfigValue = TypeVar("_ConfigValue")
+
+
+def _copy_config_structure(value: _ConfigValue) -> _ConfigValue:
+    """Copy known config containers while preserving opaque leaf objects."""
+    if type(value) is OrderedDict:
+        return cast(
+            "_ConfigValue",
+            OrderedDict(
+                (key, _copy_config_structure(item)) for key, item in value.items()
+            ),
+        )
+    if type(value) is dict:
+        return cast(
+            "_ConfigValue",
+            {key: _copy_config_structure(item) for key, item in value.items()},
+        )
+    if type(value) is list:
+        return cast("_ConfigValue", [_copy_config_structure(item) for item in value])
+    if type(value) is tuple:
+        return cast(
+            "_ConfigValue", tuple(_copy_config_structure(item) for item in value)
+        )
+    return value
+
 
 IndexingLiteral = Literal["pointer", "tensor_descriptor", "block_ptr"]
 PidTypeLiteral = Literal[
@@ -402,8 +498,8 @@ class Config(Mapping[str, object]):
         """
         Return a new Config with values matching effective defaults removed.
 
-        This produces a minimal config representation by removing any values
-        that match what the config_spec would use as defaults.
+        Matching defaults are removed only when normalization preserves the
+        selected config. Dependent or unprovable forms retain their fields.
 
         Args:
             config_spec: The ConfigSpec that defines the defaults for this kernel.
@@ -411,23 +507,62 @@ class Config(Mapping[str, object]):
         Returns:
             A new Config with default values removed.
         """
+        from ..autotuner.config_fragment import _plain_builtin_fragment_key
         from ..autotuner.config_spec import ConfigSpec
+        from ..exc import InvalidConfig
 
         assert isinstance(config_spec, ConfigSpec)
         default_config = config_spec.default_config()
 
-        # block_sizes is always required and must never be removed
-        required_keys = {"block_sizes"}
+        # Arbitrary default protocols may have side effects. Keep explicit
+        # custom values while minimizing the independent schedule fields.
+        custom_keys = {
+            key
+            for key, fragment in config_spec.user_defined_tunables.items()
+            if _plain_builtin_fragment_key(fragment) is None
+        }
+        if not custom_keys.issubset(self.config):
+            # Proving an omitted custom value would call its default again.
+            return Config.from_dict(self.config)
+        required_keys = {"block_sizes"} | custom_keys
 
         minimal: dict[str, object] = {}
         for key, value in self.config.items():
             # Keep value if it differs from the default or is required
             default_value = default_config.config.get(key)
-            if value != default_value or key in required_keys:
+            if (
+                _config_value_key(value) != _config_value_key(default_value)
+                or key in required_keys
+            ):
                 minimal[key] = value
 
-        # pyrefly: ignore [bad-argument-type]
-        return Config(**minimal)
+        candidate = Config.from_dict(minimal)
+        try:
+            expected = config_spec.normalized_config(self)
+            normalized = config_spec.normalized_config(candidate)
+            if _config_key(normalized) == _config_key(expected):
+                return candidate
+
+            # Effective search defaults may differ from normalization's omitted
+            # defaults (for example after shrinking a small kernel's warp count).
+            # Restore those fields rather than change the selected configuration.
+            for key, value in self.config.items():
+                if key not in minimal and (
+                    (key in expected) != (key in normalized)
+                    or _config_value_key(expected.config.get(key))
+                    != _config_value_key(normalized.config.get(key))
+                ):
+                    minimal[key] = value
+            candidate = Config.from_dict(minimal)
+            if _config_key(config_spec.normalized_config(candidate)) == _config_key(
+                expected
+            ):
+                return candidate
+        except InvalidConfig:
+            # Minimization is optional; leave rejected or dependent forms for
+            # the usual compilation validation instead of guessing defaults.
+            pass
+        return Config.from_dict(self.config)
 
     def save(self, path: str | Path) -> None:
         """Save the config to a JSON file."""

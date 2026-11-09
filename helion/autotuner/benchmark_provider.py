@@ -73,6 +73,7 @@ from .progress_bar import iter_with_progress
 from .render_pool import DEFAULT_MAX_JOBS as _RENDER_POOL_DEFAULT_MAX_JOBS
 from .render_pool import CudaDeviceFacts
 from .render_pool import RenderAhead
+from .tensor_serialization import save_tensor_tree
 from helion._dist_utils import all_gather_object
 from helion._dist_utils import sync_object
 
@@ -1543,7 +1544,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 self._benchmark_in_process(error)
         if self._subprocess_accuracy_check_enabled():
             baseline_path = os.path.join(self._precompile_tmpdir.name, "baseline.pt")
-            torch.save(self._baseline_output, baseline_path)
+            save_tensor_tree(self._baseline_output, baseline_path)
             self._precompile_baseline_path = baseline_path
             if len(self.mutated_arg_indices) > 0:
                 # The worker compares a candidate's post-call mutated
@@ -1589,14 +1590,14 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         benchmark/accuracy path.
         """
         try:
-            torch.save(args, path)
+            save_tensor_tree(args, path)
             return None
         except (pickle.PicklingError, AttributeError, TypeError) as error:
             portable = make_portable_args(args)
             if portable is None:
                 return error
             try:
-                torch.save(portable, path)
+                save_tensor_tree(portable, path)
             except (pickle.PicklingError, AttributeError, TypeError):
                 return error
             self.log.debug(

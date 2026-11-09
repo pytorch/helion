@@ -284,6 +284,8 @@ def default_autotuner_fn(
     from ..autotuner import LFBOTreeSearch
     from ..autotuner import cache_classes
     from ..autotuner import search_algorithms
+    from ..autotuner.base_cache import _requires_uncached_tuning
+    from ..autotuner.base_cache import _UncachedAutotuneCache
 
     autotuner_name = _env_get_str("HELION_AUTOTUNER", "")
 
@@ -326,6 +328,10 @@ def default_autotuner_fn(
     # trial. The first construction here is the autotuner the cache wraps
     # for the K=1 path; the factory is also passed through so K>1 trials can
     # build additional fresh autotuners.
+    if _requires_uncached_tuning(bound_kernel, args):
+        return _UncachedAutotuneCache(
+            autotuner_factory(), autotuner_factory=autotuner_factory
+        )
     return cache_cls(autotuner_factory(), autotuner_factory=autotuner_factory)
 
 

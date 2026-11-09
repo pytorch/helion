@@ -12,6 +12,7 @@ import torch
 from helion.autotuner.base_search import _AutotunableKernel
 from helion.autotuner.config_spec import ConfigSpec
 from helion.runtime.config import Config
+from helion.runtime.config_cache import ConfigCache
 from helion.runtime.settings import Settings
 
 if TYPE_CHECKING:
@@ -102,7 +103,7 @@ class _ExternalKernelAdapter(_AutotunableKernel):
         self._config_spec = config_spec
         self._configs: list[Config] = []
         self._compile_fn = compile_fn
-        self._compile_cache: dict[Config, Callable[..., Any]] = {}
+        self._compile_cache: ConfigCache[Callable[..., Any]] = ConfigCache()
 
         self._env = _FakeEnv(
             device

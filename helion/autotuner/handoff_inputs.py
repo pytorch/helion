@@ -15,6 +15,7 @@ from torch.utils._pytree import tree_flatten
 from torch.utils._pytree import tree_map
 
 from .benchmark_provider import _clone_args
+from .tensor_serialization import save_tensor_tree
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -107,7 +108,7 @@ def _save_inputs(value: object, path: str | Path) -> None:
             )
         return item
 
-    torch.save(
+    save_tensor_tree(
         _SavedInputs(
             tree_map(encode, value, is_leaf=is_namedtuple), _storage_residues(value)
         ),

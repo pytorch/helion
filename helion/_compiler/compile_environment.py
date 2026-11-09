@@ -69,6 +69,21 @@ PreparedGuardFactory = typing.Callable[
 CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE = 256
 
 
+@dataclasses.dataclass(eq=False)
+class _ContainerIdentity:
+    # Only the frontend owns the original. TypeInfo retains the emptied token.
+    value: object = dataclasses.field(repr=False)
+    opaque_result: bool = False
+
+
+def _supports_container_identity(value: object) -> bool:
+    return (
+        type(value) in (tuple, list, dict)
+        or (dataclasses.is_dataclass(value) and not isinstance(value, type))
+        or (isinstance(value, tuple) and hasattr(type(value), "__match_args__"))
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class ConfigValueExpression:
     """Small integer expression whose leaves are emitted config values."""
@@ -147,6 +162,26 @@ class RuntimeInputSpecialization:
     prepared_guard_factory: PreparedGuardFactory | None = dataclasses.field(
         default=None, compare=False, repr=False
     )
+    # Captured objects distinguish otherwise identical classifiers between
+    # bindings. Retain them, compare only identity, and never serialize them.
+    binding_anchors: tuple[object, ...] = dataclasses.field(
+        default=(), compare=False, repr=False
+    )
+    # Classifier results may retain explicit input owners. This cache-lifetime
+    # requirement also applies to later traces inheriting the published guard.
+    retains_input_identity: bool = dataclasses.field(default=False, compare=False)
+
+    def same_binding_semantics(self, other: RuntimeInputSpecialization) -> bool:
+        return (
+            self == other
+            and len(self.binding_anchors) == len(other.binding_anchors)
+            and all(
+                left is right
+                for left, right in zip(
+                    self.binding_anchors, other.binding_anchors, strict=True
+                )
+            )
+        )
 
 
 def _is_supported_tensor_input_source(source: Source) -> bool:
@@ -285,7 +320,7 @@ def _replay_tensor_input_source(
         return root_values.get(source.local_name)
     if isinstance(source, AttrSource):
         base = _replay_tensor_input_source(source.base, root_values)
-        return getattr(base, source.member, None)
+        return getattr(base, source.member, None) if base is not None else None
     if isinstance(source, GetItemSource):
         if not isinstance(source.index, (int, str)) or source.index_is_slice:
             return None
@@ -393,7 +428,9 @@ if TYPE_CHECKING:
     from torch._guards import Source
 
     from .. import Config
+    from ..autotuner.config_fragment import ConfigSpecFragment
     from ..runtime.settings import Settings
+    from .ast_extension import ExtendedAST
     from .autotuner_heuristics.registry import CompilerHeuristicSpecializationFact
     from .backend import Backend
     from .pallas.compact_worklist import CompactWorklistPlan
@@ -614,6 +651,30 @@ class CompileEnvironment:
         self.specialized_strides: set[TensorPropertySource] = set()
         # Config-backed values created by hl.register_tunable().
         self.tunable_symbols: set[sympy.Symbol] = set()
+        # Revisit a declaration with the same symbol after validating its
+        # snapshot. Separate call contexts need separate host variable origins.
+        self.tunable_values: dict[
+            tuple[str, tuple[ExtendedAST, ...]],
+            torch.SymInt | torch.SymFloat | torch.SymBool,
+        ] = {}
+        # Repeated visits reuse exact built-in domain snapshots. Keep originals
+        # alive so object IDs cannot be recycled; custom fragments stay shared.
+        self.tunable_fragment_snapshots: dict[
+            int, tuple[ConfigSpecFragment, ConfigSpecFragment]
+        ] = {}
+        # Exact primitive globals before normal symbolification. Fragment
+        # constructors may snapshot these values without reading the source
+        # again. Only operations with fully proved scalar operands extend it;
+        # dynamic inputs and untracked helper expressions never enter this map.
+        # Retain scalar occurrences, not SymPy expressions: algebraic
+        # simplification can erase floating rounding, signed zero and inputs.
+        # The strong scalar reference also prevents object-id reuse. These
+        # records never own runtime tensors or enter persistent cache keys.
+        self.fragment_global_literals: dict[
+            int,
+            tuple[torch.SymInt | torch.SymFloat | torch.SymBool, int | float | bool],
+        ] = {}
+        self._symbolic_fragment_domain_warned = False
         self.tensor_descriptor_layout_guards: dict[
             Source, TensorDescriptorLayoutGuard
         ] = {}
@@ -622,6 +683,14 @@ class CompileEnvironment:
         ] = {}
         self.bound_tensor_descriptor_alignments: dict[Source, bool] = {}
         self.runtime_input_specializations: dict[str, RuntimeInputSpecialization] = {}
+        # Original inputs/proxies are retained only until frontend compilation
+        # completes. Identity witnesses never become serialized cache-key data.
+        self._container_identities: dict[int, tuple[object, _ContainerIdentity]] = {}
+        # Opaque Python container identities cannot be guarded by value metadata.
+        self.requires_fresh_binding = False
+        # Opaque helper calls can inspect a fragment's Python identity. Their
+        # bindings retain explicit constexpr owners and need a bounded cache.
+        self.has_opaque_fragment_inputs = False
         # Immutable classifier outputs captured from the arguments that created
         # this BoundKernel.  Codegen may run later and obtain those arguments
         # through weak references, after their storage metadata has changed.
@@ -679,6 +748,21 @@ class CompileEnvironment:
         # hl.pdl_* ops in source order, run at kernel entry or exit.
         self.pdl_entry: list[str] = []
         self.pdl_exit: list[str] = []
+
+    def warn_symbolic_fragment_domain(self) -> None:
+        """Emit at most once per binding, subject to Python's warning filters."""
+        if not self._symbolic_fragment_domain_warned:
+            self._symbolic_fragment_domain_warned = True
+            location = current_location()
+            warnings.warn_explicit(
+                "Symbolic config fragment domains are deprecated. Use hl.constexpr "
+                "for domain values, or hl.specialize for integer shapes and arguments. "
+                "Legacy fixed configs remain supported; symbolic domains are not "
+                "snapshotted and autotuning may fail when it evaluates them.",
+                FutureWarning,
+                filename=location.filename,
+                lineno=location.lineno or 0,
+            )
 
     def _disallow_nonpersistent_pid_types(self, reason: str | None = None) -> None:
         """Restrict the search space to persistent kernels. Idempotent."""
@@ -1201,8 +1285,15 @@ class CompileEnvironment:
     ) -> None:
         """Register an internal projection from runtime inputs to a cache-key fact."""
         previous = self.runtime_input_specializations.setdefault(key, specialization)
-        if previous != specialization:
+        if not previous.same_binding_semantics(specialization):
             raise RuntimeError(f"conflicting runtime input specializations for {key!r}")
+        if (
+            specialization.retains_input_identity
+            and not previous.retains_input_identity
+        ):
+            self.runtime_input_specializations[key] = dataclasses.replace(
+                previous, retains_input_identity=True
+            )
 
     def snapshot_runtime_input_specialization_results(
         self,
@@ -1872,16 +1963,137 @@ class CompileEnvironment:
         shape = self._normalize_shape_to_block_vars(specialized_shape)
         return tensor.new_empty(shape)
 
+    def resolve_fragment_global(
+        self, value: torch.SymInt | torch.SymFloat | torch.SymBool
+    ) -> int | float | bool | None:
+        """Resolve only a captured scalar or an occurrence evaluated by Python."""
+        record = self.fragment_global_literals.get(id(value))
+        if record is not None:
+            assert record[0] is value
+            return record[1]
+        return None
+
+    def record_fragment_global_operation(
+        self,
+        result: object,
+        evaluate: typing.Callable[..., object],
+        op: ast.AST,
+        operands: tuple[object, ...],
+    ) -> object:
+        """Keep original scalar operations separate from their simplified symbols."""
+        if not self.fragment_global_literals:
+            return result
+        values: list[int | float | bool] = []
+        captured = False
+        for operand in operands:
+            if isinstance(operand, (torch.SymInt, torch.SymFloat, torch.SymBool)):
+                value = self.resolve_fragment_global(operand)
+                if value is None:
+                    return result
+                captured = True
+                values.append(value)
+            elif type(operand) in (int, float, bool):
+                values.append(typing.cast("int | float | bool", operand))
+            else:
+                return result
+        if not captured:
+            return result
+        # This is optional provenance, including for untaken branches. Bound
+        # Python integer work before evaluating it; checking the result after
+        # pow/left-shift would be too late to prevent a large allocation.
+        limit = 4096
+        bits = [value.bit_length() for value in values if type(value) is int]
+        if any(width > limit for width in bits):
+            return result
+        if len(values) == 2 and all(type(value) in (int, bool) for value in values):
+            left, right = (int(value) for value in values)
+            if isinstance(op, ast.Pow) and abs(left) > 1 and right >= 0:
+                if right > limit // left.bit_length():
+                    return result
+            elif isinstance(op, ast.LShift) and right >= 0:
+                if right > limit - left.bit_length():
+                    return result
+            elif isinstance(op, ast.Mult):
+                if left.bit_length() + right.bit_length() > limit:
+                    return result
+        try:
+            value = evaluate(op, *values)
+        except (ArithmeticError, ValueError):
+            # Symbolic tracing also visits untaken branches. This optional
+            # provenance must not evaluate an operation that its guard excludes.
+            return result
+        if type(value) not in (int, float, bool):
+            return result
+        if isinstance(result, (torch.SymInt, torch.SymFloat, torch.SymBool)):
+            # Even an operator returning an existing wrapper/node must get its
+            # own occurrence; e.g. x + 0 and x may have different zero signs.
+            result = type(result)(result.node)
+            self.fragment_global_literals[id(result)] = (
+                result,
+                typing.cast("int | float | bool", value),
+            )
+            return result
+        # Some Torch versions fold a symbolic operation to a Python scalar.
+        # All operands were proved above; keep the authored Python value.
+        return value if type(result) in (int, float, bool) else result
+
+    def container_identity(self, value: object) -> object:
+        """Recover a container or declared-field holder during frontend tracing."""
+        entry = self._container_identities.get(id(value))
+        return entry[1].value if entry is not None else value
+
+    def container_identity_witness(self, value: object) -> _ContainerIdentity | None:
+        if not _supports_container_identity(value):
+            return None
+        entry = self._container_identities.get(id(value))
+        if entry is not None:
+            return entry[1]
+        witness = _ContainerIdentity(value)
+        self._container_identities[id(value)] = (value, witness)
+        return witness
+
+    def record_container_proxy(
+        self, proxy: object, witness: _ContainerIdentity
+    ) -> None:
+        if witness.value is not None and _supports_container_identity(proxy):
+            self._container_identities[id(proxy)] = (proxy, witness)
+
+    def record_container_identity(self, proxy: object, original: object) -> None:
+        witness = self.container_identity_witness(original)
+        if witness is not None:
+            self.record_container_proxy(proxy, witness)
+
+    def clear_container_identities(self) -> None:
+        # In particular, do not let a cached BoundKernel retain real input
+        # tensors reachable through their tuple/list/dict arguments.
+        for _, witness in self._container_identities.values():
+            witness.value = None
+        self._container_identities.clear()
+
     def to_fake(self, obj: object, origin: Origin) -> object:
+        # Importing autotuner at module scope cycles back to CompileEnvironment.
+        from ..autotuner.config_fragment import ConfigSpecFragment
+
         if obj is None:
             return None
+        if isinstance(obj, ConfigSpecFragment) and not (
+            origin.is_argument() and dataclasses.is_dataclass(obj)
+        ):
+            if origin.is_argument():
+                raise TypeError(
+                    f"unsupported config fragment argument ({origin}); "
+                    "construct the fragment directly inside the kernel"
+                )
+            # Fragments describe compile-time choices, not runtime scalars.
+            # register_tunable snapshots their metadata for the bound kernel.
+            return obj
         if isinstance(obj, torch.Tensor):
             return self._to_fake_tensor(obj, origin.to_source())
         if isinstance(obj, (bool, int, float)):
             if isinstance(obj, bool):
                 with self.shape_env.ignore_fresh_unbacked_symbols():
-                    return self.shape_env.create_unbacked_symbool()
-            if isinstance(obj, int):
+                    numeric = self.shape_env.create_unbacked_symbool()
+            elif isinstance(obj, int):
                 # Preserve the concrete value as the initial hint so that
                 # subsequent hl.specialize() calls can recover the real value
                 # rather than falling back to the generic size hint.
@@ -1892,10 +2104,13 @@ class CompileEnvironment:
                     pass
                 else:
                     self.shape_env.var_to_sources[_symint_sympy_symbol(sym)] = [source]
-                return sym
-            if isinstance(obj, float):
+                numeric = sym
+            else:
                 with self.shape_env.ignore_fresh_unbacked_symbols():
-                    return self.shape_env.create_unbacked_symfloat()
+                    numeric = self.shape_env.create_unbacked_symfloat()
+            if origin.is_global() and type(obj) in (int, float, bool):
+                self.fragment_global_literals[id(numeric)] = (numeric, obj)
+            return numeric
         if isinstance(
             obj,
             (
@@ -1935,25 +2150,36 @@ class CompileEnvironment:
         if isinstance(obj, str):
             return obj
         if isinstance(obj, list):
-            return [
+            result = [
                 self.to_fake(e, GetItemOrigin(origin, i)) for i, e in enumerate(obj)
             ]
+            if type(obj) is list:
+                self.record_container_identity(result, obj)
+            return result
         if isinstance(obj, tuple) and hasattr(obj, "_fields"):
-            return type(obj)(
+            result = type(obj)(
                 **{
                     k: self.to_fake(e, AttributeOrigin(origin, k))
                     # pyrefly: ignore [missing-attribute]
                     for k, e in obj._asdict().items()
                 }
             )
+            self.record_container_identity(result, obj)
+            return result
         if isinstance(obj, tuple):
-            return tuple(
+            result = tuple(
                 self.to_fake(e, GetItemOrigin(origin, i)) for i, e in enumerate(obj)
             )
+            if type(obj) is tuple:
+                self.record_container_identity(result, obj)
+            return result
         if isinstance(obj, dict):
-            return {
+            result = {
                 k: self.to_fake(e, GetItemOrigin(origin, k)) for k, e in obj.items()
             }
+            if type(obj) is dict:
+                self.record_container_identity(result, obj)
+            return result
         if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
             # Preserve stored fields, including init=False, without rerunning
             # initialization (InitVar inputs need not be stored on the object).
@@ -1968,6 +2194,7 @@ class CompileEnvironment:
                         getattr(obj, field.name), AttributeOrigin(origin, field.name)
                     ),
                 )
+            self.record_container_identity(result, obj)
             return result
 
         raise TypeError(f"unsupported argument type {type(obj)} ({origin})")

@@ -27,6 +27,9 @@ from .ast_extension import create
 from .compile_environment import CompileEnvironment
 from .compile_environment import _constrain_unify
 from .compile_environment import warning
+from .fragment_comparison import guard_fragment_comparison
+from .fragment_comparison import guard_fragment_sequence_equality
+from .fragment_membership import guard_fragment_membership
 from .output_header import library_imports
 from .source_location import current_location
 from .tensor_utils import patch_tensor_factories
@@ -336,6 +339,8 @@ class TypePropagation(ast.NodeVisitor):
         )
 
     def _compare(self, op: ast.cmpop, left: TypeInfo, right: TypeInfo) -> TypeInfo:
+        if isinstance(op, CMP_IN):
+            guard_fragment_membership(left, right)
         # Handle `tensor is None` and `tensor is not None` checks
         # When comparing a TensorType with LiteralType(None), we can determine the result
         if isinstance(op, (ast.Is, ast.IsNot)):
@@ -352,18 +357,25 @@ class TypePropagation(ast.NodeVisitor):
                 result = isinstance(op, ast.Is)
                 return LiteralType(origin=self.origin(), value=result)
         if isinstance(left, LiteralType) and isinstance(right, LiteralType):
+            result = _eval_compare(op, left.value, right.value)
+            guard_fragment_comparison(op, left, right, result)
             return LiteralType(
                 origin=self.origin(),
-                value=_eval_compare(op, left.value, right.value),
+                value=result,
             )
         if (
             isinstance(left, LiteralType)
             and isinstance(right, CollectionType)
             and isinstance(op, CMP_IN)
         ):
+            try:
+                # Membership compares literal values or actual mapping keys.
+                values = right.membership_container()
+            except NotImplementedError:
+                return SymBoolType.new_unbacked(self.origin())
             return LiteralType(
                 origin=self.origin(),
-                value=_eval_compare(op, left.value, right.element_types),
+                value=_eval_compare(op, left.value, values),
             )
         if isinstance(left, (NumericType, LiteralType)) and isinstance(
             right,
@@ -405,6 +417,7 @@ class TypePropagation(ast.NodeVisitor):
             and isinstance(right, SequenceType)
             and isinstance(op, ast.Eq)
         ):
+            guard_fragment_sequence_equality(left, right)
             if len(left.element_types) != len(right.element_types):
                 return LiteralType(origin=self.origin(), value=False)
 
@@ -451,10 +464,13 @@ class TypePropagation(ast.NodeVisitor):
             # Python expression in order; the fresh symbol describes its value.
             env = CompileEnvironment.current()
             previous = value.value
+            captured = env.resolve_fragment_global(previous)
             value = value.new_unbacked(value.origin)
             env.preserve_tunable_float_provenance(
                 value.value, operands if operands is not None else (previous,)
             )
+            if captured is not None:
+                env.fragment_global_literals[id(value.value)] = (value.value, captured)
         return value
 
     def _assign(self, lhs: ast.AST, rhs: TypeInfo) -> None:

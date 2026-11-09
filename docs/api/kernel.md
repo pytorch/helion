@@ -199,6 +199,57 @@ Kernels are automatically cached based on:
 - **Argument types** (dtype, device)
 - **Tensor shapes** (default: `static_shapes=True`)
 
+When a compile-time `is` or `is not` comparison depends on a container returned
+by an ordinary Python helper, Helion conservatively creates a fresh binding for
+each invocation. The helper may choose an input, a captured container, or a new
+container; equal argument values do not establish that choice. These bindings
+do not use shared dispatch caches or persistent autotune caches. Ordinary
+argument-container comparisons retain guarded reuse, and comparisons against
+`None` or a different type do not need this restriction.
+
+Opaque Python helpers that receive configuration fragments may inspect their
+identity. Helion retains at most 16 such bindings per kernel, in insertion order,
+including the explicit constexpr objects needed by their traces. Repeated calls
+reuse a resident binding without executing the helper again. Once evicted, a
+binding is traced again on its next use; compatible built-in-domain autotune
+selections can be retained separately, but custom domains may require autotuning again.
+An explicit `BoundKernel.set_config()` choice remains local to that bound object;
+eviction does not publish it as an autotune result or replace a retained winner.
+Explicitly retained `BoundKernel` objects remain usable. `Kernel.reset()` clears
+both caches. This finite retention policy replaces unbounded owner retention;
+compile-time Python side effects must not rely on a binding remaining cached.
+
+The default autotuner and `Cache[Search]` factories retain search and best-of-K
+selection without cache I/O. Direct construction of the exact built-in
+`LocalAutotuneCache` and `StrictLocalAutotuneCache` classes also returns this
+uncached wrapper, rather than an instance of the requested cache class.
+Direct `RemoteAutotuneCache`, `StrictRemoteAutotuneCache` and `AOTAutotuneCache`
+construction rejects these bindings before initializing their caches. Custom
+cache subclasses retain their constructor contract and are not automatically
+replaced. Use the factory form so Helion can select the appropriate wrapper.
+For a custom cache subclass, `Cache[Search]` uses Helion's uncached wrapper
+instead of constructing that subclass, so its custom cache behavior is bypassed.
+The supplied `Search` class still controls the search.
+`HELION_ASSERT_CACHE_HIT=1` rejects a search that cannot read a cache, unless
+cache reads were explicitly bypassed by force or `HELION_SKIP_CACHE`.
+
+For these fresh bindings, `Kernel.autotune`, `autotune_multi` and automatic
+first-use tuning retain up to 16 selected configurations in memory. Each call
+still traces and compiles anew. A selection is reused only after the complete
+frontend program, built-in tunable domains, compiler policy and target match;
+no inputs or compiled launchers are retained. Changed domains or branches tune
+separately. `Kernel.reset()` clears selections, and force/skip requests bypass
+their reuse. Custom fragments or opaque domain/config values cannot establish
+this compatibility: Helion warns once per kernel and may tune each invocation.
+
+Calling such a `BoundKernel` preserves a configuration selected by `set_config`
+or `autotune`, validating and compiling it against the fresh trace. If the new
+arguments select a shareable binding that already has a configuration, that
+binding keeps its own selection. An unconfigured shareable binding receives
+the explicit configuration from the fresh bound. A callable
+returned directly by `compile_config` remains the compiled program for that
+trace and configuration; it does not perform argument rebinding.
+
 By default (`static_shapes=True`), Helion treats shapes and strides as compile-time constants, baking them into generated Triton code for the best performance. To reuse a single compiled kernel across size variations, set `static_shapes=False`, which instead buckets each dimension as `{0, 1, ≥2}` and allows more inputs to share the same cache entry.
 
 ```{note}

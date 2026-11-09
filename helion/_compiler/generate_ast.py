@@ -1179,6 +1179,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         return self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> ast.AST:
+        from .type_info import ConfigFragmentType
+
         assert isinstance(node, ExtendedAST)
         if isinstance(node.ctx, ast.Load) and node._type_info is not None:
             origin = node._type_info.origin
@@ -1186,7 +1188,20 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 isinstance(origin, ArgumentOrigin)
                 and origin.name in self.host_function.constexpr_args
             ):
+                if not self.on_device and node._type_info.contains_type(
+                    ConfigFragmentType
+                ):
+                    # Fragments, including container leaves, are not Python
+                    # literals. Preserve the actual argument and custom equality.
+                    name = origin.name
+                    return expr_from_string(
+                        f"{name}.value if isinstance({name}, hl.constexpr) else {name}"
+                    )
                 value = self.host_function.constexpr_args[origin.name]
+                if not self.on_device:
+                    return expr_from_string(
+                        self.host_function.constexpr_literal_expr(value)
+                    )
                 return expr_from_string(
                     self.host_function.literal_expr(value)
                     if type(value) in (torch.dtype, torch.device)

@@ -58,6 +58,13 @@ _warned_unavailable_options: set[str] = set()
 class TritonBackend(Backend):
     """Triton code generation backend."""
 
+    def scalar_literal_expr(self, value: float | bool) -> str:
+        if isinstance(value, float) and value == 0 and math.copysign(1.0, value) < 0:
+            # Older Triton scalar_constant() replaces either zero sign with
+            # get_null_value. Use the same bitcast as tensor constants.
+            return self.inductor_op_overrides().constant(value, torch.float32)
+        return super().scalar_literal_expr(value)
+
     def supports_block_ptr_indexing(self) -> bool:
         from ..._compat import supports_block_ptr
 
@@ -245,44 +252,25 @@ class TritonBackend(Backend):
     def finalize_ephemeral_cache(
         self, bound_kernel: BoundKernel[Any], config: Config
     ) -> None:
-        from ...runtime.config import Config
-
-        self._clear_triton_jit_cache(bound_kernel, config)
-        evict = config
-        if bound_kernel._compile_cache.pop(evict, None) is None:
-            default = bound_kernel.config_spec.default_config()
-            # pyrefly: ignore [bad-argument-type]
-            evict = Config(**(default.config | config.config))
-            bound_kernel._compile_cache.pop(evict, None)
-        bound_kernel._cache_path_map.pop(evict, None)
-
-    def _clear_triton_jit_cache(
-        self, bound_kernel: BoundKernel[Any], config: Config
-    ) -> None:
         """Clear Triton's in-memory JIT cache for the compiled kernel.
 
         After autotuning in an ephemeral cache dir, device_caches on the
         JITFunction still holds the compiled binary.  Clearing it forces
         Triton to recompile (and write to TRITON_CACHE_DIR) on the next call.
 
-        If the config was minimized by the autotuner, the lookup is retried
-        with the full config (defaults merged back in).
+        Clear every equivalent wrapper, including when the autotuner minimized
+        the winning config and rendered a new wrapper without launching it.
         """
-        from ...runtime.config import Config
-
-        compiled_fn = bound_kernel._compile_cache.get(config)
-        if compiled_fn is None:
-            default = bound_kernel.config_spec.default_config()
-            # pyrefly: ignore [bad-argument-type]
-            full_config = Config(**(default.config | config.config))
-            compiled_fn = bound_kernel._compile_cache.get(full_config)
-        if compiled_fn is None:
-            return
-        triton_jit_fn = compiled_fn.__globals__.get(
-            f"_helion_{bound_kernel.kernel.name}"
-        )
-        if triton_jit_fn is not None and hasattr(triton_jit_fn, "device_caches"):
-            triton_jit_fn.device_caches.clear()
+        for stored_config, compiled_fn in bound_kernel._matching_compiled_configs(
+            config
+        ):
+            triton_jit_fn = compiled_fn.__globals__.get(
+                f"_helion_{bound_kernel.kernel.name}"
+            )
+            if triton_jit_fn is not None and hasattr(triton_jit_fn, "device_caches"):
+                triton_jit_fn.device_caches.clear()
+            bound_kernel._compile_cache.pop(stored_config, None)
+            bound_kernel._cache_path_map.pop(stored_config, None)
 
     def compiled_cache_key(
         self, bound_kernel: BoundKernel[Any], compiled_fn: object
@@ -593,8 +581,13 @@ class TritonBackend(Backend):
     def full_expr(
         self, shape_dims: list[str], value_expr: str, dtype: torch.dtype
     ) -> str:
+        full = (
+            "tl.full"
+            if dtype.is_floating_point or dtype.is_complex
+            else "helion_triton_helpers.integer_full"
+        )
         return (
-            f"tl.full([{', '.join(shape_dims)}], {value_expr}, {self.dtype_str(dtype)})"
+            f"{full}([{', '.join(shape_dims)}], {value_expr}, {self.dtype_str(dtype)})"
         )
 
     def effective_num_warps(self, config: Config) -> int:

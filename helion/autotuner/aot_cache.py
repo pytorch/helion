@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import ClassVar
 from typing import Literal
+from typing import cast
 
 import torch
 
@@ -48,6 +49,10 @@ from ..runtime.config import Config
 from ..runtime.cute.structural_config import CuteStructuralConfig
 from ..runtime.cute.structural_config import config_artifact_json
 from ..runtime.cute.structural_config import decode_structural_policy
+from ..runtime.kernel import _BoolValueKey
+from ..runtime.kernel import _FloatValueKey
+from ..runtime.kernel import _FragmentSetValueKey
+from ..runtime.kernel import _FragmentValueKey
 from ..runtime.structural_policy import StructuralConfig
 from ..runtime.structural_policy import StructuralPolicyError
 from ..runtime.structural_policy import bound_structural_policy
@@ -67,11 +72,13 @@ from .benchmark_provider import _MultiShapeAutotuneArgs
 from .benchmark_provider import _searching_candidates
 
 if TYPE_CHECKING:
+    from collections.abc import Hashable
     from collections.abc import Sequence
     from typing import Callable
 
     from ..runtime.structural_policy import StructuralPolicy
     from .base_search import BaseSearch
+    from .config_fragment import ConfigSpecFragment
 
 log: logging.Logger = logging.getLogger(__name__)
 
@@ -1496,12 +1503,26 @@ def _serialize_value(val: object) -> object:
     """Serialize a single value to JSON-compatible format.
 
     Supports: None, bool, int, float, str, type, tuple, frozenset, set,
-    torch.dtype, torch.device, list, dict, code, bytes, ellipsis, complex.
+    torch.dtype, torch.device, list, dict, code, bytes, ellipsis, complex,
+    and the runtime's typed boolean, float and fragment specialization keys.
     """
     if val is None:
         return None
     if isinstance(val, (bool, int, float, str)):
         return val
+    if isinstance(val, _BoolValueKey):
+        return {"__bool_value_key__": val.value}
+    if isinstance(val, _FloatValueKey):
+        return {"__float_value_key__": val.bits.hex()}
+    if isinstance(val, _FragmentValueKey):
+        return {
+            "__fragment_value_key__": [
+                _serialize_value(val.fragment_type),
+                _serialize_value(val.fields),
+            ]
+        }
+    if isinstance(val, _FragmentSetValueKey):
+        return {"__fragment_set_value_key__": _serialize_value(val.entries)}
     if isinstance(val, type):
         return {"__type__": f"{val.__module__}.{val.__qualname__}"}
     if isinstance(val, tuple):
@@ -1533,12 +1554,29 @@ def _deserialize_value(val: object) -> object:
     """Deserialize a JSON value back to Python object.
 
     Handles tagged dicts: __tuple__, __frozenset__, __set__, __dtype__, __device__,
-    __type__, __bytes__, __ellipsis__, __complex__.
+    __type__, __bytes__, __ellipsis__, __complex__, and typed runtime keys.
 
     Note: __code__ is not turned back into a code object. This is fine because the AOT
     cache only compares specialization keys, it never calls the original function.
     """
     if isinstance(val, dict):
+        if "__bool_value_key__" in val:
+            return _BoolValueKey(val["__bool_value_key__"])
+        if "__float_value_key__" in val:
+            return _FloatValueKey(bytes.fromhex(val["__float_value_key__"]))
+        if "__fragment_value_key__" in val:
+            fragment_type, fields = val["__fragment_value_key__"]
+            return _FragmentValueKey(
+                cast("type[ConfigSpecFragment]", _deserialize_value(fragment_type)),
+                cast("Hashable", _deserialize_value(fields)),
+            )
+        if "__fragment_set_value_key__" in val:
+            return _FragmentSetValueKey(
+                cast(
+                    "frozenset[tuple[Hashable, int]]",
+                    _deserialize_value(val["__fragment_set_value_key__"]),
+                )
+            )
         if "__tuple__" in val:
             return tuple(_deserialize_value(v) for v in val["__tuple__"])
         if "__frozenset__" in val:
@@ -1567,6 +1605,10 @@ def _deserialize_value(val: object) -> object:
 
 def _import_type(type_name: str) -> type:
     """Import a type from its fully qualified name."""
+    if type_name == "builtins.NoneType":
+        # NoneType's qualified name has no matching builtins attribute. Do
+        # not fall back to the unrelated torch.NoneType IR class.
+        return type(None)
     parts = type_name.rsplit(".", 1)
     if len(parts) == 2:
         module_name, class_name = parts

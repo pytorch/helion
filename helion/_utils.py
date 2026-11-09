@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import collections
 import functools
+from typing import TYPE_CHECKING
 from typing import Sequence
 from typing import TypeVar
+
+if TYPE_CHECKING:
+    from types import CellType
 
 T = TypeVar("T")
 
@@ -129,3 +133,11 @@ def is_scalar_index(idx: object) -> bool:
     if hasattr(idx, "ndim"):
         return idx.ndim == 0
     return False
+
+
+def _read_cell(cell: CellType) -> tuple[bool, object]:
+    """Distinguish an empty closure cell from one containing None."""
+    try:
+        return True, cell.cell_contents
+    except ValueError:
+        return False, None

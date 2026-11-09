@@ -59,6 +59,7 @@ from ..output_header import _active_library_imports
 from ..output_header import get_needed_import_lines
 from helion._compat import torch_uses_template_producer_fusion
 from helion.runtime.config import Config
+from helion.runtime.config_cache import ConfigCache
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -123,7 +124,7 @@ class _FusionAutotuneAdapter:
         self._bound_kernel = bound_kernel
         self._factory = bench_kernel_factory
         self._fusion_context_hash = fusion_context_hash
-        self._bench_cached_paths: dict[Config, str] = {}
+        self._bench_cached_paths: ConfigCache[str] = ConfigCache()
 
     def __getattr__(self, name: str) -> object:
         return getattr(self._bound_kernel, name)
