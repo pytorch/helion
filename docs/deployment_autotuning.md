@@ -71,6 +71,17 @@ has a runner, as do requests the runner cannot serve, such as another config
 or frontend IR. Function dependencies are fingerprinted during disk lookup, not
 on each kernel launch.
 
+Dependency lookup follows static module attribute reads and fingerprints their
+current values, including reads in Python helpers and closures. Compiler
+intrinsics are admitted by object identity from an explicit set of tensor and
+language operations. Other Python functions are inspected recursively. An
+untracked dependency disables both binding and source reuse. This includes
+module objects passed as values, dynamic attribute lookup, bound built-in
+methods such as `dict.get`, state-reading C functions, and the opaque
+`hl.triton_kernel` and `hl.inline_triton` codegen entry points. These kernels
+continue through ordinary compilation. Adding a compiler intrinsic to the set
+requires accounting for every external value it can read during compilation.
+
 Bindings keep the ordinary frontend path, and no binding entry is saved, when:
 
 - the kernel is distributed, uses a tensor-descriptor config or has runtime

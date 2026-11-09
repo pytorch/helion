@@ -47,3 +47,9 @@ _logging.init_logs()
 from ._compiler._dynamo.variables import register_dynamo_variable  # noqa: E402
 
 register_dynamo_variable()
+
+# Freeze supported compiler operations after circular imports finish, before
+# application code can replace module exports ahead of its first cache lookup.
+from .runtime.generated_code_cache import _cache_intrinsics  # noqa: E402
+
+_cache_intrinsics()

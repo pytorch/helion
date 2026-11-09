@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import builtins
 import dataclasses
 import dis
-import enum
 import functools
 import hashlib
 import inspect
 import json
 import logging
+import math
+import operator
 import os
 from pathlib import Path
 import re
@@ -43,6 +45,7 @@ from ..autotuner.base_cache import triton_key_wrapper
 from ..autotuner.local_cache import get_helion_cache_dir
 from ..language.constexpr import ConstExpr
 from .config import Config
+from .ref_mode import RefMode
 from .ref_mode import is_ref_mode_enabled
 from .settings import default_autotuner_fn
 
@@ -163,52 +166,224 @@ def _code_key(code: types.CodeType) -> tuple[object, ...]:
     )
 
 
-def _global_names(code: types.CodeType) -> set[str] | None:
-    """Include globals loaded only by nested functions and comprehensions."""
+@functools.cache
+def _cache_intrinsics() -> dict[int, tuple[object, str]]:
+    """The compiler operations whose implementation is keyed by library hashes.
+
+    Python helpers are inspected recursively. Reflection, I/O, arbitrary C
+    callbacks and codegen APIs with implicit dependencies are outside this set.
+    Match objects, never a callable's claimed module/name or an API marker.
+    """
+    from .. import language as hl
+    from ..autotuner.config_fragment import BooleanFragment
+    from ..autotuner.config_fragment import EnumFragment
+
+    entries: list[tuple[object, str]] = [
+        (BooleanFragment, "helion.BooleanFragment"),
+        (EnumFragment, "helion.EnumFragment"),
+    ]
+    for name in (
+        "abs",
+        "all",
+        "any",
+        "bool",
+        "dict",
+        "enumerate",
+        "float",
+        "int",
+        "isinstance",
+        "issubclass",
+        "len",
+        "list",
+        "max",
+        "min",
+        "range",
+        "reversed",
+        "round",
+        "slice",
+        "sorted",
+        "str",
+        "sum",
+        "tuple",
+        "zip",
+    ):
+        entries.append((vars(builtins)[name], f"builtins.{name}"))
+    for module in (math, operator):
+        entries.extend(
+            (value, f"{module.__name__}.{name}")
+            for name, value in vars(module).items()
+            if not name.startswith("_") and isinstance(value, types.BuiltinFunctionType)
+        )
+    for name in (
+        "arange",
+        "associative_scan",
+        "atomic_add",
+        "atomic_and",
+        "atomic_cas",
+        "atomic_max",
+        "atomic_min",
+        "atomic_or",
+        "atomic_xchg",
+        "atomic_xor",
+        "barrier",
+        "constexpr",
+        "cumprod",
+        "cumsum",
+        "dot",
+        "dot_scaled",
+        "full",
+        "grid",
+        "jagged_tile",
+        "join",
+        "load",
+        "prefetch",
+        "rand",
+        "rand4x",
+        "randint",
+        "reduce",
+        "register_block_size",
+        "register_tunable",
+        "specialize",
+        "split",
+        "static_range",
+        "store",
+        "subscript",
+        "tile",
+        "tile_begin",
+        "tile_block_size",
+        "tile_end",
+        "tile_id",
+        "tile_index",
+        "zeros",
+    ):
+        entries.append((vars(hl)[name], f"helion.language.{name}"))
+    # Tensor operators with value semantics. Overloadability alone is not
+    # enough: Torch also exposes state readers and metadata queries whose
+    # results are not covered by the binding's saved tensor guards.
+    for name in (
+        "abs",
+        "add",
+        "addmm",
+        "arange",
+        "bmm",
+        "cat",
+        "clamp",
+        "cos",
+        "div",
+        "empty",
+        "empty_like",
+        "empty_strided",
+        "exp",
+        "exp2",
+        "full",
+        "full_like",
+        "log",
+        "log2",
+        "matmul",
+        "maximum",
+        "minimum",
+        "mm",
+        "mul",
+        "neg",
+        "ones",
+        "ones_like",
+        "pow",
+        "relu",
+        "rsqrt",
+        "sigmoid",
+        "sin",
+        "sqrt",
+        "stack",
+        "sub",
+        "sum",
+        "tanh",
+        "where",
+        "zeros",
+        "zeros_like",
+    ):
+        fn = vars(torch)[name]
+        if isinstance(fn, types.BuiltinFunctionType) and fn.__self__ is None:
+            entries.append((fn, f"torch.{name}"))
+    return {id(value): (value, name) for value, name in entries}
+
+
+def _dependency_loads(
+    code: types.CodeType,
+) -> list[tuple[str, str, tuple[str, ...]]] | None:
+    """Static global/closure reads, including reads in nested code objects."""
     instructions = tuple(dis.get_instructions(code))
-    if any(instruction.opname == "IMPORT_NAME" for instruction in instructions):
-        # A function-local import can read constants or helpers which do not
-        # appear in its globals. Resolving it here would execute lazy imports
-        # before the frontend (including imports in untaken branches). Until
-        # those dependencies can be tracked without changing import semantics,
-        # use the ordinary frontend rather than reuse potentially stale code.
-        return None
-    names = {
-        cast("str", instruction.argval)
+    if any(
+        instruction.opname == "IMPORT_NAME"
+        or (
+            instruction.opname in {"LOAD_ATTR", "LOAD_METHOD"}
+            and cast("str", instruction.argval).startswith("__")
+        )
         for instruction in instructions
-        if instruction.opname in {"LOAD_GLOBAL", "LOAD_NAME"}
-    }
+    ):
+        return None
+    loads = []
+    for i, instruction in enumerate(instructions):
+        if instruction.opname not in {"LOAD_GLOBAL", "LOAD_NAME", "LOAD_DEREF"}:
+            continue
+        attributes = []
+        for following in instructions[i + 1 :]:
+            if following.opname not in {"LOAD_ATTR", "LOAD_METHOD"}:
+                break
+            attributes.append(cast("str", following.argval))
+        loads.append(
+            (instruction.opname, cast("str", instruction.argval), tuple(attributes))
+        )
     for constant in code.co_consts:
         if isinstance(constant, types.CodeType):
-            nested = _global_names(constant)
+            nested = _dependency_loads(constant)
             if nested is None:
                 return None
-            names.update(nested)
-    return names
+            loads.extend(nested)
+    return loads
 
 
 def _function_dependencies(fn: types.FunctionType) -> object:
     try:
         closure = inspect.getclosurevars(fn)
     except ValueError:
-        # A deleted nonlocal leaves an empty closure cell.
         return _UNCACHEABLE
-    names = _global_names(fn.__code__)
-    if names is None:
+    loads = _dependency_loads(fn.__code__)
+    if loads is None:
         return _UNCACHEABLE
-    dependencies: dict[str, object] = {}
-    for name in sorted(names):
-        if name in fn.__globals__:
-            dependencies[name] = fn.__globals__[name]
+    dependencies: dict[tuple[str, ...], object] = {}
+    for operation, name, attributes in loads:
+        if operation == "LOAD_DEREF":
+            if name not in closure.nonlocals:
+                # A nested function's local captures are built by this code,
+                # whose global and external closure reads we also inspect.
+                continue
+            value = closure.nonlocals[name]
+        elif name in fn.__globals__:
+            value = fn.__globals__[name]
         elif name in fn.__builtins__:
-            dependencies[name] = fn.__builtins__[name]
+            value = fn.__builtins__[name]
         else:
-            # A missing global could be installed before compilation or resolved
-            # by dynamic execution. Its dependency cannot be established here.
             return _UNCACHEABLE
-    # Dependency discovery order can vary with Python's hash seed.
-    # Variable bindings are unordered; user-provided dict inputs are not.
-    return dict(sorted(closure.nonlocals.items())), dict(sorted(dependencies.items()))
+        path = [operation, name]
+        for attribute in attributes:
+            if type(value) is not types.ModuleType:
+                # Function/class attributes can expose an untracked namespace.
+                # Plain data containers are already fingerprinted in full.
+                if isinstance(value, (types.FunctionType, type)):
+                    return _UNCACHEABLE
+                break
+            namespace = vars(value)
+            if attribute not in namespace:
+                # Do not execute a module's lazy __getattr__ during lookup.
+                return _UNCACHEABLE
+            value = namespace[attribute]
+            path.append(attribute)
+        # A module passed/returned/aliased as a value escapes static tracking.
+        # _dependency_key also rejects modules in arguments/defaults/containers.
+        if isinstance(value, types.ModuleType):
+            return _UNCACHEABLE
+        dependencies[tuple(path)] = value
+    return dict(sorted(dependencies.items()))
 
 
 def _dependency_key(value: object, seen: frozenset[int] = frozenset()) -> object:
@@ -217,11 +392,8 @@ def _dependency_key(value: object, seen: frozenset[int] = frozenset()) -> object
         return type(value).__name__, value
     if isinstance(value, (torch.dtype, torch.device)):
         return str(value)
-    if isinstance(value, enum.Enum):
-        item = _dependency_key(value.value, seen)
-        if item is _UNCACHEABLE:
-            return _UNCACHEABLE
-        return "enum", type(value).__module__, type(value).__qualname__, item
+    if type(value) is RefMode:
+        return "ref_mode", value.value
     if type(value) in (tuple, list, dict):
         if id(value) in seen:
             return _UNCACHEABLE
@@ -239,27 +411,16 @@ def _dependency_key(value: object, seen: frozenset[int] = frozenset()) -> object
                 return _UNCACHEABLE
             result.append((name_key, key))
         return type(value).__name__, tuple(result)
-    if isinstance(value, types.ModuleType):
-        name = value.__name__
-        if name.split(".")[0] in {"torch", "helion", "math", "operator", "builtins"}:
-            return "module", name
+    intrinsic = _cache_intrinsics().get(id(value))
+    if intrinsic is not None and intrinsic[0] is value:
+        return "intrinsic", intrinsic[1]
+    if isinstance(value, (types.ModuleType, types.BuiltinFunctionType, type)):
         return _UNCACHEABLE
-    if isinstance(value, types.BuiltinFunctionType):
-        if value.__module__ == "builtins" and value.__name__ in {
-            "__import__",
-            "eval",
-            "exec",
-            "globals",
-        }:
-            return _UNCACHEABLE
-        return "builtin", value.__module__, value.__qualname__
-    if isinstance(value, type) and value.__module__.split(".")[0] in {
-        "helion",
-        "torch",
-        "builtins",
-    }:
-        return "class", value.__module__, value.__qualname__
     if isinstance(value, types.FunctionType):
+        # Function attributes can be reached through local aliases or callbacks,
+        # beyond a static global-load chain. Keep such callables on the frontend.
+        if value.__dict__:
+            return _UNCACHEABLE
         if id(value) in seen:
             return "recursive", value.__module__, value.__qualname__
         seen = seen | {id(value)}
@@ -418,7 +579,7 @@ def compiled_kernel_cache_key(
     else:
         hardware = (str(device),)
     payload = (
-        "helion-bound-source-v4",
+        "helion-bound-source-v5",
         sys.version_info[:3],
         helion_key(),
         torch_key_wrapper(),

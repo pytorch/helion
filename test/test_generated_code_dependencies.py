@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import enum
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
+import pytest
 import torch
 
 import helion
@@ -132,6 +136,75 @@ class TestGeneratedCodeDependencies(TestCase):
             self.assertEqual(self._key(kernel), key)
             equivalent["values"][0][1]["shift"] = 4
             self.assertNotEqual(self._key(kernel), key)
+
+    def test_global_and_nonlocal_with_the_same_name_are_both_keyed(self) -> None:
+        scale = 2
+
+        def helper():
+            def read_global():
+                global scale
+                return scale
+
+            return scale + read_global()
+
+        with patch.dict(helper.__globals__, {"scale": 3}):
+            original = cache._dependency_key(helper)
+            self.assertIsNot(original, cache._UNCACHEABLE)
+            self.assertEqual(helper(), 5)
+        with patch.dict(helper.__globals__, {"scale": 4}):
+            self.assertEqual(helper(), 6)
+            self.assertNotEqual(cache._dependency_key(helper), original)
+
+    def test_user_enum_with_mutable_attributes_bypasses_cache(self) -> None:
+        class Scale(enum.Enum):
+            X = 1
+
+        def helper():
+            return Scale.X.factor
+
+        Scale.X.factor = 2.0
+        self.assertIs(cache._dependency_key(Scale.X), cache._UNCACHEABLE)
+        self.assertIs(cache._dependency_key(helper), cache._UNCACHEABLE)
+
+    def test_function_attributes_through_local_alias_bypass_cache(self) -> None:
+        def helper():
+            alias = helper
+            return alias.scale
+
+        helper.scale = 2.0
+        self.assertEqual(helper(), 2.0)
+        self.assertIs(cache._dependency_key(helper), cache._UNCACHEABLE)
+        helper.scale = 3.0
+        self.assertEqual(helper(), 3.0)
+        self.assertIs(cache._dependency_key(helper), cache._UNCACHEABLE)
+
+    @pytest.mark.slow
+    def test_replaced_intrinsic_before_first_lookup_is_not_trusted(self) -> None:
+        script = """
+import helion.language as hl
+from helion.runtime import generated_code_cache as cache
+
+shift = 2
+def replacement():
+    return shift
+hl.tile = replacement
+def helper():
+    return hl.tile()
+
+first = cache._dependency_key(helper)
+assert helper() == 2
+shift = 3
+second = cache._dependency_key(helper)
+assert helper() == 3
+assert first is cache._UNCACHEABLE or second is cache._UNCACHEABLE or first != second
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_unsupported_dependencies_and_settings_skip_binding_cache(self) -> None:
         opaque = helion.kernel(

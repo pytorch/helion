@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 from builtins import __import__ as _import_module
+import json
+import operator
+import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 from types import ModuleType
 import unittest
+from unittest.mock import Mock
 from unittest.mock import patch
 
+import pytest
 import torch
 
 import helion
@@ -66,6 +72,30 @@ def _increment(x: torch.Tensor) -> torch.Tensor:
     for tile in hl.tile(x.size(0)):
         out[tile] = x[tile] + 1
     return out
+
+
+def _module_scale() -> float:
+    return torch._helion_cache_test_scale
+
+
+def _read_module_scale(x: torch.Tensor) -> torch.Tensor:
+    return x * _module_scale()
+
+
+def _named_triton_helper(x: torch.Tensor) -> torch.Tensor:
+    return hl.triton_kernel("combine", args=(x, x), output_like=x)
+
+
+_triton_call = hl.triton_kernel
+_scale_of = {"x": 2.0}.get
+
+
+def _aliased_triton_helper(x: torch.Tensor) -> torch.Tensor:
+    return _triton_call("combine", args=(x, x), output_like=x)
+
+
+def _bound_builtin_scale(x: torch.Tensor) -> torch.Tensor:
+    return x * _scale_of("x")
 
 
 class TestGeneratedCodeKeyRegressions(RefEagerTestDisabled, TestCase):
@@ -172,6 +202,202 @@ class TestGeneratedCodeKeyRegressions(RefEagerTestDisabled, TestCase):
             other_dtype = self._key(kernel)
         self.assertNotIn(None, (disabled, active, other_dtype))
         self.assertEqual(len({disabled, active, other_dtype}), 3)
+
+    def test_module_attribute_change_invalidates_or_bypasses_cache(self) -> None:
+        module_alias = torch
+
+        def closure_alias() -> float:
+            return module_alias._helion_cache_test_scale
+
+        for fn in (_module_scale, closure_alias):
+            with self.subTest(fn=fn.__name__):
+                with patch.dict(_read_module_scale.__globals__, {"_module_scale": fn}):
+                    kernel = self._kernel(_read_module_scale)
+                    with patch.object(
+                        torch, "_helion_cache_test_scale", 2.0, create=True
+                    ):
+                        cold = self._key(kernel)
+                        self.assertEqual(self._key(kernel), cold)
+                    with patch.object(
+                        torch, "_helion_cache_test_scale", 3.0, create=True
+                    ):
+                        changed = self._key(kernel)
+                self.assertTrue(cold is None or changed is None or cold != changed)
+        self.assertIsNotNone(self._key(self._kernel()))
+
+    def test_bound_builtin_receiver_change_invalidates_or_bypasses_cache(self) -> None:
+        scales = {"x": 2.0}
+        with patch.dict(_bound_builtin_scale.__globals__, {"_scale_of": scales.get}):
+            kernel = self._kernel(_bound_builtin_scale)
+            cold = self._key(kernel)
+            self.assertEqual(self._key(kernel), cold)
+            scales["x"] = 3.0
+            changed = self._key(kernel)
+        self.assertTrue(cold is None or changed is None or cold != changed)
+
+    def test_named_triton_helper_change_invalidates_or_bypasses_cache(self) -> None:
+        kernel = self._kernel(_named_triton_helper)
+        with patch.dict(_named_triton_helper.__globals__, {"combine": operator.add}):
+            cold = self._key(kernel)
+        with patch.dict(_named_triton_helper.__globals__, {"combine": operator.sub}):
+            changed = self._key(kernel)
+        self.assertTrue(cold is None or changed is None or cold != changed)
+        self.assertIsNone(self._key(self._kernel(_aliased_triton_helper)))
+
+    def test_untracked_module_and_state_access_bypasses_cache(self) -> None:
+        def consume_module(module: ModuleType) -> float:
+            return module._helion_cache_test_scale
+
+        def pass_module() -> float:
+            return consume_module(torch)
+
+        def return_module() -> ModuleType:
+            return torch
+
+        def inspect_returned_module() -> float:
+            return return_module()._helion_cache_test_scale
+
+        read_attribute = getattr
+
+        def aliased_getattr() -> float:
+            return read_attribute(torch, "_helion_cache_test_scale")
+
+        def read_thread_count() -> int:
+            return torch.get_num_threads()
+
+        ordinary = self._kernel()
+        ordinary_key = self._key(ordinary)
+        self.assertIsNotNone(ordinary_key)
+        for fn in (
+            pass_module,
+            inspect_returned_module,
+            aliased_getattr,
+            read_thread_count,
+        ):
+            with (
+                self.subTest(fn=fn.__name__),
+                patch.dict(_read_module_scale.__globals__, {"_module_scale": fn}),
+            ):
+                self.assertIsNone(self._key(self._kernel(_read_module_scale)))
+        self.assertEqual(self._key(ordinary), ordinary_key)
+
+    def test_module_getattr_is_not_executed_during_lookup(self) -> None:
+        module = ModuleType("_helion_lazy_cache_test")
+        get_attribute = Mock(side_effect=AssertionError("lazy attribute executed"))
+        module.__getattr__ = get_attribute
+
+        def lazy_attribute() -> float:
+            return module.scale
+
+        with patch.dict(
+            _read_module_scale.__globals__, {"_module_scale": lazy_attribute}
+        ):
+            self.assertIsNone(self._key(self._kernel(_read_module_scale)))
+        get_attribute.assert_not_called()
+
+    @pytest.mark.slow
+    @pytest.mark.timeout(300)
+    @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA and Triton")
+    def test_changed_dependencies_in_fresh_processes(self) -> None:
+        script = self.root / "dependency_repro.py"
+        script.write_text(
+            """
+import json
+import os
+
+import torch
+import triton
+
+import helion
+import helion.language as hl
+from helion._utils import counters
+
+changed = os.environ["CHANGED"] == "1"
+if changed:
+    @triton.jit
+    def combine(a, b):
+        return a - b
+else:
+    @triton.jit
+    def combine(a, b):
+        return a + b
+
+torch._helion_cache_test_scale = 3.0 if changed else 2.0
+SCALES = {"x": 3.0 if changed else 2.0}
+scale_of = SCALES.get
+
+def get_scale():
+    return torch._helion_cache_test_scale
+
+@helion.kernel(backend="triton", config=helion.Config(block_sizes=[128]))
+def named(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = hl.triton_kernel(
+            "combine", args=(x[tile], y[tile]), output_like=x[tile]
+        )
+    return out
+
+@helion.kernel(backend="triton", config=helion.Config(block_sizes=[128]))
+def module_attribute(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    scale = get_scale()
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] * scale
+    return out
+
+@helion.kernel(backend="triton", config=helion.Config(block_sizes=[128]))
+def bound_method(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    scale = scale_of("x")
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] * scale
+    return out
+
+@helion.kernel(backend="triton", config=helion.Config(block_sizes=[128]))
+def ordinary(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] + 1
+    return out
+
+x = torch.ones(128, device="cuda")
+results = [named(x * 5, x * 2), module_attribute(x), bound_method(x), ordinary(x)]
+expected = [3.0 if changed else 7.0, 3.0 if changed else 2.0,
+            3.0 if changed else 2.0, 2.0]
+for result, value in zip(results, expected, strict=True):
+    torch.testing.assert_close(result, torch.full_like(x, value))
+print(json.dumps({"values": [result[0].item() for result in results],
+                  "hits": counters["generated_code_cache"]["frontend_hit"]}))
+"""
+        )
+        results = {}
+        for level in ("config", "code"):
+            results[level] = []
+            for changed in ("0", "0", "1"):
+                with self.subTest(cache_level=level, changed=changed):
+                    process = subprocess.run(
+                        [sys.executable, str(script)],
+                        env={
+                            **os.environ,
+                            "HELION_CACHE_LEVEL": level,
+                            "HELION_CACHE_DIR": str(self.root / level),
+                            "HELION_BACKEND": "triton",
+                            "ENABLE_TILE": "0",
+                            "CHANGED": changed,
+                        },
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                    )
+                    self.assertEqual(process.returncode, 0, process.stderr)
+                    results[level].append(json.loads(process.stdout.splitlines()[-1]))
+        self.assertEqual(
+            [result["values"] for result in results["code"]],
+            [result["values"] for result in results["config"]],
+        )
+        # The ordinary kernel must still use the warm frontend bypass.
+        self.assertGreater(results["code"][1]["hits"], 0)
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA and Triton")
     def test_lazy_import_change_recompiles_instead_of_serving_stale_code(self) -> None:
