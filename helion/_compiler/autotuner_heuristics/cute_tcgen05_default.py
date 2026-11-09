@@ -20,6 +20,8 @@ from typing import cast
 
 from ..._utils import cdiv
 from ...runtime.config import Config
+from ..cute.cp_async_operand import TCGEN05_CP_ASYNC_A_BLOCK_K
+from ..cute.cp_async_operand import TCGEN05_CP_ASYNC_A_TILE_M
 from ..cute.dense_aligned_n import TILE_N_KEY
 from ..cute.strategies import TCGEN05_LAYOUT_OVERRIDES_KEYS
 from ..cute.strategies import TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY
@@ -145,6 +147,48 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         values.pop("cute_pdl", None)
         return Config(**values)
 
+    @staticmethod
+    def _cp_async_a_default(env: CompileEnvironment) -> Config | None:
+        """The flat one-CTA tile whose epilogue warps copy an unaligned A with
+        ``cp.async`` (``cute_mma``'s ``tcgen05_cp_async_a``), at the deepest
+        ring that fits.
+
+        Two 128-row subtiles share each B stage (a 256-row tile) while the
+        256-row tiles still occupy three quarters of the SMs: every M tile
+        streams all of B, so 30522x128x32768 with ``x.T`` as A read 1.9 GB of
+        B beside the 2 GB A on 239 128-row tiles and half that on 120 paired
+        ones (0.93 -> 1.00 of the ATen GEMM). The flat SIMT base default ran
+        0.24, the staged (transposing) copy of A 0.54.
+        """
+        spec = env.config_spec
+        state = spec._cute_tcgen05_config
+        extents = state.matmul_compile_time_static_extents
+        if extents is None or not all(isinstance(v, int) and v > 0 for v in extents):
+            return None
+        m, n, k = cast("tuple[int, int, int]", extents)
+        bk = TCGEN05_CP_ASYNC_A_BLOCK_K
+        bn = 256 if n > 128 else 128
+        paired_tiles = cdiv(m, 2 * TCGEN05_CP_ASYNC_A_TILE_M) * cdiv(n, bn)
+        bm = (
+            2 * TCGEN05_CP_ASYNC_A_TILE_M
+            if 4 * paired_tiles >= 3 * state.device_sm_count
+            and state.cp_async_a_paired_rows_allowed()
+            else TCGEN05_CP_ASYNC_A_TILE_M
+        )
+        block_sizes = state._matmul_seed_block_sizes(bm=bm, bn=bn, bk=bk)
+        stages = state.max_ab_stages_that_fit(bm=bm, bn=bn, bk=bk, cluster_m=1)
+        if block_sizes is None or stages < 2 or "flat" not in spec.allowed_pid_types:
+            return None
+        return Config(
+            block_sizes=block_sizes,
+            pid_type="flat",
+            tcgen05_cluster_m=1,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=min(stages, k // bk),
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+        )
+
     @classmethod
     def _one_cta_candidates(
         cls, env: CompileEnvironment, m: int, n: int, k: int
@@ -205,7 +249,7 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         if state._static_full_tiles(bm=bm, bn=bn, bk=bk):
             return Config(**values)
         if (
-            state.exact_shape_aux_operand_detected
+            state.exact_shape_aux_kernel_detected
             and k // bk < _ONE_CTA_N_EDGE_EXACT_AUX_MIN_K_TILES
         ):
             # An exact-shape operand (a residual) read behind the full-tile
@@ -248,12 +292,10 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         # Only kernels whose pipeline the compiler proved: TMA operands, and
         # the paired-pipeline allocation facts or, for the edge + K-tail
         # family, a plain dense GEMM body (``_edge_k_tail_default``).
-        if (
-            not spec.cute_tcgen05_search_enabled
-            or state.device_sm_count <= 0
-            or not spec.cute_tcgen05_matmul_operands_tma_provable
-        ):
+        if not spec.cute_tcgen05_search_enabled or state.device_sm_count <= 0:
             return None
+        if not spec.cute_tcgen05_matmul_operands_tma_provable:
+            return cls._cp_async_a_default(env) if state.cp_async_a_provable else None
         extents = state.matmul_compile_time_static_extents
         if extents is None or not all(isinstance(v, int) and v > 0 for v in extents):
             return None

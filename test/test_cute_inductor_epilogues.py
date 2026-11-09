@@ -351,9 +351,19 @@ def test_boolean_mask_on_tma_store_edge_tiles_reads_its_int8_storage() -> None:
     bound = dropout.kernel._bind_isolated(
         inductor_epilogue_args(dropout, 3000, 2048, 256, device="cpu", random=False)
     )
-    config = bound.config_spec.default_config()
-    assert config.block_sizes[:2] == [256, 256]
-    code = bound.to_code(config)
+    # The persistent pair over the M edge (3000 rows): whole tiles through
+    # TMA, the last row of tiles through the SIMT edge store.
+    code = bound.to_code(
+        helion.Config(
+            block_sizes=[256, 256, 64],
+            pid_type="persistent_interleaved",
+            l2_groupings=[4],
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=6,
+            tcgen05_c_stages=2,
+            tcgen05_acc_stages=2,
+        )
+    )
     assert "_edge_atom" not in code
     assert re.search(r"cute\.make_rmem_tensor\([^\n]*, cutlass\.Int8\)", code)
     assert re.search(r"= tcgen05_aux_rmem(?:_\d+)*\.load\(\) != 0$", code, re.MULTILINE)

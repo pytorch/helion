@@ -943,7 +943,9 @@ class Settings(_Settings):
             "(e.g. odd-sized bf16 rows; a misaligned base offset is not "
             "visible to the pass) into a padded row-major buffer on the host "
             "before the launch, so the tcgen05 pipeline keeps its TMA "
-            "producers instead of the scalar shared-memory producers. Set False "
+            "producers instead of the scalar shared-memory producers; an "
+            "M-major A of a GEMM at most 256 wide stays in place for the "
+            "flat one-CTA kernel's cp.async producer instead. Set False "
             "(HELION_CUTE_STAGE_UNALIGNED_OPERANDS=0) to run such operands "
             "in place."
         ),

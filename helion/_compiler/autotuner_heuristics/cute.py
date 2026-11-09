@@ -8492,6 +8492,7 @@ class CuteTcgen05ClusterM2FfiHeuristic(CuteTcgen05ClusterM2Heuristic):
         host_function = device_ir.host_function
         if host_function is None or not env.config_spec.cute_tcgen05_search_enabled:
             return frozenset()
+        from ..cute.cute_mma import host_function_cp_async_a_provable
         from ..cute.cute_mma import host_function_exact_aux_tma_provable
         from ..cute.cute_mma import host_function_matmul_operands_tma_provable
         from ..cute.cute_mma import host_function_matmul_output_matches_extents
@@ -8520,9 +8521,13 @@ class CuteTcgen05ClusterM2FfiHeuristic(CuteTcgen05ClusterM2Heuristic):
             # strided or column-major residual / gate view (codegen refuses
             # them with ``TCGEN05_AUX_TMA_ILLEGAL_TENSOR_REASON``).
             aux_provable = host_function_exact_aux_tma_provable(env, host_function)
+            cp_async_a = not provable and host_function_cp_async_a_provable(
+                env, host_function
+            )
         finally:
             env.compiler_fact_specialization_facts = saved
         env.config_spec.cute_tcgen05_matmul_operands_tma_provable = provable
+        env.config_spec.cute_tcgen05_cp_async_a_provable = cp_async_a
         env.config_spec.cute_tcgen05_exact_aux_tma_provable = aux_provable
         env.config_spec.cute_tcgen05_matmul_output_matches_extents = output_matches
         return facts

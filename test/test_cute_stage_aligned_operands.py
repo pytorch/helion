@@ -25,6 +25,10 @@ from helion._compiler.cute.stage_aligned_operands import _needs_staging
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cuda_fake
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_cp_async_a import gemm_into
+from helion._testing.cute_cp_async_a import keyword_addmm_gemm
+from helion._testing.cute_cp_async_a import residual_gemm
+from helion._testing.cute_cp_async_a import two_output_gemm
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -337,3 +341,252 @@ def test_setting_disables_the_pass() -> None:
     assert "cute_stage_unaligned_operands=False" in bound.format_kernel_decorator(
         bound.config_spec.default_config(), bound.settings
     )
+
+
+def _x_transposed_args(m: int, n: int) -> tuple[torch.Tensor, ...]:
+    # ``x.T`` of a [512, m] activation: M-contiguous A with 2 * m-byte K rows.
+    x = torch.empty((512, m), dtype=torch.bfloat16, device=CPU_DEVICE)
+    b = torch.empty((512, n), dtype=torch.bfloat16, device=CPU_DEVICE)
+    residual = torch.empty((m, n), dtype=torch.float32, device=CPU_DEVICE)
+    return x.T, b, residual
+
+
+def test_narrow_gemm_copies_an_m_major_a_with_cp_async() -> None:
+    # 2036-byte K rows: no TensorMap can address A. Up to N=256 the epilogue
+    # warps copy it with cp.async in the kernel instead of the host staging a
+    # transposing copy:
+    #     cute.copy(tcgen05_cpa_0_0_tc, tcgen05_cpa_0_0_g[None, None, None, k],
+    #               tcgen05_cpa_0_0_s[None, None, None, tcgen05_cpa_state.index],
+    #               pred=tcgen05_cpa_0_0_p)
+    #     cute.arch.cp_async_mbarrier_arrive_noinc(tcgen05_cpa_full + ...)
+    bound = _bind(residual_gemm, *_x_transposed_args(1018, 128))
+    assert _staging_statements(bound) == []
+    assert bound.config_spec.cute_tcgen05_cp_async_a_provable
+    config = bound.config_spec.default_config()
+    # 4 paired tiles would leave most of 148 SMs idle: 128-row tiles.
+    assert config.config["block_sizes"] == [128, 128, 64]
+    assert config.config["pid_type"] == "flat"
+    code = bound.to_code(config)
+    assert "constant_pad_nd" not in code
+    assert "'a_cp_async': True" in code
+    assert "tma_atom_a" not in code
+    # The copies write the stage through the generic proxy, the UMMA reads it
+    # through the async proxy: the MMA warp fences after its wait.
+    wait = code.index("cute.arch.mbarrier_wait(tcgen05_cpa_full")
+    assert code[wait:].split("\n", 2)[1].strip() == (
+        "cute.arch.fence_view_async_shared()"
+    )
+    # Rows k % 4 == 0 start 16-byte aligned, k % 4 == 2 8-byte aligned, the
+    # odd rows 4-byte aligned: one copy width per row class.
+    for bits in (128, 64, 32):
+        assert f"num_bits_per_copy={bits}" in code
+    # one arrive ahead of the K loop per stage, one refill in it
+    assert (
+        code.count("cp_async_mbarrier_arrive_noinc")
+        == 1 + config.config["tcgen05_ab_stages"]
+    )
+
+
+def test_cp_async_a_pairs_m_subtiles_on_one_b_stage() -> None:
+    bound = _bind(residual_gemm, *_x_transposed_args(1018, 128))
+    config = helion.Config(
+        **{
+            **bound.config_spec.default_config().config,
+            "block_sizes": [256, 128, 64],
+            "tcgen05_ab_stages": 4,
+        }
+    )
+    code = bound.to_code(config)
+    # Both 128-row subtiles' UMMAs read the stage's B, the second through a
+    # fragment of its own, in one statement (no CTA barrier between them):
+    #     if tcgen05_exec_active:
+    #         for _tcgen05_kblk_idx in range(...):
+    #             cute.gemm(tiled_mma, acc_frag, [tcgen05_tCrA[...]],
+    #                       [tcgen05_tCrB[...]], acc_frag)
+    #         for _tcgen05_kblk_idx in range(...):
+    #             cute.gemm(tcgen05_msub_tiled_mma, tcgen05_msub_acc_frag,
+    #                       [tcgen05_msub_tCrA[...]], [tcgen05_msub_tCrB[...]], ...)
+    assert "tcgen05_msub_tCrB = tiled_mma.make_fragment_B(sB)" in code
+    loop_start = code.index("for tile_offset_2 in")
+    loop = code[
+        loop_start : code.index("tcgen05_acc_pipeline.producer_commit", loop_start)
+    ]
+    assert "tcgen05_msub_tCrB[" in loop
+    assert "sync_threads" not in loop
+    # The epilogue drains each subtile at its own rows.
+    assert "for _tcgen05_msub in cutlass.range(2, unroll_full=True):" in code
+    assert (
+        "tcgen05_full_tile = tile_offset_0 + cutlass.Int32(_tcgen05_msub) * "
+        "cutlass.Int32(128) + cutlass.Int32(128) <= 1018"
+    ) in code
+
+
+def test_cp_async_a_needs_a_16_byte_aligned_bound_base() -> None:
+    # ``x[:, 1:1019].T`` starts 2 bytes into ``x``: the producer's 16-byte
+    # copies cannot address it, so the host stages A as before (the fake
+    # tensor's storage offset is zero; the bound pointer decides).
+    x = torch.empty((512, 1020), dtype=torch.bfloat16, device=CPU_DEVICE)
+    _, b, residual = _x_transposed_args(1018, 128)
+    bound = _bind(residual_gemm, x[:, 1:1019].T, b, residual)
+    assert _staging_statements(bound) == [
+        "a = torch.constant_pad_nd(a, [0, 64])[:, :512]"
+    ]
+    assert not bound.config_spec.cute_tcgen05_cp_async_a_provable
+
+
+def test_cp_async_a_runs_beside_an_output_no_tensormap_addresses() -> None:
+    # 520-byte output rows: the output takes the SIMT store, A still the
+    # cp.async producer (the scalar producers ran this 0.54 ms -> 47 ms).
+    a, b, _ = _x_transposed_args(1018, 128)
+    out = torch.empty((1018, 130), dtype=torch.float32, device=CPU_DEVICE)[:, :128]
+    bound = _bind(gemm_into, a, b, out)
+    assert _staging_statements(bound) == []
+    assert bound.config_spec.cute_tcgen05_cp_async_a_provable
+    config = bound.config_spec.default_config()
+    assert config.config["block_sizes"] == [128, 128, 64]
+    assert "'a_cp_async': True" in bound.to_code(config)
+
+
+def test_cp_async_a_keeps_128_row_tiles_beside_several_outputs() -> None:
+    # 239 128-row tiles would pair, but the fanout of two output stores has
+    # no paired M subtiles: the default and a projected sample keep 128 rows.
+    a, b, _ = _x_transposed_args(30522, 128)
+    bound = _bind(two_output_gemm, a, b)
+    assert bound.config_spec.cute_tcgen05_cp_async_a_provable
+    config = bound.config_spec.default_config()
+    assert config.config["block_sizes"] == [128, 128, 64]
+    assert "'a_cp_async': True" in bound.to_code(config)
+    sample = {**config.config, "block_sizes": [256, 128, 128]}
+    bound.config_spec.normalize(sample, _fix_invalid=True)
+    assert sample["block_sizes"] == [128, 128, 64]
+
+
+def test_cp_async_a_needs_the_flat_edge_tma_path() -> None:
+    # The producer runs whole tiles or the flat-edge TMA path: without the
+    # path the host stages A over the 1018-row edge and the default compiles.
+    bound = _bind(
+        residual_gemm, *_x_transposed_args(1018, 128), cute_flat_edge_tma=False
+    )
+    assert _staging_statements(bound) == [
+        "a = torch.constant_pad_nd(a, [0, 64])[:, :512]"
+    ]
+    assert not bound.config_spec.cute_tcgen05_cp_async_a_provable
+    bound.to_code(bound.config_spec.default_config())
+
+
+def test_keyword_matmul_operands_keep_their_roles() -> None:
+    # ``mat2=`` written before ``mat1=``: B is the unaligned operand (260-byte
+    # K-major rows), and the host stages it rather than taking it for A.
+    a = torch.empty((1024, 136), dtype=torch.bfloat16, device=CPU_DEVICE)[:, :130]
+    b = torch.empty((2048, 130), dtype=torch.bfloat16, device=CPU_DEVICE).T
+    bound = _bind(keyword_addmm_gemm, a, b)
+    assert [statement.split(" = ")[0] for statement in _staging_statements(bound)] == [
+        "b"
+    ]
+
+
+def test_cp_async_a_pairs_m_subtiles_in_both_accumulator_stages() -> None:
+    # A one-stage sample of the 256-row tile takes the second stage: its two
+    # subtiles' accumulators fill both (an explicit one-stage config is
+    # refused).
+    bound = _bind(residual_gemm, *_x_transposed_args(30522, 128))
+    sample = {
+        **bound.config_spec.default_config().config,
+        "block_sizes": [256, 128, 64],
+        "tcgen05_acc_stages": 1,
+    }
+    with pytest.raises(helion.exc.InvalidConfig, match="cp.async producer"):
+        bound.to_code(helion.Config(**sample))
+    bound.config_spec.normalize(sample, _fix_invalid=True)
+    assert sample["block_sizes"] == [256, 128, 64]
+    assert sample["tcgen05_acc_stages"] == 2
+    assert "'a_cp_async': True" in bound.to_code(helion.Config(**sample))
+
+
+def test_small_unstaged_a_keeps_scalar_producers_without_flat_edge_tma() -> None:
+    # Below ``STAGING_MIN_ELEMENTS`` A stays in place whatever the producer;
+    # without the flat-edge TMA path the 1018-row edge keeps the scalar
+    # producers instead of the cp.async copies, and the config compiles.
+    x = torch.empty((192, 1018), dtype=torch.bfloat16, device=CPU_DEVICE)
+    b = torch.empty((192, 128), dtype=torch.bfloat16, device=CPU_DEVICE)
+    residual = torch.empty((1018, 128), dtype=torch.float32, device=CPU_DEVICE)
+    bound = _bind(residual_gemm, x.T, b, residual, cute_flat_edge_tma=False)
+    assert _staging_statements(bound) == []
+    # the 256-row tile too: the MMA plan's prediction agrees with codegen
+    for block_m in (128, 256):
+        config = helion.Config(
+            **{
+                **bound.config_spec.default_config().config,
+                "block_sizes": [block_m, 128, 64],
+                "pid_type": "flat",
+                "tcgen05_acc_stages": 2,
+            }
+        )
+        assert "cp_async_mbarrier_arrive_noinc" not in bound.to_code(config)
+
+
+def test_explicit_configs_stay_allowed_where_staging_would_not_pad_a() -> None:
+    # A 192-deep A sits below the staging minimum: the host never padded it,
+    # so an explicit config off the cp.async envelope keeps the scalar
+    # producers it ran on rather than being refused.
+    x = torch.empty((192, 1018), dtype=torch.bfloat16, device=CPU_DEVICE)
+    b = torch.empty((192, 128), dtype=torch.bfloat16, device=CPU_DEVICE)
+    residual = torch.empty((1018, 128), dtype=torch.float32, device=CPU_DEVICE)
+    bound = _bind(residual_gemm, x.T, b, residual)
+    spec = bound.config_spec
+    assert spec.cute_tcgen05_cp_async_a_provable
+    assert not spec.cute_tcgen05_cp_async_a_unstaged
+    config = helion.Config(
+        **{
+            **spec.default_config().config,
+            "block_sizes": [128, 128, 128],
+            "tcgen05_ab_stages": 2,
+        }
+    )
+    assert "cp_async_mbarrier_arrive_noinc" not in bound.to_code(config)
+
+
+def test_wide_gemm_keeps_staging_an_m_major_a() -> None:
+    # Five 128-wide tile columns each read A: the staged copy pays for itself.
+    bound = _bind(residual_gemm, *_x_transposed_args(1018, 640))
+    # The host relays A out K-major (the staging pass's row-major copy).
+    assert _staging_statements(bound) == [
+        "a = torch.constant_pad_nd(a, [0, 64])[:, :512]"
+    ]
+    assert not bound.config_spec.cute_tcgen05_cp_async_a_provable
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"tcgen05_split_k": 2},
+        {"tcgen05_layout_overrides_smem_swizzle_a": 64},
+        {"tcgen05_strategy": "pure_matmul_role_lifecycle"},
+    ),
+    ids=("split_k", "swizzle_a", "pure_lifecycle"),
+)
+def test_cp_async_a_stays_off_configs_its_views_do_not_cover(
+    overrides: dict[str, object],
+) -> None:
+    # A split K (each split's own k-blocks), another A swizzle (the copies
+    # address the SW128 stage) or the pure lifecycle's separate TMA producer
+    # (no refill in the shared K loop) would load the unstaged A with the
+    # scalar producers: an explicit config is refused, a search sample is
+    # projected onto the cp.async envelope.
+    if overrides.get("tcgen05_strategy"):
+        # the pure lifecycle runs whole tiles of a plain GEMM: 1024 of 1026
+        # columns
+        x = torch.empty((512, 1026), dtype=torch.bfloat16, device=CPU_DEVICE)
+        b = torch.empty((512, 128), dtype=torch.bfloat16, device=CPU_DEVICE)
+        bound = _bind(_dot_gemm, x[:, :1024].T, b)
+    else:
+        bound = _bind(residual_gemm, *_x_transposed_args(1018, 128))
+    values = {**bound.config_spec.default_config().config, **overrides}
+    with pytest.raises(helion.exc.InvalidConfig, match="cp.async producer"):
+        bound.to_code(helion.Config(**values))
+    bound.config_spec.normalize(values, _fix_invalid=True)
+    assert "cp_async_mbarrier_arrive_noinc" in bound.to_code(helion.Config(**values))
+    for key, value in overrides.items():
+        assert values.get(key) != value
+    code = bound.to_code(helion.Config(**values))
+    assert "cp_async_mbarrier_arrive_noinc" in code

@@ -25,6 +25,7 @@ from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG
 from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_EPI_TMA
 from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_SIMT
 from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
+from helion._compiler.cute.tcgen05_constants import tcgen05_aux_ring_smem_bytes_per_cta
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_aux import cpu_codegen
@@ -64,6 +65,20 @@ def _residual_gemm(a: torch.Tensor, b: torch.Tensor, r: torch.Tensor) -> torch.T
             acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
         c[tile_m, tile_n] = (acc + r[tile_m, tile_n].to(torch.float32)).to(a.dtype)
     return c
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _residual_into(
+    a: torch.Tensor, b: torch.Tensor, r: torch.Tensor, out: torch.Tensor
+) -> None:
+    """``out = a @ b + r`` with ``r`` and ``out`` of any float dtypes."""
+    m, k = a.size()
+    n = b.size(1)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
+        out[tile_m, tile_n] = (acc + r[tile_m, tile_n].to(torch.float32)).to(out.dtype)
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -299,7 +314,7 @@ def _gated_pair(x: torch.Tensor, w: torch.Tensor) -> tuple[torch.Tensor, torch.T
 
 
 def test_smem_model_prices_the_rings() -> None:
-    facts = Tcgen05PipelineSmemFacts(2, 2, 232448, exact_aux_count=2)
+    facts = Tcgen05PipelineSmemFacts(2, 2, 232448, exact_aux_itemsizes=(2, 2))
     kwargs = {"bm": 256, "bn": 128, "bk": 64, "c_stages": 2, "acc_stages": 2}
     simt = pipeline_smem_bytes(facts, ab_stages=6, **kwargs)
     staged = pipeline_smem_bytes(facts, ab_stages=6, aux_load_mode=EPI_TMA, **kwargs)
@@ -315,8 +330,58 @@ def test_smem_model_prices_the_rings() -> None:
     assert max_pipeline_ab_stages(facts, **wide) == 6
     assert max_pipeline_ab_stages(facts, aux_load_mode=EPI_TMA, **wide) == 4
     # A single ring on the same tile leaves one more stage.
-    single = Tcgen05PipelineSmemFacts(2, 2, 232448, exact_aux_count=1)
+    single = Tcgen05PipelineSmemFacts(2, 2, 232448, exact_aux_itemsizes=(2,))
     assert max_pipeline_ab_stages(single, aux_load_mode=EPI_TMA, **wide) == 5
+
+
+def test_rings_are_priced_in_their_own_dtype() -> None:
+    """Each staged operand's ring holds the epilogue subtile in the operand's
+    dtype: beside a (128, 32) FP32-output subtile a bf16 residual stages 8 KiB
+    per stage and an FP32 one 16 KiB."""
+    assert (
+        tcgen05_aux_ring_smem_bytes_per_cta(
+            epi_tile_m=128, epi_tile_n=32, aux_stages=2, ring_itemsizes=(2, 4)
+        )
+        == 2 * 8192 + 2 * 16384 + 2 * 2 * 8
+    )
+    bf16 = torch.bfloat16
+    with cpu_codegen():
+        bound = _residual_into._bind_isolated(
+            (
+                torch.empty((4096, 512), dtype=bf16),
+                torch.empty((512, 1024), dtype=bf16),
+                torch.empty((4096, 1024), dtype=bf16),
+                torch.empty((4096, 1024), dtype=torch.float32),
+            )
+        )
+    state = bound.config_spec._cute_tcgen05_config
+    assert state.exact_shape_aux_kernel_detected
+    assert state.pipeline_smem_facts is not None
+    assert state.pipeline_smem_facts.exact_aux_itemsizes == (2,)
+
+
+def test_mixed_dtype_ring_stages_the_epilogue_subtile() -> None:
+    """A bf16 residual of an FP32 output stages through a bf16 ring of the
+    kernel's (FP32-sized) epilogue subtile, and the host TMA atom is built on
+    that same subtile (``epi_dtype``): sized from the residual's dtype its box
+    was (128, 64) beside the kernel's (128, 32) stage and wrote past the ring
+    (an illegal address on B200)."""
+    bf16 = torch.bfloat16
+    code = _render(
+        _residual_into,
+        (
+            torch.empty((4096, 512), dtype=bf16),
+            torch.empty((512, 1024), dtype=bf16),
+            torch.empty((4096, 1024), dtype=bf16),
+            torch.empty((4096, 1024), dtype=torch.float32),
+        ),
+        _pair(block_sizes=[256, 256, 64], tcgen05_ab_stages=4),
+    )
+    assert (
+        "make_smem_layout_epi(cutlass.BFloat16, "
+        "cutlass.utils.layout.LayoutEnum.ROW_MAJOR, tcgen05_epi_tile, 2)"
+    ) in code
+    assert "'input_dtype': 'cutlass.BFloat16', 'epi_dtype': 'cutlass.Float32'" in code
 
 
 def test_normalizer_keeps_the_ring_at_the_deepest_fitting_depth() -> None:
@@ -393,9 +458,9 @@ def test_search_surface_and_seeds() -> None:
         bound = _gated_gemm._bind_isolated(_gated_args())
         state = bound.config_spec._cute_tcgen05_config
         facts = state.pipeline_smem_facts
-        assert facts is not None and facts.exact_aux_count == 2
+        assert facts is not None and facts.exact_aux_itemsizes == (2, 2)
         assert state.rowvec_aux_facts is not None
-        assert state.rowvec_aux_facts.exact_aux_count == 2
+        assert state.rowvec_aux_facts.exact_aux_itemsizes == (2, 2)
         assert state.exact_aux_tma_provable
         assert state.epi_tma_search_enabled()
         fragment = state.aux_load_mode_autotune_fragments()[MODE]
@@ -525,6 +590,50 @@ def test_gpu_numerics(config: dict[str, object]) -> None:
     bound.set_config(helion.Config.from_dict(config))
     out = bound(a, b, g, d)
     expected = torch.addmm(g * d, a, b.T)
+    torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-1)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="tcgen05 requires an sm_100 GPU",
+)
+@pytest.mark.parametrize(
+    ("residual_dtype", "out_dtype", "mode"),
+    (
+        # a narrower operand than the output, both producers
+        (torch.bfloat16, torch.float32, EPI_TMA),
+        (torch.bfloat16, torch.float32, TCGEN05_AUX_LOAD_MODE_TMA),
+        # a wider one (its ring holds the 16-bit output's wider subtile)
+        (torch.float32, torch.bfloat16, EPI_TMA),
+        (torch.float32, torch.bfloat16, TCGEN05_AUX_LOAD_MODE_TMA),
+    ),
+    ids=(
+        "bf16_to_f32_epi_tma",
+        "bf16_to_f32_tma",
+        "f32_to_bf16_epi_tma",
+        "f32_to_bf16_tma",
+    ),
+)
+def test_gpu_mixed_dtype_rings(
+    residual_dtype: torch.dtype, out_dtype: torch.dtype, mode: str
+) -> None:
+    """Exact-shape operands of another dtype than the output stage through
+    their own rings and match torch."""
+    torch.manual_seed(0)
+    m, n, k = 2048, 1024, 256
+    a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+    b = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
+    r = torch.randn(m, n, device=DEVICE, dtype=residual_dtype)
+    out = torch.empty(m, n, device=DEVICE, dtype=out_dtype)
+    bound = _residual_into.bind((a, b, r, out))
+    config = (
+        _pair(block_sizes=[256, 256, 64], tcgen05_ab_stages=3)
+        if mode == EPI_TMA
+        else _producer_warp_tma()
+    )
+    bound.set_config(helion.Config.from_dict({**config, MODE: mode}))
+    bound(a, b, r, out)
+    expected = (torch.mm(a.float(), b.float()) + r.float()).to(out_dtype)
     torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-1)
 
 

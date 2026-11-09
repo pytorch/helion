@@ -467,7 +467,7 @@ def host_function_tcgen05_rowvec_aux_facts(
     output_itemsize: int | None = None
     rows: list[Tcgen05RowvecAuxRow] = []
     output_count = 0
-    exact_aux_count = 0
+    exact_aux_itemsizes: tuple[int, ...] = ()
     for mma_node in _tcgen05_aux_detector_mma_nodes(graphs):
         analyzed_stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
         if analyzed_stores is None:
@@ -480,16 +480,13 @@ def host_function_tcgen05_rowvec_aux_facts(
             ):
                 return None
             output_itemsize = output.dtype.itemsize
-            exact_aux_count = max(
-                exact_aux_count,
-                sum(
-                    1
-                    for leaf in chain.auxiliary_tensor_loads
-                    if leaf.broadcast_axis is None
-                    and _step_host_tensor(leaf)[1].ndim == 2
-                    and _step_host_tensor(leaf)[1].dtype == output.dtype
-                ),
+            store_itemsizes = tuple(
+                _step_host_tensor(leaf)[1].dtype.itemsize
+                for leaf in chain.auxiliary_tensor_loads
+                if leaf.broadcast_axis is None and _step_host_tensor(leaf)[1].ndim == 2
             )
+            if sum(store_itemsizes) > sum(exact_aux_itemsizes):
+                exact_aux_itemsizes = store_itemsizes
             for leaf in chain.auxiliary_tensor_loads:
                 if leaf.broadcast_axis != 1:
                     continue
@@ -507,7 +504,7 @@ def host_function_tcgen05_rowvec_aux_facts(
         output_itemsize=output_itemsize,
         rows=tuple(rows),
         output_count=max(output_count, 1),
-        exact_aux_count=exact_aux_count,
+        exact_aux_itemsizes=exact_aux_itemsizes,
     )
 
 
@@ -547,8 +544,9 @@ def host_function_has_tcgen05_exact_shape_aux_kernel_pattern(
 ) -> bool:
     """Return True when a tcgen05 aux pattern has a rank-2 exact-shape input.
 
-    The aux-TMA path requires the staged aux tensor to match the output dtype,
-    so this detector requires both exact output shape and matching dtype.
+    The aux-TMA path stages each such operand in its own dtype (a bf16
+    residual of an FP32 output included), so this detector requires the exact
+    output shape only.
     Row-vector broadcast aux inputs intentionally stay on the direct SIMT path
     because the TMA path has no useful tile to bulk-load for them. Rank-3 and
     other batched aux patterns are also excluded: the current aux-TMA wrapper
@@ -558,8 +556,7 @@ def host_function_has_tcgen05_exact_shape_aux_kernel_pattern(
     analyzer so exact-shape aux loads must pass the same whitelist and index
     checks as codegen. It then requires exactly one compatible store value,
     and every exact-shape aux descriptor on that store must match the output
-    shape and dtype, mirroring the codegen-time TMA descriptor dtype gate.
-    Any exact-shape aux shape or dtype mismatch in an analyzed store disables
+    shape. Any exact-shape aux shape mismatch in an analyzed store disables
     the detector for the whole kernel rather than trying to partially admit
     aux-TMA.
     """
@@ -586,32 +583,6 @@ def host_function_has_tcgen05_exact_shape_aux_kernel_pattern(
         store_outputs,
         inner_outputs_by_graph_id=build_inner_outputs_index_from_graphs(graphs),
         target_fx_nodes=mma_nodes,
-    )
-
-
-def host_function_has_tcgen05_exact_shape_aux_operand(
-    host_function: HostFunction,
-) -> bool:
-    """``host_function_has_tcgen05_exact_shape_aux_kernel_pattern`` without
-    the dtype match: one analyzed store reads exact-shape operands of the
-    output's shape, whatever their dtype (a bf16 residual of an FP32 output
-    included).  The default tile rules that judge what the epilogue reads,
-    not what the aux-TMA ring can stage, take this one."""
-    graphs = host_function.device_ir.graphs
-    mma_nodes = _tcgen05_aux_detector_mma_nodes(graphs) if graphs else set()
-    if not mma_nodes:
-        return False
-    store_outputs = [
-        (store_value, tensor_val)
-        for graph_info in graphs
-        for store_node, store_value in _store_value_pairs_from_graph(graph_info.graph)
-        if (tensor_val := _output_tensor_from_store_node(store_node)) is not None
-    ]
-    return bool(store_outputs) and _has_tma_compatible_analyzed_aux_store(
-        store_outputs,
-        inner_outputs_by_graph_id=build_inner_outputs_index_from_graphs(graphs),
-        target_fx_nodes=mma_nodes,
-        require_output_dtype=False,
     )
 
 
@@ -714,7 +685,6 @@ def _has_tma_compatible_analyzed_aux_store(
     *,
     inner_outputs_by_graph_id: dict[int, tuple[torch.fx.Node | None, ...]],
     target_fx_nodes: set[torch.fx.Node],
-    require_output_dtype: bool = True,
 ) -> bool:
     # Dedup by store value so repeated stores of the same computed chain are
     # treated as one aux-TMA candidate at detector time.
@@ -738,8 +708,6 @@ def _has_tma_compatible_analyzed_aux_store(
         for step in exact_steps:
             _, aux_tensor = _step_host_tensor(step)
             if not _same_static_shape(aux_tensor, output):
-                return False
-            if require_output_dtype and aux_tensor.dtype != output.dtype:
                 return False
         compatible_store_values.add(store_value)
         if len(compatible_store_values) > 1:

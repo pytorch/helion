@@ -2483,14 +2483,6 @@ class ConfigSpec:
         self._cute_tcgen05_config.exact_shape_aux_kernel_detected = value
 
     @property
-    def cute_tcgen05_exact_shape_aux_operand_detected(self) -> bool:
-        return self._cute_tcgen05_config.exact_shape_aux_operand_detected
-
-    @cute_tcgen05_exact_shape_aux_operand_detected.setter
-    def cute_tcgen05_exact_shape_aux_operand_detected(self, value: bool) -> None:
-        self._cute_tcgen05_config.exact_shape_aux_operand_detected = value
-
-    @property
     def cute_tcgen05_aux_loads_on_every_store(self) -> bool:
         return self._cute_tcgen05_config.aux_loads_on_every_store
 
@@ -2523,6 +2515,22 @@ class ConfigSpec:
     @cute_tcgen05_matmul_operands_tma_provable.setter
     def cute_tcgen05_matmul_operands_tma_provable(self, value: bool) -> None:
         self._cute_tcgen05_config.matmul_operands_tma_provable = value
+
+    @property
+    def cute_tcgen05_cp_async_a_provable(self) -> bool:
+        return self._cute_tcgen05_config.cp_async_a_provable
+
+    @cute_tcgen05_cp_async_a_provable.setter
+    def cute_tcgen05_cp_async_a_provable(self, value: bool) -> None:
+        self._cute_tcgen05_config.cp_async_a_provable = value
+
+    @property
+    def cute_tcgen05_cp_async_a_unstaged(self) -> bool:
+        return self._cute_tcgen05_config.cp_async_a_unstaged
+
+    @cute_tcgen05_cp_async_a_unstaged.setter
+    def cute_tcgen05_cp_async_a_unstaged(self, value: bool) -> None:
+        self._cute_tcgen05_config.cp_async_a_unstaged = value
 
     @property
     def cute_tcgen05_exact_aux_tma_provable(self) -> bool:
@@ -8301,6 +8309,9 @@ class ConfigSpec:
             self._cute_tcgen05_config.normalize_strategy(
                 config,
                 fix_invalid=_fix_invalid,
+            )
+            self._cute_tcgen05_config.validate_cp_async_a_config(
+                config, fix_invalid=_fix_invalid
             )
             self._normalize_cute_flash(config, fix_invalid=_fix_invalid)
             self._normalize_cute_flash_gated(config, fix_invalid=_fix_invalid)

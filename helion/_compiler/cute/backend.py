@@ -758,6 +758,7 @@ def _detect_specialized_mma_loop(
     from .cute_mma import _loop_subrange_parent_block_id
     from .cute_mma import _mma_tiles_are_static_full
     from .cute_mma import _ragged_batched_tcgen05_config
+    from .cute_mma import _tcgen05_cp_async_a_mma_bm
     from .cute_mma import _tcgen05_epi_warp_groups
     from .cute_mma import analyze_cute_mma_node
     from .cute_mma import ensure_tcgen05_fragment_epilogue_plan
@@ -860,7 +861,10 @@ def _detect_specialized_mma_loop(
         lhs_val = candidate.operands.lhs.source_fake
         mma_impl = _choose_mma_impl(
             lhs_val.dtype,
-            bm=bm,
+            # the cp.async-A kernel's 256-row tile runs 128-row subtiles
+            bm=_tcgen05_cp_async_a_mma_bm(
+                env, config, candidate.operands.lhs, candidate.operands.rhs, bm=bm
+            ),
             bn=bn,
             bk=bk,
             config=config,

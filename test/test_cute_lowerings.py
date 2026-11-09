@@ -19118,8 +19118,9 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         self.assertIn(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, msg)
         self.assertIn("single-store fan-out", msg)
 
-    def test_aux_tma_load_rejects_aux_dtype_mismatch(self) -> None:
-        """Explicit aux TMA requires the staged aux dtype to match D."""
+    def test_aux_tma_load_stages_an_aux_of_another_dtype(self) -> None:
+        """Explicit aux TMA stages an operand of another dtype than D in its
+        own dtype, on the epilogue subtile D's dtype sizes (``epi_dtype``)."""
 
         kernel = self._residual_kernel()
         args = (
@@ -19132,11 +19133,11 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         with patch_cute_mma_support():
             bound = kernel.bind(args)
             bound.env.config_spec.cute_tcgen05_search_enabled = True
-            with self.assertRaises(exc.BackendUnsupported) as cm:
-                bound.to_triton_code(config)
-        msg = str(cm.exception)
-        self.assertIn(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, msg)
-        self.assertIn("dtype to match", msg)
+            code = bound.to_triton_code(config)
+        self.assertIn("make_smem_layout_epi(cutlass.Float16, ", code)
+        self.assertIn(
+            "'input_dtype': 'cutlass.Float16', 'epi_dtype': 'cutlass.BFloat16'", code
+        )
 
     def test_aux_tma_load_runtime_correctness(self) -> None:
         """The opt-in aux TMA producer/consumer path compiles and runs."""

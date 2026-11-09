@@ -387,7 +387,7 @@ def test_bias_rows_record_their_width_and_columns_decline() -> None:
         (a, b, row, out)
     ).config_spec._cute_tcgen05_config.pipeline_smem_facts
     assert facts is not None and facts.has_auxiliary_loads
-    assert facts.rows == () and facts.exact_aux_count == 0
+    assert facts.rows == () and facts.exact_aux_itemsizes == ()
 
 
 def test_other_pipeline_analyzer_callers_refuse_bias_rows() -> None:

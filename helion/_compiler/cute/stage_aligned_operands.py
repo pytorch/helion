@@ -33,8 +33,12 @@ through such device-loop reads and its logical metadata (``size``,
 ``shape``, ``dtype``, ...): a store, a rebinding, an alias, a view, a host
 subscript (``x[0]`` is a view of the copy), a layout query, a ``return`` or
 any other call would observe the copy as a different tensor or write into
-it instead of the caller's (``_uses_are_benign``). Dynamic shapes are left
-alone; ``cute_stage_unaligned_operands=False`` disables the pass.
+it instead of the caller's (``_uses_are_benign``). The exception is an
+M-contiguous 16-bit A of the kernel's only matmul beside an aligned B at
+most ``CP_ASYNC_MAX_N`` wide, on a 16-byte bound base: the flat one-CTA
+kernel's epilogue warps copy it with ``cp.async`` instead
+(``_cp_async_lhs_names``). Dynamic shapes are left alone;
+``cute_stage_unaligned_operands=False`` disables the pass.
 """
 
 from __future__ import annotations
@@ -44,10 +48,12 @@ import math
 from typing import TYPE_CHECKING
 
 import torch
+from torch._subclasses.fake_tensor import FakeTensor
 
 from ..ast_extension import ExtendedAST
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
+from .cp_async_operand import tcgen05_cp_async_a_strided_layout
 from .full_slice_matmul import _bound_names
 from .full_slice_matmul import _global_value
 import helion.language as hl
@@ -150,22 +156,18 @@ def _plain_tile_subscript(node: ast.Subscript) -> bool:
 def _matmul_operands(
     call: ast.Call, host: HostFunction, local_names: set[str]
 ) -> list[ast.AST]:
-    """The MMA operand expressions of a matmul-family call (else empty)."""
+    """The MMA operand expressions of a matmul-family call (else empty), in
+    operand order (A, then B) whether passed by position or by keyword
+    (``torch.addmm(input=acc, mat2=b, mat1=a)`` reads ``a`` as A)."""
     callee = _global_value(call.func, host, local_names)
+    keywords = {keyword.arg: keyword.value for keyword in call.keywords}
     for function, positions, keyword_names in _MATMUL_OPERANDS:
         if callee is function:
-            return [
-                *(
-                    call.args[position]
-                    for position in positions
-                    if position < len(call.args)
-                ),
-                *(
-                    keyword.value
-                    for keyword in call.keywords
-                    if keyword.arg in keyword_names
-                ),
-            ]
+            operands = (
+                call.args[position] if position < len(call.args) else keywords.get(name)
+                for position, name in zip(positions, keyword_names, strict=True)
+            )
+            return [operand for operand in operands if operand is not None]
     return []
 
 
@@ -202,23 +204,31 @@ def _root_name(node: ast.AST, aliases: dict[str, str]) -> str | None:
     return aliases.get(node.id, node.id)
 
 
-def _matmul_operand_names(host: HostFunction, local_names: set[str]) -> set[str]:
-    """Argument names read as a matmul operand somewhere in the kernel."""
+def _matmul_operand_roots(
+    host: HostFunction, local_names: set[str]
+) -> list[list[str | None]]:
+    """The arguments each matmul of the kernel reads as its operands, in
+    operand order (``None`` for an operand that is not a plain read)."""
     module = ast.Module(body=host.body, type_ignores=[])
     aliases = _tile_read_aliases(module)
-    names: set[str] = set()
+    matmuls: list[list[str | None]] = []
     for node in ast.walk(module):
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.MatMult):
             operands: list[ast.AST] = [node.left, node.right]
         elif isinstance(node, ast.Call):
             operands = _matmul_operands(node, host, local_names)
+            if not operands:
+                continue
         else:
             continue
-        for operand in operands:
-            root = _root_name(operand, aliases)
-            if root is not None:
-                names.add(root)
-    return names
+        matmuls.append([_root_name(operand, aliases) for operand in operands])
+    return matmuls
+
+
+def _matmul_operand_names(matmuls: list[list[str | None]]) -> set[str]:
+    """Argument names read as a matmul operand somewhere in the kernel (of
+    ``_matmul_operand_roots``)."""
+    return {root for roots in matmuls for root in roots if root is not None}
 
 
 def _device_loop_nodes(
@@ -292,6 +302,56 @@ def _uses_are_benign(host: HostFunction, name: str, local_names: set[str]) -> bo
     return True
 
 
+# A narrow GEMM reads A once per tile column; up to two 128-wide columns the
+# padded copy (one more read and one write of A) costs more than the
+# ``cp.async`` producer's slower loads (``cp_async_operand``).
+CP_ASYNC_MAX_N = 256
+
+
+def _cp_async_lhs_names(
+    env: CompileEnvironment,
+    matmuls: list[list[str | None]],
+    tensors: dict[str, torch.Tensor],
+    pads: dict[str, int],
+) -> set[str]:
+    """Unaligned A operands the tcgen05 kernel copies with ``cp.async``.
+
+    The first operand of the kernel's only matmul (the default's gate,
+    ``host_function_cp_async_a_provable``, proves every MMA) when its layout
+    is one the flat one-CTA kernel's epilogue-warp producer serves
+    (``tcgen05_cp_async_a_strided_layout``) on a 16-byte aligned base: the
+    bound argument's pointer, whose residue the kernel's cache key records
+    (``register_persistent_vec_alignment_specializations``) and codegen
+    re-proves (``tcgen05_cp_async_a_operand_layout``); the fake tensor's
+    storage offset is always zero. Beside a B operand that needs no staging
+    and is at most ``CP_ASYNC_MAX_N`` wide:
+    staging re-lays out all of A through a transposing copy, which a narrow
+    GEMM reads only once or twice. The producer runs whole tiles or the
+    flat-edge TMA path (``cute_flat_edge_tma``); without that path A is
+    staged.
+    """
+    if len(matmuls) != 1 or len(matmuls[0]) != 2:
+        return set()
+    lhs, rhs = matmuls[0]
+    if lhs not in pads or rhs is None or rhs in pads or rhs not in tensors:
+        return set()
+    lhs_tensor, rhs_tensor = tensors[lhs], tensors[rhs]
+    bound = env.runtime_value_for_tensor(lhs_tensor)
+    if (
+        env.settings.cute_flat_edge_tma
+        and rhs_tensor.ndim == 2
+        and isinstance(rhs_tensor.size(-1), int)
+        and rhs_tensor.size(-1) <= CP_ASYNC_MAX_N
+        and isinstance(bound, torch.Tensor)
+        # a FakeTensor bind (Dynamo's output-spec capture) proves no pointer
+        and not isinstance(bound, FakeTensor)
+        and bound.data_ptr() % 16 == 0
+        and tcgen05_cp_async_a_strided_layout(lhs_tensor) is not None
+    ):
+        return {lhs}
+    return set()
+
+
 def stage_unaligned_matmul_operands(host: HostFunction) -> bool:
     """Pad TensorMap-unaligned matmul operands on the host; True when rewritten."""
     env = CompileEnvironment.current()
@@ -310,12 +370,20 @@ def stage_unaligned_matmul_operands(host: HostFunction) -> bool:
     if not pads:
         return False
     local_names = _bound_names(host)
-    operands = _matmul_operand_names(host, local_names)
-    staged = [
+    matmuls = _matmul_operand_roots(host, local_names)
+    operands = _matmul_operand_names(matmuls)
+    cp_async = _cp_async_lhs_names(env, matmuls, tensors, pads)
+    stageable = [
         name
         for name in pads
         if name in operands and _uses_are_benign(host, name, local_names)
     ]
+    # A left for the cp.async producer that would have been padded: the
+    # producer's envelope is then the only fast one (``validate_cp_async_a_config``).
+    env.config_spec.cute_tcgen05_cp_async_a_unstaged = any(
+        name in cp_async for name in stageable
+    )
+    staged = [name for name in stageable if name not in cp_async]
     if not staged:
         return False
     torch_alias = next(

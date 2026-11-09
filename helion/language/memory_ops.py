@@ -3152,7 +3152,24 @@ def _codegen_cute_store_tcgen05_tile(
         raise exc.BackendUnsupported(
             "cute", "tcgen05 output fanout does not support paired M subtiles"
         )
-    if tcgen05_m_subtile_count > 1:
+    if (
+        tcgen05_m_subtile_count > 1
+        and matmul_plan is not None
+        and (not matmul_plan.is_two_cta)
+    ):
+        # The cp.async-A flat kernel's 128-row subtiles (``cute_mma``'s
+        # ``tcgen05_cp_async_a``) can run past M, so the subtile's rows go into
+        # the M index itself: the full-tile predicate, the auxiliary tiles and
+        # the edge coordinates all read the drained subtile's rows, e.g.
+        # ``tcgen05_full_tile = (tile_offset_0 + cutlass.Int32(_tcgen05_msub)
+        # * cutlass.Int32(128)) + cutlass.Int32(128) <= 30522``.
+        m_index = (
+            f"({m_index} + cutlass.Int32(_tcgen05_msub) * "
+            f"cutlass.Int32({tcgen05_source_bm}))"
+        )
+        tile_coord_m = f"({m_index}) // cutlass.Int32({tcgen05_source_bm})"
+        static_tile_coord_m = tile_coord_m
+    elif tcgen05_m_subtile_count > 1:
         static_tile_coord_m = f"({tile_coord_m} + cutlass.Int32(_tcgen05_msub))"
     full_tile = df.new_var("tcgen05_full_tile")
 
@@ -8523,6 +8540,14 @@ def _codegen_cute_store_tcgen05_tile(
                 sync_after_stmt,
             ]
     else:
+        if tcgen05_m_subtile_count > 1:
+            # The cp.async-A flat kernel's M-paired tile drains its two
+            # 128-row subtiles' acc stages in turn.
+            store_body_core = [
+                f"for _tcgen05_msub in cutlass.range("
+                f"{tcgen05_m_subtile_count}, unroll_full=True):\n"
+                + textwrap.indent("\n".join(store_body_core), "    ")
+            ]
         store_body = [
             "cute.arch.sync_threads()",
             *store_body_core,
