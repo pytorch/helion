@@ -56,6 +56,7 @@ def append_epilogue_tma_wrapper(
     orientation: str = "mn",
     column_major: bool = False,
     bounded_output_shift: bool = False,
+    extents: tuple[int, int] | None = None,
 ) -> None:
     assert len(kernel_args) == 2
     assert orientation in ("mn", "nm")
@@ -139,9 +140,14 @@ def append_epilogue_tma_wrapper(
             f"(arg{tensor_idx}.iterator - cutlass.Int64(arg{tensor_idx}_shape0) "
             f"* cutlass.Int64(arg{tensor_idx}_stride0))"
         )
+    if extents is not None and not worklist_nm_store and not bounded_output_shift:
+        # A destination larger than the GEMM (``d_extents``): the TensorMap
+        # clips the edge tiles at the GEMM's (M, N), a column-major one too.
+        rows, cols = extents
+        rank3_gmem_shape = f"({rows}, {cols}, 1)"
     gmem_layout = (
         ctx.descriptors.layout(f"arg{tensor_idx}", output=True)
-        if ctx.descriptors is not None
+        if ctx.descriptors is not None and extents is None
         else f"{rank3_gmem_shape}, stride={rank3_gmem_stride}"
     )
     # Keep these layout arguments in sync with the device-side
@@ -204,6 +210,16 @@ def emit_d_tma(ctx: HostWrapperContext, plan: dict[str, object]) -> None:
     elif bool(plan.get("d_leading_passthrough")):
         d_tensor_name = f"{kernel_args[0]}_d_tma"
         ctx.append_permuted_cute_tensor_view(d_tensor_name, d_idx, (1, 2, 0))
+    elif (d_extents := plan.get("d_extents")) is not None:
+        # A destination larger than the GEMM: the TensorMap clips the edge
+        # tiles at the GEMM's (M, N), not at the destination's shape.
+        rows, cols = cast("list[int]", d_extents)
+        d_tensor_name = f"{kernel_args[0]}_d_view"
+        ctx.body.append(
+            f"    {d_tensor_name} = cute.make_tensor(arg{d_idx}.iterator, "
+            f"layout=cute.make_layout(({rows}, {cols}), "
+            f"stride=(arg{d_idx}_stride0, arg{d_idx}_stride1)))"
+        )
     append_epilogue_tma_wrapper(
         ctx,
         tensor_idx=d_idx,
@@ -222,6 +238,11 @@ def emit_d_tma(ctx: HostWrapperContext, plan: dict[str, object]) -> None:
         orientation=tcgen05_plan_orientation(plan),
         column_major=bool(plan.get("d_column_major")),
         bounded_output_shift=bool(plan.get("bounded_output_shift")),
+        extents=(
+            None
+            if (d_extents := plan.get("d_extents")) is None
+            else cast("tuple[int, int]", tuple(cast("list[int]", d_extents)))
+        ),
     )
 
 

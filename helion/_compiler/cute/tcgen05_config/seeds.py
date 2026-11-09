@@ -65,6 +65,8 @@ from ..tcgen05_constants import TCGEN05_C_STORE_MODE_DIRECT
 from ..tcgen05_constants import TCGEN05_CLUSTER_N2_SEED_L2_GROUPING
 from ..tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
+from ..tcgen05_constants import TCGEN05_LONG_N_SWEEP_L2_GROUPING
+from ..tcgen05_constants import TCGEN05_LONG_N_SWEEP_MIN_TILES
 from ..tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_N
 from ..tcgen05_constants import TCGEN05_REGION_PID_TYPE_INHERIT
 from ..tcgen05_constants import TCGEN05_REGION_PID_TYPES_CONFIG_KEY
@@ -1740,6 +1742,20 @@ def full_tile_direct_entry_seed_eligible(state: CuteTcgen05Config) -> bool:
     return full_tile_direct_entry_seed_pipeline(state) is not None
 
 
+def _direct_entry_l2_grouping(state: CuteTcgen05Config) -> int:
+    """The direct-entry pair's M-tile grouping: 2 (the measured
+    direct-entry default), or ``TCGEN05_LONG_N_SWEEP_L2_GROUPING`` on a
+    long N sweep, where grouping 2 re-reads B every two M tiles."""
+    extents = state.matmul_compile_time_static_extents
+    n = extents[1] if extents is not None else None
+    if (
+        isinstance(n, int)
+        and -(-n // TCGEN05_TWO_CTA_BLOCK_N) >= TCGEN05_LONG_N_SWEEP_MIN_TILES
+    ):
+        return TCGEN05_LONG_N_SWEEP_L2_GROUPING
+    return 2
+
+
 def full_tile_direct_entry_seed_config(
     state: CuteTcgen05Config, *, l2_groupings: list[object] | None = None
 ) -> Config | None:
@@ -1777,7 +1793,7 @@ def full_tile_direct_entry_seed_config(
     assert state.matmul_block_ids is not None
     l2_groupings[
         state.config_spec.l2_groupings.block_id_to_index(state.matmul_block_ids[0])
-    ] = 2
+    ] = _direct_entry_l2_grouping(state)
     seed: dict[str, Any] = {
         "block_sizes": block_sizes,
         "l2_groupings": l2_groupings,

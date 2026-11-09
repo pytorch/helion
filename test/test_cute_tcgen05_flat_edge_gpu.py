@@ -1,4 +1,7 @@
-"""GPU tests of the flat one-CTA tcgen05 pipeline over ragged tiles.
+"""GPU tests of tcgen05 kernels over ragged tiles.
+
+The flat one-CTA pipeline, the persistent one-CTA N-edge tiles, the staged
+rows' one-tile lookahead and the ragged two-CTA search.
 
 Partial M / N output tiles and a K tail used to take the one-warp scalar
 SMEM producer and store 16-bit scalars; the flat pipeline now loads every
@@ -10,6 +13,7 @@ GEMMs and check the results against torch.
 
 from __future__ import annotations
 
+import itertools
 import unittest
 
 import pytest
@@ -23,8 +27,11 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
+from helion._testing.cute_aux import rank_two_aux
 from helion._testing.cute_dense_tcgen05 import bias_mm_into
+from helion._testing.cute_dense_tcgen05 import plain_mm_into
 from helion._testing.cute_dense_tcgen05 import promoted_bias_mm_into
+from helion._testing.cute_dense_tcgen05 import scale_bias_mm_into
 import helion.language as hl
 
 pytestmark = pytest.mark.skipif(
@@ -212,6 +219,251 @@ class TestCuteTcgen05FlatEdgeGpu(RefEagerTestDisabled, TestCase):
             self.assertFalse(bound.config_spec.tcgen05.search_enabled)
             with self.assertRaises(helion.exc.InvalidConfig):
                 bound.to_code(_flat_config([1, 128, 256, 64]))
+
+
+@onlyBackends(["cute"])
+@skipIfNotCUDA()
+class TestCuteTcgen05OneCtaNEdgeTmaStore(RefEagerTestDisabled, TestCase):
+    def test_persistent_n_edge_tiles_store_through_tma(self) -> None:
+        # One CTA, 128x256 tiles: N=576 ends 64 columns into its third tile and
+        # 8192 rows give 192 tiles, so CTAs run more than one tile and some of
+        # the partial ones. Every tile takes the TMA store (the D descriptor
+        # drops the columns past N): a plain store, a bias row staged through
+        # the predicated copy, and an exact-shape residual read behind the
+        # full-tile guard.
+        m, n, k = 8192, 576, 192
+        a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn(n, device=DEVICE, dtype=torch.bfloat16)
+        res = torch.randn(m, n, device=DEVICE, dtype=torch.bfloat16)
+        out = torch.empty(m, n, device=DEVICE, dtype=torch.bfloat16)
+        acc = a.float() @ b.float()
+        cases = (
+            (plain_mm_into, (a, b, out), acc),
+            (bias_mm_into, (a, b, bias, out), acc + bias.float()),
+            (rank_two_aux, (a, b, res), acc + res.float()),
+        )
+        # the 128x128 tile is the decode default's (one row of M tiles)
+        for (kernel, args, expected), bn in itertools.product(cases, (256, 128)):
+            bound = kernel.bind(args)
+            config = bound.config_spec.default_config()
+            config.config.update(
+                block_sizes=[128, bn, 64],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=1,
+                tcgen05_ab_stages=3,
+                tcgen05_aux_load_placement="post_acc_wait",
+            )
+            bound.config_spec.normalize(config, _fix_invalid=True)
+            self.assertEqual(config.config["pid_type"], "persistent_interleaved")
+            code = bound.to_code(config)
+            self.assertIn("tcgen05_tma_store_atom", code)
+            self.assertNotIn("cute.nvgpu.CopyR2GOp()", code)
+            bound.set_config(config)
+            out.zero_()
+            result = bound(*args)
+            torch.testing.assert_close(
+                out if result is None else result,
+                expected.to(out.dtype),
+                rtol=1e-2,
+                atol=1e-1,
+            )
+
+    def test_plain_column_major_output_defaults_to_the_n_edge_tiles(self) -> None:
+        # A plain column-major output (no auxiliary operand) takes the
+        # persistent one-CTA N-edge tiles by default and stores every tile
+        # through TMA.
+        m, n, k = 25216, 576, 192
+        a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
+        out = torch.empty(n, m, device=DEVICE, dtype=torch.bfloat16).T
+        bound = plain_mm_into.bind((a, b, out))
+        config = bound.config_spec.default_config()
+        self.assertEqual(config.config["pid_type"], "persistent_interleaved")
+        self.assertEqual(config.block_sizes, [128, 256, 64])
+        self.assertIn("tcgen05_tma_store_atom", bound.to_code(config))
+        bound.set_config(config)
+        bound(a, b, out)
+        torch.testing.assert_close(
+            out, (a.float() @ b.float()).to(out.dtype), rtol=1e-2, atol=1e-1
+        )
+
+    def test_output_wider_than_n_keeps_its_columns_on_the_simt_store(self) -> None:
+        # The flat tile's SIMT edge store bounds the GEMM's (M, N) too: a
+        # 1001-wide output over N=1000 (2002-byte rows), and a 1008-wide one
+        # over N=1001 with a K-major B, whose vector edge copy writes the
+        # column past the last whole vector (1000) and nothing beyond.
+        config = helion.Config(block_sizes=[128, 128, 64], l2_groupings=[1])
+        for n, width, rhs_k_major in ((1000, 1001, False), (1001, 1008, True)):
+            with self.subTest(n=n, width=width):
+                a = torch.randn(1000, 512, device=DEVICE, dtype=torch.bfloat16)
+                b = (
+                    torch.randn(n, 512, device=DEVICE, dtype=torch.bfloat16).T
+                    if rhs_k_major
+                    else torch.randn(512, n, device=DEVICE, dtype=torch.bfloat16)
+                )
+                out = torch.full(
+                    (1000, width), 7.0, device=DEVICE, dtype=torch.bfloat16
+                )
+                bound = plain_mm_into.bind((a, b, out))
+                bound.set_config(config)
+                bound(a, b, out)
+                torch.testing.assert_close(
+                    out[:, :n],
+                    (a.float() @ b.float()).to(out.dtype),
+                    rtol=1e-2,
+                    atol=1e-1,
+                )
+                self.assertTrue(bool((out[:, n:] == 7).all()))
+
+    def test_output_wider_than_n_keeps_its_columns(self) -> None:
+        # The GEMM covers 576 of the output's 640 columns, row- or
+        # column-major: the edge stores stop at N (the TMA store's TensorMap
+        # views the GEMM's extents), so the columns past N keep their
+        # sentinel on the default (25216 rows: ragged for the pairs), the
+        # pair's partial-output store (25600 rows) and the persistent
+        # one-CTA N-edge tiles.
+        n, k = 576, 192
+        pair = helion.Config(
+            block_sizes=[256, 256, 64],
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=4,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+        )
+        one_cta = helion.Config(
+            block_sizes=[128, 256, 64],
+            l2_groupings=[1],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+        )
+        cases = [
+            (column_major, m, config)
+            for column_major in (False, True)
+            for m, config in ((25216, None), (25600, pair), (25600, one_cta))
+        ]
+        for column_major, m, config in cases:
+            with self.subTest(column_major=column_major, m=m, config=config):
+                a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+                b = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
+                out = (
+                    torch.full((640, m), 7.0, device=DEVICE, dtype=torch.bfloat16).T
+                    if column_major
+                    else torch.full((m, 640), 7.0, device=DEVICE, dtype=torch.bfloat16)
+                )
+                bound = plain_mm_into.bind((a, b, out))
+                self.assertFalse(
+                    bound.config_spec.tcgen05.matmul_output_matches_extents
+                )
+                bound.set_config(
+                    config if config is not None else bound.config_spec.default_config()
+                )
+                bound(a, b, out)
+                torch.testing.assert_close(
+                    out[:, :n],
+                    (a.float() @ b.float()).to(out.dtype),
+                    rtol=1e-2,
+                    atol=1e-1,
+                )
+                self.assertTrue(bool((out[:, n:] == 7).all()))
+
+    def test_column_major_output_bias_stays_off_the_n_edge_tiles(self) -> None:
+        # A column-major output with a bias row: the partial-output body's
+        # auxiliary reads do not take the accumulator's layout there, so the
+        # default keeps the flat kernel on whole tiles instead of the
+        # persistent one-CTA N-edge tiles, and matches torch.
+        m, n, k = 25216, 576, 192
+        a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
+        bias = torch.randn(n, device=DEVICE, dtype=torch.bfloat16)
+        out = torch.empty(n, m, device=DEVICE, dtype=torch.bfloat16).T
+        bound = bias_mm_into.bind((a, b, bias, out))
+        config = bound.config_spec.default_config()
+        self.assertEqual(config.config["pid_type"], "flat")
+        bound.set_config(config)
+        bound(a, b, bias, out)
+        torch.testing.assert_close(
+            out,
+            (a.float() @ b.float() + bias.float()).to(out.dtype),
+            rtol=1e-2,
+            atol=1e-1,
+        )
+
+
+@onlyBackends(["cute"])
+@skipIfNotCUDA()
+class TestCuteTcgen05RowLookahead(RefEagerTestDisabled, TestCase):
+    def test_staged_rows_load_one_tile_ahead(self) -> None:
+        # N=3000 on 256x256 pairs: 12 N tiles, the last ending 184 columns in;
+        # 2048 rows give 96 tiles over 74 pairs (one or two tiles each), 4096
+        # rows 192. Every tile takes the partial-output TMA store, whose
+        # staged rows the epilogue role copies one tile ahead: one bias row,
+        # two rows (one cp.async group per tile), and one row on the swizzled
+        # walk (swizzle 8 pads the 12 N tiles to 16; at 4096 rows a pair
+        # meets a padding slot before its next tile, which the lookahead
+        # skips in step with the role).
+        n, k = 3000, 128
+        cases = (
+            (bias_mm_into, 2048, 1),
+            (scale_bias_mm_into, 2048, 1),
+            (bias_mm_into, 4096, 8),
+        )
+        for kernel, m, swizzle in cases:
+            a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+            b = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
+            scale = torch.randn(n, device=DEVICE, dtype=torch.bfloat16)
+            bias = torch.randn(n, device=DEVICE, dtype=torch.bfloat16)
+            out = torch.empty(m, n, device=DEVICE, dtype=torch.bfloat16)
+            acc = a.float() @ b.float()
+            if kernel is scale_bias_mm_into:
+                args = (a, b, scale, bias, out)
+                expected = acc * scale.float() + bias.float()
+            else:
+                args = (a, b, bias, out)
+                expected = acc + bias.float()
+            bound = kernel.bind(args)
+            config = bound.config_spec.default_config()
+            config.config["tcgen05_l2_swizzle_size"] = swizzle
+            bound.config_spec.normalize(config, _fix_invalid=True)
+            self.assertEqual(config.config["pid_type"], "persistent_interleaved")
+            self.assertEqual(config.config["tcgen05_l2_swizzle_size"], swizzle)
+            code = bound.to_code(config)
+            self.assertIn("row_lookahead_sched", code)
+            self.assertIn("cute.arch.cp_async_wait_group(1)", code)
+            bound.set_config(config)
+            bound(*args)
+            torch.testing.assert_close(
+                out, expected.to(out.dtype), rtol=1e-2, atol=1e-1
+            )
+
+    def test_rows_off_their_vector_alignment_keep_the_synchronous_copy(self) -> None:
+        # A bias view 2 or 8 bytes past a 16-byte boundary: the lookahead's
+        # 128-bit cp.async copy needs the vector alignment the synchronous
+        # copy does not, so the row keeps the per-tile copy.
+        m, n, k = 2048, 3000, 128
+        a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
+        buf = torch.randn(n + 8, device=DEVICE, dtype=torch.bfloat16)
+        for shift in (1, 4):
+            bias = buf[shift : shift + n]
+            out = torch.empty(m, n, device=DEVICE, dtype=torch.bfloat16)
+            bound = bias_mm_into.bind((a, b, bias, out))
+            config = bound.config_spec.default_config()
+            code = bound.to_code(config)
+            self.assertNotIn("cute.arch.cp_async_wait_group(1)", code)
+            bound.set_config(config)
+            bound(a, b, bias, out)
+            torch.testing.assert_close(
+                out,
+                (a.float() @ b.float() + bias.float()).to(out.dtype),
+                rtol=1e-2,
+                atol=1e-1,
+            )
 
 
 @onlyBackends(["cute"])

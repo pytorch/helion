@@ -580,6 +580,32 @@ def host_function_has_tcgen05_exact_shape_aux_kernel_pattern(
     )
 
 
+def host_function_has_tcgen05_exact_shape_aux_operand(
+    host_function: HostFunction,
+) -> bool:
+    """``host_function_has_tcgen05_exact_shape_aux_kernel_pattern`` without
+    the dtype match: one analyzed store reads exact-shape operands of the
+    output's shape, whatever their dtype (a bf16 residual of an FP32 output
+    included).  The default tile rules that judge what the epilogue reads,
+    not what the aux-TMA ring can stage, take this one."""
+    graphs = host_function.device_ir.graphs
+    mma_nodes = _tcgen05_aux_detector_mma_nodes(graphs) if graphs else set()
+    if not mma_nodes:
+        return False
+    store_outputs = [
+        (store_value, tensor_val)
+        for graph_info in graphs
+        for store_node, store_value in _store_value_pairs_from_graph(graph_info.graph)
+        if (tensor_val := _output_tensor_from_store_node(store_node)) is not None
+    ]
+    return bool(store_outputs) and _has_tma_compatible_analyzed_aux_store(
+        store_outputs,
+        inner_outputs_by_graph_id=build_inner_outputs_index_from_graphs(graphs),
+        target_fx_nodes=mma_nodes,
+        require_output_dtype=False,
+    )
+
+
 def _tcgen05_aux_detector_mma_nodes(
     graphs: Sequence[GraphInfo],
 ) -> set[torch.fx.Node]:
@@ -679,6 +705,7 @@ def _has_tma_compatible_analyzed_aux_store(
     *,
     inner_outputs_by_graph_id: dict[int, tuple[torch.fx.Node | None, ...]],
     target_fx_nodes: set[torch.fx.Node],
+    require_output_dtype: bool = True,
 ) -> bool:
     # Dedup by store value so repeated stores of the same computed chain are
     # treated as one aux-TMA candidate at detector time.
@@ -703,7 +730,7 @@ def _has_tma_compatible_analyzed_aux_store(
             _, aux_tensor = _step_host_tensor(step)
             if not _same_static_shape(aux_tensor, output):
                 return False
-            if aux_tensor.dtype != output.dtype:
+            if require_output_dtype and aux_tensor.dtype != output.dtype:
                 return False
         compatible_store_values.add(store_value)
         if len(compatible_store_values) > 1:

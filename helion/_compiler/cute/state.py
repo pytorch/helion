@@ -69,6 +69,7 @@ if TYPE_CHECKING:
     from .device_state import CuteVloopStoreFact
     from .device_state import CuteVloopWrapperFact
     from .device_state import Tcgen05AbStartupPrefill
+    from .device_state import Tcgen05EpiRowPrefetch
     from .direct_affine_candidate import DirectAffineCandidate
     from .direct_affine_plan import DirectAffinePlan
     from .epilogue_fanout import FanoutStore
@@ -304,6 +305,11 @@ class CuteTcgen05State:
     # renamed through casts or epilogue nodes.
     matmul_fx_node_result_vars: dict[Node, str] = dataclasses.field(
         default_factory=dict
+    )
+    # Row-vector operands the epilogue role prefetches one tile ahead
+    # (``Tcgen05EpiRowPrefetch``).
+    epi_row_prefetches: list[Tcgen05EpiRowPrefetch] = dataclasses.field(
+        default_factory=list
     )
     fragment_epilogue_plan: Tcgen05FragmentEpiloguePlan | None = None
     # Rejected proofs are stable for this per-config codegen state. Keep
