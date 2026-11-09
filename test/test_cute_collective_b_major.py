@@ -107,7 +107,7 @@ def test_transposed_rhs_copies_along_proven_contiguous_k(
     assert "cute.gemm(" in source
     assert f"stride=({bk}, 1)" in source
     assert "LdMatrix8x8x16bOp(transpose=True" not in source
-    assert "cute.arch.cp_async_shared_global(" in body
+    assert "_cute_cp_async_shared_global(" in body
     assert f"collective_n = collective_flat // {bk}" in body
     assert f"collective_k = collective_flat % {bk}" in body
     # The physical vector traversal spans the whole tile; its scalar fallback
@@ -124,7 +124,7 @@ def test_n_contiguous_rhs_retains_existing_layout(copy: str) -> None:
     body = ast.unparse(_b_copy(source))
     assert "stride=(1, 32)" in source
     assert "LdMatrix8x8x16bOp(transpose=True" in source
-    assert "cute.arch.cp_async_shared_global(" in body
+    assert "_cute_cp_async_shared_global(" in body
     assert "collective_n = collective_flat % 32" in body
     assert "collective_k = collective_flat // 32" in body
 
@@ -141,7 +141,7 @@ def test_k_major_requires_direct_aligned_vector_copy(reason: str) -> None:
     )
     assert "stride=(1, 32)" in source
     assert "LdMatrix8x8x16bOp(transpose=True" in source
-    assert "cute.arch.cp_async_shared_global(" not in ast.unparse(_b_copy(source))
+    assert "_cute_cp_async_shared_global(" not in ast.unparse(_b_copy(source))
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -242,7 +242,7 @@ def test_mamba_transposed_state_uses_k_copy(shape: int, static_shapes: bool) -> 
         )
         source = bound.to_code(config)
     assert source.count("cute.gemm(") == 2
-    assert source.count("cute.arch.cp_async_shared_global(") == 3
+    assert source.count("_cute_cp_async_shared_global(") == 3
     assert source.count("LdMatrix8x8x16bOp(transpose=True") == 1
     assert source.count("mul.rn.f32") == 5
     assert "prev_states.iterator" in ast.unparse(_b_copy(source))
@@ -290,7 +290,7 @@ def test_k_major_copy_preserves_dynamic_tails_and_graph_replays(
         assert "cute.nvgpu.cpasync.CopyG2SOp(" in ast.unparse(_b_copy(source))
     else:
         assert f"stride=({bk}, 1)" in source
-        assert "cute.arch.cp_async_shared_global(" in ast.unparse(_b_copy(source))
+        assert "_cute_cp_async_shared_global(" in ast.unparse(_b_copy(source))
     bound.set_config(config)
 
     def run() -> torch.Tensor:

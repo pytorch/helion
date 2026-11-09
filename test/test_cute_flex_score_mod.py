@@ -1893,10 +1893,10 @@ class TestCuteFlexScoreMod(TestCase):
         fake_cute = types.SimpleNamespace(
             arch=types.SimpleNamespace(
                 load=fake_load,
-                cp_async_shared_global=fake_copy,
                 sync_warp=lambda: barrier.wait(),
             )
         )
+        fake_prims = types.SimpleNamespace(cp_async_shared_global=fake_copy)
         fake_ir = types.SimpleNamespace(
             VectorType=types.SimpleNamespace(get=lambda shape, t: (shape[0], t))
         )
@@ -1937,6 +1937,7 @@ class TestCuteFlexScoreMod(TestCase):
 
         with (
             patch.object(flex_score_mod_runtime, "cute", fake_cute),
+            patch.object(flex_score_mod_runtime, "prims", fake_prims),
             patch.object(flex_score_mod_runtime, "ir", fake_ir),
             patch.object(flex_score_mod_runtime, "cutlass", fake_cutlass),
         ):

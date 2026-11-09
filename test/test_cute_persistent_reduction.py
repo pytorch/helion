@@ -836,7 +836,7 @@ def test_async_pipeline_skips_rewrite_without_exact_thread_dims() -> None:
         code = bound.to_code(config)
 
     pipeline.assert_not_called()
-    assert "cute.arch.cp_async_shared_global(" not in code
+    assert "_cute_cp_async_shared_global(" not in code
     assert "_async_state_" not in code
 
 
