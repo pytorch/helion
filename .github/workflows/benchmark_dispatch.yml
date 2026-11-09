@@ -217,7 +217,7 @@ jobs:
     with:
       runner: linux.client.xpu
       python-version: "3.12"
-      image: intel/omix:0.4.0-devel-ubuntu26.04
+      image: intel/omix:0.4.1-devel-ubuntu26.04
       runtime-version: xpu
       # -e ZE_AFFINITY_MASK (no value) inherits the runner host's device
       # affinity so the container targets the GPU the host assigned it.
