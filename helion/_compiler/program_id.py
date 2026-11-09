@@ -17,6 +17,7 @@ from .ast_extension import ExtendedAST
 from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
+from .ast_read_writes import ast_rename
 from .compile_environment import CompileEnvironment
 from .cute.cutedsl_compat import emit_pipeline_advance
 from .cute.device_state import Tcgen05GroupedSchedulerMode
@@ -32,6 +33,7 @@ from .cute.strategies import l2_swizzle_size_from_config
 from .cute.strategies import persistent_grid_cap_from_config
 from .cute.tcgen05_constants import TCGEN05_GROUPED_STATIC_SPECIALIZATION_MAX_GROUPS
 from .cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_MAILBOX_FIELD_COUNT
+from .cute.tcgen05_constants import TCGEN05_ROW_LOOKAHEAD_SLOTS
 from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY
 from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL
 from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER
@@ -420,10 +422,12 @@ _TCGEN05_GROUPED_SELECTED_MAILBOX_PROBLEM_K = 7
 _TCGEN05_GROUPED_SELECTED_MAILBOX_GLOBAL_M_START = 8
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Sequence
 
     from .cute.cute_mma import _Tcgen05SchedPipelinePlan
     from .cute.device_state import CuteTcgen05MatmulPlan
+    from .cute.device_state import Tcgen05EpiRowPrefetch
     from .inductor_lowering import CodegenState
 
 NUM_SM_VAR = "_NUM_SM"
@@ -3788,6 +3792,20 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             "shared blocks live in the shared while"
         )
 
+        # The staged-row lookahead (``cute_mma``'s
+        # ``tcgen05_partial_output_row_lookahead``) is rendered on the static
+        # role-local scheduler below only.
+        row_prefetches = (
+            device_function.cute_state.tcgen05_epi_row_prefetches
+            if role_block.role_predicate == self._tcgen05_epi_role_predicate()
+            else []
+        )
+        assert not row_prefetches or not (
+            self._tcgen05_uses_grouped_worklist_nm_runtime_clc()
+            or self._tcgen05_uses_grouped_worklist_nm_scheduler_mailbox()
+            or self._tcgen05_has_scheduler_warp()
+            or self._tcgen05_uses_grouped_static_persistent()
+        ), "the staged-row lookahead needs the static role-local scheduler"
         # ``ROLE_LOCAL_WITH_SCHEDULER`` reroutes the per-role body
         # through the broadcast pipeline. When active, the consumer
         # warp waits on the sched_pipeline, reads the published tile
@@ -3947,16 +3965,21 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # scheduler shares its cluster shape with the shared scheduler,
         # so the two iterate the same tiles in the same order and the
         # role-local virtual_pid_var matches the shared one tile-by-tile.
-        coord_terms: list[str] = []
         axes = self._tcgen05_scheduler_axes(cluster_n=layout.cluster_n)
-        for i in range(len(self.pid_info)):
-            coord_terms.append(f"{work_tile_var}.tile_idx[{axes.index(i)}]")
-        linear_pid_expr = self._tcgen05_linear_virtual_pid_from_coords_expr(
-            coord_terms, pair_axis=axes[0]
-        )
+
+        def linear_pid_expr_for(work: str) -> str:
+            return self._tcgen05_linear_virtual_pid_from_coords_expr(
+                [
+                    f"{work}.tile_idx[{axes.index(i)}]"
+                    for i in range(len(self.pid_info))
+                ],
+                pair_axis=axes[0],
+            )
 
         per_tile_body: list[ast.stmt] = [
-            statement_from_string(f"{self.virtual_pid_var} = {linear_pid_expr}"),
+            statement_from_string(
+                f"{self.virtual_pid_var} = {linear_pid_expr_for(work_tile_var)}"
+            ),
         ]
         if dependency_stmts is not None:
             per_tile_body.extend(dependency_stmts)
@@ -3967,12 +3990,33 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     f"{tile_counter_var} = {tile_counter_var} + cutlass.Int32(1)"
                 )
             )
+        lookahead_per_tile: list[ast.stmt] = []
+        if row_prefetches:
+            plan = self._tcgen05_plan()
+            assert plan is not None and not plan.one_shot_role_scheduler
+            assert tile_counter_var is not None and increment_tile_counter_per_tile
+            lookahead_prelude, lookahead_per_tile = self._tcgen05_row_lookahead_stmts(
+                device_function,
+                row_prefetches,
+                sched_params_var=sched_params_var,
+                scheduler_var_prefix=scheduler_var_prefix,
+                dependency_stmts=dependency_stmts or [],
+                linear_pid_expr_for=linear_pid_expr_for,
+            )
+            prelude.extend(lookahead_prelude)
+            # Consumed: the copies exist once, and a loop built any other way
+            # leaves them behind for the check after the role loops.
+            device_function.cute_state.tcgen05_epi_row_prefetches = []
         if (plan := self._tcgen05_plan()) is not None and plan.one_shot_role_scheduler:
             prelude.extend(per_tile_body)
         else:
-            per_tile_body = self._tcgen05_guard_logical_work(
-                work_tile_var, per_tile_body
-            )
+            per_tile_body = [
+                # The next tile's row copies go out ahead of this tile's
+                # wait, on every scheduler step (padding slots included) so
+                # the lookahead stays one step ahead.
+                *lookahead_per_tile,
+                *self._tcgen05_guard_logical_work(work_tile_var, per_tile_body),
+            ]
             per_tile_body.extend(
                 [
                     statement_from_string(f"{sched_var}.advance_to_next_work()"),
@@ -3996,6 +4040,139 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             body=prelude,
             orelse=[],
         )
+
+    def _tcgen05_row_lookahead_stmts(
+        self,
+        device_function: DeviceFunction,
+        prefetches: list[Tcgen05EpiRowPrefetch],
+        *,
+        sched_params_var: str,
+        scheduler_var_prefix: str,
+        dependency_stmts: list[ast.stmt],
+        linear_pid_expr_for: Callable[[str], str],
+    ) -> tuple[list[ast.stmt], list[ast.stmt]]:
+        """Issue the epilogue's staged-row copies one tile ahead.
+
+        A second scheduler walks one step ahead of the role's own; the
+        lookahead tile's coordinates come from a renamed copy of the part of
+        the PID decomposition the copies read. Generated for the epilogue
+        role of ``bias_mm_into`` on 256x256 pairs (``la`` abbreviates
+        ``<scheduler_var_prefix>_row_lookahead``)::
+
+            la_sched = cutlass.utils.StaticPersistentTileScheduler.create(...)
+            la_work = la_sched.initial_work_tile_info()
+            la_count = cutlass.Int32(0)
+            if la_work.is_valid_tile:  # and not a padding slot
+                virtual_pid_row_lookahead_first = <la_work's linear pid>
+                inner_2d_pid_row_lookahead_first = virtual_pid_row_lookahead_first
+                pid_1_row_lookahead_first = ...
+                tile_offset_1_row_lookahead_first = pid_1_row_lookahead_first * _BLOCK_SIZE_1
+                <cp.async: bias at tile_offset_1_row_lookahead_first -> row[la_count % 2]>
+                la_count = la_count + cutlass.Int32(1)
+            cute.arch.cp_async_commit_group()
+            la_sched.advance_to_next_work()
+            while <role work tile>.is_valid_tile:
+                la_work = la_sched.get_current_work()
+                if la_work.is_valid_tile:
+                    ...  # the next tile's copy, as above (suffix _row_lookahead)
+                cute.arch.cp_async_commit_group()
+                la_sched.advance_to_next_work()
+                virtual_pid = ...  # this tile (behind the padding guard, if any)
+                ...
+                cute.arch.cp_async_wait_group(1)
+                tcgen05_epilog_sync_barrier.arrive_and_wait()
+                ...  # subtiles read row[tcgen05_tma_store_role_tile % 2]
+
+        Required for correctness:
+
+        - Two slots: with one, the next tile's copy overwrites the row this
+          tile's subtiles still read (2048x3000x128 + bias: max error 4.9).
+          Two suffice because tile ``j + 1``'s copy reuses the slot tile
+          ``j - 1`` read, and tile ``j - 1``'s last subtile ends behind the
+          epilogue barriers around its C-buffer copy and TMA store, after its
+          row reads; an epilogue body without those barriers needs a third.
+        - The lookahead skips the scheduler's padding slots as the role does:
+          a tile's slot is its logical ordinal (``la_count`` here, the role's
+          tile counter there). 4096x3000x128 + bias at swizzle 8, where a
+          pair meets a padding slot before its next tile: 5% of the outputs
+          wrong without the skip.
+        - One group per step, empty or not: ``wait_group 1`` counts groups,
+          so on the role's last tile, with no newer group committed, it would
+          return with that tile's own copy in flight (a race the one-tile
+          lead hides in practice, not a measured failure).
+
+        Copying the row at the top of its own tile instead and waiting before
+        the first subtile leaves the copy's latency on every tile:
+        4096x30000x128 + bias, 0.92 of the ATen GEMM, against 1.04 one tile
+        ahead (0.91 for the synchronous copy).
+        """
+        sched = device_function.new_var(f"{scheduler_var_prefix}_row_lookahead_sched")
+        work = device_function.new_var(f"{scheduler_var_prefix}_row_lookahead_work")
+        count = device_function.new_var(f"{scheduler_var_prefix}_row_lookahead_count")
+        selected = self._role_local_dependency_stmts(
+            dependency_stmts,
+            [
+                statement_from_string(coordinate)
+                for prefetch in prefetches
+                for coordinate in prefetch.coordinates
+            ],
+        )
+        padding = self._tcgen05_work_tile_padding_predicate(work)
+        logical = f"{work}.is_valid_tile" + (f" and ({padding})" if padding else "")
+
+        def step(suffix: str) -> list[ast.stmt]:
+            mapping = {
+                self.virtual_pid_var: device_function.new_var(
+                    f"{self.virtual_pid_var}_{suffix}"
+                )
+            }
+            for stmt in selected:
+                mapping.update(
+                    {
+                        name: device_function.new_var(f"{name}_{suffix}")
+                        for name in _stmt_name_uses(stmt)[1]
+                    }
+                )
+
+            def translate(expr: str) -> str:
+                return ast.unparse(ast_rename(ast.parse(expr, mode="eval"), mapping))
+
+            issue = "\n".join(
+                prefetch.issue(
+                    translate,
+                    f"{count} % cutlass.Int32({TCGEN05_ROW_LOOKAHEAD_SLOTS})",
+                    suffix,
+                )
+                for prefetch in prefetches
+            )
+            body: list[ast.stmt] = [
+                statement_from_string(
+                    f"{mapping[self.virtual_pid_var]} = {linear_pid_expr_for(work)}"
+                ),
+                *(ast_rename(_clone_stmt(stmt), mapping) for stmt in selected),
+                *ast.parse(issue).body,
+                statement_from_string(f"{count} = {count} + cutlass.Int32(1)"),
+            ]
+            return [
+                create(ast.If, test=expr_from_string(logical), body=body, orelse=[]),
+                statement_from_string("cute.arch.cp_async_commit_group()"),
+                statement_from_string(f"{sched}.advance_to_next_work()"),
+            ]
+
+        prelude = [
+            statement_from_string(
+                f"{sched} = cutlass.utils.StaticPersistentTileScheduler.create("
+                f"{sched_params_var}, cute.arch.block_idx(), cute.arch.grid_dim())"
+            ),
+            statement_from_string(f"{work} = {sched}.initial_work_tile_info()"),
+            statement_from_string(f"{count} = cutlass.Int32(0)"),
+            *step("row_lookahead_first"),
+        ]
+        per_tile = [
+            statement_from_string(f"{work} = {sched}.get_current_work()"),
+            *step("row_lookahead"),
+        ]
+        return prelude, per_tile
 
     def _finish_role_local_prelude(
         self,
@@ -8016,6 +8193,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                         store_aux_predicate=store_aux_predicate,
                     )
                 )
+        # Every staged-row lookahead the store lowering handed over was
+        # rendered (``_tcgen05_row_lookahead_stmts``): its tiles only wait
+        # for the copies, so one left behind would read stale rows.
+        assert not cute_state.tcgen05_epi_row_prefetches, (
+            "a staged-row lookahead was not rendered by the epilogue role loop"
+        )
         # Analyze after building every consumer, then restore the producer's
         # original position before any optional C-input role.
         scheduler_insert_index = len(role_local_whiles)

@@ -2483,6 +2483,14 @@ class ConfigSpec:
         self._cute_tcgen05_config.exact_shape_aux_kernel_detected = value
 
     @property
+    def cute_tcgen05_exact_shape_aux_operand_detected(self) -> bool:
+        return self._cute_tcgen05_config.exact_shape_aux_operand_detected
+
+    @cute_tcgen05_exact_shape_aux_operand_detected.setter
+    def cute_tcgen05_exact_shape_aux_operand_detected(self, value: bool) -> None:
+        self._cute_tcgen05_config.exact_shape_aux_operand_detected = value
+
+    @property
     def cute_tcgen05_aux_loads_on_every_store(self) -> bool:
         return self._cute_tcgen05_config.aux_loads_on_every_store
 
@@ -2523,6 +2531,14 @@ class ConfigSpec:
     @cute_tcgen05_exact_aux_tma_provable.setter
     def cute_tcgen05_exact_aux_tma_provable(self, value: bool) -> None:
         self._cute_tcgen05_config.exact_aux_tma_provable = value
+
+    @property
+    def cute_tcgen05_matmul_output_matches_extents(self) -> bool:
+        return self._cute_tcgen05_config.matmul_output_matches_extents
+
+    @cute_tcgen05_matmul_output_matches_extents.setter
+    def cute_tcgen05_matmul_output_matches_extents(self, value: bool) -> None:
+        self._cute_tcgen05_config.matmul_output_matches_extents = value
 
     def _cute_flash_autotune_fragments(
         self,

@@ -29,6 +29,7 @@ def _metadata(
         SimpleNamespace(l2_groupings=sequence, indexing=SimpleNamespace(length=6)),
     )
     metadata.matmul_block_ids = (matmul_root, matmul_root + 1, matmul_root + 2)
+    metadata.matmul_compile_time_static_extents = None
     monkeypatch.setattr(metadata, "full_tile_direct_entry_seed_eligible", lambda: True)
     monkeypatch.setattr(
         metadata, "full_tile_direct_entry_seed_pipeline", lambda: (128, 3, 2)
@@ -110,3 +111,17 @@ def test_one_root_seed_retains_complete_original_payload(
     values: list[object] = [8]
     assert metadata.full_tile_direct_entry_seed_config(l2_groupings=values) is None
     assert values == [8]
+
+
+def test_direct_entry_groups_32_m_tiles_on_a_long_n_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """At least 32 N tiles (here 125 of 256 columns): the direct-entry seed
+    and its projection group 32 M tiles instead of 2."""
+    metadata = _metadata(monkeypatch, (11,), 11)
+    metadata.matmul_compile_time_static_extents = (8192, 32000, 1024)
+    seed = metadata.full_tile_direct_entry_seed_config()
+    assert seed is not None and seed.l2_groupings == [32]
+    config: dict[str, object] = {"l2_groupings": [8], "tcgen05_tvm_ffi_launch": True}
+    metadata._fix_target1_tvm_ffi_search_config(config)
+    assert config["l2_groupings"] == [32]

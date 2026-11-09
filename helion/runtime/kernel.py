@@ -69,6 +69,9 @@ from .._compiler.cute.aux_tensor import host_function_has_tcgen05_aux_kernel_pat
 from .._compiler.cute.aux_tensor import (
     host_function_has_tcgen05_exact_shape_aux_kernel_pattern,
 )
+from .._compiler.cute.aux_tensor import (
+    host_function_has_tcgen05_exact_shape_aux_operand,
+)
 from .._compiler.cute.aux_tensor import host_function_matmul_has_non_tcgen05_operand
 from .._compiler.cute.aux_tensor import host_function_tcgen05_aux_loads_on_every_store
 from .._compiler.cute.aux_tensor import host_function_tcgen05_rowvec_aux_facts
@@ -3163,6 +3166,11 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 )
                 self.env.config_spec.cute_tcgen05_exact_shape_aux_kernel_detected = (
                     host_function_has_tcgen05_exact_shape_aux_kernel_pattern(
+                        self.host_function
+                    )
+                )
+                self.env.config_spec.cute_tcgen05_exact_shape_aux_operand_detected = (
+                    host_function_has_tcgen05_exact_shape_aux_operand(
                         self.host_function
                     )
                 )

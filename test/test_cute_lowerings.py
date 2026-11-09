@@ -18413,7 +18413,8 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         self.assertEqual(code.count("tcgen05_full_tile = "), 1, code)
         self.assertEqual(code.count("if tcgen05_full_tile:"), 1, code)
         self.assertIn("tcgen05_aux_loaded_0 = tcgen05_tTR_gAux_subtile_0.load()", code)
-        self.assertIn("pred=tcgen05_aux_rowvec_pred_", code)
+        # the row operand is staged one tile ahead (the persistent lookahead)
+        self.assertIn("_pf_pred_row_lookahead)", code)
         self.assertEqual(code.count("cute.copy(tcgen05_tma_store_atom"), 1, code)
         self.assertNotIn("tcgen05_simt_atom", code)
         self.assertGreater(
@@ -19332,7 +19333,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         """Register auxiliary loads with every tile on the TMA store: one
         hoisted TMA-store pipeline/tail stores both, the residual reads behind
         the full-tile guard and the bias row stages through a predicated
-        copy."""
+        copy, one tile ahead."""
         bound, code, args = self._bias_residual_gelu_640(
             tcgen05_acc_wait_placement=TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
             tcgen05_c_acquire_placement=TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
@@ -19352,7 +19353,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             code,
         )
         self.assertEqual(code.count("cute.copy(tcgen05_tma_store_atom"), 1, code)
-        self.assertIn("pred=tcgen05_aux_rowvec_pred_", code)
+        self.assertIn("_pf_pred_row_lookahead)", code)
         self.assertNotIn("tcgen05_simt_atom", code)
         self._check_bias_residual_gelu_640(bound, args)
 

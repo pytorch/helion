@@ -11,6 +11,7 @@ from typing import cast
 from ... import exc
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Sequence
 
     import torch
@@ -337,6 +338,9 @@ class CuteTcgen05StoreValue(_CuteTcgen05OrientationMixin):
     use_tma_store_epilogue: bool = False
     tma_store_full_tiles_only: bool = False
     partial_output_tma_store: bool = False
+    # The partial-output store's staged rows load one tile ahead
+    # (``cute_mma``'s ``tcgen05_partial_output_row_lookahead``).
+    partial_output_row_lookahead: bool = False
     # Output element dtype (cutlass type string, e.g. "cutlass.BFloat16")
     # used when computing the tcgen05 epilogue tile.
     epi_elem_dtype_str: str = ""
@@ -648,6 +652,25 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
 
 
 @dataclasses.dataclass(frozen=True)
+class Tcgen05EpiRowPrefetch:
+    """A staged row-vector operand the epilogue role loads one tile ahead.
+
+    ``program_id``'s static role-local while renders ``issue(translate,
+    slot, suffix)`` ahead of its loop for the role's first tile and at the
+    top of every iteration for the next one, on a lookahead copy of the
+    role's tile scheduler: ``translate`` maps each of ``coordinates`` (the
+    store lowering's expressions over the current tile's coordinates) onto
+    the lookahead tile's, ``slot`` is the SMEM row slot the asynchronous copy
+    fills and ``suffix`` keeps the two renderings' locals apart. The store
+    lowering then waits for the current tile's copy (``cp.async.wait_group
+    1``) where it used to copy the row synchronously.
+    """
+
+    coordinates: tuple[str, ...]
+    issue: Callable[[Callable[[str], str], str, str], str]
+
+
+@dataclasses.dataclass(frozen=True)
 class CuteVloopWrapperFact:
     """A grid tile axis partitioned into an outer lane loop x constexpr V-loop.
 
@@ -907,6 +930,9 @@ class CuteDeviceFunctionState:
         ] = {}
         self.epi_role_tile_counter_var: str | None = None
         self.epi_role_tile_counter_increment_per_tile: bool = True
+        # Row-vector operands the epilogue role prefetches one tile ahead
+        # (``Tcgen05EpiRowPrefetch``).
+        self.tcgen05_epi_row_prefetches: list[Tcgen05EpiRowPrefetch] = []
         self._collective_handled_loads: set[Node] = set()
         self._collective_handled_load_or_dependency_node_ids: set[int] = set()
         self.cluster_shape: tuple[int, int, int] | None = None

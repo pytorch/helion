@@ -3,13 +3,13 @@
 Inductor's native-matmul path runs Helion kernels with
 ``autotune_effort="none"``, so the default config is what such a GEMM runs.
 Among the compiler's proved tcgen05 seeds (plus the one-CTA 128x256 tile on
-whole tiles, and the 16-bit dense aligned-N pairs at their physical widths)
-this heuristic promotes the one whose tile minimizes wave-quantized MMA
-time; whole 256x256-tile shapes keep the FFI direct-entry pair unless a
+whole or N-edge tiles -- 128x128 too for a single row of M tiles -- and the
+16-bit dense aligned-N pairs at their physical widths) this heuristic promotes the one whose tile minimizes wave-quantized
+MMA time; whole 256x256-tile shapes keep the FFI direct-entry pair unless a
 candidate is clearly cheaper, with its promoted bias rows staged
-(``pre_acc_wait``) where the heuristic promotes that seed. Plain GEMMs only the edge +
-K-tail family runs (a 16-bit K tail on whole M and N tiles, or a K tail with
-ragged M and N) take that family's CLC pair seed.
+(``pre_acc_wait``) where the heuristic promotes that seed. Plain GEMMs only
+the edge + K-tail family runs (a 16-bit K tail on whole M and N tiles, or a K
+tail with ragged M and N) take that family's CLC pair seed.
 """
 
 from __future__ import annotations
@@ -28,6 +28,8 @@ from ..cute.tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
 from ..cute.tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
 from ..cute.tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
+from ..cute.tcgen05_constants import TCGEN05_LONG_N_SWEEP_L2_GROUPING
+from ..cute.tcgen05_constants import TCGEN05_LONG_N_SWEEP_MIN_TILES
 from ..cute.tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
@@ -78,9 +80,12 @@ _TMA_STORE_MIN_WAVES = 16
 # K tiles per output tile up to which the epilogue bounds a pair GEMM, so its
 # default stages promoted bias rows (``pre_acc_wait``; see ``_pick``).
 _EPILOGUE_BOUND_MAX_K_TILES = 2
-# The M-tile grouping of a many-tile output-edge auxiliary GEMM's default
-# (see ``_pick``). The many-tile cutoff is ``_TMA_STORE_MIN_WAVES``'s.
-_EDGE_AUX_L2_GROUPING = 32
+# An output-edge auxiliary GEMM's default grouping on sweeps shorter than
+# the long-N-sweep grouping's (``TCGEN05_LONG_N_SWEEP_*``; see ``_pick``).
+_SHORT_N_SWEEP_L2_GROUPING = 4
+# K tiles from which the one-CTA N-edge candidates take an exact-shape
+# auxiliary epilogue (see ``_one_cta_candidate``).
+_ONE_CTA_N_EDGE_EXACT_AUX_MIN_K_TILES = 8
 # A candidate replaces the FFI default only below this fraction of its cost.
 _FFI_REPLACEMENT_MARGIN = 0.9
 
@@ -140,45 +145,101 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         values.pop("cute_pdl", None)
         return Config(**values)
 
-    @staticmethod
+    @classmethod
     def _one_cta_candidates(
-        env: CompileEnvironment, m: int, n: int, k: int
+        cls, env: CompileEnvironment, m: int, n: int, k: int
     ) -> list[Config]:
-        """The one-CTA 128x256 persistent tile on whole tiles.
+        """The one-CTA 128x256 persistent tile, and for a single row of M
+        tiles the 128x128 one.
 
         The proved-schedule seeds carry it only when they had to restore the
         persistent pid types; a 128-row tile still quantizes M=25216 into
         whole waves where the 256-row pair tile leaves a half-empty last wave
-        (0.98 vs 0.90 of cuBLAS).  The persistent one-CTA runtime is validated
-        for static full tiles only.
+        (0.98 vs 0.90 of cuBLAS).  The persistent one-CTA runtime runs whole
+        tiles, and N-edge tiles where every tile takes the partial-output TMA
+        store (``CuteTcgen05Config.one_cta_n_edge_partial_output``, at the
+        deepest ring that leaves room for it): 25216x576x192 + bias, whose
+        whole-tile seeds are 128x64, runs 0.99 of cuBLAS there against 0.94
+        (cuBLAS: a 192x128 one-CTA tile).  With one row of M tiles (a decode
+        GEMM streaming B: M = 128, as the one-CTA tiles need whole M tiles,
+        so a decode step with M below 128 keeps its flat default) the MMA
+        width buys nothing and the N tiles' wave quantization decides:
+        128x50400x4096 + bias takes 394 128x128 tiles (2.66 waves of 148,
+        0.99 of the ATen GEMM at ab=6) over 197 128x256 ones (1.33 waves,
+        0.83).
         """
+        return [
+            candidate
+            for bn in ((256, 128) if m <= 128 else (256,))
+            if (candidate := cls._one_cta_candidate(env, k, bn=bn)) is not None
+        ]
+
+    @staticmethod
+    def _one_cta_candidate(
+        env: CompileEnvironment, k: int, *, bn: int
+    ) -> Config | None:
+        """The persistent one-CTA ``128 x bn`` tile at the deepest ring that
+        fits (``_one_cta_candidates``), or ``None`` where it does not apply."""
         spec = env.config_spec
         state = spec._cute_tcgen05_config
-        bm, bn, bk = 128, 256, 64
-        if (
-            not state._static_full_tiles(bm=bm, bn=bn, bk=bk)
-            or "persistent_interleaved" not in spec.allowed_pid_types
-            or (
-                state.cluster_m_search_choices is not None
-                and 1 not in state.cluster_m_search_choices
-            )
+        bm, bk = 128, 64
+        if "persistent_interleaved" not in spec.allowed_pid_types or (
+            state.cluster_m_search_choices is not None
+            and 1 not in state.cluster_m_search_choices
         ):
-            return []
+            return None
         block_sizes = state._matmul_seed_block_sizes(bm=bm, bn=bn, bk=bk)
         stages = state.max_ab_stages_that_fit(bm=bm, bn=bn, bk=bk, cluster_m=1)
         if block_sizes is None or stages < 2:
-            return []
-        return [
-            Config(
-                block_sizes=block_sizes,
-                pid_type="persistent_interleaved",
-                tcgen05_cluster_m=1,
-                tcgen05_cluster_n=1,
-                tcgen05_ab_stages=min(stages, k // bk),
-                tcgen05_acc_stages=2,
-                tcgen05_c_stages=2,
+            return None
+        deepest = min(stages, k // bk)
+        values: dict[str, Any] = {
+            "block_sizes": block_sizes,
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 1,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_ab_stages": deepest,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": 2,
+        }
+        if state._static_full_tiles(bm=bm, bn=bn, bk=bk):
+            return Config(**values)
+        if (
+            state.exact_shape_aux_operand_detected
+            and k // bk < _ONE_CTA_N_EDGE_EXACT_AUX_MIN_K_TILES
+        ):
+            # An exact-shape operand (a residual) read behind the full-tile
+            # guard bounds the edge tiles' epilogue on few K tiles (measured
+            # on the 256-wide tile; the 128-wide one keeps the same gate):
+            # bf16 25216x576xK + residual, persistent 128x256 against the
+            # flat 128x16 base default, K=256 88.0 vs 77.8 us, K=512 94.1 vs
+            # 137.2, K=1024 100.3 vs 260.1, K=2048 126.8 vs 583.6.
+            return None
+        if state.aux_kernel_detected:
+            values[TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY] = (
+                TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
             )
-        ]
+        if not state.one_cta_n_edge_tiles(values, bm=bm, bn=bn, bk=bk):
+            # M-edge, K-tail and double-edge shapes never qualify; skip the
+            # projection below.
+            return None
+        # ``default_config()`` runs the search fixups over the promoted
+        # values: an auxiliary edge epilogue's C ring goes to 4 stages, and
+        # the AB ring then shortens to the deepest that holds the
+        # partial-output store (``_fix_one_cta_n_edge_rings_search_config``; bf16
+        # 25216x576x768 + bias: ab=3). Promote the projected rings, where
+        # the sample stays persistent on that store.
+        projected = {**spec._base_default_config().config, **values}
+        spec.normalize(projected, _fix_invalid=True)
+        if projected.get(
+            "pid_type"
+        ) != "persistent_interleaved" or not state.one_cta_n_edge_partial_output(
+            projected, bm=bm, bn=bn, bk=bk
+        ):
+            return None
+        values["tcgen05_ab_stages"] = projected["tcgen05_ab_stages"]
+        values["tcgen05_c_stages"] = projected["tcgen05_c_stages"]
+        return Config(**values)
 
     @classmethod
     def _pick(cls, env: CompileEnvironment) -> Config | None:
@@ -232,9 +293,10 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             )
         best: tuple[tuple[float, int, int], Config, int] | None = None
         best_tile = (0, 0, 0)
+        one_cta = cls._one_cta_candidates(env, m, n, k)
         for seed in [
             *state.autotune_seed_configs(),
-            *cls._one_cta_candidates(env, m, n, k),
+            *one_cta,
             *state.dense_aligned_n_seed_configs(),
         ]:
             values: dict[str, Any] = seed.config
@@ -275,10 +337,16 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
                 "persistent_interleaved",
             )
             # The runtime admits persistent tcgen05 bodies only on validated
-            # schedules: one-CTA on static full tiles, the role-local pair
-            # within its K-tile cap (longer K is the split-K families' shape).
+            # schedules: one-CTA on static full tiles or N-edge tiles on the
+            # partial-output TMA store, the role-local pair within its K-tile
+            # cap (longer K is the split-K families' shape).
             if persistent and (
-                (cluster_m == 1 and not state._static_full_tiles(bm=bm, bn=bn, bk=bk))
+                (
+                    cluster_m == 1
+                    and not state._static_full_tiles(bm=bm, bn=bn, bk=bk)
+                    # N-edge tiles only on the validated one-CTA candidate
+                    and not any(seed is candidate for candidate in one_cta)
+                )
                 or (cluster_m == 2 and k // bk > TCGEN05_TWO_CTA_MAX_K_TILES)
             ):
                 continue
@@ -310,9 +378,43 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         assert pipeline_facts is not None
         many_tiles = best[2] >= _TMA_STORE_MIN_WAVES
         bm, bn, bk = best_tile
+        # An output-edge epilogue with register auxiliary loads stores every
+        # tile through TMA after the accumulator wait (``post_acc_wait``: the
+        # partial-output store, see ``cute_mma``), where the rings hold its
+        # row stages; any other placement keeps the fringe tiles, or every
+        # tile, on the SIMT store (one 16-bit element per thread and
+        # instruction). Inductor corpus on B200, + bias, of the ATen GEMM,
+        # 256x256 pairs, SIMT store -> partial-output store: 32768x576x192
+        # (6 tiles per pair) 0.50 -> 1.02, 25216x2304x768 (13) 0.69 -> 1.02,
+        # 4096x30000x128 (26, the staged row) 0.79 -> 0.90, 32768x30528x128
+        # (52, the staged row on the hybrid store) 0.93 -> 1.03.
+        partial_output = False
+        if (
+            state.aux_kernel_detected
+            and not values.get(TILE_N_KEY)
+            and not state._static_full_tiles(bm=bm, bn=bn, bk=bk)
+        ):
+            post: dict[str, Any] = {
+                **values,
+                TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY: (
+                    TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
+                ),
+            }
+            if state.simt_aux_partial_output_fits(
+                post,
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                cluster_m=cast("int", values.get("tcgen05_cluster_m", 1)),
+                ab_stages=cast("int", values.get("tcgen05_ab_stages", 2)),
+                c_stages=cast("int", values.get("tcgen05_c_stages", 2)),
+            ):
+                values = post
+                partial_output = True
         staged_row = False
         if (
-            many_tiles
+            not partial_output
+            and many_tiles
             and k // bk <= _EPILOGUE_BOUND_MAX_K_TILES
             and values.get("tcgen05_cluster_m", 1) == 2
             and not values.get(TILE_N_KEY)
@@ -348,6 +450,7 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
                     break
         if (
             many_tiles
+            and not partial_output
             and not staged_row
             and values.get(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY)
             == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
@@ -373,23 +476,29 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
                 TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
             )
         if state.aux_kernel_detected and state._has_any_matmul_fact_edge_tile(values):
-            # An output-edge auxiliary GEMM walks its tiles in groups of 32 M
-            # tiles (12.6 MB of a K=768 A operand per group, resident in L2
-            # while the group sweeps N) where it runs many tiles per CTA pair
-            # over more than 32 M tiles (on fewer the groups are the plain
-            # raster), and the plain raster otherwise. Inductor corpus on
-            # B200, + bias, of the ATen GEMM, plain / grouped (8) / grouped
-            # (32): 32768x30528x768 0.86 / 0.94 / 0.96, 16384x30528x768 0.96
-            # / 0.94 / 0.98.
+            # An output-edge auxiliary GEMM walks its tiles in groups of M
+            # tiles: 32 on long N sweeps (at least 32 N tiles: a group's A,
+            # 12.6 MB at K=768, stays resident in L2 while the group sweeps N,
+            # so B is re-read once per 32 M tiles), 4 on short ones (a wave
+            # then covers every N tile of a few M tiles); a group as tall as
+            # the M tiles decodes the plain raster. Inductor corpus on B200, +
+            # bias, of the ATen GEMM, plain / grouped (4) / grouped (8) /
+            # grouped (32): 16384x30528x768 0.96 / - / 0.94 / 0.98,
+            # 32768x30528x768 0.86 / - / 0.94 / 0.96; 25216x2304x768 (9 N
+            # tiles) 1.02 / 1.10 / 1.09 / 1.06, 32768x576x192 (3) 1.02 / 1.07
+            # / 1.06 / -.
             assert state.matmul_block_ids is not None
-            groupings = list(values.get("l2_groupings") or [1] * len(spec.l2_groupings))
+            groupings: list[object] = list(
+                values.get("l2_groupings") or [1] * len(spec.l2_groupings)
+            )
+            grouping = (
+                TCGEN05_LONG_N_SWEEP_L2_GROUPING
+                if cdiv(n, bn) >= TCGEN05_LONG_N_SWEEP_MIN_TILES
+                else _SHORT_N_SWEEP_L2_GROUPING
+            )
             groupings[
                 spec.l2_groupings.block_id_to_index(state.matmul_block_ids[0])
-            ] = (
-                _EDGE_AUX_L2_GROUPING
-                if many_tiles and cdiv(m, bm) > _EDGE_AUX_L2_GROUPING
-                else 1
-            )
+            ] = grouping if cdiv(m, bm) > grouping else 1
             values["l2_groupings"] = groupings
         elif (
             best[2] > 1
@@ -399,6 +508,12 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             # The proved-schedule seeds walk the grid ungrouped; a multi-wave
             # default needs the grouped raster so concurrent tiles share their
             # A/B panels in L2 (bf16 10240x2560x4096 on 256x128 pair tiles:
-            # 0.80 -> 1.05 of cuBLAS).
-            values["l2_groupings"] = [TCGEN05_TWO_CTA_SEED_L2_GROUPING]
+            # 0.80 -> 1.05 of cuBLAS), and a long N sweep groups 32 M tiles
+            # (bf16 8192x32000x1024 + bias on 256x256 pairs: 0.95 grouped by
+            # 8, 1.00 by 32).
+            values["l2_groupings"] = [
+                TCGEN05_LONG_N_SWEEP_L2_GROUPING
+                if cdiv(n, bn) >= TCGEN05_LONG_N_SWEEP_MIN_TILES
+                else TCGEN05_TWO_CTA_SEED_L2_GROUPING
+            ]
         return Config(**values)

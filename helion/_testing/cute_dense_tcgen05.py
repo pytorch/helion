@@ -354,6 +354,26 @@ def promoted_bias_mm_into(
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def scale_bias_mm_into(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale: torch.Tensor,
+    bias: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """Two row operands: a per-column scale and a bias row."""
+    m, k = a.shape
+    n = b.shape[1]
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        out[rows, cols] = (
+            acc * scale[cols].to(torch.float32) + bias[cols].to(torch.float32)
+        ).to(out.dtype)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def output_reading_mm(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
     """An argument output that the epilogue also reads."""
     m, k = a.shape

@@ -829,7 +829,7 @@ def enable_cute_tcgen05_search(
     # 16-bit output edges (M or N not a multiple of the widest tile, K whole)
     # that the persistent schedules run: TMA zero-fills the A/B rows past the
     # extent and clips the D store. A ragged M runs only through CtaGroup.TWO
-    # pairs (persistent cluster_m=1 needs whole tiles: the host multi-tile
+    # pairs (persistent cluster_m=1 needs whole M tiles: the host multi-tile
     # guard rejects it, so those samples are flattened by
     # ``_fix_cluster_m1_persistent_search_config``), so it needs the 256-row
     # pair tile; shapes ragged in both M and N stay on the flat pipeline.

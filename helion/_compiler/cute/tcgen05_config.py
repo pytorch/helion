@@ -245,6 +245,8 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS
+from .tcgen05_constants import TCGEN05_LONG_N_SWEEP_L2_GROUPING
+from .tcgen05_constants import TCGEN05_LONG_N_SWEEP_MIN_TILES
 from .tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_NS
 from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_N
@@ -682,6 +684,9 @@ class CuteTcgen05Config:
         self.matmul_explicit_epi_tile_compatible: bool | None = None
         self.aux_kernel_detected: bool = False
         self.exact_shape_aux_kernel_detected: bool = False
+        # Any exact-shape operand of the output's shape, whatever its dtype
+        # (``host_function_has_tcgen05_exact_shape_aux_operand``).
+        self.exact_shape_aux_operand_detected: bool = False
         # The device program's only side effect is one tile store
         # (``split_k_exchange.host_function_has_plain_store_body``): the
         # precondition of ``tcgen05_split_k``, whose last-arriver check
@@ -721,6 +726,10 @@ class CuteTcgen05Config:
         # search surface, the seeds and the normalizer mirror the proof.
         # Decided beside ``matmul_operands_tma_provable``.
         self.exact_aux_tma_provable: bool = True
+        # Every MMA store's destination is exactly the GEMM's (M, N)
+        # (``host_function_matmul_output_matches_extents``): edge stores clip
+        # at the destination's shape, not the tile loop's.
+        self.matmul_output_matches_extents: bool = True
         self.cluster_m_search_choices: tuple[int, ...] | None = None
         self.cluster_m2_search_constraints: Tcgen05ClusterM2SearchConstraints | None = (
             None
@@ -801,7 +810,9 @@ class CuteTcgen05Config:
         self.tcgen05_min_search_n: int = 8
         # A 16-bit output-edge GEMM (ragged M or N, K whole) admitted to the
         # persistent and CtaGroup.TWO schedules; persistent cluster_m=1 runs
-        # whole tiles only, so its partial-tile samples are flattened.
+        # whole tiles, or N-edge tiles on the partial-output TMA store
+        # (``one_cta_n_edge_partial_output``), so its other partial-tile
+        # samples are flattened.
         self.output_edge_persistent_admitted: bool = False
         # Block id of the leading passthrough (batch) axis, when any.
         self.matmul_leading_block_id: int | None = None
@@ -4230,6 +4241,19 @@ class CuteTcgen05Config:
             cluster_m=2,
         )
 
+    def _direct_entry_l2_grouping(self) -> int:
+        """The direct-entry pair's M-tile grouping: 2 (the measured
+        direct-entry default), or ``TCGEN05_LONG_N_SWEEP_L2_GROUPING`` on a
+        long N sweep, where grouping 2 re-reads B every two M tiles."""
+        extents = self.matmul_compile_time_static_extents
+        n = extents[1] if extents is not None else None
+        if (
+            isinstance(n, int)
+            and -(-n // TCGEN05_TWO_CTA_BLOCK_N) >= TCGEN05_LONG_N_SWEEP_MIN_TILES
+        ):
+            return TCGEN05_LONG_N_SWEEP_L2_GROUPING
+        return 2
+
     def full_tile_direct_entry_seed_config(
         self, *, l2_groupings: list[object] | None = None
     ) -> Config | None:
@@ -4266,7 +4290,7 @@ class CuteTcgen05Config:
         assert self.matmul_block_ids is not None
         l2_groupings[
             self.config_spec.l2_groupings.block_id_to_index(self.matmul_block_ids[0])
-        ] = 2
+        ] = self._direct_entry_l2_grouping()
         seed: dict[str, Any] = {
             "block_sizes": block_sizes,
             "l2_groupings": l2_groupings,
@@ -7867,6 +7891,214 @@ class CuteTcgen05Config:
             extra_stage_bytes=extra_stage_bytes,
         )
 
+    @staticmethod
+    def _simt_aux_partial_output_epilogue(config: dict[str, object]) -> bool:
+        """Register (SIMT) auxiliary loads after the accumulator wait and no
+        C-input warp: the epilogues the partial-output TMA-store body takes
+        (``pre_acc_wait``'s per-subtile loads precede the wait, which that
+        body refuses)."""
+        return (
+            config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, TCGEN05_AUX_LOAD_MODE_SIMT)
+            == TCGEN05_AUX_LOAD_MODE_SIMT
+            and config.get(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY)
+            != TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+            and config.get(TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY, 0) == 0
+        )
+
+    def simt_aux_partial_output_fits(
+        self,
+        config: dict[str, object],
+        *,
+        bm: int,
+        bn: int,
+        bk: int,
+        cluster_m: int,
+        ab_stages: int,
+        c_stages: int,
+        output_column_major: bool | None = None,
+    ) -> bool:
+        """Whether register (SIMT) auxiliary loads take the partial-output
+        TMA store (``cute_mma``'s ``tcgen05_partial_output_tma_store``):
+        every tile of an output-edge GEMM then stores through TMA, where the
+        epilogue qualifies (``_simt_aux_partial_output_epilogue``), the
+        output is row-major or carries no auxiliary operand
+        (``_aux_partial_output_layout_ok``; codegen passes its own
+        ``output_column_major``, the search reads the store facts) and the
+        arena holds its row stages (``partial_output_row_stage_fits``).
+        """
+        return (
+            self._simt_aux_partial_output_epilogue(config)
+            and self._aux_partial_output_layout_ok(output_column_major)
+            and self.partial_output_row_stage_fits(
+                config,
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                cluster_m=cluster_m,
+                ab_stages=ab_stages,
+                c_stages=c_stages,
+            )
+        )
+
+    def _aux_partial_output_layout_ok(self, output_column_major: bool | None) -> bool:
+        """Not a column-major output with auxiliary operands: there the
+        partial-output body's staged and guarded auxiliary reads keep the R2S
+        partition's register layout, not the accumulator's, and CuTe refuses
+        their sum. ``None`` reads the store facts (row-major when there are
+        none: codegen judges the output it builds again)."""
+        if output_column_major is None:
+            facts = self.pipeline_smem_facts
+            output_column_major = facts is not None and facts.output_column_major
+        return not (self.aux_kernel_detected and output_column_major)
+
+    def one_cta_n_edge_shape(self, *, bm: int, bn: int, bk: int) -> bool:
+        """A one-CTA tile whose only partial tiles are N-edge tiles of a GEMM
+        the persistent N-edge body runs: 16-bit TMA operands (the role-local
+        edge path loads through TMA only), 128-row tiles (at 64 rows that
+        body's register auxiliary fragment does not match the accumulator's
+        layout), M and K whole, N ragged and at least one tile wide, and
+        every store's destination exactly (M, N) (the edge tiles' stores clip
+        at the destination's shape). Batched GEMMs run partial tiles on the
+        flat one-CTA pipeline only (``cute_mma``'s
+        ``_ragged_batched_tcgen05_config``; a persistent batched partial tile
+        falls back to scalar code)."""
+        extents = self.matmul_compile_time_static_extents
+        constraints = self.ab_stages_three_search_constraints
+        if (
+            extents is None
+            or self.matmul_leading_block_id is not None
+            or not self.matmul_operands_tma_provable
+            or not self.matmul_output_matches_extents
+            # 16-bit operands (codegen's ``tcgen05_one_cta_n_edge_tma_store``)
+            or constraints is None
+            or constraints.dtype_bytes != 2
+        ):
+            return False
+        m, n, k = extents
+        if not (isinstance(m, int) and isinstance(n, int) and isinstance(k, int)):
+            return False
+        return (
+            bm == TCGEN05_ONE_CTA_MAX_BLOCK_M
+            and m % bm == 0
+            and k % bk == 0
+            and n % bn != 0
+            and n >= bn
+        )
+
+    def one_cta_n_edge_tiles(
+        self, config: dict[str, object], *, bm: int, bn: int, bk: int
+    ) -> bool:
+        """``one_cta_n_edge_shape`` under an epilogue the partial-output TMA
+        store takes: the normal store (``direct`` turns the TMA epilogue
+        off) and register auxiliary loads on a layout the search can read.
+        The rings are judged separately (``one_cta_n_edge_partial_output``):
+        the ring fixups after ``_fix_cluster_m1_persistent_search_config``
+        may still change them, as the auxiliary fixups may change the load
+        mode, so the search judges the epilogue on the final config
+        (``_fix_one_cta_n_edge_rings_search_config``).
+        """
+        if not self.one_cta_n_edge_shape(bm=bm, bn=bn, bk=bk) or (
+            config.get(TCGEN05_C_STORE_MODE_CONFIG_KEY, TCGEN05_C_STORE_MODE_NORMAL)
+            != TCGEN05_C_STORE_MODE_NORMAL
+        ):
+            return False
+        # The search keeps the sample persistent on the layout it can read:
+        # an auxiliary epilogue without store facts (two outputs, say) stays
+        # flat rather than run persistent on the SIMT store codegen would
+        # give a column-major one.
+        facts = self.pipeline_smem_facts
+        return self._simt_aux_partial_output_epilogue(config) and (
+            not self.aux_kernel_detected
+            or (facts is not None and not facts.output_column_major)
+        )
+
+    def one_cta_n_edge_partial_output(
+        self, config: dict[str, object], *, bm: int, bn: int, bk: int
+    ) -> bool:
+        """``one_cta_n_edge_tiles`` at rings that hold the partial-output
+        store's row stages (``cute_mma``'s
+        ``tcgen05_one_cta_n_edge_tma_store``)."""
+        if not self.one_cta_n_edge_tiles(config, bm=bm, bn=bn, bk=bk):
+            return False
+        ab_stages = config.get("tcgen05_ab_stages")
+        c_stages = config.get("tcgen05_c_stages")
+        if not (isinstance(ab_stages, int) and isinstance(c_stages, int)):
+            return False
+        return self.simt_aux_partial_output_fits(
+            config,
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            cluster_m=1,
+            ab_stages=ab_stages,
+            c_stages=c_stages,
+        )
+
+    def _fix_one_cta_n_edge_rings_search_config(
+        self, config: dict[str, object]
+    ) -> bool:
+        """Fit a persistent one-CTA N-edge sample's AB ring to the
+        partial-output store; True where the sample must go flat.
+
+        The body keeps such a sample persistent on its shape
+        (``one_cta_n_edge_shape``); its later fixups may then leave an
+        epilogue off the partial-output store, which goes flat here, or rings
+        that do not hold the store's row stages. It takes the deepest AB ring
+        from 1 stage that does beside its final C ring (bf16 25216x576x768 +
+        bias on 128x256 tiles: the auxiliary edge epilogue's C ring of 4
+        leaves ab=3 on the TMA store, 39 us, where flattening the sampled
+        ab=4 ran the SIMT store's flat kernel, 52 us), and the flat pipeline
+        where none does.
+        """
+        ab_stages = config.get("tcgen05_ab_stages")
+        c_stages = config.get("tcgen05_c_stages")
+        if not (
+            self.search_enabled
+            and self.output_edge_persistent_admitted
+            and config.get("tcgen05_cluster_m", 1) == 1
+            and config.get("pid_type")
+            in ("persistent_blocked", "persistent_interleaved")
+            and isinstance(ab_stages, int)
+            and isinstance(c_stages, int)
+        ):
+            return False
+        view = self._matmul_config_view(config)
+        if view is None:
+            return False
+        blocks, mi, ni, ki = view
+        bm, bn, bk = blocks[mi], blocks[ni], blocks[ki]
+        if not (
+            isinstance(bm, int)
+            and isinstance(bn, int)
+            and isinstance(bk, int)
+            and self.one_cta_n_edge_shape(bm=bm, bn=bn, bk=bk)
+        ):
+            return False
+        if not self.one_cta_n_edge_tiles(config, bm=bm, bn=bn, bk=bk):
+            # The final epilogue knobs (the auxiliary fixups turn a sampled
+            # ``tma`` load into ``simt``, say) are judged here, where they no
+            # longer change: off the partial-output store the edge tiles run
+            # flat.
+            config["pid_type"] = "flat"
+            return True
+        # Down to one stage: a one-K-tile GEMM's sample (and candidate) runs
+        # a single AB stage on the TMA store (bf16 25216x576x64: 8.2 us
+        # persistent at ab=1, 26.9 on the flat 128x16 default).
+        for depth in range(ab_stages, 0, -1):
+            if self.partial_output_row_stage_fits(
+                config,
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                cluster_m=1,
+                ab_stages=depth,
+                c_stages=c_stages,
+            ):
+                config["tcgen05_ab_stages"] = depth
+                return False
+        config["pid_type"] = "flat"
+        return True
+
     def partial_output_row_stage_fits(
         self,
         config: dict[str, object],
@@ -7877,17 +8109,20 @@ class CuteTcgen05Config:
         cluster_m: int,
         ab_stages: int,
         c_stages: int,
+        slots: int = 1,
     ) -> bool:
         """Whether a partial-output TMA-store epilogue's row stages fit.
 
         With register (SIMT) auxiliary loads the output-edge TMA store also
         takes the fringe tiles (``cute_mma``'s
         ``tcgen05_partial_output_tma_store``), and each row-vector operand
-        then stages one N tile in its own dtype through a predicated copy
-        (``memory_ops``' ``stage_partial_tma_rowvec``), which the arena judged
-        by ``output_edge_tma_store_smem_fits`` does not hold: an unpromoted
-        BF16 row is no ``pre_acc_wait`` stage there, but 512 B of a 256-wide
-        tile here. This judges that arena with those stages (an upper bound:
+        then stages ``slots`` N tiles in its own dtype through a predicated
+        copy (``memory_ops``' ``stage_partial_tma_rowvec``; two when the
+        epilogue loads the next tile's row ahead, ``cute_mma``'s
+        ``tcgen05_partial_output_row_lookahead``), which the arena judged by
+        ``output_edge_tma_store_smem_fits`` does not hold: an unpromoted BF16
+        row is no ``pre_acc_wait`` stage there, but 512 B of a 256-wide tile
+        here. This judges that arena with those stages (an upper bound:
         ``tcgen05_partial_output_row_stage_smem_bytes``).  Callers keep
         ``pre_acc_wait`` and C-input configs away (their rows stage
         elsewhere).
@@ -7901,9 +8136,8 @@ class CuteTcgen05Config:
             cluster_m=cluster_m,
             ab_stages=ab_stages,
             c_stages=c_stages,
-            extra_stage_bytes=tcgen05_partial_output_row_stage_smem_bytes(
-                rows=facts.rows, bn=bn
-            ),
+            extra_stage_bytes=slots
+            * tcgen05_partial_output_row_stage_smem_bytes(rows=facts.rows, bn=bn),
         )
 
     def _output_edge_epi_subtile_n(
@@ -10452,10 +10686,13 @@ class CuteTcgen05Config:
             and isinstance(bn, int)
             and isinstance(bk, int)
             and not self._static_full_tiles(bm=bm, bn=bn, bk=bk)
+            and not self.one_cta_n_edge_shape(bm=bm, bn=bn, bk=bk)
         ):
             # The output-edge admission's persistent schedules belong to its
-            # CtaGroup.TWO pairs; one-CTA persistent kernels run whole tiles
-            # only (the host multi-tile guard), so partial tiles go flat.
+            # CtaGroup.TWO pairs; one CTA runs persistent partial tiles only
+            # where they are N-edge tiles on the partial-output TMA store,
+            # whose epilogue and rings ``fix_search_config`` judges after the
+            # later fixups (``_fix_one_cta_n_edge_rings_search_config``).
             config["pid_type"] = "flat"
 
     def restrict_num_epi_warps_search(self, choices: tuple[int, ...]) -> None:
@@ -12269,6 +12506,9 @@ class CuteTcgen05Config:
 
     def fix_search_config(self, config: dict[str, object]) -> None:
         self._fix_search_config_body(config)
+        if self._fix_one_cta_n_edge_rings_search_config(config):
+            # flattened: project it again as a flat sample
+            self._fix_search_config_body(config)
         # These repairs read the repaired pid type, cluster and tile, so they
         # run last, on every path of the body (its early returns included:
         # the one-CTA pipeline, the dense-N tile, the materialized chains

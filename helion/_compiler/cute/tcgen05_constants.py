@@ -152,6 +152,12 @@ TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M = 128
 TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N = 128
 # Best measured seed L2 grouping for the full-tile CtaGroup.TWO row.
 TCGEN05_TWO_CTA_SEED_L2_GROUPING = 4
+# The M-tile grouping of a long N sweep (at least this many N tiles): a walk
+# that groups fewer M tiles re-reads B once per group (bf16 8192x32000x1024 +
+# bias, 125 N tiles, of the ATen GEMM: 0.84 grouped by 2, 0.94 by 8, 0.99 by
+# 32; the Inductor corpus' vocabulary projections likewise).
+TCGEN05_LONG_N_SWEEP_MIN_TILES = 32
+TCGEN05_LONG_N_SWEEP_L2_GROUPING = 32
 # Grouped raster for the resident-cluster 2x2 twin seeds: the co-resident
 # wave walks this many pair rows per group across the cluster-N columns.
 TCGEN05_CLUSTER_N2_SEED_L2_GROUPING = 8
@@ -200,6 +206,12 @@ TCGEN05_SMEM_MBARRIER_BYTES = 8
 TCGEN05_SMEM_AB_MBARRIER_CHUNK_BYTES = 128
 # The C ring's 1 KiB alignment follows the row stages in the arena.
 TCGEN05_SMEM_ROW_STAGE_CHUNK_BYTES = 1024
+# SMEM slots of a row stage the epilogue loads one tile ahead (``cute_mma``'s
+# ``tcgen05_partial_output_row_lookahead``): the current tile reads one while
+# the next tile's copy fills the other. Each tile waits for all but the
+# newest ``cp.async`` group (``wait_group 1``): the lookahead runs one tile
+# ahead, so more slots would add room, not distance.
+TCGEN05_ROW_LOOKAHEAD_SLOTS = 2
 TCGEN05_SMEM_TMEM_HOLDING_BUFFER_BYTES = 4
 TCGEN05_SMEM_TWO_CTA_TMEM_DEALLOC_MBARRIER_BYTES = 8
 # Small allocations the model does not enumerate, all 8/16 B aligned and

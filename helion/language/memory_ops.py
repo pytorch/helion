@@ -7,6 +7,7 @@ import logging
 import operator
 import textwrap
 from typing import TYPE_CHECKING
+from typing import NamedTuple
 from typing import cast
 
 import sympy
@@ -25,6 +26,7 @@ from .._compiler.cute.access_regions import tile_begin_symbol
 from .._compiler.cute.cache_policy_loads import cache_hinted_load_helper
 from .._compiler.cute.cache_policy_loads import is_cache_policy_suffix
 from .._compiler.cute.cutedsl_compat import emit_pipeline_advance
+from .._compiler.cute.device_state import Tcgen05EpiRowPrefetch
 from .._compiler.cute.device_state import Tcgen05GroupedDMode
 from .._compiler.cute.device_state import Tcgen05Orientation
 from .._compiler.cute.epilogue_fanout import FANOUT_CONFIG_KEY
@@ -80,6 +82,7 @@ from .._compiler.cute.tcgen05_constants import (
     TCGEN05_EPILOGUE_LAYOUT_SPLIT_ACC_T2R_STORE_TAIL,
 )
 from .._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_SPLIT_FIRST_T2R
+from .._compiler.cute.tcgen05_constants import TCGEN05_ROW_LOOKAHEAD_SLOTS
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .._compiler.cute.tcgen05_constants import tcgen05_aux_fragment_bytes_per_thread
 from .._compiler.cute.tcgen05_constants import (
@@ -111,6 +114,7 @@ from . import _decorators
 from .stack_tensor import StackTensor
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Sequence
 
     from .._compiler.cute.cute_epilogue import Tcgen05GroupedTailEpilogueMatch
@@ -122,6 +126,7 @@ if TYPE_CHECKING:
     from .._compiler.cute.fragment_epilogue import Tcgen05FragmentEpiloguePlan
     from .._compiler.cute.signed_bitfield import PackedStoreValue
     from .._compiler.cute.signed_bitfield import SignedByteSite
+    from .._compiler.device_function import DeviceFunction
     from .._compiler.inductor_lowering import CodegenState
     from .._compiler.tile_strategy import DeviceLoopOrGridState
     from .._compiler.tile_strategy import LoopDimInfo
@@ -227,6 +232,158 @@ def _exact_shape_aux_fragment_hoisted(
     return True
 
 
+class _RowvecCopyNames(NamedTuple):
+    """Locals of one row-vector GMEM-to-SMEM copy (``_rowvec_copy_lines``)."""
+
+    tiled_copy: str
+    thr_copy: str
+    gmem_tile: str
+    gmem_part: str
+    smem_part: str
+    coord: str
+    limit: str
+    pred: str
+
+
+def _rowvec_copy_lines(
+    names: _RowvecCopyNames,
+    *,
+    copy_atom: str,
+    dtype: str,
+    copy_bits: int,
+    threads: int | str,
+    copy_elems: int,
+    tidx: str,
+    aux_tensor_name: str,
+    bn: int,
+    tile_coord_n: str,
+    smem: str,
+    predicate: tuple[str, str, int] | None,
+) -> list[str]:
+    """One N tile of a row operand copied into ``smem`` by ``threads``
+    threads of ``copy_elems`` elements each; with ``predicate`` (the N
+    size, the tile's N offset and the operand's extent) the columns past the
+    row stay uncopied."""
+    atom = f"cute.make_copy_atom({copy_atom}, {dtype}, num_bits_per_copy={copy_bits})"
+    lines = [
+        (
+            f"{names.tiled_copy} = cute.make_tiled_copy_tv({atom}, "
+            f"cute.make_layout({threads}), cute.make_layout({copy_elems}))"
+        ),
+        f"{names.thr_copy} = {names.tiled_copy}.get_slice({tidx})",
+        (
+            f"{names.gmem_tile} = cute.local_tile({aux_tensor_name}, ({bn},), "
+            f"({tile_coord_n},))"
+        ),
+        f"{names.gmem_part} = {names.thr_copy}.partition_S({names.gmem_tile})",
+        f"{names.smem_part} = {names.thr_copy}.partition_D({smem})",
+    ]
+    if predicate is None:
+        lines.append(
+            f"cute.copy({names.tiled_copy}, {names.gmem_part}, {names.smem_part})"
+        )
+        return lines
+    n_size, n_index, extent = predicate
+    lines += [
+        (
+            f"{names.coord} = {names.thr_copy}.partition_S("
+            f"cute.make_identity_tensor({bn}))"
+        ),
+        (
+            f"{names.limit} = min({n_size} - ({n_index}), "
+            f"cutlass.Int32({extent}) - ({n_index}), cutlass.Int32({bn}))"
+        ),
+        (
+            f"{names.pred} = cute.make_rmem_tensor((1, cute.size("
+            f"{names.smem_part}.shape[1])), cutlass.Boolean)"
+        ),
+        (
+            f"for _rowvec_i in cutlass.range(cute.size({names.smem_part}.shape[1]), "
+            "unroll_full=True):"
+        ),
+        (
+            f"    {names.pred}[0, _rowvec_i] = {names.coord}[0, _rowvec_i] < "
+            f"{names.limit}"
+        ),
+        (
+            f"cute.copy({names.tiled_copy}, {names.gmem_part}, {names.smem_part}, "
+            f"pred={names.pred})"
+        ),
+    ]
+    return lines
+
+
+def _register_tcgen05_epi_row_prefetch(
+    df: DeviceFunction,
+    *,
+    stage: _RowvecAuxStageRecord,
+    aux_tensor_name: str,
+    aux_dtype: str,
+    bn: int,
+    n_size: str,
+    n_index: str,
+    tile_coord_n: str,
+    epi_tidx: str,
+) -> None:
+    """Hand the role-local loop the asynchronous copy of a tile's row.
+
+    The synchronous copy's predicated form (``_rowvec_copy_lines``) on a
+    ``cp.async`` atom, one 16-byte copy per thread of the ``bn``-wide row,
+    into ``slot`` of the two-slot stage (``program_id``'s
+    ``_tcgen05_row_lookahead_stmts`` places it). Generated for a 256-wide
+    bf16 bias row::
+
+        if tcgen05_epi_tidx < cutlass.Int32(32):
+            <copy> = cute.make_tiled_copy_tv(cute.make_copy_atom(
+                cute.nvgpu.cpasync.CopyG2SOp(), cutlass.BFloat16,
+                num_bits_per_copy=128), cute.make_layout(32), cute.make_layout(8))
+            ...  # partitions of bias at the lookahead tile's N offset
+            <dst> = <thr>.partition_D(tcgen05_aux_rowvec_smem_0[slot, None])
+            ...  # the predicate: columns below the row's extent
+            cute.copy(<copy>, <src>, <dst>, pred=<pred>)
+
+    Threads past the row issue nothing: a predicated-off ``cp.async`` still
+    zero-fills its 16 bytes, so on the synchronous copy's layout (every
+    epilogue thread, 1024 columns' worth) threads 32-127 zero the other
+    slot (4096x30000x128 + bias: max error 4.25).
+    """
+    threads = _rowvec_copy_threads(bn, stage.copy_elems)
+
+    def issue(translate: Callable[[str], str], slot: str, suffix: str) -> str:
+        names = _RowvecCopyNames(
+            *(
+                df.new_var(f"{stage.smem}_pf_{field}_{suffix}")
+                for field in _RowvecCopyNames._fields
+            )
+        )
+        lines = _rowvec_copy_lines(
+            names,
+            copy_atom="cute.nvgpu.cpasync.CopyG2SOp()",
+            dtype=aux_dtype,
+            copy_bits=stage.copy_bits,
+            threads=threads,
+            copy_elems=stage.copy_elems,
+            tidx=epi_tidx,
+            aux_tensor_name=aux_tensor_name,
+            bn=bn,
+            tile_coord_n=translate(tile_coord_n),
+            smem=f"{stage.smem}[{slot}, None]",
+            predicate=(translate(n_size), translate(n_index), stage.aux_extent),
+        )
+        return f"if {epi_tidx} < cutlass.Int32({threads}):\n" + "\n".join(
+            f"    {line}" for line in lines
+        )
+
+    df.cute_state.tcgen05_epi_row_prefetches.append(
+        Tcgen05EpiRowPrefetch(coordinates=(n_index, tile_coord_n, n_size), issue=issue)
+    )
+
+
+def _rowvec_copy_threads(bn: int, copy_elems: int) -> int:
+    """Threads that copy a ``bn``-wide row ``copy_elems`` elements each."""
+    return -(-bn // copy_elems)
+
+
 @dataclasses.dataclass(frozen=True)
 class _RowvecAuxStageRecord:
     """Per-tile compact SMEM staging locals for one row-vector aux step."""
@@ -257,6 +414,24 @@ class _RowvecAuxStageRecord:
     # Threads of the one cooperative copy filling a promoted stage (a
     # multiple of 32, at most the epilogue warps' threads).
     copy_threads: int = 0
+    # The epilogue role loads the row one tile ahead into the other of two
+    # SMEM slots (``Tcgen05EpiRowPrefetch``): the per-tile staging only
+    # waits for the copy issued while the previous tile ran.
+    prefetch: bool = False
+
+    @property
+    def copy_names(self) -> _RowvecCopyNames:
+        """The copy's locals, as ``_rowvec_copy_lines`` takes them."""
+        return _RowvecCopyNames(
+            self.tiled_copy,
+            self.thr_copy,
+            self.gmem_tile,
+            self.gmem_part,
+            self.smem_part,
+            self.coord,
+            self.limit,
+            self.pred,
+        )
 
 
 def _tcgen05_rowvec_aux_stage_copy_elems(
@@ -3864,33 +4039,66 @@ def _codegen_cute_store_tcgen05_tile(
             assert shared_copy_elems is not None
             copy_elems = shared_copy_elems
             copy_bits = rec.aux_dtype_bits * shared_copy_elems
+        # ``cute_mma`` decides the walk (``partial_output_row_lookahead``);
+        # the row must also be one copy pass of the epilogue warps, from a
+        # base its ``cp.async`` vectors are aligned to: the copy atom needs
+        # ``copy_bits`` alignment where the synchronous copy compiles at the
+        # pointer's own (``bias = buf[1:1 + n]``: 2 bytes, so a 128-bit
+        # ``CopyG2SOp`` failed IR verification).
+        # local: ``_compiler.cute.memory_ops`` imports this module's package
+        from .._compiler.cute.memory_ops import cute_tensor_base_is_aligned
+
+        aux_row_tensor = rec.expr.load_node.args[0]
+        assert isinstance(aux_row_tensor, torch.fx.Node)
+        prefetch_row = (
+            tcgen05_value.partial_output_row_lookahead
+            and stage_partial_tma_rowvec
+            and copy_elems is not None
+            and _rowvec_copy_threads(tcgen05_aux_bn, copy_elems)
+            <= tcgen05_value.epi_warp_count * 32
+            and cute_tensor_base_is_aligned(
+                env, aux_row_tensor.meta["val"], copy_bits // 8
+            )
+        )
         if stage_partial_tma_rowvec or stage_rowvec_per_warp or stage_rowvec_shared_f32:
             assert rec.aux_extent is not None
             assert copy_elems is not None
-            rowvec_aux_stage_records.append(
-                _RowvecAuxStageRecord(
-                    smem_layout=df.new_var(f"tcgen05_aux_rowvec_smem_layout_{aux_idx}"),
-                    smem_ptr=df.new_var(f"tcgen05_aux_rowvec_smem_ptr_{aux_idx}"),
-                    smem=df.new_var(f"tcgen05_aux_rowvec_smem_{aux_idx}"),
-                    tiled_copy=df.new_var(f"tcgen05_aux_rowvec_tiled_copy_{aux_idx}"),
-                    thr_copy=df.new_var(f"tcgen05_aux_rowvec_thr_copy_{aux_idx}"),
-                    gmem_tile=df.new_var(f"tcgen05_aux_rowvec_gmem_tile_{aux_idx}"),
-                    gmem_part=df.new_var(f"tcgen05_aux_rowvec_gmem_part_{aux_idx}"),
-                    smem_part=df.new_var(f"tcgen05_aux_rowvec_smem_part_{aux_idx}"),
-                    coord=df.new_var(f"tcgen05_aux_rowvec_coord_{aux_idx}"),
-                    limit=df.new_var(f"tcgen05_aux_rowvec_limit_{aux_idx}"),
-                    pred=df.new_var(f"tcgen05_aux_rowvec_pred_{aux_idx}"),
-                    copy_bits=copy_bits,
-                    copy_elems=copy_elems,
-                    aux_extent=rec.aux_extent,
-                    warp_private=stage_rowvec_per_warp,
-                    stage_dtype=(
-                        "cutlass.Float32" if stage_rowvec_shared_f32 else rec.aux_dtype
-                    ),
-                    promote=stage_rowvec_shared_f32,
-                    copy_threads=shared_copy_threads if stage_rowvec_shared_f32 else 0,
-                )
+            stage_record = _RowvecAuxStageRecord(
+                smem_layout=df.new_var(f"tcgen05_aux_rowvec_smem_layout_{aux_idx}"),
+                smem_ptr=df.new_var(f"tcgen05_aux_rowvec_smem_ptr_{aux_idx}"),
+                smem=df.new_var(f"tcgen05_aux_rowvec_smem_{aux_idx}"),
+                tiled_copy=df.new_var(f"tcgen05_aux_rowvec_tiled_copy_{aux_idx}"),
+                thr_copy=df.new_var(f"tcgen05_aux_rowvec_thr_copy_{aux_idx}"),
+                gmem_tile=df.new_var(f"tcgen05_aux_rowvec_gmem_tile_{aux_idx}"),
+                gmem_part=df.new_var(f"tcgen05_aux_rowvec_gmem_part_{aux_idx}"),
+                smem_part=df.new_var(f"tcgen05_aux_rowvec_smem_part_{aux_idx}"),
+                coord=df.new_var(f"tcgen05_aux_rowvec_coord_{aux_idx}"),
+                limit=df.new_var(f"tcgen05_aux_rowvec_limit_{aux_idx}"),
+                pred=df.new_var(f"tcgen05_aux_rowvec_pred_{aux_idx}"),
+                copy_bits=copy_bits,
+                copy_elems=copy_elems,
+                aux_extent=rec.aux_extent,
+                warp_private=stage_rowvec_per_warp,
+                stage_dtype=(
+                    "cutlass.Float32" if stage_rowvec_shared_f32 else rec.aux_dtype
+                ),
+                promote=stage_rowvec_shared_f32,
+                copy_threads=shared_copy_threads if stage_rowvec_shared_f32 else 0,
+                prefetch=prefetch_row,
             )
+            rowvec_aux_stage_records.append(stage_record)
+            if prefetch_row:
+                _register_tcgen05_epi_row_prefetch(
+                    df,
+                    stage=stage_record,
+                    aux_tensor_name=rec.aux_tensor_name,
+                    aux_dtype=rec.aux_dtype,
+                    bn=tcgen05_aux_bn,
+                    n_size=str(n_size),
+                    n_index=n_index,
+                    tile_coord_n=tile_coord_n,
+                    epi_tidx=tcgen05_aux_epi_tidx,
+                )
         else:
             rowvec_aux_stage_records.append(None)
     if fanout_plan is not None and any(
@@ -4049,6 +4257,9 @@ def _codegen_cute_store_tcgen05_tile(
                             f"({tcgen05_aux_epi_warp_count}, {tcgen05_aux_bn}), "
                             f"stride=({tcgen05_aux_bn}, 1))"
                             if stage.warp_private
+                            else f"({TCGEN05_ROW_LOOKAHEAD_SLOTS}, {tcgen05_aux_bn}), "
+                            f"stride=({tcgen05_aux_bn}, 1))"
+                            if stage.prefetch
                             else f"({tcgen05_aux_bn},), stride=(1,))"
                         )
                     ),
@@ -4066,9 +4277,12 @@ def _codegen_cute_store_tcgen05_tile(
         return lines
 
     def _rowvec_aux_copy_lines() -> list[str]:
-        """Emit the predicated GMEM-to-SMEM copy for staged row-vector aux."""
+        """Emit the predicated GMEM-to-SMEM copy for staged row-vector aux;
+        for rows the previous tile prefetched, the wait for their ``cp.async``
+        group and the barrier publishing them."""
 
         lines: list[str] = []
+        prefetched = False
         for aux_idx, rec in enumerate(aux_step_records):
             stage = rowvec_aux_stage_records[aux_idx]
             if stage is None:
@@ -4128,55 +4342,72 @@ def _codegen_cute_store_tcgen05_tile(
                     + f"    {epilog_sync_barrier}.arrive_and_wait()"
                 )
                 continue
+            if stage.prefetch:
+                # copied one tile ahead (``_register_tcgen05_epi_row_prefetch``)
+                prefetched = True
+                continue
+            names = stage.copy_names
             if stage.warp_private:
-                copy_thread_layout = "32"
-                copy_tidx = f"{tcgen05_aux_epi_tidx} % cutlass.Int32(32)"
-                copy_smem = (
-                    f"{stage.smem}[{tcgen05_aux_epi_tidx} // cutlass.Int32(32), None]"
-                )
-                copy_source = (
-                    f"    cute.copy({stage.tiled_copy}, {stage.gmem_part}, "
-                    f"{stage.smem_part})"
+                copy_lines = _rowvec_copy_lines(
+                    names,
+                    copy_atom="cute.nvgpu.CopyUniversalOp()",
+                    dtype=rec.aux_dtype,
+                    copy_bits=stage.copy_bits,
+                    threads=32,
+                    copy_elems=stage.copy_elems,
+                    tidx=f"{tcgen05_aux_epi_tidx} % cutlass.Int32(32)",
+                    aux_tensor_name=rec.aux_tensor_name,
+                    bn=tcgen05_aux_bn,
+                    tile_coord_n=tile_coord_n,
+                    smem=(
+                        f"{stage.smem}[{tcgen05_aux_epi_tidx} // cutlass.Int32(32), "
+                        "None]"
+                    ),
+                    predicate=None,
                 )
             else:
-                copy_thread_layout = str(tcgen05_aux_epi_warp_count * 32)
-                copy_tidx = tcgen05_aux_epi_tidx
-                copy_smem = stage.smem
-                copy_source = (
-                    f"    {stage.coord} = {stage.thr_copy}.partition_S("
-                    f"cute.make_identity_tensor({tcgen05_aux_bn}))\n"
-                    f"    {stage.limit} = min({n_size} - ({n_index}), "
-                    f"cutlass.Int32({stage.aux_extent}) - ({n_index}), "
-                    f"cutlass.Int32({tcgen05_aux_bn}))\n"
-                    f"    {stage.pred} = cute.make_rmem_tensor("
-                    f"(1, cute.size({stage.smem_part}.shape[1])), "
-                    "cutlass.Boolean)\n"
-                    f"    for _rowvec_i in cutlass.range("
-                    f"cute.size({stage.smem_part}.shape[1]), unroll_full=True):\n"
-                    f"        {stage.pred}[0, _rowvec_i] = "
-                    f"{stage.coord}[0, _rowvec_i] < {stage.limit}\n"
-                    f"    cute.copy({stage.tiled_copy}, {stage.gmem_part}, "
-                    f"{stage.smem_part}, pred={stage.pred})\n"
-                    "    cute.arch.fence_acq_rel_cta()\n"
-                    f"    {epilog_sync_barrier}.arrive_and_wait()"
-                )
+                copy_lines = [
+                    *_rowvec_copy_lines(
+                        names,
+                        copy_atom="cute.nvgpu.CopyUniversalOp()",
+                        dtype=rec.aux_dtype,
+                        copy_bits=stage.copy_bits,
+                        threads=tcgen05_aux_epi_warp_count * 32,
+                        copy_elems=stage.copy_elems,
+                        tidx=tcgen05_aux_epi_tidx,
+                        aux_tensor_name=rec.aux_tensor_name,
+                        bn=tcgen05_aux_bn,
+                        tile_coord_n=tile_coord_n,
+                        smem=stage.smem,
+                        predicate=(str(n_size), n_index, stage.aux_extent),
+                    ),
+                    "cute.arch.fence_acq_rel_cta()",
+                    f"{epilog_sync_barrier}.arrive_and_wait()",
+                ]
             lines.append(
                 f"if {tcgen05_aux_epi_active}:\n"
-                f"    {stage.tiled_copy} = cute.make_tiled_copy_tv("
-                f"cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), "
-                f"{rec.aux_dtype}, num_bits_per_copy={stage.copy_bits}), "
-                f"cute.make_layout({copy_thread_layout}), "
-                f"cute.make_layout({stage.copy_elems}))\n"
-                f"    {stage.thr_copy} = {stage.tiled_copy}.get_slice("
-                f"{copy_tidx})\n"
-                f"    {stage.gmem_tile} = cute.local_tile("
-                f"{rec.aux_tensor_name}, ({tcgen05_aux_bn},), "
-                f"({tile_coord_n},))\n"
-                f"    {stage.gmem_part} = {stage.thr_copy}.partition_S("
-                f"{stage.gmem_tile})\n"
-                f"    {stage.smem_part} = {stage.thr_copy}.partition_D("
-                f"{copy_smem})\n"
-                f"{copy_source}"
+                + "\n".join(f"    {line}" for line in copy_lines)
+            )
+        if prefetched:
+            # This tile's rows were copied while the previous tile ran (one
+            # ``cp.async`` group per scheduler step, padding steps committing
+            # empty ones, ``_register_tcgen05_epi_row_prefetch``)
+            # and only the next tile's group was committed after them (the
+            # lookahead walks one tile ahead, whatever the slot count), so the
+            # wait completes all but that newest group; the epilogue barrier
+            # then publishes every thread's part:
+            #     if tcgen05_epi_active:
+            #         cute.arch.cp_async_wait_group(1)
+            #         tcgen05_epilog_sync_barrier.arrive_and_wait()
+            # The named barrier orders the epilogue warps' shared-memory
+            # accesses, so this drops the synchronous copy's
+            # ``cute.arch.fence_acq_rel_cta()`` ahead of it, which held each
+            # tile about 0.45 us of its 2.3 us (4096x30000x128 + bias: 0.95
+            # of the ATen GEMM with the fence, 1.04 without).
+            lines.append(
+                f"if {tcgen05_aux_epi_active}:\n"
+                "    cute.arch.cp_async_wait_group(1)\n"
+                f"    {epilog_sync_barrier}.arrive_and_wait()"
             )
         return lines
 
@@ -4527,14 +4758,18 @@ def _codegen_cute_store_tcgen05_tile(
             elif rowvec_stage is not None and not force_gmem_aux:
                 assert rec.broadcast_axis == 1
                 assert rec.aux_view2d is not None
-                # The compact SMEM rowvec is allocated and populated per output
-                # tile, so its 2-D broadcast view is already tile-sized. The
+                # The compact SMEM rowvec holds one output tile's row (a
+                # prefetched row: this tile's slot, filled one tile ahead), so
+                # its 2-D broadcast view is already tile-sized. The
                 # full-tile bm256 path gives every epilogue warp a private copy,
                 # avoiding a CTA barrier between the copy and its first read.
                 rowvec_smem_iterator = (
                     f"{rowvec_stage.smem}[{tcgen05_aux_epi_tidx} // "
                     "cutlass.Int32(32), None].iterator"
                     if rowvec_stage.warp_private
+                    else f"{rowvec_stage.smem}[{tcgen05_value.role_local_tile_counter} "
+                    f"% cutlass.Int32({TCGEN05_ROW_LOOKAHEAD_SLOTS}), None].iterator"
+                    if rowvec_stage.prefetch
                     else f"{rowvec_stage.smem}.iterator"
                 )
                 lines.append(

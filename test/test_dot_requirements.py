@@ -387,7 +387,9 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         # 16-bit 8192^3 is FFI-eligible (fp16 has full bf16 parity), so the
         # default is now the validated TVM-FFI full-tile envelope: the FFI
         # direct-entry seed's L2 grouping and the CtaGroup.TWO 256x256x128 tile.
-        self.assertEqual(spec.default_config().config["l2_groupings"], [2])
+        # 8192 columns are a long N sweep (32 N tiles), grouped by 32 M tiles
+        # (B200, of cuBLAS: 0.98-1.02 grouped by 2, 4 or 32 here).
+        self.assertEqual(spec.default_config().config["l2_groupings"], [32])
         # K=8192 can form validated CtaGroup.TWO products at bk >= 32 even
         # though bk=16 is over the K-tile cap. The FFI full-tile default lands
         # on cluster_m=2, and the search exposes both arms.
