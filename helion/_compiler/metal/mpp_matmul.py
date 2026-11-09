@@ -163,8 +163,14 @@ ROUND_PREAMBLE = f"""inline float {ROUND}(float v) {{
     uint r = (u & 0x7FFFFFFFu) > 0x7F800000u ? (u | 0x00400000u) : u + 0x7FFFu + ((u >> 16) & 1u);
     return as_type<float>(r & 0xFFFF0000u);
 }}"""
-BF16_CAST_PREAMBLE = f"""inline bfloat {BF16_CAST}(float v) {{
-    return as_type<bfloat>(ushort(as_type<uint>({ROUND}(v)) >> 16));
+#: A bfloat operand is already rounded: its overload returns it as is, as
+#: ``static_cast<bfloat>`` would, NaN payload included.
+BF16_CAST_PREAMBLE = f"""template <typename T>
+inline bfloat {BF16_CAST}(T v) {{
+    return as_type<bfloat>(ushort(as_type<uint>({ROUND}(float(v))) >> 16));
+}}
+inline bfloat {BF16_CAST}(bfloat v) {{
+    return v;
 }}"""
 
 #: Each matmul's (acc, lhs, rhs) argument positions; None for no acc.  The

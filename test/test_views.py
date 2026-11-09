@@ -1355,6 +1355,28 @@ class TestViews(RefEagerTestBase, TestCase):
                 "Expected bitcast to int16 via .to() or tl.cast()",
             )
 
+    @skipIfRefEager("ref eager does not support view dtype")
+    @xfailIfPallas("view dtype reinterpret not supported on pallas")
+    def test_view_dtype_masked_lanes(self):
+        """A view of a value whose masked lanes hold -0.0 (bits 0x8000) isn't
+        zero there, so the integer sum over a 100-wide row keeps its mask."""
+
+        @helion.kernel(static_shapes=True)
+        def negated_row_bit_sums(t: torch.Tensor) -> torch.Tensor:
+            m, _ = t.shape
+            out = torch.empty([m], dtype=torch.int32, device=t.device)
+            for tile_m in hl.tile(m):
+                bits = (-t[tile_m, :]).view(dtype=torch.int16).to(torch.int32)
+                out[tile_m] = bits.sum(-1)
+            return out
+
+        t = torch.rand(8, 100, dtype=torch.float16, device=DEVICE) + 0.5
+        _, result = code_and_output(negated_row_bit_sums, (t,), block_sizes=[4])
+        expected = (
+            (-t).view(dtype=torch.int16).to(torch.int32).sum(-1, dtype=torch.int32)
+        )
+        torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
     @onlyBackends(["cute"])
     @skipIfRefEager("checks generated numeric bitcasts")
     def test_numeric_view_dtype_preserves_bits(self):

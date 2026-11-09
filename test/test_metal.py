@@ -10270,6 +10270,13 @@ class TestMetalFmaFusionRewrite(unittest.TestCase):
             """
         self.assertEqual(got, ast.unparse(ast.parse(textwrap.dedent(expected))))
 
+    def test_viewed_float_fuses(self) -> None:
+        """A float reinterpreted from int bits (``as_type``) is a float."""
+        got = self._fuse("a = as_type(float, n)\nb = w[0]\nt = a * b\nu = t + r[0]\n")
+        self.assertEqual(
+            got, "a = as_type(float, n)\nb = w[0]\nu = metal.fma(a, b, r[0])"
+        )
+
     def test_kept(self) -> None:
         for name, source in (
             ("int index math", "t = n * 4\nu = t + n\n"),
@@ -10324,6 +10331,96 @@ class TestMetalFmaFusion(unittest.TestCase):
         self.assertNotIn("metal::fma(", msl)
         expected = (x * w).to(torch.float16).to(torch.float32) + r
         torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def high_halves(t: torch.Tensor) -> torch.Tensor:
+    """The float16 in each int32's high 16 bits."""
+    out = torch.empty(t.shape, dtype=torch.float16, device=t.device)
+    for tile in hl.tile(t.size(0)):
+        out[tile] = (t[tile] >> 16).to(torch.int16).view(torch.float16)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def int32_as_halves(t: torch.Tensor) -> torch.Tensor:
+    """Each int32 as its two float16 halves: a view to a narrower dtype."""
+    out = torch.empty([t.size(0), 2], dtype=torch.float16, device=t.device)
+    for tile in hl.tile(t.size(0)):
+        out[tile, :] = t[tile].view(torch.float16).view(-1, 2)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def row_bit_sums(x: torch.Tensor) -> torch.Tensor:
+    """The sum of each row's 16-bit patterns, as integers."""
+    m, _ = x.shape
+    out = torch.empty([m], dtype=torch.int32, device=x.device)
+    for tile_m in hl.tile(m):
+        out[tile_m] = x[tile_m, :].view(torch.int16).to(torch.int32).sum(-1)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def negated_row_bit_sums(t: torch.Tensor) -> torch.Tensor:
+    """row_bit_sums of -t: a masked lane of -t holds -0.0, bits 0x8000."""
+    m, _ = t.shape
+    out = torch.empty([m], dtype=torch.int32, device=t.device)
+    for tile_m in hl.tile(m):
+        out[tile_m] = (-t[tile_m, :]).view(torch.int16).to(torch.int32).sum(-1)
+    return out
+
+
+@_requires_darwin
+class TestMetalViewDtype(unittest.TestCase):
+    def test_equal_width(self) -> None:
+        hi = torch.randn(100, dtype=torch.float16)
+        lo = torch.randn(100, dtype=torch.float16)
+        words = (hi.view(torch.int16).to(torch.int32) << 16) | (
+            lo.view(torch.int16).to(torch.int32) & 0xFFFF
+        )
+        out, _, msl = _run_with_msl(
+            high_halves, (words.to(DEVICE),), helion.Config(block_sizes=[64])
+        )
+        self.assertIn("as_type<half>(static_cast<short>(", msl)
+        torch.testing.assert_close(out.cpu(), hi, atol=0, rtol=0)
+
+    def test_bit_patterns_in_lane_copies(self) -> None:
+        """Rows folded into a thread's lanes view each element's exact bits:
+        a signaling NaN, -0.0, a subnormal and infinity among them (a lane
+        copy's bfloat conversion leaves a bfloat operand as it is)."""
+        special = [0x7F81, 0x8000, 0x0001, 0x7F80, 0xFF80, 0x0081]
+        for dtype in (torch.bfloat16, torch.float16):
+            with self.subTest(dtype=dtype):
+                bits = torch.randn(6, 256).to(dtype).view(torch.int16)
+                bits[0, : len(special)] = torch.tensor(special).to(torch.int16)
+                x = bits.view(dtype)
+                out, _, msl = _run_with_msl(
+                    row_bit_sums,
+                    (x.to(DEVICE),),
+                    helion.Config(block_sizes=[2], num_warps=1),
+                )
+                self.assertIn("__lane1", msl)
+                expected = bits.to(torch.int32).sum(-1, dtype=torch.int32)
+                torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+
+    def test_masked_lanes_of_a_view(self) -> None:
+        """A view of a value whose masked lanes hold -0.0 isn't zero there,
+        so the integer sum over the 100 columns of a 128-wide block keeps
+        its mask."""
+        t = torch.rand(8, 100, dtype=torch.float16) + 0.5
+        out, _, _ = _run_with_msl(
+            negated_row_bit_sums, (t.to(DEVICE),), helion.Config(block_sizes=[4])
+        )
+        expected = (-t).view(torch.int16).to(torch.int32).sum(-1, dtype=torch.int32)
+        torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+
+    def test_width_mismatch(self) -> None:
+        words = torch.zeros(100, dtype=torch.int32, device=DEVICE)
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, "view.dtype from torch.int32 to torch.float16"
+        ):
+            int32_as_halves.bind((words,)).to_code(helion.Config(block_sizes=[64]))
 
 
 # ---------------------------------------------------------------------------
