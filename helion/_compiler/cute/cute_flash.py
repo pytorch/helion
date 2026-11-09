@@ -17593,7 +17593,7 @@ def _flash_flex_stream_fill(
     lines = [
         f"{indent}cute.arch.cp_async_wait_group(0)",
         f"{indent}cute.arch.sync_warp()",
-        f"{indent}flash_flex_pkv = {tile}",
+        f"{indent}flash_flex_ikv = {tile}",
     ]
     for slot in range(slots):
         lines.extend(
@@ -20698,6 +20698,10 @@ def _softmax_inner(
                     # walk's next tile once past the chunk count -- is
                     # copied into the freed slot.  Rolled, the chunk
                     # index is a runtime value: the tile is a select.
+                    # The stream binds its own tile name: the register
+                    # prefetch above keeps reading ``flash_flex_pkv``
+                    # (bound once ahead of the loop) for in-tile chunks
+                    # after the stream has moved to the next tile.
                     next_tile = (
                         f"cutlass.Int32(cutlass.select_(flash_ci + {slots} < flash_LD_CHUNKS, flash_kv, flash_kv_peek))"
                         if ctx.cfg.flex_rolled_chunks
@@ -20708,7 +20712,7 @@ def _softmax_inner(
                         + _flash_flex_hook_lines(consume, " " * 16).rstrip()
                         + f"\n                flash_flex_pc = (flash_ci + {slots}) % flash_LD_CHUNKS"
                         + f"\n                flash_flex_ps = flash_ci % {slots}"
-                        + f"\n                flash_flex_pkv = {next_tile}\n"
+                        + f"\n                flash_flex_ikv = {next_tile}\n"
                         + _flash_flex_hook_lines(issue, " " * 16).rstrip()
                     )
                 # The rolled loop (``cute_flash_flex_rolled_chunks``):
