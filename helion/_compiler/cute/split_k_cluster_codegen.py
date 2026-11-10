@@ -119,12 +119,12 @@ def kernel_source(
     copy_body = f"""
 for ai in cutlass.range_constexpr({s.bm * s.bk // (32 * 8)}):
 {a_coordinates}
-    cute.arch.cp_async_shared_global(a.iterator + cute.crd2idx((m, k, warp), a.layout), x.iterator + (tile_m + m) * cutlass.Int32(x.layout.stride[0]) + (start_k + k) * cutlass.Int32(x.layout.stride[1]), 16, 'cg')
+    prims.cp_async_shared_global(a.iterator + cute.crd2idx((m, k, warp), a.layout), x.iterator + (tile_m + m) * cutlass.Int32(x.layout.stride[0]) + (start_k + k) * cutlass.Int32(x.layout.stride[1]), 16, 'cg')
 for bi in cutlass.range_constexpr({s.bn * s.bk // (32 * 8)}):
     flat = (lane + bi * 32) * 8
     n = flat % {s.bn}
     k = flat // {s.bn}
-    cute.arch.cp_async_shared_global(b.iterator + cute.crd2idx((n, k, warp), b.layout), y.iterator + (start_k + k) * cutlass.Int32(y.layout.stride[0]) + (tile_n + n) * cutlass.Int32(y.layout.stride[1]), 16, 'cg')
+    prims.cp_async_shared_global(b.iterator + cute.crd2idx((n, k, warp), b.layout), y.iterator + (start_k + k) * cutlass.Int32(y.layout.stride[0]) + (tile_n + n) * cutlass.Int32(y.layout.stride[1]), 16, 'cg')
 cute.arch.cp_async_commit_group()
 cute.arch.cp_async_wait_group(0)
 cute.arch.sync_threads()
@@ -147,6 +147,7 @@ for ki in cutlass.range_constexpr({s.bk // 16}):
     return f"""from __future__ import annotations
 import cutlass
 import cutlass.cute as cute
+import cutlass.experimental.primitives as prims
 from helion._compiler.cute.cluster_helpers import load_shared_remote_f32
 
 @cute.kernel

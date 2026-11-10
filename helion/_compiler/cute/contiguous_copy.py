@@ -865,7 +865,7 @@ class ContiguousCopy:
         else:
             async_copy = ast.Expr(
                 value=ast.Call(
-                    func=_expr("cute.arch.cp_async_shared_global"),
+                    func=_expr("_cute_cp_async_shared_global"),
                     args=[
                         _expr(f"{destination_tensor}.iterator + {destination_offset}"),
                         pointer,

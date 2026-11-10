@@ -2920,6 +2920,10 @@ class CuteBackend(Backend):
             ),
             "_cute_mma_f16": "from helion._compiler.cute._flash_row_mma_runtime import mma_f16 as _cute_mma_f16",
             "_cute_mma_bf16": "from helion._compiler.cute._flash_row_mma_runtime import mma_bf16 as _cute_mma_bf16",
+            "_cute_cp_async_shared_global": (
+                "from cutlass.experimental.primitives import "
+                "cp_async_shared_global as _cute_cp_async_shared_global"
+            ),
             "_cute_ring_cp_async_16": "from helion._compiler.cute._flash_row_mma_runtime import cp_async_16 as _cute_ring_cp_async_16",
             "_cute_ring_cp_async_16_zfill": "from helion._compiler.cute._mma_dag_runtime import cp_async_16_zfill as _cute_ring_cp_async_16_zfill",
             "_cute_ring_ldmatrix_x4": "from helion._compiler.cute._flash_row_mma_runtime import ldmatrix_x4 as _cute_ring_ldmatrix_x4",
