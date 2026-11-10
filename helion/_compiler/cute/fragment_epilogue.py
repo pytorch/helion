@@ -1843,7 +1843,11 @@ def _collect_host_loads(
                 projection=current_projection,
                 memo=memo,
             )
-        if current in region.boundaries or current.target is tile_index:
+        if (
+            current in region.boundaries
+            or current.target is tile_index
+            or _is_literal_scalar(current)
+        ):
             return frozenset()
         source = current.args[0] if current.args else None
         if (
@@ -1852,7 +1856,9 @@ def _collect_host_loads(
             and _is_host_tensor(source)
         ):
             return frozenset({(current, current_flat)})
-        inputs = _pointwise_inputs(current)
+        inputs = _where_inputs(current)
+        if inputs is None:
+            inputs = _pointwise_inputs(current)
         if inputs is not None:
             loads: set[tuple[Node, _Index]] = set()
             output_shape = _shape(current, config)

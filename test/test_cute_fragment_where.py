@@ -78,11 +78,45 @@ def _args(
     )
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_where_aux(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    out: torch.Tensor,
+    aux: torch.Tensor,
+    mode: hl.constexpr,
+) -> torch.Tensor:
+    batches, m, k = lhs.shape
+    n = rhs.shape[2]
+    for bi, mi, ni in hl.tile([batches, m, n], block_size=[1, None, None]):
+        acc = hl.zeros([bi, mi, ni], dtype=torch.float32)
+        for ki in hl.tile(k):
+            acc = torch.baddbmm(acc, lhs[bi, mi, ki], rhs[bi, ki, ni])
+        values = aux[mi, ni][None, :, :]
+        if mode == "condition":
+            value = torch.where(values >= 0.0, acc, 0.0)
+        elif mode == "true":
+            value = torch.where(acc >= 0.0, values, acc)
+        elif mode == "false":
+            value = torch.where(acc >= 0.0, acc, values)
+        else:
+            other = torch.where(values >= 0.0, values, 0.0)
+            value = torch.where(acc >= 0.0, acc, other)
+        out[bi, mi, ni] = value.to(out.dtype)
+    return out
+
+
 def _config(n: int) -> helion.Config:
     return helion.Config(block_sizes=[128, n, 64], pid_type="flat")
 
 
-def _code(args: tuple[torch.Tensor, ...], mode: str, n: int) -> str:
+def _code(
+    args: tuple[torch.Tensor, ...],
+    mode: str,
+    n: int,
+    *,
+    kernel: helion.Kernel = _fragment_where,
+) -> str:
     with (
         patch_cute_mma_support(),
         patch("torch.cuda.is_available", return_value=False),
@@ -96,9 +130,18 @@ def _code(args: tuple[torch.Tensor, ...], mode: str, n: int) -> str:
             CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
         ),
     ):
-        bound = _fragment_where._bind_isolated((*args, mode))
+        bound = kernel._bind_isolated((*args, mode))
         assert bound.config_spec.cute_tcgen05_search_enabled
         return bound.to_code(_config(n))
+
+
+@pytest.mark.parametrize("mode", ["condition", "true", "false", "nested"])
+def test_fragment_where_aux_load_codegen(mode: str) -> None:
+    args = (*_args("cpu"), torch.ones((128, 128), dtype=torch.bfloat16))
+    code = _code(args, mode, 128, kernel=_fragment_where_aux)
+    assert "cute.gemm(" in code
+    assert "tcgen05_epi_where" in code
+    assert "aux.iterator" in code
 
 
 @pytest.mark.parametrize("n", [64, 128])
