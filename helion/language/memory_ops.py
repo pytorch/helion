@@ -44,6 +44,7 @@ from .._compiler.cute.strategies import tcgen05_explicit_d_store_tile_expr
 from .._compiler.cute.strategies import tcgen05_is_two_cta_m128
 from .._compiler.cute.strategies import tcgen05_resolve_epilogue_tile
 from .._compiler.cute.strategies import tcgen05_two_cta_m128_epilogue_tile_expr
+from .._compiler.cute.tcgen05_constants import SM100_SMEM_PER_BLOCK_OPTIN_BYTES
 from .._compiler.cute.tcgen05_constants import (
     TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
 )
@@ -84,11 +85,13 @@ from .._compiler.cute.tcgen05_constants import (
 from .._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_SPLIT_FIRST_T2R
 from .._compiler.cute.tcgen05_constants import TCGEN05_ROW_LOOKAHEAD_SLOTS
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
+from .._compiler.cute.tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
 from .._compiler.cute.tcgen05_constants import tcgen05_aux_fragment_bytes_per_thread
 from .._compiler.cute.tcgen05_constants import (
     tcgen05_aux_subtile_fragment_bytes_per_thread,
 )
 from .._compiler.cute.tcgen05_constants import tcgen05_default_epilogue_tile_size
+from .._compiler.cute.tcgen05_constants import tcgen05_fixed_smem_overhead_bytes
 from .._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_store_shape
 from .._compiler.cute.tcgen05_epilogue_rounds import Tcgen05EpilogueRoundNames
 from .._compiler.cute.tcgen05_epilogue_rounds import render_round_subtile_loop
@@ -121,6 +124,7 @@ if TYPE_CHECKING:
     from .._compiler.cute.cute_epilogue import Tcgen05UnaryEpilogueChain
     from .._compiler.cute.cute_epilogue import _AuxiliaryTensorLoadExpr
     from .._compiler.cute.cute_epilogue import _LeafBindings
+    from .._compiler.cute.device_state import CuteTcgen05MatmulPlan
     from .._compiler.cute.device_state import CuteTcgen05StoreValue
     from .._compiler.cute.epilogue_fanout import RenderedChain
     from .._compiler.cute.fragment_epilogue import Tcgen05FragmentEpiloguePlan
@@ -2743,6 +2747,147 @@ def _check_tcgen05_tma_store_destination(
             + ", ".join(problems)
             + " (a TensorMap needs a 16-byte base and 16-byte outer strides)",
         )
+
+
+# The staged SIMT store's SMEM tile at most (a 128x128 bf16 tile with its
+# padding is 34 KiB).
+_STAGED_SIMT_STORE_MAX_BYTES = 64 * 1024
+# Slack for the allocations' alignment padding.
+_STAGED_SIMT_STORE_ALIGN_SLACK_BYTES = 1024
+
+
+def _staged_simt_store_fits(plan: CuteTcgen05MatmulPlan, staged_bytes: int) -> bool:
+    """Whether the staged store's SMEM tile fits beside the plan's AB ring and
+    fixed reservations (the SIMT store allocates no C ring), pricing the
+    operands at four bytes (tf32) whatever their dtype: the plan does not
+    record it, and the narrow flat tiles that stage keep shallow rings."""
+    if plan.m_subtile_count > 1:
+        # M-paired tiles allocate a second A ring
+        return False
+    used = (
+        tcgen05_ab_smem_bytes_per_cta(
+            bm=plan.bm,
+            bn=plan.bn,
+            bk=plan.bk,
+            dtype_bytes=4,
+            ab_stages=plan.ab_stage_count,
+            cluster_m=plan.cluster_m,
+        )
+        + tcgen05_fixed_smem_overhead_bytes(
+            ab_stages=plan.ab_stage_count,
+            acc_stages=plan.acc_stage_count,
+            cluster_m=plan.cluster_m,
+        )
+        + staged_bytes
+        + _STAGED_SIMT_STORE_ALIGN_SLACK_BYTES
+    )
+    return used <= SM100_SMEM_PER_BLOCK_OPTIN_BYTES
+
+
+def _staged_simt_store_lines(
+    df: DeviceFunction,
+    *,
+    tile: tuple[int, int],
+    pad: int,
+    extents: tuple[int, int],
+    tile_coord: tuple[str, str],
+    dtype: str,
+    thr_mma: str,
+    thr_copy_t2r: str,
+    epi_tile: str,
+    epi_tidx: str,
+    epi_active: str,
+    epi_warps: int,
+    barrier_id: int,
+    registers: str,
+    gmem_tile: str,
+) -> tuple[list[str], list[str], str, str]:
+    """The staged SIMT store of a flat kernel's one tile: (setup, coordinate
+    setup, per-subtile write, store). Each subtile's T2R fragment lands in a padded SMEM
+    tile at its tile coordinates; after the last subtile the epilogue warps
+    store the tile row by row, lane ``l`` of each warp writing column
+    ``32 * c + l`` of its rows. With rows of 1001 bf16 (2002 bytes) the
+    direct copy's warp instruction covers 32 rows, one 2-byte element each::
+
+        cute.copy(simt_atom, tTR_rD, tTR_gC_subtile)  # 32 sectors / instr
+
+    while each staged instruction covers 32 consecutive elements of one
+    row::
+
+        tile[coord[i]] = tTR_rD[i]  # SMEM, padded rows
+        barrier.arrive_and_wait()
+        gC_tile[row, 32 * c + lane] = tile[row, 32 * c + lane]
+
+    The row padding (16 bytes) spreads a warp's column writes over the SMEM
+    banks: without it the rows of a 256-byte tile row alias the same banks
+    (64 x 1000x1000x64 into 1001-element rows: 114 us unpadded, 96 us
+    padded)."""
+    bm, bn = tile
+    m_size, n_size = extents
+    staged_ptr = df.new_var("tcgen05_staged_ptr")
+    staged_tile = df.new_var("tcgen05_staged_tile")
+    staged_barrier = df.new_var("tcgen05_staged_barrier")
+    coord = df.new_var("tcgen05_staged_coord")
+    coord_part = df.new_var("tcgen05_staged_coord_part")
+    coord_grouped = df.new_var("tcgen05_staged_coord_grouped")
+    coord_subtile = df.new_var("tcgen05_staged_coord_subtile")
+    bounds = df.new_var("tcgen05_staged_bounds")
+    rows_per_warp = bm // epi_warps
+    setup = [
+        (
+            f"{staged_ptr} = cute.arch.alloc_smem({dtype}, "
+            f"cutlass.Int32({bm * (bn + pad)}), alignment=16)"
+        ),
+        (
+            f"{staged_tile} = cute.make_tensor({staged_ptr}, "
+            f"cute.make_layout(({bm}, {bn}), stride=({bn + pad}, 1)))"
+        ),
+        (
+            f"{staged_barrier} = cutlass.pipeline.NamedBarrier("
+            f"barrier_id=cutlass.Int32({barrier_id}), "
+            f"num_threads=cutlass.Int32({epi_warps * 32}))"
+        ),
+    ]
+    # The fragment's tile coordinates: the output partition's chain applied
+    # to the tile's identity tensor.
+    tile_setup = [
+        f"{coord} = {thr_mma}.partition_C(cute.make_identity_tensor(({bm}, {bn})))",
+        (
+            f"{coord_part} = {thr_copy_t2r}.partition_D(cute.flat_divide("
+            "cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
+            f"{coord}), {epi_tile}))"
+        ),
+        f"{coord_grouped} = cute.group_modes({coord_part}, 3, cute.rank({coord_part}))",
+        (
+            f"{bounds} = cute.local_tile(cute.make_identity_tensor("
+            f"({m_size}, {n_size})), ({bm}, {bn}), "
+            f"({tile_coord[0]}, {tile_coord[1]}))"
+        ),
+    ]
+    write = (
+        f"        {coord_subtile} = {coord_grouped}["
+        "(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
+        f"        for _staged_i in range(cute.size({registers}.shape)):\n"
+        f"            {staged_tile}[{coord_subtile}[_staged_i]] = "
+        f"{registers}[_staged_i]\n"
+    )
+    store = (
+        f"if {epi_active}:\n"
+        f"    {staged_barrier}.arrive_and_wait()\n"
+        f"    for _staged_r in range({rows_per_warp}):\n"
+        f"        _staged_row = {epi_tidx} // cutlass.Int32(32) * "
+        f"cutlass.Int32({rows_per_warp}) + cutlass.Int32(_staged_r)\n"
+        f"        for _staged_c in range({bn // 32}):\n"
+        f"            _staged_col = cutlass.Int32(_staged_c * 32) + "
+        f"{epi_tidx} % cutlass.Int32(32)\n"
+        f"            if cute.elem_less({bounds}[_staged_row, _staged_col], "
+        f"({m_size}, {n_size})):\n"
+        f"                {gmem_tile}[_staged_row, _staged_col] = "
+        f"{staged_tile}[_staged_row, _staged_col]\n"
+        # the next tile's fragments overwrite the SMEM tile
+        f"    {staged_barrier}.arrive_and_wait()\n"
+    )
+    return setup, tile_setup, write, store
 
 
 def _codegen_cute_store_tcgen05_tile(
@@ -6124,6 +6269,52 @@ def _codegen_cute_store_tcgen05_tile(
             and (tcgen05_value.bn * elem_bytes) % 16 == 0
         ):
             direct_store_align_bytes = 16
+    # A destination whose rows are not 16-byte multiples (attention scores
+    # stored in 1001-element rows, window attention's 49-element ones): each
+    # thread's T2R fragment is one row's columns, so a warp's store
+    # instruction writes 32 rows two bytes each, 32 sectors for 64 useful
+    # bytes. The staged store instead writes the tile's fragments into a
+    # padded SMEM tile, and the epilogue warps then store it row by row, each
+    # warp instruction 32 consecutive elements of one row
+    # (``_staged_simt_store_lines``), on interior and edge tiles alike. B200,
+    # 64 x 1000x1000x64 into 1001-element rows on the 64x128 tile: 197 ->
+    # 135 us at two AB stages, 96 us at one.
+    staged_store_pad = 16 // tensor.element_size()
+    staged_store_bytes = (
+        tcgen05_value.bm * (tcgen05_value.bn + staged_store_pad) * tensor.element_size()
+    )
+    output_strides = tuple(tensor.stride())
+    unaligned_rows = (
+        tensor.ndim in (2, 3)
+        and all(isinstance(value, int) for value in (*output_strides, *tensor.shape))
+        and output_strides[-1] == 1
+        and not tcgen05_value.output_column_major
+        and any(
+            (cast("int", stride) * tensor.element_size()) % 16
+            for stride in output_strides[:-1]
+        )
+    )
+    staged_plan = df.cute_state.matmul_plan
+    staged_store = (
+        (simt_mixed_store or simt_edge_only)
+        and not tcgen05_value.use_tma_store_epilogue
+        # a flat kernel's one tile per CTA (the setup sits in the per-tile
+        # body) and one store (each store site allocates its own tile)
+        and not tcgen05_value.use_role_local_epi
+        and not has_store_fanout
+        and staged_plan is not None
+        and unaligned_rows
+        and not segment_store
+        and not grouped_tail_store
+        and row_union is None
+        and not grouped_epilogue
+        and not tcgen05_lifecycle.is_two_cta
+        and (fragment_epilogue is None or not fragment_epilogue.changes_shape)
+        and tcgen05_value.bn % 32 == 0
+        and tcgen05_value.bm % tcgen05_value.epi_warp_count == 0
+        and staged_store_bytes <= _STAGED_SIMT_STORE_MAX_BYTES
+        and _staged_simt_store_fits(staged_plan, staged_store_bytes)
+    )
     if fragment_epilogue is not None and fragment_epilogue.changes_shape:
         simt_early_aux = simt_late_prelude = ""
         simt_acc_vec_rhs = ""
@@ -6381,7 +6572,33 @@ def _codegen_cute_store_tcgen05_tile(
                 f"cutlass.Int32({subtile_count}) + cutlass.Int32(_tcgen05_subtile)"
             )
     simt_store_edge_coord_preloaded = simt_edge_only and bool(aux_steps_in_chain)
-    if row_union is not None:
+    staged_store_setup: list[str] = []
+    staged_store_tile_setup: list[str] = []
+    staged_store_phase = ""
+    if staged_store:
+        (
+            staged_store_setup,
+            staged_store_tile_setup,
+            simt_store_copy_source,
+            staged_store_phase,
+        ) = _staged_simt_store_lines(
+            df,
+            tile=(tcgen05_value.bm, tcgen05_value.bn),
+            pad=staged_store_pad,
+            extents=(static_m_size, static_n_size),
+            tile_coord=(tile_coord_m, tile_coord_n),
+            dtype=target_dtype,
+            thr_mma=tcgen05_value.thr_mma,
+            thr_copy_t2r=thr_copy_t2r,
+            epi_tile=epi_tile,
+            epi_tidx=tcgen05_value.epi_tidx,
+            epi_active=tcgen05_lifecycle.epi_active,
+            epi_warps=tcgen05_value.epi_warp_count,
+            barrier_id=tcgen05_value.epilog_sync_barrier_id,
+            registers=ttr_rd,
+            gmem_tile=gmem_tile,
+        )
+    elif row_union is not None:
         simt_store_copy_source = _simt_edge_coord_subtile_source("        ")
         simt_store_copy_source += textwrap.indent(
             row_union.masked_copy(
@@ -6420,6 +6637,7 @@ def _codegen_cute_store_tcgen05_tile(
         )
     simt_store_body_core = [
         *simt_static_store_setup,
+        *staged_store_setup,
         *simt_tile_store_setup,
         (
             f"{tcgc} = cutlass.utils.gemm.sm100.transform_partitioned_tensor_layout("
@@ -6442,6 +6660,7 @@ def _codegen_cute_store_tcgen05_tile(
         f"{thr_copy_t2r} = {tiled_copy_t2r}.get_slice({tcgen05_value.epi_tidx})",
         f"{tcgc_epi} = cute.flat_divide({tcgc_planned}, {epi_tile})",
         f"{ttr_gc} = {thr_copy_t2r}.partition_D({tcgc_epi})",
+        *staged_store_tile_setup,
         (
             f"{ttr_tacc_stage} = {ttr_tacc_base}["
             f"(None, None, None, None, None, {tcgen05_acc_stage_index_expr})]"
@@ -6555,6 +6774,7 @@ def _codegen_cute_store_tcgen05_tile(
                 )
             )
             + f"{simt_store_copy_source}"
+            + staged_store_phase
             # Advance is a per-thread local state update, so it intentionally
             # stays outside elect_one; only the mbarrier release is elected.
             + (

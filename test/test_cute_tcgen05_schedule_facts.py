@@ -52,6 +52,8 @@ from helion._testing.cute_dense_tcgen05 import plain_mm_into
 from helion._testing.cute_dense_tcgen05 import promoted_bias_mm_into
 from helion._testing.cute_dense_tcgen05 import scale_bias_mm_into
 from helion._testing.cute_dense_tcgen05 import scaled_args
+from helion._testing.cute_dense_tcgen05 import scaled_bmm_args
+from helion._testing.cute_dense_tcgen05 import scaled_bmm_into
 from helion._testing.cute_dense_tcgen05 import scaled_mm
 from helion._testing.cute_dense_tcgen05 import vector_scaled_mm
 from helion._testing.cute_inductor_epilogues import INDUCTOR_EPILOGUES
@@ -1713,8 +1715,9 @@ def _scaled_bmm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         ((1024, 256, 64, 256), [1, 128, 64, 64], "flat", 2),
         # 64 rows by the widest dividing N tile; eight k-blocks: persistent
         ((384, 64, 512, 512), [1, 64, 256, 64], "persistent_blocked", 4),
-        # K below one 64-deep k-block, and not whole in them: 32-deep blocks
-        ((1024, 128, 128, 32), [1, 128, 128, 32], "flat", 2),
+        # K below one 64-deep k-block (one AB stage for its one k-block), and
+        # not whole in them: 32-deep blocks
+        ((1024, 128, 128, 32), [1, 128, 128, 32], "flat", 1),
         ((1024, 128, 128, 96), [1, 128, 128, 32], "flat", 2),
     ),
 )
@@ -1746,6 +1749,76 @@ def test_narrow_batched_default_takes_the_one_cta_tile(
     if pid_type == "persistent_blocked":
         assert config.config["tcgen05_batch_raster"] == "batch_slowest"
         assert config.config["l2_groupings"] == [1]
+
+
+# Rows of 201 bf16 (402 bytes) take no 16-byte store: the flat 64x128 tile
+# stores through the staged SMEM tile, at one AB stage over one k-block and
+# two over two; rows of 208 (416 bytes) keep the direct vector copy.
+@pytest.mark.parametrize(
+    ("k", "row", "ab_stages", "staged"),
+    ((64, 201, 1, True), (128, 201, 2, True), (64, 208, None, False)),
+)
+def test_unaligned_rows_store_through_the_staged_tile(
+    k: int, row: int, ab_stages: int | None, staged: bool
+) -> None:
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        args, _padded = scaled_bmm_args(32, 200, 200, k, row=row, device="cpu")
+        bound = scaled_bmm_into._bind_isolated(args)
+        config = bound.config_spec.default_config()
+        source = bound.to_code(config)
+        # the search keeps one AB stage only where it is all the K loop fills
+        sample = {**config.config, "tcgen05_ab_stages": 1}
+        bound.config_spec.normalize(sample, _fix_invalid=True)
+    assert ("tcgen05_staged_tile" in source) is staged
+    if staged:
+        assert config.block_sizes == [1, 64, 128, 64]
+        assert config.config["pid_type"] == "flat"
+        assert config.config["tcgen05_ab_stages"] == ab_stages
+        assert sample["tcgen05_ab_stages"] == ab_stages
+        # each warp stores its 16 rows, lane l column 32 * c + l
+        assert "_staged_col = cutlass.Int32(_staged_c * 32) + " in source
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _two_output_mm_into(
+    a: torch.Tensor, b: torch.Tensor, out: torch.Tensor, out2: torch.Tensor
+) -> None:
+    m, k = a.shape
+    n = b.shape[1]
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        out[rows, cols] = acc.to(torch.bfloat16)
+        out2[rows, cols] = (acc * 2).to(torch.bfloat16)
+
+
+def test_two_unaligned_outputs_keep_the_direct_store() -> None:
+    """Each store site would allocate its own staged tile beside the AB
+    ring: two outputs into 1001-element rows keep the direct copy (a 128x128
+    tile at five AB stages leaves no room for two 34 KiB tiles)."""
+    m, n, k = 1000, 1000, 512
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        bound = _two_output_mm_into._bind_isolated(
+            (
+                torch.empty((m, k), dtype=torch.bfloat16),
+                torch.empty((k, n), dtype=torch.bfloat16),
+                torch.empty((m, n + 1), dtype=torch.bfloat16)[:, :n],
+                torch.empty((m, n + 1), dtype=torch.bfloat16)[:, :n],
+            )
+        )
+        source = bound.to_code(
+            helion.Config(
+                **{
+                    **bound.config_spec.default_config().config,
+                    "block_sizes": [128, 128, 64],
+                    "pid_type": "flat",
+                    "tcgen05_ab_stages": 5,
+                }
+            )
+        )
+    assert "cute.gemm(" in source
+    assert "tcgen05_staged_tile" not in source
 
 
 # The direct entry over whole 256x256 tiles, and a promoted pair seed over
@@ -2452,6 +2525,30 @@ def test_split_k_default_counts_slices_on_the_tile_that_runs() -> None:
     # the registered K block comes first: K, M, N
     assert config.block_sizes == [128, 64, 64]
     assert config.config["tcgen05_split_k"] == 8
+
+
+def test_unaligned_output_small_grid_takes_the_one_cta_tile() -> None:
+    """TMA operands into 65-column rows (130 bytes, no TensorMap): the small
+    grid takes the split-K default's one-CTA tile, unsplit over its eight
+    k-blocks, its SIMT store taking the output."""
+    m, n, k = 96, 65, 512
+    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+        bound = bias_mm_into._bind_isolated(
+            (
+                torch.empty((m, k), dtype=torch.bfloat16),
+                torch.empty((n, k), dtype=torch.bfloat16).T,
+                torch.empty((n,), dtype=torch.bfloat16),
+                torch.empty((m, n), dtype=torch.bfloat16),
+            )
+        )
+        spec = bound.config_spec
+        config = spec.default_config()
+        source = bound.to_code(config)
+    assert not spec.cute_tcgen05_matmul_operands_tma_provable
+    assert spec.cute_tcgen05_matmul_inputs_tma_provable
+    assert config.block_sizes == [64, 64, 64]
+    assert config.config["tcgen05_split_k"] == 1
+    assert "cute.gemm(" in source
 
 
 # A batch of one: codegen splits no leading passthrough axis, so split-K is

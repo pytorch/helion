@@ -743,6 +743,9 @@ class CuteTcgen05Config:
         # epilogue warps copy with ``cp.async`` beside a TMA-legal B
         # (``host_function_cp_async_a_provable``).
         self.cp_async_a_provable: bool = False
+        # Every MMA's A and B pass the TensorMap proof, whatever its output
+        # (``host_function_matmul_operands_tma_provable(outputs=False)``).
+        self.matmul_inputs_tma_provable: bool = True
         # The staging pass left such an A in place for the producer
         # (``stage_aligned_operands._cp_async_lhs_names``) where it would
         # otherwise have padded it: only then does a config off the
@@ -10902,7 +10905,9 @@ class CuteTcgen05Config:
             self._set_aux_edge_cluster_m2_prefix(config)
             return
 
-        self._set_aux_edge_monolithic_prefix(config)
+        self._set_aux_edge_monolithic_prefix(
+            config, single_k_block=self._single_k_block(config)
+        )
         config["tcgen05_acc_stages"] = 2
         config["tcgen05_c_stages"] = 4
         # The tile order (``l2_groupings``, ``tcgen05_l2_swizzle_size``) is
@@ -11039,14 +11044,31 @@ class CuteTcgen05Config:
                 Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value
             )
 
+    def _single_k_block(self, config: dict[str, object]) -> bool:
+        """Whether ``config`` runs one k-block per flat CTA (its AB ring's
+        second stage would stay empty; a persistent CTA's holds the next
+        tile's k-block)."""
+        if config.get("pid_type", "flat") != "flat":
+            return False
+        view = self._matmul_config_view(config)
+        extents = self.matmul_compile_time_static_extents
+        if view is None or extents is None:
+            return False
+        blocks, _m_index, _n_index, k_index = view
+        bk, k = blocks[k_index], extents[2]
+        return isinstance(bk, int) and isinstance(k, int) and 0 < k <= bk
+
     @staticmethod
-    def _set_aux_edge_monolithic_prefix(config: dict[str, object]) -> None:
+    def _set_aux_edge_monolithic_prefix(
+        config: dict[str, object], *, single_k_block: bool = False
+    ) -> None:
         config[TCGEN05_STRATEGY_CONFIG_KEY] = (
             Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value
         )
         config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 0
         config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 0
-        if config.get("tcgen05_ab_stages") == 1:
+        # One AB stage only where the K loop has one k-block to stage.
+        if config.get("tcgen05_ab_stages") == 1 and not single_k_block:
             config["tcgen05_ab_stages"] = 2
         config.pop("epilogue_subtile", None)
 

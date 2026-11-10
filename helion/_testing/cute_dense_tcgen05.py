@@ -535,3 +535,36 @@ def bind_bmm(
     b = torch.empty((batch, n, k) if b_k_major else (batch, k, n), dtype=dtype)
     args = (a.transpose(1, 2) if a_m_major else a, b.mT if b_k_major else b)
     return helion.kernel(batched_gemm, backend="cute", static_shapes=True).bind(args)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def scaled_bmm_into(
+    a: torch.Tensor, b: torch.Tensor, mask: torch.Tensor, out: torch.Tensor
+) -> None:
+    """Attention scores ``bmm(a, b) * 0.125 + mask`` into ``out``, a view
+    whose rows may be padded past N (softmax's 1001-element rows)."""
+    batch, m, k = a.shape
+    n = b.shape[2]
+    for tile_b, tile_m, tile_n in hl.tile((batch, m, n)):
+        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.baddbmm(
+                acc, a[tile_b, tile_m, tile_k], b[tile_b, tile_k, tile_n]
+            )
+        out[tile_b, tile_m, tile_n] = (
+            acc * 0.125 + mask[tile_m, tile_n].to(torch.float32)
+        ).to(torch.bfloat16)
+
+
+def scaled_bmm_args(
+    batch: int, m: int, n: int, k: int, *, row: int, device: torch.device | str
+) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+    """``scaled_bmm_into``'s operands -- a bf16 ``[batch, m, k]`` A, a
+    K-major ``[batch, k, n]`` B, an ``[m, n]`` mask and an output whose rows
+    hold ``row`` elements -- and the padded ``[batch, m, row]`` buffer the
+    output views (``row > n`` pads its rows)."""
+    a = torch.randn(batch, m, k, device=device, dtype=torch.bfloat16)
+    b = torch.randn(batch, n, k, device=device, dtype=torch.bfloat16).mT
+    mask = torch.randn(m, n, device=device, dtype=torch.bfloat16)
+    padded = torch.empty(batch, m, row, device=device, dtype=torch.bfloat16)
+    return (a, b, mask, padded[..., :n]), padded

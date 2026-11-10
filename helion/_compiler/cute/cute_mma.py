@@ -1495,9 +1495,10 @@ def host_function_matmul_output_matches_extents(
 
 
 def host_function_matmul_operands_tma_provable(
-    env: CompileEnvironment, host_function: HostFunction
+    env: CompileEnvironment, host_function: HostFunction, *, outputs: bool = True
 ) -> bool:
-    """Return False when an MMA candidate operand or output fails the TMA proof.
+    """Return False when an MMA candidate operand or output fails the TMA proof
+    (``outputs=False``: an operand only).
 
     The tcgen05 flat-role / TVM-FFI direct-entry seed hard-requires the TMA
     A/B pipeline and the TMA store epilogue, which ``_emit_mma_pipeline`` only
@@ -1533,7 +1534,7 @@ def host_function_matmul_operands_tma_provable(
                 for operand in (candidate.operands.lhs, candidate.operands.rhs):
                     if not _tcgen05_tma_operand_is_aligned(env, operand):
                         return False
-                if not _tcgen05_mma_output_tma_store_provable(
+                if outputs and not _tcgen05_mma_output_tma_store_provable(
                     env, node, candidate, device_ir.graphs
                 ):
                     return False
