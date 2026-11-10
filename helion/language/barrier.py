@@ -21,6 +21,7 @@ BARRIER_PID_TYPE_REASON = (
 
 
 @_decorators.api(
+    cacheable=True,
     is_device_loop=False,
     is_device_only=False,
     cache_type=True,

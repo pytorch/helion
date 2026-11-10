@@ -788,7 +788,7 @@ def rewrite_implicit_random_ops(graph: torch.fx.Graph) -> None:
         graph.erase_node(node)
 
 
-@_decorators.api(tiles_as_sizes=True)
+@_decorators.api(cacheable=True, tiles_as_sizes=True)
 def rand(
     shape: list[object],
     seed: int | torch.Tensor,
@@ -895,7 +895,7 @@ def _(
     return philox_rand_ref(seed, offset).reshape(processed_shape).to(device=rng_device)
 
 
-@_decorators.api(tiles_as_sizes=False)
+@_decorators.api(cacheable=True, tiles_as_sizes=False)
 def rand4x(
     seed: int | torch.Tensor,
     offsets: torch.Tensor,
@@ -980,7 +980,7 @@ def _(
     )
 
 
-@_decorators.api(tiles_as_sizes=True)
+@_decorators.api(cacheable=True, tiles_as_sizes=True)
 def randint(
     shape: list[object],
     low: int,

@@ -50,37 +50,73 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 ```
 
 Entries live under `HELION_CACHE_DIR/generated_code` (or the default Helion
-cache directory). A binding entry records the selected config, its generated
-source and the specialization guards the frontend recorded, such as
-`hl.specialize()` values and tensor descriptor layout classes. A later process
-with the same kernel, supported Python dependencies, input signature, hardware
-(device name, compute capability and SM count), compilation settings and
-library versions evaluates those guards before compiling. Inputs they accept
-load the saved source without `KernelCompiler.compile` or source generation,
-so a `static_shapes=False` binding serves shapes the earlier process never
-saw, as one binding does with the cache disabled; `static_shapes=True` keys
-exact sizes and strides. A new guard value, such as another `hl.specialize()`
-value, compiles normally and saves another binding. Triton's binary cache
-remains independent; a source hit can still require Triton's first binary
-compilation.
+cache directory). A candidate key identifies the kernel source, argument
+structure, hardware (device name, compute capability and SM count), compilation
+settings, library versions and compiler operation implementations. Finding an
+entry under that key starts validation. The saved binding also contains a
+dependency certificate, the selected config, generated source and the
+specialization guards recorded during compilation, such as `hl.specialize()`
+values and tensor descriptor layout classes.
+
+A later process replays the certificate's global and module-attribute reads
+and evaluates the specialization guards before loading the binding. When both
+checks succeed, it can load the saved source without `KernelCompiler.compile`
+or source generation. With `static_shapes=False`, the guards can admit shapes
+the earlier process never saw. With `static_shapes=True`, the key includes
+exact sizes and strides. Changed dependencies or guard values cause ordinary
+compilation, which may produce a new eligible entry. Triton's binary cache is
+independent, so a source hit can still require Triton's first binary compilation.
 
 Direct calls (`my_kernel(x)`) use the loaded source through a lightweight
 runner that eager dispatch caches like an ordinary binding. `my_kernel.bind(x)`
 returns an ordinary binding and runs frontend compilation if the process only
 has a runner, as do requests the runner cannot serve, such as another config
-or frontend IR. Function dependencies are fingerprinted during disk lookup, not
-on each kernel launch.
+or frontend IR. Dependency validation governs persistent reuse. Once a binding
+is loaded, ordinary in-memory binding and prepared-call lifetimes apply.
 
-Dependency lookup follows static module attribute reads and fingerprints their
-current values, including reads in Python helpers and closures. Compiler
-intrinsics are admitted by object identity from an explicit set of tensor and
-language operations. Other Python functions are inspected recursively. An
-untracked dependency disables both binding and source reuse. This includes
-module objects passed as values, dynamic attribute lookup, bound built-in
-methods such as `dict.get`, state-reading C functions, and the opaque
-`hl.triton_kernel` and `hl.inline_triton` codegen entry points. These kernels
-continue through ordinary compilation. Adding a compiler intrinsic to the set
-requires accounting for every external value it can read during compilation.
+### Compiler admission and dependencies
+
+During ordinary compilation, Helion records the global values and ordinary
+module attributes its frontend actually reads. Saved certificates contain
+replayable paths and fingerprints of those values. Validation reads ordinary
+namespace dictionaries without executing attribute descriptors or lazy module
+lookup. Helion rechecks the captured values and compiler operation identity
+before publishing an entry, validates the certificate during disk lookup, and
+checks it again before a disk runner first loads executable source.
+
+Persistent reuse is restricted to operations with a compiler-owned dependency
+contract. A Helion language operation must explicitly declare that its
+compilation depends on its operands and versioned compiler context. Its
+registered type, fake and code-generation handlers contribute to the compiler
+ABI fingerprint. Tensor attributes and ordinary builtins also have bounded
+admission rules. Adding an operation requires accounting for the external
+state it can read during compilation. Replaced compiler handlers, helper
+bindings in their implementation modules, or tensor descriptors (including
+operator slots such as `__mul__`) disable reuse. Active external Torch function
+or dispatch modes also use ordinary compilation because they can run arbitrary
+Python callbacks.
+
+Functions defined inside a kernel are interpreted by Helion, so their bodies
+use the same tracked frontend operations. Calls to external Python helpers
+are opaque to this admission mechanism and use ordinary compilation. The
+exact `ConfigSpecFragment` classes shipped with Helion share a compiler-owned
+constructor contract, including `PowerOfTwoFragment`, `BooleanFragment` and
+`EnumFragment`. User-defined subclasses do not inherit cache admission.
+
+Modules are admitted as namespaces for attribute reads, and admitted callables
+as direct call targets. Passing or storing them as ordinary values, dynamic
+attribute resolution, unsupported object state and calls without a dependency
+contract disable both binding and source reuse. Examples include bound
+built-in methods such as `dict.get`, state-reading C functions, and
+`hl.triton_kernel` or `hl.inline_triton`, whose code-generation inputs include
+implicit dependencies. The kernel continues through ordinary compilation.
+
+This contract covers the compiler's admitted subset. It does not establish
+dependency completeness for unrestricted Python execution. The versioned
+compiler and PyTorch runtime must retain their native semantics; mutating
+private internal caches is not a supported invalidation interface. Cache eligibility
+and startup latency should be measured for the deployed kernels and exact
+Helion revision, including the effect of fallback paths.
 
 Bindings keep the ordinary frontend path, and no binding entry is saved, when:
 
@@ -92,7 +128,8 @@ Bindings keep the ordinary frontend path, and no binding entry is saved, when:
   with the binding. After any other guard, no binding of that signature is
   saved in the process, and runners it already loaded keep serving their
   inputs;
-- a Python dependency cannot be fingerprinted;
+- a dependency cannot be recorded or fingerprinted, or an operation lacks a
+  compiler-owned dependency contract;
 - `force_autotune`, printing code or repro callers, reference mode or
   TorchDynamo tracing is active;
 - native-source handoff (`autotune_handoff=True`) is requested, so cache hits

@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 __all__ = ["arange", "full", "zeros"]
 
 
+@_decorators.cacheable
 def zeros(
     shape: Sequence[object],
     dtype: torch.dtype = torch.float32,
@@ -65,7 +66,7 @@ def zeros(
     )
 
 
-@_decorators.api(tiles_as_sizes=True)
+@_decorators.api(cacheable=True, tiles_as_sizes=True)
 def full(
     shape: Sequence[object],
     value: float | torch.Tensor,
@@ -183,6 +184,7 @@ def _(
     )
 
 
+@_decorators.cacheable
 def arange(
     *args: int,
     dtype: torch.dtype | None = None,

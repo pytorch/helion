@@ -37,7 +37,7 @@ def _register_tile_symbol_origin(
     )
 
 
-@_decorators.api(tiles_as_sizes=True)
+@_decorators.api(cacheable=True, tiles_as_sizes=True)
 def tile_index(tile: TileInterface) -> torch.Tensor:
     """
     Retrieve the index (a 1D tensor containing offsets) of the given tile.
@@ -81,7 +81,7 @@ def _(tile: RefTile) -> torch.Tensor:
     )
 
 
-@_decorators.api(tiles_as_sizes=True)
+@_decorators.api(cacheable=True, tiles_as_sizes=True)
 def tile_begin(tile: TileInterface) -> int:
     """
     Retrieve the start offset of the given tile.
@@ -152,7 +152,7 @@ def _(tile: RefTile) -> int:
     return tile._slice.start
 
 
-@_decorators.api(tiles_as_sizes=True)
+@_decorators.api(cacheable=True, tiles_as_sizes=True)
 def tile_end(tile: TileInterface) -> int:
     """
     Retrieve the end offset of the given tile.
@@ -200,7 +200,7 @@ def _(tile: RefTile) -> int:
     return tile._slice.stop
 
 
-@_decorators.api(tiles_as_sizes=True)
+@_decorators.api(cacheable=True, tiles_as_sizes=True)
 def tile_block_size(tile: TileInterface) -> int:
     """
     Retrieve block size of a given tile, usually set the autotuner.
@@ -271,7 +271,7 @@ def _(tile: RefTile) -> int:
     return (end - begin + bs - 1) // bs
 
 
-@_decorators.api(tiles_as_sizes=True)
+@_decorators.api(cacheable=True, tiles_as_sizes=True)
 def tile_id(tile: TileInterface) -> int:
     """
     Retrieve tile_id of a given tile or list of tiles.

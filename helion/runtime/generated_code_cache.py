@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import builtins
 import dataclasses
-import dis
 import functools
 import hashlib
-import inspect
 import json
 import logging
 import math
@@ -29,12 +27,14 @@ from torch._dynamo.source import GetItemSource
 from torch._dynamo.source import LocalSource
 from torch._dynamo.source import TensorProperty
 from torch._dynamo.source import TensorPropertySource
+from torch.utils._python_dispatch import _get_current_dispatch_mode_stack
 
 from .._argument_device import _find_argument_device
 from .._compat import device_num_sm
 from .._compat import get_device_name
 from .._compat import supports_torch_compile_fusion
 from .._compat import target_device_capability
+from .._compiler.cache_dependencies import validate_dependencies
 from .._compiler.compile_environment import TensorDescriptorAlignmentGuard
 from .._utils import counters
 from .._utils import indexing_uses_tensor_descriptor
@@ -96,6 +96,145 @@ _DEFAULT_CACHE_LIMIT = 1 << 30
 # config), and binding_input_key rejects arguments it cannot fingerprint, so
 # dropping the address loses nothing.
 _OBJECT_ADDRESS = re.compile(r" at 0x[0-9a-fA-F]+")
+_HANDLER_SLOTS = (
+    "__wrapped__",
+    "_type_function",
+    "_fake_fn",
+    "_prepare_args",
+    "_post_create_proxy",
+    "_to_device_ir",
+    "_get_masked_value",
+)
+_FROZEN_COMPILER_HANDLERS: dict[int, dict[tuple[object, ...], object]] | None = None
+_FROZEN_COMPILER_NAMESPACES: dict[
+    str, tuple[types.ModuleType, dict[str, tuple[object, ...]]]
+] = {}
+
+
+def _intrinsic_handlers(value: object) -> dict[tuple[object, ...], object]:
+    if isinstance(value, type):
+        return {
+            (base, name): member
+            for base in value.__mro__
+            for name, member in vars(base).items()
+            if isinstance(member, types.FunctionType)
+        }
+    if isinstance(value, types.FunctionType):
+        result: dict[tuple[object, ...], object] = {
+            (name,): vars(value).get(name) for name in _HANDLER_SLOTS
+        }
+        codegen = vars(value).get("_codegen")
+        result[("_codegen",)] = codegen
+        if isinstance(codegen, dict):
+            result.update(
+                (("_codegen", name), handler) for name, handler in dict.items(codegen)
+            )
+        return result
+    return {}
+
+
+def freeze_compiler_cache_contract() -> None:
+    """Pin native registrations once language and backend imports have finished."""
+    global _FROZEN_COMPILER_HANDLERS
+    if _FROZEN_COMPILER_HANDLERS is None:
+        from .._compiler.backend_registry import repair_backend_codegen
+        from ..autotuner.config_spec import valid_keys
+
+        # Triton dispatch normally completes these registrations on its first
+        # compile. Capture that native state before user code can replace it.
+        repair_backend_codegen("triton")
+        # Materialize the native config-key table before pinning module bindings.
+        valid_keys()
+        _FROZEN_COMPILER_HANDLERS = {
+            identifier: _intrinsic_handlers(value)
+            for identifier, (value, _) in _cache_intrinsics().items()
+        }
+        _freeze_compiler_namespaces()
+
+
+def _namespace_binding(value: object) -> tuple[object, ...]:
+    if type(value) is types.FunctionType:
+        return value, value.__code__, value.__defaults__, value.__kwdefaults__
+    return (value,)
+
+
+def _freeze_compiler_namespaces() -> None:
+    """Pin the native module graph reached by operations and Triton handlers.
+
+    This guards the fixed compiler context, not arbitrary user Python. Imported
+    Helion helper functions and modules extend the graph. Module data objects
+    retain identity so native mutable caches can continue to populate in place.
+    """
+    pending: list[str] = []
+    for value, _ in _cache_intrinsics().values():
+        if isinstance(value, (types.FunctionType, type)):
+            pending.append(value.__module__)
+        for path, handler in _intrinsic_handlers(value).items():
+            if path[0] == "_codegen" and (
+                len(path) == 1 or path[1] not in ("common", "triton")
+            ):
+                continue
+            if type(handler) is types.FunctionType:
+                pending.append(handler.__module__)
+    while pending:
+        name = pending.pop()
+        if (
+            name in _FROZEN_COMPILER_NAMESPACES
+            or name != "helion"
+            and not name.startswith("helion.")
+        ):
+            continue
+        module = sys.modules.get(name)
+        if type(module) is not types.ModuleType:
+            continue
+        namespace = dict(vars(module))
+        _FROZEN_COMPILER_NAMESPACES[name] = (
+            module,
+            {key: _namespace_binding(value) for key, value in namespace.items()},
+        )
+        # The package exports are bindings, not a request to traverse unrelated
+        # runtime entry points such as KernelCompiler and its instrumentation.
+        if name == "helion":
+            continue
+        for value in namespace.values():
+            if type(value) is types.FunctionType:
+                pending.append(value.__module__)
+            elif type(value) is types.ModuleType:
+                pending.append(value.__name__)
+
+
+def _compiler_namespaces_valid() -> bool:
+    for name, (module, bindings) in _FROZEN_COMPILER_NAMESPACES.items():
+        if sys.modules.get(name) is not module:
+            return False
+        namespace = vars(module)
+        for key, expected in bindings.items():
+            current = _namespace_binding(namespace.get(key, _UNCACHEABLE))
+            if len(current) != len(expected) or any(
+                actual is not saved
+                for actual, saved in zip(current, expected, strict=True)
+            ):
+                return False
+    return True
+
+
+def _compiler_cache_contract_valid() -> bool:
+    from .._compiler.type_info import tensor_cache_contract_valid
+
+    if (
+        _FROZEN_COMPILER_HANDLERS is None
+        or not tensor_cache_contract_valid()
+        or not _compiler_namespaces_valid()
+    ):
+        return False
+    for identifier, (value, _) in _cache_intrinsics().items():
+        expected = _FROZEN_COMPILER_HANDLERS[identifier]
+        current = _intrinsic_handlers(value)
+        if current.keys() != expected.keys() or any(
+            current[path] is not handler for path, handler in expected.items()
+        ):
+            return False
+    return True
 
 
 @functools.cache
@@ -170,18 +309,29 @@ def _code_key(code: types.CodeType) -> tuple[object, ...]:
 def _cache_intrinsics() -> dict[int, tuple[object, str]]:
     """The compiler operations whose implementation is keyed by library hashes.
 
-    Python helpers are inspected recursively. Reflection, I/O, arbitrary C
-    callbacks and codegen APIs with implicit dependencies are outside this set.
+    The frontend records reads and rejects calls without a dependency contract.
+    Reflection, I/O and arbitrary user Python helpers cannot publish a certificate.
     Match objects, never a callable's claimed module/name or an API marker.
     """
-    from .. import language as hl
-    from ..autotuner.config_fragment import BooleanFragment
-    from ..autotuner.config_fragment import EnumFragment
+    from .._utils import cdiv
+    from .._utils import next_power_of_2
+    from ..autotuner import config_fragment
+    from ..autotuner.config_fragment import ConfigSpecFragment
 
     entries: list[tuple[object, str]] = [
-        (BooleanFragment, "helion.BooleanFragment"),
-        (EnumFragment, "helion.EnumFragment"),
+        (cdiv, "helion.cdiv"),
+        (next_power_of_2, "helion.next_power_of_2"),
     ]
+    # Exact compiler-owned fragment types share the constructor/parameter
+    # contract consumed by register_tunable. User subclasses are not admitted.
+    entries.extend(
+        (cls, f"{cls.__module__}.{cls.__qualname__}")
+        for cls in vars(config_fragment).values()
+        if isinstance(cls, type)
+        and cls.__module__ == config_fragment.__name__
+        and issubclass(cls, ConfigSpecFragment)
+        and cls is not ConfigSpecFragment
+    )
     for name in (
         "abs",
         "all",
@@ -214,49 +364,13 @@ def _cache_intrinsics() -> dict[int, tuple[object, str]]:
             for name, value in vars(module).items()
             if not name.startswith("_") and isinstance(value, types.BuiltinFunctionType)
         )
-    for name in (
-        "arange",
-        "associative_scan",
-        "atomic_add",
-        "atomic_and",
-        "atomic_cas",
-        "atomic_max",
-        "atomic_min",
-        "atomic_or",
-        "atomic_xchg",
-        "atomic_xor",
-        "barrier",
-        "constexpr",
-        "cumprod",
-        "cumsum",
-        "dot",
-        "dot_scaled",
-        "full",
-        "grid",
-        "jagged_tile",
-        "join",
-        "load",
-        "prefetch",
-        "rand",
-        "rand4x",
-        "randint",
-        "reduce",
-        "register_block_size",
-        "register_tunable",
-        "specialize",
-        "split",
-        "static_range",
-        "store",
-        "subscript",
-        "tile",
-        "tile_begin",
-        "tile_block_size",
-        "tile_end",
-        "tile_id",
-        "tile_index",
-        "zeros",
-    ):
-        entries.append((vars(hl)[name], f"helion.language.{name}"))
+    from ..language._decorators import _cacheable_apis
+
+    entries.extend(
+        (fn, f"{fn.__module__}.{fn.__qualname__}")
+        for fn in _cacheable_apis
+        if isinstance(fn, types.FunctionType)
+    )
     # Tensor operators with value semantics. Overloadability alone is not
     # enough: Torch also exposes state readers and metadata queries whose
     # results are not covered by the binding's saved tensor guards.
@@ -307,83 +421,93 @@ def _cache_intrinsics() -> dict[int, tuple[object, str]]:
     return {id(value): (value, name) for value, name in entries}
 
 
-def _dependency_loads(
-    code: types.CodeType,
-) -> list[tuple[str, str, tuple[str, ...]]] | None:
-    """Static global/closure reads, including reads in nested code objects."""
-    instructions = tuple(dis.get_instructions(code))
-    if any(
-        instruction.opname == "IMPORT_NAME"
-        or (
-            instruction.opname in {"LOAD_ATTR", "LOAD_METHOD"}
-            and cast("str", instruction.argval).startswith("__")
-        )
-        for instruction in instructions
-    ):
-        return None
-    loads = []
-    for i, instruction in enumerate(instructions):
-        if instruction.opname not in {"LOAD_GLOBAL", "LOAD_NAME", "LOAD_DEREF"}:
-            continue
-        attributes = []
-        for following in instructions[i + 1 :]:
-            if following.opname not in {"LOAD_ATTR", "LOAD_METHOD"}:
-                break
-            attributes.append(cast("str", following.argval))
-        loads.append(
-            (instruction.opname, cast("str", instruction.argval), tuple(attributes))
-        )
-    for constant in code.co_consts:
-        if isinstance(constant, types.CodeType):
-            nested = _dependency_loads(constant)
-            if nested is None:
-                return None
-            loads.extend(nested)
-    return loads
+def _intrinsic_implementation(value: object) -> str | None:
+    """Detect changes to compiler-owned implementations after import as well."""
 
-
-def _function_dependencies(fn: types.FunctionType) -> object:
-    try:
-        closure = inspect.getclosurevars(fn)
-    except ValueError:
-        return _UNCACHEABLE
-    loads = _dependency_loads(fn.__code__)
-    if loads is None:
-        return _UNCACHEABLE
-    dependencies: dict[tuple[str, ...], object] = {}
-    for operation, name, attributes in loads:
-        if operation == "LOAD_DEREF":
-            if name not in closure.nonlocals:
-                # A nested function's local captures are built by this code,
-                # whose global and external closure reads we also inspect.
-                continue
-            value = closure.nonlocals[name]
-        elif name in fn.__globals__:
-            value = fn.__globals__[name]
-        elif name in fn.__builtins__:
-            value = fn.__builtins__[name]
-        else:
-            return _UNCACHEABLE
-        path = [operation, name]
-        for attribute in attributes:
-            if type(value) is not types.ModuleType:
-                # Function/class attributes can expose an untracked namespace.
-                # Plain data containers are already fingerprinted in full.
-                if isinstance(value, (types.FunctionType, type)):
-                    return _UNCACHEABLE
-                break
-            namespace = vars(value)
-            if attribute not in namespace:
-                # Do not execute a module's lazy __getattr__ during lookup.
+    def function_key(fn: object) -> object:
+        if isinstance(fn, types.FunctionType):
+            defaults = _dependency_key((fn.__defaults__, fn.__kwdefaults__))
+            if defaults is _UNCACHEABLE:
                 return _UNCACHEABLE
-            value = namespace[attribute]
-            path.append(attribute)
-        # A module passed/returned/aliased as a value escapes static tracking.
-        # _dependency_key also rejects modules in arguments/defaults/containers.
-        if isinstance(value, types.ModuleType):
-            return _UNCACHEABLE
-        dependencies[tuple(path)] = value
-    return dict(sorted(dependencies.items()))
+            return _code_key(fn.__code__), defaults
+        if fn is None:
+            return None
+        if isinstance(fn, types.BuiltinFunctionType):
+            return fn.__module__, fn.__qualname__
+        return _UNCACHEABLE
+
+    if isinstance(value, type):
+        parts = [
+            (base.__qualname__, name, function_key(member))
+            for base in value.__mro__
+            for name, member in vars(base).items()
+            if isinstance(member, types.FunctionType)
+        ]
+    elif isinstance(value, types.FunctionType):
+        parts = [("function", function_key(value))]
+        for name in _HANDLER_SLOTS:
+            parts.append((name, function_key(vars(value).get(name))))
+        codegen = vars(value).get("_codegen", {})
+        if isinstance(codegen, dict):
+            parts.extend(
+                (name, function_key(fn)) for name, fn in sorted(codegen.items())
+            )
+    else:
+        parts = []
+    if any(part[-1] is _UNCACHEABLE for part in parts):
+        return None
+    return hashlib.sha256(repr(parts).encode()).hexdigest()
+
+
+def compiler_abi_key() -> str:
+    """Version the registered operation implementations, including transitive helpers."""
+    parts = sorted(
+        (name, _intrinsic_implementation(value) or "unsupported")
+        for value, name in _cache_intrinsics().values()
+    )
+    return hashlib.sha256(repr(parts).encode()).hexdigest()
+
+
+def validate_kernel_dependencies(snapshot: object, fn: types.FunctionType) -> bool:
+    return (
+        isinstance(snapshot, dict)
+        and not _has_active_torch_mode()
+        and _compiler_cache_contract_valid()
+        and snapshot.get("compiler_abi") == compiler_abi_key()
+        and validate_dependencies(snapshot, fn, dependency_fingerprint)
+    )
+
+
+def _has_active_torch_mode() -> bool:
+    """User dispatch modes can execute Python beyond the captured operations."""
+    return bool(
+        torch._C._is_torch_function_mode_enabled() or _get_current_dispatch_mode_stack()
+    )
+
+
+def _dependency_snapshot(bound: BoundKernel) -> dict[str, object] | None:
+    capture = bound.env.cache_dependencies
+    if capture is None:
+        return None
+    if not _compiler_cache_contract_valid():
+        capture.reject("the native compiler implementation context changed")
+        return None
+    compiler_abi = compiler_abi_key()
+    if compiler_abi != bound.env.cache_compiler_abi:
+        capture.reject("compiler operations changed during compilation")
+        return None
+    snapshot = capture.snapshot()
+    return None if snapshot is None else {**snapshot, "compiler_abi": compiler_abi}
+
+
+def dependency_fingerprint(value: object) -> str | None:
+    key = _dependency_key(value)
+    return None if key is _UNCACHEABLE else repr(key)
+
+
+def cacheable_call(value: object) -> bool:
+    entry = _cache_intrinsics().get(id(value))
+    return entry is not None and entry[0] is value
 
 
 def _dependency_key(value: object, seen: frozenset[int] = frozenset()) -> object:
@@ -413,32 +537,14 @@ def _dependency_key(value: object, seen: frozenset[int] = frozenset()) -> object
         return type(value).__name__, tuple(result)
     intrinsic = _cache_intrinsics().get(id(value))
     if intrinsic is not None and intrinsic[0] is value:
-        return "intrinsic", intrinsic[1]
+        implementation = _intrinsic_implementation(value)
+        return (
+            _UNCACHEABLE
+            if implementation is None
+            else ("intrinsic", intrinsic[1], implementation)
+        )
     if isinstance(value, (types.ModuleType, types.BuiltinFunctionType, type)):
         return _UNCACHEABLE
-    if isinstance(value, types.FunctionType):
-        # Function attributes can be reached through local aliases or callbacks,
-        # beyond a static global-load chain. Keep such callables on the frontend.
-        if value.__dict__:
-            return _UNCACHEABLE
-        if id(value) in seen:
-            return "recursive", value.__module__, value.__qualname__
-        seen = seen | {id(value)}
-        bindings = _function_dependencies(value)
-        if bindings is _UNCACHEABLE:
-            return _UNCACHEABLE
-        dependencies = _dependency_key(bindings, seen)
-        defaults = _dependency_key((value.__defaults__, value.__kwdefaults__), seen)
-        if dependencies is _UNCACHEABLE or defaults is _UNCACHEABLE:
-            return _UNCACHEABLE
-        return (
-            "function",
-            value.__module__,
-            value.__qualname__,
-            _code_key(value.__code__),
-            defaults,
-            dependencies,
-        )
     return _UNCACHEABLE
 
 
@@ -507,17 +613,15 @@ def binding_input_key(kernel: Kernel, args: Sequence[object]) -> str | None:
         kernel.settings.cache_level != "code"
         or kernel.settings.backend != "triton"
         or torch.compiler.is_compiling()
+        or _has_active_torch_mode()
     ):
         return None
-    dependencies = _dependency_key(kernel.fn)
+    dependencies = (
+        kernel.fn.__module__,
+        _code_key(kernel.fn.__code__),
+        kernel.kernel_source(),
+    )
     inputs = _argument_key(tuple(args))
-    if dependencies is _UNCACHEABLE:
-        _warn_cache_unavailable(
-            kernel,
-            "Python dependencies cannot be fingerprinted safely "
-            "(including function-local imports)",
-        )
-        return None
     if inputs is _UNCACHEABLE:
         _warn_cache_unavailable(kernel, "arguments contain an unsupported value")
         return None
@@ -533,6 +637,7 @@ def compiled_kernel_cache_key(
     """Identify a signature's saved bindings before the frontend runs."""
     if (
         kernel.settings.force_autotune
+        or _has_active_torch_mode()
         or kernel.settings.autotune_handoff
         or not supports_torch_compile_fusion()
         or kernel.settings.print_output_code
@@ -579,12 +684,13 @@ def compiled_kernel_cache_key(
     else:
         hardware = (str(device),)
     payload = (
-        "helion-bound-source-v5",
+        "helion-bound-source-v6",
         sys.version_info[:3],
         helion_key(),
         torch_key_wrapper(),
         triton_key_wrapper(),
         inputs,
+        compiler_abi_key(),
         _without_addresses(base_spec_key),
         hardware,
         settings,
@@ -756,7 +862,7 @@ def _schema_path(key: str) -> Path:
     return get_helion_cache_dir() / "generated_code" / "schemas" / f"{key}.json"
 
 
-def load_binding_schema(key: str) -> dict[str, list[object]] | None:
+def load_binding_schema(key: str) -> dict[str, object] | None:
     path = _schema_path(key)
     try:
         envelope = json.loads(path.read_text(encoding="utf-8"))
@@ -786,7 +892,7 @@ def load_binding_schema(key: str) -> dict[str, list[object]] | None:
     return schema
 
 
-def save_binding_schema(key: str, schema: dict[str, list[object]]) -> None:
+def save_binding_schema(key: str, schema: dict[str, object]) -> None:
     """Publish a checked guard schema shared by binding and source lookups."""
     _save_entry(
         _schema_path(key),
@@ -801,7 +907,7 @@ def save_binding_schema(key: str, schema: dict[str, list[object]]) -> None:
 
 def binding_variant_key(
     key: str,
-    schema: dict[str, list[object]],
+    schema: dict[str, object],
     extra_results: tuple[Hashable, ...],
     compiler_seed_results: tuple[Hashable, ...],
 ) -> str:
@@ -827,6 +933,8 @@ def save_binding(
     state = bound._generated_code
     if state is None or state.artifact_key is None or should_skip_cache():
         return
+    if (dependencies := _dependency_snapshot(bound)) is None:
+        return
     key = state.artifact_key
     signature, own_guards, guard_results, compiler_seed_results, _ = state.input_key
     guards = bound.kernel._published_guards.get(signature)
@@ -848,7 +956,8 @@ def save_binding(
     # Should bindings of one signature ever save different guard lists, the
     # earlier variants (keyed by the schema JSON) become unreachable until
     # eviction removes them.
-    schema: dict[str, list[object]] = {
+    schema: dict[str, object] = {
+        "dependencies": dependencies,
         "guards": list(guards),
         "compiler_seed_facts": [
             [extractor.fact, extractor.reserved_sms]
@@ -906,6 +1015,8 @@ def _generated_code_cache_key(
     ):
         _warn_cache_unavailable(bound.kernel, "tensor-descriptor indexing")
         return None
+    if (dependencies := _dependency_snapshot(bound)) is None:
+        return None
     fn = bound.kernel.fn
     host_function = bound.host_function
     assert host_function is not None
@@ -938,6 +1049,7 @@ def _generated_code_cache_key(
         bound.config_spec.num_sm,
         str(bound.env.index_dtype),
         frontend,
+        dependencies,
         bound.config_spec.cache_fingerprint_hash(),
         config.to_json(),
         settings,
@@ -971,6 +1083,13 @@ class GeneratedCodeState:
         input_key: str | None,
     ) -> GeneratedCodeState | None:
         """The state of a binding the frontend just compiled, or None if ineligible."""
+        capture = bound.env.cache_dependencies
+        if _dependency_snapshot(bound) is None:
+            if capture is not None:
+                _warn_cache_unavailable(
+                    bound.kernel, capture.reason or "untracked dependencies"
+                )
+            return None
         if input_key is None:
             input_key = binding_input_key(bound.kernel, args)
         if input_key is None:
@@ -1006,6 +1125,10 @@ class GeneratedCodeState:
 
     def load(self, bound: BoundKernel, config: Config) -> str | None:
         """Saved source for a normalized config that ``compile_and_save`` keyed."""
+        if _has_active_torch_mode():
+            if (capture := bound.env.cache_dependencies) is not None:
+                capture.reject("active Torch dispatch modes cannot be certified")
+            return None
         if (source_key := self.source_keys.get(config)) is None:
             return None
         source = load_generated_code(source_key)
@@ -1017,6 +1140,10 @@ class GeneratedCodeState:
         # and restore those facts before the generated module can run.
         lookup_key = _generated_code_cache_key(bound, config, include_guard_facts=False)
         if lookup_key is None or (schema := load_binding_schema(lookup_key)) is None:
+            return None
+        if not validate_kernel_dependencies(
+            schema.get("dependencies"), bound.kernel.fn
+        ):
             return None
         guards = cast("list[list[object]]", schema["guards"])
         if schema["compiler_seed_facts"] or any(guard[0] != "fact" for guard in guards):
@@ -1079,7 +1206,10 @@ class GeneratedCodeState:
             or (lookup_key, source_key) in self.persisted_source_links
         ):
             return
-        schema: dict[str, list[object]] = {
+        if (dependencies := _dependency_snapshot(bound)) is None:
+            return
+        schema: dict[str, object] = {
+            "dependencies": dependencies,
             "guards": list(fact_guards),
             "compiler_seed_facts": [],
         }
@@ -1100,6 +1230,9 @@ class GeneratedCodeState:
         Only a selected config is saved: autotuning candidates compiled with
         ``compile_config`` stay off disk.
         """
+        if _has_active_torch_mode():
+            if (capture := bound.env.cache_dependencies) is not None:
+                capture.reject("active Torch dispatch modes cannot be certified")
         normalized = bound._normalized_config_copy(config)
         source_key = None
         if not bound.settings.print_output_code:
@@ -1110,6 +1243,8 @@ class GeneratedCodeState:
                 self.source_keys[normalized] = source_key
         published = bound.kernel._specialize_extra.get(bound._base_spec_key)
         run = bound.compile_config(config)
+        if _dependency_snapshot(bound) is None:
+            return run
         if (
             source_key is not None
             and source_key not in self.persisted_source_keys

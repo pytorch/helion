@@ -17,11 +17,13 @@ import pytest
 import torch
 
 import helion
+from helion._compiler.cache_dependencies import DependencyCapture
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 import helion.language as hl
 from helion.runtime import generated_code_cache as cache
+from helion.runtime.kernel import BoundKernel
 from helion.runtime.ref_mode import RefMode
 
 
@@ -57,7 +59,11 @@ def _nested_import(x: torch.Tensor) -> torch.Tensor:
 
         return SCALE
 
-    return x * get_scale()
+    scale = get_scale()
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] * scale
+    return out
 
 
 def _divide_by_len(x: torch.Tensor, shape: hl.constexpr) -> torch.Tensor:
@@ -79,11 +85,20 @@ def _module_scale() -> float:
 
 
 def _read_module_scale(x: torch.Tensor) -> torch.Tensor:
-    return x * _module_scale()
+    scale = _module_scale()
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] * scale
+    return out
 
 
 def _named_triton_helper(x: torch.Tensor) -> torch.Tensor:
-    return hl.triton_kernel("combine", args=(x, x), output_like=x)
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = hl.triton_kernel(
+            "combine", args=(x[tile], x[tile]), output_like=x[tile]
+        )
+    return out
 
 
 _triton_call = hl.triton_kernel
@@ -91,11 +106,20 @@ _scale_of = {"x": 2.0}.get
 
 
 def _aliased_triton_helper(x: torch.Tensor) -> torch.Tensor:
-    return _triton_call("combine", args=(x, x), output_like=x)
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = _triton_call(
+            "combine", args=(x[tile], x[tile]), output_like=x[tile]
+        )
+    return out
 
 
 def _bound_builtin_scale(x: torch.Tensor) -> torch.Tensor:
-    return x * _scale_of("x")
+    scale = _scale_of("x")
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] * scale
+    return out
 
 
 class TestGeneratedCodeKeyRegressions(RefEagerTestDisabled, TestCase):
@@ -129,13 +153,31 @@ class TestGeneratedCodeKeyRegressions(RefEagerTestDisabled, TestCase):
     def _key(self, kernel):
         return cache.compiled_kernel_cache_key(kernel, (self.x,), ())
 
+    def _uncertified_binding(self, fn):
+        kernel = self._kernel(fn)
+        with kernel._bind_lock:
+            bound = kernel._bind((self.x,))
+        self.assertIsInstance(bound, BoundKernel)
+        self.assertIsNone(bound.env.cache_dependencies.snapshot())
+        self.assertIsNone(bound._generated_code)
+        return bound
+
+    def _reject_helper_without_executing(self, fn):
+        with patch.dict(_read_module_scale.__globals__, {"_module_scale": fn}):
+            capture = DependencyCapture(
+                _read_module_scale, cache.dependency_fingerprint
+            )
+            capture.record_global("_module_scale", fn)
+            self.assertIsNone(capture.snapshot())
+
     def test_local_and_nested_imports_do_not_execute_during_lookup(self) -> None:
         # Even an import in an untaken branch cannot be executed merely to
         # discover dependencies. Such functions use the normal frontend.
         self.assertNotIn("_helion_cache_test_constant", sys.modules)
         for fn in (_lazy_scale, _nested_import):
             with self.subTest(fn=fn.__name__):
-                self.assertIsNone(self._key(self._kernel(fn)))
+                self._key(self._kernel(fn))
+                self._reject_helper_without_executing(fn)
         self.assertNotIn("_helion_cache_test_constant", sys.modules)
         self.assertFalse((self.root / "generated_code").exists())
 
@@ -153,8 +195,9 @@ class TestGeneratedCodeKeyRegressions(RefEagerTestDisabled, TestCase):
         for fn in (_lazy_builtin_scale, aliased_import, nested_import):
             with self.subTest(fn=fn.__name__):
                 kernel = self._kernel(fn)
-                self.assertIsNone(cache.binding_input_key(kernel, (self.x,)))
-                self.assertIsNone(self._key(kernel))
+                cache.binding_input_key(kernel, (self.x,))
+                self._key(kernel)
+                self._reject_helper_without_executing(fn)
         self.assertNotIn("_helion_cache_test_constant", sys.modules)
         self.assertFalse((self.root / "generated_code").exists())
 
@@ -210,39 +253,40 @@ class TestGeneratedCodeKeyRegressions(RefEagerTestDisabled, TestCase):
             return module_alias._helion_cache_test_scale
 
         for fn in (_module_scale, closure_alias):
-            with self.subTest(fn=fn.__name__):
-                with patch.dict(_read_module_scale.__globals__, {"_module_scale": fn}):
-                    kernel = self._kernel(_read_module_scale)
+            with (
+                self.subTest(fn=fn.__name__),
+                patch.dict(_read_module_scale.__globals__, {"_module_scale": fn}),
+            ):
+                sources = []
+                for scale in (2.0, 2.0, 3.0):
                     with patch.object(
-                        torch, "_helion_cache_test_scale", 2.0, create=True
+                        torch, "_helion_cache_test_scale", scale, create=True
                     ):
-                        cold = self._key(kernel)
-                        self.assertEqual(self._key(kernel), cold)
-                    with patch.object(
-                        torch, "_helion_cache_test_scale", 3.0, create=True
-                    ):
-                        changed = self._key(kernel)
-                self.assertTrue(cold is None or changed is None or cold != changed)
+                        bound = self._uncertified_binding(_read_module_scale)
+                        sources.append(bound.to_code(helion.Config(block_sizes=[32])))
+                self.assertEqual(sources[0], sources[1])
+                self.assertNotEqual(sources[0], sources[2])
+        self.assertFalse((self.root / "generated_code").exists())
         self.assertIsNotNone(self._key(self._kernel()))
 
     def test_bound_builtin_receiver_change_invalidates_or_bypasses_cache(self) -> None:
         scales = {"x": 2.0}
+        sources = []
         with patch.dict(_bound_builtin_scale.__globals__, {"_scale_of": scales.get}):
-            kernel = self._kernel(_bound_builtin_scale)
-            cold = self._key(kernel)
-            self.assertEqual(self._key(kernel), cold)
-            scales["x"] = 3.0
-            changed = self._key(kernel)
-        self.assertTrue(cold is None or changed is None or cold != changed)
+            for value in (2.0, 2.0, 3.0):
+                scales["x"] = value
+                bound = self._uncertified_binding(_bound_builtin_scale)
+                sources.append(bound.to_code(helion.Config(block_sizes=[32])))
+        self.assertEqual(sources[0], sources[1])
+        self.assertNotEqual(sources[0], sources[2])
+        self.assertFalse((self.root / "generated_code").exists())
 
     def test_named_triton_helper_change_invalidates_or_bypasses_cache(self) -> None:
-        kernel = self._kernel(_named_triton_helper)
-        with patch.dict(_named_triton_helper.__globals__, {"combine": operator.add}):
-            cold = self._key(kernel)
-        with patch.dict(_named_triton_helper.__globals__, {"combine": operator.sub}):
-            changed = self._key(kernel)
-        self.assertTrue(cold is None or changed is None or cold != changed)
-        self.assertIsNone(self._key(self._kernel(_aliased_triton_helper)))
+        for combine in (operator.add, operator.sub):
+            with patch.dict(_named_triton_helper.__globals__, {"combine": combine}):
+                self._uncertified_binding(_named_triton_helper)
+        self._uncertified_binding(_aliased_triton_helper)
+        self.assertFalse((self.root / "generated_code").exists())
 
     def test_untracked_module_and_state_access_bypasses_cache(self) -> None:
         def consume_module(module: ModuleType) -> float:
@@ -277,8 +321,9 @@ class TestGeneratedCodeKeyRegressions(RefEagerTestDisabled, TestCase):
             with (
                 self.subTest(fn=fn.__name__),
                 patch.dict(_read_module_scale.__globals__, {"_module_scale": fn}),
+                patch.object(torch, "_helion_cache_test_scale", 2.0, create=True),
             ):
-                self.assertIsNone(self._key(self._kernel(_read_module_scale)))
+                self._uncertified_binding(_read_module_scale)
         self.assertEqual(self._key(ordinary), ordinary_key)
 
     def test_module_getattr_is_not_executed_during_lookup(self) -> None:
@@ -292,7 +337,8 @@ class TestGeneratedCodeKeyRegressions(RefEagerTestDisabled, TestCase):
         with patch.dict(
             _read_module_scale.__globals__, {"_module_scale": lazy_attribute}
         ):
-            self.assertIsNone(self._key(self._kernel(_read_module_scale)))
+            self._key(self._kernel(_read_module_scale))
+            self._reject_helper_without_executing(lazy_attribute)
         get_attribute.assert_not_called()
 
     @pytest.mark.slow

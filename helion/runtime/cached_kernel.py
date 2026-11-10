@@ -35,6 +35,7 @@ from .generated_code_cache import binding_variant_key
 from .generated_code_cache import compiled_kernel_cache_key
 from .generated_code_cache import load_binding_schema
 from .generated_code_cache import load_compiled_kernel
+from .generated_code_cache import validate_kernel_dependencies
 from .kernel import BoundKernel
 from .kernel import PreparedMetadataSpecializationExtractor
 from .kernel import _CompilerSeedSpecializationExtractor
@@ -237,7 +238,9 @@ def load_cached_kernel(
 ) -> BoundKernel[_R] | None:
     """Return a runner when a saved binding's guards accept these inputs."""
     schema = load_binding_schema(artifact_key)
-    if schema is None:
+    if schema is None or not validate_kernel_dependencies(
+        schema.get("dependencies"), kernel.fn
+    ):
         return None
     guards = tuple(cast("list[list[object]]", schema["guards"]))
     published = kernel._published_guards.get(signature)
@@ -302,6 +305,7 @@ def load_cached_kernel(
         extractors,
         compiler_seed_extractors,
         compiler_seed_results,
+        schema["dependencies"],
     )
     # The runner forwards frontend APIs to an ordinary binding on demand.
     return cast("BoundKernel[_R]", runner)
@@ -352,6 +356,7 @@ class _CachedBoundKernel(Generic[_R]):
         extractors: tuple[Callable[[Sequence[object]], Hashable], ...],
         compiler_seed_extractors: tuple[_CompilerSeedSpecializationExtractor, ...],
         compiler_seed_results: tuple[Hashable, ...],
+        dependencies: object,
     ) -> None:
         self.kernel = kernel
         self._base_spec_key = signature
@@ -364,6 +369,7 @@ class _CachedBoundKernel(Generic[_R]):
         self._compiler_seed_specialization_extractors = compiler_seed_extractors
         self._compiler_seed_specialization_results = compiler_seed_results
         self._artifact = artifact
+        self._dependencies = dependencies
         self._binding_args = tree_map_only(
             torch.Tensor, _CachedTensorArgument.capture, args
         )
@@ -633,7 +639,10 @@ class _CachedBoundKernel(Generic[_R]):
         if self._delegate is not None:
             return self._delegate.compile_config(config, allow_print=allow_print)
         requested = self._requested_config(config)
-        if requested not in self._artifact[:2]:
+        if requested not in self._artifact[:2] or (
+            self._compiled_run is None
+            and not validate_kernel_dependencies(self._dependencies, self.kernel.fn)
+        ):
             return self._materialize().compile_config(
                 requested, allow_print=allow_print
             )

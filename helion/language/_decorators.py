@@ -39,6 +39,10 @@ if TYPE_CHECKING:
 
 _CodegenT = TypeVar("_CodegenT")
 _CODEGEN_REPAIR_STATE = threading.local()
+# Operations opting into persistent reuse promise that compilation depends on
+# their explicit operands and the versioned compiler context, with no opaque
+# Python execution or implicit source-module lookup.
+_cacheable_apis: set[object] = set()
 
 
 def _codegen_repair_in_progress() -> bool:
@@ -212,8 +216,19 @@ def no_op_prepare_args(*args: object) -> tuple[object, ...]:
     return args
 
 
+def cacheable(fn: _C) -> _C:
+    """Register a compiler-owned helper with explicit-operand dependencies.
+
+    Opaque Python callbacks must not opt in. Its implementation is part of the
+    compiler ABI and its current code is included in dependency certificates.
+    """
+    _cacheable_apis.add(fn)
+    return fn
+
+
 def api(
     *,
+    cacheable: bool = False,
     is_device_loop: bool = False,
     is_device_only: bool = True,
     tiles_as_sizes: bool = False,
@@ -273,6 +288,8 @@ def api(
             return out
 
         api: APIFunc = cast("APIFunc", wrapper)
+        if cacheable:
+            _cacheable_apis.add(wrapper)
         api._helion_api = True
         api._is_device_loop = is_device_loop
         api._is_device_only = is_device_only

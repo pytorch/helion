@@ -28,7 +28,7 @@ log = logging.getLogger(__name__)
 
 
 @has_side_effect
-@_decorators.api(tiles_as_sizes=True, allow_host_tensor=True)
+@_decorators.api(cacheable=True, tiles_as_sizes=True, allow_host_tensor=True)
 def store(
     tensor: torch.Tensor | StackTensor,
     index: list[object],
@@ -221,7 +221,7 @@ def _(
     )
 
 
-@_decorators.api(tiles_as_sizes=True, allow_host_tensor=True)
+@_decorators.api(cacheable=True, tiles_as_sizes=True, allow_host_tensor=True)
 def load(
     tensor: torch.Tensor | StackTensor,
     index: list[object],
@@ -428,7 +428,7 @@ def _(
 
 
 @has_side_effect
-@_decorators.api(tiles_as_sizes=True, allow_host_tensor=True)
+@_decorators.api(cacheable=True, tiles_as_sizes=True, allow_host_tensor=True)
 def prefetch(
     tensor: torch.Tensor,
     index: list[object],

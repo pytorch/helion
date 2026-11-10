@@ -56,6 +56,7 @@ from .._compiler.autotuner_heuristics import compiler_seed_configs
 from .._compiler.autotuner_heuristics import compiler_seed_specialization_facts
 from .._compiler.autotuner_heuristics import register_compiler_coverage_groups
 from .._compiler.backend_registry import get_backend
+from .._compiler.cache_dependencies import DependencyCapture
 from .._compiler.compile_environment import CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import _concrete_tensor_satisfies_alignment_guard
@@ -87,8 +88,11 @@ from .cute.structural_config import DEFAULT_STRUCTURAL_POLICY
 from .cute.structural_config import CuteStructuralConfig
 from .cute.structural_config import select_structural_policy
 from .generated_code_cache import GeneratedCodeState
+from .generated_code_cache import _has_active_torch_mode
 from .generated_code_cache import binding_input_key
 from .generated_code_cache import compiled_kernel_cache_key
+from .generated_code_cache import compiler_abi_key
+from .generated_code_cache import dependency_fingerprint
 from .generated_code_cache import serialized_fact
 from .ref_mode import RefModeContext
 from .ref_mode import is_ref_mode_enabled
@@ -3154,6 +3158,18 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             index_dtype=_resolve_index_dtype(self.kernel.settings, args),
             is_distributed=is_distributed,
         )
+        if (
+            kernel.settings.cache_level == "code"
+            and kernel.settings.backend == "triton"
+        ):
+            self._env.cache_compiler_abi = compiler_abi_key()
+            self._env.cache_dependencies = DependencyCapture(
+                kernel.fn, dependency_fingerprint
+            )
+            if _has_active_torch_mode():
+                self._env.cache_dependencies.reject(
+                    "active Torch dispatch modes cannot be certified"
+                )
         # The structural policy the traced IR will follow (None for backends
         # whose config schema does not depend on Settings).
         policy_type = self._env.backend.structural_policy_type()

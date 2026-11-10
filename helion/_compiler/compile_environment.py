@@ -376,6 +376,7 @@ if TYPE_CHECKING:
     from ..runtime.settings import Settings
     from .autotuner_heuristics.registry import CompilerHeuristicSpecializationFact
     from .backend import Backend
+    from .cache_dependencies import DependencyCapture
     from .pallas.compact_worklist import CompactWorklistPlan
     from .pallas.compact_worklist import ResidentCacheDecision
     from .pallas.compact_worklist import ResidentPrepHoist
@@ -482,6 +483,8 @@ class CompileEnvironment:
         # pyrefly: ignore [read-only]
         self.device = device
         self.settings = settings
+        self.cache_dependencies: DependencyCapture | None = None
+        self.cache_compiler_abi: str | None = None
         self.index_dtype: torch.dtype = (
             index_dtype or settings.index_dtype or torch.int32
         )

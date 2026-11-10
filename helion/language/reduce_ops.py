@@ -24,7 +24,7 @@ __all__ = ["reduce"]
 
 
 @overload
-@_decorators.api(is_device_only=True)
+@_decorators.api(cacheable=True, is_device_only=True)
 def reduce(
     combine_fn: CombineFunction,
     input_tensor: torch.Tensor,
@@ -35,7 +35,7 @@ def reduce(
 
 
 @overload
-@_decorators.api(is_device_only=True)
+@_decorators.api(cacheable=True, is_device_only=True)
 def reduce(
     combine_fn: CombineFunction,
     input_tensor: tuple[torch.Tensor, ...],
@@ -45,7 +45,7 @@ def reduce(
 ) -> tuple[torch.Tensor, ...]: ...
 
 
-@_decorators.api(is_device_only=True)
+@_decorators.api(cacheable=True, is_device_only=True)
 def reduce(
     combine_fn: CombineFunction,
     input_tensor: torch.Tensor | tuple[torch.Tensor, ...],

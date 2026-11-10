@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -12,8 +13,15 @@ import pytest
 import torch
 
 import helion
+from helion._compiler.cache_dependencies import DependencyCapture
+from helion._compiler.cache_dependencies import validate_dependencies
 from helion._testing import TestCase
+import helion.language as hl
 from helion.runtime import generated_code_cache as cache
+from helion.runtime.cached_kernel import _CachedBoundKernel
+from helion.runtime.kernel import BoundKernel
+from helion.runtime.kernel import KernelCompiler
+from helion.runtime.kernel import PyCodeCache
 from helion.runtime.ref_mode import RefMode
 
 if TYPE_CHECKING:
@@ -36,7 +44,11 @@ def _nested_global(x: torch.Tensor) -> torch.Tensor:
     def shift() -> int:
         return _NESTED_SHIFT
 
-    return x + shift()
+    value = shift()
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] + value
+    return out
 
 
 def _nested_values(x: torch.Tensor) -> torch.Tensor:
@@ -71,6 +83,25 @@ def _nested_missing(x: torch.Tensor) -> torch.Tensor:
     return x + shift()
 
 
+def _direct_values(x: torch.Tensor) -> torch.Tensor:
+    value = _NESTED_VALUES["values"][0][1]["shift"]
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] + value
+    return out
+
+
+_DEPENDENCY_HELPER = int
+
+
+def _dependency_call_kernel(x: torch.Tensor) -> torch.Tensor:
+    value = _DEPENDENCY_HELPER()
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] + value
+    return out
+
+
 class TestGeneratedCodeDependencies(TestCase):
     def setUp(self) -> None:
         super().setUp()
@@ -94,48 +125,110 @@ class TestGeneratedCodeDependencies(TestCase):
         )
         self.cache_root = Path(root)
         self.x = torch.ones(16)
+        self.sources = []
+        self._test_stack.enter_context(
+            patch.object(PyCodeCache, "load", side_effect=self._load)
+        )
+
+    def _load(self, source, *, extra=""):
+        self.sources.append(source)
+        path = self.cache_root / f"module_{len(self.sources)}.py"
+        path.write_text(source)
+        return SimpleNamespace(
+            __file__=str(path),
+            _nested_global=lambda x: None,
+            _direct_values=lambda x: None,
+            _dependency_call_kernel=lambda x: None,
+        )
+
+    def _compile(self, fn):
+        config = helion.Config(block_sizes=[32])
+        kernel = helion.kernel(
+            backend="triton", cache_level="code", config=config, autotune_effort="none"
+        )(fn)
+        with kernel._bind_lock:
+            bound = kernel._bind((self.x,))
+        bound.set_config(config)
+        return bound
 
     def _key(self, kernel: Kernel) -> str | None:
         return cache.compiled_kernel_cache_key(kernel, (self.x,), ())
 
     def test_nested_global_change_invalidates_saved_binding(self) -> None:
-        kernel = helion.kernel(
-            backend="triton",
-            ref_mode=RefMode.OFF,
-            cache_level="code",
-            autotune_effort="none",
-        )(_nested_global)
-        key = self._key(kernel)
-        self.assertIsNotNone(key)
-        assert key is not None
-        config = helion.Config(block_sizes=[32])
-        source = "def nested_global():\n    return 1\n"
-        source_key = "a" * 64
-        cache.save_generated_code(source_key, source)
-        cache.save_compiled_kernel(key, config, config, source_key)
-        self.assertEqual(cache.load_compiled_kernel(key), (config, config, source))
+        bound = self._compile(_nested_global)
+        snapshot = bound.env.cache_dependencies.snapshot()
+        self.assertIsNotNone(snapshot)
+        with patch.object(
+            KernelCompiler,
+            "compile",
+            side_effect=AssertionError("unchanged dependency recompiled"),
+        ):
+            warm = self._compile(_nested_global)
+        self.assertIsInstance(warm, _CachedBoundKernel)
         with patch.dict(_nested_global.__globals__, {"_NESTED_SHIFT": 2}):
-            changed = self._key(kernel)
-            self.assertIsNotNone(changed)
-            self.assertNotEqual(changed, key)
-            assert changed is not None
-            self.assertIsNone(cache.load_compiled_kernel(changed))
-        self.assertEqual(self._key(kernel), key)
+            self.assertFalse(
+                validate_dependencies(
+                    snapshot, _nested_global, cache.dependency_fingerprint
+                )
+            )
+            with patch.object(
+                KernelCompiler,
+                "compile",
+                autospec=True,
+                side_effect=KernelCompiler.compile,
+            ) as compile_fn:
+                changed = self._compile(_nested_global)
+            self.assertIsInstance(changed, BoundKernel)
+            self.assertGreater(compile_fn.call_count, 0)
+        self.assertTrue(
+            validate_dependencies(
+                snapshot, _nested_global, cache.dependency_fingerprint
+            )
+        )
+        self.assertEqual(self.sources[0], self.sources[1])
 
     def test_recursive_supported_values_preserve_binding_identity(self) -> None:
-        kernel = helion.kernel(
-            backend="triton",
-            ref_mode=RefMode.OFF,
-            cache_level="code",
-            autotune_effort="none",
-        )(_nested_values)
-        key = self._key(kernel)
-        self.assertIsNotNone(key)
+        bound = self._compile(_direct_values)
+        snapshot = bound.env.cache_dependencies.snapshot()
+        self.assertIsNotNone(snapshot)
         equivalent = {"values": [(1, {"shift": 2})]}
-        with patch.dict(_nested_values.__globals__, {"_NESTED_VALUES": equivalent}):
-            self.assertEqual(self._key(kernel), key)
+        with patch.dict(_direct_values.__globals__, {"_NESTED_VALUES": equivalent}):
+            self.assertTrue(
+                validate_dependencies(
+                    snapshot, _direct_values, cache.dependency_fingerprint
+                )
+            )
+            with patch.object(
+                KernelCompiler,
+                "compile",
+                side_effect=AssertionError("unchanged dependency recompiled"),
+            ):
+                warm = self._compile(_direct_values)
+            self.assertIsInstance(warm, _CachedBoundKernel)
             equivalent["values"][0][1]["shift"] = 4
-            self.assertNotEqual(self._key(kernel), key)
+            self.assertFalse(
+                validate_dependencies(
+                    snapshot, _direct_values, cache.dependency_fingerprint
+                )
+            )
+            changed = self._compile(_direct_values)
+            self.assertIsInstance(changed, BoundKernel)
+        self.assertEqual(self.sources[0], self.sources[1])
+        self.assertTrue(
+            validate_dependencies(
+                snapshot, _direct_values, cache.dependency_fingerprint
+            )
+        )
+        # Nested user execution remains unsupported even when it reads the
+        # same containers as the admitted direct compiler expression.
+        with patch.dict(
+            _dependency_call_kernel.__globals__, {"_DEPENDENCY_HELPER": _nested_values}
+        ):
+            capture = DependencyCapture(
+                _dependency_call_kernel, cache.dependency_fingerprint
+            )
+            capture.record_global("_DEPENDENCY_HELPER", _nested_values)
+            self.assertIsNone(capture.snapshot())
 
     def test_global_and_nonlocal_with_the_same_name_are_both_keyed(self) -> None:
         scale = 2
@@ -147,13 +240,18 @@ class TestGeneratedCodeDependencies(TestCase):
 
             return scale + read_global()
 
-        with patch.dict(helper.__globals__, {"scale": 3}):
-            original = cache._dependency_key(helper)
-            self.assertIsNot(original, cache._UNCACHEABLE)
-            self.assertEqual(helper(), 5)
-        with patch.dict(helper.__globals__, {"scale": 4}):
-            self.assertEqual(helper(), 6)
-            self.assertNotEqual(cache._dependency_key(helper), original)
+        with patch.dict(
+            _dependency_call_kernel.__globals__, {"_DEPENDENCY_HELPER": helper}
+        ):
+            for value in (3, 4):
+                with patch.dict(helper.__globals__, {"scale": value}):
+                    self.assertEqual(helper(), 2 + value)
+                    bound = self._compile(_dependency_call_kernel)
+                    self.assertIsInstance(bound, BoundKernel)
+                    self.assertIsNone(bound.env.cache_dependencies.snapshot())
+                    self.assertIsNone(bound._generated_code)
+        self.assertNotEqual(self.sources[0], self.sources[1])
+        self.assertFalse((self.cache_root / "generated_code").exists())
 
     def test_user_enum_with_mutable_attributes_bypasses_cache(self) -> None:
         class Scale(enum.Enum):
@@ -191,10 +289,16 @@ hl.tile = replacement
 def helper():
     return hl.tile()
 
-first = cache._dependency_key(helper)
+from helion._compiler.cache_dependencies import DependencyCapture
+capture = DependencyCapture(helper, cache.dependency_fingerprint)
+capture.record_global("hl", hl)
+capture.record_attribute(hl, "tile", hl.tile)
+assert capture.snapshot() is None
+assert not cache.cacheable_call(replacement)
+first = cache._dependency_key(replacement)
 assert helper() == 2
 shift = 3
-second = cache._dependency_key(helper)
+second = cache._dependency_key(replacement)
 assert helper() == 3
 assert first is cache._UNCACHEABLE or second is cache._UNCACHEABLE or first != second
 """
@@ -207,35 +311,34 @@ assert first is cache._UNCACHEABLE or second is cache._UNCACHEABLE or first != s
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_unsupported_dependencies_and_settings_skip_binding_cache(self) -> None:
-        opaque = helion.kernel(
-            backend="triton",
-            ref_mode=RefMode.OFF,
-            cache_level="code",
-            autotune_effort="none",
-        )(_nested_opaque)
-        self.assertIsNone(self._key(opaque))
-        dynamic = helion.kernel(
-            backend="triton",
-            ref_mode=RefMode.OFF,
-            cache_level="code",
-            autotune_effort="none",
-        )(_nested_dynamic)
-        self.assertIsNone(self._key(dynamic))
-        missing = helion.kernel(
-            backend="triton",
-            ref_mode=RefMode.OFF,
-            cache_level="code",
-            autotune_effort="none",
-        )(_nested_missing)
+        for name, value in (
+            ("_OPAQUE", _OPAQUE),
+            ("_DEPENDENCY_HELPER", _nested_dynamic),
+        ):
+            with patch.dict(_dependency_call_kernel.__globals__, {name: value}):
+                capture = DependencyCapture(
+                    _dependency_call_kernel, cache.dependency_fingerprint
+                )
+                capture.record_global(name, value)
+                self.assertIsNone(capture.snapshot())
+                self.assertFalse(
+                    validate_dependencies(
+                        capture.snapshot(),
+                        _dependency_call_kernel,
+                        cache.dependency_fingerprint,
+                    )
+                )
         with patch.dict(_nested_missing.__globals__):
             _nested_missing.__globals__.pop("_MISSING")
-            self.assertIsNone(self._key(missing))
+            capture = DependencyCapture(_nested_missing, cache.dependency_fingerprint)
+            capture.record_global("_MISSING", 1)
+            self.assertIsNone(capture.snapshot())
         supported = helion.kernel(
             backend="triton",
             ref_mode=RefMode.OFF,
             cache_level="code",
             autotune_effort="none",
-        )(_nested_global)
+        )(_direct_values)
         with patch.object(supported.settings, "fast_math", _OPAQUE):
             self.assertIsNone(self._key(supported))
         self.assertFalse((self.cache_root / "generated_code").exists())

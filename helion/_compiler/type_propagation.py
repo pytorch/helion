@@ -38,6 +38,7 @@ from .type_info import NestedFunctionType
 from .type_info import NoType
 from .type_info import NumericType
 from .type_info import PdlResultType
+from .type_info import PythonModuleType
 from .type_info import SequenceType
 from .type_info import SliceType
 from .type_info import StackTensorType
@@ -93,10 +94,16 @@ class GlobalScope(Scope):
         except KeyError:
             if hasattr(builtins, name):
                 value = getattr(builtins, name)
+                if (
+                    capture := CompileEnvironment.current().cache_dependencies
+                ) is not None:
+                    capture.record_global(name, value)
                 origin = BuiltinOrigin(name=name, function=self.function)
             else:
                 raise exc.UndefinedVariable(name) from None
         else:
+            if (capture := CompileEnvironment.current().cache_dependencies) is not None:
+                capture.record_global(name, value)
             if value is language_module:
                 origin = GlobalOrigin(name="hl", function=self.function)
                 return TypeInfo.from_example(value, origin)
@@ -257,6 +264,24 @@ class TypePropagation(ast.NodeVisitor):
                 assert isinstance(type_info, TypeInfo), (
                     f"expected TypeInfo, got {type_info!r} from {visitor!r}"
                 )
+                capture = CompileEnvironment.current().cache_dependencies
+                if capture is not None and isinstance(
+                    type_info, (PythonModuleType, CallableType)
+                ):
+                    stack = ExtendedAST.current()
+                    parent = stack[-2] if len(stack) > 1 else None
+                    namespace_read = (
+                        isinstance(parent, ast.Attribute) and parent.value is node
+                    )
+                    direct_call = isinstance(parent, ast.Call) and parent.func is node
+                    if isinstance(type_info, PythonModuleType):
+                        permitted = namespace_read
+                    else:
+                        permitted = direct_call
+                    if not permitted:
+                        capture.reject(
+                            "a namespace or callable escaped its compiler operation"
+                        )
                 return node.update_type_info(type_info)
             except exc.Base:
                 raise
@@ -336,6 +361,16 @@ class TypePropagation(ast.NodeVisitor):
         # Handle `tensor is None` and `tensor is not None` checks
         # When comparing a TensorType with LiteralType(None), we can determine the result
         if isinstance(op, (ast.Is, ast.IsNot)):
+            if (capture := CompileEnvironment.current().cache_dependencies) is not None:
+                if not (
+                    isinstance(left, LiteralType)
+                    and left.value is None
+                    or isinstance(right, LiteralType)
+                    and right.value is None
+                ):
+                    capture.reject(
+                        "identity comparison requires an unrecorded alias relation"
+                    )
             left_is_none = isinstance(left, LiteralType) and left.value is None
             right_is_none = isinstance(right, LiteralType) and right.value is None
             left_is_tensor = isinstance(left, TensorType)

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-import inspect
 import json
 import operator
 import os
@@ -220,26 +219,19 @@ class TestGeneratedCodeCache(_GeneratedCodeCacheTestCase):
         x = torch.ones(16)
         config = helion.Config(block_sizes=[32])
         sources: list[str] = []
-        getclosurevars = inspect.getclosurevars
-
-        def reverse_dependencies(fn):
-            closure = getclosurevars(fn)
-            return closure._replace(
-                globals=dict(reversed(closure.globals.items())),
-                nonlocals=dict(reversed(closure.nonlocals.items())),
-            )
-
+        first = _bound(x)
+        capture = first.env.cache_dependencies
+        self.assertIsNotNone(capture)
+        assert capture is not None
+        snapshot = capture.snapshot()
+        capture._guards = dict(reversed(capture._guards.items()))
+        self.assertEqual(capture.snapshot(), snapshot)
         with patch.object(
             PyCodeCache, "load", side_effect=_source_loader(self.cache_root, sources)
         ):
-            _bound(x).set_config(config)
-            with (
-                patch.object(cache.inspect, "getclosurevars", reverse_dependencies),
-                patch.object(
-                    KernelCompiler,
-                    "compile",
-                    side_effect=AssertionError("frontend ran"),
-                ),
+            first.set_config(config)
+            with patch.object(
+                KernelCompiler, "compile", side_effect=AssertionError("frontend ran")
             ):
                 _bound(x).set_config(config)
         self.assertEqual(sources[0], sources[1])
@@ -589,7 +581,11 @@ class TestGeneratedCodeCache(_GeneratedCodeCacheTestCase):
 
     def test_opaque_dependency_keeps_frontend(self) -> None:
         kernel = helion.kernel(_cached_opaque.fn, backend="triton", cache_level="code")
-        self.assertIsNone(cache.binding_input_key(kernel, (torch.ones(16),)))
+        from helion._compiler.cache_dependencies import DependencyCapture
+
+        capture = DependencyCapture(kernel.fn, cache.dependency_fingerprint)
+        capture.record_global("_OPAQUE", _OPAQUE)
+        self.assertIsNone(capture.snapshot())
 
     def test_global_values_invalidate_frontend_identity(self) -> None:
         def bind():
@@ -806,7 +802,7 @@ for bound, config in (
         module._TUNABLE_CONFIG,
     ),
     (
-        module._cached_bound(module._cached_apply.fn, torch.ones(16), module._double),
+        module._cached_bound(module._cached_apply.fn, torch.ones(16), module.torch.abs),
         module.helion.Config(block_sizes=[32]),
     ),
 ):
