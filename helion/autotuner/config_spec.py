@@ -14,6 +14,7 @@ from typing import Callable
 from typing import Iterator
 from typing import NamedTuple
 from typing import cast
+import warnings
 
 import torch
 from torch._inductor.runtime.runtime_utils import next_power_of_2
@@ -2007,9 +2008,24 @@ class ConfigSpec:
                     )
                 config.pop(name, None)
                 continue
-            config[name] = mapping._normalize(
-                name, config.get(name, ()), flatten=flatten
-            )
+            raw = config.get(name, ())
+            if (
+                name == "static_ranges"
+                and isinstance(raw, (list, tuple))
+                and len(raw) > len(mapping)
+            ):
+                if not _fix_invalid:
+                    warnings.warn(
+                        "Ignoring config['static_ranges'] because the current kernel "
+                        f"has {len(mapping)} static-range loops, but the config has "
+                        f"{len(raw)} values",
+                        RuntimeWarning,
+                        stacklevel=5,
+                    )
+                # static_ranges has no block-id metadata, so positional
+                # values may refer to different loops after specialization.
+                raw = ()
+            config[name] = mapping._normalize(name, raw, flatten=flatten)
 
         surface.normalize_after_sequences(self, config, fix_invalid=_fix_invalid)
 

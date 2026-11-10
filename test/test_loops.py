@@ -1705,6 +1705,39 @@ class TestLoops(RefEagerTestBase, TestCase):
         self.assertIn("tl.range", code_false)
         self.assertIn("tl.static_range", code_true)
 
+    @skipIfTileIR("tileir backend will ignore `static_ranges` hint")
+    @skipIfNotTriton(
+        "asserts tl.range; CuTe accepts static_ranges but emits the same loop"
+    )
+    def test_static_range_drops_when_specialized_shape_changes(self):
+        @helion.kernel()
+        def nested_loop_kernel_specialized(x: torch.Tensor) -> torch.Tensor:
+            cols = hl.specialize(x.size(1))
+            for tile_outer in hl.tile(x.size(0)):
+                for col in range(cols):
+                    x[tile_outer, col] = x[tile_outer, col] + 1
+            return x
+
+        config = {
+            "block_sizes": [16],
+            "static_ranges": [True],
+        }
+        x_static = torch.randn([16, 8], device=DEVICE)
+        code_static, result_static = code_and_output(
+            nested_loop_kernel_specialized, (x_static.clone(),), **config
+        )
+        self.assertIn("tl.static_range", code_static)
+        torch.testing.assert_close(result_static, x_static + 1)
+
+        x_dynamic = torch.randn([16, 10], device=DEVICE)
+        with self.assertWarnsRegex(RuntimeWarning, "static_ranges"):
+            code_dynamic, result_dynamic = code_and_output(
+                nested_loop_kernel_specialized, (x_dynamic.clone(),), **config
+            )
+        self.assertIn("tl.range", code_dynamic)
+        self.assertNotIn("tl.static_range", code_dynamic)
+        torch.testing.assert_close(result_dynamic, x_dynamic + 1)
+
     @skipIfFn(
         lambda: _get_backend() not in ("triton", "cute"),
         "static_ranges is only exercised on Triton and CuTe",
