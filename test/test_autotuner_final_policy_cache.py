@@ -12,6 +12,7 @@ import pytest
 from helion._testing import TestCase
 from helion.autotuner.aot_cache import AOTAutotuneCache
 from helion.autotuner.aot_cache import ShapeKey
+from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.differential_evolution import DifferentialEvolutionSearch
 from helion.autotuner.effort_profile import FinalSelectionConfig
 from helion.autotuner.local_cache import _search_policy_hash
@@ -25,6 +26,7 @@ class TestFinalPolicyCache(TestCase):
         self, banks: int = 1, effort: str = "full"
     ) -> DifferentialEvolutionSearch:
         search = object.__new__(DifferentialEvolutionSearch)
+        search._benchmark_provider_cls = LocalBenchmarkProvider
         search.settings = Settings(
             autotune_benchmark_input_banks=banks, autotune_effort=effort
         )

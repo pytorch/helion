@@ -13,12 +13,14 @@ from unittest import SkipTest
 from unittest.mock import patch
 
 import torch
+from torch._inductor.runtime.hints import DeviceProperties
 from torch._subclasses.fake_tensor import FakeTensor
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._python_dispatch import _get_current_dispatch_mode_stack
 from torch.utils._pytree import tree_leaves
 
+from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.cute.cutedsl_compat import _cute_backend_requirement_error
 from .._compiler.cute.full_tile_bounds import prove_full_tile_launch
 from .._compiler.cute.target_facts import B200
@@ -37,9 +39,12 @@ if TYPE_CHECKING:
     from typing import Any
     from unittest.mock import MagicMock
 
+    from torch._dynamo.source import Source
+
     from .._compiler.cute.full_tile_bounds import FullTilePlan
     from ..runtime.kernel import BoundKernel
     from ..runtime.kernel import Kernel
+    from ..runtime.settings import Settings
 
 
 def tcgen05_mma_support() -> SimpleNamespace:
@@ -342,3 +347,89 @@ def full_tile_launch_plan(
         scalar_inputs={"length", "runtime"},
         constexpr_values={"BLOCK": 8} if constants is None else constants,
     )
+
+
+@contextmanager
+def cuda_metadata_trace() -> Generator[None, None, None]:
+    """Real static converter, with only the traced device replaced by CUDA."""
+    old_init = CompileEnvironment.__init__
+    old_convert = CompileEnvironment._to_fake_tensor
+    old_threads = torch.get_num_threads()
+    initial_cuda_state = torch.cuda.is_initialized()
+    torch.set_num_threads(1)
+
+    def initialize(
+        env: CompileEnvironment,
+        device: torch.device,
+        settings: Settings,
+        *,
+        index_dtype: torch.dtype | None = None,
+        is_distributed: bool = False,
+    ) -> None:
+        assert device.type in ("cpu", "cuda")
+        old_init(
+            env,
+            torch.device("cuda:0"),
+            settings,
+            index_dtype=index_dtype,
+            is_distributed=is_distributed,
+        )
+
+    def convert(
+        env: CompileEnvironment, tensor: torch.Tensor, origin: Source
+    ) -> FakeTensor:
+        result = old_convert(env, tensor, origin)
+        assert isinstance(result, FakeTensor) and result.fake_mode is env.fake_mode
+        result.fake_device = torch.device("cuda:0")
+        return result
+
+    try:
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch_target_facts(
+                    capability=(10, 0),
+                    num_sm=148,
+                    is_hip=False,
+                    smem_capacity_bytes=232448,
+                    hardware=B200.hardware_info(),
+                )
+            )
+            stack.enter_context(
+                patch_cute_mma_support(default_cute_mma_support(tcgen05_f8=False))
+            )
+            stack.enter_context(
+                patch.object(CompileEnvironment, "__init__", initialize)
+            )
+            stack.enter_context(
+                patch.object(CompileEnvironment, "_to_fake_tensor", convert)
+            )
+            stack.enter_context(mock_cuda_unavailable())
+            stack.enter_context(
+                patch(
+                    "torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")
+                )
+            )
+            stack.enter_context(
+                patch("torch.cuda.get_device_capability", return_value=(10, 0))
+            )
+            stack.enter_context(
+                patch.object(
+                    DeviceProperties,
+                    "create",
+                    return_value=DeviceProperties(
+                        type="cuda",
+                        index=0,
+                        multi_processor_count=148,
+                        cc=100,
+                        major=10,
+                        regs_per_multiprocessor=65536,
+                        max_threads_per_multi_processor=2048,
+                        max_threads_per_block=1024,
+                        warp_size=32,
+                    ),
+                )
+            )
+            yield
+    finally:
+        torch.set_num_threads(old_threads)
+        assert torch.cuda.is_initialized() == initial_cuda_state

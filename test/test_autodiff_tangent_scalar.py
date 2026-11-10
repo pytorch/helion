@@ -38,6 +38,8 @@ if TYPE_CHECKING:
 pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["triton", "cute"])]
 
 
+# Each named case has a distinct coupled shape/dataflow proof; the rationale
+# and complete list live beside ALIAS_SHAPE_CASES, rather than a product grid.
 @pytest.mark.parametrize("case", ALIAS_SHAPE_CASES)
 def test_alias_branches_preserve_compatible_physical_ranks(case: str) -> None:
     forward, inputs, blocks = alias_shape_case(case, "cpu")

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass
 from dataclasses import field
 import json
@@ -11,11 +10,15 @@ from typing import cast
 
 from ..exc import InvalidConfig
 from ..runtime.config import Config
+from ..runtime.config import _copy_config_structure
+from ..runtime.config_cache import ConfigSet
+from ..runtime.config_cache import _stored_config
 from .config_fragment import BooleanFragment
 from .config_fragment import EnumFragment
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import MutableSet
     from collections.abc import Sequence
 
     from .config_fragment import ConfigSpecFragment
@@ -56,6 +59,26 @@ class CoverageWitness:
     @property
     def carrier(self) -> Config:
         return Config.from_dict(json.loads(self._carrier_json))
+
+
+@dataclass(frozen=True, init=False, eq=False)
+class _WarmCoverageWitness:
+    """An in-memory cache carrier, outside the declared policy's JSON payload.
+
+    Copy ordinary config containers on ingress and on every read, retaining
+    opaque enum owners without invoking serialization or user copy hooks.
+    """
+
+    _carrier: Config = field(repr=False)
+    value: CoverageValue
+
+    def __init__(self, carrier: Config, value: CoverageValue) -> None:
+        object.__setattr__(self, "_carrier", _stored_config(carrier.config))
+        object.__setattr__(self, "value", value)
+
+    @property
+    def carrier(self) -> Config:
+        return _stored_config(self._carrier.config)
 
 
 @dataclass(frozen=True)
@@ -265,17 +288,19 @@ def append_compiler_coverage(
     groups = generation.config_spec.compiler_coverage_groups
     result = list(population)
     outcomes: list[CoverageOutcome] = []
-    seen: set[Config] = set()
+    seen: MutableSet[Config] = ConfigSet()
     for flat in population:
         try:
-            _flat, config = generation.canonicalize_flat(copy.deepcopy(flat))
+            _flat, config = generation.canonicalize_flat(_copy_config_structure(flat))
             generation.config_spec.normalize(config.config)
         except (InvalidConfig, ValueError, TypeError, KeyError, AssertionError):
             continue
         seen.add(config)
     owned_keys = {group.key for group in groups}
     counts = {group.mechanism: 0 for group in groups}
-    pinned: dict[str, set[Config]] = {group.mechanism: set() for group in groups}
+    pinned: dict[str, MutableSet[Config]] = {
+        group.mechanism: ConfigSet() for group in groups
+    }
 
     def old_values(config: Config) -> dict[str, object]:
         return {
@@ -284,7 +309,7 @@ def append_compiler_coverage(
 
     def append(
         group: CompilerCoverageGroup,
-        witness: CoverageWitness,
+        witness: CoverageWitness | _WarmCoverageWitness,
         origin: Literal["declared", "cache"],
     ) -> None:
         requested = witness.carrier
@@ -337,15 +362,15 @@ def append_compiler_coverage(
             elif counts[group.mechanism] >= MAX_COMPILER_COVERAGE_CONFIGS:
                 outcome = "addition_limit"
             else:
-                result.append(copy.deepcopy(flat))
-                seen.add(copy.deepcopy(effective))
+                result.append(_copy_config_structure(flat))
+                seen.add(effective)
                 counts[group.mechanism] += 1
                 outcome = "added"
             if outcome in ("added", "already_present"):
                 group_pins = pinned[group.mechanism]
                 if len(group_pins) < MAX_COMPILER_COVERAGE_CONFIGS:
-                    group_pins.add(copy.deepcopy(effective))
-                    pin(copy.deepcopy(effective))
+                    group_pins.add(effective)
+                    pin(_stored_config(effective.config))
         except (
             InvalidConfig,
             ValueError,
@@ -376,7 +401,7 @@ def append_compiler_coverage(
         if any(
             counts[group.mechanism] < MAX_COMPILER_COVERAGE_CONFIGS for group in tier
         ):
-            warm: dict[str, list[CoverageWitness]] = {
+            warm: dict[str, list[_WarmCoverageWitness]] = {
                 group.mechanism: [] for group in groups
             }
             if cached_rows is None:
@@ -397,10 +422,15 @@ def append_compiler_coverage(
                 value = config.config[group.key]
                 if not any(same_value(value, mode) for mode in group.domain):
                     continue
-                carrier = copy.deepcopy(config)
-                carrier.config.pop(group.key, None)
+                carrier = Config.from_dict(
+                    {
+                        key: item
+                        for key, item in config.config.items()
+                        if key != group.key
+                    }
+                )
                 warm[group.mechanism].append(
-                    CoverageWitness(carrier, cast("CoverageValue", value))
+                    _WarmCoverageWitness(carrier, cast("CoverageValue", value))
                 )
             # Declared witnesses have priority. Warm entries then retain registry
             # order and their original cache order inside each mechanism's budget.

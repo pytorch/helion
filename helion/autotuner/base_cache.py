@@ -61,6 +61,9 @@ def _requires_uncached_tuning(kernel: object, args: object = None) -> bool:
 class AutotuneCacheMeta(abc.ABCMeta):
     """Metaclass that enables the Cache[Search] syntax for autotuner cache classes."""
 
+    # Defined by AutotuneCache on the class object received as cls.
+    _supports_fresh_bindings: bool
+
     def __getitem__(
         cls, search_cls: type[BaseSearch]
     ) -> Callable[[BoundKernel, Sequence[Any]], BaseAutotuner]:
@@ -77,11 +80,12 @@ class AutotuneCacheMeta(abc.ABCMeta):
             def autotuner_factory() -> BaseSearch:
                 return search_cls(kernel, args)
 
-            if _requires_uncached_tuning(kernel, args):
+            fresh = _requires_uncached_tuning(kernel, args)
+            if fresh and not cls._supports_fresh_bindings:
                 return _UncachedAutotuneCache(
                     autotuner_factory(), autotuner_factory=autotuner_factory
                 )
-            if not kernel.is_cacheable():
+            if not fresh and not kernel.is_cacheable():
                 raise TypeError(
                     f"Autotune caches require a cacheable kernel "
                     f"(e.g. BoundKernel); got {type(kernel).__name__}. "
@@ -341,14 +345,14 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         search_policy_cacheable = self._search_policy_allows_cache_io()
         skip_read = skip_cache or skip_cache_env or not search_policy_cacheable
         if (
-            self._supports_fresh_bindings
+            not search_policy_cacheable
             and not skip_cache
             and not skip_cache_env
             and os.environ.get("HELION_ASSERT_CACHE_HIT") == "1"
         ):
             # There is intentionally no persistent key to print or enumerate.
             log.error(
-                "Fresh binding for %s cannot read an autotune cache",
+                "Search policy for %s cannot read an autotune cache",
                 self.kernel.kernel.name,
             )
             raise exc.CacheAssertionError(self.kernel.kernel.name)

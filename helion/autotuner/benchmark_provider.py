@@ -33,6 +33,10 @@ from torch.utils._pytree import tree_map_only
 
 from .. import exc
 from ..runtime.config import Config
+from ..runtime.config import _config_key
+from ..runtime.config_cache import ConfigCache
+from ..runtime.config_cache import ConfigSet
+from ..runtime.config_cache import _stored_config
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import already_compiled_fail
 from ..runtime.precompile_shim import make_precompiler
@@ -93,6 +97,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
     from collections.abc import Mapping
+    from collections.abc import MutableMapping
+    from collections.abc import MutableSet
     from collections.abc import Sequence
 
     from ..runtime.kernel import BoundKernel
@@ -603,9 +609,9 @@ class BenchmarkProvider(abc.ABC):
         """Return whether a successful measurement produced ``source_hash``."""
         return False
 
-    def take_effective_source_repairs(self) -> dict[Config, BenchmarkResult]:
+    def take_effective_source_repairs(self) -> MutableMapping[Config, BenchmarkResult]:
         """Return and clear source-equivalent repairs discovered since last read."""
-        return {}
+        return ConfigCache()
 
     def take_no_viable_config_error(self) -> Exception | None:
         """Return and clear the compile error deferred by the last batch.
@@ -717,7 +723,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
     _measured_config_values: set[tuple[str, object]] | None = None
     _compile_failure_values: dict[tuple[str, object], tuple[int, str]] | None = None
     _config_roles: Mapping[Config, str] = MappingProxyType({})
-    _compiler_seed_configs: set[Config] | frozenset[Config] = frozenset()
+    _compiler_seed_configs: MutableSet[Config] | frozenset[Config] = frozenset()
     # The configs behind the functions of the isolated batch in progress,
     # by ``id(fn)`` (``register_isolated_candidates``), so a failed
     # re-timing can name its candidate.
@@ -809,8 +815,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._pending_effective_source_failures: dict[
             str, list[_PendingEffectiveSourceFailure]
         ] = {}
-        self._effective_source_repairs: dict[Config, BenchmarkResult] = {}
-        self._compiler_seed_configs: set[Config] = set()
+        self._effective_source_repairs: MutableMapping[Config, BenchmarkResult] = (
+            ConfigCache()
+        )
+        self._compiler_seed_configs: MutableSet[Config] = ConfigSet()
         self._compiler_seed_source_hashes: set[str] = set()
         self._compiler_seed_timeout_retry_claims: set[tuple[str, object]] = set()
         # budget_exceeded_fn inherits the class-level _never_exceeded default
@@ -861,9 +869,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             and math.isfinite(result.perf)
         )
 
-    def take_effective_source_repairs(self) -> dict[Config, BenchmarkResult]:
+    def take_effective_source_repairs(self) -> MutableMapping[Config, BenchmarkResult]:
         repairs = self._effective_source_repairs
-        self._effective_source_repairs = {}
+        self._effective_source_repairs = ConfigCache()
         return repairs
 
     def take_no_viable_config_error(self) -> Exception | None:
@@ -887,7 +895,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         config_id: str | None,
         compile_time: float | None,
     ) -> None:
-        stored_config = copy.deepcopy(config)
+        stored_config = _stored_config(config.config)
         self._pending_effective_source_failures.setdefault(source_hash, []).append(
             _PendingEffectiveSourceFailure(
                 config=stored_config,
@@ -900,8 +908,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self,
         source_hash: str,
         source_result: BenchmarkResult,
-    ) -> dict[Config, BenchmarkResult]:
-        repaired: dict[Config, BenchmarkResult] = {}
+    ) -> MutableMapping[Config, BenchmarkResult]:
+        repaired: MutableMapping[Config, BenchmarkResult] = ConfigCache()
         for pending in self._pending_effective_source_failures.pop(source_hash, []):
             repair = BenchmarkResult(
                 config=pending.config,
@@ -936,9 +944,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._compiler_seed_source_hashes = set()
         self._compiler_seed_timeout_retry_claims = set()
         if self._compiler_seed_timeout_retry_repetitions() is None:
-            self._compiler_seed_configs = set()
+            self._compiler_seed_configs = ConfigSet()
             return
-        self._compiler_seed_configs = {copy.deepcopy(config) for config in configs}
+        self._compiler_seed_configs = ConfigSet(configs)
 
     def _compiler_seed_timeout_retry_repetitions(self) -> int | None:
         repetitions = self.config_spec.compiler_seed_timeout_retry_repetitions
@@ -1036,7 +1044,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         )
 
     def set_config_roles(self, roles: Mapping[Config, str]) -> None:
-        self._config_roles = dict(roles)
+        self._config_roles = ConfigCache(roles)
 
     def _timed_out_config_role(self, config: Config) -> str | None:
         """How a config that timed out in the benchmark worker mattered to the
@@ -1242,7 +1250,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         """
         reference = self.config_spec.autotune_reference_config()
         execution = self.config_spec.default_config()
-        if execution.config == reference.config:
+        if _config_key(execution) == _config_key(reference):
             return self._run_reference_or_sampled_baseline(reference)
         try:
             promoted = self._run_baseline_config(
@@ -2052,7 +2060,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         seen_sources = self._effective_source_hashes
         deduplicated_indices: set[int] = set()
         recorded_deduplicated_indices: set[int] = set()
-        batch_repairs: dict[Config, BenchmarkResult] = {}
+        batch_repairs: MutableMapping[Config, BenchmarkResult] = ConfigCache()
         cached_source_results = self._effective_source_results
         invalid_sources = self._invalid_effective_source_hashes
 
@@ -3420,7 +3428,9 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
         self._collect_effective_source_repairs = config_spec.cute_flash_search_enabled
         self._original_configs_by_materialized_key: dict[str, list[Config]] = {}
         self._anchor_fns_by_materialized_key: dict[str, Callable[..., object]] = {}
-        self._effective_source_repairs: dict[Config, BenchmarkResult] = {}
+        self._effective_source_repairs: MutableMapping[Config, BenchmarkResult] = (
+            ConfigCache()
+        )
         child_log = copy.copy(log)
         child_log._log_sink = None
         child_log._trace_sink = None
@@ -3474,9 +3484,9 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
                 failures[pair] = (total + failed, kept)
         return _unmeasured_config_values(measured, failures)
 
-    def take_effective_source_repairs(self) -> dict[Config, BenchmarkResult]:
+    def take_effective_source_repairs(self) -> MutableMapping[Config, BenchmarkResult]:
         repairs = self._effective_source_repairs
-        self._effective_source_repairs = {}
+        self._effective_source_repairs = ConfigCache()
         return repairs
 
     def take_no_viable_config_error(self) -> Exception | None:

@@ -239,6 +239,13 @@ class AutotuningLogger:
             )
 
     @_logging_errors()
+    def record_compiler_refinement(self, transcript: dict[str, object]) -> None:
+        if self._trace_sink is not None:
+            self._trace_sink.record(
+                "compiler_refinement", self._trace_algorithm, transcript=transcript
+            )
+
+    @_logging_errors()
     def record_handoff(self, point: HandoffPoint) -> None:
         if self._trace_sink is not None:
             self._trace_sink.record(

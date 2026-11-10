@@ -7480,6 +7480,7 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
         assert pattern is not None
         search = object.__new__(LFBOTreeSearch)
         search.settings = settings
+        search._benchmark_provider_cls = LocalBenchmarkProvider
         search.final_selection = search._final_selection_from_settings(settings)
         search.config_spec = SimpleNamespace(  # type: ignore[assignment]
             compiler_seed_configs=[],
@@ -7940,7 +7941,7 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
         search = object.__new__(RandomSearch)
         search.count = 100
         search._benchmark_provider_cls = object
-        self.assertIsNone(search._algorithm_cache_policy())
+        self.assertIsNone(search.cache_policy())
 
         search._benchmark_provider_cls = LocalBenchmarkProvider
         self.assertEqual(

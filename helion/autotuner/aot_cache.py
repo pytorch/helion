@@ -68,6 +68,7 @@ from .aot_structural_policy import policy_path
 from .base_cache import AutotuneCacheBase
 from .base_cache import BoundKernelInMemoryCacheKey
 from .base_cache import LooseAutotuneCacheKey
+from .base_cache import _requires_uncached_tuning
 from .benchmark_provider import _MultiShapeAutotuneArgs
 from .benchmark_provider import _searching_candidates
 
@@ -347,6 +348,11 @@ class AOTAutotuneCache(AutotuneCacheBase):
     - One-shot: If both set in collect mode, runs both phases in one invocation
     """
 
+    # Preserve explicit evaluate/compile dispatch for fresh bindings. This does
+    # not make their collect-mode search results reusable: that read is guarded
+    # separately by _search_policy_allows_cache_io.
+    _supports_fresh_bindings = True
+
     # Tracks which AOT modes have been announced to avoid repeated stderr messages.
     # Class-level so announcements happen only once per mode across all instances.
     _mode_announced: ClassVar[set[str]] = set()
@@ -437,6 +443,10 @@ class AOTAutotuneCache(AutotuneCacheBase):
         # they are not search-result cache reads and must never start tuning.
         if self.mode in ("disabled", "evaluate", "compile"):
             return True
+        if self.mode == "collect":
+            # Explicit collection owns its artifacts even for custom providers.
+            # A fresh binding still has no reusable automatic selection key.
+            return not _requires_uncached_tuning(self.kernel, self.args)
         return super()._search_policy_allows_cache_io()
 
     def _search_policy_allows_cache_write(self) -> bool:
@@ -621,6 +631,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
         search_policy_hash = _search_policy_hash(
             self.autotuner,
             cute_flash_search_enabled=self.kernel.config_spec.cute_flash_search_enabled,
+            explicit_aot=True,
         )
         return ShapeKey(
             kernel_name=self.kernel.kernel.name,

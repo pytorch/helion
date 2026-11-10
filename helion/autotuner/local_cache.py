@@ -33,6 +33,7 @@ from .base_cache import StrictAutotuneCacheKey
 from .base_cache import _requires_uncached_tuning
 from .base_cache import _UncachedAutotuneCache
 from .base_search import PopulationBasedSearch
+from .benchmark_provider import LocalBenchmarkProvider
 from .benchmarking import _resolve_l2_flush_mode
 from .benchmarking import final_selection_l2_flush_mode
 
@@ -121,8 +122,29 @@ def _hash_search_policy(encoded: bytes) -> str:
     return hashlib.sha256(b"helion.input_clone.v6\0" + encoded).hexdigest()
 
 
+def _explicit_aot_policy(autotuner: BaseSearch) -> dict[str, object]:
+    # Explicit AOT artifacts belong to the user's kernel/data namespace. Unlike
+    # automatic winner caches, their shape identifiers must survive a new search
+    # instance. Unkeyable provider/callback changes require artifact regeneration.
+    autotuner._search_policy_cacheable = False
+    accuracy = keyable_accuracy_check(autotuner.settings)
+    return {
+        "schema": "explicit_aot_artifact_v1",
+        "search_class": f"{type(autotuner).__module__}.{type(autotuner).__qualname__}",
+        "input_banks": autotuner.settings.autotune_benchmark_input_banks,
+        "accuracy_check": (
+            accuracy.cache_policy()
+            if accuracy is not None and autotuner.settings.autotune_accuracy_check
+            else None
+        ),
+    }
+
+
 def _search_policy_hash(
-    autotuner: BaseSearch, *, cute_flash_search_enabled: bool
+    autotuner: BaseSearch,
+    *,
+    cute_flash_search_enabled: bool,
+    explicit_aot: bool = False,
 ) -> str:
     """Hash the effective clone, accuracy, search and timing policy.
 
@@ -130,6 +152,9 @@ def _search_policy_hash(
     enabled AccuracyCheck independently of their bank and final-selection
     policies. Unknown/custom flash policies get a unique one-shot key. Clone
     semantics version ordinary one-bank keys across every backend and AOT mode.
+    Explicit AOT artifacts use stable identifiers even when custom provider or
+    callback state cannot be fingerprinted; their owner must regenerate them
+    after changes to that state. This does not enable automatic winner reuse.
     """
     banks = autotuner.settings.autotune_benchmark_input_banks
     resident_bank_policy = None
@@ -141,7 +166,16 @@ def _search_policy_hash(
                 "search_l2_flush_mode": regimes[0],
                 "final_l2_flush_mode": regimes[1],
             }
-    if cute_flash_search_enabled:
+    custom_provider = autotuner._benchmark_provider_cls is not LocalBenchmarkProvider
+    if custom_provider:
+        # AOT owns its explicit artifacts, but must not grant this search
+        # permission to reuse an automatic winner (including late providers).
+        autotuner._search_policy_cacheable = False
+    if not explicit_aot and custom_provider:
+        # Providers can change validation as well as timing. Reject them before
+        # the non-flash legacy-key path, even if installed after construction.
+        policy = None
+    elif cute_flash_search_enabled:
         policy = autotuner.cache_policy()
     else:
         policy = None
@@ -176,12 +210,24 @@ def _search_policy_hash(
             )
 
     if policy is None:
-        log.warning(
-            "CuTe-flash autotune cache reuse is disabled for unsupported search "
-            "policy %s",
-            type(autotuner).__qualname__,
-        )
-        policy = _uncacheable_search_policy(autotuner)
+        if explicit_aot:
+            policy = _explicit_aot_policy(autotuner)
+        elif autotuner._benchmark_provider_cls is not LocalBenchmarkProvider:
+            log.warning(
+                "Autotune cache reuse is disabled for custom benchmark provider %s",
+                getattr(
+                    autotuner._benchmark_provider_cls,
+                    "__qualname__",
+                    type(autotuner._benchmark_provider_cls).__qualname__,
+                ),
+            )
+        else:
+            log.warning(
+                "Autotune cache reuse is disabled for unsupported search policy %s",
+                type(autotuner).__qualname__,
+            )
+        if not explicit_aot:
+            policy = _uncacheable_search_policy(autotuner)
     if resident_bank_policy is not None:
         policy = {"search_policy": policy, "resident_banks": resident_bank_policy}
     try:
@@ -193,9 +239,12 @@ def _search_policy_hash(
             allow_nan=False,
         ).encode("utf-8")
     except (TypeError, ValueError) as error:
-        log.warning("Autotune cache reuse is disabled: %s", error)
+        if not explicit_aot:
+            log.warning("Autotune cache reuse is disabled: %s", error)
         encoded = json.dumps(
-            _uncacheable_search_policy(autotuner),
+            _explicit_aot_policy(autotuner)
+            if explicit_aot
+            else _uncacheable_search_policy(autotuner),
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")

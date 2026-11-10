@@ -33,6 +33,8 @@ from ....autotuner.surrogate_pattern_search import CUTE_FLASH_LANE_POLICY_VERSIO
 from ....autotuner.surrogate_pattern_search import FLASH_EXACT_SPACE_RAW_FLOOR
 from ....autotuner.surrogate_pattern_search import flash_terminal_measurement_is_valid
 from ....exc import InvalidConfig
+from ....runtime.config import _config_key
+from ....runtime.config_cache import ConfigSet
 from ..cute_flash import FLASH_CLC_HEADS_PER_BATCH_KEY
 from ..cute_flash import FLASH_EXP2_PACKET_KEY
 from ..cute_flash import FLASH_KV_STAGE_KEY
@@ -47,6 +49,7 @@ from .config_generation_ext import cute_generation_extension
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+    from collections.abc import MutableSet
     from collections.abc import Sequence
 
     from ....autotuner.base_search import PopulationMember
@@ -282,7 +285,7 @@ def design_flash_coverage(generation: ConfigGeneration) -> FlashCoverageDesign:
             frozenset[tuple[str | tuple[str, ...], object]],
         ]
     ] = []
-    seen: set[Config] = set()
+    seen: MutableSet[Config] = ConfigSet()
     normalized_cache: dict[
         tuple[str, bool],
         tuple[
@@ -812,7 +815,7 @@ class FlashStructuralQualification:
     def __init__(
         self,
         search: LFBOPatternSearch,
-        visited: set[Config],
+        visited: MutableSet[Config],
         *,
         initial_population: Sequence[PopulationMember] | None = None,
     ) -> None:
@@ -877,9 +880,9 @@ class FlashStructuralQualification:
         exact_space = flash_generation.exact_effective_search_space_configs(
             exact_space_raw_budget
         )
-        measured_initial_configs = {
+        measured_initial_configs = ConfigSet(
             member.config for member in initial_population if member.perfs
-        }
+        )
 
         def measured_space_exhausted(configs: Sequence[Config] | None) -> bool:
             return bool(configs) and all(
@@ -1136,7 +1139,9 @@ class FlashStructuralQualification:
             members: Sequence[PopulationMember],
         ) -> list[PopulationMember]:
             """Keep only configs that this phase has not already measured or queued."""
-            known_configs = {member.config for member in qualified_population.values()}
+            known_configs = ConfigSet(
+                member.config for member in qualified_population.values()
+            )
             result: list[PopulationMember] = []
             for member in members:
                 if member.perfs or member.config in known_configs:
@@ -1206,7 +1211,7 @@ class FlashStructuralQualification:
                 (
                     member
                     for member in qualified_population.values()
-                    if member.config == config
+                    if _config_key(member.config) == _config_key(config)
                 ),
                 None,
             )
@@ -1334,7 +1339,8 @@ class FlashStructuralQualification:
                                     (
                                         member
                                         for member in qualified_population.values()
-                                        if member.config == witness.config
+                                        if _config_key(member.config)
+                                        == _config_key(witness.config)
                                     ),
                                     witness,
                                 )
@@ -1363,7 +1369,8 @@ class FlashStructuralQualification:
                             (
                                 member
                                 for member in qualified_population.values()
-                                if member.config == witness.config
+                                if _config_key(member.config)
+                                == _config_key(witness.config)
                             ),
                             None,
                         )
@@ -1400,10 +1407,10 @@ class FlashStructuralQualification:
                                 members,
                                 leaf,
                                 (*search._flash_leaf_constraints(leaf), lane),
-                                {
+                                ConfigSet(
                                     member.config
                                     for member in qualified_population.values()
-                                },
+                                ),
                                 neighbor_limit,
                             )
                         )
@@ -1415,7 +1422,8 @@ class FlashStructuralQualification:
                             # metric): the lane counts as exhausted rather
                             # than leaving the qualification incomplete.
                             lane_metrics[(leaf, lane)]["conditional_exhausted"] = True
-                        visited.update(member.config for member in added)
+                        for member in added:
+                            visited.add(member.config)
                         parent_decisions.append(
                             {
                                 "job_index": job_index,
@@ -1808,7 +1816,7 @@ class FlashStructuralQualification:
                         (
                             member
                             for member in qualified_population.values()
-                            if member.config == witness.config
+                            if _config_key(member.config) == _config_key(witness.config)
                         ),
                         None,
                     )
@@ -2324,7 +2332,7 @@ class FlashStructuralQualification:
                 clc_metrics[leaf]["combination_depth_config_ids"] = depth_config_ids
                 clc_metrics[leaf]["combination_divisor_values"] = divisor_values
                 combined: list[PopulationMember] = []
-                seen_configs: set[Config] = set()
+                seen_configs: MutableSet[Config] = ConfigSet()
                 cells: list[dict[str, object]] = []
                 for depth_member, depth_config_id in zip(
                     depth_members, depth_config_ids, strict=True
@@ -2354,7 +2362,8 @@ class FlashStructuralQualification:
                             (
                                 member
                                 for member in qualified_population.values()
-                                if member.config == candidate.config
+                                if _config_key(member.config)
+                                == _config_key(candidate.config)
                             ),
                             None,
                         )
@@ -2454,7 +2463,7 @@ class FlashStructuralQualification:
                     (
                         member
                         for member in qualified_population.values()
-                        if member.config == candidate.config
+                        if _config_key(member.config) == _config_key(candidate.config)
                     ),
                     None,
                 )
@@ -2556,7 +2565,7 @@ class FlashStructuralQualification:
                 ),
                 key=search._flash_member_rank_key,
             )
-            source_configs = {member.config for member in combined_source_pool}
+            source_configs = ConfigSet(member.config for member in combined_source_pool)
             source_pool = [
                 *combined_source_pool,
                 *(
@@ -3143,7 +3152,9 @@ class FlashStructuralQualification:
         ) -> None:
             config_id = canonical_config_id(config)
             existing_config = manifest_configs.get(config_id)
-            if existing_config is not None and existing_config != config:
+            if existing_config is not None and _config_key(
+                existing_config
+            ) != _config_key(config):
                 raise AssertionError(f"canonical config ID collision for {config_id}")
             manifest_configs[config_id] = config
 

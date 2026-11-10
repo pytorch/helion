@@ -328,7 +328,10 @@ def default_autotuner_fn(
     # trial. The first construction here is the autotuner the cache wraps
     # for the K=1 path; the factory is also passed through so K>1 trials can
     # build additional fresh autotuners.
-    if _requires_uncached_tuning(bound_kernel, args):
+    if (
+        _requires_uncached_tuning(bound_kernel, args)
+        and not cache_cls._supports_fresh_bindings
+    ):
         return _UncachedAutotuneCache(
             autotuner_factory(), autotuner_factory=autotuner_factory
         )

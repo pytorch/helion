@@ -442,6 +442,7 @@ class TestLLMGuidedSearch(TestCase):
 
         llm_requests: list[list[dict[str, str]]] = []
         benchmark_batches: list[tuple[str, list[dict[str, object]]]] = []
+        refinement_configs: list[helion.Config] = []
         rebenchmark_descs: list[str] = []
         async_request_count = 0
         sync_request_count = 0
@@ -481,9 +482,34 @@ class TestLLMGuidedSearch(TestCase):
             llm_requests.append([dict(message) for message in messages])
             return next(llm_responses)
 
+        def failed_refinement(*args, **kwargs):
+            raise AssertionError("A failed refinement must not execute")
+
         def fake_benchmark_batch(
-            self, configs: list[helion.Config], *, desc: str = "Benchmarking"
+            self,
+            configs: list[helion.Config],
+            *,
+            desc: str = "Benchmarking",
+            raise_if_no_viable_config: bool = True,
         ) -> list[BenchmarkResult]:
+            if desc == "Compiler-option refinement":
+                # The fixture defines timings for the three LLM proposals.
+                # Model unsupported compiler variants as compile failures and
+                # verify that refinement preserves those measured fallbacks.
+                assert not raise_if_no_viable_config
+                refinement_configs.extend(configs)
+                self._autotune_metrics.num_configs_tested += len(configs)
+                self._autotune_metrics.num_compile_failures += len(configs)
+                return [
+                    BenchmarkResult(
+                        config=config,
+                        fn=failed_refinement,
+                        perf=float("inf"),
+                        status="error",
+                        compile_time=0.01,
+                    )
+                    for config in configs
+                ]
             batch_keys = [repr(config) for config in configs]
             benchmark_batches.append(
                 (desc, [sparse_config(config) for config in configs])
@@ -659,7 +685,18 @@ class TestLLMGuidedSearch(TestCase):
         final_metrics = search._autotune_metrics.final_selection
         assert final_metrics is not None
         self.assertEqual(final_metrics["finalists"], 3)
-        self.assertEqual(search._autotune_metrics.num_configs_tested, 3)
+        self.assertEqual(
+            search._autotune_metrics.num_configs_tested, 3 + len(refinement_configs)
+        )
+        self.assertEqual(
+            search._autotune_metrics.num_compile_failures, len(refinement_configs)
+        )
+        if search.config_spec.backend_name == "cute":
+            self.assertTrue(refinement_configs)
+            refinement = search._autotune_metrics.compiler_refinement
+            assert refinement is not None
+            self.assertTrue(refinement["completed"])
+            self.assertEqual(refinement["new_trials"], len(refinement_configs))
         self.assertEqual(len(search._all_benchmark_results), 3)
         self.assertEqual(len(search.population), 3)
         self.assertEqual(len(search._benchmarked_members), 3)

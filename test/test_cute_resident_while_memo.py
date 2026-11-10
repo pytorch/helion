@@ -10,8 +10,6 @@ import weakref
 import pytest
 import torch
 
-from test.cute_population_contracts import _target
-
 import helion
 from helion import exc
 from helion._compiler.cute import resident_while
@@ -21,6 +19,7 @@ from helion._testing import skipIfRefEager
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_native_compile
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_codegen import tcgen05_target as _target
 import helion.language as hl
 from helion.language import _tracing_ops
 
