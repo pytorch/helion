@@ -31,6 +31,7 @@ from __future__ import annotations
 import cutlass
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import dsl_user_op
+import cutlass.experimental.primitives as prims
 
 from .affine_recurrence_primitives import _ldmatrix
 from .affine_recurrence_primitives import ldmatrix_x2_trans
@@ -287,7 +288,7 @@ def stage_state_tile8x8_async_bf16(
             state_feature,
             ROW_EXTENT,
         )
-        cute.arch.cp_async_shared_global(
+        prims.cp_async_shared_global(
             aligned_state + cute.assume(cutlass.Int32(state_index), divby=8),
             aligned_source + source_index,
             16,

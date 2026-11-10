@@ -3260,7 +3260,7 @@ for {prefix}prefetch_chunk in cutlass.range_constexpr({lookahead}):
             + ({prefix}row_thread * {group_rows} + {prefix}row_local) * {column_extent}
             + {prefix}column
         )
-        cute.arch.cp_async_shared_global(
+        _cute_cp_async_shared_global(
             {prefix}smem.data_ptr() + {prefix}destination,
             {raw_pointer},
             {copy_bytes},
@@ -3296,7 +3296,7 @@ for {prefix}row_local in cutlass.range_constexpr({group_rows}):
         + ({prefix}row_thread * {group_rows} + {prefix}row_local) * {column_extent}
         + {prefix}column
     )
-    cute.arch.cp_async_shared_global(
+    _cute_cp_async_shared_global(
         {prefix}smem.data_ptr() + {prefix}destination,
         {raw_pointer},
         {copy_bytes},
@@ -3335,7 +3335,7 @@ if {prefix}row_local == 0 and {prefix}chunk > 0:
                 + ({prefix}row_thread * {group_rows} + {prefix}prefetch_row) * {column_extent}
                 + {prefix}column
             )
-            cute.arch.cp_async_shared_global(
+            _cute_cp_async_shared_global(
                 {prefix}smem.data_ptr() + {prefix}destination,
                 {raw_pointer},
                 {copy_bytes},

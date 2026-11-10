@@ -1307,7 +1307,13 @@ class GenerateASTFromInductor(DefaultHandler):
     def _to_ast(self, x: object) -> ast.AST:
         if isinstance(x, ast.AST):
             return x
-        return expr_from_string(_unpack_opsvalue(x))
+        return self._parse_op(x)
+
+    def _parse_op(self, x: object) -> ast.AST:
+        """The AST of an expression the parent handler returned (or one of
+        its operands), which is written in the backend's device language."""
+        backend = CompileEnvironment.current().backend
+        return backend.parse_op_expression(_unpack_opsvalue(x))
 
     def _lift(self, expr: ast.AST) -> str:
         return self.cg.lift(expr).id
@@ -1352,14 +1358,9 @@ class GenerateASTFromInductor(DefaultHandler):
     def _default(
         self, name: str, args: tuple[object, ...], kwargs: dict[str, object]
     ) -> str:
-        result_str = _unpack_opsvalue(
-            getattr(self.parent_handler, name)(*args, **kwargs)
+        return self._lift(
+            self._parse_op(getattr(self.parent_handler, name)(*args, **kwargs))
         )
-        # C++ namespace syntax (::) is not valid Python.  Replace with dot
-        # notation so expr_from_string can parse it as attribute access.
-        if CompileEnvironment.current().backend_name == "metal" and "::" in result_str:
-            result_str = result_str.replace("::", ".")
-        return self._lift(expr_from_string(result_str))
 
     def to_dtype(
         self,
@@ -1404,9 +1405,7 @@ class GenerateASTFromInductor(DefaultHandler):
                 f"tl.where({inner_name} >= 0, {reciprocal}, {exponential} * {reciprocal})"
             )
         else:
-            result = expr_from_string(
-                _unpack_opsvalue(self.parent_handler.sigmoid(inner_name))
-            )
+            result = self._parse_op(self.parent_handler.sigmoid(inner_name))
 
         expected_dtype = self._expected_tensor_dtype()
         if expected_dtype is not None and expected_dtype != torch.float32:
@@ -1513,8 +1512,7 @@ class GenerateASTFromInductor(DefaultHandler):
                 return False
             return any(isinstance(arg, (int, float, bool)) for arg in current_node.args)
 
-        result_str = _unpack_opsvalue(self.parent_handler.mul(a, b))
-        result_expr = expr_from_string(result_str)
+        result_expr = self._parse_op(self.parent_handler.mul(a, b))
 
         # Only cast if we have a scalar operand and expected dtype is not float32.
         # This is to handle cases like `x_bf16 * 0.1` where Triton would promote the result to float32,

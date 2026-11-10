@@ -122,6 +122,7 @@ _PLAN_TENSOR_NAME_KEYS: tuple[str, ...] = (
     "dk_name",
     "dv_name",
     "lse_name",
+    "row_max_name",
     "bias_name",
     "alibi_name",
     "document_name",

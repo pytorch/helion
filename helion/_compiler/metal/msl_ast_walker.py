@@ -4,16 +4,16 @@ Provides pure functions for converting Python AST nodes to MSL C++ text.
 Used by ``metal_kernel._generate_msl`` to translate the body of a
 ``@metal_jit`` decorated function into MSL source code.
 
-MetalOverrides (reused from Inductor's MPS codegen) emits MSL expression strings
-using ``c10::metal::`` and ``metal::precise::`` namespaces.  The ``::`` namespace
-separator is replaced with ``.`` before Python AST parsing and converted back
-to ``::`` by this module when emitting C++.
+MetalOverrides (reused from Inductor's MPS codegen) emits MSL expression strings;
+``msl_expr`` parses them into Python AST (``metal::precise::sin`` →
+``metal.precise.sin``, ``static_cast<T>(x)`` → ``static_cast(T, x)``,
+``a && b`` → ``a and b``, ...) and this module prints that AST back as MSL.
 
 Handles:
   - Statement-level Python→C++ translation (assignments, if/for, etc.)
   - ``tl.load(ptr + offset, mask, other=0)`` → ``(mask ? *(ptr+offset) : (T)(0))``
   - ``tl.store(ptr + offset, val, mask)`` → ``if (mask) { *(ptr+offset) = val; }``
-  - ``static_cast<T>(x)`` parsed as Compare (from MetalOverrides.to_dtype)
+  - ``static_cast(T, x)`` → ``static_cast<T>(x)`` (and the other ``TEMPLATE_CALLS``)
   - C++ namespace restoration: ``metal.precise.sin`` → ``metal::precise::sin``
   - Generic function call fallback (main handler for MetalOverrides expressions)
 """
@@ -27,6 +27,8 @@ from typing import Iterator
 
 from ... import exc
 from .mpp_matmul import ACC_SEED
+from .msl_expr import GLOBAL_SCOPE
+from .msl_expr import TEMPLATE_CALLS
 from .msl_reduction import REDUCTION_NAMESPACE
 
 
@@ -687,6 +689,8 @@ def _ast_expr_to_msl(
             return f"(!{operand})"
         if isinstance(node.op, ast.Invert):
             return f"(~{operand})"
+        if isinstance(node.op, ast.UAdd):
+            return f"(+{operand})"
         raise exc.BackendUnsupported("metal", f"unary op: {type(node.op).__name__}")
 
     if isinstance(node, ast.BinOp):
@@ -738,33 +742,6 @@ def _ast_expr_to_msl(
         return f"({op_str.join(parts)})"
 
     if isinstance(node, ast.Compare):
-        # Detect static_cast<dtype>(expr) parsed as Compare by Python.
-        # The type can be a simple Name (e.g. float) or a Call like
-        # decltype(a+b) from Inductor's MetalOverrides.
-        if (
-            isinstance(node.left, ast.Name)
-            and node.left.id == "static_cast"
-            and len(node.ops) == 2
-            and isinstance(node.ops[0], ast.Lt)
-            and isinstance(node.ops[1], ast.Gt)
-        ):
-            type_node = node.comparators[0]
-            if isinstance(type_node, ast.Name):
-                metal_type = type_node.id
-            elif isinstance(type_node, ast.Call) and isinstance(
-                type_node.func, ast.Name
-            ):
-                fn = type_node.func.id
-                # decltype(expr) → decltype(expr)
-                args_msl = [_ast_expr_to_msl(a, subs=subs) for a in type_node.args]
-                metal_type = f"{fn}({', '.join(args_msl)})"
-                if metal_type == "decltype((*_it))":
-                    metal_type = "decltype(+(*_it))"
-            else:
-                metal_type = _ast_expr_to_msl(type_node, subs=subs)
-            inner = _ast_expr_to_msl(node.comparators[1], subs=subs)
-            return f"static_cast<{metal_type}>({inner})"
-
         left = _ast_expr_to_msl(node.left, subs=subs)
         parts = [left]
         for op, comp in zip(node.ops, node.comparators, strict=True):
@@ -800,8 +777,11 @@ def _ast_expr_to_msl(
         return _ast_subscript_to_msl(node, subs=subs)
 
     if isinstance(node, ast.Attribute):
-        # C++ namespace access: metal.precise.sin → metal::precise::sin
-        # The :: was replaced with . before Python AST parsing; restore it here.
+        # C++ namespace access: metal.precise.sin → metal::precise::sin, and
+        # _msl_global.metal.precise.atan2 → ::metal::precise::atan2 (see
+        # msl_expr).
+        if isinstance(node.value, ast.Name) and node.value.id == GLOBAL_SCOPE:
+            return f"::{node.attr}"
         value = _ast_expr_to_msl(node.value, subs=subs)
         sep = "::" if _is_cpp_namespace_root(node) else "."
         return f"{value}{sep}{node.attr}"
@@ -867,10 +847,41 @@ def _ast_call_to_msl(node: ast.AST, subs: dict[str, str] | None = None) -> str:
             return f"({mask} ? {access} : ({other}))"
         return access
 
+    # A C++ cast or MSL template function: static_cast(T, x) → static_cast<T>(x)
+    if _template_name(func) in TEMPLATE_CALLS:
+        callee = _ast_expr_to_msl(func, subs=subs)
+        template_arg, *args = node.args
+        args_msl = [_ast_expr_to_msl(a, subs=subs) for a in args]
+        return f"{callee}<{_template_arg_to_msl(template_arg, subs)}>({', '.join(args_msl)})"
+
     # Generic function call (main path for MetalOverrides expressions)
     func_msl = _ast_expr_to_msl(func, subs=subs)
     args_msl = [_ast_expr_to_msl(a, subs=subs) for a in node.args]
     return f"{func_msl}({', '.join(args_msl)})"
+
+
+def _template_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+def _template_arg_to_msl(node: ast.AST, subs: dict[str, str] | None) -> str:
+    """A template argument: ``float``, ``metal::half``, ``decltype(a + b)``."""
+    if isinstance(node, ast.Attribute):
+        if isinstance(node.value, ast.Name) and node.value.id == GLOBAL_SCOPE:
+            return f"::{node.attr}"
+        return f"{_template_arg_to_msl(node.value, subs)}::{node.attr}"
+    if _is_call_to(node, "decltype"):
+        assert isinstance(node, ast.Call)
+        (operand,) = node.args
+        inner = _ast_expr_to_msl(operand, subs=subs)
+        # decltype((*_it)) is a reference type; the element value type is
+        # decltype(+(*_it)).
+        return "decltype(+(*_it))" if inner == "(*_it)" else f"decltype({inner})"
+    return _ast_expr_to_msl(node, subs=subs)
 
 
 #: What Inductor's ``constant_repr`` emits for non-finite float constants.
@@ -880,15 +891,15 @@ _NON_FINITE_FLOATS = {
     "nan": "NAN",
 }
 
-_CPP_NAMESPACE_ROOTS = frozenset({"metal", "c10", REDUCTION_NAMESPACE})
+_CPP_NAMESPACE_ROOTS = frozenset({"metal", "c10", REDUCTION_NAMESPACE, GLOBAL_SCOPE})
 
 
 def _is_cpp_namespace_root(node: ast.Attribute) -> bool:
     """Return True if *node* is an attribute chain rooted at a C++ namespace.
 
-    C++ namespace syntax (``metal::precise::sin``) is converted to Python
-    dot notation (``metal.precise.sin``) before AST parsing.  This detects
-    those chains so the walker can emit ``::`` instead of ``.``.
+    ``msl_expr`` parses C++ namespace syntax (``metal::precise::sin``) into
+    Python dot notation (``metal.precise.sin``).  This detects those chains so
+    the walker can emit ``::`` instead of ``.``.
     """
     while isinstance(node.value, ast.Attribute):
         node = node.value

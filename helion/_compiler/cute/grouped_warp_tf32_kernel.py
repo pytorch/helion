@@ -68,6 +68,7 @@ _TEMPLATE = """from __future__ import annotations
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.experimental.primitives as prims
 
 
 @cute.jit
@@ -113,7 +114,7 @@ def _grouped_warp_copy_ab(a, b, a_packed, b_grouped, start, length, group, offse
     for packet in cutlass.range_constexpr(4):
         row = first_row + packet * 32
         valid_bytes = cutlass.Int32(16) if cutlass.Int64(row) < length else cutlass.Int32(0)
-        cute.arch.cp_async_shared_global(
+        prims.cp_async_shared_global(
             a.iterator + cute.crd2idx((t // 16 + packet * 32, k), a.layout),
             a_source, 16, "cg", cp_size=valid_bytes,
         )
@@ -132,7 +133,7 @@ def _grouped_warp_copy_ab(a, b, a_packed, b_grouped, start, length, group, offse
         k = t // 64 + (packet // 2) * 8 + (packet % 2) * 32
         source = b_pointers[packet % 2]
         b_pointers[packet % 2] = source + b_step
-        cute.arch.cp_async_shared_global(
+        prims.cp_async_shared_global(
             b.iterator + cute.crd2idx((n, k), b.layout),
             source, 4, "ca", cp_size=b_valid_bytes,
         )

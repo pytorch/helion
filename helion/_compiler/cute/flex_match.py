@@ -238,6 +238,9 @@ class FlexMatch:
     o_name: str
     lse_name: str | None
     lse_log_base: str | None
+    # The optional store of the running row max beside the LSE (same
+    # ``[B, H, M]`` fp32 geometry; ``plan.row_max_scale`` its factor).
+    row_max_name: str | None
     batch: int
     heads: int
     kv_heads: int
@@ -2334,10 +2337,12 @@ def _assemble(
         (batch, heads, q_seq),
         head_dim_v,
         io_dtype,
+        part_body.exp_base,
     )
     if epilogue is None:
         return None
-    o_name, o_strides, lse_name, lse_log_base = epilogue
+    o_name, o_strides, lse_name, lse_log_base = epilogue[:4]
+    row_max_name = epilogue.row_max_name
 
     # Closed world of host tensors.
     aux_names = tuple(buffer.name for buffer in part_body.regions.aux)
@@ -2345,6 +2350,8 @@ def _assemble(
     allowed.update(name for name, _, _ in tables)
     if lse_name is not None:
         allowed.add(lse_name)
+    if row_max_name is not None:
+        allowed.add(row_max_name)
     present: set[str] = set()
     for info in ctx.graphs.values():
         for node in info.graph.nodes:
@@ -2368,7 +2375,17 @@ def _assemble(
         qk_scale_log2 = scale_literal * multiplier
     else:
         qk_scale_log2 = multiplier
+    # ``_match_epilogue`` proved the stored units agree with the exp base.
     lse_scale = math.log(2.0) if lse_log_base == "log" else 1.0
+    # The stored row max is the kernel's ``m`` (times ``ln 2`` in its
+    # natural-log form): the log2-unit row max the fused body tracks
+    # (``row_max * qk_scale_log2``) for an ``exp2`` kernel, ``ln 2`` times it
+    # for an ``exp`` kernel (whose ``m`` is in natural units).
+    row_max_scale: float | None = None
+    if row_max_name is not None:
+        row_max_scale = (math.log(2.0) if part_body.exp_base == "exp" else 1.0) * (
+            math.log(2.0) if epilogue.row_max_log_base == "log" else 1.0
+        )
     regions = part_body.regions
     score_region = regions.score
     mask_region = regions.mask
@@ -2399,7 +2416,10 @@ def _assemble(
         host_scalars=regions.host_scalars,
         scale_arg=part_body.scale_symbol,
         scale_peeled=part_body.scale_peeled,
-        flex_dense=flex_dense_plan(
+        # The dense bodies store no row max: a row-max plan keeps the flex
+        # body, which hosts the dense geometry too.
+        flex_dense=row_max_name is None
+        and flex_dense_plan(
             trivial=trivial,
             score_region=score_region is not None,
             mask_region=mask_region is not None,
@@ -2418,6 +2438,7 @@ def _assemble(
                 )
             ),
         ),
+        row_max_scale=row_max_scale,
     )
     match = FlexMatch(
         plan=plan,
@@ -2449,6 +2470,7 @@ def _assemble(
         o_name=o_name,
         lse_name=lse_name,
         lse_log_base=lse_log_base,
+        row_max_name=row_max_name,
         batch=batch,
         heads=heads,
         kv_heads=kv_heads,
@@ -2541,6 +2563,19 @@ def _phi_chain(
     return final[0], final[1], final[2]
 
 
+class _Epilogue(NamedTuple):
+    """The stores ``_match_epilogue`` proved: O, the optional LSE and the
+    optional row max (each row store with its log base, ``"log2"`` or
+    ``"log"``)."""
+
+    o_name: str
+    o_strides: tuple[int, ...]
+    lse_name: str | None
+    lse_log_base: str | None
+    row_max_name: str | None
+    row_max_log_base: str | None
+
+
 def _match_epilogue(
     ctx: _Ctx,
     root: GraphInfo,
@@ -2550,10 +2585,12 @@ def _match_epilogue(
     bhm: tuple[int, int, int],
     head_dim_v: int,
     io_dtype: torch.dtype,
-) -> tuple[str, tuple[int, ...], str | None, str | None] | None:
-    """``l_safe`` guard, ``acc / l_safe[:, None]`` -> O store and the
-    optional LSE store; returns ``(o_name, o_strides, lse_name,
-    lse_log_base)``."""
+    exp_base: str,
+) -> _Epilogue | None:
+    """``l_safe`` guard, ``acc / l_safe[:, None]`` -> O store, the optional
+    LSE store and the optional row-max store (the running max ``m`` itself,
+    FlexAttention's ``max_scores``, beside the LSE). ``exp_base`` is the
+    softmax's (``"exp2"`` or ``"exp"``), whose units ``m`` is in."""
     from ...language import memory_ops
 
     l_safe: torch.fx.Node = final_l
@@ -2583,6 +2620,8 @@ def _match_epilogue(
     o_strides: tuple[int, ...] = ()
     lse_name: str | None = None
     lse_log_base: str | None = None
+    row_max_name: str | None = None
+    row_max_log_base: str | None = None
     batch, heads, q_seq = bhm
     for store in stores:
         if len(store.args) < 3 or (len(store.args) > 3 and store.args[3] is not None):
@@ -2639,39 +2678,67 @@ def _match_epilogue(
             o_name, o_strides = name, strides
             continue
         if host.ndim == 3:
+            # A row store: the LSE or the running row max, both ``[B, H, M]``
+            # fp32 rows the fused epilogue stores from the final statistics.
             if len(indices) != 3:
-                ctx.decline("flex: the LSE store must index [b, h, tile_m]")
-                return None
-            base = _lse_log_base(stored, final_m, l_safe)
-            if base is None:
-                ctx.decline(
-                    "flex: the LSE value is not m + log2(l) (or its natural-log form)"
-                )
+                ctx.decline(f"flex: the row store to {name} must index [b, h, tile_m]")
                 return None
             if (
                 tuple(int(size) for size in host.shape) != (batch, heads, q_seq)
                 or host.dtype != torch.float32
                 or not host.is_contiguous()
-                or lse_name is not None
             ):
-                ctx.decline("flex: the LSE tensor geometry is wrong or duplicated")
+                ctx.decline(f"flex: the row tensor {name} geometry is wrong")
                 return None
-            lse_name, lse_log_base = name, base
-            continue
+            lse = _lse_log_base(stored, final_m, l_safe)
+            if lse is not None:
+                log, base = lse
+                # ``m`` is in the units of the softmax's exp base: a row-sum
+                # log in the other base mixes units, a value no one scale of
+                # the fused body's log2-unit LSE gives.
+                if log != ("log2" if exp_base == "exp2" else "log"):
+                    ctx.decline(
+                        f"flex: the LSE store to {name} adds {log}(l) to the "
+                        f"{exp_base} softmax's running max (mixed units)"
+                    )
+                    return None
+                if lse_name is not None:
+                    ctx.decline("flex: duplicated LSE store")
+                    return None
+                lse_name, lse_log_base = name, base
+                continue
+            base = _row_max_log_base(stored, final_m)
+            if base is not None:
+                if row_max_name is not None:
+                    ctx.decline("flex: duplicated row-max store")
+                    return None
+                row_max_name, row_max_log_base = name, base
+                continue
+            ctx.decline(
+                f"flex: the row store to {name} is neither the LSE (m + log2(l), "
+                "or its natural-log form) nor the row max m"
+            )
+            return None
         ctx.decline(f"flex: unexpected store to {name}")
         return None
     if o_name is None:
         ctx.decline("flex: no O store")
         return None
-    return o_name, o_strides, lse_name, lse_log_base
+    if row_max_name is not None and lse_name is None:
+        # The fused bodies store the row max beside the LSE, from the same
+        # final statistics and under the same row guards.
+        ctx.decline("flex: a row-max store needs the LSE store beside it")
+        return None
+    return _Epilogue(
+        o_name, o_strides, lse_name, lse_log_base, row_max_name, row_max_log_base
+    )
 
 
-def _lse_log_base(
-    value: object, final_m: torch.fx.Node, l_safe: torch.fx.Node
-) -> str | None:
-    """``"log2"`` for ``m + log2(l)``, ``"log"`` for ``(m + log2(l)) / log2e``,
-    ``(m + log2(l)) * ln2`` or ``m + log(l)``."""
-    natural = False
+def _peel_natural_log_factor(value: object) -> tuple[object, bool] | None:
+    """``(inner, natural)``: ``x / log2e`` and ``x * ln2`` (a base-2 value
+    converted to natural units) peel to ``(x, True)``, anything else is
+    ``(value, False)``; ``None`` for a division or multiplication by another
+    factor."""
     value = _strip_identity(value)
     if _is_call(value, _aten.div.Tensor) and isinstance(value, torch.fx.Node):
         factor = value.args[1]
@@ -2680,9 +2747,8 @@ def _lse_log_base(
             and math.isclose(factor, LOG2E, rel_tol=1e-6)
         ):
             return None
-        natural = True
-        value = _strip_identity(value.args[0])
-    elif _is_call(value, _aten.mul.Tensor) and isinstance(value, torch.fx.Node):
+        return _strip_identity(value.args[0]), True
+    if _is_call(value, _aten.mul.Tensor) and isinstance(value, torch.fx.Node):
         lhs, rhs = value.args[:2]
         factor = rhs if isinstance(lhs, torch.fx.Node) else lhs
         tensor = lhs if isinstance(lhs, torch.fx.Node) else rhs
@@ -2691,8 +2757,33 @@ def _lse_log_base(
             and math.isclose(factor, math.log(2.0), rel_tol=1e-6)
         ):
             return None
-        natural = True
-        value = _strip_identity(tensor)
+        return _strip_identity(tensor), True
+    return value, False
+
+
+def _row_max_log_base(value: object, final_m: torch.fx.Node) -> str | None:
+    """``"log2"`` for the running max ``m`` itself, ``"log"`` for ``m /
+    log2e`` or ``m * ln2``. Any of them is a plain multiple of ``m``, so
+    every exp base compiles: ``_assemble`` folds the base's units into
+    ``row_max_scale``."""
+    peeled = _peel_natural_log_factor(value)
+    if peeled is None or peeled[0] is not final_m:
+        return None
+    return "log" if peeled[1] else "log2"
+
+
+def _lse_log_base(
+    value: object, final_m: torch.fx.Node, l_safe: torch.fx.Node
+) -> tuple[str, str] | None:
+    """``(log, base)``: the log of the row sum (``"log2"`` or ``"log"``) and
+    the stored units, ``"log2"`` for ``m + log2(l)``, ``"log"`` for ``(m +
+    log2(l)) / log2e``, ``(m + log2(l)) * ln2`` or ``m + log(l)``. The units
+    hold when ``m`` is in the log's base; ``_match_epilogue`` checks that
+    against the softmax's exp base."""
+    peeled = _peel_natural_log_factor(value)
+    if peeled is None:
+        return None
+    value, natural = peeled
     if not (_is_call(value, _aten.add.Tensor) and isinstance(value, torch.fx.Node)):
         return None
     lhs, rhs = value.args[:2]
@@ -2705,8 +2796,8 @@ def _lse_log_base(
     if _strip_identity(log_node.args[0]) is not l_safe:
         return None
     if log_node.target is _aten.log.default:
-        return None if natural else "log"
-    return "log" if natural else "log2"
+        return None if natural else ("log", "log")
+    return ("log2", "log" if natural else "log2")
 
 
 def _root_graph_admitted(ctx: _Ctx, root: GraphInfo) -> bool:

@@ -385,6 +385,9 @@ class FlashGraphOutputPlan(NamedTuple):
     # the same storage as the ``[batch, seq, head_dim]`` / ``[batch, seq]``
     # views the bodies address (``examples/blackwell_attention.py``).
     flattened_rows: bool = False
+    # The flex envelope's ``(B, H, M)`` row-max store beside the LSE
+    # (``AttentionScorePlan.row_max_scale``).
+    row_max_name: str | None = None
 
     @property
     def value_head_dim(self) -> int:
@@ -393,7 +396,8 @@ class FlashGraphOutputPlan(NamedTuple):
 
 def _flash_flex_graph_output_plan(match: FlexMatch) -> FlashGraphOutputPlan:
     """The output plan of a matched flex kernel: 4-D operands, the
-    ``(B, H, M)`` LSE, the table and aux names in the closed world."""
+    ``(B, H, M)`` LSE (and row max), the table and aux names in the closed
+    world."""
     return FlashGraphOutputPlan(
         match.q_name,
         match.k_name,
@@ -419,6 +423,7 @@ def _flash_flex_graph_output_plan(match: FlexMatch) -> FlashGraphOutputPlan:
         kv_walk_names=match.table_names,
         aux_names=match.aux_names,
         operand_strides=match.operand_strides,
+        row_max_name=match.row_max_name,
     )
 
 
@@ -14116,11 +14121,26 @@ def _flash_lse_store(
     lse_scale: float,
     row_max: str = "flash_row_max",
     row_sum: str = "flash_row_sum",
+    row_max_scale: float | None = None,
+    true_row_max: str | None = None,
 ) -> str:
+    """The LSE store of one row from its final statistics and, with
+    ``row_max_scale`` (the flex row-max store, ``_flash_mRowMax``), the row
+    max beside it: ``true_row_max`` when the softmax pins a stale max
+    (``rescale_threshold``) and tracks the true one apart, else ``row_max``
+    (``-inf`` for a row that saw no key either way)."""
     value = f"{row_max} * _flash_scale_log2 + cute.math.log2({row_sum})"
     if not math.isclose(lse_scale, 1.0, rel_tol=1e-6, abs_tol=1e-7):
         value = f"({value}) * cutlass.Float32({lse_scale!r})"
-    return f"\n{indent}_flash_mLSE[{row_expr}, {bh_expr}] = {value}"
+    store = f"\n{indent}_flash_mLSE[{row_expr}, {bh_expr}] = {value}"
+    if row_max_scale is not None:
+        max_value = (
+            f"{row_max if true_row_max is None else true_row_max} * _flash_scale_log2"
+        )
+        if not math.isclose(row_max_scale, 1.0, rel_tol=1e-6, abs_tol=1e-7):
+            max_value = f"({max_value}) * cutlass.Float32({row_max_scale!r})"
+        store += f"\n{indent}_flash_mRowMax[{row_expr}, {bh_expr}] = {max_value}"
+    return store
 
 
 def _flash_ws_guard(src: str, condition: str, indent: str = "            ") -> str:
@@ -15184,6 +15204,7 @@ def _flash_ws_consumer_body(
     staged_store: bool = False,
     early_teardown: bool = False,
     lse_store: str = "",
+    track_true_row_max: bool = False,
     two_rows: bool = False,
     aux_smem_staging: bool = False,
     one_pass: bool = False,
@@ -15394,8 +15415,22 @@ def _flash_ws_consumer_body(
     else:
         range_prelude = ""
     has_previous_o = "flash_o_started"
+    # ``track_true_row_max`` (the flex row-max store): the pin keeps a stale
+    # row max, so the true one (every step's unpinned max) is kept apart.
+    true_row_max_update = (
+        "            flash_true_row_max = cute.arch.fmax(flash_true_row_max, flash_row_max)\n"
+        if track_true_row_max
+        else ""
+    )
+    true_row_max_init = (
+        "\n        flash_true_row_max = cutlass.Float32(-cutlass.Float32.inf)"
+        if track_true_row_max
+        else ""
+    )
+    if track_true_row_max:
+        assert cfg.rescale_threshold > 0.0 and not two_rows and not one_pass
     if cfg.rescale_threshold > 0.0:
-        alpha_pre = f"""            flash_acc_log = _flash_scale_log2 * (flash_old_row_max - flash_row_max_safe)
+        alpha_pre = f"""{true_row_max_update}            flash_acc_log = _flash_scale_log2 * (flash_old_row_max - flash_row_max_safe)
             flash_alpha = cute.math.exp2(flash_acc_log, fastmath=True)
             if ({has_previous_o}) & (flash_acc_log >= -{cfg.rescale_threshold}):
                 flash_row_max = flash_old_row_max
@@ -15443,10 +15478,10 @@ def _flash_ws_consumer_body(
 
     consumer_iter = _step(score_transform)
     consumer_iter_below = _step(score_transform_below)
-    state_init = """        flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
+    state_init = f"""        flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
         flash_row_sum = cutlass.Float32(0.0)
         flash_s_idx = cutlass.Int32(0)
-        flash_o_started = cutlass.Boolean(False)"""
+        flash_o_started = cutlass.Boolean(False){true_row_max_init}"""
     inv_sum_init = _flash_ws_inv_sum_source(score_plan)
     if two_rows:
         # 64-row tiles: each consumer thread owns two rows (r and r+8) of the
@@ -15631,7 +15666,7 @@ def _flash_ws_consumer_body(
     return f"""        flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
         flash_row_sum = cutlass.Float32(0.0)
         flash_s_idx = cutlass.Int32(0)
-        flash_o_started = cutlass.Boolean(False)
+        flash_o_started = cutlass.Boolean(False){true_row_max_init}
 {range_prelude}{loop_header}{consumer_iter}{lse_store}
 
         flash_o_full = flash_mma_o_cons.wait_and_advance()
@@ -15839,9 +15874,13 @@ def emit_flash_ws_device_body(
     flex_words_pairs: int | None = None,
     tensor_4d_heads: int = 0,
     flex_item_table: str | None = None,
+    row_max_scale: float | None = None,
 ) -> list[ast.stmt]:
     """Stage-4 device body: 2-warpgroup producer/consumer split with a
     double-buffered S TMEM accumulator (S0 @ col 0, S1 @ col 128, O @ col 256).
+
+    ``row_max_scale``: the flex row-max store beside the LSE
+    (``AttentionScorePlan.row_max_scale``; the cooperative pair's list walk).
 
     Launch is ``block=(256, 1, 1)``: warp 0 = producer (Q/K/V TMA ring + both
     tcgen05 MMAs), warp 1 = TMEM owner (allocates at entry, frees at the end),
@@ -16126,6 +16165,18 @@ tOsO_epi = flash_o_gmem_thr.partition_S(sO)"""
     if one_pass:
         assert two_rows and num_kv == 2 and kv_stage >= 2 and dense_tiles
         assert not score_plan.modifiers and row_epilogue is None
+    # The flex row-max store (the list walk's one-row tiles): a pinned row
+    # max (``rescale_threshold``) may lag the true one, which the consumer
+    # then tracks apart (``flash_true_row_max``) for the store.
+    track_true_row_max = False
+    row_max_kwargs: dict[str, Any] = {}
+    if row_max_scale is not None:
+        assert has_lse and list_walk and not two_rows
+        track_true_row_max = cfg.rescale_threshold > 0.0
+        row_max_kwargs = {
+            "row_max_scale": row_max_scale,
+            "true_row_max": "flash_true_row_max" if track_true_row_max else None,
+        }
     if not has_lse:
         ws_lse_store = ""
     elif two_rows:
@@ -16155,6 +16206,7 @@ tOsO_epi = flash_o_gmem_thr.partition_S(sO)"""
                 "flash_bh",
                 "            ",
                 lse_scale=score_plan.lse_scale,
+                **row_max_kwargs,
             )
         )
     else:
@@ -16163,6 +16215,7 @@ tOsO_epi = flash_o_gmem_thr.partition_S(sO)"""
             "flash_bh",
             "        ",
             lse_scale=score_plan.lse_scale,
+            **row_max_kwargs,
         )
     # TMEM copy atoms over the score/probability tiles. M=128 accumulators read
     # one row per thread (32x32b); M=64 accumulators keep 16 rows per lane
@@ -16665,6 +16718,7 @@ else:
         staged_store=staged_store,
         early_teardown=early_teardown,
         lse_store=ws_lse_store,
+        track_true_row_max=track_true_row_max,
         two_rows=two_rows,
         aux_smem_staging=aux_smem_staging,
         one_pass=one_pass,
@@ -18592,6 +18646,8 @@ class FlashBodyContext:
     hd: int
     tensor_4d_heads: int
     v_storage_k_major: bool
+    # The flex row-max store beside the LSE (``AttentionScorePlan.row_max_scale``).
+    row_max_scale: float | None
     # Derived by the body and _fa4_softmax_facts, in the order the body reaches them.
     hd_v: int = dataclasses.field(init=False)
     asymmetric_kv_ring: bool = dataclasses.field(init=False)
@@ -18621,6 +18677,8 @@ class FlashBodyContext:
     flex_dead_split: bool = dataclasses.field(init=False)
     flex_kv_split: int = dataclasses.field(init=False)
     flex_tail_k: int = dataclasses.field(init=False)
+    track_true_row_max: bool = dataclasses.field(init=False)
+    unpin_last_step: bool = dataclasses.field(init=False)
     segment_tiling: bool = dataclasses.field(init=False)
     use_tmem_row_reduce: bool = dataclasses.field(init=False)
     causal_desc_kv: bool = dataclasses.field(init=False)
@@ -19012,7 +19070,11 @@ def _mma_commit_o_ready(ctx: FlashBodyContext, stage: str) -> str:
 # emits the prior block byte-identically.
 # Stage-parameterized, so one definition covers both softmax warpgroups (0/1).
 def _disc_alpha_blocks_for(
-    ctx: FlashBodyContext, not_first: str, *, known_not_first: bool = False
+    ctx: FlashBodyContext,
+    not_first: str,
+    *,
+    known_not_first: bool = False,
+    last_step: tuple[str, str] | None = None,
 ) -> tuple[str, str]:
     if ctx.cfg.rescale_threshold > 0.0:
         pin_condition = (
@@ -19020,7 +19082,24 @@ def _disc_alpha_blocks_for(
             if known_not_first
             else f"({not_first}) & (flash_acc_log >= -{ctx.cfg.rescale_threshold})"
         )
+        # The flex row-max store's true max: every step's unpinned max;
+        # ``last_step`` (the walk's (last, not last) step tests) unpins
+        # the split renders' last step.
+        true_max = (
+            "            flash_true_row_max = cute.arch.fmax(flash_true_row_max, flash_row_max)\n"
+            if ctx.track_true_row_max
+            else ""
+        )
+        if ctx.unpin_last_step:
+            assert last_step is not None
+            last, not_last = last_step
+            true_max += f"""            if ({last}) & (flash_true_row_max > flash_row_max):
+                flash_row_max = flash_true_row_max
+                flash_row_max_safe = flash_true_row_max
+"""
+            pin_condition = f"({pin_condition}) & ({not_last})"
         if ctx.defer_causal_minus_scale:
+            assert not ctx.track_true_row_max
             return (
                 f"""            flash_acc_log = _flash_scale_log2 * (flash_old_row_max - flash_row_max_safe)
             flash_alpha = cute.math.exp2(flash_acc_log, fastmath=True)
@@ -19031,7 +19110,7 @@ def _disc_alpha_blocks_for(
                 "            flash_minus_max_scale = (0.0 - flash_row_max_safe) * _flash_scale_log2",
             )
         return (
-            f"""            flash_acc_log = _flash_scale_log2 * (flash_old_row_max - flash_row_max_safe)
+            f"""{true_max}            flash_acc_log = _flash_scale_log2 * (flash_old_row_max - flash_row_max_safe)
             flash_alpha = cute.math.exp2(flash_acc_log, fastmath=True)
             if {pin_condition}:
                 flash_row_max = flash_old_row_max
@@ -19263,6 +19342,12 @@ def _flex_tail_softmax_merge(ctx: FlashBodyContext, stage: str) -> str:
     rank_index = f"{2 * bank} + ({group_index}) * {k} + flash_split_sid"
     lane_zero = "(flash_local_tidx & cutlass.Int32(31)) == 0"
     all_bits = (1 << k) - 1
+    # The flex row-max store beside the merged LSE.
+    row_max_args = (
+        ""
+        if ctx.row_max_scale is None
+        else f", row_max_out=_flash_mRowMax, row_max_scale={ctx.row_max_scale!r}"
+    )
 
     def merge(slice_expr: str, indent: str) -> list[str]:
         return [
@@ -19273,7 +19358,7 @@ def _flex_tail_softmax_merge(ctx: FlashBodyContext, stage: str) -> str:
             f"{indent}    flash_m_tile{stage} * 128, {live}),), {o_row_stride},",
             f"{indent}    {'_flash_mLSE' if ctx.has_lse else 'None'}, {_stage_bh(ctx, stage)}, flash_local_tidx,",
             f"{indent}    {slice_expr}, {k}, {ctx.hd_v}, {ctx.cfg.corr_tile_size}, {ctx.io_dtype},",
-            f"{indent}    _flash_scale_log2, {ctx.score_plan.lse_scale!r}, {tile_elems})",
+            f"{indent}    _flash_scale_log2, {ctx.score_plan.lse_scale!r}, {tile_elems}{row_max_args})",
         ]
 
     body = [
@@ -19840,9 +19925,14 @@ def _flex_softmax_body(
     )
     if pre_loop_fill:
         loop = f"{pre_loop_fill}\n{loop}"
+    true_row_max_init = (
+        "        flash_true_row_max = cutlass.Float32(-cutlass.Float32.inf)\n"
+        if ctx.track_true_row_max
+        else ""
+    )
     return f"""{item_prelude}        flash_row_max = cutlass.Float32(-cutlass.Float32.inf)
         flash_row_sum = cutlass.Float32(0.0)
-{loop}
+{true_row_max_init}{loop}
 {corr_publish_rowsum}"""
 
 
@@ -20298,6 +20388,21 @@ def _softmax_inner(
     # bodies (the target policy's packed exp2 / resident lowerings) stay
     # on the output-only surface (``dense_target_lowering_applies``).
     assert not (ctx.has_lse and ctx.effective_probability_log2_shift)
+    # The flex row-max store beside the LSE (the softmax's own final
+    # statistics: the true max when the pinned one may lag it).
+    softmax_row_max_kwargs: dict[str, Any] = (
+        {}
+        if ctx.row_max_scale is None
+        else {
+            "row_max_scale": ctx.row_max_scale,
+            # (The split renders' last step leaves the row max exact.)
+            "true_row_max": (
+                "flash_true_row_max"
+                if ctx.track_true_row_max and not ctx.unpin_last_step
+                else None
+            ),
+        }
+    )
     if ctx.has_lse and (ctx.segment_tiling or ctx.ragged_m):
         # Global row of this thread's segment-relative row; the rows past
         # the segment end (or the query length) are not this item's.
@@ -20311,6 +20416,7 @@ def _softmax_inner(
                 "flash_bh",
                 "            ",
                 lse_scale=ctx.score_plan.lse_scale,
+                **softmax_row_max_kwargs,
             )
         )
     elif ctx.has_lse:
@@ -20319,6 +20425,7 @@ def _softmax_inner(
             _stage_bh(ctx, stage),
             "        ",
             lse_scale=ctx.score_plan.lse_scale,
+            **softmax_row_max_kwargs,
         )
     else:
         lse_store = ""
@@ -20358,6 +20465,7 @@ def _softmax_inner(
                 lse_scale=ctx.score_plan.lse_scale,
                 row_max="(-cutlass.Float32.inf)",
                 row_sum="cutlass.Float32(0.0)",
+                row_max_scale=ctx.row_max_scale,
             )
             if ctx.ragged_m:
                 dead_lse = (
@@ -20570,6 +20678,12 @@ def _softmax_inner(
                 ctx,
                 segment.not_first_condition,
                 known_not_first=segment.continues_previous_segment,
+                last_step=(
+                    f"{segment.loop_var} == {segment.loop_bound} - cutlass.Int32(1)",
+                    f"{segment.loop_var} != {segment.loop_bound} - cutlass.Int32(1)",
+                )
+                if ctx.unpin_last_step
+                else None,
             )
             # ``tile_epilogue`` (the flex hook's cross-tile prefetch fill)
             # runs after PASS1 on every step, computed or not, ahead of
@@ -21765,6 +21879,7 @@ def _corr_epi_dead_split(
                     lse_scale=ctx.score_plan.lse_scale,
                     row_max="flash_flex_mm",
                     row_sum="flash_flex_L",
+                    row_max_scale=ctx.row_max_scale,
                 )
             )
         return f"""        _helion_flash_rt.named_barrier_wait_unaligned(
@@ -22196,7 +22311,7 @@ def _corr_epi_kv_split(
         f"    {store_args})",
     ]
     if ctx.has_lse:
-        store.append(
+        store.extend(
             _flash_lse_store(
                 f"flash_m_tile{stage} * 128 + flash_local_tidx",
                 _stage_bh(ctx, stage),
@@ -22204,7 +22319,10 @@ def _corr_epi_kv_split(
                 lse_scale=ctx.score_plan.lse_scale,
                 row_max="flash_split_mm",
                 row_sum="flash_split_L",
-            ).strip("\n")
+                row_max_scale=ctx.row_max_scale,
+            )
+            .strip("\n")
+            .split("\n")
         )
     if ctx.ragged_m:
         merge.append(f"    if flash_local_tidx < flash_live_rows{stage}:")
@@ -24478,6 +24596,7 @@ def emit_flash_fa4_device_body(
     flex_tail_split: int = 0,
     flex_tail_items_ws: int = 0,
     v_storage_k_major: bool = False,
+    row_max_scale: float | None = None,
 ) -> list[ast.stmt]:
     """FA4-topology device body: faithful transcription of the validated 16-warp /
     512-thread spike kernel (sp single-pass softmax body), adapted for Helion's
@@ -24548,6 +24667,7 @@ def emit_flash_fa4_device_body(
         hd=head_dim,
         tensor_4d_heads=tensor_4d_heads,
         v_storage_k_major=v_storage_k_major,
+        row_max_scale=row_max_scale,
     )
     ctx.hd_v = head_dim if head_dim_v is None else head_dim_v
     ctx.asymmetric_kv_ring = ctx.hd_v != ctx.hd
@@ -24721,6 +24841,26 @@ def emit_flash_fa4_device_body(
         assert ctx.cfg.stat_transport not in ("single", "single_final")
         assert _flash_bool_env("HELION_CUTE_FLASH_SCOPED_CORR_EPI", True)
         assert _flash_bool_env("HELION_CUTE_FLASH_SPLIT_CORR_EPILOGUE_HANDOFF", True)
+    # The flex row-max store (``row_max_scale``), beside every LSE store.
+    # The softmax's pinned row max (``rescale_threshold``) may lag the true
+    # one by up to the threshold, so the softmax keeps the true max apart
+    # (``flash_true_row_max``, one FMNMX per step) and the softmax warps'
+    # stores store it.  The merges of the split renders (split-KV, the tail
+    # split, the dead-stage split) fold the row max each unit and stage
+    # publishes with its statistics, so there the walk's last step unpins
+    # (``unpin_last_step``): the published max advances to the true one,
+    # rescaling the output once if it lagged.  (A true max stashed beside
+    # the statistics instead cost the merging warp its batch of partial
+    # loads -- two more live registers in the 64-register correction warps
+    # -- about 2% on a small split-KV kernel against under 1% here.)
+    ctx.track_true_row_max = False
+    ctx.unpin_last_step = False
+    if ctx.row_max_scale is not None:
+        assert ctx.has_lse and ctx.flex_body
+        ctx.track_true_row_max = ctx.cfg.rescale_threshold > 0.0
+        ctx.unpin_last_step = ctx.track_true_row_max and (
+            ctx.flex_dead_split or ctx.flex_kv_split > 1 or ctx.flex_tail_k > 1
+        )
     if ctx.pruned_interval:
         assert ctx.score_plan.has_contiguous_kv_interval
         assert not ctx.cfg.use_2cta_instrs
@@ -26772,6 +26912,11 @@ _FLASH_LSE_KERNEL_PARAMS = [
     "_flash_mLSE",
 ]
 
+# The flex row-max store beside the LSE (the same ``(seq, batch)`` view).
+_FLASH_ROW_MAX_KERNEL_PARAMS = [
+    "_flash_mRowMax",
+]
+
 _FLASH_BIAS_KERNEL_PARAMS = [
     "_flash_mBias",
     "_flash_score_bias_scale",
@@ -26881,6 +27026,9 @@ class FlashTensorPlan(NamedTuple):
     scale_arg_name: str | None = None
     # Strided flex operands (``FlashGraphOutputPlan.operand_strides``).
     operand_strides: tuple[tuple[int, ...], ...] | None = None
+    # The flex row-max output (``FlashGraphOutputPlan.row_max_name``), the
+    # LSE's geometry; only with ``lse_arg``.
+    row_max_arg: TensorArg | None = None
 
     @property
     def value_head_dim(self) -> int:
@@ -26893,9 +27041,10 @@ def _flash_flex_tensor_plan(
     """Bind the operands of a matched flex kernel to ``TensorArg``s.
 
     Q/O are ``[B, H, M, D]`` / ``[B, H, M, Dv]``, K/V ``[B, H // g, N, D]`` /
-    ``[B, H // g, N, Dv]`` (contiguous), the LSE ``[B, H, M]`` fp32, the
-    tables int32 with the matched ``(Bm, Hm, R)`` geometry (any strides) and
-    the aux tensors exactly as the plan captured them.
+    ``[B, H // g, N, Dv]`` (contiguous), the LSE and the row max ``[B, H, M]``
+    fp32 (contiguous), the tables int32 with the matched ``(Bm, Hm, R)``
+    geometry (any strides) and the aux tensors exactly as the plan captured
+    them.
     """
     from ..host_function import HostFunction
     from .flex_match import flex_host_scalar_device_name
@@ -26916,6 +27065,8 @@ def _flash_flex_tensor_plan(
     ]
     if match.lse_name is not None:
         required.append(match.lse_name)
+    if match.row_max_name is not None:
+        required.append(match.row_max_name)
     host_tensors = _flash_graph_host_tensors(df.codegen.codegen_graphs)
     if any(name not in host_tensors for name in required):
         return None
@@ -26959,16 +27110,19 @@ def _flash_flex_tensor_plan(
             or flex_operand_strides(value) != expected_strides
         ):
             return None
-    lse_arg = None
-    if match.lse_name is not None:
-        lse_arg = args[match.lse_name]
-        value = lse_arg.fake_value
-        if (
-            tuple(int(size) for size in value.shape) != (batch, heads, match.q_seq)
-            or value.dtype != torch.float32
-            or not value.is_contiguous()
-        ):
-            return None
+    row_args: list[TensorArg | None] = []
+    for row_name in (match.lse_name, match.row_max_name):
+        row_arg = None if row_name is None else args[row_name]
+        if row_arg is not None:
+            value = row_arg.fake_value
+            if (
+                tuple(int(size) for size in value.shape) != (batch, heads, match.q_seq)
+                or value.dtype != torch.float32
+                or not value.is_contiguous()
+            ):
+                return None
+        row_args.append(row_arg)
+    lse_arg, row_max_arg = row_args
     rows = int(args[walk.part_cnt_name].fake_value.shape[2])
     for index, name in enumerate(graph_plan.kv_walk_names):
         value = args[name].fake_value
@@ -27035,6 +27189,7 @@ def _flash_flex_tensor_plan(
         flex_scalar_arg_names=tuple(scalar_arg_names),
         scale_arg_name=scale_arg_name,
         operand_strides=match.operand_strides,
+        row_max_arg=row_max_arg,
     )
 
 
@@ -27366,6 +27521,7 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
     q_arg, k_arg, v_arg, o_arg = plan.q_arg, plan.k_arg, plan.v_arg, plan.o_arg
     output_epilogue = plan.output_epilogue
     lse_arg = plan.lse_arg
+    row_max_arg = plan.row_max_arg
     bias_args = plan.bias_args
     alibi_args = plan.alibi_args
     document_args = plan.document_args
@@ -27407,6 +27563,17 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         return False
     if lse_arg is not None and batch * seq > 1 << 31:
         return False
+    # The flex row-max store: beside the LSE, from the same final statistics
+    # (the matcher requires the LSE store with it).
+    row_max_scale: float | None = None
+    if row_max_arg is not None:
+        if (
+            lse_arg is None
+            or score_plan.row_max_scale is None
+            or not score_plan.flex_envelope
+        ):
+            return False
+        row_max_scale = score_plan.row_max_scale
 
     scale_log2 = score_plan.qk_scale_log2
     # The flex envelope's query and K/V lengths may differ and need not be
@@ -27591,6 +27758,14 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         # stays in the config; this size-dependent choice is the emitter's.
         cfg = dataclasses.replace(cfg, epi_tma=False, epi_stg=True)
     if _flash_output_requires_tma(batch, seq, head_dim_v) and not cfg.epi_tma:
+        return False
+    if row_max_arg is not None and not (
+        (cfg.topology == "fa4" and not cfg.alternating_warpgroups)
+        or (cfg.topology == "ws_overlap" and cfg.use_2cta_instrs and cfg.s_stage == 2)
+    ):
+        # The row-max store exists in the bodies of the flex envelope (the
+        # fa4 pair body and the single-tile body's cooperative pair), the
+        # families the resolver pins every flex plan to.
         return False
     if head_dim_v != head_dim and (
         cfg.topology != "fa4"
@@ -27918,6 +28093,8 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         wrapper_plan["use_pdl"] = True
     if lse_arg is not None:
         wrapper_plan["lse_name"] = lse_arg.name
+    if row_max_arg is not None:
+        wrapper_plan["row_max_name"] = row_max_arg.name
     if tensor_biases:
         bias_arg = bias_args[0]
         bias_modifier = tensor_biases[0]
@@ -28121,6 +28298,8 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         df.wrapper_only_params.extend(_FLASH_FLEX_TAIL_KERNEL_PARAMS)
     if lse_arg is not None:
         df.wrapper_only_params.extend(_FLASH_LSE_KERNEL_PARAMS)
+    if row_max_arg is not None:
+        df.wrapper_only_params.extend(_FLASH_ROW_MAX_KERNEL_PARAMS)
     if tensor_biases:
         df.wrapper_only_params.extend(_FLASH_BIAS_KERNEL_PARAMS)
         if cfg.bias_stage == "tma":
@@ -28167,6 +28346,8 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
     df.placeholder_args.update((q_arg.name, k_arg.name, v_arg.name, o_arg.name))
     if lse_arg is not None:
         df.placeholder_args.add(lse_arg.name)
+    if row_max_arg is not None:
+        df.placeholder_args.add(row_max_arg.name)
     for bias_arg in bias_args:
         df.placeholder_args.add(bias_arg.name)
     for alibi_arg in alibi_args:
@@ -28201,8 +28382,10 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
                 flex_item_table=flex_item_table,
                 output_epilogue=output_epilogue,
                 row_epilogue=row_emit,
+                row_max_scale=row_max_scale,
             ).statements
         else:
+            assert row_max_arg is None
             df.body = emit_flash_body(
                 df,
                 head_dim=head_dim,
@@ -28215,6 +28398,7 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
                 row_epilogue=row_emit,
             ).statements
     elif cfg.topology == "fa4" and cfg.alternating_warpgroups:
+        assert row_max_arg is None
         emit_flash_alt_module_statements(cg)
         df.cute_state.flash.threads = 512
         alt_exp2 = _flash_disc_exp2_codegen_params(
@@ -28278,6 +28462,7 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
             flex_tail_split=flex_tail_split,
             flex_tail_items_ws=flex_tail_items_ws,
             v_storage_k_major=plan.v_storage_k_major,
+            row_max_scale=row_max_scale,
         ).statements
     else:
         raise ValueError(f"unknown flash attention topology: {cfg.topology!r}")

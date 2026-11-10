@@ -110,6 +110,7 @@ from .lane_fold import LaneArrayBudget
 from .lane_fold import LaneJam
 from .lane_fold import const_extent
 from .lane_fold import folded_lanes
+from .msl_expr import PURE_CALLS
 from .msl_reduction import REDUCTION_NAMESPACE
 from .reduction import alloc_threadgroup_buffer
 
@@ -4235,7 +4236,11 @@ def _distribute_lane_loop(
             if (
                 assigned is not None
                 and assigned[0] not in names_read(assigned[1])
-                and not any(isinstance(x, ast.Call) for x in ast.walk(assigned[1]))
+                and not any(
+                    isinstance(x, ast.Call)
+                    and not (isinstance(x.func, ast.Name) and x.func.id in PURE_CALLS)
+                    for x in ast.walk(assigned[1])
+                )
             ):
                 pure[assigned[0]] = s
         elif (

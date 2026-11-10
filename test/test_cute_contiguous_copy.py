@@ -196,9 +196,9 @@ def _evaluate_copy(
             Float32=float,
             range=lambda n, unroll: range(n),
         ),
+        "_cute_cp_async_shared_global": cp_async,
         "cute": SimpleNamespace(
             crd2idx=_index,
-            arch=SimpleNamespace(cp_async_shared_global=cp_async),
             assume=assume,
             AddressSpace=SimpleNamespace(gmem="gmem"),
             nvgpu=SimpleNamespace(

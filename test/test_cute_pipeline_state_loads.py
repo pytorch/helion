@@ -250,7 +250,7 @@ def test_pipelines_exact_private_vector_state_region() -> None:
     result = _transform()
 
     assert "cutlass.Array(cutlass.Uint16, 10240" in result
-    assert result.count("cute.arch.cp_async_shared_global(") == 3
+    assert result.count("_cute_cp_async_shared_global(") == 3
     assert result.count("cute.arch.cp_async_commit_group()") == 3
     assert result.count("cute.arch.cp_async_wait_group(") == 4
     assert "cute.arch.cp_async_wait_group(2)" in result
@@ -324,7 +324,7 @@ def test_noncanonical_or_nonliteral_row_loop_is_not_unrolled(
 
 
 def test_canonical_vector_type_is_admitted() -> None:
-    assert "cute.arch.cp_async_shared_global(" in _transform()
+    assert "_cute_cp_async_shared_global(" in _transform()
 
 
 @pytest.mark.parametrize(
@@ -357,7 +357,7 @@ def test_codegen_requires_sm80_or_newer(
 
 
 def test_codegen_accepts_sm80() -> None:
-    assert "cute.arch.cp_async_shared_global(" in _transform(
+    assert "_cute_cp_async_shared_global(" in _transform(
         target_device_capability=(8, 0)
     )
 
@@ -426,7 +426,7 @@ def test_cache_specialized_runtime_disjointness_proof_is_consumed() -> None:
         proven_disjoint_tensor_pairs={frozenset(("state", "other"))},
     )
 
-    assert "cute.arch.cp_async_shared_global(" in result
+    assert "_cute_cp_async_shared_global(" in result
 
 
 def test_runtime_alias_reclassification_cannot_reuse_disjoint_plan() -> None:
@@ -443,8 +443,8 @@ def test_runtime_alias_reclassification_cannot_reuse_disjoint_plan() -> None:
         proven_disjoint_tensor_pairs=set(),
     )
 
-    assert "cute.arch.cp_async_shared_global(" in disjoint
-    assert "cute.arch.cp_async_shared_global(" not in overlapping
+    assert "_cute_cp_async_shared_global(" in disjoint
+    assert "_cute_cp_async_shared_global(" not in overlapping
 
 
 @pytest.mark.parametrize(
@@ -497,8 +497,8 @@ def test_async_pointer_drops_statically_true_vector_column_bounds() -> None:
         node
         for node in ast.walk(module)
         if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "cp_async_shared_global"
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_cute_cp_async_shared_global"
     ]
 
     assert len(async_calls) == 3
@@ -555,8 +555,8 @@ def test_sibling_branch_column_aliases_still_strip_bounds() -> None:
         node
         for node in ast.walk(module)
         if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "cp_async_shared_global"
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_cute_cp_async_shared_global"
     ]
 
     assert len(async_calls) == 3
@@ -626,7 +626,7 @@ def test_row_partition_accepts_block_and_launch_uniform_base() -> None:
         uniform_names=frozenset(("state_size", "tile_base")),
     )
 
-    assert "cute.arch.cp_async_shared_global(" in result
+    assert "_cute_cp_async_shared_global(" in result
 
 
 @pytest.mark.parametrize("exit_statement", ("return", "raise RuntimeError"))
@@ -643,7 +643,7 @@ def test_prefetch_prologue_does_not_cross_an_early_exit(
         uniform_names=frozenset(("state_size", "stop")),
     )
 
-    assert "cute.arch.cp_async_shared_global(" in result
+    assert "_cute_cp_async_shared_global(" in result
     assert result.index("if stop:") < result.index("independent = expensive_prepare()")
     assert result.index("independent = expensive_prepare()") < result.index(
         "_async_state_0_row_thread ="
@@ -661,7 +661,7 @@ def test_pointer_dependencies_dominate_the_prefetch_prologue() -> None:
     )
     result = _transform(source)
 
-    assert "cute.arch.cp_async_shared_global(" in result
+    assert "_cute_cp_async_shared_global(" in result
     assert result.index("state_head = cutlass.Int32(head)") < result.index(
         "_async_state_0_row_thread ="
     )
@@ -811,7 +811,7 @@ def test_immutable_uniform_scalar_tensor_load_mask_is_admitted() -> None:
         proven_tensor_stride_values=_scalar_index_strides(),
     )
 
-    assert "cute.arch.cp_async_shared_global(" in result
+    assert "_cute_cp_async_shared_global(" in result
 
 
 @pytest.mark.parametrize(
@@ -953,7 +953,7 @@ def test_earlier_immutable_pointer_alias_is_admitted() -> None:
         1,
     )
 
-    assert "cute.arch.cp_async_shared_global(" in _transform(source)
+    assert "_cute_cp_async_shared_global(" in _transform(source)
 
 
 def test_column_partition_does_not_capture_a_later_rebinding() -> None:
@@ -1333,7 +1333,7 @@ def test_scalar_pair_preload_requires_cache_specialized_base_alignment() -> None
         uniform_names=frozenset(("state_size", "aux_size")),
     )
 
-    assert "cute.arch.cp_async_shared_global(" in result
+    assert "_cute_cp_async_shared_global(" in result
     assert "_async_state_0_scalar_pairs" not in result
 
 
@@ -1502,7 +1502,7 @@ def test_scalar_pair_parity_uses_assignment_time_reaching_definitions() -> None:
         uniform_names=frozenset(("state_size", "aux_size", "selector")),
     )
 
-    assert "cute.arch.cp_async_shared_global(" in result
+    assert "_cute_cp_async_shared_global(" in result
     assert "_async_state_0_scalar_pairs" not in result
 
 
@@ -1527,7 +1527,7 @@ def test_scalar_pair_parity_rejects_a_rebound_constexpr_name() -> None:
         uniform_names=frozenset(("state_size", "aux_size", "_AUX_TILE")),
     )
 
-    assert "cute.arch.cp_async_shared_global(" in result
+    assert "_cute_cp_async_shared_global(" in result
     assert "_async_state_0_scalar_pairs" not in result
 
 
@@ -1548,7 +1548,7 @@ def test_scalar_pair_parity_does_not_treat_untyped_uniform_as_integer() -> None:
         uniform_names=frozenset(("state_size", "aux_size", "scale")),
     )
 
-    assert "cute.arch.cp_async_shared_global(" in result
+    assert "_cute_cp_async_shared_global(" in result
     assert "_async_state_0_scalar_pairs" not in result
 
 
@@ -1578,7 +1578,7 @@ def test_scalar_pair_address_rejects_loop_carried_alias_snapshot() -> None:
         uniform_names=frozenset(("state_size", "aux_size")),
     )
 
-    assert "cute.arch.cp_async_shared_global(" in result
+    assert "_cute_cp_async_shared_global(" in result
     assert "_async_state_0_scalar_pairs" not in result
 
 
@@ -1599,7 +1599,7 @@ def test_scalar_pair_preload_does_not_cross_an_unknown_effect() -> None:
         uniform_names=frozenset(("state_size", "aux_size")),
     )
 
-    assert "cute.arch.cp_async_shared_global(" in result
+    assert "_cute_cp_async_shared_global(" in result
     assert "_async_state_0_scalar_pairs" not in result
 
 
@@ -1620,7 +1620,7 @@ def test_scalar_pair_preload_does_not_cross_a_runtime_division_trap() -> None:
         uniform_names=frozenset(("state_size", "aux_size", "divisor")),
     )
 
-    assert "cute.arch.cp_async_shared_global(" in result
+    assert "_cute_cp_async_shared_global(" in result
     assert "_async_state_0_scalar_pairs" not in result
 
 
@@ -1652,7 +1652,7 @@ def test_scalar_pair_preload_uses_loop_local_divisor_reaching_definition() -> No
         uniform_names=frozenset(("state_size", "aux_size", "divisor")),
     )
 
-    assert "cute.arch.cp_async_shared_global(" in result
+    assert "_cute_cp_async_shared_global(" in result
     assert "_async_state_0_scalar_pairs" not in result
 
 
@@ -1672,7 +1672,7 @@ def test_scalar_pair_preload_rejects_runtime_division_in_matched_mask() -> None:
         uniform_names=frozenset(("state_size", "aux_size")),
     )
 
-    assert "cute.arch.cp_async_shared_global(" in result
+    assert "_cute_cp_async_shared_global(" in result
     assert "_async_state_0_scalar_pairs" not in result
 
 
@@ -1739,7 +1739,7 @@ def test_scalar_pair_preload_rejects_shift_stride_dtype_and_mask_variants(
         uniform_names=frozenset(("state_size", "aux_size")),
     )
 
-    assert "cute.arch.cp_async_shared_global(" in result
+    assert "_cute_cp_async_shared_global(" in result
     assert "_async_state_0_scalar_pairs" not in result
 
 
@@ -1755,7 +1755,7 @@ def test_scalar_pair_preload_requires_source_disjoint_from_every_tensor() -> Non
         uniform_names=frozenset(("state_size", "aux_size")),
     )
 
-    assert "cute.arch.cp_async_shared_global(" in result
+    assert "_cute_cp_async_shared_global(" in result
     assert "_async_state_0_scalar_pairs" not in result
 
 
@@ -1803,7 +1803,7 @@ def test_scalar_pair_preload_rejects_alias_store_escape_and_nonidentical_sites(
         uniform_names=frozenset(("state_size", "aux_size")),
     )
 
-    assert "cute.arch.cp_async_shared_global(" in result
+    assert "_cute_cp_async_shared_global(" in result
     assert "_async_state_0_scalar_pairs" not in result
 
 

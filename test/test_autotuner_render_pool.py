@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import contextlib
+import gc
 import logging
 import multiprocessing as mp
 import multiprocessing.context
 import operator
 import os
+import pickle
 import tempfile
+import threading
 import time
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -14,6 +18,7 @@ from unittest.mock import Mock
 from unittest.mock import patch
 import zlib
 
+import pytest
 import torch
 
 import helion
@@ -21,20 +26,29 @@ from helion._compiler.backend import autotune_precompile_mode
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import onlyBackends
+from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion.autotuner import DifferentialEvolutionSearch
 from helion.autotuner import PatternSearch
 from helion.autotuner import benchmark_provider as benchmark_provider_module
+from helion.autotuner import precompile_future as precompile_future_module
+from helion.autotuner import process_utils
 from helion.autotuner import render_pool
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.logger import AutotuningLogger
+from helion.autotuner.precompile_future import PrecompileFuture
+from helion.autotuner.process_utils import isolate_forked_worker
+from helion.autotuner.process_utils import start_without_collection
 from helion.autotuner.render_pool import CudaDeviceFacts
 from helion.autotuner.render_pool import RenderAhead
 import helion.language as hl
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from typing_extensions import Self
+
+    from helion.autotuner.render_pool import RenderFuture
 
 
 def _make_bound(**settings: object) -> tuple[object, tuple[torch.Tensor, torch.Tensor]]:
@@ -89,6 +103,110 @@ def _probe_device_facts(facts: CudaDeviceFacts, conn: object) -> None:
     os._exit(0)
 
 
+def _exit_holding_tqdm_locks(tqdm_std: object) -> None:
+    """Fork target: a worker that dies inside tqdm's critical section, through
+    the class lock and through a default lock it builds."""
+    isolate_forked_worker()
+    tqdm_std.tqdm.get_lock().acquire()  # pyrefly: ignore[missing-attribute]
+    tqdm_std.TqdmDefaultWriteLock().acquire()  # pyrefly: ignore[missing-attribute]
+    os._exit(0)
+
+
+def _report_inherited_start_state(conn: object) -> None:
+    """Fork target: whether collection is on and the start lock is free."""
+    lock_free = process_utils._start_without_collection_lock.acquire(timeout=5)
+    conn.send((gc.isenabled(), lock_free))  # pyrefly: ignore[missing-attribute]
+    os._exit(0)
+
+
+def _generate_code_collecting_garbage(
+    config: helion.Config, emit_repro_caller: bool
+) -> str:
+    """Stand-in for a render worker's code generation: the garbage collection
+    it may run into."""
+    gc.collect()
+    return "code"
+
+
+def _join(process: mp.process.BaseProcess, timeout: float) -> None:
+    """Join a forked test worker, killing it if it outlives ``timeout``."""
+    process.join(timeout)
+    if process.is_alive():
+        process.kill()
+        process.join()
+
+
+def _render_once(tmp: str) -> RenderFuture:
+    """Render one config in a forked render worker whose code generation
+    collects garbage (a stub kernel); the finished future."""
+    kernel = SimpleNamespace(
+        settings=SimpleNamespace(print_output_code=False),
+        to_triton_code=_generate_code_collecting_garbage,
+    )
+    pool = RenderAhead(
+        kernel,  # pyrefly: ignore[bad-argument-type]
+        [helion.Config()],
+        jobs=1,
+        timeout=60,
+        facts=None,
+        result_path=lambda: os.path.join(tmp, "render.pkl"),
+        log=Mock(),
+    )
+    try:
+        return pool.take(0)
+    finally:
+        pool.close()
+
+
+def _precompile_once(result_path: str) -> mp.process.BaseProcess:
+    """Run a fork-mode precompile worker whose precompiler collects garbage,
+    started by ``PrecompileFuture.start``; the exited process."""
+    process = mp.get_context("fork").Process(
+        target=precompile_future_module._run_kernel_in_subprocess_fork,
+        args=(gc.collect, helion.Config(), None, result_path, ""),
+    )
+    PrecompileFuture(
+        ctx=Mock(),
+        config=helion.Config(),
+        process=process,
+        timeout=60,
+        result_path=result_path,
+    ).start()
+    _join(process, 60)
+    return process
+
+
+def _render_all(
+    bound: object,
+    configs: list[helion.Config],
+    timeout: float,
+    each: Callable[[int, RenderFuture], None],
+) -> list[str]:
+    """Render ``configs`` in a pool of three workers, calling ``each`` with
+    every config's index and future in turn (between the pool's ``take``
+    calls, as the provider's streaming loop does); the files left in the
+    pool's result directory."""
+    facts = CudaDeviceFacts.capture(bound.env.device)  # pyrefly: ignore[missing-attribute]
+    assert facts is not None
+    with tempfile.TemporaryDirectory() as tmp:
+        counter = iter(range(10**6))
+        pool = RenderAhead(
+            bound,  # pyrefly: ignore[bad-argument-type]
+            configs,
+            jobs=3,
+            timeout=timeout,
+            facts=facts,
+            result_path=lambda: os.path.join(tmp, f"render_{next(counter)}.pkl"),
+            log=AutotuningLogger(bound.settings),  # pyrefly: ignore[missing-attribute]
+        )
+        try:
+            for index in range(len(configs)):
+                each(index, pool.take(index))
+        finally:
+            pool.close()
+        return os.listdir(tmp)
+
+
 class _RecordedPools:
     """``patch`` the provider's pool class to record every pool it builds."""
 
@@ -115,6 +233,143 @@ def _record_pools() -> _RecordedPools:
     return _RecordedPools()
 
 
+@contextlib.contextmanager
+def _parent_cuda_event_garbage() -> Iterator[None]:
+    """A recorded CUDA event in a garbage cycle, as benchmarking leaves behind,
+    kept from collection until the block exits so that a fork inherits it."""
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        torch.cuda.synchronize()
+        cycle: list[object] = [event]
+        cycle.append(cycle)
+        del event, cycle
+        yield
+    finally:
+        if enabled:
+            gc.enable()
+        gc.collect()
+
+
+@onlyBackends(["triton", "cute"])
+class TestForkedWorkerIsolation(TestCase):
+    """Forked autotune workers (CuTe renders, Triton precompiles) stay off the
+    parent state they share through the fork."""
+
+    def test_worker_dying_in_tqdm_lock_leaves_the_parent_lock_free(self) -> None:
+        tqdm_std = pytest.importorskip("tqdm.std")
+        # tqdm's default write lock includes a semaphore shared across the
+        # fork, which torch.fx takes during code generation. A fresh one
+        # stands in for it so that a leak cannot reach other tests.
+        shared = mp.get_context("fork").RLock()
+        self.addCleanup(tqdm_std.tqdm.set_lock, tqdm_std.tqdm.get_lock())
+        tqdm_std.tqdm.set_lock(shared)
+        default_mp_lock = patch.object(
+            tqdm_std.TqdmDefaultWriteLock, "mp_lock", shared, create=True
+        )
+        default_mp_lock.start()
+        self.addCleanup(default_mp_lock.stop)
+        process = mp.get_context("fork").Process(
+            target=_exit_holding_tqdm_locks, args=(tqdm_std,)
+        )
+        start_without_collection(process)
+        _join(process, 60)
+        self.assertEqual(process.exitcode, 0)
+        # The nightly b200 CuTe layer_norm autotune hung here: a worker died
+        # holding the lock and the parent's next code generation waited on it
+        # forever.
+        self.assertTrue(
+            shared.acquire(timeout=10), "a dead worker left tqdm's lock held"
+        )
+        shared.release()
+
+    @skipIfNotCUDA()
+    def test_render_worker_does_not_collect_the_parents_cuda_objects(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, _parent_cuda_event_garbage():
+            future = _render_once(tmp)
+        # Freeing the parent's event in the worker aborts it: its destructor
+        # switches devices, which fails in a forked process.
+        self.assertEqual((future.status, future.code), ("ok", "code"), future.error)
+
+    @skipIfNotCUDA()
+    def test_precompile_worker_does_not_collect_the_parents_cuda_objects(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp, _parent_cuda_event_garbage():
+            result_path = os.path.join(tmp, "result.pkl")
+            process = _precompile_once(result_path)
+            self.assertEqual(process.exitcode, 0)
+            with open(result_path, "rb") as f:
+                self.assertEqual(pickle.load(f), {"status": "ok"})
+
+    def test_workers_cannot_collect_before_their_isolation(self) -> None:
+        if not gc.isenabled():
+            gc.enable()
+            self.addCleanup(gc.disable)
+        parent_conn, child_conn = mp.get_context("fork").Pipe()
+        self.addCleanup(parent_conn.close)
+        self.addCleanup(child_conn.close)
+
+        def isolate_reporting() -> None:
+            # Whether collection is on when the worker starts and after its
+            # isolation, and whether the isolation froze the objects tracked
+            # so far.
+            at_start = gc.isenabled()
+            frozen = gc.get_freeze_count()
+            isolate_forked_worker()
+            child_conn.send((at_start, gc.isenabled(), gc.get_freeze_count() > frozen))
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(render_pool, "isolate_forked_worker", isolate_reporting),
+            patch.object(
+                precompile_future_module, "isolate_forked_worker", isolate_reporting
+            ),
+        ):
+            _render_once(tmp)
+            _precompile_once(os.path.join(tmp, "precompile.pkl"))
+        child_conn.close()
+        # Both workers have exited, so their states are in the pipe.
+        states = [parent_conn.recv() for _ in ("render", "precompile")]
+        self.assertTrue(gc.isenabled())
+        # Off from the fork to the freeze, so nothing inherited is collected in
+        # between; on afterwards for the worker's own objects.
+        self.assertEqual(states, [(False, True, True)] * 2)
+
+    def test_fork_by_another_thread_during_a_start_inherits_no_start_state(
+        self,
+    ) -> None:
+        if not gc.isenabled():
+            gc.enable()
+            self.addCleanup(gc.disable)
+        ctx = mp.get_context("fork")
+        inside, release = threading.Event(), threading.Event()
+        # A start that stays in progress until released: the lock held,
+        # collection off.
+        held = ctx.Process(target=os._exit, args=(0,))
+        held.start = lambda: (inside.set(), release.wait(60))
+        starter = threading.Thread(target=start_without_collection, args=(held,))
+        starter.start()
+        parent_conn, child_conn = ctx.Pipe()
+        self.addCleanup(parent_conn.close)
+        self.addCleanup(child_conn.close)
+        try:
+            self.assertTrue(inside.wait(60))
+            # Another thread's fork, not a worker of ours.
+            process = ctx.Process(
+                target=_report_inherited_start_state, args=(child_conn,)
+            )
+            process.start()
+            _join(process, 60)
+        finally:
+            release.set()
+            starter.join()
+        child_conn.close()
+        self.assertEqual(parent_conn.recv(), (True, True))
+
+
 @skipIfRefEager("Autotuning requires compilation, not supported in ref eager mode")
 @onlyBackends(["cute"])
 class TestRenderPool(TestCase):
@@ -123,31 +378,17 @@ class TestRenderPool(TestCase):
     def test_forked_renders_match_the_parent(self) -> None:
         bound, _args = _make_bound()
         configs = _configs(bound, 6)
-        facts = CudaDeviceFacts.capture(bound.env.device)  # pyrefly: ignore[missing-attribute]
-        self.assertIsNotNone(facts)
-        with tempfile.TemporaryDirectory() as tmp:
-            counter = iter(range(10**6))
-            pool = RenderAhead(
-                bound,  # pyrefly: ignore[bad-argument-type]
-                configs,
-                jobs=3,
-                timeout=120,
-                facts=facts,
-                result_path=lambda: os.path.join(tmp, f"render_{next(counter)}.pkl"),
-                log=AutotuningLogger(bound.settings),  # pyrefly: ignore[missing-attribute]
+
+        def check(index: int, future: RenderFuture) -> None:
+            self.assertEqual(future.status, "ok", future.error)
+            # The parent renders between takes: later workers fork from it.
+            self.assertEqual(
+                future.code,
+                bound.to_triton_code(configs[index]),  # pyrefly: ignore[missing-attribute]
             )
-            try:
-                for index, config in enumerate(configs):
-                    future = pool.take(index)
-                    self.assertEqual(future.status, "ok", future.error)
-                    self.assertEqual(
-                        future.code,
-                        bound.to_triton_code(config),  # pyrefly: ignore[missing-attribute]
-                    )
-                    self.assertGreater(future.elapsed, 0.0)
-            finally:
-                pool.close()
-            self.assertFalse(os.listdir(tmp))
+            self.assertGreater(future.elapsed, 0.0)
+
+        self.assertFalse(_render_all(bound, configs, timeout=120, each=check))
 
     def test_device_facts_answer_cuda_queries_in_a_forked_child(self) -> None:
         facts = CudaDeviceFacts.capture(DEVICE)
@@ -174,6 +415,39 @@ class TestRenderPool(TestCase):
         self.assertIn("refused", driver)
         with self.assertRaisesRegex(RuntimeError, "not captured"):
             facts.index(facts.current + 1000)
+
+    def test_renders_succeed_while_another_thread_holds_tqdm_lock(self) -> None:
+        tqdm_cls = pytest.importorskip("tqdm").tqdm
+        bound, _args = _make_bound()
+        configs = _configs(bound, 3)
+        # A thread lock, like the thread half of tqdm's default lock, held by
+        # another thread while the workers fork: their copies stay locked.
+        lock = threading.RLock()
+        self.addCleanup(tqdm_cls.set_lock, tqdm_cls.get_lock())
+        tqdm_cls.set_lock(lock)
+        held = threading.Event()
+        release = threading.Event()
+
+        def hold() -> None:
+            with lock:
+                held.set()
+                release.wait()
+
+        holder = threading.Thread(target=hold, daemon=True)
+        holder.start()
+        held.wait()
+        statuses: list[str] = []
+        try:
+            _render_all(
+                bound,
+                configs,
+                timeout=30,
+                each=lambda _index, future: statuses.append(future.status),
+            )
+        finally:
+            release.set()
+            holder.join()
+        self.assertEqual(statuses, ["ok"] * len(configs))
 
     def test_provider_loads_worker_renders_and_rerenders_before_execution(
         self,

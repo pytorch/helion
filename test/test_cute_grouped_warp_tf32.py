@@ -241,11 +241,11 @@ def test_actual_copy_expressions_cover_each_tail_and_refill(k, n):
         "cutlass": SimpleNamespace(Int32=int, Int64=int, range_constexpr=range),
         "cute": SimpleNamespace(
             crd2idx=lambda coordinate, layout: coordinate[0] * 64 + coordinate[1],
-            arch=SimpleNamespace(
-                cp_async_shared_global=lambda *args, **kwargs: transfers.append(
-                    (args, kwargs)
-                ),
-                cp_async_commit_group=lambda: None,
+            arch=SimpleNamespace(cp_async_commit_group=lambda: None),
+        ),
+        "prims": SimpleNamespace(
+            cp_async_shared_global=lambda *args, **kwargs: transfers.append(
+                (args, kwargs)
             ),
         ),
     }

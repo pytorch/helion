@@ -242,7 +242,7 @@ def test_async_copies_have_cache_safe_alignment_and_stride_facts() -> None:
     bound = cpu_bind(kernel, inputs)
     assert "input_tensor_metadata" in bound.env.compiler_fact_specialization_facts
     source = bound.to_code(_config(bk=64, copy="async"))
-    assert source.count("cute.arch.cp_async_shared_global(") == 2
+    assert source.count("_cute_cp_async_shared_global(") == 2
     assert "cute.arch.cp_async_wait_group(0)" in source
     assert "copy_tail_lane" in source
 
@@ -254,7 +254,7 @@ def test_cached_copy_keeps_gather_loads_outside_reduction_loop() -> None:
     inputs = (*_padded_inputs("cpu", torch.float16), 97)
     bound = cpu_bind(kernel, inputs)
     source = bound.to_code(_config(bk=64, copy="async_cached"))
-    assert source.count("cute.arch.cp_async_shared_global(") == 2
+    assert source.count("_cute_cp_async_shared_global(") == 2
     assert "cute.make_rmem_tensor((4,), cutlass.Int32)" in source
     reduction = next(
         node
@@ -288,7 +288,7 @@ def test_async_gathered_matmul_preserves_tails_and_empty_groups(
     bound = kernel._bind_isolated(inputs)
     config = _config(bk=64, copy=copy)
     source = bound.to_code(config)
-    assert source.count("cute.arch.cp_async_shared_global(") == (1 if unaligned else 2)
+    assert source.count("_cute_cp_async_shared_global(") == (1 if unaligned else 2)
     bound.set_config(config)
     expected = torch.empty((193, 70), device=CUDA_DEVICE, dtype=dtype)
     expected[rows[:96].long()] = (a[rows[:96].long()].float() @ b[1].float()).to(dtype)

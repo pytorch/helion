@@ -5,6 +5,7 @@ from __future__ import annotations
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import CopyUniversalOp
+import cutlass.experimental.primitives as prims
 
 
 @cute.jit
@@ -18,7 +19,7 @@ def _cute_resident_copy_async(
     byte_count: cutlass.Constexpr = width * source.element_type.width // 8
     if cutlass.const_expr(byte_count in (4, 8, 16)):
         if source_offset % width == 0:
-            cute.arch.cp_async_shared_global(
+            prims.cp_async_shared_global(
                 destination.iterator + cute.assume(destination_offset, divby=width),
                 source.iterator + cute.assume(source_offset, divby=width),
                 byte_count,

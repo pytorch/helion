@@ -34,6 +34,8 @@ dev = [
     "pre-commit",
     "hypothesis",
     "tabulate",
+    # torch.fx takes tqdm's lock; test_autotuner_render_pool covers it
+    "tqdm",
 ]
 # Helion integrates tightly with the cutlass DSL's internal APIs; each
 # upstream release tends to break the cute backend. The pin tracked in

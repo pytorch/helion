@@ -18,6 +18,7 @@ from typing import cast
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import Float32
+import cutlass.experimental.primitives as prims
 
 from ._mlir_compat import ir
 
@@ -164,7 +165,7 @@ def coop_issue(
             )
         piece = cast("Any", row_ptr) + offset
         for k in range(lanes_per_row):
-            cute.arch.cp_async_shared_global(
+            prims.cp_async_shared_global(
                 target + (u * unit_elems + k * rows_per_request * pitch),
                 piece + k * rows_per_request * row_step,
                 16,

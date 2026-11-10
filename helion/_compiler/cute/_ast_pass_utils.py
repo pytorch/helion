@@ -744,7 +744,9 @@ def _is_proven_relocatable_call(
 ) -> bool:
     """Whether evaluating ``call`` is known not to have observable effects."""
     # ``scalar_recipe`` is a user of this utility layer (it imports
-    # ``names_read`` at module level), so bind its tables at call time.
+    # ``names_read`` at module level), and the backend registry imports this
+    # module through the CuTe backend, so bind these at call time.
+    from ..compile_environment import CompileEnvironment
     from .scalar_recipe import PURE_HELPERS
     from .scalar_recipe import is_rounded_multiply
 
@@ -808,6 +810,13 @@ def _is_proven_relocatable_call(
         # proved that before the fold was emitted), so it relocates exactly
         # like a load of the same tensors.
         return allow_load
+    if (
+        CompileEnvironment.has_current()
+        and name in CompileEnvironment.current().backend.pure_device_calls
+    ):
+        # Another backend's pure device calls (Metal's casts); the AST passes
+        # also run outside a compile, in their unit tests.
+        return True
     return allow_reduction and (
         name in _CHUNK_REDUCTION_HELPERS or name.startswith("cute.arch.warp_reduction")
     )
