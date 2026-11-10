@@ -79,8 +79,8 @@ class CuteHandlerOpOverrides(HandlerOpOverrides):
         # CuTe promotes a narrow integer combined with a Python shift count
         # to Int32. Torch truncates each tensor operation to its result dtype,
         # before any subsequent shift or conversion.
-        result = _unpack_opsvalue(getattr(handler.parent_handler, name)(x, y))
-        return handler._lift(handler._create_cast_expr(expr_from_string(result), dtype))
+        result = handler._parse_op(getattr(handler.parent_handler, name)(x, y))
+        return handler._lift(handler._create_cast_expr(result, dtype))
 
     def neg(self, handler: GenerateASTFromInductor, x: object) -> str | None:
         return handler._lift(expr_from_string("-({x})", x=handler._to_ast(x)))

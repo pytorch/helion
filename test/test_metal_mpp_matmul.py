@@ -15214,6 +15214,31 @@ class TestMppThreadgroupBudget(unittest.TestCase):
         self.assertEqual(_launch(code), (16, 4, 1))
         _close(out, _mm(x, y) + x.cpu().double().sum(-1, keepdim=True))
 
+    def test_distribution_repeats_a_cast_index(self) -> None:
+        """A pure index that casts (the signed-index printer's
+        ``static_cast(long, ...)``) is repeated like one that doesn't."""
+        self.assertEqual(
+            _distribute(
+                """
+                for slice_lane_0 in range(4):
+                    i = static_cast(long, slice_lane_0) * 16
+                    tl.store(y + i, 1.0)
+                    _mpp_acc_0 = _helion_mpp_acc(0, None)
+                    tl.store(out + i, 2.0)
+                """
+            ),
+            textwrap.dedent(
+                """\
+                for slice_lane_0 in range(4):
+                    i = static_cast(long, slice_lane_0) * 16
+                    tl.store(y + i, 1.0)
+                _mpp_acc_0 = _helion_mpp_acc(0, None)
+                for slice_lane_0 in range(4):
+                    i = static_cast(long, slice_lane_0) * 16
+                    tl.store(out + i, 2.0)"""
+            ),
+        )
+
     def test_distribution_positions(self) -> None:
         """Each run of lane-dependent statements becomes its own lane loop,
         with the pure index it reads repeated; lane-invariant statements run

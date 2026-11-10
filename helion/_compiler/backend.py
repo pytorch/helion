@@ -1416,6 +1416,20 @@ class Backend(abc.ABC):
         """The Inductor ``OpsHandler`` the pointwise lowering prints elementwise ops through."""
         raise exc.BackendUnsupported(self.name, "Inductor OpOverrides")
 
+    def parse_op_expression(self, text: str) -> ast.AST:
+        """The device-code AST of *text*, an expression this backend's
+        :meth:`inductor_op_overrides` returned.  Overrides write the device
+        language; the default reads it as Python, the syntax the other
+        backends' overrides write."""
+        return expr_from_string(text)
+
+    @property
+    def pure_device_calls(self) -> frozenset[str]:
+        """Qualified names of device-code calls that compute registers from
+        registers (no memory access, synchronization or exchange between
+        threads), so lane-loop placement may move or repeat them freely."""
+        return frozenset()
+
     def cast_ast(self, x: ast.AST, target_dtype: torch.dtype) -> ast.AST:
         """``x`` cast to ``target_dtype`` as an AST (``cast_expr`` over ``dtype_str``)."""
         return expr_from_string(

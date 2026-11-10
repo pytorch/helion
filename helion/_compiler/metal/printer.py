@@ -19,6 +19,7 @@ from torch.utils._sympy.functions import PythonMod
 from ..device_function import DeviceFunction
 from ..triton.printer import HelionTritonPrinter
 from ..triton.printer import texpr
+from .msl_expr import cast_source
 
 
 def _operands(node: sympy.Basic) -> tuple[sympy.Expr, sympy.Expr]:
@@ -55,10 +56,7 @@ class _MetalPrinter(HelionTritonPrinter):
 
     def _print_IntTrueDiv(self, expr: sympy.Expr) -> str:
         lhs, rhs = _operands(expr)
-        # The device-code walker reads ``static_cast<float>(a) / b`` as a
-        # comparison chain whose cast spans the quotient; the parentheses keep
-        # it on ``a``.
-        return f"((static_cast<float>({self.doprint(lhs)})) / ({self.doprint(rhs)}))"
+        return f"({cast_source('float', self.doprint(lhs))} / ({self.doprint(rhs)}))"
 
 
 class _SignedIndexPrinter(_MetalPrinter):
@@ -73,7 +71,7 @@ class _SignedIndexPrinter(_MetalPrinter):
     """
 
     def _print_Symbol(self, expr: sympy.Symbol) -> str:
-        return f"(static_cast<long>({expr.name}))"
+        return cast_source("long", expr.name)
 
     def _print_FloorDiv(self, expr: sympy.Expr) -> str:
         lhs, rhs = _operands(expr)

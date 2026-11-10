@@ -1,9 +1,9 @@
 """MetalOverrides — thin subclass of Inductor's MPS MetalOverrides.
 
 Reuses Inductor's MetalOverrides for all expression generation (math ops,
-casts, comparisons, etc.).  The C++ namespace syntax (``::`` in expressions
-like ``metal::precise::sin(x)``) is handled by replacing ``::`` with ``.``
-before Python AST parsing, then converting back in the MSL walker.
+casts, comparisons, etc.).  Its results are MSL text, which
+``MetalBackend.parse_op_expression`` parses (``msl_expr``) into device-code
+AST, so no op needs rewriting into Python syntax.
 
 Overrides:
 - ``_special_unary`` / ``_special_binary``: skip the ``V.kernel.headers``
