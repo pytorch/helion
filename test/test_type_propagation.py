@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import contextlib
+import io
 from pathlib import Path
 from typing import TYPE_CHECKING
 import unittest
 
+import pytest
 import torch
 
 import helion
@@ -26,6 +29,13 @@ examples_dir = Path(__file__).parent.parent / "examples"
 
 def type_propagation_report(fn: Kernel, *args, ignore=False):
     return fn.bind(args)._debug_str()
+
+
+def _bind_stderr(kernel: Kernel, args: tuple[object, ...]) -> str:
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr):
+        kernel.bind(args)
+    return stderr.getvalue()
 
 
 @onlyBackends(["triton", "cute"])
@@ -207,6 +217,61 @@ class TestTypePropagation(RefEagerTestDisabled, TestCase):
         ]
         output = type_propagation_report(kernel_list_iteration, tensors)
         self.assertExpectedJournal(output)
+
+
+@pytest.mark.cpu_only
+class TestTensorComparisonWarnings(unittest.TestCase):
+    def test_optional_tensor_identity_does_not_warn(self) -> None:
+        @helion.kernel(backend="triton", ref_mode=helion.RefMode.OFF)
+        def scale_rows(
+            x: torch.Tensor, bias: torch.Tensor | None = None
+        ) -> torch.Tensor:
+            m, n = x.size()
+            if bias is not None:
+                assert bias.size(0) == n
+                assert None is not bias
+                assert (bias is None) is False
+                assert (None is bias) is False
+                assert bias is bias is not None
+                # The tensor only participates in the identity part of this chain.
+                assert 0 < n is not bias
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(m):
+                acc = x[tile_m, :] * 2.0
+                if bias is not None:
+                    acc = acc + bias[:]
+                out[tile_m, :] = acc
+            return out
+
+        x = torch.randn(8, 16)
+        # Both bindings are valid uses of an optional tensor argument.
+        for bias in (None, torch.randn(16)):
+            with self.subTest(has_bias=bias is not None):
+                self.assertNotIn(
+                    "TensorOperationInWrapper", _bind_stderr(scale_rows, (x, bias))
+                )
+
+    def test_tensor_comparisons_still_warn(self) -> None:
+        @helion.kernel(backend="triton", ref_mode=helion.RefMode.OFF)
+        def compare(x: torch.Tensor) -> torch.Tensor:
+            mask = x > 0
+            out = torch.empty_like(x, dtype=torch.bool)
+            for tile in hl.tile(x.shape):
+                out[tile] = mask[tile]
+            return out
+
+        @helion.kernel(backend="triton", ref_mode=helion.RefMode.OFF)
+        def compare_chain(x: torch.Tensor) -> torch.Tensor:
+            mask = None is not x > 0
+            out = torch.empty_like(x, dtype=torch.bool)
+            for tile in hl.tile(x.shape):
+                out[tile] = mask[tile]
+            return out
+
+        x = torch.randn(8, 16)
+        for kernel in (compare, compare_chain):
+            with self.subTest(kernel=kernel.__name__):
+                self.assertIn("TensorOperationInWrapper", _bind_stderr(kernel, (x,)))
 
 
 if __name__ == "__main__":
