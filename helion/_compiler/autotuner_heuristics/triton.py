@@ -4424,6 +4424,8 @@ class _ReductionResources(NamedTuple):
     peak_live_bytes: int
     num_warps: int
     launch_waves: tuple[float | None, ...]
+    max_threads_per_sm: int
+    max_ctas_per_sm: int
 
 
 class _LivenessTileAllocation(NamedTuple):
@@ -4436,15 +4438,18 @@ class _LivenessTileAllocation(NamedTuple):
 
 
 class TritonReductionHeuristic(AutotunerHeuristic):
-    """Candidate-resolved Triton reduction seed for H100 and B200.
+    """Candidate-resolved Triton reduction seed, tuned on H100 and B200.
 
     One allocator resolves every sized reduction and ordinary block axis against the kernel's
     live-step timeline. The primary reduction category affects only final config routing:
     compiler-rolled reductions emit through ``reduction_loops``, while user-written mutable
     ``hl.tile`` reductions emit through ``block_sizes`` and fixed tiles emit no size knob.
 
-    The conservative fallback for other hardware remains the standalone
-    :class:`TritonNarrowReductionHeuristic`.
+    The conservative fallback for a standard reduction on other hardware remains the
+    standalone :class:`TritonNarrowReductionHeuristic`. A user-tiled reduction has no such
+    fallback, so on any other CUDA arch this class still seeds it as a search candidate,
+    but does not promote it there. The occupancy model reads that arch's own thread and
+    CTA residency limits (see ``occupancy_limits_for``).
     """
 
     name = "triton_reduction"
@@ -4454,6 +4459,10 @@ class TritonReductionHeuristic(AutotunerHeuristic):
         ("cuda", "sm90"),
         ("cuda", "sm100"),
     )
+    # Where the user-tiled track seeds without a tuned target: the narrow fallback claims only
+    # standard reductions. ROCm is left out: its wavefront is 64 lanes, and the occupancy model
+    # below counts 32-lane warps against CUDA residency limits.
+    USER_TILE_SEED_TARGETS: ClassVar[tuple[HardwareTarget, ...]] = (("cuda", None),)
     # Promote the tuned reduction seed to the compiler default (autotune off) on H100 and B200.
     # The narrow fallback is a separate class and stays unpromoted.
     # This is safe because the seed only emits valid configs: it materializes through
@@ -4461,6 +4470,7 @@ class TritonReductionHeuristic(AutotunerHeuristic):
     # ``ReductionLoopSpec._normalize`` floors a degenerate looped chunk of 1, and the reduction
     # roller refuses to roll a scan-containing reduction (which would drop the scan's chunk carry).
     promote_seed_to_default = True
+    PROMOTE_TARGETS = HARDWARE_TARGETS
 
     # Candidate capacity, occupancy, and work-exchange policy.
     NORMAL_LIVE_BUDGET = 240 * 1024
@@ -4476,14 +4486,40 @@ class TritonReductionHeuristic(AutotunerHeuristic):
     WARP_DESCENT_MIN_LIVE_BYTES = 8 * 1024
     WARP_DESCENT_CALIBRATION_MAX_SPILL = 0.50
     REGISTER_FILE_REGISTERS_PER_SM = 65536
+    # Resident threads and CTAs per SM. The defaults are the sm80/sm90/sm100/sm103 limits.
     MAX_THREADS_PER_SM = 2048
     MAX_CTAS_PER_SM = 32
+    # Arches with lower limits, as (max resident threads, max resident CTAs) per SM, from the
+    # table "Device and Streaming Multiprocessor (SM) Information per Compute Capability" in
+    # the CUDA Programming Guide (appendix "Compute Capabilities"). 12.x covers sm120 and
+    # sm121; the RTX 5080 driver also reports 1536 threads and 24 CTAs per SM.
+    OCCUPANCY_LIMITS_BY_ARCH: ClassVar[dict[str, tuple[int, int]]] = {
+        "sm75": (1024, 16),
+        "sm86": (1536, 16),
+        "sm87": (1536, 16),
+        "sm89": (1536, 24),
+        "sm110": (1536, 24),
+        "sm120": (1536, 24),
+        "sm121": (1536, 24),
+    }
     GRID_RESIDENCY_GAIN_THRESHOLD = 1.5
     FULL_GRID_SPLIT_GAIN_THRESHOLD = 2.0
     SERIAL_LOOP_COST_ALPHA = 1.1
     MAX_BLOCK_ADJUSTMENT_PASSES = 20
     ROW_PACK_WORKING_SET = 4096
     MIN_ROW_PACK_WAVES = 8
+
+    @classmethod
+    def occupancy_limits_for(cls, env: CompileEnvironment) -> tuple[int, int]:
+        """(max resident threads, max resident CTAs) per SM for this device.
+
+        Arch-keyed, like ``TritonPointwiseSeedHeuristic.tile_bytes_for``: the user-tiled track
+        also seeds consumer arches, whose SMs hold fewer threads and CTAs than sm90/sm100.
+        """
+        for arch, limits in cls.OCCUPANCY_LIMITS_BY_ARCH.items():
+            if matches_hardware(env, (("cuda", arch),)):
+                return limits
+        return cls.MAX_THREADS_PER_SM, cls.MAX_CTAS_PER_SM
 
     # Structural fact accessors.
     @classmethod
@@ -4633,10 +4669,13 @@ class TritonReductionHeuristic(AutotunerHeuristic):
         """Resolve the independent resource inputs for one candidate."""
         peak_bytes = cls._reduction_peak_live_bytes(env, candidate)
         warps = max(cls.MIN_NUM_WARPS, min(cls.MAX_NUM_WARPS, num_warps))
+        max_threads_per_sm, max_ctas_per_sm = cls.occupancy_limits_for(env)
         return _ReductionResources(
             peak_live_bytes=peak_bytes,
             num_warps=warps,
             launch_waves=cls._reduction_launch_waves(env, candidate, num_sm),
+            max_threads_per_sm=max_threads_per_sm,
+            max_ctas_per_sm=max_ctas_per_sm,
         )
 
     @classmethod
@@ -4693,8 +4732,8 @@ class TritonReductionHeuristic(AutotunerHeuristic):
         return max(
             1,
             min(
-                cls.MAX_CTAS_PER_SM,
-                cls.MAX_THREADS_PER_SM // threads,
+                resources.max_ctas_per_sm,
+                resources.max_threads_per_sm // threads,
                 register_limit,
             ),
         )
@@ -4804,7 +4843,7 @@ class TritonReductionHeuristic(AutotunerHeuristic):
         register_estimate_scale: float = 1.0,
     ) -> float:
         """Conservative resident-warp score across independently executing roots."""
-        hardware_warp_slots = cls.MAX_THREADS_PER_SM // 32
+        hardware_warp_slots = resources.max_threads_per_sm // 32
         return min(
             min(float(hardware_warp_slots), value * resources.num_warps)
             for value in cls._reduction_effective_resident_ctas_per_sm(
@@ -5179,11 +5218,16 @@ class TritonReductionHeuristic(AutotunerHeuristic):
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
-        if not matches_hardware(env, cls.HARDWARE_TARGETS):
-            return False
         if not _triton_reduction_eligible(env, device_ir):
             return False
-        return _primary_descriptor_selected(env) is not None
+        pd = _primary_descriptor_selected(env)
+        if pd is None:
+            return False
+        if matches_hardware(env, cls.HARDWARE_TARGETS):
+            return True
+        return not _is_standard_reduction(pd) and matches_hardware(
+            env, cls.USER_TILE_SEED_TARGETS
+        )
 
     @classmethod
     def get_seed_config(
@@ -5248,9 +5292,10 @@ class TritonNarrowReductionHeuristic(AutotunerHeuristic):
     """Conservative upstream reduction fallback for hardware WITHOUT a tuned track (anything
     other than sm90/sm100): one row/program, single persistent pass, ``['last']`` eviction where
     supported. Fires only for a STANDARD (Helion-rolled) reduction — the user-tiled track had no
-    upstream seed, so it stays unclaimed on non-sm90/sm100. Not promoted (the un-tuned baseline
-    should not override the compiler default). This is the verbatim pre-sm100 behavior, now its own
-    class rather than an off-target branch inside the sm90 heuristic.
+    upstream seed, and :class:`TritonReductionHeuristic` seeds it on other CUDA arches. Not
+    promoted (the un-tuned baseline should not override the compiler default). This is the
+    verbatim pre-sm100 behavior, now its own class rather than an off-target branch inside the
+    sm90 heuristic.
     """
 
     name = "triton_reduction_narrow"
