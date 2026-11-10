@@ -249,6 +249,12 @@ class AttentionScorePlan:
     # trivial walk, the plan relies on FlexAttention's contract that a mask's
     # tables describe its ``mask_mod``.
     flex_dense: bool = False
+    # The flex envelope's optional per-row store of the running row max
+    # beside the LSE (FlexAttention's ``max_scores``): the factor that turns
+    # the log2-unit row max (``row_max * qk_scale_log2``) into the stored
+    # value (1.0 for the kernel's own base-2 ``m``, ``ln 2`` for natural
+    # units); ``None`` when the kernel stores no row max.
+    row_max_scale: float | None = None
 
     @property
     def is_flex(self) -> bool:
