@@ -474,12 +474,15 @@ def test_hold_claim_renews_and_removes(board):
     gpu_board.save_claim(bd, claim)
     with gpu_board.hold_claim(bd, claim, ttl=0.15):
         deadline = start + 5
+        loaded = []
         while time.time() < deadline:
-            (loaded,) = gpu_board.load_claims(bd)
-            if loaded.expires > start:  # renewed from the real clock
+            # A read racing a renewal's rename skips the claim; read again.
+            loaded = gpu_board.load_claims(bd)
+            if loaded and loaded[0].expires > start:  # renewed from the real clock
                 break
             time.sleep(0.02)
-        assert loaded.expires > start
+        assert len(loaded) == 1
+        assert loaded[0].expires > start
     assert gpu_board.load_claims(bd) == []
 
 
