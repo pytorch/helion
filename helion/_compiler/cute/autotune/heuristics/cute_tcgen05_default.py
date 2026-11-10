@@ -687,8 +687,9 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         the widest tile partitioning its layout whose store boxes sit inside
         its runs, ``RadixStoreLayout.one_cta_tile``), the deepest of 64-,
         32- or 16-deep k-blocks dividing K, else 64 (32 below 64); flat with
-        two AB stages, the persistent loop with four from eight k-blocks on
-        over whole tiles, walking the batches slowest (``_batch_slowest``).
+        two AB stages (one over a single k-block), the persistent loop with
+        four from eight k-blocks on over whole tiles, walking the batches
+        slowest (``_batch_slowest``).
 
         The base default ran a 64x16 tile; B200, Inductor corpus, of the ATen
         GEMM (many batches of one or two tiles each): 1024 x 256x64x256
@@ -736,7 +737,11 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             # (``cute_mma._ragged_batched_tcgen05_config``)
             and facts._static_full_tiles(state, bm=bm, bn=bn, bk=bk)
         )
-        stages = 4 if persistent else 2
+        # A flat tile's ring holds no more stages than its K loop has
+        # k-blocks: one k-block leaves the second stage empty, SMEM that
+        # holds another CTA instead (64 x 1000x1000x64 into 1001-element
+        # rows, beside the staged store's tile: 135 -> 103 us).
+        stages = 4 if persistent else min(2, cdiv(k, bk))
         block_sizes = facts._matmul_seed_block_sizes(state, bm=bm, bn=bn, bk=bk)
         if (
             block_sizes is None
@@ -758,6 +763,30 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             # tiles (one M tile per batch) ~8%.
             return Config(**_batch_slowest(state, config.config))
         return config
+
+    @classmethod
+    def _unaligned_output_split_k_default(
+        cls, env: CompileEnvironment
+    ) -> Config | None:
+        """TMA operands into an output no TensorMap addresses (rows of 65
+        bf16: 130 bytes) over fewer 128x128 tiles than SMs, unbatched: the
+        split-K default's one-CTA tile (``_split_k_default``), whose SIMT
+        store takes such an output, where the base default ran its 64x16
+        SIMT tile. B200, of the ATen GEMM, 96x65x512 + bias + sigmoid (eight
+        k-blocks, unsplit): 0.29 -> 0.50."""
+        state = env.config_spec._cute_tcgen05_config
+        extents = state.matmul_compile_time_static_extents
+        if (
+            state.kernel_has_atomics
+            or extents is None
+            or not all(isinstance(v, int) and v > 0 for v in extents)
+            or state.matmul_leading_work_multiplier != 1
+        ):
+            return None
+        m, n, k = cast("tuple[int, int, int]", extents)
+        if cdiv(m, 128) * cdiv(n, 128) >= state.device_sm_count:
+            return None
+        return cls._split_k_default(env, m, n, k)
 
     @classmethod
     def _small_matrix_batch_default(cls, env: CompileEnvironment) -> Config | None:
@@ -1009,7 +1038,10 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         if not spec.tcgen05.matmul_operands_tma_provable:
             if state.cp_async_a_provable:
                 return cls._cp_async_a_default(env)
-            return cls._small_matrix_batch_default(env)
+            small = cls._small_matrix_batch_default(env)
+            if small is not None or not state.matmul_inputs_tma_provable:
+                return small
+            return cls._unaligned_output_split_k_default(env)
         if state.kernel_has_atomics:
             # Every tile below is a pair or a persistent CTA owning several
             # tiles, where codegen refuses atomics beside the warp roles

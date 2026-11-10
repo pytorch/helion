@@ -4383,7 +4383,9 @@ def _fix_aux_edge_search_config(
         _set_aux_edge_cluster_m2_prefix(config)
         return
 
-    _set_aux_edge_monolithic_prefix(config)
+    _set_aux_edge_monolithic_prefix(
+        config, single_k_block=_single_k_block(state, config)
+    )
     config["tcgen05_acc_stages"] = 2
     config["tcgen05_c_stages"] = 4
     # The tile order (``l2_groupings``, ``tcgen05_l2_swizzle_size``) is
@@ -4519,11 +4521,29 @@ def _fix_cp_async_a_search_config(
     config.pop(TCGEN05_LAYOUT_OVERRIDES_SWIZZLE_A_KEY, None)
 
 
-def _set_aux_edge_monolithic_prefix(config: dict[str, object]) -> None:
+def _single_k_block(state: CuteTcgen05Config, config: dict[str, object]) -> bool:
+    """Whether ``config`` runs one k-block per flat CTA (its AB ring's
+    second stage would stay empty; a persistent CTA's holds the next
+    tile's k-block)."""
+    if config.get("pid_type", "flat") != "flat":
+        return False
+    view = facts._matmul_config_view(state, config)
+    extents = state.matmul_compile_time_static_extents
+    if view is None or extents is None:
+        return False
+    blocks, _m_index, _n_index, k_index = view
+    bk, k = blocks[k_index], extents[2]
+    return isinstance(bk, int) and isinstance(k, int) and 0 < k <= bk
+
+
+def _set_aux_edge_monolithic_prefix(
+    config: dict[str, object], *, single_k_block: bool = False
+) -> None:
     config[TCGEN05_STRATEGY_CONFIG_KEY] = Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value
     config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 0
     config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 0
-    if config.get("tcgen05_ab_stages") == 1:
+    # One AB stage only where the K loop has one k-block to stage.
+    if config.get("tcgen05_ab_stages") == 1 and not single_k_block:
         config["tcgen05_ab_stages"] = 2
     config.pop("epilogue_subtile", None)
 

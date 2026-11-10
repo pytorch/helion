@@ -8539,6 +8539,9 @@ class CuteTcgen05ClusterM2FfiHeuristic(CuteTcgen05ClusterM2Heuristic):
         env.compiler_fact_specialization_facts = saved | facts
         try:
             provable = host_function_matmul_operands_tma_provable(env, host_function)
+            inputs_provable = provable or host_function_matmul_operands_tma_provable(
+                env, host_function, outputs=False
+            )
             output_matches = host_function_matmul_output_matches_extents(
                 env, host_function
             )
@@ -8555,6 +8558,7 @@ class CuteTcgen05ClusterM2FfiHeuristic(CuteTcgen05ClusterM2Heuristic):
         finally:
             env.compiler_fact_specialization_facts = saved
         env.config_spec.tcgen05.matmul_operands_tma_provable = provable
+        env.config_spec.tcgen05.matmul_inputs_tma_provable = inputs_provable
         env.config_spec.tcgen05.cp_async_a_provable = cp_async_a
         env.config_spec.tcgen05.exact_aux_tma_provable = aux_provable
         env.config_spec.tcgen05.matmul_output_matches_extents = output_matches
