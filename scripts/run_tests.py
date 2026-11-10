@@ -84,6 +84,8 @@ BACKEND_ENV = {
 }
 # Variables this script sets per job; whatever the shell had in them must not
 # leak into a job (a stale HELION_TEST_SHARD would silently halve a run).
+# HIP_VISIBLE_DEVICES would take the place of the job's CUDA_VISIBLE_DEVICES
+# on AMD machines (every lane on one GPU, the CPU lane on a GPU).
 RUNNER_ENV = (
     "HELION_BACKEND",
     "HELION_TEST_SHARD",
@@ -91,6 +93,7 @@ RUNNER_ENV = (
     "HELION_PALLAS_INTERPRET",
     "ENABLE_TILE",
     "CUDA_VISIBLE_DEVICES",
+    "HIP_VISIBLE_DEVICES",
 )
 # The CuTe shards and the slow runners get this in CI; under local contention
 # every lane does.
@@ -212,7 +215,8 @@ def lane_env(
     if lane == "gpu":
         assert gpu is not None
         env["CUDA_VISIBLE_DEVICES"] = gpu
-        # The indices are nvidia-smi's, which number GPUs in PCI bus order.
+        # The indices are the board's: nvidia-smi's, which number GPUs in PCI
+        # bus order, or on AMD machines HIP's.
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         if shard is not None and shard[1] > 1:
             env["HELION_TEST_SHARD"] = f"{shard[0]}/{shard[1]}"
@@ -478,7 +482,7 @@ def select_modules(
 
 
 def explicit_gpus(args: argparse.Namespace) -> list[str]:
-    """``--gpus``, else ``CUDA_VISIBLE_DEVICES``, as sorted unique nvidia-smi
+    """``--gpus``, else ``CUDA_VISIBLE_DEVICES``, as sorted unique board
     indices; empty when neither is set."""
     if args.gpus:
         return args.gpus
@@ -506,13 +510,31 @@ def acquire_gpus(
     ``--shared``, unless ``--force``), else ``-n`` free GPUs picked and
     claimed under the board lock."""
     explicit = explicit_gpus(args)
+    hip = os.environ.get("HIP_VISIBLE_DEVICES")
+    if hip is not None and not explicit:
+        # Jobs never get it (RUNNER_ENV); its GPUs must be named instead.
+        raise SystemExit(
+            f"run_tests: HIP_VISIBLE_DEVICES={hip} would take the place of the "
+            "GPUs each job gets; unset it and name the GPUs with --gpus (or "
+            "CUDA_VISIBLE_DEVICES)"
+        )
     if explicit and args.no_board:
         return explicit
-    gpus = gpu_board.sample_gpus()
+    try:
+        gpus = gpu_board.sample_gpus()
+    except gpu_board.GpuReadError as e:
+        raise SystemExit(f"run_tests: {e}; report it") from None
     if gpus is None or len(gpus) < 2:
-        # A machine with one GPU (or none nvidia-smi can see) is not shared:
-        # no board, no claims.
+        # A machine with one GPU (or none nvidia-smi or rocm-smi can see) is
+        # not shared: no board, no claims.
         return explicit or ["0"]
+    pins = gpu_board.rocm_visibility_pins(gpus)
+    if "ROCR_VISIBLE_DEVICES" in pins:
+        raise SystemExit(
+            f"run_tests: ROCR_VISIBLE_DEVICES={pins['ROCR_VISIBLE_DEVICES']} hides "
+            "GPUs before the board's indices apply; unset it, or keep it and pass "
+            "--no-board --gpus with indices into the GPUs it leaves"
+        )
     try:
         if explicit:
             board, claim, problems = gpu_board.claim_gpus(
@@ -521,6 +543,7 @@ def acquire_gpus(
                 CLAIM_TTL,
                 force=args.force,
                 shared=args.shared,
+                reading=True,
             )
             for gpu, why in sorted(problems.items()):
                 print(
@@ -529,7 +552,7 @@ def acquire_gpus(
                 )
         else:
             board, claim = gpu_board.pick_and_claim(
-                args.count, args.shared, [], purpose, CLAIM_TTL
+                args.count, args.shared, [], purpose, CLAIM_TTL, reading=True
             )
     except gpu_board.SecurityAlert as e:
         print(f"run_tests: {e.report()}", file=sys.stderr)
@@ -543,6 +566,11 @@ def acquire_gpus(
         # Not "board unavailable": whoever holds the lock may be keeping us
         # from checking the GPUs, so never fall back to running unchecked.
         raise SystemExit(f"run_tests: {e}") from None
+    except gpu_board.GpuReadError as e:
+        # Nor when the GPUs cannot be read.
+        raise SystemExit(f"run_tests: {e}; report it") from None
+    except gpu_board.UnknownGpu as e:
+        raise SystemExit(f"run_tests: {e}; pass --gpus with GPUs it has") from None
     except gpu_board.GpuConflict as e:
         raise SystemExit(
             f"run_tests: {e}. Let the board choose (drop --gpus or "

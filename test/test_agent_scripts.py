@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 from dataclasses import replace
 import fcntl
+import functools
 import importlib.util
 import json
 import os
@@ -56,6 +57,43 @@ GPU-ccc, 2001
 GPU-eee, 3001
 """
 OWNERS = {1001: "vasiliy", 1002: "vasiliy", 2001: "vasiliy", 3001: "me"}
+# rocm-smi's card numbers follow the PCI bus; HIP numbers the GPUs by node id.
+ROCM_JSON = json.dumps(
+    {
+        f"card{card}": {
+            "Unique ID": f"0x{card}abc",
+            "GPU use (%)": util,
+            "VRAM Total Memory (B)": str(288 << 30),
+            "VRAM Total Used Memory (B)": str(used_mib << 20),
+            "Card Series": "AMD Instinct MI355X",
+            "Node ID": node,
+        }
+        for card, node, util, used_mib in [
+            (0, "3", "0", 800),
+            (1, "4", "97", 100_000),
+            (2, "2", "N/A", 800),
+        ]
+    }
+    | {"system": {"Driver version": "6.16.6"}}
+)
+# Root's monitoring daemon (4001) holds every card, its list wrapped over lines;
+# 4005 is a job of root's.
+ROCM_PID_GPUS = """\
+================================== GPUs Indexed by PID ===================================
+PID 4001 is using 3 DRM device(s):
+1 0
+2
+PID 4002 is using 0 DRM device(s)
+PID 4003 is using 1 DRM device(s):
+0
+PID 4004 is using 1 DRM device(s):
+1
+PID 4005 is using 1 DRM device(s):
+2
+==========================================================================================
+"""
+ROCM_OWNERS = {4001: "root", 4002: "vasiliy", 4003: "me", 4004: "vasiliy", 4005: "root"}
+ROCM_NAMES = {4001: "dynolog", 4005: "python3"}
 
 
 def _gpus() -> list:
@@ -65,6 +103,12 @@ def _gpus() -> list:
         gpu = by_uuid[uuid]
         gpu.processes[OWNERS[pid]] = gpu.processes.get(OWNERS[pid], 0) + 1
     return gpus
+
+
+def _rocm_gpus() -> list:
+    """ROCM_JSON's GPUs, without processes: index 0 (card2) is free."""
+    gpus = gpu_board.parse_rocm_smi_json(ROCM_JSON).values()
+    return sorted(gpus, key=lambda g: g.index)
 
 
 def _claim(user: str, gpus: list[int], expires: float, created: float = NOW - 10):
@@ -87,11 +131,14 @@ FAKE_OWNERS: dict[tuple[int, int], str] = {}
 
 @pytest.fixture
 def board(tmp_path, monkeypatch):
-    """A private board directory with nvidia-smi stubbed, this account named
+    """A private board directory with sample_gpus stubbed, this account named
     ``me``, and file ownership taken from FAKE_OWNERS; returns the root."""
     FAKE_OWNERS.clear()
     monkeypatch.setenv("GPU_BOARD_DIR", str(tmp_path / "board"))
     for name in gpu_board.SESSION_ENV:  # no agent session unless a test sets one
+        monkeypatch.delenv(name, raising=False)
+    # Nor the ROCm visibility variables (CI's mi350x containers set them).
+    for name in gpu_board.ROCM_VISIBILITY_ENV:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(gpu_board, "sample_gpus", lambda *args, **kwargs: _gpus())
     monkeypatch.setattr(gpu_board, "current_user", lambda: "me")
@@ -147,6 +194,164 @@ def test_parse_nvidia_smi_csv():
         ("GPU-ccc", 2001),
         ("GPU-eee", 3001),
     ]
+
+
+def test_parse_rocm_smi():
+    gpus = gpu_board.parse_rocm_smi_json(ROCM_JSON)
+    # Numbered in node order, as HIP numbers CUDA_VISIBLE_DEVICES.
+    assert {card: g.index for card, g in gpus.items()} == {
+        "card2": 0,
+        "card0": 1,
+        "card1": 2,
+    }
+    assert gpus["card0"].uuid == "0x0abc" and gpus["card0"].tool == "rocm-smi"
+    assert gpus["card0"].name == "AMD Instinct MI355X"
+    assert gpus["card0"].memory_used_mib == 800
+    assert gpus["card0"].memory_total_mib == 288 * 1024
+    assert gpus["card1"].utilization == 97.0
+    assert gpus["card2"].utilization == 0.0  # N/A
+    data = json.loads(ROCM_JSON)
+    data["card1"]["Node ID"] = "N/A"
+    with pytest.raises(ValueError, match="card1 no node id"):
+        gpu_board.parse_rocm_smi_json(json.dumps(data))
+    # A card rocm-smi leaves out would shift the indices of the others.
+    data = json.loads(ROCM_JSON)
+    del data["card1"]
+    with pytest.raises(ValueError, match="with gaps"):
+        gpu_board.parse_rocm_smi_json(json.dumps(data))
+    # Output that does not say which processes there are would hide them: a
+    # process whose cards it does not list, or no list at all.
+    header = ROCM_PID_GPUS.splitlines()[0] + "\n"
+    for broken in [
+        ROCM_PID_GPUS + "PID 4006 is using 2 DRM device(s):\n1\n=====\n",
+        ROCM_PID_GPUS + "PID 4006 is using 1 DRM device(s):\n",
+        ROCM_PID_GPUS
+        + "None Unable to get list of KFD PIDs. A kernel update may be needed None\n",
+        "",
+        header,
+    ]:
+        with pytest.raises(ValueError):
+            gpu_board.parse_rocm_pid_gpus(broken)
+    none = header + "No KFD PIDs currently running\n"
+    assert gpu_board.parse_rocm_pid_gpus(none) == []
+    assert gpu_board.parse_rocm_pid_gpus(ROCM_PID_GPUS + "garbage 7\n") == [
+        ("card1", 4001),
+        ("card0", 4001),
+        ("card2", 4001),
+        ("card0", 4003),
+        ("card1", 4004),
+        ("card2", 4005),
+    ]
+
+
+def test_sample_gpus_reads_nvidia_smi_else_rocm_smi(monkeypatch):
+    def nvidia(tool, *args, processes=PROC_CSV):
+        assert tool == "nvidia-smi"  # rocm-smi is never asked
+        return processes if "--query-compute-apps=gpu_uuid,pid" in args else GPU_CSV
+
+    monkeypatch.setattr(gpu_board, "_smi", nvidia)
+    assert gpu_board.sample_gpus(owner_of=OWNERS.__getitem__) == _gpus()
+    # A process list that keeps failing would hide processes: an error.
+    monkeypatch.setattr(gpu_board, "_smi", functools.partial(nvidia, processes=None))
+    with pytest.raises(gpu_board.GpuReadError, match="not their processes"):
+        gpu_board.sample_gpus(interval=0)
+
+    tools = []
+
+    def smi(tool, *args):
+        tools.append(tool)
+        if tool == "nvidia-smi":
+            return None
+        return ROCM_PID_GPUS if "--showpidgpus" in args else ROCM_JSON
+
+    monkeypatch.setattr(gpu_board, "_smi", smi)
+    gpus = gpu_board.sample_gpus(
+        2, interval=0, owner_of=ROCM_OWNERS.__getitem__, name_of=ROCM_NAMES.get
+    )
+    assert tools[0] == "nvidia-smi" and set(tools[1:]) == {"rocm-smi"}
+    assert [g.uuid for g in gpus] == ["0x2abc", "0x0abc", "0x1abc"]
+    # Root's daemon on every GPU is not counted; root's job and the accounts'
+    # processes are.
+    assert [g.processes for g in gpus] == [{"root": 1}, {"me": 1}, {"vasiliy": 1}]
+    assert [gpu_board.classify(g, "me") for g in gpus] == ["idle", "mine", "busy"]
+    assert gpu_board.sample_gpus(
+        owner_of=ROCM_OWNERS.__getitem__, name_of=lambda pid: ""
+    )[0].processes == {"root": 2}
+
+    # Without the amdgpu driver rocm-smi prints nothing: no AMD GPUs.
+    monkeypatch.setattr(
+        gpu_board, "_smi", lambda tool, *args: None if tool == "nvidia-smi" else ""
+    )
+    assert gpu_board.sample_gpus() is None
+
+    # A reading the board cannot use stops it rather than reading as a machine
+    # without GPUs (which run_tests takes as unshared).
+    no_node = json.loads(ROCM_JSON)
+    no_node["card1"]["Node ID"] = "N/A"
+    null_memory = json.loads(ROCM_JSON)
+    null_memory["card0"]["VRAM Total Memory (B)"] = None
+    no_use = json.loads(ROCM_JSON)
+    del no_use["card0"]["GPU use (%)"]  # rocm-smi drops an unsupported reading
+    unlisted = ROCM_PID_GPUS + "PID 4006 is using 1 DRM device(s):\n"
+    for gpus_output, pids_output, match in [
+        (json.dumps(no_node), ROCM_PID_GPUS, "card1 no node id"),
+        (json.dumps(null_memory), ROCM_PID_GPUS, "TypeError"),
+        (json.dumps(no_use), ROCM_PID_GPUS, "KeyError: 'GPU use"),
+        ("{", ROCM_PID_GPUS, "cannot read its output"),
+        (ROCM_JSON, None, "not their processes"),
+        (ROCM_JSON, unlisted, "PID 4006 uses 1 more card"),
+    ]:
+
+        def broken(tool, *args, gpus_output=gpus_output, pids_output=pids_output):
+            if tool == "nvidia-smi":
+                return None
+            return pids_output if "--showpidgpus" in args else gpus_output
+
+        monkeypatch.setattr(gpu_board, "_smi", broken)
+        with pytest.raises(gpu_board.GpuReadError, match=match):
+            gpu_board.sample_gpus(interval=0)
+
+    # The process list asks for rocm-smi's real exit status, and a failure
+    # (a process exiting while it is looked up) is tried again.
+    calls = []
+
+    def flaky(tool, *args):
+        if tool == "nvidia-smi":
+            return None
+        if "--showpidgpus" not in args:
+            return ROCM_JSON
+        calls.append(args)
+        return None if len(calls) < gpu_board.PROCESS_LIST_ATTEMPTS else ROCM_PID_GPUS
+
+    monkeypatch.setattr(gpu_board, "_smi", flaky)
+    gpus = gpu_board.sample_gpus(
+        interval=0, owner_of=ROCM_OWNERS.__getitem__, name_of=ROCM_NAMES.get
+    )
+    assert gpus[1].processes == {"me": 1}
+    assert all(args[-2:] == ("--loglevel", "error") for args in calls)
+    # The error names the last attempt's cause, not an earlier one's.
+    outputs = ["garbage", None, None]
+
+    def mixed(tool, *args):
+        if tool == "nvidia-smi":
+            return None
+        return outputs.pop(0) if "--showpidgpus" in args else ROCM_JSON
+
+    monkeypatch.setattr(gpu_board, "_smi", mixed)
+    with pytest.raises(gpu_board.GpuReadError, match=r"\(it failed, 3 times\)"):
+        gpu_board.sample_gpus(interval=0)
+
+
+def test_a_gpu_tool_that_hangs_is_an_error(monkeypatch):
+    # A tool that is missing or fails (no such GPUs here) is just not there.
+    assert gpu_board._smi("/nonexistent/smi") is None
+
+    def hang(command, **kwargs):
+        raise gpu_board.subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(gpu_board.subprocess, "run", hang)
+    with pytest.raises(gpu_board.GpuReadError, match="nvidia-smi did not answer"):
+        gpu_board.sample_gpus()
 
 
 def test_classify_states():
@@ -387,7 +592,9 @@ def test_board_publishes_only_as_its_owner_and_never_downgrades(board):
     assert gpu_board.published_version(bd) == gpu_board.VERSION
     # An equal version is left alone (two checkouts never swap it back and
     # forth); a newer one, compared numerically, is never replaced.
-    for published in (gpu_board.VERSION, "2026-11-07.10", "2999-01-01"):
+    date, serial = gpu_board.version_key(gpu_board.VERSION)
+    newer = f"{date}.{serial + 10}"
+    for published in (gpu_board.VERSION, newer, "2999-01-01"):
         copy.write_text(f'VERSION = "{published}"\n')
         doc.write_text("newer\n")
         gpu_board.Board()
@@ -923,6 +1130,63 @@ def test_run_refuses_gpus_others_use_and_reports_signals(board, capsys):
     assert gpu_board.load_claims(gpu_board.BoardDir(board)) == []
 
 
+def test_rocm_visibility_variables_on_amd_gpus_only(board, monkeypatch, capsys):
+    # On AMD machines they make CUDA_VISIBLE_DEVICES select other GPUs than the
+    # board's indices name: run drops them, pick and claim warn.
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "3")
+    monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "1")
+    envs = []
+
+    class Popen:
+        pid = os.getpid()
+
+        def __init__(self, command, env, start_new_session):
+            envs.append(env)
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(gpu_board.subprocess, "Popen", Popen)
+    handler = signal.getsignal(signal.SIGTERM)
+    assert gpu_board.main(["run", "--gpus", "0", "--", "cmd"]) == 0
+    # NVIDIA GPUs: they select nothing there, and pass through.
+    assert envs[-1]["HIP_VISIBLE_DEVICES"] == "3"
+    assert "not passing on" not in capsys.readouterr().err
+
+    monkeypatch.setattr(gpu_board, "sample_gpus", lambda *a, **k: _rocm_gpus())
+    assert gpu_board.main(["run", "--gpus", "0", "--", "cmd"]) == 0
+    env = envs[-1]
+    assert env["CUDA_VISIBLE_DEVICES"] == "0"
+    assert "HIP_VISIBLE_DEVICES" not in env and "ROCR_VISIBLE_DEVICES" not in env
+    err = capsys.readouterr().err
+    assert "not passing on HIP_VISIBLE_DEVICES=3" in err
+    assert "not passing on ROCR_VISIBLE_DEVICES=1" in err
+    assert signal.getsignal(signal.SIGTERM) == handler  # run restores its handlers
+    assert gpu_board.main(["pick", "-n", "1"]) == 0
+    err = capsys.readouterr().err
+    assert "warning: HIP_VISIBLE_DEVICES=3 is set" in err
+    assert "warning: ROCR_VISIBLE_DEVICES=1 is set" in err
+
+
+def test_unreadable_gpus_stop_choosing_but_not_the_claims(board, monkeypatch, capsys):
+    assert gpu_board.main(["claim", "4", "--purpose", "running"]) == 0
+
+    def unreadable(*args, **kwargs):
+        raise gpu_board.GpuReadError("rocm-smi answered, but ...")
+
+    monkeypatch.setattr(gpu_board, "sample_gpus", unreadable)
+    capsys.readouterr()
+    assert gpu_board.main(["pick", "-n", "1"]) == 1
+    assert gpu_board.main(["claim", "0"]) == 1
+    assert "rocm-smi answered, but ..." in capsys.readouterr().err
+    assert gpu_board.main(["status"]) == 0
+    out = capsys.readouterr().out
+    assert "rocm-smi answered, but ...: the GPU states below come from claims" in out
+    assert "you hold: 4" in out
+    assert gpu_board.main(["release", "--all"]) == 0
+    assert gpu_board.load_claims(gpu_board.BoardDir(board)) == []
+
+
 def test_board_errors_become_exit_status(tmp_path, monkeypatch, capsys):
     blocker = tmp_path / "file"
     blocker.write_text("")
@@ -1065,6 +1329,7 @@ def test_job_environment_drops_the_shell_values_of_runner_variables(tmp_path):
         "HELION_TEST_SHARD": "1/2",  # stale: would silently halve the run
         "HELION_TEST_LANE": "cpu",
         "CUDA_VISIBLE_DEVICES": "7",
+        "HIP_VISIBLE_DEVICES": "5",  # on AMD would replace CUDA_VISIBLE_DEVICES
         "HELION_AUTOTUNE_EFFORT": "none",  # the user's, kept
         "PATH": "/bin",
     }
@@ -1073,7 +1338,7 @@ def test_job_environment_drops_the_shell_values_of_runner_variables(tmp_path):
     env = run_tests.job_environment(job, shell)
     assert env["PYTHONPATH"] == str(run_tests.REPO_ROOT)
     assert "HELION_TEST_SHARD" not in env and "HELION_TEST_LANE" not in env
-    assert env["CUDA_VISIBLE_DEVICES"] == "3"
+    assert env["CUDA_VISIBLE_DEVICES"] == "3" and "HIP_VISIBLE_DEVICES" not in env
     assert env["HELION_BACKEND"] == "triton"
     assert env["HELION_AUTOTUNE_EFFORT"] == "none" and env["PATH"] == "/bin"
 
@@ -1277,6 +1542,71 @@ def test_acquire_gpus_skips_the_board_on_a_single_gpu_machine(board, monkeypatch
             args = run_tests.parse_args(["--gpus", "0"])
             assert run_tests.acquire_gpus(args, "t", stack) == ["0"]
         assert gpu_board.load_claims(gpu_board.BoardDir(board)) == []
+
+
+def test_acquire_gpus_and_the_rocm_visibility_variables(board, monkeypatch, tmp_path):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    # HIP_VISIBLE_DEVICES would take the place of every job's GPUs, so its
+    # GPUs must be named instead, on any machine.
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "3")
+    for sample in (_gpus, _rocm_gpus, lambda: None):
+        monkeypatch.setattr(gpu_board, "sample_gpus", lambda *a, s=sample, **k: s())
+        with contextlib.ExitStack() as stack, pytest.raises(SystemExit) as info:
+            run_tests.acquire_gpus(run_tests.parse_args(["-n", "1"]), "t", stack)
+        assert "HIP_VISIBLE_DEVICES=3 would take the place of" in str(info.value)
+        with contextlib.ExitStack() as stack:
+            args = run_tests.parse_args(["--gpus", "0"])
+            assert run_tests.acquire_gpus(args, "t", stack) == ["0"]
+    monkeypatch.delenv("HIP_VISIBLE_DEVICES")
+    # ROCR_VISIBLE_DEVICES hides GPUs before the board's indices apply: refused
+    # with rocm-smi's GPUs, harmless with nvidia-smi's.
+    monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "1")
+    monkeypatch.setattr(gpu_board, "sample_gpus", lambda *a, **k: _rocm_gpus())
+    with contextlib.ExitStack() as stack, pytest.raises(SystemExit) as info:
+        run_tests.acquire_gpus(run_tests.parse_args(["-n", "1"]), "t", stack)
+    assert "hides GPUs before the board's indices apply" in str(info.value)
+    monkeypatch.setattr(gpu_board, "sample_gpus", lambda *a, **k: _gpus())
+    with contextlib.ExitStack() as stack:
+        assert run_tests.acquire_gpus(run_tests.parse_args(["-n", "1"]), "t", stack)
+    assert gpu_board.load_claims(gpu_board.BoardDir(board)) == []
+    # Jobs keep ROCR_VISIBLE_DEVICES (without the board their indices are the
+    # caller's) and never get HIP_VISIBLE_DEVICES.
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "3")
+    with contextlib.ExitStack() as stack:
+        args = run_tests.parse_args(["--no-board", "--gpus", "0"])
+        assert run_tests.acquire_gpus(args, "t", stack) == ["0"]
+    env = run_tests.lane_env("triton", "gpu", "0", None)
+    job = run_tests.Job("j", "triton", "gpu", "0", None, [], env, tmp_path, tmp_path)
+    env = run_tests.job_environment(job)
+    assert env["ROCR_VISIBLE_DEVICES"] == "1" and "HIP_VISIBLE_DEVICES" not in env
+
+
+def test_acquire_gpus_stops_when_the_gpus_cannot_be_read(board, monkeypatch):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    readings = []
+
+    def sample(*args, **kwargs):
+        if readings:
+            return readings.pop(0)
+        raise gpu_board.GpuReadError("rocm-smi answered, but ...")
+
+    monkeypatch.setattr(gpu_board, "sample_gpus", sample)
+    # The first reading fails, or the one taken under the lock to claim fails
+    # or comes back empty, or lacks the GPU: never a run on GPUs nobody checked.
+    for argv, ok, match in [
+        (["-n", "1"], [], "rocm-smi answered"),
+        (["-n", "1"], [_gpus()], "rocm-smi answered"),
+        (["--gpus", "0"], [_gpus()], "rocm-smi answered"),
+        (["-n", "1"], [_gpus(), None], "stopped reporting the GPUs"),
+        (["--gpus", "0"], [_gpus(), None], "stopped reporting the GPUs"),
+        (["--gpus", "0"], [_gpus(), []], "stopped reporting the GPUs"),
+        (["--gpus", "9"], [_gpus(), _gpus()], "no such GPU: 9"),
+    ]:
+        readings[:] = ok
+        with contextlib.ExitStack() as stack, pytest.raises(SystemExit) as info:
+            run_tests.acquire_gpus(run_tests.parse_args(argv), "t", stack)
+        assert match in str(info.value)
+    assert gpu_board.load_claims(gpu_board.BoardDir(board)) == []
 
 
 def test_acquire_gpus_respects_other_sessions_of_this_account(board, monkeypatch):
