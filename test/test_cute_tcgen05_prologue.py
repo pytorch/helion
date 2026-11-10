@@ -48,9 +48,10 @@ def test_runtime_helpers_fold_python_ints(divisor):
 
 
 def test_split_init_surface_is_pinned_to_the_installed_dsl():
-    """The no-init pipeline constructors mirror one DSL release's private
-    surface; on it the fast path is enabled, and the pin's expected surface
-    is the live one (a DSL bump fails here loudly while codegen falls back)."""
+    """The no-init pipeline constructors mirror the validated DSL releases'
+    private surface; on them the fast path is enabled, and the pin's expected
+    surface is the live one (a DSL bump fails here loudly while codegen falls
+    back)."""
     pytest.importorskip("cutlass")
     import dataclasses
     import inspect
@@ -63,7 +64,7 @@ def test_split_init_surface_is_pinned_to_the_installed_dsl():
     from helion._compiler.cute.cutedsl_compat import installed_cute_dsl_version
     from helion._compiler.cute.tcgen05_prologue import split_barrier_init_supported
 
-    assert installed_cute_dsl_version() == rt.SPLIT_INIT_VALIDATED_DSL_VERSION
+    assert installed_cute_dsl_version() in rt.SPLIT_INIT_VALIDATED_DSL_VERSIONS
     assert (
         tuple(inspect.signature(inspect.unwrap(MbarrierArray.__init__)).parameters)
         == rt._MBARRIER_ARRAY_INIT_PARAMETERS
