@@ -172,7 +172,12 @@ jobs:
           python install.py --liger
           if [[ "${{ inputs.runtime-version }}" == cu* ]]; then
             uv pip install einops
-            MAX_JOBS=4 uv pip install "mamba-ssm==2.3.2.post1" --no-build-isolation --no-deps
+            # mamba-ssm's setup.py hard-codes -std=c++17, but torch 2.15's
+            # headers need C++20 (std::bit_width), so build its release
+            # source with -std=c++20, which torch 2.13 also accepts.
+            git clone --depth 1 --branch v2.3.2.post1 https://github.com/state-spaces/mamba /tmp/mamba
+            sed -i 's/-std=c++17/-std=c++20/g' /tmp/mamba/setup.py
+            MAX_JOBS=4 uv pip install /tmp/mamba --no-build-isolation --no-deps
             FLA_COMMIT=$(cat $GITHUB_WORKSPACE/.github/ci_commit_pins/flash_linear_attention.txt)
             uv pip install "git+https://github.com/fla-org/flash-linear-attention@${FLA_COMMIT}" --no-deps
           fi
