@@ -38,8 +38,10 @@ from .logger import format_triton_compile_failure
 from .logger import log_generated_triton_code_debug
 from .logger import match_unrecoverable_runtime_error
 from .logger import maybe_dump_triton_failure
+from .process_utils import isolate_forked_worker
 from .process_utils import signal_process_tree
 from .process_utils import start_isolated_process_group
+from .process_utils import start_without_collection
 from .progress_bar import iter_with_progress
 
 if TYPE_CHECKING:
@@ -430,6 +432,7 @@ def _run_kernel_in_subprocess_fork(
     decorator: str,
 ) -> None:
     start_isolated_process_group()
+    isolate_forked_worker()
     status = 0
     _cap: list[str] = [""]
     try:
@@ -526,7 +529,7 @@ class PrecompileFuture:
         if self.process is None or self.started:
             return
         self.start_time = time.time()
-        self.process.start()
+        start_without_collection(self.process)
 
     @staticmethod
     def skip(ctx: PrecompileContext, config: Config, ok: bool) -> PrecompileFuture:
