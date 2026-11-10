@@ -1009,9 +1009,6 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
             kernel, lambda x: x.sum(-1), 1, shape=(8, 16, 32), grad_shape=(8, 16)
         )
 
-    @skipIfRocm(
-        "the mean backward binds with two extra singleton dims on ROCm (RankMismatch; fails every mi350x CI run since Nov 2026)"
-    )
     def test_mean_reduction_3d_last_dim(self):
         @helion.kernel(autotune_effort="none")
         def kernel(x: torch.Tensor) -> torch.Tensor:
@@ -1025,9 +1022,6 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
             kernel, lambda x: x.mean(-1), 1, shape=(8, 16, 32), grad_shape=(8, 16)
         )
 
-    @skipIfRocm(
-        "the mean backward binds with two extra singleton dims on ROCm (RankMismatch; fails every mi350x CI run since Nov 2026)"
-    )
     def test_mean_reduction_middle_dim(self):
         @helion.kernel(autotune_effort="none")
         def kernel(x: torch.Tensor) -> torch.Tensor:
