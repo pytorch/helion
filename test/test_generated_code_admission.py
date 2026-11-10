@@ -18,6 +18,7 @@ from torch.overrides import TorchFunctionMode
 from torch.utils._python_dispatch import TorchDispatchMode
 
 import helion
+from helion._compiler import backend_registry
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import onlyBackends
@@ -499,6 +500,45 @@ class TestGeneratedCodeAdmission(RefEagerTestDisabled, TestCase):
         self.assertIn("2.0", self.sources[0])
         self.assertIn("3.0", self.sources[1])
         self.assertFalse((self.root / "generated_code").exists())
+
+    def test_other_backend_handlers_preserve_triton_cache(self) -> None:
+        cold = self._bind_and_compile(_full_kernel)
+        snapshot = cache._dependency_snapshot(cold)
+        self.assertIsNotNone(snapshot)
+        compiler_abi = cache.compiler_abi_key()
+        # load already has a CuTe handler; full can use its common handler.
+        # Both replacement and addition leave Triton's lookup unchanged.
+        for operation in (hl.load, hl.full):
+            with (
+                self.subTest(operation=operation.__name__),
+                patch.dict(
+                    operation._codegen,
+                    {"cute": Mock(side_effect=AssertionError("CuTe handler ran"))},
+                ),
+                patch.object(
+                    backend_registry,
+                    "_REPAIRED_CODEGEN_NAMES",
+                    backend_registry._REPAIRED_CODEGEN_NAMES | {"cute"},
+                ),
+                patch.object(
+                    KernelCompiler,
+                    "compile",
+                    side_effect=AssertionError("warm frontend ran"),
+                ),
+            ):
+                self.assertEqual(compiler_abi, cache.compiler_abi_key())
+                self.assertTrue(
+                    cache.validate_kernel_dependencies(snapshot, _full_kernel)
+                )
+                warm = self._bind_and_compile(_full_kernel)
+                self.assertIsInstance(warm, _CachedBoundKernel)
+        self.assertEqual(self.sources, [self.sources[0]] * 3)
+        with patch.object(
+            backend_registry,
+            "_REPAIRED_CODEGEN_NAMES",
+            backend_registry._REPAIRED_CODEGEN_NAMES - {"triton"},
+        ):
+            self.assertFalse(cache.validate_kernel_dependencies(snapshot, _full_kernel))
 
     def test_codegen_closure_after_warm_hit_invalidates_artifact(self) -> None:
         cold = self._bind_and_compile(_full_kernel)

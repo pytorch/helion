@@ -128,7 +128,9 @@ def _intrinsic_handlers(value: object) -> dict[tuple[object, ...], object]:
         result[("_codegen",)] = codegen
         if isinstance(codegen, dict):
             result.update(
-                (("_codegen", name), handler) for name, handler in dict.items(codegen)
+                (("_codegen", name), handler)
+                for name, handler in dict.items(codegen)
+                if name in ("common", "triton")
             )
         return result
     return {}
@@ -161,7 +163,18 @@ def freeze_compiler_cache_contract() -> None:
         _freeze_compiler_namespaces()
 
 
-def _namespace_binding(value: object) -> tuple[object, ...]:
+def _namespace_binding(
+    value: object, module_name: str = "", name: str = ""
+) -> tuple[object, ...]:
+    if (
+        module_name == "helion._compiler.backend_registry"
+        and name == "_REPAIRED_CODEGEN_NAMES"
+        and type(value) is frozenset
+        and all(type(backend) is str for backend in value)
+    ):
+        # This is a backend-load memo. Other backends may finish loading after
+        # Triton's contract is frozen; its actual handlers are guarded separately.
+        return frozenset, "triton" in value
     if type(value) is types.FunctionType:
         return value, value.__code__, value.__defaults__, value.__kwdefaults__
     return (value,)
@@ -199,7 +212,10 @@ def _freeze_compiler_namespaces() -> None:
         namespace = dict(vars(module))
         _FROZEN_COMPILER_NAMESPACES[name] = (
             module,
-            {key: _namespace_binding(value) for key, value in namespace.items()},
+            {
+                key: _namespace_binding(value, name, key)
+                for key, value in namespace.items()
+            },
         )
         # The package exports are bindings, not a request to traverse unrelated
         # runtime entry points such as KernelCompiler and its instrumentation.
@@ -218,7 +234,7 @@ def _compiler_namespaces_valid() -> bool:
             return False
         namespace = vars(module)
         for key, expected in bindings.items():
-            current = _namespace_binding(namespace.get(key, _UNCACHEABLE))
+            current = _namespace_binding(namespace.get(key, _UNCACHEABLE), name, key)
             if len(current) != len(expected) or any(
                 actual is not saved
                 for actual, saved in zip(current, expected, strict=True)
@@ -459,7 +475,9 @@ def _intrinsic_implementation(value: object) -> str | None:
         codegen = vars(value).get("_codegen", {})
         if isinstance(codegen, dict):
             parts.extend(
-                (name, function_key(fn)) for name, fn in sorted(codegen.items())
+                (name, function_key(fn))
+                for name, fn in sorted(codegen.items())
+                if name in ("common", "triton")
             )
     else:
         parts = []

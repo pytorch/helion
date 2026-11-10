@@ -273,8 +273,7 @@ class TestGeneratedCodeEviction(TestCase):
         )
 
         @dataclasses.dataclass
-        class HiddenSettings:
-            static_shapes: bool = True
+        class HiddenSettings(helion.Settings):
             hidden: int = dataclasses.field(default=0, repr=False)
 
         # A field hidden from repr can still affect codegen.
