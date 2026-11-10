@@ -248,14 +248,48 @@ def scaled_mm(
             hl.atomic_add(out, [tile_m, tile_n], out_blk)
 
 
-def _kernel(fn, *, cache_level="code", config=None):
+def _kernel(fn, *, cache_level="code", config=None, **settings):
     return helion.kernel(
         backend="triton",
         cache_level=cache_level,
         config=config or helion.Config(block_sizes=[32]),
         static_shapes=False,
         autotune_effort="none",
+        **settings,
     )(fn)
+
+
+def _scaled_mm_baseline(out, a, b, a_scales, b_scales, bias=None):
+    result = torch.mm(a.to(torch.float32), b.to(torch.float32))
+    result = a_scales * result
+    result = b_scales.T * result
+    result = result.to(out.dtype)
+    if bias is not None:
+        result = result + bias
+    out.copy_(result)
+
+
+def _scaled_mm_kernel(*, cache_level="code", config=None):
+    # Preserve the vLLM wrapper's warning policy and baseline settings as well
+    # as its kernel body; both participate in normal cache admission.
+    settings = helion.Settings(
+        backend="triton",
+        cache_level=cache_level,
+        static_shapes=False,
+        autotune_effort="none",
+        autotune_baseline_fn=_scaled_mm_baseline,
+        autotune_baseline_atol=1e-1,
+        autotune_baseline_rtol=1e-1,
+        ignore_warnings=[
+            helion.exc.TensorOperationInWrapper,
+            helion.exc.ProcessGroupNameNotFound,
+        ],
+    )
+    return helion.kernel(
+        config=config
+        or helion.Config(block_sizes=[16, 32, 32], split_k=1, swap_ab=False),
+        settings=settings,
+    )(scaled_mm)
 
 
 @onlyBackends(["triton"])
@@ -297,14 +331,68 @@ class TestGeneratedCodeAdmission(RefEagerTestDisabled, TestCase):
             _tensor_abs=lambda x: None,
             _torch_add=lambda x: None,
             _full_kernel=lambda x: None,
+            scaled_mm=lambda *args: None,
         )
 
-    def _bind_and_compile(self, fn, *, cache_level="code"):
-        kernel = _kernel(fn, cache_level=cache_level)
+    def _bind_and_compile(self, fn, *, cache_level="code", **settings):
+        kernel = _kernel(fn, cache_level=cache_level, **settings)
         with kernel._bind_lock:
             bound = kernel._bind((self.x,))
         bound.set_config(helion.Config(block_sizes=[32]))
         return bound
+
+    def test_exact_vllm_warning_settings_preserve_warm_cache(self) -> None:
+        args = (
+            torch.empty((16, 64), dtype=torch.bfloat16),
+            torch.ones((16, 64), dtype=torch.int8),
+            torch.ones((64, 64), dtype=torch.int8).t(),
+            torch.full((16, 1), 0.5),
+            torch.full((64, 1), 0.25),
+            None,
+        )
+        cold = _scaled_mm_kernel()
+        key = cache._compilation_settings_key(cold.settings)
+        self.assertIsNot(key, cache._UNCACHEABLE)
+        with patch.object(cold.settings, "ignore_warnings", []):
+            self.assertNotEqual(key, cache._compilation_settings_key(cold.settings))
+        for warning in cold.settings.ignore_warnings:
+            self.assertIs(cache._dependency_key(warning), cache._UNCACHEABLE)
+        bound = cold.bind(args)
+        bound.set_config(cold.configs[0])
+        self.assertIsNotNone(bound._generated_code)
+        warm = _scaled_mm_kernel()
+        with patch.object(
+            KernelCompiler, "compile", side_effect=AssertionError("warm frontend ran")
+        ):
+            with warm._bind_lock:
+                runner = warm._bind(args)
+            runner.set_config(warm.configs[0])
+        self.assertIsInstance(runner, _CachedBoundKernel)
+        self.assertEqual(self.sources[0], self.sources[1])
+
+    def test_custom_warning_settings_keep_native_compilation(self) -> None:
+        class WarningMeta(type):
+            def __subclasscheck__(cls, subclass):
+                raise AssertionError("cache admission invoked a custom metaclass")
+
+        class CustomWarning(helion.exc.BaseWarning, metaclass=WarningMeta):
+            pass
+
+        settings = helion.Settings(ignore_warnings=[CustomWarning])
+        self.assertIs(cache._compilation_settings_key(settings), cache._UNCACHEABLE)
+        for _ in range(2):
+            with patch.object(
+                KernelCompiler,
+                "compile",
+                autospec=True,
+                side_effect=KernelCompiler.compile,
+            ) as compile_fn:
+                bound = self._bind_and_compile(
+                    _full_kernel, ignore_warnings=[CustomWarning]
+                )
+            self.assertIsInstance(bound, BoundKernel)
+            self.assertGreater(compile_fn.call_count, 0)
+        self.assertFalse((self.root / "generated_code").exists())
 
     def test_nested_class_helper_never_loads_a_frontend_artifact(self) -> None:
         for scale in (2.0, 2.0, 3.0):
@@ -780,7 +868,7 @@ else:
     out = torch.empty((16, 64), device="cuda", dtype=torch.bfloat16)
     expected = (a.float() @ b.float()) * a_scales * b_scales.T
     config = module.helion.Config(block_sizes=[16, 32, 32], split_k=1, swap_ab=False)
-    kernel = module._kernel(module.scaled_mm, cache_level=level, config=config)
+    kernel = module._scaled_mm_kernel(cache_level=level, config=config)
     if phase == "warm" and level == "code":
         with patch.object(module.KernelCompiler, "compile", side_effect=AssertionError("exact vLLM warm frontend ran")):
             kernel(out, a, b, a_scales, b_scales)

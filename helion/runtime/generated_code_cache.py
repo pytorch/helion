@@ -109,6 +109,7 @@ _FROZEN_COMPILER_HANDLERS: dict[int, dict[tuple[object, ...], object]] | None = 
 _FROZEN_COMPILER_NAMESPACES: dict[
     str, tuple[types.ModuleType, dict[str, tuple[object, ...]]]
 ] = {}
+_FROZEN_WARNING_TYPES: dict[int, tuple[type, str]] = {}
 
 
 def _intrinsic_handlers(value: object) -> dict[tuple[object, ...], object]:
@@ -137,6 +138,7 @@ def freeze_compiler_cache_contract() -> None:
     """Pin native registrations once language and backend imports have finished."""
     global _FROZEN_COMPILER_HANDLERS
     if _FROZEN_COMPILER_HANDLERS is None:
+        from .. import exc
         from .._compiler.backend_registry import repair_backend_codegen
         from ..autotuner.config_spec import valid_keys
 
@@ -149,6 +151,13 @@ def freeze_compiler_cache_contract() -> None:
             identifier: _intrinsic_handlers(value)
             for identifier, (value, _) in _cache_intrinsics().items()
         }
+        _FROZEN_WARNING_TYPES.update(
+            (id(value), (value, f"{exc.__name__}.{name}"))
+            for name, value in vars(exc).items()
+            if type(value) is type
+            and value.__module__ == exc.__name__
+            and issubclass(value, exc.BaseWarning)
+        )
         _freeze_compiler_namespaces()
 
 
@@ -558,16 +567,27 @@ _NON_CODEGEN_SETTINGS = frozenset({"cache_level"})
 def _compilation_settings_key(settings: Settings) -> object:
     # Reject unknown compilation values instead of hashing an address-bearing
     # repr. Read fields directly: to_dict() deep-copies arbitrary values first.
-    return _dependency_key(
-        dict(
-            sorted(
-                (field.name, getattr(settings, field.name))
-                for field in dataclasses.fields(settings)
-                if field.name not in _NON_CODEGEN_SETTINGS
-                and not field.name.startswith(_NON_CODEGEN_SETTING_PREFIXES)
-            )
+    values = dict(
+        sorted(
+            (field.name, getattr(settings, field.name))
+            for field in dataclasses.fields(settings)
+            if field.name not in _NON_CODEGEN_SETTINGS
+            and not field.name.startswith(_NON_CODEGEN_SETTING_PREFIXES)
         )
     )
+    warnings = values["ignore_warnings"]
+    if type(warnings) not in (list, tuple):
+        return _UNCACHEABLE
+    warning_names = []
+    for warning in warnings:
+        native = _FROZEN_WARNING_TYPES.get(id(warning))
+        if native is None or native[0] is not warning:
+            return _UNCACHEABLE
+        warning_names.append(native[1])
+    # Warning policy affects diagnostics, but accepting native warning classes
+    # here must not admit arbitrary classes or calls in kernel dependencies.
+    values["ignore_warnings"] = ("native_warning_types", tuple(warning_names))
+    return _dependency_key(values)
 
 
 def _argument_key(value: object) -> object:
