@@ -332,16 +332,16 @@ def test_mma_dag_kernel_exports_the_shared_ptx_rows(tmp_path: Path) -> None:
     c = torch.randn(1024, 256, device=DEVICE, dtype=torch.float16)
     bound = kernel.bind((g, g, g, c))
     with bound.env:
-        default = bound.config_spec.default_config()
+        # Pin the accumulating-addmm codegen test's four-warp geometry.
         config = bound.config_spec.normalized_config(
             helion.Config(
-                **{
-                    **default.config,
-                    "cute_mma_dag": "warp",
-                    # The TMA ring adds a descriptor-preparation plan the
-                    # exporter refuses; per-thread packets leave the alias plan.
-                    "cute_mma_dag_loads": "lane",
-                }
+                block_sizes=[32, 32, 64],
+                cute_mma_dag="warp",
+                cute_mma_dag_warps=4,
+                cute_mma_dag_stages=2,
+                # The TMA ring adds a descriptor-preparation plan the
+                # exporter refuses; per-thread packets leave the alias plan.
+                cute_mma_dag_loads="lane",
             )
         )
     code = bound.to_code(config)
