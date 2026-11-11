@@ -700,9 +700,12 @@ class TypePropagation(ast.NodeVisitor):
             self.visit(node.left),
             *[self.visit(comparator) for comparator in node.comparators],
         ]
-        if (
-            any(isinstance(comparator, TensorType) for comparator in comparators)
-            and self.device_loop_depth == 0
+        if self.device_loop_depth == 0 and any(
+            not isinstance(op, CMP_IS)
+            and (isinstance(left, TensorType) or isinstance(right, TensorType))
+            for op, (left, right) in zip(
+                node.ops, itertools.pairwise(comparators), strict=True
+            )
         ):
             warning(exc.TensorOperationInWrapper)
         result = self._compare(node.ops[0], comparators[0], comparators[1])
