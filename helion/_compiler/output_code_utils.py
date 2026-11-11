@@ -22,6 +22,8 @@ launch wrappers can instead implement ``Backend.build_standalone_code``.
 from __future__ import annotations
 
 import ast
+import builtins
+import symtable
 from typing import TYPE_CHECKING
 from typing import Any
 
@@ -42,6 +44,178 @@ _SHIM_DOC = (
     "the ``helion`` namespace built from this function. The launcher is inlined in "
     "this private scope so its symbols can never collide with the kernel name."
 )
+
+
+def _artifact_global_reads(table: symtable.SymbolTable) -> set[str]:
+    """Use Python's scope analysis, including nested functions and defaults."""
+    names = {
+        symbol.get_name()
+        for symbol in table.get_symbols()
+        if symbol.is_global() and symbol.is_referenced()
+    }
+    for child in table.get_children():
+        names.update(_artifact_global_reads(child))
+    return names
+
+
+def _artifact_annotation_reads(tree: ast.AST) -> set[str]:
+    # Future/quoted annotations are absent from Python's runtime symbol table,
+    # but may subsequently be evaluated by the backend or typing machinery.
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        annotation = None
+        if isinstance(node, (ast.arg, ast.AnnAssign)):
+            annotation = node.annotation
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            annotation = node.returns
+        if annotation is None:
+            continue
+        for value in ast.walk(annotation):
+            if isinstance(value, ast.Name):
+                names.add(value.id)
+            elif isinstance(value, ast.Constant) and isinstance(value.value, str):
+                try:
+                    expression = ast.parse(value.value, mode="eval")
+                except SyntaxError:
+                    continue
+                names.update(
+                    item.id
+                    for item in ast.walk(expression)
+                    if isinstance(item, ast.Name)
+                )
+    return names
+
+
+def _artifact_runtime_nodes(tree: ast.Module) -> set[ast.AST]:
+    """Recognize the exact compiler-owned runtime, including optional CUDA APIs."""
+    from .triton.backend import TritonBackend
+
+    canonical = _runtime_shim_statements(TritonBackend().dependency_free_launcher_info)[
+        0
+    ]
+    canonical_dump = ast.dump(canonical)
+    return {
+        child
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and ast.dump(node) == canonical_dump
+        for child in ast.walk(node)
+    }
+
+
+def close_artifact_source(source: str) -> str:
+    """Require emitted artifact code to depend only on its declared runtimes.
+
+    This checks the generated program, not equivalence to future executions of
+    the original Python kernel. Torch, Triton and the standard-library modules
+    used by native code generation are trusted runtime dependencies, as is the
+    exact native launcher (whose optional residency checks use CUDA bindings).
+    This is not a sandbox for untrusted source or a monkeypatched installation.
+    """
+    tree = ast.parse(source)
+    runtime_nodes = _artifact_runtime_nodes(tree)
+    source = ast.unparse(tree)
+    table = symtable.symtable(source, "<helion-artifact>", "exec")
+    referenced = _artifact_global_reads(table) | _artifact_annotation_reads(tree)
+    # These are dependencies of the emitted launcher/dispatcher, not an
+    # allowlist of operations in the source Helion kernel.
+    runtime_modules = {
+        "__future__",
+        "collections",
+        "contextvars",
+        "functools",
+        "inspect",
+        "math",
+        "operator",
+        "torch",
+        "triton",
+        "types",
+        "typing",
+        "weakref",
+    }
+    dynamic_names = {
+        "__import__",
+        "__builtins__",
+        "eval",
+        "exec",
+        "compile",
+        "globals",
+        "locals",
+        "import_module",
+        "load_module",
+        "exec_module",
+    }
+    for node in ast.walk(tree):
+        if node in runtime_nodes:
+            continue
+        if (
+            (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Load)
+                and node.id in dynamic_names
+            )
+            or isinstance(node, ast.Attribute)
+            and node.attr in dynamic_names
+        ):
+            raise ValueError("artifact source uses dynamic Python namespace access")
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "vars"
+            and not node.args
+        ):
+            raise ValueError("artifact source uses dynamic Python namespace access")
+    for node in tuple(ast.walk(tree)):
+        if node in runtime_nodes or not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        kept = []
+        for alias in node.names:
+            if alias.name in dynamic_names:
+                raise ValueError("artifact source uses dynamic Python namespace access")
+            module = alias.name if isinstance(node, ast.Import) else node.module or ""
+            if alias.name == "*" or isinstance(node, ast.ImportFrom) and node.level:
+                raise ValueError(
+                    "artifact source cannot use relative or wildcard imports"
+                )
+            if module.split(".")[0] in runtime_modules:
+                kept.append(alias)
+                continue
+            name = alias.asname or (
+                alias.name.split(".")[0] if isinstance(node, ast.Import) else alias.name
+            )
+            # Only discard compiler-emitted top-level imports. Nested imports
+            # are rejected conservatively; they may have runtime side effects.
+            if node not in tree.body or name in referenced:
+                raise ValueError(
+                    f"artifact source depends on external module {module!r}"
+                )
+        if kept:
+            node.names = kept
+        else:
+            tree.body.remove(node)
+    closed = ast.unparse(tree) + "\n"
+    closed_table = symtable.symtable(closed, "<helion-artifact>", "exec")
+    bound = {
+        symbol.get_name()
+        for symbol in closed_table.get_symbols()
+        if symbol.is_assigned() or symbol.is_imported() or symbol.is_namespace()
+    }
+    implicit = {
+        "__name__",
+        "__doc__",
+        "__package__",
+        "__file__",
+        "__spec__",
+        "__loader__",
+        "__cached__",
+    }
+    missing = (
+        _artifact_global_reads(closed_table) - bound - set(vars(builtins)) - implicit
+    )
+    if missing:
+        raise ValueError(
+            f"artifact source has unbound global names: {', '.join(sorted(missing))}"
+        )
+    return closed
 
 
 def build_dependency_free_code(

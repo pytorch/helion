@@ -40,7 +40,7 @@ def _dot_result_shape(
     return [*batch_shape, mat1.shape[-2], mat2.shape[-1]]
 
 
-@_decorators.api(cacheable=True, is_device_only=True)
+@_decorators.api(is_device_only=True)
 def dot(
     mat1: torch.Tensor,
     mat2: torch.Tensor,
@@ -416,7 +416,7 @@ def _(
 VALID_SCALED_FORMATS = frozenset({"e2m1", "e4m3", "e5m2", "bf16", "fp16"})
 
 
-@_decorators.api(cacheable=True, is_device_only=True)
+@_decorators.api(is_device_only=True)
 def dot_scaled(
     mat1: torch.Tensor,
     mat1_scale: torch.Tensor,

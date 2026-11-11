@@ -75,7 +75,7 @@ class ProcessGroupName(ConstExpr):
     """
 
 
-@_decorators.api(cacheable=True, is_device_only=False)
+@_decorators.api(is_device_only=False)
 def specialize(value: _T) -> _T:
     """
     Turn dynamic tensor sizes or strides into compile-time constants. Examples::

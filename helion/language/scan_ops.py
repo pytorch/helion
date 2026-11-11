@@ -25,7 +25,7 @@ __all__ = ["associative_scan", "cumprod", "cumsum"]
 
 @overload
 @_decorators.device_func_replacement(higher_order_ops.associative_scan)
-@_decorators.api(cacheable=True, is_device_only=True)
+@_decorators.api(is_device_only=True)
 def associative_scan(
     combine_fn: CombineFunction,
     input_tensor: torch.Tensor,
@@ -36,7 +36,7 @@ def associative_scan(
 
 @overload
 @_decorators.device_func_replacement(higher_order_ops.associative_scan)
-@_decorators.api(cacheable=True, is_device_only=True)
+@_decorators.api(is_device_only=True)
 def associative_scan(
     combine_fn: CombineFunction,
     input_tensor: tuple[torch.Tensor, ...],
@@ -46,7 +46,7 @@ def associative_scan(
 
 
 @_decorators.device_func_replacement(higher_order_ops.associative_scan)
-@_decorators.api(cacheable=True, is_device_only=True)
+@_decorators.api(is_device_only=True)
 def associative_scan(
     combine_fn: CombineFunction,
     input_tensor: torch.Tensor | tuple[torch.Tensor, ...],

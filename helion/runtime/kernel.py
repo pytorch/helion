@@ -56,7 +56,6 @@ from .._compiler.autotuner_heuristics import compiler_seed_configs
 from .._compiler.autotuner_heuristics import compiler_seed_specialization_facts
 from .._compiler.autotuner_heuristics import register_compiler_coverage_groups
 from .._compiler.backend_registry import get_backend
-from .._compiler.cache_dependencies import DependencyCapture
 from .._compiler.compile_environment import CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import _concrete_tensor_satisfies_alignment_guard
@@ -87,13 +86,6 @@ from .config import Config
 from .cute.structural_config import DEFAULT_STRUCTURAL_POLICY
 from .cute.structural_config import CuteStructuralConfig
 from .cute.structural_config import select_structural_policy
-from .generated_code_cache import GeneratedCodeState
-from .generated_code_cache import _has_active_torch_mode
-from .generated_code_cache import binding_input_key
-from .generated_code_cache import compiled_kernel_cache_key
-from .generated_code_cache import compiler_abi_key
-from .generated_code_cache import dependency_fingerprint
-from .generated_code_cache import serialized_fact
 from .ref_mode import RefModeContext
 from .ref_mode import is_ref_mode_enabled
 from .settings import Settings
@@ -109,7 +101,6 @@ if TYPE_CHECKING:
     from .._compiler.autotuner_heuristics.registry import (
         CompilerHeuristicSpecializationFact,
     )
-    from .._compiler.backend import Backend
     from .._compiler.compile_environment import PreparedGuardFactory
     from .._compiler.compile_environment import TensorDescriptorLayoutGuard
     from .._compiler.host_function import HostFunction
@@ -117,26 +108,10 @@ if TYPE_CHECKING:
     from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
     from .cute.structural_config import CuteStructuralPolicyRequest
     from .cute.structural_policy import CuteStructuralPolicy
-    from .generated_code_cache import GuardSource
 
     ConfigLike = Config | dict[str, object] | CuteStructuralConfig
 
 log: logging.Logger = logging.getLogger(__name__)
-
-
-def _load_code(
-    kernel: Kernel,
-    backend: Backend,
-    source: str,
-    device_index: int,
-    *,
-    extra: str = "",
-) -> types.ModuleType:
-    backend.setup_compile_cache_dir(device_index)
-    with measure("BoundKernel.PyCodeCache.load"):
-        module = PyCodeCache.load(source, extra=extra)
-    backend.annotate_compiled_module(module, source, kernel.name)
-    return module
 
 
 def _indexing_config_uses_tensor_descriptor(indexing: object, index: int) -> bool:
@@ -1118,10 +1093,7 @@ class _PreparedCall:
         is_distributed: bool,
     ) -> _PreparedCall | None:
         if (
-            # Disk runners always use Triton and never expose a frontend env.
-            not (
-                bound._is_disk_runner or bound.env.backend.supports_eager_prepared_call
-            )
+            not bound.env.backend.supports_eager_prepared_call
             or kernel._key_fn is not None
         ):
             return None
@@ -1401,11 +1373,6 @@ class Kernel(Generic[_R]):
         self._compiler_seed_specialize_extra: dict[
             Hashable, tuple[_CompilerSeedSpecializationExtractor, ...]
         ] = {}
-        # Serialized form of each published schema for the generated code
-        # cache, or None once a schema holds a guard it cannot serialize.
-        self._published_guards: dict[
-            Hashable, tuple[list[object] | None, ...] | None
-        ] = {}
         self._specialization_aliases: dict[
             tuple[Hashable, ...], _SpecializationAlias
         ] = {}
@@ -1601,9 +1568,6 @@ class Kernel(Generic[_R]):
                         self._compiler_seed_specialize_extra[signature] = (
                             compiler_seed_fns
                         )
-                        self._published_guards[signature] = (
-                            bound_kernel._serialized_guards
-                        )
                         if extra_fns:
                             self._has_specialization_extras = True
                     else:
@@ -1720,7 +1684,6 @@ class Kernel(Generic[_R]):
                 # published lists requires the generation bump below.
                 self._has_specialization_extras = True
                 self._specialize_extra[signature] = updated_extractors
-                self._published_guards[signature] = None
                 for alias_signature, alias in aliases.items():
                     self._specialize_extra[alias_signature] = [alias]
                     self._compiler_seed_specialize_extra[alias_signature] = (
@@ -1793,10 +1756,7 @@ class Kernel(Generic[_R]):
                 if key.specialization_key not in (signature, *aliases):
                     continue
                 del self._bound_kernels[key]
-                # Alias keys pack the canonical results; let them rebind. A
-                # disk runner evaluates the facts on the inputs it was bound
-                # to: its saved code fired none of them, like a native bound
-                # whose hints do not satisfy them.
+                # Alias keys pack the canonical results; let them rebind.
                 if (
                     key.specialization_key == signature
                     and (results := _bound_guarded_input_facts(bound, new_facts))
@@ -1811,25 +1771,6 @@ class Kernel(Generic[_R]):
                     ] = bound
             # Replacing a published list requires the generation bump below.
             self._specialize_extra[signature] = [*published, *new_facts]
-            # The generated code cache saves the facts after the guards. One
-            # it cannot serialize (None) stops saving bindings of the signature.
-            arguments = {
-                name: index for index, name in enumerate(self.signature.parameters)
-            }
-            guards = self._published_guards.get(signature)
-            self._published_guards[signature] = (
-                None
-                if guards is None
-                else (
-                    *guards,
-                    *(
-                        serialized_fact(
-                            cast("_GuardedInputFact", fact.extractor), arguments
-                        )
-                        for fact in new_facts
-                    ),
-                )
-            )
             for alias_signature, alias in aliases.items():
                 # An alias published while the canonical schema was empty
                 # keys no canonical extractor; let it key the new facts.
@@ -2167,7 +2108,7 @@ class Kernel(Generic[_R]):
                 keyed_direct_dispatch = (
                     not self.settings.distributed
                     and not self._declares_process_group
-                    and (bound._is_disk_runner or not bound._env._is_distributed)
+                    and not bound._env._is_distributed
                 )
             # Process-group initialization is external to ``_bind_lock``. Do
             # not publish a key assembled across a state transition.
@@ -2183,25 +2124,12 @@ class Kernel(Generic[_R]):
         """
         Bind the given arguments to the Kernel and return a BoundKernel object.
 
-        With ``cache_level="code"``, a warm cache hit runs frontend
-        compilation here to return an ordinary binding, while calling the
-        kernel directly (``kernel(*args)``) does not.
-
         Args:
             args: The arguments to bind to the Kernel.
 
         Returns:
             BoundKernel: A BoundKernel object with the given arguments bound.
         """
-        bound_kernel = self._dispatch_bind(args)
-        if bound_kernel._is_disk_runner:
-            # Calls keep the generated code cache's disk runner; the public
-            # binding is an ordinary one with a frontend.
-            bound_kernel = bound_kernel._materialize(self.normalize_args(*args))
-        return bound_kernel
-
-    def _dispatch_bind(self, args: tuple[object, ...]) -> BoundKernel[_R]:
-        """Bind for a call, where a disk runner serves in place of a binding."""
         # Dynamo executes bind while capturing the call but cannot trace an RLock.
         # Capture only needs an independent host function and compile environment.
         if torch.compiler.is_compiling():
@@ -2284,31 +2212,13 @@ class Kernel(Generic[_R]):
                         else []
                     )
                 else:
-                    input_key = (
-                        None if is_distributed else binding_input_key(self, args)
+                    bound_kernel = BoundKernel(
+                        self,
+                        args,
+                        base_spec_key=signature,
+                        is_distributed=is_distributed,
                     )
-                    artifact_key = (
-                        None
-                        if input_key is None
-                        else compiled_kernel_cache_key(self, args, signature, input_key)
-                    )
-                    if artifact_key is not None:
-                        # cached_kernel builds ordinary bindings from this module.
-                        from .cached_kernel import load_cached_kernel
-
-                        bound_kernel = load_cached_kernel(
-                            self, args, signature, artifact_key, cache_key
-                        )
-                    if bound_kernel is None:
-                        bound_kernel = BoundKernel(
-                            self,
-                            args,
-                            base_spec_key=signature,
-                            is_distributed=is_distributed,
-                            artifact_key=artifact_key,
-                            input_key=input_key,
-                        )
-                        created = True
+                    created = True
                 if cache_key is None:
                     cache_key = self._create_bound_kernel_cache_key(
                         bound_kernel,
@@ -2934,8 +2844,8 @@ class Kernel(Generic[_R]):
             result = auto_capture_call(self, args)
             if result is not RUN_NORMAL:
                 return cast("_R", result)
-            return self._dispatch_bind(args)(*args)
-        bound = self._dispatch_bind(args)
+            return self.bind(args)(*args)
+        bound = self.bind(args)
         result = bound(*args)
         if is_compiling:
             return result
@@ -2982,7 +2892,6 @@ class Kernel(Generic[_R]):
                 # The generation bump below retires every published list.
                 self._specialize_extra = {}
                 self._compiler_seed_specialize_extra = {}
-                self._published_guards = {}
                 self._specialization_aliases = {}
                 self._cute_grouped_static_tail_extra_descriptors = {}
                 self._cute_reduction_extent_descriptors = {}
@@ -3015,44 +2924,6 @@ class Kernel(Generic[_R]):
 
 
 class BoundKernel(_AutotunableKernel, Generic[_R]):
-    # True for cached_kernel's disk runners, which have no frontend env.
-    _is_disk_runner: bool = False
-    # Generated code cache keys and bookkeeping; None when the cache is off
-    # for this binding.
-    _generated_code: GeneratedCodeState | None = None
-
-    def _materialize(self, args: tuple[object, ...] | None = None) -> BoundKernel[_R]:
-        """The ordinary binding behind this one (disk runners compile one)."""
-        return self
-
-    @property
-    def _serialized_guards(self) -> tuple[list[object] | None, ...] | None:
-        """This binding's specialization guards as the generated code cache saves them."""
-        if self._generated_code is None:
-            return None
-        return self._generated_code.guards
-
-    def _guard_fact_value(self, fact: _GuardedInputFact) -> Hashable:
-        """``fact`` at this binding's bind-time hints (None when not recoverable)."""
-        return fact.bound_value(self.env)
-
-    def _guard_fact_results(self) -> tuple[tuple[str, Hashable], ...] | None:
-        """Each guard fact published after this binding's guards, with its value here.
-
-        Code generation reads them, so the generated code cache keys them.
-        None when the schema holds something else there.
-        """
-        assert self._generated_code is not None
-        facts = self.kernel._specialize_extra.get(self._base_spec_key, [])[
-            len(self._generated_code.guards) :
-        ]
-        results = _bound_guarded_input_facts(self, facts)
-        return (
-            None
-            if results is None
-            else tuple(zip(map(repr, facts), results, strict=True))
-        )
-
     def __init__(
         self,
         kernel: Kernel[_R],
@@ -3062,8 +2933,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         is_distributed: bool | None = None,
         cache_managed: bool = True,
         rewrite_ast: bool = True,
-        artifact_key: str | None = None,
-        input_key: str | None = None,
     ) -> None:
         """
         Initialize a BoundKernel object.
@@ -3158,18 +3027,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             index_dtype=_resolve_index_dtype(self.kernel.settings, args),
             is_distributed=is_distributed,
         )
-        if (
-            kernel.settings.cache_level == "code"
-            and kernel.settings.backend == "triton"
-        ):
-            self._env.cache_compiler_abi = compiler_abi_key()
-            self._env.cache_dependencies = DependencyCapture(
-                kernel.fn, dependency_fingerprint
-            )
-            if _has_active_torch_mode():
-                self._env.cache_dependencies.reject(
-                    "active Torch dispatch modes cannot be certified"
-                )
         # The structural policy the traced IR will follow (None for backends
         # whose config schema does not depend on Settings).
         policy_type = self._env.backend.structural_policy_type()
@@ -3302,11 +3159,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     register_compiler_coverage_groups(
                         self.env, self.host_function.device_ir
                     )
-
-        if self._cache_managed:
-            self._generated_code = GeneratedCodeState.create(
-                self, args, artifact_key, input_key
-            )
 
     def _apply_mark_static(self, args: tuple[object, ...]) -> None:
         """
@@ -3544,6 +3396,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 # Loaded from a render worker's source for a measurement; a
                 # config about to run for real is rendered here so to_code
                 # records its guard facts and CuTe specializations.
+                self._render_only_configs.discard(config)
                 del self._compile_cache[config]
             else:
                 self.env.backend.after_compile(self, config)
@@ -3551,21 +3404,15 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         device_index = (
             self._env.device.index if self._env.device.index is not None else 0
         )
+        self.env.backend.setup_compile_cache_dir(device_index)
         try:
             if primed is not None and _SEARCHING_CANDIDATES.get():
                 triton_code = primed
                 self._render_only_configs.add(config)
             else:
-                triton_code = (
-                    None
-                    if self._generated_code is None
-                    or config in self._render_only_configs
-                    else self._generated_code.load(self, config)
+                triton_code = self.to_triton_code(
+                    config, emit_repro_caller=self.settings.print_output_code
                 )
-                if triton_code is None:
-                    triton_code = self.to_triton_code(
-                        config, emit_repro_caller=self.settings.print_output_code
-                    )
                 self._render_only_configs.discard(config)
             # static_shapes=True keys a distinct BoundKernel per input shape (see
             # _tensor_key), but PyCodeCache keys compiled modules by SOURCE TEXT, so
@@ -3590,12 +3437,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 cache_extra = repr(self._base_spec_key)
             if self.kernel.cute_structural_policy is not None:
                 cache_extra += self.extra_cache_key()
-            module = _load_code(
-                self.kernel,
-                self.env.backend,
-                triton_code,
-                device_index,
-                extra=cache_extra,
+            with measure("BoundKernel.PyCodeCache.load"):
+                module = PyCodeCache.load(triton_code, extra=cache_extra)
+            self.env.backend.annotate_compiled_module(
+                module, triton_code, self.kernel.name
             )
         except Exception:
             log.warning(
@@ -3900,10 +3745,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         """
         requested_config = config
         config = self._normalize_config(config)
-        if self._generated_code is None:
-            self._run = self.compile_config(config)
-        else:
-            self._run = self._generated_code.compile_and_save(self, config)
+        self._run = self.compile_config(config)
         self._config = config
         repro_config = (
             requested_config
@@ -3914,22 +3756,14 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             self.format_kernel_decorator(repro_config, self.settings)
         ] = 1
 
-    def _specialize_extra(
-        self, guard_sources: list[GuardSource] | None = None
-    ) -> list[Callable[[Sequence[object]], Hashable]]:
+    def _specialize_extra(self) -> list[Callable[[Sequence[object]], Hashable]]:
         """
         Returns a list of functions that will be called to generate extra specialization keys.
         This is used to specialize on the values hl.specialize()'ed arguments.
 
-        Args:
-            guard_sources: Receives what each function reads, for the generated
-                code cache.
-
         Returns:
             list[Callable[[Sequence[object]], Hashable]]: A list of functions that generate extra specialization keys.
         """
-        if guard_sources is None:
-            guard_sources = []
         tensor_descriptor_layout_guards = self.env.tensor_descriptor_layout_guards
         tensor_descriptor_alignment_guards = getattr(
             self.env, "tensor_descriptor_alignment_guards", {}
@@ -4025,7 +3859,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             if isinstance(source, TensorPropertySource):
                 extractor = PreparedMetadataSpecializationExtractor(extractor)
             extractors.append(extractor)
-            guard_sources.append((source, None, None))
             if (
                 isinstance(source, TensorPropertySource)
                 and source.prop == TensorProperty.STRIDE
@@ -4038,7 +3871,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             extractors.append(
                 PreparedMetadataSpecializationExtractor(make_extractor(source))
             )
-            guard_sources.append((source, None, None))
         candidate_configs: tuple[Config, ...] | None
         if tensor_descriptor_layout_guards or tensor_descriptor_alignment_guards:
             implicit_config = self._fixed_config_for_td_layout_guards()
@@ -4113,7 +3945,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             if not guard_is_active(guard):
                 continue
             extract_tensor = make_extractor(source)
-            extent_cap = descriptor_extent_cap(guard)
 
             def td_layout_extractor(
                 args: Sequence[object],
@@ -4122,7 +3953,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 ] = extract_tensor,
                 _ndim: int = guard.ndim,
                 _element_size: int = guard.element_size,
-                _extent_cap: int | None = extent_cap,
+                _extent_cap: int | None = descriptor_extent_cap(guard),
             ) -> Hashable:
                 tensor = cast("torch.Tensor", _extract_tensor(args))
                 if tensor.ndim != _ndim:
@@ -4149,7 +3980,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             extractors.append(
                 PreparedMetadataSpecializationExtractor(td_layout_extractor)
             )
-            guard_sources.append((source, guard, extent_cap))
 
         for source, guard in sorted(
             tensor_descriptor_alignment_guards.items(),
@@ -4163,7 +3993,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     make_extractor(source), guard.requires_zero_storage_offset
                 )
             )
-            guard_sources.append((source, guard, None))
 
         for key, specialization in sorted(
             self.env.runtime_input_specializations.items(),
@@ -4181,8 +4010,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     specialization.prepared_guard_factory,
                 )
             )
-            # Runtime classifiers inspect storage; no saved guard rebuilds them.
-            guard_sources.append(None)
         return extractors
 
     def _publish_guarded_input_facts(self) -> None:
@@ -4285,10 +4112,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             )
             if lhs.free_symbols and all(free in sources for free in free_symbols):
                 facts.setdefault(
-                    _GuardedInputFact.create(
+                    _GuardedInputFact(
                         lhs,
                         expr,
-                        {free: sources[free] for free in free_symbols},
+                        tuple((free, sources[free]) for free in free_symbols),
                         block,
                         equal,
                         param_names,
@@ -4479,7 +4306,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             self._cache_managed
             and self._reset_generation != self.kernel._reset_generation
         ):
-            return self.kernel._dispatch_bind(args)(*args)
+            return self.kernel.bind(args)(*args)
         is_compiling = torch.compiler.is_compiling()
         if (
             not is_compiling
@@ -4522,11 +4349,11 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 new_compiler_seed_device
                 or compiler_seed_results != self._compiler_seed_specialization_results
             ):
-                rebound = self.kernel._dispatch_bind(args)
+                rebound = self.kernel.bind(args)
                 if rebound is not self:
                     return rebound(*args)
         if self._cache_managed and self.kernel._has_specialization_extras:
-            rebound = self.kernel._dispatch_bind(args)
+            rebound = self.kernel.bind(args)
             if rebound is not self:
                 return rebound(*args)
 
@@ -4535,7 +4362,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 # Another caller may have discovered a late specialization while
                 # this caller waited for the first compile.
                 if self._cache_managed and self.kernel._has_specialization_extras:
-                    rebound = self.kernel._dispatch_bind(args)
+                    rebound = self.kernel.bind(args)
                     if rebound is not self:
                         return rebound(*args)
                 if self._run is None:
@@ -5083,43 +4910,6 @@ class _GuardedInputFact:
     equal: bool
     param_names: tuple[str, ...]
 
-    @classmethod
-    def create(
-        cls,
-        lhs: sympy.Expr,
-        rhs: sympy.Expr,
-        sources: dict[sympy.Symbol, TensorPropertySource],
-        block: bool,
-        equal: bool,
-        param_names: tuple[str, ...],
-    ) -> _GuardedInputFact:
-        """The fact with each symbol named by the input size or stride it reads.
-
-        Equal facts then compare equal across bindings and processes, the ones
-        the generated code cache saved included.
-        """
-        names = {
-            symbol: sympy.Symbol(
-                f"{cast('LocalSource', source.base).local_name}"
-                f".{source.prop.name.lower()}({source.idx})",
-                integer=True,
-            )
-            for symbol, source in sources.items()
-        }
-        return cls(
-            lhs.xreplace(names),
-            rhs.xreplace(names),
-            tuple(
-                sorted(
-                    ((names[symbol], source) for symbol, source in sources.items()),
-                    key=lambda item: str(item[0]),
-                )
-            ),
-            block,
-            equal,
-            param_names,
-        )
-
     def _holds(self, values: dict[sympy.Symbol, int]) -> bool:
         lhs = evaluate_sympy_expr(self.lhs, values)
         same = (next_power_of_2(lhs) if self.block else lhs) == evaluate_sympy_expr(
@@ -5139,17 +4929,6 @@ class _GuardedInputFact:
             values[symbol] = value
         return self._holds(values)
 
-    def value_at(
-        self, input_value: Callable[[TensorPropertySource], int | None]
-    ) -> Hashable:
-        """This fact where ``input_value`` gives each source (None if unknown)."""
-        values: dict[sympy.Symbol, int] = {}
-        for symbol, source in self.sources:
-            if (value := input_value(source)) is None:
-                return None
-            values[symbol] = value
-        return self._holds(values)
-
     def bound_value(self, env: CompileEnvironment) -> Hashable:
         """This fact at ``env``'s bind-time hints (None when not recoverable)."""
         symbols = {
@@ -5158,15 +4937,14 @@ class _GuardedInputFact:
             for source in sources
         }
         hints = shape_env_var_hints(env.shape_env)
-
-        def hint(source: TensorPropertySource) -> int | None:
-            if (bound_symbol := symbols.get(source)) is None or (
-                bound_symbol not in hints
-            ):
+        values: dict[sympy.Symbol, int] = {}
+        for symbol, source in self.sources:
+            if (
+                bound_symbol := symbols.get(source)
+            ) is None or bound_symbol not in hints:
                 return None
-            return int(hints[bound_symbol])
-
-        return self.value_at(hint)
+            values[symbol] = int(hints[bound_symbol])
+        return self._holds(values)
 
 
 def _bound_guarded_input_facts(
@@ -5181,7 +4959,7 @@ def _bound_guarded_input_facts(
             and isinstance(fact := extractor.extractor, _GuardedInputFact)
         ):
             return None
-        if (result := bound._guard_fact_value(fact)) is None:
+        if (result := fact.bound_value(bound.env)) is None:
             return None
         results.append(result)
     return tuple(results)

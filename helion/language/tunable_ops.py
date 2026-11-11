@@ -37,9 +37,7 @@ __all__ = [
 ]
 
 
-@_decorators.api(
-    cacheable=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
-)
+@_decorators.api(is_device_only=False, cache_type=True, tiles_as_sizes=True)
 def register_block_size(min_or_max: int, max_or_none: int | None = None, /) -> int:
     """
     Explicitly register a block size that should be autotuned and can be used for
@@ -139,7 +137,7 @@ def _(state: CodegenState) -> ast.AST:
     return expr_from_string(constant_repr(block_size))
 
 
-@_decorators.api(cacheable=True, is_device_only=False)
+@_decorators.api(is_device_only=False)
 def register_tunable(name: str, fragment: ConfigSpecFragment) -> int:
     """
     Register a tunable parameter for autotuning.

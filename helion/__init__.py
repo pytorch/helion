@@ -15,6 +15,9 @@ from .runtime import Kernel
 from .runtime import OutputCodeOptions
 from .runtime import kernel
 from .runtime import kernel as jit  # alias
+from .runtime.artifact import ArtifactCase
+from .runtime.artifact import export_artifact
+from .runtime.artifact import load_artifact
 from .runtime.cute.structural_config import CuteStructuralConfig
 from .runtime.cute.structural_config import resolve_cute_structural_policy
 from .runtime.cute.structural_policy import CuteStructuralPolicy
@@ -22,6 +25,7 @@ from .runtime.settings import RefMode
 from .runtime.settings import Settings
 
 __all__ = [
+    "ArtifactCase",
     "Config",
     "CuteStructuralConfig",
     "CuteStructuralPolicy",
@@ -32,10 +36,12 @@ __all__ = [
     "aot_kernel",
     "cdiv",
     "exc",
+    "export_artifact",
     "from_cache",
     "jit",
     "kernel",
     "language",
+    "load_artifact",
     "next_power_of_2",
     "resolve_cute_structural_policy",
     "runtime",
@@ -47,9 +53,3 @@ _logging.init_logs()
 from ._compiler._dynamo.variables import register_dynamo_variable  # noqa: E402
 
 register_dynamo_variable()
-
-# Freeze supported compiler operations after circular imports finish, before
-# application code can replace module exports ahead of its first cache lookup.
-from .runtime.generated_code_cache import freeze_compiler_cache_contract  # noqa: E402
-
-freeze_compiler_cache_contract()

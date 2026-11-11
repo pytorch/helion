@@ -112,7 +112,7 @@ def _torch_chunk(
     return _unbind_two(input.reshape(shape), dim)
 
 
-@_decorators.api(cacheable=True, tiles_as_sizes=True)
+@_decorators.api(tiles_as_sizes=True)
 def subscript(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
     """
     Equivalent to tensor[index] where tensor is a kernel-tensor (not a host-tensor).
@@ -205,7 +205,7 @@ def _(node: torch.fx.Node) -> float | bool | None:
     return cached_masked_value(other)
 
 
-@_decorators.api(cacheable=True, is_device_only=True)
+@_decorators.api(is_device_only=True)
 def split(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Split the last dimension of a tensor with size two into two separate tensors.
@@ -285,7 +285,7 @@ def _(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return cast("tuple[torch.Tensor, torch.Tensor]", torch.unbind(tensor, dim=-1))
 
 
-@_decorators.api(cacheable=True, is_device_only=True)
+@_decorators.api(is_device_only=True)
 def join(
     tensor0: torch.Tensor,
     tensor1: torch.Tensor,

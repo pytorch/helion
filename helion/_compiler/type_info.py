@@ -14,7 +14,6 @@ from unittest.mock import patch
 
 import sympy
 import torch
-from torch._subclasses.fake_tensor import FakeTensor
 from torch.fx.experimental import proxy_tensor
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_map_only
@@ -359,117 +358,6 @@ def _is_scaled_block_extent(expr: sympy.Basic) -> bool:
     return False
 
 
-_CACHEABLE_TENSOR_ATTRIBUTES = {
-    "dim",
-    "ndimension",
-    "size",
-    "stride",
-    "numel",
-    "is_floating_point",
-    "to",
-    "float",
-    "double",
-    "half",
-    "bfloat16",
-    "int",
-    "long",
-    "bool",
-    "reshape",
-    "view",
-    "expand",
-    "unsqueeze",
-    "squeeze",
-    "transpose",
-    "permute",
-    "t",
-    "contiguous",
-    "clone",
-    "zero_",
-    "fill_",
-    "sum",
-    "mean",
-    "max",
-    "min",
-    "abs",
-    "sqrt",
-    "rsqrt",
-    "exp",
-    "log",
-} | {"dtype", "device", "ndim", "shape", "T"}
-
-
-def _tensor_descriptor(cls: type[torch.Tensor], name: str) -> object:
-    for base in cls.__mro__:
-        if name in vars(base):
-            return vars(base)[name]
-    return None
-
-
-_CACHEABLE_TENSOR_DESCRIPTORS = {
-    (cls, name): _tensor_descriptor(cls, name)
-    for cls in (torch.Tensor, FakeTensor)
-    for name in _CACHEABLE_TENSOR_ATTRIBUTES
-}
-_FAKE_DEVICE_GETTER = FakeTensor.device.fget
-assert _FAKE_DEVICE_GETTER is not None
-_FAKE_DEVICE_GETTER_CODE = _FAKE_DEVICE_GETTER.__code__
-
-# Operators reach these slots without an attribute AST node (for example,
-# x * y invokes __mul__). Pin their implementations as well as explicit reads.
-_TENSOR_OPERATOR_DESCRIPTORS = {
-    (cls, name): _tensor_descriptor(cls, name)
-    for cls in (torch.Tensor, FakeTensor)
-    for name in {
-        name
-        for base in cls.__mro__
-        for name in vars(base)
-        if name.startswith("__") and name.endswith("__")
-    }
-}
-_TENSOR_OPERATOR_CODE = {
-    value: value.__code__
-    for descriptor in _TENSOR_OPERATOR_DESCRIPTORS.values()
-    for value in (
-        descriptor.__func__
-        if isinstance(descriptor, (classmethod, staticmethod))
-        else descriptor,
-    )
-    if isinstance(value, types.FunctionType)
-}
-
-
-def tensor_cache_contract_valid() -> bool:
-    """A Python replacement must not inherit a native tensor method's contract."""
-    if any(
-        _tensor_descriptor(cls, name) is not expected
-        for (cls, name), expected in _TENSOR_OPERATOR_DESCRIPTORS.items()
-    ) or any(fn.__code__ is not code for fn, code in _TENSOR_OPERATOR_CODE.items()):
-        return False
-    for (cls, name), expected in _CACHEABLE_TENSOR_DESCRIPTORS.items():
-        if _tensor_descriptor(cls, name) is not expected:
-            return False
-        if type(expected) in (types.MethodDescriptorType, types.GetSetDescriptorType):
-            continue
-        if not (
-            cls is FakeTensor
-            and name == "device"
-            and type(expected) is property
-            and expected.fget is _FAKE_DEVICE_GETTER
-            and _FAKE_DEVICE_GETTER.__code__ is _FAKE_DEVICE_GETTER_CODE
-        ):
-            return False
-    return True
-
-
-def _cacheable_tensor_attribute(tensor: torch.Tensor, name: str) -> bool:
-    expected = _CACHEABLE_TENSOR_DESCRIPTORS.get((type(tensor), name))
-    return (
-        expected is not None
-        and _tensor_descriptor(type(tensor), name) is expected
-        and tensor_cache_contract_valid()
-    )
-
-
 class TensorType(TypeInfo):
     fake_value: torch.Tensor
 
@@ -513,13 +401,6 @@ class TensorType(TypeInfo):
             raise exc.TorchOpTracingError(e) from e
 
     def propagate_attribute(self, attr: str, origin: AttributeOrigin) -> TypeInfo:
-        capture = CompileEnvironment.current().cache_dependencies
-        if capture is not None and not _cacheable_tensor_attribute(
-            self.fake_value, attr
-        ):
-            capture.reject(
-                "a tensor attribute has no persistent-cache dependency contract"
-            )
         assert origin.key == attr
         if attr in {"dtype", "device", "ndim", "shape", "T"}:
             return TypeInfo.from_example(getattr(self.fake_value, attr), origin)
@@ -773,13 +654,6 @@ class TensorAttributeType(TypeInfo):
         self, args: tuple[TypeInfo, ...], kwargs: dict[str, TypeInfo], origin: Origin
     ) -> TypeInfo:
         attr = self.attr()
-        # These methods are represented by tensor metadata guards or ordinary
-        # runtime tensor operations. Other methods may expose untracked state.
-        if (capture := CompileEnvironment.current().cache_dependencies) is not None:
-            if not _cacheable_tensor_attribute(self.tensor.fake_value, attr):
-                capture.reject(
-                    "a tensor method has no persistent-cache dependency contract"
-                )
         if (
             origin.is_device()
             and attr in _TENSOR_METHOD_REPLACEMENTS
@@ -909,13 +783,7 @@ class LiteralType(TypeInfo):
         )
 
     def propagate_attribute(self, attr: str, origin: AttributeOrigin) -> TypeInfo:
-        value = getattr(self.value, attr)
-        capture = CompileEnvironment.current().cache_dependencies
-        if capture is not None and not isinstance(
-            self.value, (torch.dtype, torch.device)
-        ):
-            capture.record_attribute(self.value, attr, value)
-        return TypeInfo.from_example(value, origin)
+        return TypeInfo.from_example(getattr(self.value, attr), origin)
 
     def propagate_getitem(self, key: TypeInfo, origin: Origin) -> TypeInfo:
         try:
@@ -1102,14 +970,6 @@ class CallableType(LiteralType):
     def propagate_call(
         self, args: tuple[TypeInfo, ...], kwargs: dict[str, TypeInfo], origin: Origin
     ) -> TypeInfo | None:
-        capture = CompileEnvironment.current().cache_dependencies
-        if capture is not None:
-            from ..runtime.generated_code_cache import cacheable_call
-
-            if not cacheable_call(self.value):
-                capture.reject(
-                    "an opaque Python call has no compiler dependency contract"
-                )
         if self.value is breakpoint:
             # special handling to prevent breakpoint() from being called during host-code type propagation
             return LiteralType(origin, None)

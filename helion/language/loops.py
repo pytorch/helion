@@ -63,11 +63,7 @@ _T = TypeVar("_T")
 
 @overload
 @_decorators.api(
-    cacheable=True,
-    is_device_loop=True,
-    is_device_only=False,
-    cache_type=True,
-    tiles_as_sizes=True,
+    is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
 )
 def tile(
     begin_or_end: int | torch.Tensor,
@@ -79,11 +75,7 @@ def tile(
 
 @overload
 @_decorators.api(
-    cacheable=True,
-    is_device_loop=True,
-    is_device_only=False,
-    cache_type=True,
-    tiles_as_sizes=True,
+    is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
 )
 def tile(
     begin_or_end: Sequence[int | torch.Tensor],
@@ -94,11 +86,7 @@ def tile(
 
 
 @_decorators.api(
-    cacheable=True,
-    is_device_loop=True,
-    is_device_only=False,
-    cache_type=True,
-    tiles_as_sizes=True,
+    is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
 )
 def tile(
     begin_or_end: int | torch.Tensor | Sequence[int | torch.Tensor],
@@ -620,11 +608,7 @@ def _ref_device_loop(iterable: Iterable[_T]) -> Iterator[_T]:
 
 
 @_decorators.api(
-    cacheable=True,
-    is_device_loop=True,
-    is_device_only=False,
-    cache_type=True,
-    tiles_as_sizes=True,
+    is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
 )
 def jagged_tile(
     parent: object,
@@ -834,11 +818,7 @@ def _codegen_loop_helper(
 @overload
 @_decorators.device_func_replacement(builtins.range)
 @_decorators.api(
-    cacheable=True,
-    is_device_loop=True,
-    is_device_only=False,
-    cache_type=True,
-    tiles_as_sizes=True,
+    is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
 )
 def grid(
     begin_or_end: int | torch.Tensor | ConstExpr,
@@ -855,11 +835,7 @@ def grid(
 @overload
 @_decorators.device_func_replacement(builtins.range)
 @_decorators.api(
-    cacheable=True,
-    is_device_loop=True,
-    is_device_only=False,
-    cache_type=True,
-    tiles_as_sizes=True,
+    is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
 )
 def grid(
     begin_or_end: Sequence[int | torch.Tensor | ConstExpr],
@@ -875,11 +851,7 @@ def grid(
 
 @_decorators.device_func_replacement(builtins.range)
 @_decorators.api(
-    cacheable=True,
-    is_device_loop=True,
-    is_device_only=False,
-    cache_type=True,
-    tiles_as_sizes=True,
+    is_device_loop=True, is_device_only=False, cache_type=True, tiles_as_sizes=True
 )
 def grid(
     begin_or_end: int
@@ -1300,7 +1272,7 @@ def _(
     return [*builtins.enumerate(iterable, start=start)]  # type: ignore[arg-type]
 
 
-@_decorators.api(cacheable=True, is_device_only=True, cache_type=True)
+@_decorators.api(is_device_only=True, cache_type=True)
 def static_range(
     begin_or_end: int,
     end_or_none: int | None = None,
