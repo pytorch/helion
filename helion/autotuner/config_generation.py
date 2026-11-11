@@ -17,6 +17,7 @@ from typing import cast
 from .._compat import warps_to_threads
 from ..exc import AutotuneError
 from ..exc import InvalidConfig
+from ..runtime.config import _config_value_key
 from .block_id_sequence import BlockIdSequence
 from .compiler_coverage import same_value
 from .config_fragment import Category
@@ -41,7 +42,11 @@ FlatConfig = list[object]
 
 @dataclasses.dataclass(frozen=True)
 class CoordinateNeighborProjection:
-    """One deterministic raw coordinate change and its normalized result."""
+    """One coordinate change, its request with prerequisites, and normalized result.
+
+    The request retains the originating generation's layout even when the result
+    is later recanonicalized against another search surface.
+    """
 
     flat_index: int
     key: str
@@ -51,9 +56,11 @@ class CoordinateNeighborProjection:
     outcome: Literal["candidate", "incumbent_alias", "candidate_alias", "invalid"]
     flat_values: FlatConfig | None
     config: Config | None
+    requested_flat_values: FlatConfig
 
 
 TRITON_MAX_TENSOR_NUMEL = 1048576
+_MAX_COORDINATE_VALUES = 10_000
 
 
 def _value_or(value: object, fallback: Callable[[], object]) -> object:
@@ -367,7 +374,7 @@ class ConfigGeneration:
         )
 
     def coordinate_surface_catalog(self, *, radius: int = 1) -> dict[str, object]:
-        """Describe every deterministic pattern-neighbor row for this surface."""
+        """Describe raw coordinate moves before backend prerequisites/normalization."""
         if type(radius) is not int or radius < 1:
             raise ValueError(f"Expected positive int radius, got {radius!r}")
 
@@ -375,7 +382,7 @@ class ConfigGeneration:
         overridden = self.overridden_flat_indices
         coordinates: list[dict[str, object]] = []
         for flat_index, spec in enumerate(self.flat_spec):
-            active_values = spec.search_values(limit=10_000)
+            active_values = spec.search_values(limit=_MAX_COORDINATE_VALUES)
             if active_values is None:
                 raise AutotuneError(
                     "terminal coordinate surface is not finitely enumerable for "
@@ -418,6 +425,44 @@ class ConfigGeneration:
             "coordinates": coordinates,
         }
 
+    def conditional_neighbor(
+        self,
+        base: FlatConfig,
+        requested: FlatConfig,
+        *,
+        frozen_indices: Sequence[int] = (),
+    ) -> FlatConfig:
+        """Complete a neighbor's backend prerequisites without changing pins.
+
+        A refused transition keeps its original raw proposal, so ordinary
+        normalization still reports its alias or invalid outcome. Neither the
+        incumbent nor the caller's proposal is mutated.
+        """
+        updates = self.extension.conditional_neighbor_updates(base, requested)
+        changes = {
+            index: value
+            for index, value in updates.items()
+            if requested[index] != value
+        }
+        if not changes:
+            return requested
+        frozen = self.overridden_flat_indices | set(frozen_indices)
+        for index, value in changes.items():
+            choices = self.flat_spec[index].search_values(limit=_MAX_COORDINATE_VALUES)
+            if (
+                index in frozen
+                or choices is None
+                or not any(
+                    _config_value_key(value) == _config_value_key(choice)
+                    for choice in choices
+                )
+            ):
+                return requested
+        result = copy.deepcopy(requested)
+        for index, value in changes.items():
+            result[index] = copy.deepcopy(value)
+        return result
+
     def coordinate_neighbor_projections(
         self,
         base: FlatConfig,
@@ -426,7 +471,7 @@ class ConfigGeneration:
         limit: int | None = None,
         frozen_indices: Sequence[int] = (),
     ) -> list[CoordinateNeighborProjection]:
-        """Enumerate normalized one-coordinate pattern neighbors in order.
+        """Enumerate normalized coordinate moves with backend prerequisites.
 
         The returned order follows the flat ConfigSpec layout and each fragment's
         own deterministic ``pattern_neighbors`` order. Invalid and normalized
@@ -450,6 +495,9 @@ class ConfigGeneration:
                     return result
                 requested = copy.deepcopy(canonical_base)
                 requested[flat_index] = copy.deepcopy(value)
+                requested = self.conditional_neighbor(
+                    canonical_base, requested, frozen_indices=frozen_indices
+                )
                 try:
                     normalized_flat, config = self.canonicalize_flat(requested)
                 except InvalidConfig:
@@ -463,6 +511,7 @@ class ConfigGeneration:
                             "invalid",
                             None,
                             None,
+                            requested,
                         )
                     )
                     continue
@@ -484,6 +533,7 @@ class ConfigGeneration:
                         outcome,
                         normalized_flat,
                         config,
+                        requested,
                     )
                 )
         return result

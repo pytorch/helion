@@ -164,15 +164,41 @@ MMA_DAG_EXCHANGE_CHOICES: tuple[str, ...] = (
     MMA_DAG_EXCHANGE_AUTO,
     MMA_DAG_EXCHANGE_SMEM,
 )
+MMA_DAG_V_LAG_KEY = "cute_mma_dag_v_lag"
+# The paired loader keeps the original K0,K1,V0,V1 order at zero. Positive
+# values issue K(i) before V(i-lag), with a guarded bounded-head drain.
+MMA_DAG_V_LAG_CHOICES: tuple[int, ...] = (0, 1, 2, 3)
+# Paired non-MMA warps may suspend at barriers, leaving the issuer warps'
+# latency-sensitive waits unchanged. Short and long pipelines can differ.
+MMA_DAG_SLEEP_WAITS_KEY = "cute_mma_dag_sleep_waits"
+# Paired queries can use a proved rectangular TMA map or scalar shared stores.
+MMA_DAG_QUERY_TMA_KEY = "cute_mma_dag_query_tma"
+# Paired V transport can inspect proved scale metadata before fetching raw bytes.
+MMA_DAG_VALUE_METADATA_SKIP_KEY = "cute_mma_dag_value_metadata_skip"
+# Read immutable scale words while the prior shared-slot consumer is active.
+MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY = "cute_mma_dag_value_metadata_read_overlap"
+# ``serial`` prepares P after the prior PV; ``early`` prepares it in registers
+# before that wait. ``early_tmem`` also keeps denominator partials in TMEM.
+MMA_DAG_PROBABILITY_SCHEDULE_KEY = "cute_mma_dag_probability_schedule"
+MMA_DAG_PROBABILITY_SCHEDULE_SERIAL = "serial"
+MMA_DAG_PROBABILITY_SCHEDULE_EARLY = "early"
+MMA_DAG_PROBABILITY_SCHEDULE_EARLY_TMEM = "early_tmem"
+MMA_DAG_PROBABILITY_SCHEDULE_CHOICES: tuple[str, ...] = (
+    MMA_DAG_PROBABILITY_SCHEDULE_SERIAL,
+    MMA_DAG_PROBABILITY_SCHEDULE_EARLY,
+    MMA_DAG_PROBABILITY_SCHEDULE_EARLY_TMEM,
+)
 MMA_DAG_PASS_WARPS_KEY = "cute_mma_dag_pass_warps"
 MMA_DAG_PASS_WARPS_OFF = "off"
 MMA_DAG_PASS_WARPS_ON = "on"
 MMA_DAG_PASS_WARPS_MMA = "mma"
 MMA_DAG_PASS_WARPS_ATTENTION = "attention"
 MMA_DAG_PASS_WARPS_ATTENTION_SCOPED = "attention_scoped"
+MMA_DAG_PASS_WARPS_ATTENTION_PAIRED = "attention_paired"
 MMA_DAG_ATTENTION_PASS_WARPS: tuple[str, ...] = (
     MMA_DAG_PASS_WARPS_ATTENTION,
     MMA_DAG_PASS_WARPS_ATTENTION_SCOPED,
+    MMA_DAG_PASS_WARPS_ATTENTION_PAIRED,
 )
 # tcgen05 at eight warps with loop operand passes: ``on`` has warps 4-7
 # rewrite the operand tiles one tile ahead of the epilogue warps' chain
@@ -191,7 +217,9 @@ MMA_DAG_ATTENTION_PASS_WARPS: tuple[str, ...] = (
 # ``attention`` uses the proved paged recurrence's ten- or thirteen-warp
 # topology. ``attention_scoped`` retains the per-key recurrence's pipeline
 # with twelve warps and 128/64/32 compute/conversion/control register quotas.
-# Both are explicit search choices; reduced denominators retain ``attention``.
+# ``attention_paired`` groups two proved independent heads in a twenty-warp
+# CTA with 144/72/48 compute/conversion/control quotas. These are explicit
+# search choices; reduced denominators retain only ``attention``.
 MMA_DAG_PASS_WARPS_CHOICES: tuple[str, ...] = (
     MMA_DAG_PASS_WARPS_OFF,
     MMA_DAG_PASS_WARPS_ON,
@@ -204,9 +232,42 @@ def paged_attention_pass_warp_choices(facts: CuteMmaDagFacts) -> tuple[str, ...]
     """Schedules whose role topology implements the proved recurrence."""
     if facts.attention is None:
         return ()
+    if facts.attention.partial_statistics:
+        return (MMA_DAG_PASS_WARPS_ATTENTION_PAIRED,)
     if facts.attention.denominator_per_key:
-        return MMA_DAG_ATTENTION_PASS_WARPS
+        return (
+            MMA_DAG_ATTENTION_PASS_WARPS
+            if facts.attention.paired_items
+            else (MMA_DAG_PASS_WARPS_ATTENTION, MMA_DAG_PASS_WARPS_ATTENTION_SCOPED)
+        )
     return (MMA_DAG_PASS_WARPS_ATTENTION,)
+
+
+def paged_attention_v_lag_choices(
+    facts: CuteMmaDagFacts, pass_warps: object
+) -> tuple[int, ...]:
+    """Only a proved paired loader consumes the V issue-distance knob."""
+    if (
+        facts.attention is not None
+        and facts.attention.paired_items
+        and pass_warps == MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
+    ):
+        return MMA_DAG_V_LAG_CHOICES
+    return (0,)
+
+
+def paged_attention_probability_choices(
+    facts: CuteMmaDagFacts, pass_warps: object
+) -> tuple[str, ...]:
+    """Early P preparation has a lifetime proof for paired reference scores."""
+    if (
+        facts.attention is not None
+        and facts.attention.paired_items
+        and facts.attention.reference_scores
+        and pass_warps == MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
+    ):
+        return MMA_DAG_PROBABILITY_SCHEDULE_CHOICES
+    return (MMA_DAG_PROBABILITY_SCHEDULE_SERIAL,)
 
 
 def paged_attention_pass_warps_reason(
@@ -216,6 +277,13 @@ def paged_attention_pass_warps_reason(
     if facts.attention is None:
         return "the paged-attention semantic and transport proof did not match"
     if pass_warps not in paged_attention_pass_warp_choices(facts):
+        if facts.attention.partial_statistics:
+            return "raw attention statistics require the paired schedule"
+        if pass_warps == MMA_DAG_PASS_WARPS_ATTENTION_PAIRED:
+            return (
+                "attention_paired requires a per-key denominator and compatible "
+                "paired-head bounds, layout, and shared-memory capacity"
+            )
         return f"{pass_warps} requires the per-key denominator"
     return None
 
@@ -379,6 +447,12 @@ MMA_DAG_KEYS: tuple[str, ...] = (
     MMA_DAG_STORE_KEY,
     MMA_DAG_EXCHANGE_KEY,
     MMA_DAG_PASS_WARPS_KEY,
+    MMA_DAG_V_LAG_KEY,
+    MMA_DAG_SLEEP_WAITS_KEY,
+    MMA_DAG_QUERY_TMA_KEY,
+    MMA_DAG_VALUE_METADATA_SKIP_KEY,
+    MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY,
+    MMA_DAG_PROBABILITY_SCHEDULE_KEY,
     MMA_DAG_LOADS_KEY,
     MMA_DAG_AUX_KEY,
     MMA_DAG_PERSISTENT_KEY,
@@ -1713,6 +1787,8 @@ class CuteMmaDagFacts:
     # both the online recurrence and physical byte transport are proved.
     attention: PagedAttentionScheduleFacts | None = None
     mapped_io: bool = False
+    # Native bit decoders currently have only the dedicated attention emitter.
+    native_s2f6_operands: bool = False
 
     def block_size(self, axis: int, sizes: Mapping[int, object]) -> int | None:
         facts = self.axes[axis]
@@ -3144,6 +3220,11 @@ def mma_dag_config_reason(
     ``cute_mma_dag_pass_warps`` schedule (``mma`` adds the streamed loops'
     ``ready`` barriers and needs their accumulators in tensor memory).
     """
+    if facts.native_s2f6_operands and pass_warps not in MMA_DAG_ATTENTION_PASS_WARPS:
+        return Reason(
+            "native S2F6 operands require the proved attention transport",
+            MMA_DAG_PASS_WARPS_KEY,
+        )
     if facts.mapped_io and pass_warps not in MMA_DAG_ATTENTION_PASS_WARPS:
         return Reason(
             "folded storage index maps require the proved attention transport",
@@ -5945,6 +6026,7 @@ class _Matcher:
         """
         from ...language import _tracing_ops
         from ...language import memory_ops
+        from .analysis.native_s2f6_operand import match_native_s2f6_operand
 
         memo: dict[Node, bool] = {}
         aux: list[Access] = []
@@ -5973,6 +6055,20 @@ class _Matcher:
                 swap = not swap
                 chain.append(("permute",))
                 current = cast("Node", current.args[0])
+                continue
+            native = match_native_s2f6_operand(current, resolve=self.resolve)
+            if native is not None:
+                # Only this complete integer/assembly proof may cross the
+                # BF16 bitcast. Arbitrary views and inline assembly retain
+                # their existing refusal. Addressing, aux lifetime and the
+                # complete region closure are still checked below.
+                dimensions = self.tile_dims(current)
+                if len(dimensions) != 2 or dimensions != self.tile_dims(native.raw):
+                    raise _NotMine
+                self.aux_dag(native.scale, aux, seen, vecs)
+                chain.append(("native_s2f6_bf16", (), (), (native.scale,)))
+                pointwise = True
+                current = native.raw
                 continue
             if not _is_pointwise(current):
                 raise _NotMine
@@ -8293,6 +8389,12 @@ def mma_dag_facts(program: MmaDagProgram) -> CuteMmaDagFacts:
             else None
         ),
         mapped_io=any(access.index_map is not None for access in program.accesses),
+        native_s2f6_operands=any(
+            isinstance(entry, tuple) and entry[0] == "native_s2f6_bf16"
+            for dot in program.dots
+            for operand in (dot.a, dot.b)
+            for entry in cast("tuple[object, ...]", operand.chain_key[1])
+        ),
     )
 
 

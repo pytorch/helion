@@ -230,6 +230,11 @@ def folded_attention_reference(
     reference_scores: bool = False,
     reverse_pages: bool = False,
     base2_scores: bool = False,
+    output_reciprocal: bool = False,
+    key_post_scale_log2: int = 0,
+    value_post_scale_log2: int = 0,
+    output_scale_log2: int = 0,
+    value_positive_zero: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Eager page recurrence with independent logical-to-original-layout mapping."""
     q, k, v, ks, vs, pages, lengths = (cast("torch.Tensor", arg) for arg in args[:7])
@@ -273,9 +278,14 @@ def folded_attention_reference(
                         32, -1
                     )
                 ).to(q.dtype)
+                key = key * (2.0**key_post_scale_log2)
+                value = value * (2.0**value_post_scale_log2)
+                if value_positive_zero:
+                    value = value + 0.0
                 score_scale = dim**-0.5
                 if base2_scores:
                     score_scale *= math.log2(math.e)
+                score_scale *= 2.0**-key_post_scale_log2
                 scores = query.float() @ key.float().T * score_scale
                 reference = maximum
                 if reference_scores:
@@ -309,8 +319,12 @@ def folded_attention_reference(
                 )
                 maximum = next_maximum
             denominator = partials.sum(1)
+            safe_denominator = torch.where(denominator == 0, 1, denominator)
             normalized = (
-                accumulator / torch.where(denominator == 0, 1, denominator)[:, None]
+                accumulator
+                * ((1.0 / safe_denominator) * (2.0**output_scale_log2))[:, None]
+                if output_reciprocal
+                else accumulator / safe_denominator[:, None]
             )
             output[request, :, head * group : (head + 1) * group] = normalized.reshape(
                 query_len, group, dim

@@ -55,6 +55,8 @@ def _key(kernel: SimpleNamespace) -> str | None:
     )
 
 
+# Selected families exercise transitive invalidation and unrelated-family
+# isolation; rows vary the edited relationship or the unrelated family.
 @pytest.mark.parametrize(
     "kind,edited,unrelated",
     [
@@ -160,8 +162,38 @@ def test_transitive_helper_changes_only_its_family(
     assert _key(unaffected) == before[1]
 
 
+def test_absolute_language_constant_changes_compiled_family_keys(
+    source_tree: Path,
+) -> None:
+    path = source_tree / "language/_gelu_tanh_approx.py"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("GELU_ERF_INV_SQRT2 = 0.7071067811865476\n")
+    kernels = [_kernel(kind) for kind in ("helion_flash", "tcgen05_grouped_rna")]
+    unrelated = _kernel("chunk_recurrence_sm100")
+    before = [_key(kernel) for kernel in kernels]
+    unrelated_before = _key(unrelated)
+    path.write_text("GELU_ERF_INV_SQRT2 = 0.7\n")
+    assert all(_key(kernel) != key for kernel, key in zip(kernels, before, strict=True))
+    assert _key(unrelated) == unrelated_before
+    path.unlink()
+    assert all(_key(kernel) is None for kernel in kernels)
+
+
+def test_import_closure_keeps_absolute_helion_dependencies() -> None:
+    assert "language/_gelu_tanh_approx.py" in helion_imports(
+        "_compiler/cute/epilogue_helpers.py", prefix="_compiler/cute/"
+    )
+
+
+# Keep these roots independent of the registry so removing one cannot also
+# remove the regression case that requires it.
 @pytest.mark.parametrize(
-    "edited", ("_compiler/cute/_flash_runtime.py", "_compiler/cute/_mlir_compat.py")
+    "edited",
+    (
+        "_compiler/cute/_flash_runtime.py",
+        "_compiler/cute/_mlir_compat.py",
+        "_compiler/cute/epilogue_helpers.py",
+    ),
 )
 def test_grouped_mailbox_helpers_invalidate_both_conversion_families(
     source_tree: Path, edited: str
@@ -462,6 +494,9 @@ def test_source_checkout_path_does_not_enter_key(
 # ``_mlir_compat`` is a typing shim (``ir: Any = cutlass._mlir.ir``): modules
 # import the ``ir`` object, not the shim, so the walk never reaches the file.
 _TYPING_SHIMS = frozenset({"_compiler/cute/_mlir_compat.py"})
+# Explicitly fingerprinted host analysis, not a compiled device entry. Its
+# analysis imports are outside the device-declaration closure checked below.
+_HOST_PLANNERS = frozenset({"_compiler/cute/mxfp8_mma.py"})
 
 
 @pytest.mark.parametrize(
@@ -502,8 +537,20 @@ def test_helper_kinds_and_plan_kinds_are_disjoint() -> None:
     assert set(source_dependencies._HELPER_KIND_DEPENDENCIES) <= set(table)
 
 
-def test_paged_dependency_declaration_is_import_closed() -> None:
-    dependencies = source_dependencies.wrapper_dependencies()["helion_paged_attention"]
+# Every declared wrapper kind is a distinct cache contract; this is a cheap
+# static-source check, not a kernel configuration or compilation grid.
+@pytest.mark.parametrize("kind", sorted(source_dependencies.wrapper_dependencies()))
+def test_device_dependency_declarations_are_import_closed(kind: str) -> None:
+    dependencies = source_dependencies.wrapper_dependencies()[kind]
     declared = set(dependencies) | set(source_dependencies._COMMON_DEPENDENCIES)
-    imported = set().union(*(helion_imports(path) for path in dependencies))
+    # This static guard covers compiler-side helpers. The runtime namespace
+    # walker also follows runtime/cute modules; we avoid traversing host
+    # preparation into the compiler/runtime's full analysis import graph here.
+    imported = set().union(
+        *(
+            helion_imports(path, prefix="_compiler/cute/")
+            for path in dependencies
+            if path not in _HOST_PLANNERS
+        )
+    )
     assert imported <= declared

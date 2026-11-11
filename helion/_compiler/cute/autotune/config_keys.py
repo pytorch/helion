@@ -211,6 +211,7 @@ CUTE_MISC_SCHEDULE_KEYS: tuple[str, ...] = (
     "cute_dot_ring_stages",
     "cute_dot_ring_split",
     "cute_pdl",
+    "cute_pdl_capture_overlap",
     "cute_pdl_release",
     "cute_pdl_spread",
     "cute_warp_aggregated_atomics",

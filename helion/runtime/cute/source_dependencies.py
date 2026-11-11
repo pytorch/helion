@@ -55,17 +55,20 @@ _HELPER_KIND_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "split_k_cluster": ("_compiler/cute/cluster_helpers.py",),
     "resident_reduction": ("_compiler/cute/resident_reduction_runtime.py",),
     "single_host_sum": (
+        "runtime/cute/source_dependencies.py",
         "runtime/cute/single_sum.py",
         "runtime/cute/paired_sum.py",
         "_compiler/cute/single_sum_runtime.py",
         "_compiler/cute/resident_reduction_runtime.py",
     ),
     "paired_host_sum": (
+        "runtime/cute/source_dependencies.py",
         "runtime/cute/paired_sum.py",
         "_compiler/cute/paired_sum_runtime.py",
         "_compiler/cute/resident_reduction_runtime.py",
     ),
     "full_host_sum": (
+        "runtime/cute/source_dependencies.py",
         "runtime/cute/full_sum.py",
         "runtime/cute/paired_sum.py",
         "_compiler/cute/full_sum_runtime.py",

@@ -4,15 +4,13 @@ from __future__ import annotations
 
 import ast
 import functools
-import inspect
 import math
 from typing import TYPE_CHECKING
 
 from .cute_folded_attention import folded_paged_attention
 from .cute_paged_attention import paged_online_attention
 from .cute_paged_reference import reference_attention_fixture
-from .cute_source import function_from_ast
-import helion
+from .cute_source import transform_kernel
 
 if TYPE_CHECKING:
     import torch
@@ -68,20 +66,15 @@ class _Base2Source(ast.NodeTransformer):
 def _base2_kernel(form: str) -> Kernel[tuple[torch.Tensor, torch.Tensor | None]]:
     assert form in ("mapped", "per_key", "reduced")
     kernel = folded_paged_attention if form == "mapped" else paged_online_attention
-    function = ast.parse(inspect.getsource(kernel.fn)).body[0]
-    assert isinstance(function, ast.FunctionDef)
-    function.decorator_list = []
-    function.name += "_base2"
     transform = _Base2Source()
-    transform.visit(function)
-    assert (transform.exponentials, transform.scales, transform.lse) == (3, 1, 1)
-    return helion.kernel(
-        function_from_ast(
-            function, kernel.fn.__globals__, f"<helion_paged_base2_{form}>"
-        ),
-        backend="cute",
-        static_shapes=True,
+    result = transform_kernel(
+        kernel,
+        transform,
+        name=kernel.fn.__name__ + "_base2",
+        filename=f"<helion_paged_base2_{form}>",
     )
+    assert (transform.exponentials, transform.scales, transform.lse) == (3, 1, 1)
+    return result
 
 
 def base2_attention_fixture(

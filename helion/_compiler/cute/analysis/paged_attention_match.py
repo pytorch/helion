@@ -11,6 +11,7 @@ import dataclasses
 import math
 import operator
 from typing import TYPE_CHECKING
+from typing import Literal
 from typing import TypeGuard
 
 import sympy
@@ -23,10 +24,14 @@ from ....language._tracing_ops import _get_symnode
 from ....language._tracing_ops import _mask_to
 from ....language._tracing_ops import _new_var
 from ...utils import is_full_slice
+from ..cute_mma_dag import _storage
 from .match_common import scalar_value
 from .match_common import symnode_sympy
+from .native_s2f6_operand import match_native_s2f6_operand
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from torch.fx import Node
 
     from ..cute_mma_dag import Access
@@ -34,11 +39,16 @@ if TYPE_CHECKING:
     from ..cute_mma_dag import Loop
     from ..cute_mma_dag import MmaDagProgram
     from ..cute_mma_dag import VecCarry
+    from .native_s2f6_match import NativeS2F6Decode
 
 
 @dataclasses.dataclass(frozen=True)
 class BlockScaledOperand:
-    """An exact ``(int8.float() * exp2(uint8.float() - 127)).to(dtype)``.
+    """A typed byte decode with optional explicit BF16 scaling and V +0.
+
+    The base expression is ``(int8.float() * exp2(uint8.float() - 127)).to(dtype)``.
+    A post-multiply by a power of two retains that first rounding boundary.
+    Value operands may also add positive zero after the final BF16 rounding.
 
     Both accesses retain the runtime tensor name, physical strides,
     scalar page/head subscripts, and logical axes. Only the scale's final axis
@@ -50,6 +60,15 @@ class BlockScaledOperand:
     scale: Access
     group_size: int
     value: Node
+    # Optional source multiplication after the first BF16 rounding.
+    post_scale_log2: int = 0
+    # Explicit BF16 addition of positive zero after the decode/postscale.
+    positive_zero: bool = False
+    native_proof: NativeS2F6Decode | None = None
+
+    @property
+    def decode_kind(self) -> Literal["float_exp2", "native_s2f6_bf16"]:
+        return "native_s2f6_bf16" if self.native_proof is not None else "float_exp2"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -129,6 +148,24 @@ class PagedAttentionPlan:
     # Explicit exp2 probability/alpha and a natural-log LSE conversion.
     # This is a source recurrence choice, never an exp->exp2 rewrite.
     score_base2: bool
+    # Source explicitly computes a row reciprocal then multiplies each output.
+    # Preserve this rounding order separately from per-element division.
+    output_reciprocal: bool
+    # An explicit FP32 multiplication after the rounded row reciprocal.
+    output_scale_log2: int = 0
+    # Explicit FP32 clamp_max(exp2(...), 1) on both recurrence coefficients.
+    coefficients_capped: bool = False
+    # Raw FP32 accumulator output with separate exact maximum/denominator stores.
+    # Current admission couples this epilogue to capped coefficients. Keep the
+    # math and storage facts separate: neither implies the other for a source.
+    partial_statistics: tuple[Access, Access] | None = None
+
+    @property
+    def row_outputs(self) -> tuple[Access, ...]:
+        """All epilogue row stores, in their proved logical roles."""
+        return (() if self.lse is None else (self.lse,)) + (
+            self.partial_statistics or ()
+        )
 
     @property
     def io_dtype(self) -> torch.dtype:
@@ -179,8 +216,9 @@ def _other(value: object, target: object, source: object) -> object:
 def _scalar(value: object, expected: float) -> bool:
     if _call(value, torch.ops.aten.scalar_tensor.default):
         tensor = value.meta.get("val")
-        # The constants read here (-inf, 0, 1, 127) are exact in these
-        # floating dtypes. Integer/bool/FP8 constructors can change them.
+        # Structural constants (-inf, 0, 1, 127) are exact in these floating
+        # dtypes. _power_of_two also checks its wider constants against the
+        # constructor dtype. Integer/bool/FP8 constructors can change them.
         if not isinstance(tensor, torch.Tensor) or tensor.dtype not in (
             torch.float16,
             torch.bfloat16,
@@ -199,6 +237,19 @@ def _cast(value: object, dtype: torch.dtype) -> object:
     return None
 
 
+def _unit_coefficient_input(value: object) -> object:
+    """Strip an explicit FP32 unit cap; callers prove the returned operation."""
+    if not _call(value, torch.ops.aten.clamp_max.default) or len(value.args) != 2:
+        return None
+    if not _scalar(value.args[1], 1.0):
+        return None
+    for node in (value, value.args[0]):
+        tensor = node.meta.get("val") if isinstance(node, torch.fx.Node) else None
+        if not isinstance(tensor, torch.Tensor) or tensor.dtype != torch.float32:
+            return None
+    return value.args[0]
+
+
 def _broadcast(value: object, *, row: bool) -> object:
     if not _call(value, view_ops.subscript):
         return None
@@ -210,6 +261,53 @@ def _broadcast(value: object, *, row: bool) -> object:
         return None
     full, added = (indices[0], indices[1]) if row else (indices[1], indices[0])
     return _copy(value.args[0]) if is_full_slice(full) and added is None else None
+
+
+def _power_of_two(value: object, low: int, high: int) -> int | None:
+    """Match binary constants only when their source dtype represents them exactly."""
+    for exponent in range(low, high + 1):
+        factor = 2.0**exponent
+        if _scalar(value, factor):
+            if _call(value, torch.ops.aten.scalar_tensor.default):
+                tensor = value.meta.get("val")
+                assert isinstance(tensor, torch.Tensor)  # Proved by _scalar.
+                limits = torch.finfo(tensor.dtype)
+                # A binary power inside this interval is exact, including
+                # subnormals. Outside it the constructor rounds to zero/Inf.
+                if not limits.tiny * limits.eps <= factor <= limits.max:
+                    return None
+            return exponent
+    return None
+
+
+def _reciprocal_denominator(value: object) -> tuple[object, int]:
+    """The FP32 row reciprocal, including Torch's ``1.0 / tensor`` lowering."""
+    value = _copy(value)
+    output_scale = 0
+    # One explicit power-of-two multiplier, with optional identity multiplies
+    # introduced by Torch's 1.0 / tensor lowering. Do not combine two nonunit
+    # factors: their intermediate rounding/overflow is part of the source.
+    # The bounded output range mirrors the supported V representation scales;
+    # other factors retain ordinary source lowering.
+    while _call(value, torch.ops.aten.mul.Tensor) and len(value.args) == 2:
+        tensor = value.meta.get("val")
+        if not isinstance(tensor, torch.Tensor) or tensor.dtype != torch.float32:
+            return None, 0
+        left, right = value.args
+        scale = _power_of_two(right, 0, 22)
+        if scale is None:
+            left, right = right, left
+            scale = _power_of_two(right, 0, 22)
+        if scale is None or (scale != 0 and output_scale != 0):
+            return None, 0
+        output_scale += scale
+        value = _copy(left)
+    if not _call(value, torch.ops.aten.reciprocal.default) or len(value.args) != 1:
+        return None, 0
+    tensor = value.meta.get("val")
+    if not isinstance(tensor, torch.Tensor) or tensor.dtype != torch.float32:
+        return None, 0
+    return _copy(value.args[0]), output_scale
 
 
 def _row_reduction(value: object, target: object, source: object, fill: float) -> bool:
@@ -330,11 +428,94 @@ def _nonnegative_reference(value: Node, maximum: Node) -> bool:
     )
 
 
+def _block_scaled_access_pair(
+    raw: Node, scale: Node, accesses: dict[Node, Access]
+) -> tuple[Access, Access, int] | None:
+    raw_access, scale_access = accesses.get(raw), accesses.get(scale)
+    if (
+        raw_access is None
+        or scale_access is None
+        or raw_access.dtype != torch.int8
+        or scale_access.dtype != torch.uint8
+        or raw_access.grouped
+        or len(raw_access.subscripts) != len(scale_access.subscripts)
+        or raw_access.dims != scale_access.dims
+    ):
+        return None
+    divisors = [s.divisor for s in scale_access.subscripts if s.divisor is not None]
+    if len(divisors) != 1:
+        return None
+    group = divisors[0]
+    assert group is not None
+    if group <= 0 or scale_access.subscripts[-1].divisor != group:
+        return None
+    if any(
+        left != dataclasses.replace(right, divisor=None)
+        for left, right in zip(
+            raw_access.subscripts, scale_access.subscripts, strict=True
+        )
+    ):
+        return None
+    return raw_access, scale_access, group
+
+
 def _block_scaled_operand(
-    value: object, accesses: dict[Node, Access], dtype: torch.dtype
+    value: object,
+    accesses: dict[Node, Access],
+    dtype: torch.dtype,
+    *,
+    allow_positive_zero: bool = False,
+    resolve: Callable[[Node], Node] | None = None,
 ) -> BlockScaledOperand | None:
     value = _zero_mask(value)
-    product = _cast(value, dtype)
+    if dtype == torch.bfloat16 and isinstance(value, torch.fx.Node):
+        native = match_native_s2f6_operand(value, resolve=resolve)
+        if native is not None:
+            pair = _block_scaled_access_pair(native.raw, native.scale, accesses)
+            if pair is None or pair[2] != 32:
+                return None
+            raw_access, scale_access, group = pair
+            return BlockScaledOperand(
+                raw_access,
+                scale_access,
+                group,
+                value,
+                native_proof=native,
+            )
+    decoded = value
+    positive_zero = False
+    if allow_positive_zero and _call(value, torch.ops.aten.add.Tensor):
+        if len(value.args) != 2 or dtype != torch.bfloat16:
+            return None
+        left, right = value.args
+        if type(left) is float:
+            left, right = right, left
+        if type(right) is not float or right != 0.0 or math.copysign(1.0, right) != 1.0:
+            return None
+        for node in (value, left):
+            tensor = node.meta.get("val") if isinstance(node, torch.fx.Node) else None
+            if not isinstance(tensor, torch.Tensor) or tensor.dtype != torch.bfloat16:
+                return None
+        decoded = left
+        positive_zero = True
+    post_scale = 0
+    if _call(decoded, torch.ops.aten.mul.Tensor) and len(decoded.args) == 2:
+        tensor = decoded.meta.get("val")
+        if (
+            dtype != torch.bfloat16
+            or not isinstance(tensor, torch.Tensor)
+            or tensor.dtype != dtype
+        ):
+            return None
+        decoded, factor = decoded.args
+        exponent = _power_of_two(factor, -22, 0)
+        if exponent is None:
+            decoded, factor = factor, decoded
+            exponent = _power_of_two(factor, -22, 0)
+        if exponent is None:
+            return None
+        post_scale = exponent
+    product = _cast(decoded, dtype)
     if not _call(product, torch.ops.aten.mul.Tensor) or len(product.args) != 2:
         return None
     for integer_cast, exponent in (product.args, tuple(reversed(product.args))):
@@ -359,27 +540,14 @@ def _block_scaled_operand(
             or accesses[scale].dtype != torch.uint8
         ):
             continue
-        raw_access, scale_access = accesses[raw], accesses[scale]
-        if raw_access.grouped or len(raw_access.subscripts) != len(
-            scale_access.subscripts
-        ):
+        pair = _block_scaled_access_pair(raw, scale, accesses)
+        if pair is None:
             continue
-        divisors = [s.divisor for s in scale_access.subscripts if s.divisor is not None]
-        if len(divisors) != 1 or raw_access.dims != scale_access.dims:
-            continue
-        group = divisors[0]
-        assert group is not None
-        if group <= 0 or scale_access.subscripts[-1].divisor != group:
-            continue
-        if any(
-            left != dataclasses.replace(right, divisor=None)
-            for left, right in zip(
-                raw_access.subscripts, scale_access.subscripts, strict=True
-            )
-        ):
-            continue
+        raw_access, scale_access, group = pair
         assert isinstance(value, torch.fx.Node)
-        return BlockScaledOperand(raw_access, scale_access, group, value)
+        return BlockScaledOperand(
+            raw_access, scale_access, group, value, post_scale, positive_zero
+        )
     return None
 
 
@@ -597,8 +765,16 @@ def match_paged_attention(program: MmaDagProgram) -> PagedAttentionPlan | None:
         1
     ] != [1, 0]:
         return None
-    key = _block_scaled_operand(transposed_key.args[0], accesses, query.dtype)
-    value = _block_scaled_operand(pv.args[1], accesses, query.dtype)
+    key = _block_scaled_operand(
+        transposed_key.args[0], accesses, query.dtype, resolve=program.resolve
+    )
+    value = _block_scaled_operand(
+        pv.args[1],
+        accesses,
+        query.dtype,
+        allow_positive_zero=True,
+        resolve=program.resolve,
+    )
     if key is None or value is None or key.raw.subscripts != value.raw.subscripts:
         return None
     if key.raw.tile_dims != (
@@ -621,10 +797,17 @@ def match_paged_attention(program: MmaDagProgram) -> PagedAttentionPlan | None:
     if page_table.loops != frozenset({loop.index}):
         return None
     probability = _cast(_zero_mask(pv.args[0]), query.dtype)
-    score_base2 = _call(probability, torch.ops.aten.exp2.default)
-    if not score_base2 and not _call(probability, torch.ops.aten.exp.default):
+    if not isinstance(probability, torch.fx.Node):
         return None
-    centered = probability.args[0]
+    coefficients_capped = _call(probability, torch.ops.aten.clamp_max.default)
+    probability_exp = (
+        _unit_coefficient_input(probability) if coefficients_capped else probability
+    )
+    score_base2 = _call(probability_exp, torch.ops.aten.exp2.default)
+    if not score_base2 and not _call(probability_exp, torch.ops.aten.exp.default):
+        return None
+    assert isinstance(probability_exp, torch.fx.Node)
+    centered = probability_exp.args[0]
     relative_scores = _call(centered, torch.ops.aten.add.Tensor)
     if (not relative_scores and not _call(centered, torch.ops.aten.sub.Tensor)) or len(
         centered.args
@@ -638,9 +821,9 @@ def match_paged_attention(program: MmaDagProgram) -> PagedAttentionPlan | None:
     if score_match is None:
         return None
     score, score_scale, mask, reference = score_match
-    if (score_base2 and reference is None) or relative_scores != (
-        reference is not None
-    ):
+    if (
+        score_base2 and reference is None and not coefficients_capped
+    ) or relative_scores != (reference is not None):
         return None
     coordinates = _coordinate_contract(program, query, key, loop, mask, accesses)
     if coordinates is None:
@@ -667,6 +850,10 @@ def match_paged_attention(program: MmaDagProgram) -> PagedAttentionPlan | None:
         if carry.init_vec is None and carry.init_fill == 0 and not carry.identity
     ]
     per_key = len(loop.carries) == 2
+    if coefficients_capped and (
+        not score_base2 or reference is not None or not per_key
+    ):
+        return None
     if len(maximums) != 1 or len(denominators) != (0 if per_key else 1):
         return None
     maximum = maximums[0]
@@ -695,12 +882,13 @@ def match_paged_attention(program: MmaDagProgram) -> PagedAttentionPlan | None:
     rescale = pv.args[2]
     alpha_view = _other(rescale, torch.ops.aten.mul.Tensor, accumulator.placeholder)
     alpha = _broadcast(alpha_view, row=True)
+    alpha_exp = _unit_coefficient_input(alpha) if coefficients_capped else alpha
     if not _call(
-        alpha,
+        alpha_exp,
         torch.ops.aten.exp2.default if score_base2 else torch.ops.aten.exp.default,
     ):
         return None
-    difference = alpha.args[0]
+    difference = alpha_exp.args[0]
     if not _call(difference, torch.ops.aten.sub.Tensor) or len(difference.args) != 2:
         return None
     if (
@@ -746,41 +934,91 @@ def match_paged_attention(program: MmaDagProgram) -> PagedAttentionPlan | None:
             is not denominator.placeholder
         ):
             return None
-    # Exactly one normalized matrix store and an optional natural-log LSE
-    # store; no other side effects may be dropped by a fused replacement.
-    if len(program.stores) != 1 or len(program.vec_stores) > 1:
+    # All stores must belong to one of the two explicit epilogue contracts.
+    # Neither route may discard an unrelated side effect.
+    if len(program.stores) != 1:
         return None
     output = program.stores[0]
-    lse = program.vec_stores[0] if program.vec_stores else None
-    if (
-        output.region != "epilogue"
-        or (lse is not None and lse.loop != -1)
-        or output.access.dtype != query.dtype
+    if output.region != "epilogue" or any(
+        store.loop != -1 for store in program.vec_stores
     ):
         return None
-    normalized = _cast(output.value, query.dtype)
-    if not _call(normalized, torch.ops.aten.div.Tensor) or len(normalized.args) != 2:
-        return None
-    if _copy(normalized.args[0]) is not accumulator.phi:
-        return None
-    safe_denominator = _broadcast(normalized.args[1], row=True)
-    if (
-        not _call(safe_denominator, torch.ops.aten.where.self)
-        or len(safe_denominator.args) != 3
-    ):
-        return None
-    denominator_final = _copy(safe_denominator.args[2])
-    if not isinstance(denominator_final, torch.fx.Node):
-        return None
-    if per_key:
-        if not _row_reduction(
-            denominator_final, torch.ops.aten.sum.dim_IntList, denominator.phi, 0
+    partial_statistics = None
+    lse = None
+    output_reciprocal = False
+    output_scale = 0
+    if coefficients_capped:
+        if (
+            query.dtype != torch.bfloat16
+            or output.access.dtype != torch.float32
+            or _copy(output.value) is not accumulator.phi
+            or len(program.vec_stores) != 2
         ):
             return None
-    elif denominator_final is not denominator.phi:
-        return None
-    if not _safe_value(safe_denominator, denominator_final, 0, 1):
-        return None
+        # This schedule groups raw/m/l stores by kind rather than source
+        # order. Same-storage views therefore need the ordinary emitter.
+        # The runtime alias guard separately protects distinct arguments
+        # that acquire overlapping storage on a later invocation.
+        if (
+            len({_storage(store.access) for store in (output, *program.vec_stores)})
+            != 3
+        ):
+            return None
+        maxima = [
+            store for store in program.vec_stores if _copy(store.value) is maximum.phi
+        ]
+        totals = [
+            store
+            for store in program.vec_stores
+            if _row_reduction(
+                _copy(store.value), torch.ops.aten.sum.dim_IntList, denominator.phi, 0
+            )
+        ]
+        if (
+            len(maxima) != 1
+            or len(totals) != 1
+            or any(store.access.dtype != torch.float32 for store in program.vec_stores)
+        ):
+            return None
+        partial_statistics = (maxima[0].access, totals[0].access)
+        denominator_final = _copy(totals[0].value)
+        assert isinstance(denominator_final, torch.fx.Node)
+    else:
+        if len(program.vec_stores) > 1 or output.access.dtype != query.dtype:
+            return None
+        lse = program.vec_stores[0] if program.vec_stores else None
+        normalized = _cast(output.value, query.dtype)
+        output_reciprocal = not _call(normalized, torch.ops.aten.div.Tensor)
+        if output_reciprocal:
+            factor = _other(normalized, torch.ops.aten.mul.Tensor, accumulator.phi)
+            safe_denominator, output_scale = _reciprocal_denominator(
+                _broadcast(factor, row=True)
+            )
+        else:
+            assert isinstance(normalized, torch.fx.Node)
+            if (
+                len(normalized.args) != 2
+                or _copy(normalized.args[0]) is not accumulator.phi
+            ):
+                return None
+            safe_denominator = _broadcast(normalized.args[1], row=True)
+        if (
+            not _call(safe_denominator, torch.ops.aten.where.self)
+            or len(safe_denominator.args) != 3
+        ):
+            return None
+        denominator_final = _copy(safe_denominator.args[2])
+        if not isinstance(denominator_final, torch.fx.Node):
+            return None
+        if per_key:
+            if not _row_reduction(
+                denominator_final, torch.ops.aten.sum.dim_IntList, denominator.phi, 0
+            ):
+                return None
+        elif denominator_final is not denominator.phi:
+            return None
+        if not _safe_value(safe_denominator, denominator_final, 0, 1):
+            return None
     if lse is not None:
         lse_maximum = maximum.phi
         if score_base2:
@@ -809,10 +1047,10 @@ def match_paged_attention(program: MmaDagProgram) -> PagedAttentionPlan | None:
         if output.access.index_map is None:
             return None
         expected_axes = [(output.access.index_map.axes, query_axes)]
-        if lse is not None:
-            if lse.access.index_map is None:
+        for store in program.vec_stores:
+            if store.access.index_map is None:
                 return None
-            expected_axes.append((lse.access.index_map.axes, query_axes[:-1]))
+            expected_axes.append((store.access.index_map.axes, query_axes[:-1]))
         for actual, expected in expected_axes:
             if len(actual) != len(expected) or any(
                 left.axis != right.axis or left.origin is not right.origin
@@ -825,10 +1063,10 @@ def match_paged_attention(program: MmaDagProgram) -> PagedAttentionPlan | None:
         output.access.index_map is not None
         or output.access.subscripts != query.subscripts
         or (
-            lse is not None
-            and (
-                lse.access.index_map is not None
-                or lse.access.subscripts != query.subscripts[:-1]
+            any(
+                store.access.index_map is not None
+                or store.access.subscripts != query.subscripts[:-1]
+                for store in program.vec_stores
             )
         )
     ):
@@ -856,4 +1094,8 @@ def match_paged_attention(program: MmaDagProgram) -> PagedAttentionPlan | None:
         denominator_final,
         reference,
         score_base2,
+        output_reciprocal,
+        output_scale,
+        coefficients_capped,
+        partial_statistics,
     )

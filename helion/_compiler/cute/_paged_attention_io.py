@@ -38,7 +38,7 @@ def store_output_element(
     item: cutlass.Int32,
     row: cutlass.Int32,
     column: cutlass.Int32,
-    value: cutlass.BFloat16,
+    value: cutlass.Numeric,
     heads: cutlass.Constexpr,
     group: cutlass.Constexpr,
     layouts: cutlass.Constexpr,
@@ -57,22 +57,21 @@ def store_output_element(
 
 
 @cute.jit
-def store_lse_element(
-    lse: cute.Tensor,
+def store_row_element(
+    output: cute.Tensor,
     item: cutlass.Int32,
     row: cutlass.Int32,
     value: cutlass.Float32,
     heads: cutlass.Constexpr,
     group: cutlass.Constexpr,
-    layouts: cutlass.Constexpr,
+    strides: cutlass.Constexpr,
 ) -> None:
-    if cutlass.const_expr(layouts is None):
-        lse[item, row] = value
+    if cutlass.const_expr(strides is None):
+        output[item, row] = value
     else:
-        strides = layouts[2]
         offset = (
             cutlass.Int64(item // heads) * strides[0]
             + cutlass.Int64(row // group) * strides[1]
             + cutlass.Int64(item % heads * group + row % group) * strides[2]
         )
-        lse[offset] = value
+        output[offset] = value

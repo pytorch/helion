@@ -209,6 +209,25 @@ def post_kernel_metadata_statements(
     return statements
 
 
+def _capture_pdl_wrapper_parameter_sizes(
+    params: list[str], annotations: dict[str, str], mode: str
+) -> tuple[int, ...] | None:
+    """Prove the entire wrapper-owned ABI: tensor maps then one Int32 mode."""
+    if (
+        len(params) < 2
+        or params[-1] != mode
+        or len(set(params)) != len(params)
+        or annotations.get(mode) != "cutlass.Int32"
+        or any(
+            annotations.get(param)
+            != "cutlass.GridConstant[_helion_mma_dag_tc.cuda.TensorMap]"
+            for param in params[:-1]
+        )
+    ):
+        return None
+    return (128,) * (len(params) - 1) + (4,)
+
+
 def _resolve_plan_arg_positions(
     cg: GenerateAST, host: HostFunction, plans: list[dict[str, object]]
 ) -> list[dict[str, object]]:
@@ -226,6 +245,19 @@ def _resolve_plan_arg_positions(
     resolved_plans: list[dict[str, object]] = []
     for plan in plans:
         resolved = dict(plan)
+        mode = resolved.get("capture_pdl_mode_param")
+        if resolved.get(
+            "capture_pdl_contract"
+        ) == "paired-output-stores-v1" and isinstance(mode, str):
+            resolved.pop("capture_pdl_parameter_sizes", None)
+            # Derive from the final device signature, including any additional
+            # wrapper maps. Unknown/interleaved arguments leave no proof.
+            fn = cg.device_function
+            sizes = _capture_pdl_wrapper_parameter_sizes(
+                fn.wrapper_only_params, fn.wrapper_only_param_annotations, mode
+            )
+            if sizes is not None:
+                resolved["capture_pdl_parameter_sizes"] = sizes
         # The ``key[:-5] + "_idx"`` substring rewrite turns each tensor name
         # into a positional index resolved against the device function's
         # sorted-arg ordering so the runtime launcher can identify the tensor

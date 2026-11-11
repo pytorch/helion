@@ -204,6 +204,14 @@ transport proves the request/head relation, nonoverlapping output strides, and
 masked query tails; `_paged_attention_io.py` renders those addresses without packing.
 Ordinary MMA, packet loads, auxiliary rings, and TMA routes reject these maps.
 
+The explicit paged-attention schedules honor `load_eviction_policies` on their
+four TMA inputs: raw K, K scales, raw V and V scales. Their original load slots
+survive normalization and materialized-phase projection; other slots retain
+the owning launch's rules. TMA bypasses L1, so L1-only `first`/`last` are inert.
+L2 priorities canonicalize to `streaming` (evict first) and `l2_last` (evict
+last), with the empty policy preserving the default. Generic seeds try all
+three uniform choices, and search can vary the four inputs independently.
+
 ### 3.3 Whole-kernel generators and regeneration
 
 `KERNEL_GENERATORS` (`kernel_generators.py`): `grouped_prefix_adaptive_n`,

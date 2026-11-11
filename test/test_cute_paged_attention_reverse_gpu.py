@@ -60,7 +60,7 @@ def test_reverse_attention_source_and_changed_input_replay(
         query_len,
         fast_math,
         lse,
-        scoped,
+        "attention_scoped" if scoped else "attention",
         occupancy,
         pdl,
         reference_scores=reference_scores,
@@ -137,7 +137,8 @@ def test_reverse_integer_operation_order_and_key_product(bits):
 
 
 @skipIfNotCUDA()
-def test_reversed_int64_empty_then_nonempty_interval_replay():
+@pytest.mark.parametrize("schedule", ["attention", "attention_paired"])
+def test_reversed_int64_empty_then_nonempty_interval_replay(schedule):
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("the attention transport uses SM100 tensor memory")
     kernel, args = reverse_attention_fixture("per_key", 4, True, DEVICE)
@@ -155,7 +156,11 @@ def test_reversed_int64_empty_then_nonempty_interval_replay():
     args = tuple(args)
     bound = kernel.bind(args)
     config = optional_lse_config()
-    assert "reflected_dtype=cutlass.Int64" in bound.to_code(config)
+    config.config["cute_mma_dag_pass_warps"] = schedule
+    source = bound.to_code(config)
+    assert "reflected_dtype=cutlass.Int64" in source
+    if schedule == "attention_paired":
+        assert "paged_attention_paired_body(" in source
     compiled = bound.compile_config(config)
     compiled(*args)
     with cuda_graph_for_replay() as graph:

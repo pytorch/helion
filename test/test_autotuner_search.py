@@ -335,6 +335,7 @@ class TestAutotunerSearch(AutotunerTestCase):
             ],
             block_size_indices=[0, 1],
             overridden_flat_indices=set(),
+            conditional_neighbor=lambda base, requested, **kwargs: requested,
             config_spec=SimpleNamespace(tensor_numel_constraints=[]),
         )
         search.num_neighbors_cap = -1
@@ -372,6 +373,7 @@ class TestAutotunerSearch(AutotunerTestCase):
             ],
             block_size_indices=[0, 1],
             overridden_flat_indices={1},  # freeze block_size[1]
+            conditional_neighbor=lambda base, requested, **kwargs: requested,
         )
         search.num_neighbors_cap = -1
 
@@ -496,6 +498,7 @@ class TestAutotunerSearch(AutotunerTestCase):
             block_size_indices=[0, 1],
             num_warps_index=2,
             overridden_flat_indices={1, 2},  # freeze block_size[1] and num_warps
+            conditional_neighbor=lambda base, requested, **kwargs: requested,
         )
         search.num_neighbors_cap = -1
 
@@ -582,6 +585,7 @@ class TestAutotunerSearch(AutotunerTestCase):
             block_size_indices=[0, 1],
             num_warps_index=2,
             overridden_flat_indices=set(),
+            conditional_neighbor=lambda base, requested, **kwargs: requested,
             config_spec=SimpleNamespace(tensor_numel_constraints=[]),
         )
         search.num_neighbors_cap = -1
@@ -646,6 +650,7 @@ class TestAutotunerSearch(AutotunerTestCase):
             block_size_indices=[0],
             num_warps_index=-1,
             overridden_flat_indices=set(),
+            conditional_neighbor=lambda base, requested, **kwargs: requested,
             encode_config=lambda flat: spec.encode(flat[0]),
         )
 

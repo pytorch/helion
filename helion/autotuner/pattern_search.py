@@ -530,4 +530,6 @@ class PatternSearch(PopulationBasedSearch):
                         new_flat[second] = second_value
                         neighbors.append(new_flat)
 
-        return self.shrink_neighbors(neighbors)
+        return self.shrink_neighbors(
+            [self.config_gen.conditional_neighbor(base, row) for row in neighbors]
+        )

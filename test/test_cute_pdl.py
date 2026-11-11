@@ -591,6 +591,7 @@ def test_the_release_knob_rides_on_cute_pdl(cpu_only: None) -> None:
         "none",
         "exit",
         "last_wave",
+        "loader_tail",
     )
     assert spec._flat_fields()["cute_pdl_release"].search_choices == ("auto",)
     # The nested-row seeds turn the knob on, leave the placement to its

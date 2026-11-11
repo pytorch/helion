@@ -64,8 +64,10 @@ def produce(
 def attribute_only_control(bound: BoundKernel, source: str) -> Callable[..., object]:
     """Keep the real dependent-launch attribute but remove its single wait."""
     lines = source.splitlines()
-    kept = [line for line in lines if WAIT_CALL not in line]
-    assert len(kept) == len(lines) - 1
+    assert sum(WAIT_CALL in line for line in lines) == 1
+    # A guarded wait may be the only statement in an if-body. Preserve that
+    # empty control arm while removing the synchronization being tested.
+    kept = [line.replace(WAIT_CALL, "pass") for line in lines]
     control_source = "\n".join(kept) + "\n"
     module = PyCodeCache.load(control_source)
     bound.env.backend.annotate_compiled_module(

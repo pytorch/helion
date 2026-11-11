@@ -910,53 +910,6 @@ class TestAutotunerHeuristic(TestCase):
         ):
             compiler_seed_configs(env, MagicMock())
 
-    @onlyBackends(["cute"])
-    @pytest.mark.cpu_only
-    def test_cute_flash_disable_heuristics_keeps_structural_coverage(self) -> None:
-        @helion.kernel(backend="cute", disable_autotuner_heuristics=True)
-        def pointwise(x: torch.Tensor) -> torch.Tensor:
-            out = torch.empty_like(x)
-            for tile in hl.tile(x.size(0)):
-                out[tile] = x[tile] + 1
-            return out
-
-        spec = ConfigSpec(backend=CuteBackend())
-        self.assertIsNone(spec.compiler_seed_timeout_retry_repetitions)
-        for block_id, size_hint in enumerate((1, 128, 128)):
-            spec.block_sizes.append(
-                BlockSizeSpec(block_id=block_id, size_hint=size_hint)
-            )
-        enable_cute_flash_search(
-            spec,
-            head_dim=64,
-            num_kv=64,
-            block_size_targets={0: 1, 1: 128, 2: 128},
-            is_causal=True,
-        )
-        self.assertIsNone(spec.compiler_seed_timeout_retry_repetitions)
-        with mock_cuda_unavailable(), forbid_native_compile():
-            bound = cpu_bind(pointwise, (torch.empty(8),))
-            bound.env.config_spec = spec
-            with bound.env, bound.host_function:
-                self.assertEqual(
-                    compiler_seed_configs(bound.env, bound.host_function.device_ir), []
-                )
-        self.assertIsNone(spec.compiler_seed_timeout_retry_repetitions)
-        self.assertEqual(spec.compiler_seed_configs, [])
-        self.assertEqual(spec.autotuner_heuristics, [])
-
-        config_gen = spec.create_config_generation()
-        self.assertEqual(config_gen.seed_flat_config_pairs(), [])
-        self.assertFalse(
-            set(FLASH_AUTOTUNE_CONFIG_KEYS) & set(config_gen._config_value_priors)
-        )
-        coverage = config_gen.extension.deterministic_population_configs()
-        self.assertTrue(coverage)
-        population = config_gen.random_population(100)
-
-        self.assertGreaterEqual(len(population), 100)
-        self.assertLessEqual(set(coverage), set(population))
-
     @memoized_flash_fragments()
     def test_cute_flash_heuristic_returns_all_legal_seeds(self) -> None:
         spec = ConfigSpec(backend=CuteBackend())

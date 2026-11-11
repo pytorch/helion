@@ -771,18 +771,22 @@ def emit_ab_tma(ctx: HostWrapperContext, plan: dict[str, object]) -> None:
 
 
 # Keep transitive Helion device helpers with each wrapper that compiles them.
-GROUPED_RNA_DEPENDENCIES = (
+GROUPED_MAILBOX_DEPENDENCIES = (
+    "language/_gelu_tanh_approx.py",
     "_compiler/cute/_flash_runtime.py",
     "_compiler/cute/_mlir_compat.py",
+    "_compiler/cute/epilogue_helpers.py",
+)
+GROUPED_RNA_DEPENDENCIES = (
+    *GROUPED_MAILBOX_DEPENDENCIES,
     "_compiler/cute/tcgen05_flattened_prefix.py",
     "_compiler/cute/tcgen05_operand_pipeline.py",
     "_compiler/cute/tcgen05_operand_transform.py",
     "_compiler/cute/tcgen05_storage.py",
 )
 GROUPED_TMA_RN_DEPENDENCIES = (
+    *GROUPED_MAILBOX_DEPENDENCIES,
     "_compiler/cute/tcgen05_flattened_prefix.py",
-    "_compiler/cute/_flash_runtime.py",
-    "_compiler/cute/_mlir_compat.py",
 )
 
 EMITTERS = (

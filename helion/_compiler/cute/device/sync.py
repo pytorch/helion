@@ -43,9 +43,8 @@ if TYPE_CHECKING:
 # The inline-asm flags of the integer-address variants.  ``device.ptx`` imports
 # them from here rather than the other way round: this module is in the common
 # fingerprint set, ``ptx.py`` is keyed per family (the ptx family-isolation
-# cases), and the schedules' import-closure tests (``_helion_imports`` in
-# test_cute_gdn_recurrence.py) require every Helion module a fingerprinted
-# schedule reaches to be fingerprinted too.
+# cases). Any compiler-side device helper imported by a fingerprinted helper
+# must itself be declared in that family or in the common fingerprint set.
 ASM_KW = {
     "is_align_stack": False,
     "asm_dialect": llvm.AsmDialect.AD_ATT,

@@ -21,9 +21,11 @@ import cutlass.experimental.cuda as experimental_cuda
 import cutlass.experimental.primitives as prims
 
 from ._mma_dag_tcgen05_runtime import mbar_wait
+from ._paged_attention_compute import normalize_output
+from ._paged_attention_compute import output_normalization_factor
 from ._paged_attention_io import load_query_element
-from ._paged_attention_io import store_lse_element
 from ._paged_attention_io import store_output_element
+from ._paged_attention_io import store_row_element
 from ._paged_attention_partial_compute import load_query_panel
 from ._paged_attention_partial_compute import mma_128xnx128
 from ._paged_attention_partial_compute import online_softmax_per_key
@@ -83,6 +85,12 @@ def paged_attention_partial_body(
     reference_scores: cutlass.Constexpr = False,
     reflected_dtype: cutlass.Constexpr = None,
     base2_scores: cutlass.Constexpr = False,
+    output_reciprocal: cutlass.Constexpr = False,
+    key_post_scale_log2: cutlass.Constexpr = 0,
+    value_post_scale_log2: cutlass.Constexpr = 0,
+    output_scale_log2: cutlass.Constexpr = 0,
+    tma_load_hints: cutlass.Constexpr = ("", "", "", ""),
+    value_positive_zero: cutlass.Constexpr = False,
 ) -> None:
     assert cutlass.const_expr(not base2_scores or reference_scores)
     thread = cute.arch.thread_idx()[0]
@@ -279,7 +287,11 @@ def paged_attention_partial_body(
             safe_total = total
             if total == 0:
                 safe_total = cutlass.Float32(1)
-            state[3, thread] = safe_total
+            state[3, thread] = output_normalization_factor(
+                safe_total,
+                output_reciprocal,
+                output_scale_log2=output_scale_log2,
+            )
         cute.arch.barrier(barrier_id=1, number_of_threads=128)
         result = load_query_panel(output_address, query_columns)
         prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
@@ -290,7 +302,11 @@ def paged_attention_partial_body(
                     tile,
                     query,
                     thread,
-                    cutlass.BFloat16(result[query] / state[3, query]),
+                    cutlass.BFloat16(
+                        normalize_output(
+                            result[query], state[3, query], output_reciprocal
+                        )
+                    ),
                     heads,
                     group,
                     io_layouts,
@@ -301,14 +317,14 @@ def paged_attention_partial_body(
                 lse_maximum = state[0, thread]
                 if cutlass.const_expr(base2_scores):
                     lse_maximum = lse_maximum * cutlass.Float32(math.log(2))
-                store_lse_element(
+                store_row_element(
                     lse,
                     tile,
                     thread,
                     lse_maximum + cute.math.log(state[1, thread], fastmath=fast_math),
                     heads,
                     group,
-                    io_layouts,
+                    None if io_layouts is None else io_layouts[2],
                 )
         prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
     elif warp < 8:
@@ -335,6 +351,7 @@ def paged_attention_partial_body(
                 base,
                 128,
                 32,
+                post_scale_log2=key_post_scale_log2,
             )
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
             prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
@@ -358,6 +375,8 @@ def paged_attention_partial_body(
                 lane,
                 base + 64,
                 128,
+                post_scale_log2=value_post_scale_log2,
+                positive_zero=value_positive_zero,
             )
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
             prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
@@ -389,6 +408,7 @@ def paged_attention_partial_body(
                         cutlass.Int32(0),
                         head,
                         128,
+                        l2_hints=tma_load_hints[:2],
                     )
                     enqueue_paged_tma_operand(
                         vmap,
@@ -400,6 +420,7 @@ def paged_attention_partial_body(
                         cutlass.Int32(0),
                         head,
                         128,
+                        l2_hints=tma_load_hints[2:],
                     )
         elif warp == 9:
             for step in cutlass.range(count):

@@ -103,9 +103,16 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
                     env.snapshot_runtime_input_specialization_results(
                         env.runtime_arg_values_by_name
                     )
-                facts = mma_dag_facts(program)
+                # Schedule facts must see this projection, not a previous
+                # registration's phase: paired attention owns a whole root.
                 env.config_spec.cute_mma_dag_phase_index = phase_index
                 env.config_spec.cute_mma_dag_phase_owned_blocks = phase_owned_blocks
+                facts = mma_dag_facts(program)
+                env.config_spec.cute_pdl_capture_overlap_available = (
+                    len(device_ir.root_ids) == 1
+                    and facts.attention is not None
+                    and facts.attention.paired_items
+                )
                 if phase_index is not None:
                     from .....language import memory_ops
                     from ....device_ir_analysis import _load_needs_eviction_tunable

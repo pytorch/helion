@@ -2,9 +2,10 @@
 
 ``CuteSearchSurface.config_generation_extension`` hands one
 :class:`CuteConfigGenerationExtension` to every CuTe ``ConfigGeneration``
-(``generation.extension``).  It owns the two CuTe-specific parts of config
-generation that used to be inlined in ``helion/autotuner/config_generation.py``:
+(``generation.extension``). It owns these CuTe-specific parts of config
+generation:
 
+* the conditional neighbor prerequisites of paired PDL policies;
 * the SIMT launch-thread repairs (``repair_flat_config``): ``num_threads``
   slots follow their block sizes, the collective warp MMA's ownership rule,
   flattened loop groups and simultaneous launch axes stay under 1024 threads,
@@ -14,7 +15,8 @@ generation that used to be inlined in ``helion/autotuner/config_generation.py``:
   ``flash_*`` accessor the flash searches read from it, plus the structurally
   designed initial population (``initial_population_flats``).
 
-Every method keeps the body it had on ``ConfigGeneration``; the generic hooks
+The launch-thread repairs and flash coverage design were extracted from
+``ConfigGeneration``. The generic population hooks
 (``population_floor``, ``deterministic_population_configs``, ...) are the
 ``flash_*`` methods under the names of the backend-neutral
 :class:`ConfigGenerationExtension` contract.
@@ -45,7 +47,14 @@ from ..cute_flash import FLASH_SOFTMAX_DISC_KEY
 from ..cute_flash import FLASH_SOFTMAX_LOWERING_KEY
 from ..cute_flash import _flash_resident_softmax_overrides
 from ..cute_flash import flash_exp2_packet_is_compound
+from ..cute_mma_dag import MMA_DAG_KEY
+from ..cute_mma_dag import MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
+from ..cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
+from ..cute_mma_dag import MMA_DAG_TCGEN05
 from ..flash_knobs import FLASH_COVERAGE_CHILD_PARENTS
+from ..pdl_release import CUTE_PDL_CAPTURE_RELEASE_CHOICES
+from ..pdl_release import CUTE_PDL_RELEASE_DEFAULT
+from ..pdl_release import CUTE_PDL_SPREAD_KEY
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -93,6 +102,59 @@ class CuteConfigGenerationExtension(ConfigGenerationExtension):
     def __init__(self, generation: ConfigGeneration) -> None:
         super().__init__(generation)
         self._flash_coverage_design_cache: FlashCoverageDesign | None = None
+
+    def conditional_neighbor_updates(
+        self, base: FlatConfig, requested: FlatConfig
+    ) -> Mapping[int, object]:
+        """Activate paired PDL policies together with their prerequisites.
+
+        Enabling ordinary PDL, capture overlap, or loader-tail release also
+        disables generic spread padding, which the imported attention body
+        cannot implement. Capture and loader-tail additionally activate their
+        parent PDL policies. Keep explicit configs unchanged.
+        """
+        generation = self.generation
+        spec = generation.config_spec
+        if not spec.cute_pdl_capture_overlap_available or spec.has_explicit_pdl:
+            return {}
+        layout = generation._key_to_flat_indices
+        keys = (
+            MMA_DAG_KEY,
+            MMA_DAG_PASS_WARPS_KEY,
+            "cute_pdl",
+            "cute_pdl_capture_overlap",
+            "cute_pdl_release",
+            CUTE_PDL_SPREAD_KEY,
+        )
+        if any(key not in layout for key in keys):
+            return {}
+        slots = {key: layout[key][0][0] for key in keys}
+        for values in (base, requested):
+            if (
+                values[slots[MMA_DAG_KEY]] != MMA_DAG_TCGEN05
+                or values[slots[MMA_DAG_PASS_WARPS_KEY]]
+                != MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
+            ):
+                return {}
+        pdl = slots["cute_pdl"]
+        capture = slots["cute_pdl_capture_overlap"]
+        release = slots["cute_pdl_release"]
+        enable_capture = requested[capture] is True and base[capture] is not True
+        enable_tail = (
+            requested[release] == "loader_tail" and base[release] != "loader_tail"
+        )
+        enable_pdl = requested[pdl] is True and base[pdl] is not True
+        if not (enable_capture or enable_tail or enable_pdl):
+            return {}
+        updates: dict[int, object] = {pdl: True, slots[CUTE_PDL_SPREAD_KEY]: False}
+        if enable_tail:
+            updates[capture] = True
+        elif (
+            enable_capture
+            and requested[release] not in CUTE_PDL_CAPTURE_RELEASE_CHOICES
+        ):
+            updates[release] = CUTE_PDL_RELEASE_DEFAULT
+        return updates
 
     # -- SIMT launch threads ---------------------------------------------------
 

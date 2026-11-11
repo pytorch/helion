@@ -146,6 +146,13 @@ def cute_cuda_graph(
 
     Raw ``torch.cuda.graph`` captures cannot expose their Python graph owner to
     the launcher, so their resources are conservatively retained without bound.
+
+    Captured native paired-attention launches may use a dependency proof to
+    overlap reads of independent inputs. Such graphs must retain their captured
+    node topology and parameter addresses. Updating tensor contents before
+    replay is supported; replacing pointer arguments or rewiring nodes through
+    raw CUDA graph handles requires a new capture. ``replay()`` accepts no new
+    arguments, and ``reset()`` releases the old capture proof.
     """
     graph = CuteCUDAGraph()
     token = ACTIVE_CUDA_GRAPH.set(graph)

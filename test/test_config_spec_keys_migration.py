@@ -34,6 +34,8 @@ from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.search_surface import EMPTY_SEARCH_SURFACE
 from helion.autotuner.search_surface import BackendSearchSurface
 
+pytestmark = pytest.mark.cpu_only
+
 # ``VALID_KEYS``.
 _BASE_VALID_KEYS = """
     advanced_controls_file atomic_indexing block_sizes cross_loop_pipeline
@@ -112,8 +114,13 @@ _BASE_VALID_KEYS = """
     cute_mma_dag cute_mma_dag_aux cute_mma_dag_cluster cute_mma_dag_derived
     cute_mma_dag_epilogue cute_mma_dag_exchange cute_mma_dag_loads
     cute_mma_dag_lookahead cute_mma_dag_pass_warps cute_mma_dag_persistent
-    cute_mma_dag_split cute_mma_dag_stages cute_mma_dag_store cute_mma_dag_warps
-    cute_mma_f32_conversion cute_packet_prefetch cute_pdl cute_pdl_release
+    cute_mma_dag_probability_schedule
+    cute_mma_dag_query_tma cute_mma_dag_sleep_waits cute_mma_dag_split cute_mma_dag_stages
+    cute_mma_dag_value_metadata_skip
+    cute_mma_dag_value_metadata_read_overlap
+    cute_mma_dag_store cute_mma_dag_v_lag
+    cute_mma_dag_warps
+    cute_mma_f32_conversion cute_packet_prefetch cute_pdl cute_pdl_capture_overlap cute_pdl_release
     cute_pointwise_pid_type cute_proven_bounds cute_radix_boundary_early_exit
     cute_radix_cached_payload_inverse cute_radix_candidate_capacity
     cute_radix_candidate_key_cache cute_radix_cluster_ctas cute_radix_defer_output
@@ -267,8 +274,13 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_mma_dag cute_mma_dag_aux cute_mma_dag_cluster cute_mma_dag_derived
     cute_mma_dag_epilogue cute_mma_dag_exchange cute_mma_dag_loads
     cute_mma_dag_lookahead cute_mma_dag_pass_warps cute_mma_dag_persistent
-    cute_mma_dag_split cute_mma_dag_stages cute_mma_dag_store cute_mma_dag_warps
-    cute_mma_f32_conversion cute_packet_prefetch cute_pdl cute_pdl_release
+    cute_mma_dag_probability_schedule
+    cute_mma_dag_query_tma cute_mma_dag_sleep_waits cute_mma_dag_split cute_mma_dag_stages
+    cute_mma_dag_value_metadata_skip
+    cute_mma_dag_value_metadata_read_overlap
+    cute_mma_dag_store cute_mma_dag_v_lag
+    cute_mma_dag_warps
+    cute_mma_f32_conversion cute_packet_prefetch cute_pdl cute_pdl_capture_overlap cute_pdl_release
     cute_pointwise_pid_type cute_proven_bounds cute_radix_boundary_early_exit
     cute_radix_cached_payload_inverse cute_radix_candidate_capacity
     cute_radix_candidate_key_cache cute_radix_cluster_ctas cute_radix_defer_output
@@ -365,7 +377,7 @@ _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     cute_fragment_warp_scan cute_gathered_mma_n cute_gathered_mma_stages
     cute_host_paired_sum cute_independent_reduction cute_integer_loop_reduction
     cute_lane_unroll cute_materialized_operand_schedule cute_materialized_schedule
-    cute_packet_prefetch cute_pdl cute_pdl_release cute_pointwise_pid_type
+    cute_packet_prefetch cute_pdl cute_pdl_capture_overlap cute_pdl_release cute_pointwise_pid_type
     cute_proven_bounds cute_radix_boundary_early_exit
     cute_radix_cached_payload_inverse cute_radix_candidate_capacity
     cute_radix_candidate_key_cache cute_radix_cluster_ctas cute_radix_defer_output
@@ -473,8 +485,13 @@ _BASE_CUTE_ACCEPTED = """
     cute_mma_dag cute_mma_dag_aux cute_mma_dag_cluster cute_mma_dag_derived
     cute_mma_dag_epilogue cute_mma_dag_exchange cute_mma_dag_loads
     cute_mma_dag_lookahead cute_mma_dag_pass_warps cute_mma_dag_persistent
-    cute_mma_dag_split cute_mma_dag_stages cute_mma_dag_store cute_mma_dag_warps
-    cute_mma_f32_conversion cute_packet_prefetch cute_pdl cute_pdl_release
+    cute_mma_dag_probability_schedule
+    cute_mma_dag_query_tma cute_mma_dag_sleep_waits cute_mma_dag_split cute_mma_dag_stages
+    cute_mma_dag_value_metadata_skip
+    cute_mma_dag_value_metadata_read_overlap
+    cute_mma_dag_store cute_mma_dag_v_lag
+    cute_mma_dag_warps
+    cute_mma_f32_conversion cute_packet_prefetch cute_pdl cute_pdl_capture_overlap cute_pdl_release
     cute_pointwise_pid_type cute_proven_bounds cute_radix_boundary_early_exit
     cute_radix_cached_payload_inverse cute_radix_candidate_capacity
     cute_radix_candidate_key_cache cute_radix_cluster_ctas cute_radix_defer_output

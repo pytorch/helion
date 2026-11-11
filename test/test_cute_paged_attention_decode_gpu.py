@@ -7,83 +7,7 @@ import torch
 
 from helion._testing import DEVICE
 from helion._testing import skipIfNotCUDA
-
-
-def _check_full_domain_decode(
-    columns: int,
-    scale_group: int,
-    scale_row_stride: int,
-    scale_swizzle: bool,
-    transpose: bool,
-) -> None:
-    """Compare every byte/scale pair and graph replay using raw BF16 bits.
-
-    Replay mixes exceptional and ordinary scales within warps to force the
-    uniform fallback. Bit comparison includes NaN and signed infinity cases.
-    """
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("the decoder uses SM100 tensor memory and scaled S2F6")
-
-    cuda = importlib.import_module("cuda.bindings.driver")
-    import cutlass.cute as cute
-    from cutlass.cute.runtime import from_dlpack
-
-    from helion._testing.cute_paged_attention_decode import launch
-
-    tiles = (65536 + 128 * columns - 1) // (128 * columns)
-    codes = torch.arange(
-        tiles * 128 * columns, device=DEVICE, dtype=torch.int32
-    ).reshape(tiles, 128, columns)
-    raw = (codes % 256).to(torch.uint8).view(torch.int8)
-    scales = (codes[:, :, ::scale_group] // 256).to(torch.uint8).contiguous()
-    output = torch.empty((tiles, 128, columns // 2), device=DEVICE, dtype=torch.int32)
-    args = [from_dlpack(t, assumed_align=16) for t in (raw, scales, output)]
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    compiled = cute.compile(
-        launch,
-        *args,
-        stream,
-        scale_row_stride,
-        scale_swizzle,
-        transpose,
-        columns,
-        scale_group,
-    )
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        compiled(*args, cuda.CUstream(torch.cuda.current_stream().cuda_stream))
-    for changed in (False, True):
-        if changed:
-            raw.copy_(
-                ((codes * 37 + (codes // 128) * 13 + 11) % 256)
-                .to(torch.uint8)
-                .view(torch.int8)
-            )
-            scales.copy_(
-                (
-                    (
-                        codes[:, :, ::scale_group] // 256 * 73
-                        + (torch.arange(128, device=DEVICE)[None, :, None] % 2) * 127
-                        + torch.arange(columns // scale_group, device=DEVICE)[
-                            None, None, :
-                        ]
-                        * 17
-                        + 29
-                    )
-                    % 256
-                ).to(torch.uint8)
-            )
-        graph.replay()
-        expected = (
-            raw.float()
-            * torch.exp2(scales.float().repeat_interleave(scale_group, -1) - 127.0)
-        ).to(torch.bfloat16)
-        if transpose:
-            expected = expected.transpose(-1, -2)
-        expected = expected.contiguous()
-        assert torch.equal(
-            output.view(torch.bfloat16).view(torch.int16), expected.view(torch.int16)
-        )
+from helion._testing.cute_paged_decode_reference import check_full_domain_decode
 
 
 @skipIfNotCUDA()
@@ -94,7 +18,7 @@ def test_transposed_byte_decode_full_domain_and_replay(
     scale_row_stride: int, scale_swizzle: bool
 ) -> None:
     """Native packed V staging and padded/composed indexed-load fallbacks."""
-    _check_full_domain_decode(128, 32, scale_row_stride, scale_swizzle, True)
+    check_full_domain_decode(128, 32, scale_row_stride, scale_swizzle, True)
 
 
 @skipIfNotCUDA()
@@ -115,7 +39,7 @@ def test_row_byte_decode_grouped_stores(
     columns: int, scale_group: int, padding: int, swizzle: bool
 ) -> None:
     """Group batching, original store widths, and noncontiguous scale layouts."""
-    _check_full_domain_decode(
+    check_full_domain_decode(
         columns, scale_group, columns // scale_group + padding, swizzle, False
     )
 

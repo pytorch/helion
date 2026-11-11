@@ -42,6 +42,8 @@ from cutlass._mlir.dialects import func
 import helion._compiler.cute as cute_package
 from helion._compiler.cute.cute_flash import FlashAttentionConfig
 
+pytestmark = pytest.mark.cpu_only
+
 CUTE_ROOT = Path(cute_package.__file__).parent
 CUTE_PACKAGE = cute_package.__name__
 
@@ -604,6 +606,7 @@ def test_every_rendered_helper_name_resolves() -> None:
 # re-exported by at least one module; ``test_every_ptx_row_is_pinned`` keeps
 # the two tables and the module in step).
 PTX_ROW_EXPORTS: dict[str, tuple[str, ...]] = {
+    "_paged_attention_runtime": ("add_bf16x2",),
     "_flash_row_mma_runtime": (
         "bulk_reduce_add_f32",
         "cp_async_16",
@@ -759,6 +762,14 @@ _F32_QUAD = "!llvm.struct<(f32, f32, f32, f32)>"
 _I32_PAIR = "!llvm.struct<(i32, i32)>"
 _I32_QUAD = "!llvm.struct<(i32, i32, i32, i32)>"
 PTX_ROW_FINGERPRINTS: dict[str, _Fingerprint] = {
+    "add_bf16x2": (
+        "add.rn.bf16x2 $0, $1, $2;",
+        "=r,r,r",
+        False,
+        ("i32", "i32"),
+        "i32",
+        "Int32",
+    ),
     "atom_add_release_gpu_u32": (
         "atom.add.release.gpu.global.u32 $0, [$1], $2;",
         "=r,l,r,~{memory}",

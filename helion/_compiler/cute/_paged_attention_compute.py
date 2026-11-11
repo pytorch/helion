@@ -8,6 +8,31 @@ import cutlass.experimental.primitives as prims
 
 
 @cute.jit
+def output_normalization_factor(
+    safe_denominator: cutlass.Float32,
+    reciprocal: cutlass.Constexpr,
+    output_scale_log2: cutlass.Constexpr = 0,
+) -> cutlass.Float32:
+    """Publish the source-selected divisor or one rounded row reciprocal."""
+    assert cutlass.const_expr(reciprocal or output_scale_log2 == 0)
+    if cutlass.const_expr(reciprocal):
+        factor = cutlass.Float32(1) / safe_denominator
+        if cutlass.const_expr(output_scale_log2 != 0):
+            factor = factor * (2.0**output_scale_log2)
+        return factor
+    return safe_denominator
+
+
+@cute.jit
+def normalize_output(
+    value: cutlass.Float32, factor: cutlass.Float32, reciprocal: cutlass.Constexpr
+) -> cutlass.Float32:
+    if cutlass.const_expr(reciprocal):
+        return value * factor
+    return value / factor
+
+
+@cute.jit
 def logical_attention_mask(
     logical_key_base: cutlass.Int64,
     key_offset: cutlass.Int32,

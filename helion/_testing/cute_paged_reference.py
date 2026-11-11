@@ -85,7 +85,7 @@ def check_reference_attention_fixture(
     query_len: int,
     fast_math: bool,
     lse: bool,
-    scoped: bool,
+    schedule: str,
     occupancy: int,
     pdl: bool,
     *,
@@ -93,6 +93,11 @@ def check_reference_attention_fixture(
     reference_scores: bool = True,
     reverse_pages: bool = False,
     index_dtype: torch.dtype | None = None,
+    output_reciprocal: bool = False,
+    key_post_scale_log2: int = 0,
+    value_post_scale_log2: int = 0,
+    output_scale_log2: int = 0,
+    value_positive_zero: bool = False,
 ) -> None:
     """Compile each source choice and replay it against matching source math."""
     initialize_paged_attention_inputs(args)
@@ -103,14 +108,19 @@ def check_reference_attention_fixture(
     config = optional_lse_config()
     config.config.update(
         block_sizes=[helion.next_power_of_2(query_len * 8)],
-        cute_mma_dag_pass_warps="attention_scoped" if scoped else "attention",
+        cute_mma_dag_pass_warps=schedule,
         cute_min_blocks_per_mp=occupancy,
         cute_pdl=pdl,
     )
     source = bound.to_code(config)
+    assert ("paged_attention_paired_body(" in source) == (
+        schedule == "attention_paired"
+    )
     assert ("reference_scores=True" in source) == reference_scores
     assert ("base2_scores=True" in source) == base2_scores
     assert ("reflected_dtype=" in source) == reverse_pages
+    assert ("output_reciprocal=True" in source) == output_reciprocal
+    assert ("value_positive_zero=True" in source) == value_positive_zero
     if reverse_pages:
         # These source fixtures use INT32 bounds even with INT64 row indices.
         assert "reflected_dtype=cutlass.Int32" in source
@@ -123,4 +133,9 @@ def check_reference_attention_fixture(
         reference_scores=reference_scores,
         base2_scores=base2_scores,
         reverse_pages=reverse_pages,
+        output_reciprocal=output_reciprocal,
+        key_post_scale_log2=key_post_scale_log2,
+        value_post_scale_log2=value_post_scale_log2,
+        output_scale_log2=output_scale_log2,
+        value_positive_zero=value_positive_zero,
     )

@@ -58,7 +58,6 @@ from helion._testing import DEVICE
 from helion._testing import EXAMPLES_DIR
 from helion._testing import code_and_output
 from helion._testing import import_path
-from helion._testing.cute_cache_sources import helion_imports as _helion_imports
 from helion._testing.tunable_fragments import load_host_function
 import helion.language as hl
 
@@ -1488,21 +1487,18 @@ def test_gdn_recurrence_schedule_sources_fingerprint_the_disk_cache() -> None:
 
     The generated wrapper only imports the schedule, so the launcher's key has
     to hash the schedule sources themselves or a schedule fix would reload
-    obsolete machine code from an earlier build.  The expected set follows
-    the schedule's imports, so a new Helion import needs a table entry too.
+    obsolete machine code from an earlier build. Import closure for every
+    wrapper family is checked in test_cute_helper_cache_dependencies.
     """
 
     from helion.runtime.cute import source_dependencies
 
     dependencies = source_dependencies.wrapper_dependencies()["gdn_recurrence_sm100"]
-    imported = _helion_imports("_compiler/cute/gdn_recurrence_sm100.py")
-    assert imported >= {
+    assert set(dependencies) >= {
         "_compiler/cute/gdn_recurrence_sm100.py",
         "_compiler/cute/gdn_recurrence_geometry.py",
         "_compiler/cute/affine_recurrence_primitives.py",
     }
-    assert set(dependencies) | set(source_dependencies._COMMON_DEPENDENCIES) >= imported
-    assert set(dependencies) >= imported - set(source_dependencies._COMMON_DEPENDENCIES)
     fingerprints = source_dependencies.wrapper_source_dependencies(
         ("gdn_recurrence_sm100",)
     )

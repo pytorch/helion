@@ -12,9 +12,14 @@ if TYPE_CHECKING:
 
 
 def paged_attention_args(
-    *, rows: int = 64, width: int = 128, device: torch.device | str = "cpu"
+    *,
+    rows: int = 64,
+    width: int = 128,
+    heads: int = 2,
+    requests: int = 2,
+    device: torch.device | str = "cpu",
 ) -> tuple[object, ...]:
-    pages, heads, dim = 13, 2, 128
+    pages, dim = 13, 128
     raw_bytes = width * heads * dim
     scale_bytes = width * heads * 4
     page_stride = raw_bytes + scale_bytes
@@ -25,13 +30,13 @@ def paged_attention_args(
     scale_shape = (pages, 1, width, heads, 4)
     scale_strides = (page_stride, scale_bytes, 4, width * 4, 1)
     return (
-        torch.empty(4, rows, dim, dtype=torch.bfloat16, device=device),
+        torch.empty(requests * heads, rows, dim, dtype=torch.bfloat16, device=device),
         storage_k.as_strided(shape, strides),
         storage_v.as_strided(shape, strides),
         storage_k.view(torch.uint8).as_strided(scale_shape, scale_strides, raw_bytes),
         storage_v.view(torch.uint8).as_strided(scale_shape, scale_strides, raw_bytes),
-        torch.empty(2, 17, dtype=torch.int32, device=device),
-        torch.empty(2, dtype=torch.int32, device=device),
+        torch.empty(requests, 17, dtype=torch.int32, device=device),
+        torch.empty(requests, dtype=torch.int32, device=device),
         5,
         8,
         31,

@@ -14,6 +14,7 @@ from itertools import starmap
 from typing import TYPE_CHECKING
 
 import torch
+from torch.fx.experimental.symbolic_shapes import statically_known_true
 
 from ....language._tracing_ops import _new_var
 from .match_common import node_tensor
@@ -120,6 +121,54 @@ def _recipe() -> tuple[_Input, _Input, _Op, _Op, _Op]:
 _RAW, _SCALE, _SIGNED, _EXPONENT, _RESULT = _recipe()
 
 
+def native_s2f6_same_shape(left: torch.Tensor, right: torch.Tensor) -> bool:
+    return left.ndim == right.ndim and all(
+        statically_known_true(a == b)
+        for a, b in zip(left.shape, right.shape, strict=True)
+    )
+
+
+def unwrap_native_s2f6_value(
+    node: object,
+    nodes: set[torch.fx.Node],
+    resolve: Callable[[torch.fx.Node], torch.fx.Node] | None,
+    *,
+    require_same_shape: bool = False,
+) -> object:
+    """Resolve typed aliases, retaining every observed resolver endpoint.
+
+    The integer recipe checks operator widths; its caller proves broadcasting.
+    The fused leaf additionally checks shape-preserving casts and aliases.
+    Opaque cross-graph resolver semantics remain the caller's obligation.
+    """
+    seen: set[torch.fx.Node] = set()
+    while isinstance(node, torch.fx.Node) and node not in seen:
+        seen.add(node)
+        nodes.add(node)
+        if resolve is not None:
+            resolved = resolve(node)
+            if resolved is not node:
+                node = resolved
+                continue
+        if (
+            node.op != "call_function"
+            or node.target not in (_aten.alias.default, _new_var)
+            or len(node.args) != 1
+            or node.kwargs
+        ):
+            break
+        tensor, source = node_tensor(node), node_tensor(node.args[0])
+        if (
+            tensor is None
+            or source is None
+            or tensor.dtype != source.dtype
+            or (require_same_shape and not native_s2f6_same_shape(tensor, source))
+        ):
+            break
+        node = node.args[0]
+    return node
+
+
 def match_native_s2f6_decode(
     value: torch.fx.Node,
     *,
@@ -138,36 +187,11 @@ def match_native_s2f6_decode(
     matched: dict[object, torch.fx.Node] = {}
     nodes: set[torch.fx.Node] = set()
 
-    def unwrap(node: object) -> object:
-        seen: set[torch.fx.Node] = set()
-        while isinstance(node, torch.fx.Node) and node not in seen:
-            seen.add(node)
-            if resolve is not None:
-                resolved = resolve(node)
-                if resolved is not node:
-                    nodes.add(node)
-                    node = resolved
-                    continue
-            if (
-                node.op != "call_function"
-                or node.target not in (_aten.alias.default, _new_var)
-                or len(node.args) != 1
-                or node.kwargs
-            ):
-                break
-            tensor = node_tensor(node)
-            source = node_tensor(node.args[0])
-            if tensor is None or source is None or tensor.dtype != source.dtype:
-                break
-            nodes.add(node)
-            node = node.args[0]
-        return node
-
     def match(pattern: object, candidate: object) -> bool:
         if not isinstance(pattern, (_Input, _Constant, _Op)):
             # In particular, bool/float constants do not stand in for integers.
             return type(candidate) is type(pattern) and candidate == pattern
-        candidate = unwrap(candidate)
+        candidate = unwrap_native_s2f6_value(candidate, nodes, resolve)
         tensor = node_tensor(candidate)
         if (
             not isinstance(candidate, torch.fx.Node)

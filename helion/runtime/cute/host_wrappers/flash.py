@@ -1389,6 +1389,7 @@ def emit_flash_bwd(ctx: HostWrapperContext, plan: dict[str, object]) -> None:
 # The flash families (dense, gated, backward) share one generated preamble that
 # imports these runtime modules; the alternating-warpgroup body adds its own.
 FLASH_DEPENDENCIES = (
+    "language/_gelu_tanh_approx.py",
     "_compiler/cute/_flash_runtime.py",
     "_compiler/cute/_flash_alt_runtime.py",
     "_compiler/cute/_flash_gemm_ptx.py",
@@ -1427,7 +1428,7 @@ EMITTERS = (
         emit_flash_gated_row_mma,
         source_dependencies=(
             *FLASH_DEPENDENCIES,
-            "_compiler/cute/_flash_row_mma_runtime.py",
+            *ROW_MMA_DEPENDENCIES,
         ),
     ),
     HostWrapperEmitter(
