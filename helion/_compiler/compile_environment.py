@@ -17,6 +17,7 @@ import warnings
 import sympy
 import torch
 from torch import SymInt
+from torch._dynamo.source import AttrSource
 from torch._dynamo.source import EphemeralSource
 from torch._dynamo.source import GetItemSource
 from torch._dynamo.source import LocalSource
@@ -45,7 +46,9 @@ from .backend_registry import get_backend
 from .fake_tensor import create_fake_tensor_mode
 from .source_location import SourceLocation
 from .source_location import current_location
+from .variable_origin import AttributeOrigin
 from .variable_origin import BlockSizeOrigin
+from .variable_origin import GetItemOrigin
 from .variable_origin import GridOrigin
 from .variable_origin import Origin
 from .variable_origin import TensorSizeOrigin
@@ -149,6 +152,17 @@ class RuntimeInputSpecialization:
 def _is_supported_tensor_input_source(source: Source) -> bool:
     if isinstance(source, LocalSource):
         return True
+    if isinstance(source, AttrSource):
+        # ClosureOrigin records function.__closure__[index].cell_contents.
+        # Captures retain their external specialization policy.
+        if (
+            source.member == "cell_contents"
+            and isinstance(source.base, GetItemSource)
+            and isinstance(source.base.base, AttrSource)
+            and source.base.base.member == "__closure__"
+        ):
+            return False
+        return _is_supported_tensor_input_source(source.base)
     if isinstance(source, GetItemSource):
         return (
             isinstance(source.index, (int, str))
@@ -269,6 +283,9 @@ def _replay_tensor_input_source(
 ) -> object:
     if isinstance(source, LocalSource):
         return root_values.get(source.local_name)
+    if isinstance(source, AttrSource):
+        base = _replay_tensor_input_source(source.base, root_values)
+        return getattr(base, source.member, None)
     if isinstance(source, GetItemSource):
         if not isinstance(source.index, (int, str)) or source.index_is_slice:
             return None
@@ -281,8 +298,6 @@ def _replay_tensor_input_source(
             return base[source.index]
         if isinstance(base, dict) and source.index in base:
             return base[source.index]
-        if isinstance(source.index, str) and base is not None:
-            return getattr(base, source.index, None)
     return None
 
 
@@ -293,14 +308,17 @@ def _find_tensor_input_source(
 ) -> Source | None:
     if value is target:
         return source
+    attributes = False
     if isinstance(value, dict):
         items = value.items()
     elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+        attributes = True
         items = (
             (field.name, getattr(value, field.name))
             for field in dataclasses.fields(value)
         )
     elif isinstance(value, tuple) and hasattr(value, "_fields"):
+        attributes = True
         items = ((name, getattr(value, name)) for name in value._fields)
     elif isinstance(value, (list, tuple)):
         items = enumerate(value)
@@ -311,7 +329,9 @@ def _find_tensor_input_source(
             result = _find_tensor_input_source(
                 target,
                 item,
-                GetItemSource(source, index),
+                AttrSource(source, typing.cast("str", index))
+                if attributes
+                else GetItemSource(source, index),
             )
             if result is not None:
                 return result
@@ -1006,6 +1026,33 @@ class CompileEnvironment:
 
         self._tensor_input_source_cache[cache_key] = result
         return result
+
+    def tensor_stride_input_source(self, fake_tensor: torch.Tensor) -> Source | None:
+        """Resolve a runtime stride source, including an aliased input leaf.
+
+        Full, fast and prepared dispatch guard the input tensor alias partition,
+        so any recorded path to this exact receiver supplies its current stride.
+        Keep the unique-owner query conservative for consumers that need storage
+        ownership rather than receiver identity.
+        """
+        source = self.tensor_input_source(fake_tensor)
+        if source is not None:
+            return source
+        if id(fake_tensor) not in self._ambiguous_tensor_input_source_ids:
+            return None
+        source = self.input_sources.get(fake_tensor)
+        from .host_function import HostFunction
+
+        if (
+            source is not None
+            and _is_supported_tensor_input_source(source)
+            and _replay_tensor_input_source(
+                source, HostFunction.current().params.arguments
+            )
+            is fake_tensor
+        ):
+            return source
+        return None
 
     def tensor_layout_is_symbolically_exact(self, tensor: torch.Tensor) -> bool:
         """Whether the wrapper determines this tensor's layout exactly.
@@ -1888,27 +1935,40 @@ class CompileEnvironment:
         if isinstance(obj, str):
             return obj
         if isinstance(obj, list):
-            return [self.to_fake(e, origin) for e in obj]
+            return [
+                self.to_fake(e, GetItemOrigin(origin, i)) for i, e in enumerate(obj)
+            ]
         if isinstance(obj, tuple) and hasattr(obj, "_fields"):
             return type(obj)(
                 **{
-                    k: self.to_fake(e, origin)
+                    k: self.to_fake(e, AttributeOrigin(origin, k))
                     # pyrefly: ignore [missing-attribute]
                     for k, e in obj._asdict().items()
                 }
             )
         if isinstance(obj, tuple):
-            return tuple(self.to_fake(e, origin) for e in obj)
-        if isinstance(obj, dict):
-            return {k: self.to_fake(e, origin) for k, e in obj.items()}
-        if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
-            return dataclasses.replace(
-                obj,
-                **{
-                    k: self.to_fake(getattr(obj, k), origin)
-                    for k in obj.__dataclass_fields__
-                },
+            return tuple(
+                self.to_fake(e, GetItemOrigin(origin, i)) for i, e in enumerate(obj)
             )
+        if isinstance(obj, dict):
+            return {
+                k: self.to_fake(e, GetItemOrigin(origin, k)) for k, e in obj.items()
+            }
+        if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+            # Preserve stored fields, including init=False, without rerunning
+            # initialization (InitVar inputs need not be stored on the object).
+            # Only the declared fields participate in typing; allocate that
+            # representation without invoking a user-defined copy hook either.
+            result = object.__new__(type(obj))
+            for field in dataclasses.fields(obj):
+                object.__setattr__(
+                    result,
+                    field.name,
+                    self.to_fake(
+                        getattr(obj, field.name), AttributeOrigin(origin, field.name)
+                    ),
+                )
+            return result
 
         raise TypeError(f"unsupported argument type {type(obj)} ({origin})")
 
@@ -2049,6 +2109,21 @@ class CompileEnvironment:
             and self.is_tunable_expr(size._sympy_())
             and self.resolve_block_id(size) is None
         )
+
+    def preserve_tunable_float_provenance(
+        self, result: torch.SymFloat, operands: tuple[object, ...]
+    ) -> None:
+        """Keep fresh ordered-float symbols constant only for tunable-only inputs."""
+        symbols: set[sympy.Basic] = set()
+        for value in operands:
+            if isinstance(value, (torch.SymInt, torch.SymFloat, torch.SymBool)):
+                symbols.update(value._sympy_().free_symbols)
+            elif type(value) not in (int, float, bool):
+                return
+        if symbols and symbols <= self.tunable_symbols:
+            symbol = result._sympy_()
+            assert isinstance(symbol, sympy.Symbol)
+            self.tunable_symbols.add(symbol)
 
     def tunable_default_hint(self, expr: sympy.Basic) -> int | None:
         """``expr`` evaluated with every ``hl.register_tunable`` symbol at its default.

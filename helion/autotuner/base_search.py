@@ -474,6 +474,17 @@ class BaseSearch(BaseAutotuner):
             self.settings.autotune_precompile = autotune_precompile_mode(
                 self.config_spec.backend, self.settings.autotune_precompile
             )
+        from ..runtime.kernel import BoundKernel
+
+        # Direct search construction bypasses BoundKernel.autotune(), which
+        # normally fills evaluated defaults. Workers reload generated source
+        # without nonportable defaults, so ship the complete argument list.
+        # Multi-shape cases are already normalized; retain their carrier so
+        # provider selection and aggregate measurements still see every case.
+        if isinstance(kernel, BoundKernel) and not isinstance(
+            args, _MultiShapeAutotuneArgs
+        ):
+            args = kernel.kernel.normalize_args(*args)
         self.args: Sequence[object] = args
         self.log = AutotuningLogger(self.settings)
         self.best_perf_so_far = inf

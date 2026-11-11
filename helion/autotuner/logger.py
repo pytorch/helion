@@ -116,7 +116,7 @@ class _ElapsedFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:  # type: ignore[override]
         elapsed = self._elapsed_fn()
-        return f"[{elapsed}s] {record.getMessage()}"
+        return f"[{elapsed}s] {super().format(record)}"
 
 
 class AutotuningLogger:

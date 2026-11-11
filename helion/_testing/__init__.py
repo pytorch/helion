@@ -1488,8 +1488,12 @@ def import_path(filename: Path) -> types.ModuleType:
         # pyrefly: ignore [implicit-import]
         module = importlib.util.module_from_spec(spec)
         assert spec.loader is not None
-        spec.loader.exec_module(module)
         sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(module_name, None)
+            raise
     return sys.modules[module_name]
 
 

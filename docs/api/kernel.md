@@ -21,6 +21,13 @@ A `Kernel` object is typically created via the `@helion.kernel` decorator. It ma
 
 The kernel compilation process converts Python functions using `helion.language` constructs into optimized Triton GPU kernels.
 
+Host sizes can pass through symbolic float conversion and division before an
+integer extent, including `int(x.size(0) / 2)` and assigning that quotient to a
+local first. Additive and multiplicative floating-point size expressions remain
+runtime values: simplifying them algebraically can change ordered IEEE rounding.
+Their conversion to dynamic integer extents may therefore still be unsupported;
+use equivalent integer shape arithmetic when its rounding semantics are intended.
+
 ## Creation and Usage
 
 ### Basic Kernel Creation
@@ -162,6 +169,23 @@ input types and specialization constraints remain those of the exported kernel;
 export does not make a shape-specialized kernel accept arbitrary shapes. The
 source and launcher can be edited directly, without regenerating a Helion config.
 Unsupported backend export paths raise `NotImplementedError`.
+
+Raw generated entrypoints preserve only a trailing run of portable immutable
+defaults. Callable, mutable and config-fragment defaults must be supplied
+explicitly, as must any defaults preceding them: Python does not allow required
+positional parameters after optional ones. Additional required parameters
+introduced during generation remove all defaults from the raw entrypoint.
+Default expressions from the original source are not replayed. Calling a raw
+entrypoint with a required argument omitted raises `TypeError`; the decorated
+kernel and the result of `compile_config` still apply the original defaults.
+Capture defaults once before binding and pass those same arguments to the
+generated entrypoint:
+
+```python
+args = kernel.normalize_args(*args)
+bound = kernel.bind(args)
+# Generate and load bound.to_code(config), then call its entrypoint with *args.
+```
 
 CuTe export currently requires `static_shapes=True` and static tensor layouts at
 each native launch. Dynamic

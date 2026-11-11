@@ -219,6 +219,10 @@ def _(lhs: object, rhs: object) -> object:
         assert isinstance(rhs, Tile)
         assert lhs.block_id == rhs.block_id
         return lhs
+    if isinstance(lhs, torch.SymFloat) and isinstance(rhs, torch.SymFloat):
+        shape_env = CompileEnvironment.current().shape_env
+        with shape_env.ignore_fresh_unbacked_symbols():
+            return shape_env.create_unbacked_symfloat()
     assert isinstance(lhs, torch.Tensor), lhs
     assert isinstance(rhs, torch.Tensor), rhs
     assert lhs.size() == rhs.size()
@@ -419,6 +423,11 @@ def _(value: _T) -> _T:
     if isinstance(value, torch.SymInt):
         # pyrefly: ignore [bad-return]
         return CompileEnvironment.current().create_unbacked_symint()
+    if isinstance(value, torch.SymFloat):
+        shape_env = CompileEnvironment.current().shape_env
+        with shape_env.ignore_fresh_unbacked_symbols():
+            # pyrefly: ignore [bad-return]
+            return shape_env.create_unbacked_symfloat()
     if isinstance(value, (int, float, bool)) or value is None:
         # pyrefly: ignore [bad-return]
         return value

@@ -2190,11 +2190,16 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     maybe_dump_triton_failure(
                         self.kernel, config, e, captured_output=captured[0] or None
                     )
-                    self.log.warning(
-                        "Skipping config that failed to compile: "
-                        f"{self.kernel.format_kernel_decorator(config, self.settings)}",
-                        exc_info=True,
-                    )
+                    if not self.settings.autotune_ignore_errors:
+                        action = self.config_spec.backend.classify_autotune_exception(
+                            e
+                        ) or classify_triton_exception(e)
+                        log = self.log.debug if action == "debug" else self.log.warning
+                        log(
+                            "Skipping config that failed to compile: "
+                            f"{self.kernel.format_kernel_decorator(config, self.settings)}",
+                            exc_info=True,
+                        )
                     if first_error["value"] is None:
                         first_error["value"] = e
                     if no_viable_config:

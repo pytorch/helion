@@ -557,10 +557,26 @@ class PallasBackend(Backend):
             return f"{host_str}.reshape(1)"
         if isinstance(arg, (SymbolArgument, TensorSizeArg, TensorStrideArg)):
             from ..compile_environment import CompileEnvironment
+            from ..device_function import DeviceFunction
 
-            if tensor_host_args:
-                device_expr = f"{tensor_host_args[0]}.device"
-            elif CompileEnvironment.current().settings.pallas_interpret:
+            env = CompileEnvironment.current()
+            input_storages = {id(t.untyped_storage()) for t in env.input_sources}
+            # Body outputs can be retargeted to meta placeholders after this
+            # call. Use the same input-storage provenance as output classification
+            # so scalar data is allocated on a real input's device instead.
+            input_arg = next(
+                (
+                    candidate
+                    for candidate in DeviceFunction.current().sorted_args()
+                    if isinstance(candidate, TensorArg)
+                    and candidate.host_str() in tensor_host_args
+                    and id(candidate.fake_value.untyped_storage()) in input_storages
+                ),
+                None,
+            )
+            if input_arg is not None:
+                device_expr = f"{input_arg.host_str()}.device"
+            elif env.settings.pallas_interpret:
                 device_expr = "'cpu'"
             else:
                 device_expr = "'tpu'"
@@ -572,9 +588,7 @@ class PallasBackend(Backend):
             # The kernel dereferences the scalar with ``name[0]`` (see
             # ``scalar_arg_preamble``).
             if isinstance(arg, (TensorSizeArg, TensorStrideArg)):
-                from ..compile_environment import CompileEnvironment
-
-                idx_dtype = CompileEnvironment.current().index_dtype
+                idx_dtype = env.index_dtype
                 return f"torch.tensor([{host_str}], dtype={idx_dtype!r}, device={device_expr})"
             return f"torch.tensor([{host_str}], dtype=torch.float32 if isinstance({host_str}, float) else torch.int32, device={device_expr})"
         return host_str

@@ -14,6 +14,7 @@ from typing import cast
 from ..exc import InvalidConfig
 
 if TYPE_CHECKING:
+    from collections.abc import Hashable
     from typing import Callable
 
     from . import ConfigSpec
@@ -607,3 +608,37 @@ class ListOf(ConfigSpecFragment):
         for v in value:
             encoded.extend(self.inner.encode(v))
         return encoded
+
+
+def _fragment_domain_fields(
+    fragment: ConfigSpecFragment,
+) -> tuple[tuple[str, object], ...] | None:
+    """Declared built-in domain fields, separate from flat-layout identity.
+
+    Subclasses retain these common fields; custom extra domain state belongs
+    in their existing fingerprint() implementation.
+    """
+    if isinstance(fragment, BaseIntegerFragment):
+        return (
+            ("low", fragment.low),
+            ("high", fragment.high),
+            ("default_val", fragment.default_val),
+        )
+    if isinstance(fragment, NumThreadsFragment):
+        return (("high", fragment.high),)
+    return None
+
+
+def _scalar_fragment_key(value: object) -> Hashable | None:
+    """Exact built-in scalar type and value, including a float's zero sign."""
+    kind = type(value)
+    if kind in (bool, int):
+        return kind, value
+    if kind is float:
+        return float, cast("float", value).hex()
+    return None
+
+
+def _same_scalar(left: object, right: object) -> bool:
+    key = _scalar_fragment_key(left)
+    return key is not None and key == _scalar_fragment_key(right)

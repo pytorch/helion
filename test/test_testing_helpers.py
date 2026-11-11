@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 import runpy
 import shutil
+import sys
+import textwrap
 from unittest.mock import patch
 
 import pytest
@@ -18,6 +20,7 @@ from helion import _compat
 from helion import _hardware
 from helion._compiler.cute.target_facts import B200
 from helion._testing import cpu_render_target
+from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import pairwise
 from helion._testing import patch_target_facts
@@ -122,6 +125,56 @@ def test_patch_target_runtime_versions_leave_unspecified_models_untouched(monkey
         assert (torch.version.cuda, torch.version.hip) == (None, "host-hip")
     with patch_target_facts(hardware=hardware):
         assert (torch.version.cuda, torch.version.hip) == (None, "host-hip")
+
+
+def test_import_path_supports_dataclass_annotations_and_cached_defaults(tmp_path):
+    path = tmp_path / "helper_dataclass.py"
+    name = "helion._testing.helper_dataclass"
+    path.write_text(
+        textwrap.dedent(
+            """
+            from __future__ import annotations
+            from dataclasses import dataclass, fields
+            from typing import ClassVar
+
+            @dataclass(slots=True)
+            class Defaults:
+                marker: ClassVar[int] = 7
+                scale: float = -0.0
+
+            default = Defaults()
+            def call(value=default):
+                return value
+            """
+        )
+    )
+    try:
+        module = import_path(path)
+        assert [field.name for field in module.fields(module.Defaults)] == ["scale"]
+        assert module.call() is module.default
+        assert module.call().scale.hex() == (-0.0).hex()
+        assert import_path(path) is module
+        assert sys.modules[name] is module
+    finally:
+        sys.modules.pop(name, None)
+
+
+def test_import_path_failed_execution_does_not_publish_partial_module(tmp_path):
+    path = tmp_path / "helper_failed_import.py"
+    name = "helion._testing.helper_failed_import"
+    path.write_text(
+        "import sys\n"
+        "published_during_execution = sys.modules[__name__]\n"
+        "raise RuntimeError('failed during execution')\n"
+    )
+    try:
+        with pytest.raises(RuntimeError, match="failed during execution"):
+            import_path(path)
+        assert name not in sys.modules
+        path.write_text("value = 2\n")
+        assert import_path(path).value == 2
+    finally:
+        sys.modules.pop(name, None)
 
 
 def _assert_all_pairs_covered(rows: list[tuple[object, ...]], **axes: tuple) -> None:

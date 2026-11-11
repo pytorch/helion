@@ -3,6 +3,8 @@ from __future__ import annotations
 import ast
 import contextlib
 import dataclasses
+import math
+import struct
 import sys
 import threading
 import typing
@@ -59,6 +61,44 @@ class GlobalImport(NamedTuple):
         if self.alias is not None:
             return f"import {self.module} as {self.alias}"
         return f"import {self.module}"
+
+
+def _torch_literal(value: object) -> str | None:
+    if type(value) is torch.dtype:
+        return str(value)
+    if type(value) is torch.device:
+        return f"torch.device({str(value)!r})"
+    return None
+
+
+def _portable_default_expr(value: object, host: HostFunction) -> ast.expr | None:
+    """Emit captured immutable values, never the user's default-expression AST."""
+    if type(value) is float:
+        return typing.cast(
+            "ast.expr", expr_from_string(host._float_literal_expr(value))
+        )
+    if type(value) in (type(None), bool, int, str, bytes):
+        return ast_extension.create(ast.Constant, value=value)
+    if (literal := _torch_literal(value)) is not None:
+        return typing.cast("ast.expr", expr_from_string(literal))
+    if type(value) is complex:
+        # repr(complex) can lose signed-zero components when parsed as arithmetic.
+        # This built-in conversion uses the captured components, not a user call.
+        return typing.cast(
+            "ast.expr",
+            expr_from_string(
+                "complex({real}, {imag})",
+                real=expr_from_string(host._float_literal_expr(value.real)),
+                imag=expr_from_string(host._float_literal_expr(value.imag)),
+            ),
+        )
+    if type(value) is tuple:
+        parts = [_portable_default_expr(item, host) for item in value]
+        if all(part is not None for part in parts):
+            return ast_extension.create(
+                ast.Tuple, elts=typing.cast("list[ast.expr]", parts), ctx=ast.Load()
+            )
+    return None
 
 
 class SymbolOrigin(NamedTuple):
@@ -326,6 +366,8 @@ class HostFunction:
         return pexpr(expr.xreplace(replacements))
 
     def literal_expr(self, expr: object) -> str:
+        if (literal := _torch_literal(expr)) is not None:
+            return literal
         if isinstance(expr, (torch.SymInt, torch.SymFloat, torch.SymBool)):
             # SymBool's `_sympy_()` is a boolean, not an Expr that sympy_expr wants.
             # pyrefly: ignore [bad-argument-type]
@@ -341,6 +383,31 @@ class HostFunction:
                 return f"({self.literal_expr(expr[0])},)"
             return "(" + ", ".join(self.literal_expr(x) for x in expr) + ")"
         return repr(expr)
+
+    def _float_literal_expr(self, value: float) -> str:
+        if not math.isfinite(value):
+            # repr emits bare nan/inf names; float('nan') also loses its sign
+            # and payload, which are part of the constexpr specialization key.
+            # This is a compiler-owned standard-library import, not a captured
+            # value from the user's module (which standalone export rejects).
+            key = "<float-literal-unpack>"
+            if key not in self.global_imports:
+                code = self.definition.fn.__code__
+                used = {
+                    self.name,
+                    *code.co_varnames,
+                    *code.co_names,
+                    *(item.alias for item in self.global_imports.values()),
+                }
+                alias = "_float_unpack"
+                while alias in used:
+                    alias += "_"
+                self.global_imports[key] = GlobalImport(
+                    struct.unpack, "struct", alias, "unpack"
+                )
+            unpack = self.global_imports[key].alias
+            return f"{unpack}('!d', {struct.pack('!d', value)!r})[0]"
+        return repr(value)
 
     def host_debug_str(self) -> str:
         return print_ast(
@@ -367,24 +434,34 @@ class HostFunction:
         extra_params: list[str] | None = None,
         removed_args: set[str] | None = None,
     ) -> ast.FunctionDef:
-        # Rebuild defaults: Python aligns defaults to the *end* of args,
-        # so removing an arg shifts alignment.
-        if removed_args:
-            old_args = self.args.args
-            old_defaults = self.args.defaults
-            n_no_default = len(old_args) - len(old_defaults)
-            new_defaults = [
-                old_defaults[i - n_no_default]
-                for i, a in enumerate(old_args)
-                if a.arg not in removed_args and i >= n_no_default
-            ]
-        else:
-            new_defaults = self.args.defaults
+        positional = [
+            arg
+            for arg in (*self.args.posonlyargs, *self.args.args)
+            if not removed_args or arg.arg not in removed_args
+        ]
+        # Source defaults have already run in the user's module. Replaying their
+        # AST can call constructors again or refer to names absent from this
+        # generated module. Immutable literal values are portable; compile_config
+        # attaches the original evaluated defaults to its private entrypoint.
+        # Python aligns defaults with the trailing positional parameters.
+        new_defaults = []
+        for arg in positional:
+            default = self.params.signature.parameters[arg.arg].default
+            if (expression := _portable_default_expr(default, self)) is not None:
+                new_defaults.append(expression)
+            else:
+                new_defaults.clear()
+        if extra_params:
+            new_defaults.clear()
 
         # Create a new arguments structure with _launcher kwarg-only parameter
         new_args = ast_extension.create(
             ast.arguments,
-            posonlyargs=self.args.posonlyargs,
+            posonlyargs=[
+                a
+                for a in self.args.posonlyargs
+                if not removed_args or a.arg not in removed_args
+            ],
             args=[
                 *(
                     a
@@ -406,7 +483,7 @@ class HostFunction:
                 ),
             ],
             kw_defaults=[
-                *self.args.kw_defaults,
+                *(None for _ in self.args.kwonlyargs),
                 expr_from_string(
                     CompileEnvironment.current().backend.get_launcher_name()
                 ),

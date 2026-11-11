@@ -349,6 +349,7 @@ def test_provider_traces_measured_failed_and_aliased_configs(
         backend=SimpleNamespace(
             should_deduplicate_generated_sources=lambda spec: deduplicate,
             generated_source_hash=lambda fn: fn.source_hash,
+            classify_autotune_exception=lambda error: None,
         ),
         compiler_seed_timeout_retry_repetitions=None,
     )

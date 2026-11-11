@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from contextlib import redirect_stderr
 import csv
 import dataclasses
+import io
 import itertools
 import json
 import logging
@@ -1774,6 +1776,68 @@ class TestAutotuneIgnoreErrors(TestCase):
         self.assertEqual(results[1].status, "error")
         self.assertEqual(results[2].perf, 1.0)
         self.assertEqual(search._autotune_metrics.num_compile_failures, 1)
+
+    @pytest.mark.cpu_only
+    def test_compile_failure_diagnostics_follow_error_policy(self) -> None:
+        cases = (
+            (
+                torch.cuda.OutOfMemoryError("allocation failed"),
+                False,
+                logging.WARNING,
+                None,
+                False,
+            ),
+            (
+                torch.cuda.OutOfMemoryError("allocation failed"),
+                False,
+                logging.DEBUG,
+                None,
+                True,
+            ),
+            (
+                RuntimeError("PassManager::run failed"),
+                False,
+                logging.WARNING,
+                None,
+                True,
+            ),
+            (RuntimeError("unexpected compiler bug"), True, logging.DEBUG, None, False),
+            (
+                RuntimeError("backend resource limit"),
+                False,
+                logging.WARNING,
+                "debug",
+                False,
+            ),
+        )
+        for error, ignore, level, backend_action, visible in cases:
+            with self.subTest(error=error, ignore=ignore, level=level):
+                output = io.StringIO()
+                with redirect_stderr(output):
+                    search = self._make_search(
+                        Settings(
+                            autotune_precompile=None,
+                            autotune_ignore_errors=ignore,
+                            autotune_log_level=level,
+                        )
+                    )
+                    search.kernel.compile_config = Mock(side_effect=error)
+                    search.kernel.config_spec.backend.classify_autotune_exception = (
+                        Mock(return_value=backend_action)
+                    )
+                    results = search.benchmark_batch(
+                        [helion.Config(block_sizes=[1])],
+                        raise_if_no_viable_config=False,
+                    )
+                self.assertEqual([r.status for r in results], ["error"])
+                self.assertEqual(search._autotune_metrics.num_compile_failures, 1)
+                text = output.getvalue()
+                self.assertEqual(
+                    "Skipping config that failed to compile" in text, visible
+                )
+                self.assertEqual("Traceback (most recent call last):" in text, visible)
+                if visible:
+                    self.assertIn(str(error), text)
 
     def test_initial_compile_failures_raise(self) -> None:
         cases: tuple[tuple[str, type[Exception], str, Exception], ...] = (

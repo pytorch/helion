@@ -211,7 +211,52 @@ def ast_rename(node: _A, renames: dict[str, str]) -> _A:
     return node
 
 
-class _DeleteAssignments(ast.NodeTransformer):
+class _PreserveRequiredSuites(ast.NodeTransformer):
+    def _visit_required_suite(
+        self,
+        node: ast.If
+        | ast.For
+        | ast.AsyncFor
+        | ast.While
+        | ast.With
+        | ast.AsyncWith
+        | ast.FunctionDef
+        | ast.AsyncFunctionDef
+        | ast.ClassDef
+        | ast.Try
+        | ast.ExceptHandler
+        | ast.match_case,
+    ) -> ast.AST:
+        self.generic_visit(node)
+        if not node.body:
+            # Keep the surrounding control flow and its effects when cleanup
+            # removes every statement from a required suite.
+            node.body = [ast.copy_location(ast.Pass(), node)]
+        return node
+
+    visit_If = _visit_required_suite
+    visit_For = _visit_required_suite
+    visit_AsyncFor = _visit_required_suite
+    visit_While = _visit_required_suite
+    visit_With = _visit_required_suite
+    visit_AsyncWith = _visit_required_suite
+    visit_FunctionDef = _visit_required_suite
+    visit_AsyncFunctionDef = _visit_required_suite
+    visit_ClassDef = _visit_required_suite
+    visit_ExceptHandler = _visit_required_suite
+    visit_match_case = _visit_required_suite
+
+    def visit_Try(self, node: ast.Try) -> ast.AST:
+        had_finally = bool(node.finalbody)
+        self._visit_required_suite(node)
+        if (had_finally or not node.handlers) and not node.finalbody:
+            node.finalbody = [ast.copy_location(ast.Pass(), node)]
+        return node
+
+    visit_TryStar = visit_Try
+
+
+class _DeleteAssignments(_PreserveRequiredSuites):
     def __init__(self, to_remove: set[str]) -> None:
         super().__init__()
         self.to_remove = to_remove
@@ -498,7 +543,7 @@ def definitely_does_not_have_side_effects(
         return False
 
 
-class _DeletePureExpressions(ast.NodeTransformer):
+class _DeletePureExpressions(_PreserveRequiredSuites):
     def visit_Expr(self, node: ast.Expr) -> ast.Expr | None:
         if definitely_does_not_have_side_effects(node.value):
             return None

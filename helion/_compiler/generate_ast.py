@@ -1186,8 +1186,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 isinstance(origin, ArgumentOrigin)
                 and origin.name in self.host_function.constexpr_args
             ):
+                value = self.host_function.constexpr_args[origin.name]
                 return expr_from_string(
-                    repr(self.host_function.constexpr_args[origin.name])
+                    self.host_function.literal_expr(value)
+                    if type(value) in (torch.dtype, torch.device)
+                    else repr(value)
                 )
             if origin.needs_rename():
                 # `x` => `_source_module.x`
