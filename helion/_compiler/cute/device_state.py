@@ -329,9 +329,9 @@ class CuteTcgen05StoreValue(_CuteTcgen05OrientationMixin):
     # The partial-output store's staged rows load one tile ahead
     # (``cute_mma``'s ``tcgen05_partial_output_row_lookahead``).
     partial_output_row_lookahead: bool = False
-    # Output element dtype (cutlass type string, e.g. "cutlass.BFloat16")
-    # used when computing the tcgen05 epilogue tile.
-    epi_elem_dtype_str: str = ""
+    # Element dtype the tcgen05 epilogue tile is sized by (the matmul plan's:
+    # the widest output store's); ``None`` sizes it by the store's own dtype.
+    epi_elem_dtype: torch.dtype | None = None
     explicit_epi_tile_m: int | None = None
     explicit_epi_tile_n: int | None = None
     explicit_d_store_box_n: int | None = None

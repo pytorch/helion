@@ -71,11 +71,13 @@ def append_epilogue_tma_wrapper(
         value is not None for value in (epi_tile_m, epi_tile_n, d_store_box_n)
     )
     if epi_tile_raw_expr is not None:
-        # The bm=128 CtaGroup.TWO family threads the device-exact (N-mode
-        # permuted) epilogue-tile expression verbatim so the host TMA-store
-        # atom is built from the same layout the device r2s copy writes
-        # through. The plain ``epi_tile_m/n`` integer keys cannot express
-        # the permutation. See ``tcgen05_two_cta_m128_epilogue_tile_expr``.
+        # The device-exact epilogue-tile expression, threaded verbatim so the
+        # host TMA-store atom is built from the same layout the device r2s
+        # copy writes through: the bm=128 CtaGroup.TWO family's N-mode
+        # permuted tile (which the plain ``epi_tile_m/n`` integer keys cannot
+        # express; see ``tcgen05_two_cta_m128_epilogue_tile_expr``), and the
+        # tile a store narrower than the matmul plan's epilogue dtype walks
+        # (sized by the plan's dtype, not this output's).
         assert not explicit_epi_tile
         epi_tile_expr = epi_tile_raw_expr
     elif explicit_epi_tile:

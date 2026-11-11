@@ -15015,10 +15015,9 @@ class TestCuteLowerings(unittest.TestCase):
     def test_trace_mma_to_store_dtype_multi_store_fan_out_returns_none(
         self,
     ) -> None:
-        """The matmul value feeds two stores with different dtypes: the
-        trace can't pin a unique target and must return ``None`` so the
-        caller falls back and the cross-site assertion is the
-        loud-failure backstop."""
+        """The matmul value feeds two stores with different dtypes: there is
+        no unique target dtype (the plan sizes the epilogue tile by the
+        widest, ``_tcgen05_epilogue_tile_dtype``)."""
         mma_node, graphs = self._build_matmul_store_graphs(
             store_dtypes=[torch.bfloat16, torch.float32],
             cast_dtype=None,

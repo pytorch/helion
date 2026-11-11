@@ -447,10 +447,12 @@ def host_function_tcgen05_rowvec_aux_facts(
     Pre-codegen companion of :func:`host_function_has_tcgen05_aux_kernel_pattern`
     for the autotune seeds: the N-broadcast rows the analyzed stores load, their
     element sizes and whether the store lowering stages them promoted to FP32
-    (:func:`aux_leaf_promoted_by_f32_root`), plus the stored output's element
-    size. Rows are counted per store, as the store lowering allocates them.
-    ``None`` when no store chain was analyzed or the analyzed stores disagree
-    on the output element size.
+    (:func:`aux_leaf_promoted_by_f32_root`), plus the widest stored output's
+    element size, which sizes every store's epilogue subtile
+    (``cute_mma._tcgen05_epilogue_tile_dtype``) and so prices each C ring.
+    Rows are counted per store, as the store lowering allocates them.
+    ``None`` when no store chain was analyzed, or when two matmuls' widest
+    outputs differ (their plans size their subtiles apart).
     """
     graphs = host_function.device_ir.graphs
     if not graphs:
@@ -465,13 +467,12 @@ def host_function_tcgen05_rowvec_aux_facts(
         if analyzed_stores is None:
             continue
         output_count = max(output_count, len(analyzed_stores))
+        matmul_itemsize = 0
         for store_node, chain in analyzed_stores:
             output = _output_tensor_from_store_node(store_node)
-            if output is None or (
-                output_itemsize is not None and output.dtype.itemsize != output_itemsize
-            ):
+            if output is None:
                 return None
-            output_itemsize = output.dtype.itemsize
+            matmul_itemsize = max(matmul_itemsize, output.dtype.itemsize)
             store_itemsizes = tuple(
                 _step_host_tensor(leaf)[1].dtype.itemsize
                 for leaf in chain.auxiliary_tensor_loads
@@ -498,6 +499,9 @@ def host_function_tcgen05_rowvec_aux_facts(
                 rows.append(
                     tcgen05_rowvec_aux_row(chain, leaf, host_val.dtype.itemsize)
                 )
+        if output_itemsize not in (None, matmul_itemsize):
+            return None
+        output_itemsize = matmul_itemsize
     if output_itemsize is None:
         return None
     return Tcgen05RowvecAuxFacts(

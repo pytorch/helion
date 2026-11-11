@@ -301,6 +301,7 @@
  "test/test_cute_tcgen05_fixed_cost.py": 21.0,
  "test/test_cute_tcgen05_flat_edge_gpu.py": 14.8,
  "test/test_cute_tcgen05_loop_orders.py": 6.7,
+ "test/test_cute_tcgen05_mixed_stores_gpu.py": 4.2,
  "test/test_cute_tcgen05_persistent_residual.py": 0.6,
  "test/test_cute_tcgen05_seed_flag_ordering.py": 0.9,
  "test/test_cute_tcgen05_split_k.py": 11.6,
