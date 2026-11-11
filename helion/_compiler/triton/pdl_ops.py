@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from ...language import _decorators
+from ...language.pdl_ops import code_warm
 from ...language.pdl_ops import pdl_launch_dependents
 from ...language.pdl_ops import pdl_wait
 from ..ast_extension import expr_from_string
@@ -20,3 +21,4 @@ def _host_noop(state: CodegenState) -> object:
 
 _decorators.codegen(pdl_wait, "triton")(_host_noop)
 _decorators.codegen(pdl_launch_dependents, "triton")(_host_noop)
+_decorators.codegen(code_warm, "triton")(_host_noop)

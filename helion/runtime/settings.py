@@ -721,7 +721,8 @@ class Settings(_Settings):
 
     __slots__ = {
         "backend": (
-            "Code generation backend. One of 'triton' (default), 'pallas' (JAX/Pallas), "
+            "Code generation backend. One of 'triton' (default), 'gluon' (Triton's "
+            "lowering compiled as Gluon), 'pallas' (JAX/Pallas), "
             "'cute' (CUTLASS CuTe DSL), or 'metal' (Apple Metal MSL). "
             "Set HELION_BACKEND=<backend> to override."
         ),

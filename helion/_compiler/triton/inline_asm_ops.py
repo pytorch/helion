@@ -37,7 +37,7 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     raw_args = state.ast_args[2]
     if isinstance(raw_args, list):
         # Create AST List node with the tensor elements
-        args_ast = create(ast.List, elts=raw_args, ctx=ast.Load())
+        args_ast = create(ast.List, elts=list(raw_args), ctx=ast.Load())
     else:
         # If it's not a list, wrap it in a list (shouldn't normally happen)
         args_ast = raw_args

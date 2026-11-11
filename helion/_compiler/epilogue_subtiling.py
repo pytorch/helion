@@ -126,7 +126,7 @@ def _iter_eligible_epilogue_chains(
             continue
         if output_node.target is atomic_add and output_node.users:
             continue
-        if output_node.target is atomic_add and env.backend_name != "triton":
+        if output_node.target is atomic_add and not env.backend.uses_triton_compiler:
             continue
 
         value_node = output_node.args[2]

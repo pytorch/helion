@@ -584,7 +584,7 @@ def _get_disable_reason(config_spec: ConfigSpec, key: str) -> str:
         if key in ("num_warps", "num_stages"):
             return "Pallas backend (handled by XLA)"
 
-    elif backend_name == "triton":
+    elif config_spec.backend.uses_triton_compiler:
         if key == "pallas_loop_type":
             return "Triton backend (no Pallas loops)"
         if key == "pallas_pre_broadcast":

@@ -99,6 +99,7 @@ if TYPE_CHECKING:
 
     from ..autotuner.config_spec import AccumulatorFact
     from ..autotuner.config_spec import MemoryOpFact
+    from .backend import Backend
     from .cute.execution_plans import CuTeGridExecutionPlan
     from .device_function import DeviceFunction
     from .device_ir_analysis import DeviceIRAnalysis
@@ -3210,14 +3211,14 @@ _FAST_MATH_SENSITIVE_TRITON_TARGETS: dict[object, str] = {
 }
 
 
-def fast_math_sensitive_ops(device_ir: DeviceIR, backend: str) -> list[str]:
+def fast_math_sensitive_ops(device_ir: DeviceIR, backend: Backend) -> list[str]:
     """Names of the floating-point operations in ``device_ir`` that the
     ``fast_math`` setting would lower to approximate forms on ``backend``,
     sorted."""
     from .inductor_lowering import _is_plain_true_division
 
     targets = dict(_FAST_MATH_SENSITIVE_TARGETS)
-    if backend == "triton":
+    if backend.uses_triton_compiler:
         targets.update(_FAST_MATH_SENSITIVE_TRITON_TARGETS)
     names: set[str] = set()
     for graph_info in device_ir.graphs:
@@ -3241,7 +3242,7 @@ def warn_fast_math_unused(device_ir: DeviceIR) -> None:
     env = CompileEnvironment.current()
     if env.settings.fast_math or not env.backend.warns_fast_math_unused:
         return
-    ops = fast_math_sensitive_ops(device_ir, env.backend.name)
+    ops = fast_math_sensitive_ops(device_ir, env.backend)
     if ops:
         warning(exc.FastMathUnused(", ".join(ops)))
 
@@ -3397,16 +3398,17 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         if len(device_ir.task_families) > 1 and not env.backend.roots_fissioned(env):
             # Ranks check that they agree at the first launch, not here.
             group_name = env.process_group_name
+            group = (
+                _dist_utils._resolve_process_group(group_name)
+                if group_name is not None
+                else None
+            )
             device_ir.tile_dependency_graph = build_tile_dependency_graph(
                 tile_accesses,
                 device_ir=device_ir,
                 root_phases=source_root_phases,
                 world_size=(
-                    torch.distributed.get_world_size(
-                        _dist_utils._resolve_process_group(group_name)
-                    )
-                    if group_name is not None
-                    else 1
+                    torch.distributed.get_world_size(group) if group is not None else 1
                 ),
             )
             cross_rank = device_ir.tile_dependency_graph.crosses_ranks()
@@ -3435,15 +3437,18 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 )
                 env.require_persistent_blocked(reason)
                 # Peer transports order static and dynamic schedules alike; only
-                # static ones mark guard-skipped tasks for inband scatters.
+                # static ones, and dynamic ones with a gluon ring's claimed roots
+                # (ConfigSpec.normalize checks the config), mark guard-skipped
+                # tasks for inband scatters.
                 graph = device_ir.tile_dependency_graph
+                config_spec.inband_scatter = any(
+                    graph.scatter_position(allocation_id) is not None
+                    for allocation_id in graph.inband_allocation_ids
+                )
                 allowed = (
                     ("static", "dynamic") if cross_rank else VALID_CROSS_LOOP_PIPELINES
                 )
-                if any(
-                    graph.scatter_position(allocation_id) is not None
-                    for allocation_id in graph.inband_allocation_ids
-                ):
+                if config_spec.inband_scatter and env.backend_name != "gluon":
                     allowed = ("static",)
                 choices = tuple(
                     pipeline

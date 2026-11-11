@@ -1381,7 +1381,10 @@ class TestLayoutProvenance(unittest.TestCase):
             self.assertIsInstance(literal, StaticShape)
             self.assertEqual(literal.name, "1")
 
-            host = SimpleNamespace(params=SimpleNamespace(arguments={"x": fake_input}))
+            host = SimpleNamespace(
+                params=SimpleNamespace(arguments={"x": fake_input}),
+                compiler_state=SimpleNamespace(static_peer_layouts=()),
+            )
             with patch(
                 "helion._compiler.host_function.HostFunction.current",
                 return_value=host,

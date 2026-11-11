@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import contextvars
 import math
+from typing import cast
 import weakref
 
 import torch
@@ -185,6 +186,7 @@ def default_launcher(
     ] = (),
     _persistent_state_process_group_name: str | None = None,
     _persistent_state_rank_digest: str | None = None,
+    _persistent_state_rank_shares: tuple[int, ...] = (),
     _minimum_resident_programs: int = 0,
     ptx_options: str | None = None,
     launch_cooperative_grid: bool = False,
@@ -263,6 +265,7 @@ def default_launcher(
                     dtype,
                     symmetric=symmetric,
                     process_group_name=_persistent_state_process_group_name,
+                    shares=_persistent_state_rank_shares,
                 )
             args = (*args, *state_args)
     # For both CUDA and MTIA, use the same kernel execution.
@@ -287,7 +290,6 @@ def default_launcher(
         _validate_resident_program_capacity(
             compiled_kernel,
             args,
-            num_warps=num_warps,
             required_programs=_minimum_resident_programs,
         )
     return triton_kernel.run(  # type: ignore[union-attr]
@@ -321,7 +323,10 @@ def compile_only_launch_args(
     kwargs = {name: value for name, value in kwargs.items() if not name.startswith("_")}
     if not dtypes:
         return args, kwargs
-    device = next(arg.device for arg in args if isinstance(arg, torch.Tensor))
+    # The specs' tensors name the device when every argument is a descriptor.
+    likes = [like for like, _ in _remote_copy_scratch_specs]
+    likes += [like for like, *_ in _persistent_state_specs]
+    device = next(t.device for t in (*args, *likes) if isinstance(t, torch.Tensor))
     placeholders = [torch.empty(0, dtype=dtype, device=device) for dtype in dtypes]
     return (*args, *placeholders), kwargs
 
@@ -453,6 +458,7 @@ def _get_process_group_state(
     *,
     symmetric: bool,
     process_group_name: str,
+    shares: tuple[int, ...] = (),
 ) -> tuple[object, ...]:
     """Return the kernel arguments of retained state shared by every stream.
 
@@ -485,6 +491,7 @@ def _get_process_group_state(
                 required_numel,
                 dtype,
                 process_group_name,
+                shares,
             )
         else:
             entry = (torch.zeros(required_numel, dtype=dtype, device=like.device),)
@@ -498,11 +505,13 @@ def _new_symmetric_state(
     numel: int,
     dtype: torch.dtype,
     process_group_name: str,
+    shares: tuple[int, ...] = (),
 ) -> tuple[torch.Tensor, torch.Tensor, object]:
     """Allocate zeroed symmetric state once every rank agrees on the launch.
 
-    Returns the state, its per-rank base pointer table followed by this rank,
-    and the owning handle.
+    ``shares``: the share of each tagged tensor this rank pushes; the ranks'
+    shares must cover each tensor once.  Returns the state, its per-rank base
+    pointer table followed by this rank, and the owning handle.
     """
     import torch.distributed as dist
     import torch.distributed._symmetric_memory as symm_mem
@@ -513,13 +522,24 @@ def _new_symmetric_state(
     )
     with torch.cuda.device(device):
         fingerprint = (*fingerprint, torch.cuda.get_device_capability(device))
-        fingerprints: list[object] = [None] * dist.get_world_size(group)
-        dist.all_gather_object(fingerprints, fingerprint, group=group)
+        world = dist.get_world_size(group)
+        gathered: list[object] = [None] * world
+        dist.all_gather_object(gathered, (fingerprint, shares), group=group)
+        entries = cast("list[tuple[object, tuple[int, ...]]]", gathered)
+        fingerprints = [entry[0] for entry in entries]
         if any(other != fingerprint for other in fingerprints):
             raise RuntimeError(
                 "Helion distributed kernels require the same launch on every "
                 f"rank; got {fingerprints!r}"
             )
+        for index in range(len(shares)):
+            pushed = [entry[1][index] for entry in entries]
+            if sorted(pushed) != list(range(world)):
+                raise RuntimeError(
+                    "Helion tagged peer transport needs each rank to push its own "
+                    f"share of a tensor; the ranks push shares {pushed}, so some "
+                    "ranks write the same part of every rank's copy."
+                )
         state = symm_mem.empty(numel, dtype=dtype, device=device)
         state.zero_()
         # Zero before rendezvous, since peers may publish right after it.
@@ -538,7 +558,6 @@ def _validate_resident_program_capacity(
     compiled_kernel: object,
     args: tuple[object, ...],
     *,
-    num_warps: int,
     required_programs: int,
 ) -> None:
     """Reject a polling schedule whose required CTA cohort cannot be resident."""
@@ -558,9 +577,12 @@ def _validate_resident_program_capacity(
     function = getattr(compiled_kernel, "function", None)
     metadata = getattr(compiled_kernel, "metadata", None)
     shared = getattr(metadata, "shared", None)
-    if function is None or not isinstance(shared, int):
+    if function is None or metadata is None or not isinstance(shared, int):
         raise RuntimeError("unable to query cross-loop kernel occupancy")
 
+    # The compiled warp count (a warp-specialized kernel's includes its
+    # partitions').
+    num_warps = metadata.num_warps
     device = tensor.device
     cache = vars(compiled_kernel).setdefault(
         "_helion_resident_program_capacity_cache", {}

@@ -250,7 +250,9 @@ class Config(Mapping[str, object]):
                 grid synchronization. ``"static"`` and ``"dynamic"`` (Triton
                 only) execute the same compiler-derived dependency schedule
                 with fixed worker ownership or one-shot packet dispatch,
-                respectively. Unsupported kernels reject this field.
+                respectively (under the gluon ring, dynamic workers claim the
+                tasks of a data-dependent task count past a fixed first wave).
+                Unsupported kernels reject this field.
             num_sm_multiplier: Positive integer multiplier for the number of SMs
                 in persistent kernels. The autotuner searches powers of two, but
                 explicit configurations may use intermediate values.

@@ -542,6 +542,13 @@ class CompileEnvironment:
             f"helion_runtime_arg_values_{id(self)}",
             default=None,
         )
+        # Set while ``generate_ast`` regenerates a kernel whose tagged peer
+        # transport failed a late precondition (``TaggedPeerFallback``):
+        # its cross-rank pushes keep keyed peer counters.
+        self.tagged_peer_disabled: bool = False
+        # Set while ``generate_ast`` regenerates a kernel whose gluon ring the
+        # lowering rejected (``RingFallback``).
+        self.ring_disabled: bool = False
         # Host integer helpers such as cdiv/next_power_of_2 deliberately return
         # unbacked SymInts during tracing. Preserve the config expression beside
         # that symbol so a fixed block size derived from a user tunable can still
@@ -659,6 +666,8 @@ class CompileEnvironment:
         # hl.pdl_* ops in source order, run at kernel entry or exit.
         self.pdl_entry: list[str] = []
         self.pdl_exit: list[str] = []
+        # hl.code_warm(): the kernel L2-warms its native code at entry.
+        self.code_warm: bool = False
 
     def _disallow_nonpersistent_pid_types(self, reason: str | None = None) -> None:
         """Restrict the search space to persistent kernels. Idempotent."""
@@ -803,7 +812,7 @@ class CompileEnvironment:
         # specialization.
         alignment_source = (
             self.tensor_descriptor_alignment_source(fake_tensor)
-            if self.backend_name == "triton" and self.device.type in ("cuda", "xpu")
+            if self.backend.uses_triton_compiler and self.device.type in ("cuda", "xpu")
             else None
         )
         if alignment_source is not None:
@@ -912,18 +921,19 @@ class CompileEnvironment:
         """The input whose runtime base ``fake_tensor`` starts a fixed number of bytes past.
 
         A direct input is its own owner at offset zero.  A statically exact
-        view of the storage of exactly one zero-offset input starts
-        ``storage_offset * element_size`` bytes past that input's base, so
-        its base residue follows from the owner's bound residue and the
-        static offset.  Layout legality remains a separate proof.
+        view of the storage of exactly one owner input starts the difference
+        of their byte storage offsets past that input's base, so its base
+        residue follows from the owner's bound residue whenever that
+        difference is a constant (with dynamic shapes, both offsets may carry
+        the input's symbolic storage offset).  The input at the storage's
+        start owns the views when there is one.  Layout legality remains a
+        separate proof.
         """
         source = self.tensor_input_source(fake_tensor)
         if source is not None and _is_supported_tensor_input_source(source):
             return source, 0
-        storage_offset = fake_tensor.storage_offset()
         if (
-            not isinstance(storage_offset, int)
-            or not (
+            not (
                 self.settings.static_shapes
                 or self.tensor_layout_is_symbolically_exact(fake_tensor)
             )
@@ -932,20 +942,36 @@ class CompileEnvironment:
         ):
             return None
 
-        def is_zero_offset(tensor: torch.Tensor) -> bool:
+        def byte_offset(tensor: torch.Tensor) -> sympy.Expr:
+            offset = tensor.storage_offset()
+            expr = (
+                offset._sympy_()
+                if isinstance(offset, torch.SymInt)
+                else sympy.Integer(offset)
+            )
+            return sympy.Mul(expr, tensor.element_size())
+
+        def at_storage_start(tensor: torch.Tensor) -> bool:
             offset = tensor.storage_offset()
             return isinstance(offset, int) and offset == 0
 
-        owners = tuple(
-            (tensor, candidate)
+        owners = [
+            (candidate, delta, at_storage_start(tensor))
             for tensor, candidate in self._tensor_input_storage_owners(fake_tensor)
-            if is_zero_offset(tensor)
+            if (
+                # pyrefly: ignore [unsupported-operation]
+                delta := sympy.expand(byte_offset(fake_tensor) - byte_offset(tensor))
+            ).is_Integer
             and _is_supported_tensor_input_source(candidate)
             and id(tensor) not in self._ambiguous_tensor_input_source_ids
-        )
+        ]
+        # The input at the start of the storage owns its views when there is
+        # one; with symbolic offsets (dynamic shapes), the one at a constant
+        # distance does.
+        owners = [owner for owner in owners if owner[2]] or owners
         if len(owners) != 1:
             return None
-        return owners[0][1], storage_offset * fake_tensor.element_size()
+        return owners[0][0], int(owners[0][1])
 
     def tensor_descriptor_alignment_source(
         self, fake_tensor: torch.Tensor
@@ -2203,7 +2229,7 @@ class CompileEnvironment:
     @property
     def ptx_capability(self) -> tuple[int, int] | None:
         """Compute capability when the kernel lowers to NVIDIA PTX, else None."""
-        if self.backend_name != "triton" or is_hip():
+        if not self.backend.uses_triton_compiler or is_hip():
             return None
         return self.config_spec.target_device_capability
 
@@ -2617,10 +2643,21 @@ class LoopSpecBlockSizeSource(BlockSizeSource):
     def from_config(self, config: Config, block_size_info: BlockSizeInfo) -> int:
         env = CompileEnvironment.current()
         size = block_size_info.size
-        if isinstance(size, (int, torch.SymInt)) and env.known_equal(size, 1):
+        specs = env.config_spec.block_sizes
+        block_id = block_size_info.block_id
+        # A size-1 dimension tiles by 1 unless the backend's tiles may exceed
+        # it and its block may overshoot (a matmul output dimension).
+        if (
+            isinstance(size, (int, torch.SymInt))
+            and env.known_equal(size, 1)
+            and (
+                not env.backend.tiles_exceed_extents
+                or block_id not in specs.valid_block_ids()
+                or specs.block_id_lookup(block_id).max_size <= 1
+            )
+        ):
             return 1
-        index = env.config_spec.block_sizes.block_id_to_index(block_size_info.block_id)
-        return config.block_sizes[index]
+        return config.block_sizes[specs.block_id_to_index(block_id)]
 
 
 @dataclasses.dataclass

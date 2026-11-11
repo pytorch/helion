@@ -407,11 +407,15 @@ class TestCrossLoopScheduler(TestCase):
         )
         static = _plan(roots, 4, barriers=frozenset(((0, 1),)))
         dynamic = dataclasses.replace(static, dispatch_mode="dynamic")
+        claimed = dataclasses.replace(static, dispatch_mode="claimed")
 
         self.assertEqual(static.execution_orders, dynamic.execution_orders)
         self.assertEqual(static.readiness_counters, dynamic.readiness_counters)
         self.assertEqual(static.root_barrier_arrival_count(0), 4)
         self.assertEqual(dynamic.root_barrier_arrival_count(0), 5)
+        # Claiming workers still publish once each, after their task loop.
+        self.assertEqual(claimed.root_barrier_arrival_count(0), 4)
+        self.assertEqual(claimed.deferred_peer_releases(frozenset({1})), {})
         with self.assertRaisesRegex(ValueError, "invalid cross-loop dispatch mode"):
             dataclasses.replace(static, dispatch_mode=cast("Any", "invalid"))
 
@@ -426,6 +430,7 @@ class TestCrossLoopScheduler(TestCase):
         graph = ReadinessGraph((root,), (event,))
         static = _plan((root,), 1, counters=(counter,))
         dynamic = dataclasses.replace(static, dispatch_mode="dynamic")
+        claimed = dataclasses.replace(static, dispatch_mode="claimed")
 
         def is_safe(plan: StaticPipelinePlan) -> bool:
             return cross_loop_scheduler._schedule_is_progress_safe(
@@ -439,6 +444,7 @@ class TestCrossLoopScheduler(TestCase):
 
         self.assertTrue(is_safe(static))
         self.assertFalse(is_safe(dynamic))
+        self.assertFalse(is_safe(claimed))
 
     def test_static_geometry_uses_all_root_padded_prefixes(self) -> None:
         roots = tuple(

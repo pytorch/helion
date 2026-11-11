@@ -455,6 +455,32 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         self.assertEqual(code.count("_helion_tensor_descriptor("), 1)
 
     @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
+    def test_host_tensor_descriptor_contiguous_index_reduction_operand(self):
+        # A reduction relies on the load's masked lanes reading 0, which TMA's
+        # zero fill keeps.
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def row_sums(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+            for row in hl.tile(x.size(0), block_size=1):
+                acc = hl.zeros([32], dtype=torch.float32)
+                for tile_k in hl.tile(x.size(1) // 32, block_size=1):
+                    index = tile_k.begin * 32 + hl.arange(32)
+                    acc = acc + x[row.begin, index]
+                out[row.begin] = acc.sum(0)
+            return out
+
+        x = torch.randn([4, 128], device=DEVICE)
+        code, result = code_and_output(
+            row_sums,
+            (x,),
+            indexing=["tensor_descriptor", "pointer"],
+            host_tensor_descriptors=True,
+        )
+
+        torch.testing.assert_close(result, x.sum(1), rtol=1e-4, atol=1e-4)
+        self.assertEqual(code.count("_helion_tensor_descriptor("), 1)
+
+    @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
     def test_host_tensor_descriptor_non_power_of_two_index_falls_back(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
         def copy_scaled_tiles(x: torch.Tensor) -> torch.Tensor:
@@ -595,6 +621,42 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
             pointer_copy_view(unaligned), unaligned.view(16, 128)
         )
         self.assertIs(pointer_bound, pointer_copy_view.bind((unaligned,)))
+
+    @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
+    @skipIfRefEager("Test checks bound kernel specialization cache")
+    def test_host_tensor_descriptor_view_alignment_dynamic_shapes(self):
+        # With dynamic shapes the input's storage offset stays symbolic; a view
+        # at that same offset still starts at the input's guarded base.
+        @helion.kernel(
+            autotune_effort="none",
+            static_shapes=False,
+            config=helion.Config(
+                block_sizes=[16, 16],
+                indexing="tensor_descriptor",
+                host_tensor_descriptors=True,
+            ),
+        )
+        def copy_view(x: torch.Tensor) -> torch.Tensor:
+            hl.specialize(x.size())
+            hl.specialize(x.stride())
+            view = x.view(16, 128)
+            out = torch.empty_like(view)
+            for tile in hl.tile(view.size()):
+                out[tile] = view[tile]
+            return out
+
+        aligned = torch.randn([32, 64], device=DEVICE)
+        storage = torch.randn(32 * 64 + 1, device=DEVICE)
+        unaligned = storage[1:].view(32, 64)
+
+        aligned_code, aligned_result = code_and_output(copy_view, (aligned,))
+        torch.testing.assert_close(aligned_result, aligned.view(16, 128))
+        self.assertIn("_helion_tensor_descriptor(view", aligned_code)
+
+        unaligned_code, unaligned_result = code_and_output(copy_view, (unaligned,))
+        torch.testing.assert_close(unaligned_result, unaligned.view(16, 128))
+        self.assertNotIn("_helion_tensor_descriptor(view", unaligned_code)
+        self.assertIsNot(copy_view.bind((aligned,)), copy_view.bind((unaligned,)))
 
     @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
     @skipIfRefEager("Test checks keyed dispatch specialization")
@@ -787,6 +849,32 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         # Should contain both tensor descriptor and permute operations
         self.assertIn(get_tensor_descriptor_fn_name(), code)
         self.assertIn("tl.permute", code)
+
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    def test_permuted_view_leading_batch_dim(self):
+        """A permuted view's leading descriptor dim (block 1) lies outside the
+        box's tile dims, so it needs no 16-byte extent."""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel_split_rows(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            rows, splits, width = out.size(1), out.size(0), x.size(1) // out.size(0)
+            # (split, row, column) view of (row, split * width).
+            xs = x.view(rows, splits, width).permute(1, 0, 2)
+            for tile_s, tile_r, tile_c in hl.tile([splits, rows, width]):
+                out[tile_s, tile_r, tile_c] = xs[tile_s, tile_r, tile_c] * 2
+            return out
+
+        x = torch.randn([16, 512], device=DEVICE, dtype=HALF_DTYPE)
+        out = torch.empty([2, 16, 256], device=DEVICE, dtype=HALF_DTYPE)
+        code, result = code_and_output(
+            kernel_split_rows,
+            (x, out),
+            indexing="tensor_descriptor",
+            block_sizes=[1, 16, 64],
+        )
+        torch.testing.assert_close(result, x.view(16, 2, 256).permute(1, 0, 2) * 2)
+        self.assertIn(get_tensor_descriptor_fn_name(), code)
+        self.assertNotIn("tl.load(", code)
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_matrix_transpose_case(self):

@@ -41,6 +41,7 @@ from .._compat import get_tensor_descriptor_fn_name
 from .._compat import requires_torch_version
 from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_block_ptr
+from .._compat import supports_gluon
 from .._compat import supports_host_tensor_descriptor
 from .._compat import supports_tensor_descriptor
 from .._compat import target_device_capability
@@ -973,6 +974,13 @@ def skipIfA10G(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running on A10G GPU."""
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
     return skipIfFn(lambda: "A10G" in get_nvidia_gpu_model(), reason=reason)
+
+
+def skipUnlessGluon(
+    reason: str = "the gluon backend needs CUDA sm_100 and Triton >= 3.8",
+) -> Callable[[Callable], Callable]:
+    """Skip unless the gluon backend can run here (``supports_gluon``)."""
+    return skipIfFn(lambda: not supports_gluon(), reason)
 
 
 def skipIfNotCUDA() -> Callable[[Callable], Callable]:

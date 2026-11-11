@@ -56,12 +56,15 @@ if TYPE_CHECKING:
     from .cross_loop_codegen import PeerState
     from .cute.bounded_cache_codegen import BoundedCacheRequest
     from .cute.device_state import CuteDeviceFunctionState
+    from .device_ir import GraphInfo
     from .device_ir import HelperFunctionGraphInfo
     from .generate_ast import GenerateAST
     from .indexing_strategy import IndexingStrategy
     from .program_id import ProgramIDs
+    from .tile_dependency import TileDependencyGraph
     from .tile_dispatch import TileStrategyDispatch
     from .triton.distributed_ops import InbandPoll
+    from .triton.gluon_ring import RingLowering
     from helion._compiler.pallas.dma import DmaResources
     from helion._compiler.pallas.ordered_carry import CarryBoundaryTile
     from helion._compiler.pallas.ordered_carry import CarryScratchKey
@@ -75,6 +78,13 @@ if TYPE_CHECKING:
 
 
 tls: _TLS = cast("_TLS", threading.local())
+
+
+class RingFallback(exc.Base):
+    """The gluon ring cannot lower this kernel: regenerate it without the ring."""
+
+    def report(self) -> str:
+        return f"gluon ring fallback: {self}"
 
 
 def _exact_thread_block_dims(
@@ -281,6 +291,30 @@ _sort_order: dict[type[Argument], int] = {
 
 
 @dataclasses.dataclass
+class SyncRole:
+    """A scheduler synchronization statement, by the name it assigns: what later
+    lowerings (the ring's partition slicer) keep, drop or rewrite."""
+
+    # wait: dependency waits (spins, their syncs and fences); release:
+    # publications (pushes, their syncs and drains), which order no later load;
+    # launch: per-launch state read at entry and rewritten at exit; claim: a
+    # claimed task loop's claim; poll: in-band mailbox reads and their vote,
+    # which order only the reads of the mailbox they return.
+    kind: str
+    # A wait's covered obligations: the allocations whose reads it orders
+    # (None: every read).
+    covers: frozenset[int] | None = None
+    # A covering wait that also orders its root's barrier publication (whose
+    # waiters rely on it transitively): the publishing partition keeps it.
+    publication: bool = False
+    # A zero-valued wait token feeding task PIDs.
+    zero: bool = False
+    # The wait as a one-warp partition runs it, free of the body's tensor
+    # layouts (None: as emitted).
+    scalar: ast.stmt | None = None
+
+
+@dataclasses.dataclass
 class ScratchArg:
     """A scratch memory buffer allocated in device memory (e.g., VMEM on TPU).
 
@@ -324,7 +358,7 @@ def _selects_tma_access(config: Config) -> bool:
     env = CompileEnvironment.current()
     capability = env.config_spec.target_device_capability
     if (
-        env.backend_name != "triton"
+        not env.backend.uses_triton_compiler
         or env.device.type != "cuda"
         or is_hip()
         or capability is None
@@ -357,7 +391,7 @@ class DeviceFunction:
         self.body: list[ast.AST] = []
         self._tensor_args: dict[torch.Tensor, TensorArg] = {}
         self._tensor_descriptor_args: dict[
-            tuple[torch.Tensor, str], TensorDescriptorArg
+            tuple[torch.Tensor, str, bool | None], TensorDescriptorArg
         ] = {}
         self._expr_args: dict[sympy.Expr, NumericArgument] = {}
         self._constexpr_exprs: set[sympy.Expr] = set()
@@ -469,6 +503,10 @@ class DeviceFunction:
         self.inband_polls: list[InbandPoll] = []
         self.inband_access_ids: set[int] = set()
         self.inband_scatter_done: dict[int, str] = {}
+        # Tagged peer transport (cross_loop_codegen): the allocations this config
+        # sends as tagged words and the graph whose transport says so.
+        self.tagged_allocation_ids: frozenset[int] | None = None
+        self.codegen_dependency_graph: TileDependencyGraph | None = None
         # Cross-grid polling is safe in isolation only when the required worker
         # cohort can reside together. The launcher validates exact compiled
         # occupancy, but does not reserve capacity against concurrent streams.
@@ -480,6 +518,20 @@ class DeviceFunction:
             tuple[str, tuple[str, ...], tuple[ast.stmt, ...], bool]
         ] = []
         self.triton_outlined_helper_constexprs: dict[str, int] = {}
+        # The scheduler's synchronization statements, by the names they assign.
+        self.sync_roles: dict[str, SyncRole] = {}
+        # The scheduler's end-of-launch rewrites of the launch state it reads
+        # (the "launch" sync roles), in program order.
+        self.launch_writes: list[ast.stmt] = []
+        self.ring: RingLowering | None = None
+        env = CompileEnvironment.current()
+        if env.backend_name == "gluon" and not env.ring_disabled:
+            # Gluon requires Triton >= 3.8: import only on the gluon backend.
+            from ..autotuner.config_spec import ring_depth
+            from .triton.gluon_ring import RingLowering
+
+            if ring_depth(config, env.backend_name):
+                self.ring = RingLowering(self)
         # FlyDSL: (tensor_name, is_vec, is_rolled_col) → loop-invariant buffer/
         # div/copy-atom setup, memoized per generated function so load and store
         # reuse the same lifted AST vars.
@@ -944,14 +996,24 @@ class DeviceFunction:
             self.dce_vars.append(name)
         return name
 
-    def _thread_asm(self, prefix: str, asm: str) -> ast.stmt:
+    def _thread_asm(self, prefix: str, asm: str, kind: str) -> ast.stmt:
         var = self.new_var(prefix, dce=False)
-        return statement_from_string(
-            f"{var} = tl.inline_asm_elementwise("
-            f"asm='{asm} mov.u32 $0, $1;', "
-            "constraints='=r,r', args=[tl.arange(0, 32)], "
-            "dtype=tl.uint32, is_pure=False, pack=1)"
+        statement = (
+            f"{var} = tl.inline_asm_elementwise(asm='{asm} mov.u32 $0, $1;', "
+            "constraints='=r,r', args=[VEHICLE], dtype=tl.uint32, is_pure=False, "
+            "pack=1)"
         )
+        scalar = statement.replace("VEHICLE", "tl.full([], 0, tl.int32)")
+        self.sync_roles[var] = SyncRole(kind, scalar=statement_from_string(scalar))
+        return statement_from_string(statement.replace("VEHICLE", "tl.arange(0, 32)"))
+
+    def sync_names(self, *kinds: str) -> set[str]:
+        return {name for name, role in self.sync_roles.items() if role.kind in kinds}
+
+    def graph_infos(self) -> list[GraphInfo]:
+        """This config's codegen graph copies, then the traced originals (a copy's
+        ``placeholder_to_outer_arg`` returns nodes of the originals)."""
+        return [*self.codegen.codegen_graphs, *HostFunction.current().device_ir.graphs]
 
     def async_store_drain(self) -> list[ast.stmt]:
         """Complete this thread's TMA global writes before a cross-thread sync."""
@@ -960,18 +1022,20 @@ class DeviceFunction:
         self._async_store_drained = True
         self._check_async_store_drain()
         # wait_group.read (emitted per TMA store) only frees the smem source.
-        return [
-            self._thread_asm(
-                "async_store_drain",
-                "cp.async.bulk.wait_group 0; fence.proxy.async.global;",
-            )
-        ]
+        drain = self._thread_asm(
+            "async_store_drain",
+            "cp.async.bulk.wait_group 0; fence.proxy.async.global;",
+            "release",
+        )
+        return [drain]
 
     def async_load_fence(self) -> list[ast.stmt]:
         """Order a completed acquire before later TMA global reads or writes."""
         if not self.uses_async_proxy_global:
             return []
-        return [self._thread_asm("async_load_fence", "fence.proxy.async.global;")]
+        return [
+            self._thread_asm("async_load_fence", "fence.proxy.async.global;", "wait")
+        ]
 
     def cta_barrier(self, barrier: str = "tl.debug_barrier()") -> list[ast.stmt]:
         """A barrier that also orders TMA global accesses across threads."""
@@ -1010,14 +1074,27 @@ class DeviceFunction:
         return self._tensor_args[fake_value]
 
     def tensor_descriptor_arg(
-        self, fake_value: torch.Tensor, block_size: list[int | torch.SymInt]
+        self,
+        fake_value: torch.Tensor,
+        block_size: list[int | torch.SymInt],
+        *,
+        ring_swizzle: bool | None = None,
     ) -> TensorDescriptorArg:
+        """``ring_swizzle`` set: a Gluon host descriptor filling the ring's
+        slots (``gluon_ring.ring_descriptor``), swizzled unless it holds scales."""
         host_function = HostFunction.current()
         block_size_expr = ", ".join(map(self.literal_expr, block_size))
-        key = (fake_value, block_size_expr)
+        # A gluon plain descriptor is the ring's swizzled one: one per box (an
+        # unswizzled scale slot keeps its own).
+        gluon = CompileEnvironment.current().backend_name == "gluon"
+        swizzle = True if gluon and ring_swizzle is None else ring_swizzle
+        key = (fake_value, block_size_expr, swizzle)
         if key not in self._tensor_descriptor_args:
             origin = host_function.tensor_to_origin[fake_value]
-            desc_name = self.new_var(origin.suggest_var_name() + "_desc")
+            desc_name = self.new_var(
+                origin.suggest_var_name()
+                + ("_desc" if ring_swizzle is None else "_ring_desc")
+            )
             env = CompileEnvironment.current()
 
             # Find which dimension has stride==1
@@ -1044,7 +1121,9 @@ class DeviceFunction:
                 permutation if permutation is not None else [*range(fake_value.ndim)]
             )
             assert descriptor_dims[-1] == stride_one_dim
-            if self.config.host_tensor_descriptors:
+            if CompileEnvironment.current().backend.host_tensor_descriptors(
+                self.config
+            ):
                 tensor_host = origin.host_str()
                 tensor_base = env.backend.tensor_descriptor_host_base(
                     fake_value, tensor_host
@@ -1061,11 +1140,17 @@ class DeviceFunction:
                 # a launch-time descriptor.
                 strides[-1] = "1"
                 host_block_size = ", ".join(map(host_function.literal_expr, block_size))
+                descriptor = (
+                    "_helion_tensor_descriptor("
+                    if ring_swizzle is None
+                    else "_helion_ring.ring_descriptor("
+                )
+                ring_layout = "" if ring_swizzle is None else f", {ring_swizzle}"
                 arg = TensorDescriptorArg(
                     desc_name,
                     fake_value,
-                    f"_helion_tensor_descriptor({tensor_base}, [{', '.join(sizes)}], "
-                    f"[{', '.join(strides)}], [{host_block_size}])",
+                    f"{descriptor}{tensor_base}, [{', '.join(sizes)}], "
+                    f"[{', '.join(strides)}], [{host_block_size}]{ring_layout})",
                     permutation,
                 )
                 self.arguments.append(arg)
@@ -1248,9 +1333,12 @@ class DeviceFunction:
             in env.specialized_strides
         ):
             return StaticShape(int(v))
-        if isinstance(v, int):
-            if env.settings.static_shapes:
-                return StaticShape(v)
+        if isinstance(v, int) and (
+            env.settings.static_shapes
+            or fake_value.untyped_storage()
+            in HostFunction.current().compiler_state.static_peer_layouts
+        ):
+            return StaticShape(v)
         return self._tensor_property(TensorStrideArg, fake_value, dim, "stride")
 
     def sorted_args(self) -> list[Argument]:
@@ -1362,9 +1450,15 @@ class DeviceFunction:
             "wait": "tl.extra.cuda.gdc_wait()",
             "launch_dependents": "tl.extra.cuda.gdc_launch_dependents()",
         }
+        code_warm = (
+            [statement_from_string("helion_code_warm.code_warm()")]
+            if env.code_warm and backend.uses_triton_compiler
+            else []
+        )
         kernel_body: list[ast.stmt] = cast(
             "list[ast.stmt]",
             [
+                *code_warm,
                 *[statement_from_string(pdl[op]) for op in env.pdl_entry],
                 *scalar_preamble,
                 *self.preamble,
@@ -1677,7 +1771,7 @@ class DeviceFunction:
         noinline: bool = False,
     ) -> tuple[str, tuple[str, ...]]:
         """Outline an opaque body without changing its computation AST."""
-        if CompileEnvironment.current().backend_name != "triton":
+        if not CompileEnvironment.current().backend.uses_triton_compiler:
             raise AssertionError("outlined Triton helpers require the Triton backend")
         cloned_body = cast("list[ast.stmt]", clone_ast(body))
         if tuple(
@@ -1775,6 +1869,7 @@ class DeviceFunction:
         helpers.extend(self.helper_manager.codegen_helper_functions())
         renames = {name: values[0] for name, values in self._variable_renames.items()}
         argument_by_name = {argument.name: argument for argument in self.arguments}
+        decorator = CompileEnvironment.current().backend.helper_decorator
         for name, argument_names, body, noinline in self.triton_outlined_helpers:
             arguments: list[ast.arg] = []
             for argument_name in argument_names:
@@ -1795,10 +1890,12 @@ class DeviceFunction:
                     ast.FunctionDef,
                     name=name,
                     args=create_arguments(arguments),
-                    body=helper_module.body,
+                    body=CompileEnvironment.current().backend.pipeline_loops(
+                        helper_module.body, self
+                    ),
                     decorator_list=[
                         expr_from_string(
-                            "triton.jit(noinline=True)" if noinline else "triton.jit"
+                            f"{decorator}(noinline=True)" if noinline else decorator
                         )
                     ],
                     type_params=[],

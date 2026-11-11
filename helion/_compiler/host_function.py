@@ -115,6 +115,16 @@ class CompilerState:
     peer_views: dict[torch.UntypedStorage, tuple[torch.UntypedStorage, int] | None] = (
         dataclasses.field(default_factory=dict)
     )
+    # get_remote_tensors views with a fixed layout: contiguous views of
+    # local.size() whose trailing sizes are specialized.
+    static_peer_layouts: set[torch.UntypedStorage] = dataclasses.field(
+        default_factory=set
+    )
+    # Mapped local storage -> its guarded owner's storage offset: the symmetric
+    # allocation base, where the peer views start.
+    symmetric_bases: dict[torch.UntypedStorage, object] = dataclasses.field(
+        default_factory=dict
+    )
 
     def ssa_source(self, tensor: torch.Tensor) -> torch.Tensor | None:
         """The tensor an SSA fake copies, or None if a join makes it ambiguous."""

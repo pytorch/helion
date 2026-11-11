@@ -3918,7 +3918,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 for config in candidate_configs
                 if _td_guard_active_for_config(guard, config)
             )
-            with self.env:
+            # Registered block sizes resolve through the host function's origins.
+            assert self.host_function is not None
+            with self.env, self.host_function:
                 resolved_block_sizes = (
                     block_size.from_config(config)
                     for config in active_configs
@@ -3966,7 +3968,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 # int32-coordinate legality. Other backends retain the legacy
                 # layout-only key; they neither consume host descriptors nor
                 # use Triton's descriptor legality checks.
-                if self.env.backend_name != "triton":
+                if not self.env.backend.uses_triton_compiler:
                     return layout
                 return (
                     layout,

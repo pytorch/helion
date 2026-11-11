@@ -841,6 +841,27 @@ VALID_PID_TYPES = (
 MIN_NUM_SM_MULTIPLIER = 1
 MAX_NUM_SM_MULTIPLIER = 128
 DEFAULT_NUM_SM_MULTIPLIER = 1
+
+
+def ring_depth(config: Mapping[str, object], backend_name: str) -> int:
+    """Slots of the gluon backend's shared-memory ring (``gluon_ring``):
+    ``num_stages`` when at least 2 on programs of whole warpgroups (Triton
+    warp-specializes only those) with tensor-descriptor loads (the ring's only
+    kind), else 0 (no ring: loads are plain loads, dot operands staged from
+    registers)."""
+    stages = cast("int", config.get("num_stages", DEFAULT_NUM_STAGES))
+    indexing = config.get("indexing", "pointer")
+    if (
+        backend_name != "gluon"
+        or stages < 2
+        or cast("int", config.get("num_warps", DEFAULT_NUM_WARPS)) % 4
+        or "tensor_descriptor"
+        not in ([indexing] if isinstance(indexing, str) else cast("list", indexing))
+    ):
+        return 0
+    return stages
+
+
 EPILOGUE_SUBTILE_EXTENDED_CHOICES = (None, 2, 4)
 EPILOGUE_SUBTILE_DEFAULT_CHOICES = (None, 2)
 EPILOGUE_SUBTILE_MIN_K_HINT = 1024
@@ -861,7 +882,7 @@ DEFAULT_MAXNREG = None
 # only on backend name can poison later Triton ConfigSpec construction inside
 # the same worker process.
 def get_valid_eviction_policies(backend: Backend) -> tuple[str, ...]:
-    if backend.name == "triton" and not supports_amd_cdna_tunables():
+    if backend.uses_triton_compiler and not supports_amd_cdna_tunables():
         return ("", "first", "last")
     return backend.config_spec_extension().eviction_policies()
 
@@ -1078,6 +1099,9 @@ class ConfigSpec:
         # implicit cross-root dependency the backend can lower (CuTe offers
         # the barrier pipeline only).
         self.cross_loop_pipeline: EnumFragment | None = None
+        # Whether a cross-rank dependency transports a scatter in band: its
+        # guard-skipped tasks need static or claimed (gluon ring) roots.
+        self.inband_scatter: bool = False
         # Whether the kernel runs several phases in one persistent launch
         # (``hl.barrier()`` or an implicit cross-root dependency).
         self.multi_phase: bool = False
@@ -2123,9 +2147,10 @@ class ConfigSpec:
                 ("range_multi_buffers", self.range_multi_buffers),
                 ("range_flattens", self.range_flattens),
             ):
-                config[name] = mapping._reset_config_to_default(
-                    name, config.get(name, ()), block_ids=static_range_block_ids
-                )
+                if self.supports_config_key(name):
+                    config[name] = mapping._reset_config_to_default(
+                        name, config.get(name, ()), block_ids=static_range_block_ids
+                    )
 
         for name in (
             "loop_orders",
@@ -2245,6 +2270,21 @@ class ConfigSpec:
                         "cross_loop_pipeline must be one of "
                         f"{cross_loop_pipeline_fragment.choices!r}, got "
                         f"{cross_loop_pipeline!r}"
+                    )
+            if (
+                self.inband_scatter
+                and config["cross_loop_pipeline"] == "dynamic"
+                and not ring_depth(config, self.backend_name)
+            ):
+                # Guard-skipped tasks mark their inband scatter's done words
+                # from each worker's lanes, which static and claimed roots
+                # keep; dynamic packets have none.
+                if _fix_invalid:
+                    config["cross_loop_pipeline"] = "static"
+                else:
+                    raise InvalidConfig(
+                        "inband scatters need cross_loop_pipeline='static', or "
+                        "'dynamic' with a ring (claimed roots)"
                     )
         surface.normalize_recurrence_families(self, config, fix_invalid=_fix_invalid)
         surface.normalize_pre_pid_type(self, config, fix_invalid=_fix_invalid)
@@ -2553,8 +2593,13 @@ class ConfigSpec:
             # Only one range_warp_specializes per loop nest, take the first one
             # Prefer warp specialize on outermost loop
             nest_starts = [0]
-            if config.get("cross_loop_pipeline") == "static":
-                # Static cross-loop roots are sequential loop nests in one kernel.
+            if config.get("cross_loop_pipeline") == "static" or ring_depth(
+                config, self.backend_name
+            ):
+                # Static cross-loop roots are sequential loop nests in one kernel;
+                # under the ring (which takes the requests in place of Triton)
+                # each root's loop nest is one even when dynamic dispatch
+                # wraps the roots.
                 grid_ids = {*self.grid_block_ids}
                 nest_starts = [
                     i

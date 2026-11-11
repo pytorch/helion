@@ -31,6 +31,7 @@ from ..ast_extension import convert
 from ..ast_extension import create
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
+from ..compile_environment import CompileEnvironment
 from ..host_function import HostFunction
 from ..output_header import SOURCE_MODULE
 
@@ -223,7 +224,8 @@ def _ensure_triton_jit_decorator(func_def: ast.FunctionDef) -> ast.FunctionDef:
     )
     if has_jit:
         return func_def
-    func_def.decorator_list.insert(0, cast("ast.expr", expr_from_string("triton.jit")))
+    decorator = CompileEnvironment.current().backend.helper_decorator
+    func_def.decorator_list.insert(0, cast("ast.expr", expr_from_string(decorator)))
     return func_def
 
 

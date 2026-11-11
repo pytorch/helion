@@ -466,15 +466,31 @@ def getitem_masked_value(
     This handles loop outputs, since the `_for` node has multiple outputs.
     """
     from .device_ir import DeviceIR
+    from .device_ir import IfGraphInfo
 
     assert not getitem_node.kwargs, "getitem kwargs not supported"
     node, index = getitem_node.args
     assert isinstance(node, torch.fx.Node)
     assert isinstance(index, int)
+    if node.target is _if:
+        # The if's values: each branch output (``branches_outputs``), then
+        # each else output; an entry naming an outer value passes it through.
+        pairs = cast(
+            "IfGraphInfo", DeviceIR.current().graphs[cast("int", node.args[1])]
+        ).branches_outputs
+        if not pairs:
+            return None
+        side, pair = divmod(index, len(pairs))
+        entry = pairs[pair][side]
+        if not isinstance(entry, int):
+            return None
+        graph = DeviceIR.current().graphs[cast("int", node.args[1 + side])].graph
+        output = graph.find_nodes(op="output")[0].args[0][entry]
+        return (
+            cached_masked_value(output) if isinstance(output, torch.fx.Node) else None
+        )
     if is_for_loop_target(node.target):
         graph_ids = [node.args[0]]
-    elif node.target is _if:
-        graph_ids = [node.args[1], node.args[2]]
     else:
         return None
     assert isinstance(graph_ids, list)
