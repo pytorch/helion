@@ -1915,8 +1915,12 @@ class SubscriptIndexing(NamedTuple):
                     # On backends that don't pad factory ops to
                     # power-of-2, keep concrete dims concrete so shape
                     # inference can prove equality with concretely-sized
-                    # buffers (matches _device_indexing_size).
-                    if not env.backend.pad_factory_tensors_to_power_of_2:
+                    # buffers (matches _device_indexing_size).  A tunable
+                    # extent still needs a reduction dim.
+                    if (
+                        not env.backend.pad_factory_tensors_to_power_of_2
+                        and not env.is_tunable_extent(slice_size)
+                    ):
                         output_size.append(env.try_concretize_symint(slice_size))
                     else:
                         rdim = env.allocate_reduction_dimension(slice_size)
