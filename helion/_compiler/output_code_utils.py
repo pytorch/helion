@@ -23,10 +23,13 @@ from __future__ import annotations
 
 import ast
 import builtins
+import inspect
 import symtable
 from typing import TYPE_CHECKING
 from typing import Any
 
+from .._utils import cdiv
+from .._utils import next_power_of_2
 from .backend import dedupe_preserve_order
 from .backend import read_launcher_source
 
@@ -44,6 +47,7 @@ _SHIM_DOC = (
     "the ``helion`` namespace built from this function. The launcher is inlined in "
     "this private scope so its symbols can never collide with the kernel name."
 )
+_HOST_HELPERS = (cdiv, next_power_of_2)
 
 
 def _artifact_global_reads(table: symtable.SymbolTable) -> set[str]:
@@ -102,6 +106,40 @@ def _artifact_runtime_nodes(tree: ast.Module) -> set[ast.AST]:
     }
 
 
+def _check_artifact_helion_namespace(tree: ast.Module) -> None:
+    """Reject references the inlined Helion namespace cannot satisfy."""
+    from .triton.backend import TritonBackend
+
+    info = TritonBackend().dependency_free_launcher_info
+    runtime_names = {*info.runtime_helper_names, info.launcher_symbol}
+    host_names = {helper.__name__ for helper in _HOST_HELPERS}
+    parents = {
+        child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)
+    }
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Name)
+            and node.id == "helion"
+            and isinstance(node.ctx, ast.Load)
+        ):
+            continue
+        attribute = parents.get(node)
+        if isinstance(attribute, ast.Attribute) and attribute.value is node:
+            if attribute.attr in host_names:
+                continue
+            if attribute.attr == "runtime":
+                runtime_attribute = parents.get(attribute)
+                if (
+                    isinstance(runtime_attribute, ast.Attribute)
+                    and runtime_attribute.value is attribute
+                    and runtime_attribute.attr in runtime_names
+                ):
+                    continue
+        raise ValueError(
+            "artifact source uses an unsupported Helion namespace reference"
+        )
+
+
 def close_artifact_source(source: str) -> str:
     """Require emitted artifact code to depend only on its declared runtimes.
 
@@ -112,6 +150,7 @@ def close_artifact_source(source: str) -> str:
     This is not a sandbox for untrusted source or a monkeypatched installation.
     """
     tree = ast.parse(source)
+    _check_artifact_helion_namespace(tree)
     runtime_nodes = _artifact_runtime_nodes(tree)
     source = ast.unparse(tree)
     table = symtable.symtable(source, "<helion-artifact>", "exec")
@@ -319,8 +358,9 @@ def _runtime_shim_statements(info: LauncherInfo) -> list[ast.stmt]:
     The launcher is inlined inside ``_make_helion_runtime`` -- a private function
     scope, so none of its symbols (``get_num_sm``, ``default_launcher``, ...) land at
     module level where they could clash with the generated kernel -- and re-exported
-    on a ``types.SimpleNamespace`` as ``helion.runtime`` so the body's verbatim
-    ``helion.runtime.<fn>(...)`` calls resolve against it.
+    on a ``types.SimpleNamespace`` as ``helion.runtime``. Pure host helpers are
+    embedded from their canonical implementations on the outer ``helion``
+    namespace, so generated host expressions need no Helion package either.
 
     Built by editing the AST: parse a small template, splice the launcher body into
     the function and the exports into the returned namespace -- no string surgery.
@@ -344,7 +384,7 @@ def _runtime_shim_statements(info: LauncherInfo) -> list[ast.stmt]:
     module = ast.parse(
         "def _make_helion_runtime():\n"
         "    return types.SimpleNamespace()\n"
-        "helion = types.SimpleNamespace(runtime=_make_helion_runtime())\n"
+        "helion = _make_helion_runtime()\n"
         f"{info.launcher_alias} = helion.runtime.{info.launcher_symbol}\n"
     )
     make_fn = module.body[0]
@@ -354,10 +394,31 @@ def _runtime_shim_statements(info: LauncherInfo) -> list[ast.stmt]:
     namespace_call = return_stmt.value
     assert isinstance(namespace_call, ast.Call)
     # Docstring explaining the shim, then the inlined launcher, then the return.
-    make_fn.body = [ast.Expr(ast.Constant(_SHIM_DOC)), *launcher_stmts, return_stmt]
+    host_helpers = [
+        ast.parse(inspect.getsource(helper)).body[0] for helper in _HOST_HELPERS
+    ]
+    make_fn.body = [
+        ast.Expr(ast.Constant(_SHIM_DOC)),
+        *launcher_stmts,
+        *host_helpers,
+        return_stmt,
+    ]
+    runtime_namespace = ast.Call(
+        func=namespace_call.func,
+        args=[],
+        keywords=[
+            ast.keyword(arg=name, value=ast.Name(id=name, ctx=ast.Load()))
+            for name in exports
+        ],
+    )
     namespace_call.keywords = [
-        ast.keyword(arg=name, value=ast.Name(id=name, ctx=ast.Load()))
-        for name in exports
+        ast.keyword(arg="runtime", value=runtime_namespace),
+        *(
+            ast.keyword(
+                arg=helper.__name__, value=ast.Name(id=helper.__name__, ctx=ast.Load())
+            )
+            for helper in _HOST_HELPERS
+        ),
     ]
     ast.fix_missing_locations(module)
     return module.body

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -7,7 +8,9 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
+from unittest.mock import Mock
 from unittest.mock import patch
 
 import pytest
@@ -15,9 +18,12 @@ import torch
 from torch._inductor import config as inductor_config
 
 import helion
+from helion._compiler.output_code_utils import dependency_free_runtime_source
+from helion._compiler.triton.backend import TritonBackend
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import onlyBackends
+from helion._utils import next_power_of_2
 from helion.autotuner import BooleanFragment
 from helion.autotuner import PowerOfTwoFragment
 import helion.language as hl
@@ -383,6 +389,44 @@ class TestKernelArtifact(RefEagerTestDisabled, TestCase):
                 frozen(*_scaled_mm_inputs())
             loader.assert_not_called()
 
+    def test_actual_scaled_mm_host_wrapper_reaches_launcher(self) -> None:
+        args = _scaled_mm_inputs()
+        with tempfile.TemporaryDirectory() as directory:
+            path = export_artifact(
+                _scaled_mm_kernel(),
+                [
+                    ArtifactCase(
+                        args,
+                        helion.Config(
+                            block_sizes=[16, 32, 32], split_k=1, swap_ab=False
+                        ),
+                    )
+                ],
+                Path(directory) / "scaled_mm.json",
+            )
+            tree = ast.parse(json.loads(path.read_text())["payload"]["source"])
+        wrapper = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_scaled_mm_c0"
+        )
+        namespace = {"torch": torch, "types": types}
+        exec(
+            dependency_free_runtime_source(
+                TritonBackend().dependency_free_launcher_info
+            ),
+            namespace,
+        )
+        # Exercise actual emitted host code on CPU. Only the GPU kernel/launcher
+        # and Triton's integer helper are substituted; this is not a GPU result.
+        namespace["triton"] = types.SimpleNamespace(next_power_of_2=next_power_of_2)
+        namespace["_helion_scaled_mm_c0"] = object()
+        exec(ast.unparse(wrapper), namespace)
+        launch = Mock()
+        namespace["_scaled_mm_c0"](*args, _launcher=launch)
+        launch.assert_called_once()
+        assert launch.call_args.args[7] == 64
+
 
 @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA and Triton")
 @pytest.mark.cuda
@@ -395,6 +439,7 @@ class TestKernelArtifactCUDA(RefEagerTestDisabled, TestCase):
 import importlib.util
 from pathlib import Path
 import sys
+from unittest.mock import Mock
 from unittest.mock import patch
 import torch
 from torch._inductor import config as inductor_config
