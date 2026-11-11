@@ -1738,7 +1738,7 @@ def _pallas_pl_kernel_jit_fn(
     pipe_in_specs = [all_specs[p] for p in pipe_positions if p < n_inputs]
     pipe_out_specs = [all_specs[p] for p in pipe_positions if p >= n_inputs]
 
-    mesh = pltpu.create_tensorcore_mesh("_helion_core", num_cores=1)  # type: ignore[union-attr]
+    mesh = pltpu.TensorCoreMesh(axis_name="_helion_core", num_cores=1)  # type: ignore[union-attr]
     scratch_kw = _pallas_kernel_scratch_kwarg(pl)
 
     # ``jax.new_ref`` models physical HBM aliases for real TPU execution, but
@@ -3021,7 +3021,7 @@ def _pallas_compile_compact_jit_fn(
                 out_specs=pipe_out_specs,
             )(*pipe_any)
 
-        mesh = pltpu.create_tensorcore_mesh("_helion_core", num_cores=1)  # type: ignore[union-attr]
+        mesh = pltpu.TensorCoreMesh(axis_name="_helion_core", num_cores=1)
         call = pl.kernel(  # type: ignore[union-attr]
             kernel_body,
             out_shape_arg,

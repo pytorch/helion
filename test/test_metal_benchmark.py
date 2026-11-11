@@ -32,7 +32,6 @@ from benchmarks.metal.providers import mlx_available
 import pytest
 import torch
 
-import helion
 from helion import exc
 
 # Metal runs on macOS only: CI's Linux jobs skip the whole file.
@@ -742,14 +741,6 @@ _TINY_ROWS = {
     ],
 }
 
-#: Helion configs for the tiny-shape check where the kernel's default config
-#: is not one Metal lowers.  mamba2_chunk_scan's default num_warps=4 leaves
-#: one of its non-matmul blocks threads around the cooperative MPP matmul,
-#: which Metal rejects; the autotuner skips such configs.
-_TINY_CONFIGS = {
-    "mamba2_chunk_scan": helion.Config(block_sizes=[16, 16, 64], num_warps=2),
-}
-
 
 @_requires_mps
 class TestHarness(unittest.TestCase):
@@ -883,8 +874,7 @@ class TestHarness(unittest.TestCase):
         self.assertTrue(harness._same_run(header, other))
 
     def test_every_operator_matches_its_reference_at_tiny_shapes(self) -> None:
-        """Every provider, Helion at each kernel's default config (or its
-        ``_TINY_CONFIGS`` entry)."""
+        """Every provider, Helion at each kernel's default config."""
         providers = ("torch_eager", "helion")
         if mlx_available():
             providers += ("mlx",)
@@ -899,12 +889,6 @@ class TestHarness(unittest.TestCase):
                     stack.enter_context(
                         patch.object(helion_kernel.settings, "autotune_effort", "none")
                     )
-                    if name in _TINY_CONFIGS:
-                        stack.enter_context(
-                            patch.object(
-                                helion_kernel, "configs", [_TINY_CONFIGS[name]]
-                            )
-                        )
                 for case in kernel.cases:
                     harness.run_cell(
                         results, kernel, case, self._options(providers), "crash"

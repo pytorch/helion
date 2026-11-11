@@ -14,6 +14,7 @@ from unittest.mock import patch
 import pytest
 import torch
 from torch._inductor.codecache import PyCodeCache
+import torch.nn.functional as F
 
 import helion
 from helion import exc
@@ -346,6 +347,23 @@ def logical_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     for tile in hl.tile(x.size(0)):
         a, b = x[tile] > 0, y[tile] > 0
         out[tile] = torch.logical_and(a, b).float() + 2 * torch.logical_or(a, b)
+    return out
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def gelu_kernel(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        v = x[tile]
+        out[tile] = F.gelu(v) - F.gelu(v, approximate="tanh")
+    return out
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def gelu_tanh_kernel(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = F.gelu(x[tile], approximate="tanh")
     return out
 
 
@@ -747,6 +765,25 @@ class TestMetalMathOps(unittest.TestCase):
         a, b = x > 0, y > 0
         expected = torch.logical_and(a, b).float() + 2 * torch.logical_or(a, b)
         torch.testing.assert_close(logical_kernel(x, y), expected)
+
+    def test_gelu(self) -> None:
+        """Both forms, each in float and rounded back once for 16-bit
+        inputs, as eager computes them."""
+        for dtype, tol in (
+            (torch.float32, 1e-5),
+            (torch.float16, 1e-3),
+            (torch.bfloat16, 1e-2),
+        ):
+            with self.subTest(dtype=dtype):
+                x = torch.randn(1024, device=DEVICE, dtype=dtype) * 3
+                torch.testing.assert_close(
+                    gelu_tanh_kernel(x),
+                    F.gelu(x, approximate="tanh"),
+                    atol=tol,
+                    rtol=tol,
+                )
+                expected = F.gelu(x) - F.gelu(x, approximate="tanh")
+                torch.testing.assert_close(gelu_kernel(x), expected, atol=tol, rtol=tol)
 
     def test_clamp(self) -> None:
         x = torch.randn(1024, device=DEVICE)

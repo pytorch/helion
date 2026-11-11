@@ -50,12 +50,13 @@ from .cutedsl_compat import installed_cute_dsl_version
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-# The DSL release whose private pipeline surface the constructors below
+# The DSL releases whose private pipeline surface the constructors below
 # mirror: ``PipelineTmaUmma.create`` / ``PipelineUmmaAsync.create`` minus the
 # serial warp-0 mbarrier init (``MbarrierArray.__init__``'s fields and
 # validation, the ``_compute_*`` mask helpers, ``_get_thread_arrive_count``,
-# ``MbarrierLayout.V0``, ``register_barrier``).
-SPLIT_INIT_VALIDATED_DSL_VERSION = Version("4.7.0")
+# ``MbarrierLayout.V0``, ``register_barrier``).  4.7.1 (what fbcode runs)
+# ships ``cutlass/pipeline`` byte-identical to 4.7.0.
+SPLIT_INIT_VALIDATED_DSL_VERSIONS = frozenset({Version("4.7.0"), Version("4.7.1")})
 # The exact surface the mirror was lifted from: ``MbarrierArray.__init__``'s
 # parameters and the two pipeline dataclasses' field order (positional
 # construction below).
@@ -91,12 +92,12 @@ _PIPELINE_UMMA_ASYNC_FIELDS = (
 
 @cache
 def _private_surface_matches(installed: Version | None) -> bool:
-    """Whether ``installed`` is the validated DSL release and the loaded DSL
+    """Whether ``installed`` is a validated DSL release and the loaded DSL
     still exposes exactly the private surface the constructors mirror.  When
     it does not, :func:`split_barrier_init_supported` is False and the codegen
     falls back to the DSL constructors (``create(..., defer_sync=True)``, the
     serial warp-0 inits; ``cute_mma`` ``tcgen05_split_barrier_init``)."""
-    if installed != SPLIT_INIT_VALIDATED_DSL_VERSION:
+    if installed not in SPLIT_INIT_VALIDATED_DSL_VERSIONS:
         return False
     # The DSL pins a documentation signature ``(self)`` on the decorated
     # ``__init__``; the wrapped function carries the real one.

@@ -3497,11 +3497,13 @@ class FXToHelionConverter:
                     input_node = node.args[0]
                     # In the non-reduction path, `tangents_N` tiles are already
                     # loaded with the correct shape (tile loading inserts `None`
-                    # indices for missing dims), so aliasing is correct.  For
-                    # non-tangent inputs (primals or intermediates) the tile
+                    # indices for missing dims), so aliasing is correct; so is
+                    # a same-shape op of the tangent alone (newer PyTorch
+                    # divides the mean backward's tangent before unsqueezing).
+                    # For other inputs (primals or intermediates) the tile
                     # variable has the same ndim as the original tensor and the
                     # unsqueeze must be emitted explicitly.
-                    is_tangent_input = input_node.name.startswith("tangents_")
+                    is_tangent_input = _is_tangent_shaped(input_node)
                     if self._use_reduction_kernel_path or not is_tangent_input:
                         result_var = f"{node.name}_val"
                         node_to_var[node.name] = result_var
@@ -4866,6 +4868,28 @@ def _numel(shape: tuple[int, ...]) -> int:
     for s in shape:
         n *= s
     return n
+
+
+def _is_tangent_shaped(node: Node) -> bool:
+    """Whether ``node`` is a ``tangents_N`` placeholder or a chain of
+    same-shape ops on one, whose other operands are scalars."""
+    while not node.name.startswith("tangents_"):
+        val = node.meta.get("val")
+        tensor_args = [
+            arg
+            for arg in node.args
+            if isinstance(arg, Node)
+            and isinstance(arg.meta.get("val"), torch.Tensor)
+            and arg.meta["val"].ndim > 0
+        ]
+        if (
+            len(tensor_args) != 1
+            or not isinstance(val, torch.Tensor)
+            or val.shape != tensor_args[0].meta["val"].shape
+        ):
+            return False
+        node = tensor_args[0]
+    return True
 
 
 def _diff_squeezed_dims(
