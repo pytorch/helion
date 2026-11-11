@@ -29,6 +29,7 @@ from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessCuteAvailable
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallasTpu
+from helion._testing.reduction_inputs import exact_fp32_sum_input
 from helion.autotuner import IntegerFragment
 import helion.language as hl
 
@@ -272,7 +273,15 @@ class TestReductions(RefEagerTestBase, TestCase):
         ),
     )
     def test_reduction_over_multiple_dims(self, shape, dtype, transpose, op, chunk):
-        x = torch.randn(shape, device=DEVICE, dtype=dtype)
+        exact_sum = dtype == torch.float32 and op in ("sum", "bounded_sum")
+        # This test checks dimension merging and loop carries. Signed fixed-point
+        # data keeps their sums exact without making the inputs all one sign:
+        # at most 1536 * 2048 integer units < 2**24, with 1/1024-unit values.
+        x = (
+            exact_fp32_sum_input(shape).to(device=DEVICE, dtype=dtype)
+            if exact_sum
+            else torch.randn(shape, device=DEVICE, dtype=dtype)
+        )
         if x.size(1) == 1:
             x = x.as_strided(x.shape, (x.stride(0), 999, x.stride(2)))
         if transpose:
@@ -304,16 +313,25 @@ class TestReductions(RefEagerTestBase, TestCase):
         self.assertEqual(
             "flatten(1, 2)" in bound.to_triton_code(spec.default_config()), merged
         )
-        expected = (
-            (x - x.mean((1, 2), keepdim=True)).amax((1, 2))
-            if op == "centered"
-            else getattr(torch, "sum" if op == "bounded_sum" else op)(x, dim=(1, 2))
-        )
+        if exact_sum:
+            expected = (
+                x.cpu().to(torch.float64).sum((1, 2)).to(device=DEVICE, dtype=dtype)
+            )
+        elif op == "centered":
+            expected = (x - x.mean((1, 2), keepdim=True)).amax((1, 2))
+        else:
+            expected = getattr(torch, "sum" if op == "bounded_sum" else op)(
+                x, dim=(1, 2)
+            )
         for loop in (None, chunk) if chunk is not None else (None,):
-            actual = bound.compile_config(
-                helion.Config(block_sizes=[2], reduction_loops=[loop] * n_loops)
-            )(x, op)
-            torch.testing.assert_close(actual, expected)
+            with self.subTest(reduction_loop=loop):
+                actual = bound.compile_config(
+                    helion.Config(block_sizes=[2], reduction_loops=[loop] * n_loops)
+                )(x, op)
+                if exact_sum:
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                else:
+                    torch.testing.assert_close(actual, expected)
 
     @onlyBackends(["triton", "cute"])
     @skipIfRefEager("checks the generated code")
@@ -512,8 +530,19 @@ class TestReductions(RefEagerTestBase, TestCase):
                     out[tile, step] = total[:, None]
             return out
 
-        x = torch.randn(6, 24, 40, device=DEVICE)
-        scale = torch.randn(6, device=DEVICE)
+        # Generate the same data on every backend without changing global RNG
+        # state. Positive values make each nonempty reduction chunk nonzero,
+        # while the signed row scales below still exercise both signs.
+        # Every FP32 sum is exact: the absolute sum in quarter-units is bounded
+        # by 960 * 16 * 8 * 4 = 491520 < 2**24.
+        cpu_device = torch.device("cpu")
+        cpu_generator = torch.Generator(device=cpu_device).manual_seed(0)
+        x = torch.randint(
+            1, 17, (6, 24, 40), generator=cpu_generator, device=cpu_device
+        ).to(device=DEVICE, dtype=torch.float32)
+        scale = torch.tensor(
+            [-4.0, -2.0, -0.5, 0.25, 1.0, 8.0], device=DEVICE, dtype=torch.float32
+        )
         # Without static_shapes kernels aren't specialized on strides, so a
         # later input might not flatten into a view: the dims stay chained.
         for static_shapes in (True, False):
@@ -542,6 +571,8 @@ class TestReductions(RefEagerTestBase, TestCase):
                     torch.testing.assert_close(
                         output,
                         (x * scale[:, None, None]).sum((1, 2))[:, None].expand(-1, 3),
+                        rtol=0,
+                        atol=0,
                     )
 
     @onlyBackends(["triton", "cute"])

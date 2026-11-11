@@ -89,7 +89,8 @@ class TestAutotunerConfigs(AutotunerTestCase):
             torch.randn([8, 512, 512], device=DEVICE),
             torch.randn([8, 512, 512], device=DEVICE),
         )
-        spec = basic_kernels.add.bind(args).config_spec
+        # The target/capability mocks must not reuse a spec bound by another test.
+        spec = basic_kernels.add._bind_isolated(args).config_spec
         configs = ConfigGeneration(spec).random_population(10)
         self.assertExpectedJournal("\n".join(map(repr, configs)))
 
@@ -114,7 +115,8 @@ class TestAutotunerConfigs(AutotunerTestCase):
             torch.randn([8, 512, 512], device=DEVICE),
             torch.randn([8, 512, 512], device=DEVICE),
         )
-        spec = basic_kernels.add.bind(args).config_spec
+        # Keep this golden independent of cached binds with other target facts.
+        spec = basic_kernels.add._bind_isolated(args).config_spec
         overrides = {"range_unroll_factors": [4], "range_warp_specializes": ([True])}
         # We expect all the unroll factors to be set to 0
         configs = ConfigGeneration(spec, overrides=overrides).random_population(10)
@@ -151,7 +153,7 @@ class TestAutotunerConfigs(AutotunerTestCase):
             torch.randn([8, 512, 512], device=DEVICE),
             torch.randn([8, 512, 512], device=DEVICE),
         )
-        spec = basic_kernels.add.bind(args).config_spec
+        spec = basic_kernels.add._bind_isolated(args).config_spec
         overrides = {"indexing": "tensor_descriptor"}
         gen = ConfigGeneration(spec, overrides=overrides)
 

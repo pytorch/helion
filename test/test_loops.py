@@ -11,6 +11,7 @@ import torch
 
 import helion
 from helion import _compat
+from helion import _utils
 from helion._compat import use_tileir_tunables
 from helion._compiler.static_loop_unroller import StaticLoopUnroller
 from helion._compiler.static_loop_unroller import unroll_static_loops
@@ -1335,9 +1336,12 @@ class TestLoops(RefEagerTestBase, TestCase):
             code3,
         )
 
-    @xfailIfPallas("range_num_stages is Triton-specific")
     @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
     @skipIfRefEager("not supported in ref eager mode")
+    @skipIfFn(
+        lambda: not _utils.triton_is_available(),
+        "range_num_stages metadata requires the installed Triton range API",
+    )
     def test_range_num_stages_preserved_without_aliasing(self):
         args = (torch.randn([16, 16], device=DEVICE),)
         spec = nested_loop_kernel.bind(args).config_spec
@@ -1374,7 +1378,12 @@ class TestLoops(RefEagerTestBase, TestCase):
         normalized = spec.normalized_config(
             helion.Config(block_sizes=[16, 16], range_num_stages=[3] * slots)
         )
-        self.assertEqual(normalized.range_num_stages, [0] * slots)
+        if "range_num_stages" in spec.supported_config_keys():
+            self.assertEqual(normalized.range_num_stages, [0] * slots)
+        else:
+            # Backends without this hint retain the alias analysis but drop
+            # its config key during normalization.
+            self.assertNotIn("range_num_stages", normalized.config)
 
     @skipIfNotCUDA()
     @skipIfCudaCapabilityLessThan(
@@ -1423,9 +1432,12 @@ class TestLoops(RefEagerTestBase, TestCase):
                 spec = kernel.bind(args).config_spec
                 self.assertTrue(all(item.pinned for item in spec.range_num_stages))
 
-    @xfailIfPallas("range_num_stages is Triton-specific")
     @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
     @skipIfRefEager("not supported in ref eager mode")
+    @skipIfFn(
+        lambda: not _utils.triton_is_available(),
+        "range_num_stages metadata requires the installed Triton range API",
+    )
     def test_range_num_stages_preserved_for_fresh_host_buffers(self):
         # A nested-if rebinding to another fresh buffer, and a view of a fresh
         # buffer whose shape arguments come from x (scalars share no storage).
@@ -1439,9 +1451,12 @@ class TestLoops(RefEagerTestBase, TestCase):
                 self.assertGreater(len(spec.range_num_stages), 0)
                 self.assertFalse(any(item.pinned for item in spec.range_num_stages))
 
-    @xfailIfPallas("range_num_stages is Triton-specific")
     @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
     @skipIfRefEager("not supported in ref eager mode")
+    @skipIfFn(
+        lambda: not _utils.triton_is_available(),
+        "range_num_stages metadata requires the installed Triton range API",
+    )
     def test_inplace_loop_only_disables_its_own_pipeline(self):
         args = (
             torch.randn([16], device=DEVICE),
@@ -1456,9 +1471,12 @@ class TestLoops(RefEagerTestBase, TestCase):
         }
         self.assertEqual(pinned, {0: True, 1: False, 2: False, 3: False})
 
-    @xfailIfPallas("range_num_stages is Triton-specific")
     @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
     @skipIfRefEager("not supported in ref eager mode")
+    @skipIfFn(
+        lambda: not _utils.triton_is_available(),
+        "range_num_stages metadata requires the installed Triton range API",
+    )
     def test_atomic_loop_only_disables_its_own_pipeline(self):
         args = (
             torch.randn([16, 16], device=DEVICE),

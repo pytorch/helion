@@ -24,6 +24,8 @@ from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 from helion.language import _tracing_ops
 
+pytestmark = pytest.mark.cpu_only
+
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def _while_recipe(x, limits, swap: hl.constexpr, steps: hl.constexpr):
@@ -114,16 +116,18 @@ def test_two_configs_in_one_environment_plan_their_own_graph_copies() -> None:
         forbid_native_compile(),
     ):
         first = bound.to_code(first_config)
+        # Keep both passes' owners alive: reset_mock() otherwise frees the
+        # first graphs, allowing Python to reuse their ids during the next pass.
         first_graphs = {
-            id(info) for call in planner.call_args_list for info in call.args[1]
+            id(info): info for call in planner.call_args_list for info in call.args[1]
         }
         planner.reset_mock()
         second = bound.to_code(second_config)
         second_graphs = {
-            id(info) for call in planner.call_args_list for info in call.args[1]
+            id(info): info for call in planner.call_args_list for info in call.args[1]
         }
     assert first_graphs and second_graphs
-    assert first_graphs.isdisjoint(second_graphs)
+    assert first_graphs.keys().isdisjoint(second_graphs)
     memo = cute_env_state(bound.env).resident_while_plans
     assert memo
     assert not any(

@@ -1675,33 +1675,44 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         finally:
             worker.shutdown()
 
+    @pytest.mark.cpu_only
     def test_timeout_with_unkillable_worker_prevents_respawn(self) -> None:
         worker = BenchmarkWorker()
         process = Mock(pid=123)
         process.is_alive.return_value = True
         connection = Mock()
-        kill_started = threading.Event()
-
-        def poll_until_watchdog_runs(timeout: float) -> bool:
-            self.assertTrue(kill_started.wait(timeout=1.0))
-            return False
-
-        connection.poll.side_effect = poll_until_watchdog_runs
         worker._process = process
         worker._parent_connection = connection
 
         with (
+            patch("helion.autotuner.benchmark_worker.threading.Timer") as timer,
+            patch("helion.autotuner.benchmark_worker.time.monotonic", return_value=0.0),
             patch(
-                "helion.autotuner.benchmark_worker.signal_process_tree",
-                side_effect=lambda *_args: kill_started.set(),
+                "helion.autotuner.benchmark_worker.signal_process_tree"
             ) as signal_tree,
             self.assertRaisesRegex(
                 BenchmarkWorkerUnkillable,
                 "refusing to launch another worker",
             ),
         ):
+            # Fire the real watchdog callback before the mocked reply. This
+            # checks fatal-state handling without a thread-scheduling deadline.
+            def poll_after_watchdog(_timeout: float) -> bool:
+                # The ordinary poll-timeout path also kills. Check before that
+                # path runs so a missing or ineffective watchdog cannot pass.
+                signal_tree.assert_called_once_with(process, signal.SIGKILL)
+                self.assertIsNotNone(worker._fatal_error)
+                return False
+
+            connection.send.side_effect = lambda _job: timer.call_args.args[1]()
+            connection.poll.side_effect = poll_after_watchdog
             worker.run(_ReturnValue(7), timeout=0.01)
 
+        connection.poll.assert_called_once_with(0.01)
+        timer.assert_called_once()
+        self.assertEqual(timer.call_args.args[0], 0.01)
+        timer.return_value.start.assert_called_once_with()
+        timer.return_value.cancel.assert_called_once_with()
         signal_tree.assert_called_once_with(process, signal.SIGKILL)
         process.join.assert_called_once_with(timeout=_REAP_TIMEOUT_SECONDS)
         connection.close.assert_called_once_with()

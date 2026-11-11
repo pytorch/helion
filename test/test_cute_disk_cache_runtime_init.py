@@ -4,26 +4,25 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import subprocess
 import sys
 
 import pytest
 
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.subprocess_startup import run_test_subprocess
+from helion._testing.subprocess_startup import subprocess_ready
 
 pytestmark = pytest.mark.cpu_only
 
 
 @skipUnlessCuteAvailable("CuTe disk-cache loading requires the supported CuTe DSL")
 @pytest.mark.parametrize("mode", ("ffi", "plain", "miss", "corrupt"))
+@pytest.mark.slow
 def test_fresh_process_cache_runtime_init(tmp_path: Path, mode: str) -> None:
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="", CUTE_DSL_ARCH="sm_100a")
-    result = subprocess.run(
+    result = run_test_subprocess(
         [sys.executable, "-B", __file__, "--probe", mode, str(tmp_path)],
         env=env,
-        text=True,
-        capture_output=True,
-        timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert '"status": "pass"' in result.stdout
@@ -48,6 +47,7 @@ def _probe(mode: str, directory: str) -> None:
 
     from helion.runtime.cute import launcher
 
+    subprocess_ready()
     assert not torch.cuda.is_initialized() and "tvm_ffi" not in sys.modules
     os.environ["CUTE_DSL_CACHE_DIR"] = directory
     options = "--generate-line-info --enable-tvm-ffi" if mode != "plain" else None

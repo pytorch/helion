@@ -3,7 +3,6 @@ from __future__ import annotations
 from contextlib import nullcontext
 import os
 from pathlib import Path
-import subprocess
 import sys
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -16,6 +15,8 @@ from helion import _compat
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.subprocess_startup import run_test_subprocess
+from helion._testing.subprocess_startup import subprocess_ready
 from helion.autotuner import config_spec
 import helion.language as hl
 from helion.language import loops
@@ -76,6 +77,7 @@ def _pointwise(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 def _check_codegen_cache_isolation(warm: bool) -> None:
+    subprocess_ready()
     original = _cached_capabilities()
     assert original[0].cache_info().currsize == 0
     assert not torch.cuda.is_initialized()
@@ -142,6 +144,7 @@ def _check_codegen_cache_isolation(warm: bool) -> None:
 
 
 @pytest.mark.parametrize("warm", [False, True])
+@pytest.mark.slow
 @skipUnlessBackends(["cute"])
 def test_cpu_codegen_keeps_later_triton_maxnreg(warm: bool) -> None:
     # Each child starts with a real cold cache; no process-wide cache is cleared.
@@ -152,7 +155,7 @@ def test_cpu_codegen_keeps_later_triton_maxnreg(warm: bool) -> None:
     )
     environment.pop("HELION_BACKEND", None)
     environment.pop("HELION_AUTOTUNE_EFFORT", None)
-    result = subprocess.run(
+    result = run_test_subprocess(
         [
             sys.executable,
             "-B",
@@ -164,9 +167,5 @@ def test_cpu_codegen_keeps_later_triton_maxnreg(warm: bool) -> None:
         ],
         cwd=root,
         env=environment,
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr

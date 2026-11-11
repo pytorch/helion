@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -13,6 +14,8 @@ from test.test_cute_fixed_token_rank1_recurrence import _to_cuda_fake_tensor
 
 import helion
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 pytest.importorskip("cutlass")
 
@@ -34,6 +37,18 @@ def _fake_cute_context() -> ExitStack:
     )
     stack.enter_context(
         patch("helion.runtime.kernel.target_device_capability", return_value=(10, 3))
+    )
+    stack.enter_context(
+        patch(
+            "torch._inductor.runtime.hints.DeviceProperties.create",
+            return_value=SimpleNamespace(
+                type="cuda",
+                index=0,
+                cc=103,
+                warp_size=32,
+                multi_processor_count=148,
+            ),
+        )
     )
     stack.enter_context(
         patch(

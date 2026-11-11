@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import Mock
 from unittest.mock import patch
 
+import pytest
 import torch
 
 import helion
@@ -51,6 +52,9 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterable
     from collections.abc import Sequence
+
+
+pytestmark = pytest.mark.cpu_only
 
 
 class TestMultiShapeTimingAggregation(unittest.TestCase):
@@ -1615,6 +1619,8 @@ class TestMultiShapeLLMSeeded(unittest.TestCase):
         self.assertEqual(search._autotune_metrics.num_configs_tested, 5)
 
 
+@pytest.mark.slow
+@pytest.mark.cuda
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
 @skipIfRefEager("Autotuning requires compilation, not supported in ref eager mode")
 class TestMultiShapeAutotuneIntegration(unittest.TestCase):

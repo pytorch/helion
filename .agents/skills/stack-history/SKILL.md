@@ -14,11 +14,11 @@ Before any rewrite:
 
 - find out now whether the stack is submitted; never rely on what you saw
   earlier, because the user may have run `stack-pr submit` since. Record every
-  commit's trailer:
+  commit's trailer with the inventory below.
 
-  ```
-  git log --format='%h %s%n    %(trailers:key=stack-info,valueonly)' origin/main..HEAD
-  ```
+  Read raw messages here: Git's `%(trailers)` formatter can omit `stack-info:`
+  when it shares a paragraph with `autoreview passed:`. An empty formatter
+  result does not establish that a commit is unsubmitted.
 
   A commit with a `stack-info:` line has a pull request. That line must
   survive every rewrite: a commit that loses it looks new to the next submit,
@@ -31,6 +31,23 @@ Before any rewrite:
   rolling back. `git reset --hard <that sha>` undoes everything below, and
   `git rebase --abort` undoes a rebase in progress. These are your own
   commits; `reset --hard` is never for changes you did not make.
+
+Run this inventory before changing history. Keep the code fence at the top
+level so copying either its Markdown source or rendered text preserves the
+Python indentation:
+
+```
+git log --reverse --format='%h %s%n%B%x00' origin/main..HEAD |
+  python -c 'import sys
+for entry in sys.stdin.read().split("\0"):
+    lines = entry.strip().splitlines()
+    if lines:
+        print(lines[0])
+        for line in lines[1:]:
+            if line.startswith("stack-info:"):
+                print("    " + line)
+'
+```
 
 Each commit message ends with its `autoreview passed: ...` line, above any
 `stack-info:` trailer. Rewording keeps both. A rewrite that changes a commit's
@@ -116,7 +133,7 @@ git commit --amend -F "$msg"
 GIT_EDITOR=true git rebase --continue
 ```
 
-Check afterwards that `git log --format=%B -1 <new sha> | tail -1` still
+Check afterwards that `git log --format=%B -1 <new sha> | awk 'NF {last=$0} END {print last}'` still
 starts with `stack-info:` for a submitted commit.
 
 ## Split a commit
@@ -162,9 +179,8 @@ upstream commits also touched.
   the commit with the same title, and still last. Check it every time, not
   only when you believe the stack is submitted:
 
-  ```
-  git log --format='%h %s%n    %(trailers:key=stack-info,valueonly)' origin/main..HEAD
-  ```
+  Repeat the raw-message inventory above and compare its `stack-info:` lines
+  with the ones recorded before the rewrite.
 
   A missing one is an error: put it back (reword recipe) before anything
   else, and before any submit. `stack-pr view` should show every submitted
