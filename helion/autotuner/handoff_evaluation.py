@@ -15,6 +15,7 @@ import statistics
 import time
 import traceback
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import Callable
 from typing import cast
 import uuid
@@ -22,6 +23,7 @@ import uuid
 import torch
 from torch.utils._pytree import tree_flatten
 
+from .accuracy import AtolScale
 from .accuracy import assert_close
 from .accuracy import is_fp8_dtype
 from .benchmark_provider import _aggregate_multi_shape_timings
@@ -98,7 +100,8 @@ class _EvaluateCase:
     timing: str
     atol: float
     rtol: float
-    scale_atol: bool
+    # Per-tensor atol scaling: None, "rms" or "peak" (see ``_atol_scale``).
+    atol_scale: AtolScale | None
     repetitions: int
     alias_signature: list[int] | None = None
     progress_path: str | None = None
@@ -157,7 +160,7 @@ class _EvaluateCase:
                         aliases,
                         self.atol,
                         self.rtol,
-                        self.scale_atol,
+                        self.atol_scale,
                         self.fp8_accuracy,
                     )
 
@@ -357,6 +360,18 @@ def _check_input_storage(
             raise AssertionError("Storage outside input views was modified")
 
 
+def _atol_scale(case: dict[str, Any]) -> AtolScale | None:
+    """A case's per-tensor atol scaling; bundles written before ``atol_scale``
+    was recorded give it as ``scale_atol`` (rms or none)."""
+    if "atol_scale" in case:
+        scale = case["atol_scale"]
+    else:
+        scale = "rms" if case["scale_atol"] else None
+    if scale not in (None, "rms", "peak"):
+        raise ValueError(f"Unknown handoff atol_scale: {scale!r}")
+    return scale
+
+
 def _check_result(
     output: object,
     args: Sequence[object],
@@ -366,7 +381,7 @@ def _check_result(
     aliases: list[int],
     atol: float,
     rtol: float,
-    scale_atol: bool,
+    atol_scale: AtolScale | None,
     fp8_accuracy: str = "bitwise",
 ) -> None:
     assert_close(
@@ -374,7 +389,7 @@ def _check_result(
         reference,
         atol,
         rtol,
-        scale_atol_by_expected_rms=scale_atol,
+        atol_scale=atol_scale,
         fp8_accuracy=fp8_accuracy,
     )
     actual_flat, actual_spec = tree_flatten(args)
@@ -407,7 +422,7 @@ def _check_result(
             expected,
             atol,
             rtol,
-            scale_atol_by_expected_rms=scale_atol,
+            atol_scale=atol_scale,
             fp8_accuracy=fp8_accuracy,
         )
     if _alias_signature((output, args)) != aliases:
@@ -468,8 +483,10 @@ def evaluate_handoff(
     directory = Path(directory).resolve()
     manifest_text = (directory / "manifest.json").read_text()
     manifest = json.loads(manifest_text)
-    if manifest["schema_version"] != 1 or not manifest["cases"]:
-        raise ValueError("Expected a version 1 handoff bundle with at least one case")
+    if manifest["schema_version"] not in (1, 2) or not manifest["cases"]:
+        raise ValueError(
+            "Expected a version 1 or 2 handoff bundle with at least one case"
+        )
     objective = manifest["objective"]
     aggregation = objective["aggregation"]
     unit = objective["unit"]
@@ -541,7 +558,7 @@ def evaluate_handoff(
                             timing,
                             case["atol"],
                             case["rtol"],
-                            case["scale_atol"],
+                            _atol_scale(case),
                             repetitions,
                             case.get("alias_signature"),
                             str(progress_path),

@@ -21,6 +21,7 @@ from .._hardware import get_hardware_info
 from ..language.constexpr import ConstExpr
 from .accuracy import effective_fp8_accuracy
 from .accuracy import is_fp8_dtype
+from .accuracy import keyable_accuracy_check
 from .benchmark_provider import _materialize_multi_shape_config
 from .benchmark_provider import _MultiShapeAutotuneArgs
 from .benchmarking import do_bench_generic
@@ -233,6 +234,38 @@ def _tolerances(
     return atol if atol is not None else 0.01, rtol if rtol is not None else 0.01
 
 
+def _accuracy(
+    settings: Settings,
+    output: object,
+    inputs: Sequence[object],
+    post_args: Sequence[object],
+) -> dict[str, object]:
+    """The case's accuracy rule, as autotuning applied it: an ``AccuracyCheck``'s
+    tolerances, or the ``autotune_baseline_*`` settings (``_tolerances``).
+
+    ``atol_scale`` is the check's per-tensor atol scaling (None, "rms" or
+    "peak"); ``scale_atol`` repeats ``atol_scale == "rms"`` for evaluators
+    that predate ``atol_scale``. They cannot apply "peak", so a bundle with a
+    "peak" case is schema version 2, which they refuse.
+    """
+    check = keyable_accuracy_check(settings)
+    if check is not None:
+        atol, rtol = float(check.atol), float(check.rtol)
+        atol_scale = check.atol_scale
+        fp8_accuracy = check.effective_fp8_accuracy
+    else:
+        atol, rtol = _tolerances(settings, output, inputs, post_args)
+        atol_scale = "rms" if settings.autotune_baseline_atol is None else None
+        fp8_accuracy = effective_fp8_accuracy(settings)
+    return {
+        "atol": atol,
+        "rtol": rtol,
+        "atol_scale": atol_scale,
+        "scale_atol": atol_scale == "rms",
+        "fp8_accuracy": fp8_accuracy,
+    }
+
+
 def _dependencies(source: str) -> list[str]:
     roots: set[str] = set()
     for node in ast.walk(ast.parse(source)):
@@ -287,8 +320,9 @@ def build_handoff(
 
     CUDA bundles default to GPU-only graph timing; ``timing`` can explicitly
     select a native policy. Autotuning retains its own timing policy.
-    Custom accuracy/arbitrary benchmark callbacks and distributed workloads are
-    unsupported. Unsupported standalone export paths raise the backend's error.
+    An ``AccuracyCheck`` carries into the bundle; arbitrary accuracy or
+    benchmark callbacks and distributed workloads are unsupported.
+    Unsupported standalone export paths raise the backend's error.
     The resulting bundle contains no BoundKernel or search object.
     """
     # Runtime imports avoid the kernel -> autotuner package import cycle.
@@ -310,9 +344,13 @@ def build_handoff(
             )
         if bound.env.process_group_name is not None:
             raise NotImplementedError("Distributed handoff evaluation is not supported")
-        if bound.settings.autotune_baseline_accuracy_check_fn is not None:
+        if (
+            bound.settings.autotune_baseline_accuracy_check_fn is not None
+            and keyable_accuracy_check(bound.settings) is None
+        ):
             raise NotImplementedError(
-                "Handoff does not support custom accuracy callbacks"
+                "Handoff supports an exact AccuracyCheck, not a subclass or "
+                "other accuracy callback"
             )
         if bound.settings.autotune_benchmark_fn is not None:
             raise NotImplementedError(
@@ -386,7 +424,7 @@ def build_handoff(
                 output = reference(*reference_args)
                 synchronize_device()
         _save_inputs((output, entry_post_args), case_dir / "reference.pt")
-        atol, rtol = _tolerances(bound.settings, output, entry_inputs, entry_post_args)
+        accuracy = _accuracy(bound.settings, output, entry_inputs, entry_post_args)
         case_metadata.append(
             {
                 "source": f"case_{index}/kernel.py",
@@ -406,16 +444,17 @@ def build_handoff(
                 "reference_kind": reference_kind,
                 "alias_signature": alias_signature,
                 "timing": case_timing,
-                "atol": atol,
-                "rtol": rtol,
-                "scale_atol": bound.settings.autotune_baseline_atol is None,
-                "fp8_accuracy": effective_fp8_accuracy(bound.settings),
+                **accuracy,
                 "inputs": f"case_{index}/inputs.pt",
                 "reference": f"case_{index}/reference.pt",
             }
         )
     manifest = {
-        "schema_version": 1,
+        # Version 2 marks "peak" tolerances, which version-1 evaluators would
+        # misread as unscaled ones.
+        "schema_version": 2
+        if any(case["atol_scale"] == "peak" for case in case_metadata)
+        else 1,
         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "objective": {
             "aggregation": multi.aggregation if multi else "geomean",

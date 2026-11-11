@@ -117,6 +117,30 @@ def test_native_case_contracts_and_backend(
     assert "evaluate.py" not in prompt
 
 
+def test_peak_atol_scale_is_stated_only_when_used(manifest: dict[str, Any]) -> None:
+    default = build_handoff_prompt(manifest)
+    (contract,) = _json_after(default, "Cases:")
+    assert "atol_scale" not in contract
+    assert "max|reference|" not in default
+    manifest["cases"][0].update(atol=0.03, rtol=0.0, atol_scale="peak")
+    peak = build_handoff_prompt(manifest)
+    (contract,) = _json_after(peak, "Cases:")
+    assert contract["atol_scale"] == "peak"
+    assert contract["fp8_accuracy"] == "bitwise"
+    assert "scale_atol" not in contract
+    for rule in (
+        "|output - reference| <= atol * max|reference|",
+        "finite elements",
+        "infinite reference elements must be matched exactly",
+        "a NaN output fails",
+        "integer and bool tensors use the unscaled atol",
+        "each input the reference mutates",
+        'fp8_accuracy "ulp", one fp8 ulp',
+        "not mostly in one direction",
+    ):
+        assert rule in peak
+
+
 @pytest.mark.parametrize("count", [1, 2])
 @pytest.mark.parametrize(
     ("aggregation", "label"), [("geomean", "geometric mean"), ("max", "maximum")]
