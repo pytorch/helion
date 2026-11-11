@@ -700,7 +700,11 @@ def detect_warp_mma_grouped_gemm(
     )
     if reason is not None:
         raise _decline(reason)
-    analyzed = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
+    # The family lowers the accumulator's stores alone (a store of epilogue
+    # inputs is refused with the rest of the root body).
+    analyzed = analyze_tcgen05_matmul_store_chains(
+        graphs, mma_node, adopt_aux_only=False
+    )
     assert analyzed is not None and len(analyzed) == 1
     store_node, chain = analyzed[0]
     assert store_node is proof.worklist_store.store_node and not chain.steps
@@ -829,7 +833,11 @@ def warp_mma_store_matches(
         )
         expected_shape = (batch, m, n)
 
-    analyzed = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
+    # A store of epilogue inputs alone is not the family's: it is refused
+    # with the rest of the root body (``_require_complete_root``).
+    analyzed = analyze_tcgen05_matmul_store_chains(
+        graphs, mma_node, adopt_aux_only=False
+    )
     if analyzed is None:
         raise _decline("every store of the accumulator must be a supported epilogue")
     stores: list[WarpMmaStoreMatch] = []

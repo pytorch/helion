@@ -54,6 +54,7 @@ def _cute_tcgen05_output_store_facts(
     """``(output dtype width, store count)`` of one MMA, for the SMEM fit estimate."""
     from .cute_mma import _trace_mma_to_stores
 
+    # The adopted stores of epilogue inputs alone own C rings too.
     stores = _trace_mma_to_stores(node, device_ir.graphs)
     if not stores:
         return None, 1

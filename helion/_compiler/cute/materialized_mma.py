@@ -145,7 +145,9 @@ def _paired_region_smem_facts(
         or candidate.requires_accumulator_seed
     ):
         return None
-    chains = analyze_tcgen05_matmul_store_chains(graphs, node)
+    # The accumulator's two stores; a store of epilogue inputs alone is not
+    # the family's.
+    chains = analyze_tcgen05_matmul_store_chains(graphs, node, adopt_aux_only=False)
     if chains is None or len(chains) != 2:
         return None
     stores = {store for store, _chain in chains}
@@ -437,10 +439,14 @@ def enable_phase_mma_search(
                 operands.k_block_id,
             }:
                 return False
-            chains = analyze_tcgen05_matmul_store_chains(region_graphs, mma_node)
+            chains = analyze_tcgen05_matmul_store_chains(
+                region_graphs, mma_node, adopt_aux_only=False
+            )
             # Every store the matmul reaches is a spliceable chain, and the
             # phase holds nothing else: an independent store (or any other
-            # op) beside a collective matmul has no tcgen05 lowering.
+            # op) beside a collective matmul has no tcgen05 lowering in a
+            # phase (only a single-region epilogue adopts a store of
+            # epilogue inputs alone).
             if chains is None or (
                 _plain_gemm_region_loops(
                     region_graphs,

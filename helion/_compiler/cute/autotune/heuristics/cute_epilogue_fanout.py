@@ -85,10 +85,12 @@ def register_epilogue_fanout_coverage(
         for node in info.graph.nodes:
             if node.op != "call_function" or node.target not in targets:
                 continue
-            stores = _trace_mma_to_stores(node, device_ir.graphs)
-            if stores is None:
-                continue
             with host:
+                # Every store of the epilogue, the adopted stores of epilogue
+                # inputs included: the pair is the whole store set.
+                stores = _trace_mma_to_stores(node, device_ir.graphs)
+                if stores is None:
+                    continue
                 plan = prove_paired_fanout(env, host, device_ir.graphs, stores, {node})
             if plan is not None:
                 plans.append(plan)

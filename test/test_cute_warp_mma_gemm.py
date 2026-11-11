@@ -676,9 +676,12 @@ def test_root_statements_outside_the_gemm_fail_closed(kernel_fn: object) -> None
     # tile loop (before or after the K loop) is not part of the matched GEMM:
     # it must refuse the family instead of silently dropping that store.  The
     # default (tcgen05) config of the same kernel runs the rest of the tile
-    # body once per thread beside its matmul, where the per-element store has
-    # no lane coordinates either: it refuses too rather than emitting a kernel
-    # that reads undefined lane indices.
+    # body once per thread beside its matmul.  After the K loop the tcgen05
+    # epilogue stores ``flag`` itself, reading ``other`` per subtile
+    # (``aux_tensor.tcgen05_aux_only_epilogue_stores``); ahead of it the
+    # store lowers before the epilogue exists, with no lane coordinates for
+    # its per-element store, and refuses rather than emitting a kernel that
+    # reads undefined lane indices.
     bound = _bind(
         kernel_fn,
         torch.empty((256, 256), dtype=torch.float16, device=CPU_DEVICE),
@@ -691,8 +694,11 @@ def test_root_statements_outside_the_gemm_fail_closed(kernel_fn: object) -> None
         _source(bound, _warp_config([16, 8, 128], 1))
     with bound.env:
         default = bound.config_spec.default_config()
-    with pytest.raises(BackendUnsupported, match="beside a collective matmul"):
-        bound.to_code(default)
+    if kernel_fn is _extra_root_store_after:
+        assert "tcgen05_tma_store_atom_1" in bound.to_code(default)
+    else:
+        with pytest.raises(BackendUnsupported, match="beside a collective matmul"):
+            bound.to_code(default)
 
 
 def test_admission_mirrors_the_detector_gates() -> None:

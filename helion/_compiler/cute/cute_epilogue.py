@@ -73,12 +73,14 @@ import math
 import operator
 from typing import TYPE_CHECKING
 from typing import TypeVar
+from typing import cast
 
 import sympy
 import torch
 from torch._subclasses.fake_tensor import unset_fake_temporarily
 
 from ...language import _tracing_ops
+from ...language import memory_ops
 from ...language._gelu_tanh_approx import _gelu_erf
 from ...language._gelu_tanh_approx import _gelu_tanh_approx
 from ...language._gelu_tanh_approx import epilogue_unary_step_template
@@ -1450,6 +1452,16 @@ class Tcgen05UnaryEpilogueChain:
     steps: tuple[_AuxiliaryTensorExprStep, ...]
 
     @property
+    def reads_accumulator(self) -> bool:
+        """Whether the stored value reads the accumulator: the identity chain
+        stores it and every matmul chain's first step reads it; the one-step
+        chain of an aux-only store (``analyze_tcgen05_aux_only_store_chain``)
+        computes its value from epilogue input loads alone."""
+        return not self.steps or any(
+            _tensor_expr_contains_current(step.expr) for step in self.steps
+        )
+
+    @property
     def auxiliary_tensor_loads(self) -> tuple[_AuxiliaryTensorLoadExpr, ...]:
         """All auxiliary-tensor steps in application order.
 
@@ -2757,6 +2769,86 @@ def analyze_tcgen05_unary_epilogue_chain(
         # actionable message.
         return None
     return None
+
+
+def store_tile_index_nodes(
+    store_node: torch.fx.Node,
+) -> tuple[torch.fx.Node, ...] | None:
+    """The index nodes of a store's subscript, when every index is a node:
+    the stores of one output tile share them."""
+    subscripts = store_node.args[1] if len(store_node.args) > 1 else None
+    if not isinstance(subscripts, (list, tuple)) or not all(
+        isinstance(index, torch.fx.Node) for index in subscripts
+    ):
+        return None
+    return tuple(cast("list[torch.fx.Node]", subscripts))
+
+
+def analyze_tcgen05_aux_only_store_chain(
+    store_node: torch.fx.Node,
+) -> Tcgen05UnaryEpilogueChain | None:
+    """The one-step chain of a store whose value never reads the accumulator.
+
+    ``out1[tile] = in2[tile].to(torch.float32)`` beside the stores of a
+    collective matmul's accumulator stores an epilogue input itself. The
+    collective matmul runs the rest of the tile body once per thread, so the
+    load has no per-element coordinates outside the matmul's epilogue
+    (``memory_ops._cute_load_has_placeholder_value``); the epilogue reads it
+    per subtile through the accumulator's partition like any auxiliary leaf.
+    The value must classify as an auxiliary expression
+    (``_classify_auxiliary_tensor_expr``: loads at the store's own tile
+    coordinates, scalars and whitelisted elementwise ops) whose loads are all
+    exact-shape: a broadcast row would take a shared-memory row stage the
+    SMEM model prices only for the accumulator's chains. A trailing
+    conversion to the output dtype is the splice site's ``.to(target_dtype)``,
+    as for every chain. The single step holds no ``_CurrentTensorExpr``, so
+    each subtile renders ::
+
+        tcgen05_aux_loaded = tcgen05_aux_rmem.load()
+        tcgen05_acc_vec = tcgen05_aux_loaded.to(cutlass.Float32)
+
+    Which matmul's epilogue stores it is
+    ``aux_tensor.tcgen05_aux_only_epilogue_stores``'s decision.
+    """
+    if (
+        store_node.op != "call_function"
+        or store_node.target is not memory_ops.store
+        or store_node.kwargs
+        or len(store_node.args) != 4
+        or store_node.args[3] is not None
+    ):
+        return None
+    tensor_node, _subscripts, value = store_node.args[:3]
+    output = (
+        tensor_node.meta.get("val") if isinstance(tensor_node, torch.fx.Node) else None
+    )
+    index_nodes = store_tile_index_nodes(store_node)
+    if (
+        not isinstance(output, torch.Tensor)
+        or not isinstance(value, torch.fx.Node)
+        or index_nodes is None
+    ):
+        return None
+    chain_input = value
+    converted = _convert_input_and_dtype(value)
+    if converted is not None and converted[1] == output.dtype:
+        # the store conversion itself, which the splice site renders
+        chain_input = converted[0]
+    tile_shape = _carrier_tile_shape(chain_input)
+    if tile_shape is None or len(tile_shape) != len(index_nodes):
+        return None
+    expr = _classify_auxiliary_tensor_expr(
+        chain_input,
+        carrier_tile_shape=tile_shape,
+        carrier_tile_index_nodes=index_nodes,
+        carrier_global_shape=tuple(output.shape),
+    )
+    if expr is None:
+        return None
+    leaves = _tensor_expr_leaves(expr, _AuxiliaryTensorLoadExpr)
+    if not leaves or any(leaf.broadcast_axis is not None for leaf in leaves):
+        return None
+    return _chain_of([_AuxiliaryTensorExprStep(expr=expr)])
 
 
 def _convert_input_and_dtype(

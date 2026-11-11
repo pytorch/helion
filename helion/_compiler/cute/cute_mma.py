@@ -58,6 +58,7 @@ from .admission import Declined
 from .admission import refused
 from .aux_tensor import analyze_tcgen05_matmul_store_chains
 from .aux_tensor import discover_tcgen05_aux_tensor_descriptors
+from .aux_tensor import tcgen05_aux_only_epilogue_stores
 from .aux_tensor import tcgen05_promoted_rowvec_epilogue
 from .cp_async_operand import Tcgen05CpAsyncALayout
 from .cp_async_operand import Tcgen05CpAsyncAPlan
@@ -7147,7 +7148,12 @@ def _trace_mma_to_stores(
     mma_node: Node,
     graphs: list[GraphInfo],
 ) -> tuple[Node, ...] | None:
-    """Forward-trace ``mma_node`` to all reachable supported stores."""
+    """Forward-trace ``mma_node`` to all reachable supported stores, then the
+    stores of epilogue inputs alone its tcgen05 epilogue adopts
+    (``aux_tensor.tcgen05_aux_only_epilogue_stores``): every store the
+    epilogue writes, for its store protocol, TMA legality and C rings. The
+    adoption's alias proof reads the bound arguments, so a kernel with such
+    a store must be traced inside its host function."""
     import operator
 
     from ...language import _tracing_ops
@@ -7218,7 +7224,17 @@ def _trace_mma_to_stores(
                 continue
             return None
 
-    return tuple(stores) if stores else None
+    if not stores:
+        return None
+    # A store of epilogue inputs alone beside the accumulator's
+    # (``out1[tile] = in2[tile].to(torch.float32)``) is one of the epilogue's
+    # output stores: it walks the same subtiles with its own C ring, waits
+    # for the accumulator as the first store and releases it as the last.
+    traced = tuple(stores)
+    return traced + tuple(
+        store
+        for store, _chain in tcgen05_aux_only_epilogue_stores(graphs, mma_node, traced)
+    )
 
 
 def _trace_mma_to_store_dtypes(
