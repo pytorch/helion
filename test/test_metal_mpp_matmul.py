@@ -14194,6 +14194,13 @@ class TestMppWholeKDot(_WholeKDotCase):
                     preamble, r"_mpp_owner\w* = tid\[0\] == 0 and tid\[2\]"
                 )
 
+    def test_mamba2_chunk_scan_dstate_equal_to_headdim(self) -> None:
+        """At the default config dstate's ':' block holds threads around the K
+        loop's matmul, whose operands load x: x's host dim of dstate's length
+        is no block of theirs."""
+        args = _scan_args(1, 2, 64, 2, 16, 16)
+        self._mpp(mamba2_chunk_scan, args, None, ref_chunk_scan(*_cpu64(*args)), ops=2)
+
     def test_mamba2_chunk_state(self) -> None:
         """A staged, transposed, decayed lhs, at a small shape with tails."""
         args = _state_args(2, 3, 48, 3, 24, 40)

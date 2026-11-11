@@ -2885,11 +2885,16 @@ def _group_blocks(group: MppGroup) -> set[int]:
     index tiles included.  The planner admits a seed, an update's operands,
     an epilogue's and a store's only over the group's own blocks or as 0-d
     values, so threads that differ on any other block hold the same element
-    of every value the group stages or reads per element."""
+    of every value the group stages or reads per element.  A loaded host
+    tensor's dims are host extents, not blocks; only its load's are."""
     nodes = {group.matmul, *(n for n in _operands(group.matmul) if n is not None)}
     blocks: set[int] = set()
     for n in nodes:
         for v in (n, *n.all_input_nodes):
+            if v.target is _tracing_ops._host_tensor:
+                # An extent that equals a reduction dim's size would
+                # resolve to that block.
+                continue
             val = v.meta.get("val")
             sizes = val.size() if isinstance(val, torch.Tensor) else (val,)
             # _block maps only ints and SymInts; a float kernel argument's
