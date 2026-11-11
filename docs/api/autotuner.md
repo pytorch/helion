@@ -27,6 +27,15 @@ to benchmark in-process.
 ```
 
 
+## Accuracy Checks
+
+### AccuracyCheck
+
+```{eval-rst}
+.. autoclass:: helion.autotuner.AccuracyCheck
+   :members: cache_policy
+```
+
 ## Configuration Classes
 
 ### Config

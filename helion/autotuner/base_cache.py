@@ -162,8 +162,9 @@ class LooseAutotuneCacheKey(BoundKernelInMemoryCacheKey):
         winning config across trials is the one cached. Default ``1`` (the
         historical single-trial path) is hidden from ``repr`` so K=1 cache
         hashes stay byte-identical to entries written before this field existed.
-    search_policy_hash: Hash of the effective CuTe-flash search policy. Empty
-        for every other search so their historical cache hashes stay unchanged.
+    search_policy_hash: Hash of the effective CuTe-flash search policy, or for
+        other kernels of the ``AccuracyCheck`` validating the search. Empty
+        otherwise, so historical cache hashes stay unchanged.
     """
 
     kernel_source_hash: str

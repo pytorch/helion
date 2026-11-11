@@ -373,7 +373,7 @@ def test_original_mamba_tmem_a_cuda(
             reference(*args),
             atol=0.01,
             rtol=0.01,
-            scale_atol_by_expected_rms=True,
+            atol_scale="rms",
         )
         torch.testing.assert_close(bound(*args), expected, rtol=0, atol=0)
         torch.testing.assert_close(replay(), expected, rtol=0, atol=0)

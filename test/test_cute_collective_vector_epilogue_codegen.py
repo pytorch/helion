@@ -269,7 +269,7 @@ def test_mamba_epilogue_cuda_mutations(
             reference(*arguments),
             atol=0.01,
             rtol=0.01,
-            scale_atol_by_expected_rms=True,
+            atol_scale="rms",
         )
         torch.testing.assert_close(run(), expected, rtol=0, atol=0)
         output = replay()

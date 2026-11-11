@@ -608,9 +608,9 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
     def _create_shape_key(self) -> ShapeKey:
         """Create a shape key for the current kernel invocation."""
-        from .local_cache import _cute_flash_search_policy_hash
+        from .local_cache import _search_policy_hash
 
-        search_policy_hash = _cute_flash_search_policy_hash(
+        search_policy_hash = _search_policy_hash(
             self.autotuner,
             cute_flash_search_enabled=self.kernel.config_spec.cute_flash_search_enabled,
         )

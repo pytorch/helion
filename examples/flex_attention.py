@@ -324,34 +324,25 @@ def _flex_attention_bwd_preprocess(
     return delta, lse2
 
 
-def _gradient_accuracy_check(actual: object, expected: object) -> None:
-    """Autotuning accuracy check of :func:`helion_flex_attention_backward_kernel`.
-
-    bf16 attention gradients carry rounding error proportional to each
-    output's peak magnitude (P and dS round to bf16 before the dV / dK / dQ
-    MMAs; dQ accumulates through fp32 atomics), and gradient tensors are
-    heavy-tailed (their peak is ~30-70x their rms).  The default check's
-    absolute tolerance (1e-2, scaled only when the rms exceeds 1) rejects
-    correct configs over a single mid-magnitude element (e.g. every polynomial
-    exp2 config of a causal mask).  This check bounds every element's
-    difference by 2% of the output's peak instead: correct configs differ from
-    each other by at most ~0.8% of the peak, broken ones (a missing tile, a
-    wrong scale, a race) by far more.
-    """
-    for got, ref in zip(
-        cast("tuple[torch.Tensor, ...]", actual),
-        cast("tuple[torch.Tensor, ...]", expected),
-        strict=True,
-    ):
-        ref = ref.float()
-        peak = ref.abs().max().item()
-        torch.testing.assert_close(got.float(), ref, atol=2e-2 * peak, rtol=0.0)
+# Autotuning accuracy check of :func:`helion_flex_attention_backward_kernel`.
+# bf16 attention gradients carry rounding error proportional to each output's
+# peak magnitude (P and dS round to bf16 before the dV / dK / dQ MMAs; dQ
+# accumulates through fp32 atomics), and gradient tensors are heavy-tailed
+# (their peak is ~30-70x their rms).  The default check's absolute tolerance
+# (1e-2, scaled only when the rms exceeds 1) rejects correct configs over a
+# single mid-magnitude element (e.g. every polynomial exp2 config of a causal
+# mask).  This check bounds every element's difference by 2% of the output's
+# peak instead: correct configs differ from each other by at most ~0.8% of the
+# peak, broken ones (a missing tile, a wrong scale, a race) by far more.
+_GRADIENT_ACCURACY_CHECK = helion.autotuner.AccuracyCheck(
+    atol=2e-2, rtol=0.0, atol_scale="peak"
+)
 
 
 @helion.kernel(
     static_shapes=True,
     fast_math=True,
-    autotune_baseline_accuracy_check_fn=_gradient_accuracy_check,
+    autotune_baseline_accuracy_check_fn=_GRADIENT_ACCURACY_CHECK,
 )
 def helion_flex_attention_backward_kernel(
     query: torch.Tensor,
