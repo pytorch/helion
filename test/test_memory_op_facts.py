@@ -68,9 +68,10 @@ class TestMemoryOpFacts(RefEagerTestBase, TestCase):
     def test_reduction_fact_indexing_slot_invariant(self):
         """The ReductionKernelFact is built after _collect_memory_op_facts, but the collector
         still runs after the reduction rolling, so every rolled-subgraph load/store keeps
-        its ``Config.indexing`` slot and the ``memory_op_facts[i].indexing_index == i``
-        invariant holds. Collecting before the rolling would desync ``Config.indexing``
-        from codegen."""
+        its ``Config.indexing`` slot: in this kernel, whose loads and stores all take one
+        (``tile.index`` and stack tensor loads take the slots after the others), fact
+        ``i`` has slot ``i``. Collecting before the rolling would desync
+        ``Config.indexing`` from codegen."""
         x = torch.randn([256, 512], device=DEVICE, dtype=torch.float32)
         spec = row_sum_kernel.bind((x,)).config_spec
         specs = spec.memory_op_facts

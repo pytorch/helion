@@ -15,6 +15,7 @@ from torch.utils._sympy.functions import Min as SymbolicMin
 
 from .. import exc
 from .._dist_utils import _resolve_process_group
+from .._utils import indexing_uses_tensor_descriptor
 from .ast_extension import ExtendedAST
 from .ast_extension import create
 from .ast_extension import expr_from_string
@@ -1453,10 +1454,26 @@ def emit_cross_loop_schedule(
             and indexing[memory_op_index] == "tensor_descriptor"
         )
 
+    # The stores this code indexes through tensor descriptors, by their
+    # ``memory_op_facts`` slot (``TileAccess.memory_op_index``): a config that
+    # rolls a reduction numbers its slots in an order of its own.
+    descriptor_stores: set[int] = set()
+    if indexing_uses_tensor_descriptor(indexing):
+        from .device_ir import codegen_memory_op_fact_pairs
+
+        descriptor_stores = {
+            fact.indexing_index
+            for fact, config_fact in codegen_memory_op_fact_pairs(
+                device_function.codegen.codegen_graphs,
+                HostFunction.current().device_ir.root_ids,
+            )
+            if fact.kind == "store"
+            and uses_tensor_descriptor(config_fact.indexing_index)
+        }
     unpublishable_site_ids = frozenset(
         site_id
         for access in dependency_graph.accesses
-        if access.kind == "store" and uses_tensor_descriptor(access.memory_op_index)
+        if access.kind == "store" and access.memory_op_index in descriptor_stores
         for site_id in dependency_graph.site_ids_by_access[access.access_id]
     )
     publishable_site_ids = (

@@ -1519,6 +1519,45 @@ class TestReductions(RefEagerTestBase, TestCase):
         expected = x.float() - 1.0
         torch.testing.assert_close(output, expected, rtol=1e-3, atol=1e-3)
 
+    @skipIfPallas("Pallas does not pad hl.arange to a power of two")
+    @skipIfMetal("not verified on Metal")
+    @skipIfCute("CuTe sums a grid load over a padded hl.arange wrong")
+    def test_mean_over_a_padded_range_divides_by_its_length(self):
+        """A grid kernel's load over ``hl.arange(n)``, for an ``n`` that is not a
+        power of two, has the range's padded size; the lanes past ``n`` hold no
+        elements, and the mean divides by ``n``, as do var_mean's mean and
+        variance (they divided by 256 at n=200).  Triton leaves those
+        lanes, where the squared deviation is ``(0 - mean) ** 2``, out of
+        var_mean's sum."""
+
+        @helion.kernel(static_shapes=True)
+        def grid_row_stats(
+            x: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            m, n = x.shape
+            mean = torch.empty([m], dtype=x.dtype, device=x.device)
+            var = torch.empty([m, 1], dtype=x.dtype, device=x.device)
+            var_mean = torch.empty([m, 1], dtype=x.dtype, device=x.device)
+            for i in hl.grid(m):
+                row = hl.load(x, [i, hl.arange(n)])
+                mean[i] = row.mean(-1)
+                var[i, :], var_mean[i, :] = torch.var_mean(
+                    row, dim=-1, keepdim=True, correction=0
+                )
+            return mean, var, var_mean
+
+        for width in (5, 200):
+            with self.subTest(width=width):
+                x = torch.randn(16, width, device=DEVICE) + 1.0
+                _, (mean, var, var_mean) = code_and_output(grid_row_stats, (x,))
+                torch.testing.assert_close(mean, x.mean(-1), rtol=1e-4, atol=1e-4)
+                torch.testing.assert_close(
+                    var_mean, x.mean(-1, keepdim=True), rtol=1e-4, atol=1e-4
+                )
+                torch.testing.assert_close(
+                    var, x.var(-1, correction=0, keepdim=True), rtol=1e-4, atol=1e-4
+                )
+
     @skipIfRefEager("block sizes are not applied in ref mode: no tile is padded")
     def test_mean_over_a_padded_tile_divides_by_the_tiles_elements(self):
         """A block wider than the dim, or the last tile of a dim the block does not divide, holds fewer elements than the block; the masked ones are out of the sum and must not count in the mean's divisor."""

@@ -468,9 +468,9 @@ class _Graphs:
         return self.infos[gid]
 
     def if_branch(self, gid: object) -> tuple[IfGraphInfo, list[tuple[int | str, ...]]]:
-        """An if branch graph's info and its ``branches_outputs``: per output
-        of the ``_if``, its slot in each branch graph's output, or the name an
-        else branch leaves as it was."""
+        """An if branch graph's info and its ``branches_outputs``: per
+        variable the ``_if`` gives back, its slot in each branch graph's
+        output, or its name for the branch that leaves it as it was."""
         from ..device_ir import IfGraphInfo
 
         info = self.info(gid)
@@ -1153,14 +1153,13 @@ def _dot_admissible(matmul: Node, dot_ks: set[int]) -> bool:
 def _matmul_derived(node: Node, graphs: _Graphs) -> bool:
     """Whether a matmul's result reaches ``node``: through its producers,
     each placeholder's value from the enclosing graph, each loop-carried
-    placeholder's carried-back value and each for loop's output value in its
-    body, up to loads and shape reads.
+    placeholder's carried-back value, each for loop's output value in its
+    body and each ``if`` result's branch output, or the outer value a branch
+    passes through, up to loads and shape reads.
 
     Unlike :func:`_producers`, which stops at a carried placeholder (a staged
     operand's positional check needs only its first-iteration value), this
-    follows every value an operand can hold.  It has no ``_if`` output edge:
-    an ``if`` output that reaches an ``hl.dot`` operand fails in the
-    frontend's masked-value pass (``node_masking.getitem_masked_value``)."""
+    follows every value an operand can hold."""
     work = [node]
     seen: set[Node] = set()
     while work:
@@ -1192,8 +1191,28 @@ def _matmul_derived(node: Node, graphs: _Graphs) -> bool:
             if isinstance(value, Node):
                 work.append(value)
             continue
+        if isinstance(flow, Node) and flow.target is _tracing_ops._if:
+            value = _if_result(flow, cast("int", n.args[1]), graphs)
+            if value is not None:
+                work.append(value)
+            continue
         work += n.all_input_nodes
     return False
+
+
+def _if_result(if_node: Node, index: int, graphs: _Graphs) -> Node | None:
+    """The value result ``index`` of ``if_node`` takes: a branch output, or
+    for a variable only the other branch writes, the outer value this branch
+    passes through (``IfGraphInfo.result_source``); None for a value that is
+    not a node."""
+    info, _ = graphs.if_branch(if_node.args[1])
+    source = info.result_source(if_node, index)
+    if not isinstance(source, tuple):
+        return source
+    graph_id, slot = source
+    (output,) = graphs.info(graph_id).graph.find_nodes(op="output")
+    value = _seq(output.args[0])[slot]
+    return value if isinstance(value, Node) else None
 
 
 def _plan_group(gid: int, matmul: Node, k_loop_block: int, graphs: _Graphs) -> MppGroup:
@@ -2442,17 +2461,21 @@ def _check_uniform(node: Node, graphs: _Graphs) -> None:
 
 def _live_exit(node: Node, output: Node, graphs: _Graphs) -> bool:
     """Whether a getitem of the graph's owner reads one of ``output``'s slots
-    that hold ``node``.  An if graph outputs every name it writes, so a slot
-    no getitem reads is dead."""
+    that hold ``node``.  A branch graph also outputs the variables local to
+    it, which the ``_if`` does not give back, so their slots are dead."""
     owner = graphs.owner(output)
     if owner is None:
         return True
     slots = {i for i, v in enumerate(_seq(output.args[0])) if v is node}
     if owner.target is _tracing_ops._if:
+        info, _ = graphs.if_branch(owner.args[1])
         gid = graphs.graph_id[output.graph]
-        _, branches = graphs.if_branch(gid)
-        side = 0 if gid == owner.args[1] else 1
-        slots = {i for i, pair in enumerate(branches) if pair[side] in slots}
+        live = {(gid, slot) for slot in slots}
+        return any(
+            u.target is operator.getitem
+            and info.result_source(owner, cast("int", u.args[1])) in live
+            for u in owner.users
+        )
     return any(u.target is operator.getitem and u.args[1] in slots for u in owner.users)
 
 

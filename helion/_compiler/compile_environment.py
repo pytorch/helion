@@ -690,6 +690,12 @@ class CompileEnvironment:
             f"helion_debug_shape_renames_{id(self)}",
             default=None,
         )
+        # The symbols of ``config_value_expressions`` no host variable names
+        # (a host helper written inline, ``block_size=[next_power_of_2(foo)]``):
+        # code generation substitutes the value each takes under the config
+        # it compiles (``config_constants``).  Recorded once the type pass has
+        # given host variables their origins (``propagate_types``).
+        self.inline_config_symbols: frozenset[sympy.Symbol] = frozenset()
         try:
             from ..runtime import get_num_sm
 
@@ -981,6 +987,25 @@ class CompileEnvironment:
                 # the logical extent is constant. Tiled axes do not.
                 expr = self.specialize_expr(self.shape_env.simplify(block.numel))
         return int(expr) if isinstance(expr, sympy.Integer) else None
+
+    def config_constants(self, expr: sympy.Expr, config: Config) -> sympy.Expr:
+        """``expr`` with each of ``inline_config_symbols`` replaced by the
+        value it takes under ``config`` (``config_value_expressions``)."""
+        if not self.inline_config_symbols:
+            return expr
+        free = expr.free_symbols
+        symbols = [symbol for symbol in self.inline_config_symbols if symbol in free]
+        if not symbols:
+            return expr
+        # pyrefly: ignore [bad-return]
+        return expr.xreplace(
+            {
+                symbol: sympy.Integer(
+                    self.config_value_expressions[symbol].evaluate(config)
+                )
+                for symbol in symbols
+            }
+        )
 
     def register_tensor_descriptor_layout_guard(
         self,
@@ -2517,32 +2542,67 @@ class CompileEnvironment:
         self, tensors: typing.Sequence[torch.Tensor]
     ) -> list[int | torch.SymInt]:
         """Compute broadcast shape for tensor indexers."""
-        shapes = [list(t.size()) for t in tensors]
-        if all(len(s) == 1 for s in shapes) and len(shapes) > 1:  # Cartesian
-            # Normalize each dimension to block size variable
-            return self._normalize_shape_to_block_vars([s[0] for s in shapes])
-        max_ndim = max(len(s) for s in shapes)
-        padded = [([1] * (max_ndim - len(s)) + s) for s in shapes]
-        result = [
-            next((d for d in dims if self.size_hint(d) != 1), 1)
-            for dims in zip(*padded, strict=True)
+        result: list[int | torch.SymInt] = [
+            tensors[sources[0][0]].size(sources[0][1]) if sources else 1
+            for sources in self.tensor_indexer_broadcast_sources(tensors)
         ]
         # Normalize the result to use canonical block size variables
         return self._normalize_shape_to_block_vars(result)
+
+    def tensor_indexer_broadcast_sources(
+        self, tensors: typing.Sequence[torch.Tensor]
+    ) -> list[list[tuple[int, int]]]:
+        """For each dim of ``tensor_indexer_broadcast_shape``, the
+        ``(tensor, dim)`` positions of the indexer dims it runs along, the
+        one that sizes it first: one dim per tensor for several 1-D indexers
+        (the Cartesian case), else the dims of the tensors that align with it
+        from the trailing end, leaving out those of size 1."""
+        shapes = [list(t.size()) for t in tensors]
+        if all(len(s) == 1 for s in shapes) and len(shapes) > 1:  # Cartesian
+            return [[(i, 0)] for i in range(len(shapes))]
+        max_ndim = max(len(s) for s in shapes)
+        return [
+            [
+                (i, dim - max_ndim + len(s))
+                for i, s in enumerate(shapes)
+                if dim - max_ndim + len(s) >= 0
+                and self.size_hint(s[dim - max_ndim + len(s)]) != 1
+            ]
+            for dim in range(max_ndim)
+        ]
 
     def tensor_indexer_dims(
         self, indexer_tensor: torch.Tensor
     ) -> list[int | torch.SymInt]:
         """Return dims contributed by a tensor indexer (non-broadcast case)."""
+        return [size for size, _ in self._tensor_indexer_dims(indexer_tensor)]
+
+    def tensor_indexer_dim_sources(
+        self, indexer_tensor: torch.Tensor
+    ) -> list[int | None]:
+        """The dim of ``indexer_tensor`` each of its ``tensor_indexer_dims``
+        runs along, or None where no one dim does (a block's variable
+        standing for several, or the 1 of an indexer of size-1 dims)."""
+        return [dim for _, dim in self._tensor_indexer_dims(indexer_tensor)]
+
+    def _tensor_indexer_dims(
+        self, indexer_tensor: torch.Tensor
+    ) -> list[tuple[int | torch.SymInt, int | None]]:
+        """``tensor_indexer_dims`` with ``tensor_indexer_dim_sources``."""
         if indexer_tensor.ndim == 0:
             # Scalar tensor eliminates a dimension, contributes no output dims
             return []
-        non_trivial = [d for d in indexer_tensor.size() if self.size_hint(d) != 1]
+        non_trivial = [
+            (dim, size)
+            for dim, size in enumerate(indexer_tensor.size())
+            if self.size_hint(size) != 1
+        ]
         # Use size-based approach to find block_id
-        bid = self.resolve_block_id(non_trivial[0]) if non_trivial else None
+        bid = self.resolve_block_id(non_trivial[0][1]) if non_trivial else None
         if bid is not None:
-            return [self.block_sizes[self.canonical_block_id(bid)].var]
-        return non_trivial or [1]  # type: ignore[return-value]
+            var = self.block_sizes[self.canonical_block_id(bid)].var
+            return [(var, non_trivial[0][0] if len(non_trivial) == 1 else None)]
+        return [(size, dim) for dim, size in non_trivial] or [(1, None)]
 
     def new_index_result(
         self, tensor: torch.Tensor, output_shape: typing.Sequence[int | torch.SymInt]
@@ -3563,10 +3623,27 @@ class BlockSizeSource:
 @dataclasses.dataclass
 class FixedBlockSizeSource(BlockSizeSource):
     value: int | torch.SymInt
+    # Whether ``value`` reads a symbol that no host variable names, a host
+    # helper over tunables written inline (``inline_config_symbols``), so the
+    # block varies with the config.  The type pass sets it once it knows
+    # those symbols.
+    varies_with_config: bool = dataclasses.field(default=False, compare=False)
 
     def from_config(
         self, config: Config, block_size_info: BlockSizeInfo
     ) -> int | torch.SymInt:
+        if (
+            self.varies_with_config
+            and isinstance(self.value, torch.SymInt)
+            and (expr := _symint_expr(self.value)) is not None
+        ):
+            # A host helper over tunables written inline in ``block_size``
+            # (``helion.next_power_of_2(foo)``) has no host variable to pass
+            # its value in: the block takes the value under ``config`` and is
+            # static, like a literal block size.
+            resolved = CompileEnvironment.current().config_constants(expr, config)
+            if isinstance(resolved, sympy.Integer):
+                return int(resolved)
         return self.value
 
 

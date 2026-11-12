@@ -159,9 +159,13 @@ def _root_launch_threads(code: str) -> tuple[int, int]:
 _plan_thread_axis = TileStrategyDispatch.thread_axis_for_strategy
 
 
-def _shift_tile_axes(self: TileStrategyDispatch, target: TileStrategy) -> int | None:
+def _shift_tile_axes(
+    self: TileStrategyDispatch,
+    target: TileStrategy,
+    root_grid: TileStrategy | None = None,
+) -> int | None:
     """A launch layout one axis too high for every tile."""
-    axis = _plan_thread_axis(self, target)
+    axis = _plan_thread_axis(self, target, root_grid)
     if axis is not None and not isinstance(target, ReductionStrategy):
         return axis + 1
     return axis

@@ -386,6 +386,14 @@ class Backend(abc.ABC):
         on the device (through ``hl.split``)."""
         return False
 
+    @property
+    def lowers_mask_select(self) -> bool:
+        """Whether the backend lowers ``_mask_select``, with which
+        ``mask_loop_carries`` keeps a partial tile's padded lanes out of a
+        loop carry; without it such a carry takes the values those lanes
+        load (FlyDSL)."""
+        return False
+
     def barrier_allows_pid_type(self, pid_type: str) -> bool:
         """Whether ``hl.barrier()`` keeps ``pid_type`` available.
 
@@ -419,6 +427,14 @@ class Backend(abc.ABC):
         """Whether a statically known program count may be folded into the
         grouped-ordering arithmetic (``L2GroupingProgramIDs``)."""
         return False
+
+    @property
+    def relowered_memory_ops_take_new_slots(self) -> bool:
+        """Whether a load or store that code generation lowers again (a
+        ``while`` condition, again at the end of the loop's body) takes the
+        next per-memory-op config slots (``indexing``,
+        ``load_eviction_policies``) rather than the ones it took first."""
+        return True
 
     @property
     def reduction_loops_allow_non_power_of_two(self) -> bool:
@@ -1218,6 +1234,17 @@ class Backend(abc.ABC):
         """Generate a backend-specific conditional select expression."""
         raise exc.BackendUnsupported(self.name, "where")
 
+    def mask_padded_range_lanes(
+        self, value: str, length: int, dim: int, ndim: int, identity: str
+    ) -> str | None:
+        """``value``, the input of a persistent reduction over dim ``dim`` of
+        an ``ndim``-dim value, with that dim's lanes past the ``length``
+        elements of a padded ``hl.arange`` set to the reduction's
+        ``identity``, or None to leave the input as it is: the default, for
+        backends whose reductions do not read those lanes through this path
+        (masking them in their own emitter, or not padding the range)."""
+        return None
+
     def minimum_expr(self, a: str, b: str) -> str:
         """Generate a backend-specific minimum expression."""
         raise exc.BackendUnsupported(self.name, "minimum")
@@ -1789,7 +1816,9 @@ class Backend(abc.ABC):
     def shares_sibling_thread_axes(self) -> bool:
         """Whether sibling tile loops and mutually exclusive pid branches share
         CUDA thread axes: the dispatcher then widens narrower siblings to the
-        launch and lets exclusive branches share an axis."""
+        launch, lets exclusive branches share an axis, and lays a loop that
+        several grid roots run out after each root's own grid (elsewhere the
+        roots must agree on its axis)."""
         return False
 
     def inactive_broadcast_alias_block_ids(

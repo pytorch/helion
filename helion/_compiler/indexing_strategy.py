@@ -5,6 +5,7 @@ import collections
 import dataclasses
 import logging
 import operator
+import threading
 from typing import TYPE_CHECKING
 from typing import ClassVar
 from typing import NamedTuple
@@ -39,6 +40,7 @@ if TYPE_CHECKING:
     from ..runtime.config import Config
     from ..runtime.config import IndexingLiteral
     from .device_function import TensorDescriptorArg
+    from .device_ir import GraphInfo
     from .inductor_lowering import CodegenState
 
     SymIntLike = torch.SymInt | int
@@ -191,24 +193,64 @@ def exact_tile_block_ids(
     return tuple(block_ids)
 
 
-def _padded_iota_dims(node: object) -> tuple[int | None, ...] | None:
+def _padded_iota_dims(
+    node: object,
+    *,
+    through_loads: bool = False,
+    memo: dict[tuple[torch.fx.Node, bool], tuple[int | None, ...] | None] | None = None,
+) -> tuple[int | None, ...] | None:
     """Per-dim lengths of the padded iotas ``node`` is computed lane-wise from.
 
     A static non-power-of-2 ``hl.arange`` is emitted as a power-of-2 range, and
     ``[:, None]`` subscripts and pointwise ops (``rows[:, None] * 9 + cols``)
-    keep its padding lanes in place.  Entry ``d`` is the iota length behind
-    dim ``d``, or None where no padded iota feeds that dim.
+    keep its padding lanes in place; with ``through_loads``, so does a load
+    indexed by such a range (``_padded_load_dims``).  Entry ``d`` is the iota
+    length behind dim ``d``, or None where no padded iota feeds that dim.
     """
+    from ..language import _tracing_ops
+    from ..language import memory_ops
     from ..language import view_ops
 
     if not isinstance(node, torch.fx.Node):
         return None
+    if memo is None and through_loads and not _kernel_has_padded_iota(node):
+        return None
+    if memo is None:
+        memo = {}
+    if (captured := _captured_value(node)) is not None:
+        value, update = captured
+        held = _padded_iota_dims_once(value, through_loads, memo)
+        if update is None:
+            return held
+        # A loop carry keeps its lanes in place (``_phi`` keeps its shape):
+        # it is padded as its value before the loop is while the loop's
+        # update keeps that padding.  The update reads the carry, so the walk
+        # takes the answer for it first and drops what it found from there
+        # if the update disagrees.
+        key = (node, through_loads)
+        before = set(memo)
+        memo[key] = held
+        updated = _padded_iota_dims_once(update, through_loads, memo)
+        if updated != held:
+            for stale in set(memo) - before:
+                del memo[stale]
+            return _padding_differs(memo, held, updated)
+        return held
+    if node.target is _tracing_ops._phi:
+        # The value after a loop or an ``if``, which merges the value before
+        # it with the loop's or branch's result.
+        found = [_merged_dims(side, through_loads, memo) for side in node.args]
+        if found[0] == found[1]:
+            return found[0]
+        return _padding_differs(memo, *found)
     if node.target == torch.ops.prims.iota.default:
         length = node.args[0]
         padded = isinstance(length, int) and length != next_power_of_2(length)
         return (length if padded else None,)
+    if through_loads and node.target is memory_ops.load:
+        return _padded_load_dims(node, memo)
     if node.target is view_ops.subscript:
-        base = _padded_iota_dims(node.args[0])
+        base = _padded_iota_dims_once(node.args[0], through_loads, memo)
         index = node.args[1]
         if base is None or not isinstance(index, (list, tuple)):
             return None
@@ -224,14 +266,15 @@ def _padded_iota_dims(node: object) -> tuple[int | None, ...] | None:
                 return None
         return (*dims, *base[consumed:])
     val = node.meta.get("val")
-    if not isinstance(val, torch.Tensor) or torch.Tag.pointwise not in getattr(
-        node.target, "tags", ()
+    if not isinstance(val, torch.Tensor) or not (
+        torch.Tag.pointwise in getattr(node.target, "tags", ())
+        or _is_lowered_pointwise(node)
     ):
         return None
     dims = [None] * val.ndim
     for arg in node.all_input_nodes:
         # Inputs that no iota feeds carry no padding lanes of their own here.
-        if (arg_dims := _padded_iota_dims(arg)) is None:
+        if (arg_dims := _padded_iota_dims_once(arg, through_loads, memo)) is None:
             continue
         offset = val.ndim - len(arg_dims)
         if offset < 0:
@@ -245,13 +288,327 @@ def _padded_iota_dims(node: object) -> tuple[int | None, ...] | None:
     return tuple(dims)
 
 
+# How many loads deep ``_padded_iota_dims_once`` follows indices, per thread.
+_MAX_LOAD_DEPTH = 32
+_walk_depth = threading.local()
+
+
+def _padded_iota_dims_once(
+    node: object,
+    through_loads: bool,
+    memo: dict[tuple[torch.fx.Node, bool], tuple[int | None, ...] | None],
+) -> tuple[int | None, ...] | None:
+    """``_padded_iota_dims`` of a node one walk reaches, computed once.
+
+    A value read along several paths (``row + row * 0.5``) is reached once per
+    path, so without the walk's ``memo`` a chain of such values is walked
+    exponentially many times.  A memo lasts one walk: lowering changes node
+    args between walks.
+    """
+    from ..language import memory_ops
+
+    if not isinstance(node, torch.fx.Node):
+        return None
+    key = (node, through_loads)
+    if key not in memo:
+        # Each load the walk follows into its index nests the walk deeper: a
+        # long chain of gathers (``cols = a[cols]``) would recurse past
+        # Python's limit.  Past ``_MAX_LOAD_DEPTH`` loads the padding is
+        # unknown, as where the walk cannot see it, and the access through
+        # such an index keeps the lowering it had before loads were followed.
+        follows = through_loads and node.target is memory_ops.load
+        depth = getattr(_walk_depth, "loads", 0)
+        if follows and depth >= _MAX_LOAD_DEPTH:
+            return None
+        _walk_depth.loads = depth + follows
+        try:
+            memo[key] = _padded_iota_dims(node, through_loads=through_loads, memo=memo)
+        finally:
+            _walk_depth.loads = depth
+    return memo[key]
+
+
+def _padded_load_dims(
+    node: torch.fx.Node,
+    memo: dict[tuple[torch.fx.Node, bool], tuple[int | None, ...] | None],
+) -> tuple[int | None, ...] | None:
+    """``_padded_iota_dims`` of a load: the padded iotas its tensor indices
+    carry into the dims ``SubscriptIndexing.compute_shape`` gives them.
+
+    ``hl.load(x, [i, hl.arange(200)])`` has one dim, of the range's padded
+    size 256, whose first 200 lanes it loads.
+    """
+    index = node.args[1]
+    val = node.meta.get("val")
+    if not isinstance(index, (list, tuple)) or not isinstance(val, torch.Tensor):
+        return None
+    env = CompileEnvironment.current()
+    fake = [
+        item.meta.get("val") if isinstance(item, torch.fx.Node) else item
+        for item in index
+    ]
+    tensors = [
+        (position, k) for position, k in enumerate(fake) if isinstance(k, torch.Tensor)
+    ]
+
+    def lanes(position: int) -> tuple[int | None, ...]:
+        k = fake[position]
+        assert isinstance(k, torch.Tensor)
+        found = _padded_iota_dims_once(index[position], True, memo)
+        return found if found is not None and len(found) == k.ndim else (None,) * k.ndim
+
+    broadcast = env.should_broadcast_tensor_indexers(fake)
+    dims: list[int | None] = []
+    for position, k in enumerate(fake):
+        if isinstance(k, torch.Tensor):
+            # The dims the indexers give the load, and the indexer dims each
+            # runs along, are compute_shape's (through the same helpers).
+            if not broadcast:
+                dims.extend(
+                    None if dim is None else lanes(position)[dim]
+                    for dim in env.tensor_indexer_dim_sources(k)
+                )
+            elif position == tensors[0][0]:
+                for sources in env.tensor_indexer_broadcast_sources(
+                    [t for _, t in tensors]
+                ):
+                    found = {lanes(tensors[i][0])[dim] for i, dim in sources}
+                    found.discard(None)
+                    if len(found) > 1:
+                        return None
+                    dims.append(found.pop() if found else None)
+        elif k is None or isinstance(k, slice) or is_block_size_index(k):
+            dims.append(None)
+    return tuple(dims) if len(dims) == val.ndim else None
+
+
+def _kernel_has_padded_iota(node: torch.fx.Node) -> bool:
+    """Whether a graph of the kernel ``node`` belongs to holds a static
+    ``hl.arange`` whose length is not a power of two.  Without one no value
+    has padded lanes, and a walk through loads, which can cover the whole
+    graph feeding a reduction, is skipped: followed through a long chain of
+    gathers (``cols = a[cols]``), it would recurse past Python's limit."""
+    from .device_ir import tls
+
+    lowering = getattr(tls, "device_irs", None)
+    device_ir = lowering[-1] if lowering else HostFunction.current().device_ir
+    return any(
+        other.target == torch.ops.prims.iota.default
+        and isinstance(length := other.args[0], int)
+        and length != next_power_of_2(length)
+        for graph in (node.graph, *(info.graph for info in device_ir.graphs))
+        for other in graph.nodes
+    )
+
+
+def _is_lowered_pointwise(node: torch.fx.Node) -> bool:
+    """Whether ``node`` holds an elementwise buffer of a lowering that made
+    several (``_inductor_lowering_extra``), such as var_mean's squared
+    deviations: lane-wise like the pointwise ops above.  Only var_mean's
+    lowering makes such buffers (``var_mean_helper_``), each element read at
+    its own index; one that reindexed its inputs (a permute, a flip) would
+    not keep the padding lanes in place and would need a narrower test."""
+    from ..language import _tracing_ops
+    from .inductor_lowering import PointwiseLowering
+
+    return node.target is _tracing_ops._inductor_lowering_extra and isinstance(
+        node.meta.get("lowering"), PointwiseLowering
+    )
+
+
+def _captured_value(node: torch.fx.Node) -> tuple[torch.fx.Node, object] | None:
+    """``(value, update)``: the value a loop or branch body reads through
+    ``node``, the outer node behind a placeholder that captures one (``cols``,
+    loaded before a loop, is ``cols_copy_0`` inside it) or the value a
+    ``_new_var`` copy reads, and for a value the loop carries the body's
+    output that holds its next value (else None).  None for other nodes, for
+    a combine function's parameters (``HelperFunctionGraphInfo``), which
+    capture nothing, and for a ``while`` condition's read of a carry, whose
+    update is in the body."""
+    from ..language import _tracing_ops
+    from .device_ir import HelperFunctionGraphInfo
+    from .device_ir import NodeArgsGraphInfo
+
+    if node.target is _tracing_ops._new_var:
+        value = node.args[0]
+        return (value, None) if isinstance(value, torch.fx.Node) else None
+    if node.op != "placeholder":
+        return None
+    for info in [info for infos in _device_ir_graphs() for info in infos]:
+        if (
+            info.graph is not node.graph
+            or not isinstance(info, NodeArgsGraphInfo)
+            or isinstance(info, HelperFunctionGraphInfo)
+        ):
+            continue
+        outer = info.placeholder_to_outer_arg(node)
+        # A loop carries ``outer`` when a ``_phi`` after it merges ``outer``
+        # with one of its results, ``getitem(loop, index)``.
+        for phi in outer.users:
+            if phi.target is not _tracing_ops._phi or phi.args[0] is not outer:
+                continue
+            result = phi.args[1]
+            if (
+                not isinstance(result, torch.fx.Node)
+                or result.target is not operator.getitem
+            ):
+                continue
+            loop, index = result.args
+            assert isinstance(loop, torch.fx.Node)
+            if loop.target is _tracing_ops._while_loop:
+                if loop.args[0] == info.graph_id:
+                    return None
+                body = loop.args[1]
+            elif _tracing_ops.is_for_loop_target(loop.target):
+                body = loop.args[0]
+            else:
+                continue
+            if body == info.graph_id:
+                (output,) = node.graph.find_nodes(op="output")
+                outputs = output.args[0]
+                assert isinstance(outputs, (list, tuple)) and isinstance(index, int)
+                return outer, outputs[index]
+        return outer, None
+    return None
+
+
+class _IndexWalkMemo(dict):
+    """The memo of a walk for a load's or store's index
+    (``_padded_iota_mask``).  Where the values a loop or branch merges
+    disagree on their padded iotas, such a walk refuses the kernel
+    (``_padding_differs``): no one mask fits the lanes of every path."""
+
+
+def _padding_differs(
+    memo: dict[tuple[torch.fx.Node, bool], tuple[int | None, ...] | None],
+    *found: tuple[int | None, ...] | None,
+) -> None:
+    """The padding of merged values ``found`` that disagree: unknown (None),
+    and a refusal for an index walk (``_IndexWalkMemo``) when one of them
+    has a padded iota, whose lanes an unmasked access would then read or
+    write in some iterations or branches."""
+    if isinstance(memo, _IndexWalkMemo) and any(map(_has_padding, found)):
+        raise exc.BackendUnsupported(
+            CompileEnvironment.current().backend.name,
+            "an index over a padded hl.arange whose padding a loop or branch changes",
+        )
+    return None
+
+
+def _merged_dims(
+    side: object,
+    through_loads: bool,
+    memo: dict[tuple[torch.fx.Node, bool], tuple[int | None, ...] | None],
+) -> tuple[int | None, ...] | None:
+    """``_padded_iota_dims`` of a value a ``_phi`` merges: of the loop body's
+    output a loop's result names, and of the branch output or the outer value
+    a branch passes through that an ``if`` result names
+    (``_if_result_source``).  None, unknown, where the graph holding the
+    output is not found."""
+    from ..language import _tracing_ops
+
+    if not isinstance(side, torch.fx.Node) or side.target is not operator.getitem:
+        return _padded_iota_dims_once(side, through_loads, memo)
+    control, index = side.args
+    assert isinstance(control, torch.fx.Node)
+    if _tracing_ops.is_for_loop_target(control.target):
+        graph_id = control.args[0]
+    elif control.target is _tracing_ops._while_loop:
+        graph_id = control.args[1]
+    elif control.target is _tracing_ops._if:
+        assert isinstance(index, int)
+        if (infos := _graph_infos(control)) is None:
+            return None
+        source = _if_result_source(control, index, infos)
+        if not isinstance(source, tuple):
+            # The outer value the branch passes through (None: not a node).
+            return _padded_iota_dims_once(source, through_loads, memo)
+        graph_id, index = source
+    else:
+        return _padded_iota_dims_once(side, through_loads, memo)
+    assert isinstance(index, int)
+    if (outputs := _graph_outputs(control, graph_id)) is None:
+        return None
+    return _padded_iota_dims_once(outputs[index], through_loads, memo)
+
+
+def _has_padding(dims: tuple[int | None, ...] | None) -> bool:
+    """Whether a padded iota feeds one of ``dims`` (``_padded_iota_dims``)."""
+    return dims is not None and any(length is not None for length in dims)
+
+
+def _device_ir_graphs() -> list[Sequence[GraphInfo]]:
+    """The graphs of the device IR being lowered, or the graphs codegen reads:
+    its per-config copies, whose ``placeholder_to_outer_arg`` returns the
+    original graphs' nodes, and those originals."""
+    from .device_ir import tls
+
+    if lowering := getattr(tls, "device_irs", None):
+        return [lowering[-1].graphs]
+    return [
+        DeviceFunction.current().codegen.codegen_graphs,
+        HostFunction.current().device_ir.graphs,
+    ]
+
+
+def _if_result_source(
+    if_node: torch.fx.Node, index: int, infos: Sequence[GraphInfo]
+) -> tuple[int, int] | object:
+    """Where result ``index`` of the ``_if`` ``if_node`` comes from: a branch
+    output, as ``(graph_id, output_index)``, or the outer value the branch
+    that does not write the variable passes through.
+    ``WalkDeviceAST._create_if_subgraph`` lays the results out as the if
+    branch's slot of each of ``branches_outputs``, then the else branch's."""
+    from .device_ir import IfGraphInfo
+
+    if_graph_id = if_node.args[1]
+    assert isinstance(if_graph_id, int)
+    info = infos[if_graph_id]
+    assert isinstance(info, IfGraphInfo) and info.branches_outputs is not None
+    side, entry = divmod(index, len(info.branches_outputs))
+    slot = info.branches_outputs[entry][side]
+    if isinstance(slot, int):
+        graph_id = if_node.args[1 + side]
+        assert isinstance(graph_id, int)
+        return graph_id, slot
+    # The other branch writes the variable, so it takes it as an input.
+    names = (info.else_arg_names, info.if_arg_names)[side]
+    args = if_node.args[4 - side]
+    assert names is not None and isinstance(args, (list, tuple))
+    return args[names.index(slot)]
+
+
+def _graph_infos(node: torch.fx.Node) -> Sequence[GraphInfo] | None:
+    """The graphs, by graph id, of the device IR ``node``'s graph is in
+    (``_device_ir_graphs``), or None when none holds it."""
+    for infos in _device_ir_graphs():
+        if any(info.graph is node.graph for info in infos):
+            return infos
+    return None
+
+
+def _graph_outputs(node: torch.fx.Node, graph_id: object) -> list[object] | None:
+    """The outputs of graph ``graph_id`` of the device IR ``node``'s graph is
+    in (``_graph_infos``), or None when no device IR holds that graph."""
+    if (infos := _graph_infos(node)) is None:
+        return None
+    (output,) = next(
+        info for info in infos if info.graph_id == graph_id
+    ).graph.find_nodes(op="output")
+    outputs = output.args[0]
+    assert isinstance(outputs, (list, tuple))
+    return list(outputs)
+
+
 def _padded_iota_mask(state: CodegenState, index_position: int) -> str | None:
     """Mask the padding lanes of a padded-iota index at the given position.
 
     ``hl.arange(start, end, step)`` with a static non-power-of-2 length is
     emitted as ``start + step * tl.arange(0, next_power_of_2(length))``, so the
-    valid lanes of the index (and of anything computed lane-wise from it) are
-    the first ``length`` arange positions whatever ``start`` and ``step`` are.
+    valid lanes of the index (and of anything computed lane-wise from it,
+    such as the columns a load over it reads: ``cols = hl.load(idx,
+    [hl.arange(100)])`` indexing ``hl.store(out, [i, cols], v)``) are the
+    first ``length`` arange positions whatever ``start`` and ``step`` are.
     The mask compares those positions, not the index values, and has the
     index's own rank.
 
@@ -266,19 +623,35 @@ def _padded_iota_mask(state: CodegenState, index_position: int) -> str | None:
         index_node = state.fx_node.args[1][index_position]  # type: ignore[union-attr, index]
     except (AttributeError, IndexError, TypeError):
         return None
-    if (dims := _padded_iota_dims(index_node)) is None:
+    # A kernel without a padded range has no lane to mask.  The explicit
+    # memo starts the walk through loads past ``_padded_iota_dims``' own
+    # check of that, and through a long chain of gathers the walk recursed
+    # past Python's limit.
+    if not isinstance(index_node, torch.fx.Node) or not _kernel_has_padded_iota(
+        index_node
+    ):
         return None
-    terms = []
-    for dim, length in enumerate(dims):
-        if length is None:
-            continue
-        expand = (
-            "[" + ", ".join(":" if d == dim else "None" for d in range(len(dims))) + "]"
-            if len(dims) > 1
-            else ""
-        )
-        terms.append(f"(tl.arange(0, {next_power_of_2(length)}) < {length}){expand}")
+    dims = _padded_iota_dims(index_node, through_loads=True, memo=_IndexWalkMemo())
+    if dims is None:
+        return None
+    terms = [
+        padded_lanes_mask(length, dim, len(dims))
+        for dim, length in enumerate(dims)
+        if length is not None
+    ]
     return f"({' & '.join(terms)})" if terms else None
+
+
+def padded_lanes_mask(length: int, dim: int, ndim: int) -> str:
+    """Triton's mask of the first ``length`` lanes, the elements, of a padded
+    ``hl.arange`` along dim ``dim`` of an ``ndim``-dim value: it compares the
+    lanes' positions, not their values."""
+    expand = (
+        "[" + ", ".join(":" if d == dim else "None" for d in range(ndim)) + "]"
+        if ndim > 1
+        else ""
+    )
+    return f"(tl.arange(0, {next_power_of_2(length)}) < {length}){expand}"
 
 
 def _get_tile_with_offset_info(

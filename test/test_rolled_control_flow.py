@@ -209,7 +209,9 @@ def test_apply_rolling_preserves_root_phase_metadata() -> None:
         )
     ]
 
-    reduction_specs = _FakeReductionLoopSpecs([SimpleNamespace(block_id=block_id)])
+    reduction_specs = _FakeReductionLoopSpecs(
+        [SimpleNamespace(block_id=block_id, persistent_reason=None)]
+    )
     fake_env = SimpleNamespace(
         block_sizes=[SimpleNamespace(block_id=block_id, reduction=True)],
         config_spec=SimpleNamespace(reduction_loops=reduction_specs),

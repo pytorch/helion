@@ -1575,6 +1575,10 @@ class CuteBackend(Backend):
     def lowers_chunk_unbind(self) -> bool:
         return True
 
+    @property
+    def lowers_mask_select(self) -> bool:
+        return True
+
     def barrier_allows_pid_type(self, pid_type: str) -> bool:
         # CuTe launches the phases in order with ``pid_type="flat"``;
         # DeviceIR keeps ``flat`` only once it has proved those launches
@@ -1643,6 +1647,12 @@ class CuteBackend(Backend):
     @property
     def folds_static_program_counts(self) -> bool:
         return True
+
+    @property
+    def relowered_memory_ops_take_new_slots(self) -> bool:
+        # A load lowered again keeps its ``load_eviction_policies`` slot
+        # (``memory_ops._cute_load_eviction_slot``).
+        return False
 
     @property
     def reduction_loops_allow_non_power_of_two(self) -> bool:
