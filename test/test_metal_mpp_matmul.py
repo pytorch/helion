@@ -79,6 +79,12 @@ def _full_threadgroup(test: Callable[..., None]) -> Callable[..., None]:
     return patch("helion.autotuner.config_spec.DEFAULT_NUM_WARPS", 32)(test)
 
 
+def _masked_load(name: str) -> str:
+    """A pattern for a masked load of *name*: conditional, or selected after
+    an unconditional load."""
+    return rf"(\? |_helion_masked\(){name}\["
+
+
 def _run(
     kernel: helion.Kernel, args: tuple[object, ...], config: helion.Config | None
 ) -> tuple[torch.Tensor, str, str]:
@@ -16150,7 +16156,7 @@ class TestMppUniformLaunch(_MppCase):
                     _close(out, ref)
                     self._launches(code, launch)
                     self.assertNotRegex(msl, r"\bmask_\d+")
-                    self.assertNotIn("? B[", msl)
+                    self.assertNotRegex(msl, _masked_load("B"))
                     self.assertRegex(msl, r"if \(_mpp_owner\w*\) \{ _mpp_tile\[")
                     if launch == (64, 1, 1):
                         self.assertRegex(
@@ -16257,7 +16263,7 @@ class TestMppUniformLaunchKeepsMasks(_MppCase):
                 out, code, msl = _run(int4_gemm, (lhs, rhs), config)
                 _close(out, ref)
                 self.assertIn(f"_block_dims={launch}", code)
-                self.assertIn("? B[", msl)
+                self.assertRegex(msl, _masked_load("B"))
                 self.assertRegex(msl, r"if \(\(\(\(indices_\d+ - offset_\d+\) < 128\)")
 
     def test_threads_no_strategy_owns(self) -> None:

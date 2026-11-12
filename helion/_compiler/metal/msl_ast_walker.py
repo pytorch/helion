@@ -12,6 +12,8 @@ MetalOverrides (reused from Inductor's MPS codegen) emits MSL expression strings
 Handles:
   - Statement-level Python→C++ translation (assignments, if/for, etc.)
   - ``tl.load(ptr + offset, mask, other=0)`` → ``(mask ? *(ptr+offset) : (T)(0))``
+    (``select_masked_loads`` first turns a read-only buffer's into
+    ``_helion_masked(ptr[mask ? offset : 0], mask, 0)``)
   - ``tl.store(ptr + offset, val, mask)`` → ``if (mask) { *(ptr+offset) = val; }``
   - ``static_cast(T, x)`` → ``static_cast<T>(x)`` (and the other ``TEMPLATE_CALLS``)
   - C++ namespace restoration: ``metal.precise.sin`` → ``metal::precise::sin``
@@ -21,11 +23,16 @@ Handles:
 from __future__ import annotations
 
 import ast
+from collections import Counter
 import contextlib
+import copy
 import dataclasses
 from typing import Iterator
 
 from ... import exc
+from .lane_fold import LANE_PUT
+from .lane_fold import load_mask_other
+from .lane_fold import tl_load
 from .mpp_matmul import ACC_SEED
 from .msl_expr import GLOBAL_SCOPE
 from .msl_expr import TEMPLATE_CALLS
@@ -190,7 +197,7 @@ def _emit_stmts(
             if _is_tl_store_call(call):
                 assert isinstance(call, ast.Call)
                 _emit_tl_store(call, parts, indent=indent, subs=subs)
-            elif _is_call_to(call, "_metal_lane_put"):
+            elif _is_call_to(call, LANE_PUT):
                 assert isinstance(call, ast.Call)
                 array, lane, value = (_ast_expr_to_msl(a, subs=subs) for a in call.args)
                 parts.append(f"{pad}{array}[{lane}] = {value};")
@@ -821,32 +828,18 @@ def _ast_call_to_msl(node: ast.AST, subs: dict[str, str] | None = None) -> str:
         return literal
 
     # tl.load(ptr + offset, mask, other=0) → (mask ? *(ptr+offset) : (other))
-    if (
-        isinstance(func, ast.Attribute)
-        and isinstance(func.value, ast.Name)
-        and func.value.id == "tl"
-        and func.attr == "load"
-    ):
-        access = _ptr_access_expr(node.args[0], subs=subs)
-        if len(node.args) >= 2:
-            mask_node = node.args[1]
-            if isinstance(mask_node, ast.Constant) and mask_node.value is None:
-                return access
-            mask = _ast_expr_to_msl(mask_node, subs=subs)
-            other = None
-            if len(node.args) >= 3:
-                other = _ast_expr_to_msl(node.args[2], subs=subs)
-            else:
-                for kw in node.keywords:
-                    if kw.arg == "other":
-                        other = _ast_expr_to_msl(kw.value, subs=subs)
-                        break
-            if other is None:
-                raise exc.BackendUnsupported(
-                    "metal", "tl.load with mask requires 'other' argument"
-                )
-            return f"({mask} ? {access} : ({other}))"
-        return access
+    if (load := tl_load(node)) is not None:
+        access = _ptr_access_expr(load.args[0], subs=subs)
+        masked = load_mask_other(load)
+        if masked is None:
+            return access
+        mask, other = masked
+        if other is None:
+            raise exc.BackendUnsupported(
+                "metal", "tl.load with mask requires 'other' argument"
+            )
+        mask_msl = _ast_expr_to_msl(mask, subs=subs)
+        return f"({mask_msl} ? {access} : ({_ast_expr_to_msl(other, subs=subs)}))"
 
     # A C++ cast or MSL template function: static_cast(T, x) → static_cast<T>(x)
     if _template_name(func) in TEMPLATE_CALLS:
@@ -883,6 +876,82 @@ def _template_arg_to_msl(node: ast.AST, subs: dict[str, str] | None) -> str:
         # decltype(+(*_it)).
         return "decltype(+(*_it))" if inner == "(*_it)" else f"decltype({inner})"
     return _ast_expr_to_msl(node, subs=subs)
+
+
+#: ``m ? v : other`` as a call, so ``v`` (a load at a safe index) is
+#: evaluated unconditionally; the result has the conditional's own type.
+MASKED_LOAD = "_helion_masked"
+MASKED_LOAD_PREAMBLE = f"""template <typename T, typename O>
+inline auto {MASKED_LOAD}(T v, bool m, O other) {{
+    return m ? v : other;
+}}"""
+
+
+def select_masked_loads(
+    stmts: list[ast.stmt], candidates: frozenset[str]
+) -> list[ast.stmt]:
+    """Rewrite each masked ``tl.load(buf + offset, mask, other)`` of a buffer
+    in *candidates* to ``_helion_masked(tl.load(buf + (offset if mask else
+    0)), mask, other)``: load unconditionally, at element 0 when masked off,
+    and select afterwards.  A load under the condition is a branch per load,
+    which keeps Metal from issuing loads together.
+
+    *candidates* are the buffers with an element 0 that no other parameter
+    shares storage with.  A candidate's loads still stay conditional where
+    the kernel uses it other than through ``tl.load`` (a store, an atomic, an
+    MPP operand), since another thread may write element 0 while a
+    masked-off lane reads it."""
+    loaded = Counter(
+        load.args[0].left.id
+        for stmt in stmts
+        for node in ast.walk(stmt)
+        if (load := tl_load(node)) is not None
+        and isinstance(load.args[0], ast.BinOp)
+        and isinstance(load.args[0].left, ast.Name)
+    )
+    named = Counter(
+        node.id
+        for stmt in stmts
+        for node in ast.walk(stmt)
+        if isinstance(node, ast.Name)
+    )
+    read_only = {name for name in candidates if loaded[name] == named[name]}
+
+    class Select(ast.NodeTransformer):
+        def visit_Call(self, node: ast.Call) -> ast.AST:
+            self.generic_visit(node)
+            if (load := tl_load(node)) is None or (
+                masked := load_mask_other(load)
+            ) is None:
+                return node
+            mask, other = masked
+            ptr = load.args[0]
+            if not (
+                other is not None
+                and isinstance(ptr, ast.BinOp)
+                and isinstance(ptr.op, ast.Add)
+                and isinstance(ptr.left, ast.Name)
+                and ptr.left.id in read_only
+            ):
+                return node
+            safe = ast.BinOp(
+                left=ptr.left,
+                op=ast.Add(),
+                right=ast.IfExp(
+                    test=copy.deepcopy(mask), body=ptr.right, orelse=ast.Constant(0)
+                ),
+            )
+            return ast.Call(
+                func=ast.Name(id=MASKED_LOAD, ctx=ast.Load()),
+                args=[
+                    ast.Call(func=node.func, args=[safe], keywords=[]),
+                    mask,
+                    other,
+                ],
+                keywords=[],
+            )
+
+    return [Select().visit(stmt) for stmt in stmts]
 
 
 #: What Inductor's ``constant_repr`` emits for non-finite float constants.
