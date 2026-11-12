@@ -55,6 +55,7 @@ from ..cross_loop_codegen import _stored_names
 from ..cross_loop_codegen import _written_allocations
 from ..cross_loop_codegen import peer_state
 from ..device_function import RingFallback
+from ..device_ir import control_flow_parent_ids
 from ..emitter_protocols import RetryPolicy
 from ..host_function import HostFunction
 from ..indexing_strategy import BlockedSubscriptIndexing
@@ -673,6 +674,8 @@ class RingLowering:
         # (shape, ordinal in its task) -> accumulator ring; each dot's root.
         self.acc_rings: dict[tuple[tuple[int, ...], int], int] = {}
         self.dot_roots: dict[torch.fx.Node, int | None] = {}
+        # Each ring dot's accumulator ring key.
+        self.acc_keys: dict[torch.fx.Node, tuple[tuple[int, ...], int]] = {}
         # The MMA partition stores scales from registers (4-warp layouts).
         self.mma_tensors = False
         # Tensor memory of the dots outside the ring, (rows, columns) each.
@@ -971,12 +974,9 @@ class RingLowering:
             shapes = [gluon_ops.concrete(n.meta["val"].shape)[-2:] for n in peers]
             key = (tuple(shape), shapes.count(shape))
             if key not in self.acc_rings and self._tmem_left(key[0]) < 0:
-                # No tensor memory for another ring: share the shape's first.
-                key = (tuple(shape), 1)
-                if key not in self.acc_rings:
-                    raise RingFallback(
-                        "the ring: no tensor memory for an accumulator ring"
-                    )
+                # No tensor memory for another ring: share one of the shape's.
+                key = self._shared_ring(node, tuple(shape))
+            self.acc_keys[node] = key
             ring = _acc(self.acc_rings.setdefault(key, len(self.acc_rings)))
             self.mma_tensors |= node.target is dot_scaled and not all(
                 gluon_ops.copied_scale(node, i) for i in gluon_ops._SCALES[dot_scaled]
@@ -984,6 +984,43 @@ class RingLowering:
         # The step's groups share its channel's slot: one commit frees it.
         empty, step = (_link(dot_index, groups[0], name) for name in ("empty", "step"))
         return gluon_ops.codegen_tmem_dot(interp, node, (empty, step, _DEPTH), ring)
+
+    def _shared_ring(
+        self, node: torch.fx.Node, shape: tuple[int, ...]
+    ) -> tuple[tuple[int, ...], int]:
+        """The first accumulator ring of ``shape`` with no dot whose accumulator
+        is live with ``node``'s: one dot's loop (a ring dot's own graph,
+        ``gluon_ops.resident``) is, or holds, the other's.  RingFallback when
+        no ring of the shape exists, or each holds a live accumulator."""
+        rings = sorted(key for key in self.acc_rings if key[0] == shape)
+        if not rings:
+            raise RingFallback("the ring: no tensor memory for an accumulator ring")
+        parents = control_flow_parent_ids(self.device_function.graph_infos())
+
+        def graphs(dot: torch.fx.Node) -> list[int]:
+            graph: int | None = gluon_ops._graph_info(
+                self.device_function, dot.graph
+            ).graph_id
+            chain = []
+            while graph is not None:
+                chain.append(graph)
+                graph = parents.get(graph)
+            return chain
+
+        mine = graphs(node)
+        live = {
+            key
+            for dot, key in self.acc_keys.items()
+            if key[0] == shape
+            and (mine[0] in (theirs := graphs(dot)) or theirs[0] in mine)
+        }
+        for key in rings:
+            if key not in live:
+                return key
+        raise RingFallback(
+            "the ring: every accumulator ring of the shape holds an accumulator"
+            " live with this one"
+        )
 
     def _tmem_left(self, *rings: tuple[int, ...]) -> int:
         """Tensor-memory columns the accumulator rings (and ``rings`` more) and the

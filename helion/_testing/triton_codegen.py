@@ -4,15 +4,21 @@ from __future__ import annotations
 
 import ast
 from contextlib import ExitStack
+from contextlib import contextmanager
 import importlib.util
 import sys
+from types import MappingProxyType
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
 
+from .cute_codegen import cuda_metadata_trace
+
 if TYPE_CHECKING:
     from collections.abc import Generator
+    from collections.abc import Mapping
     from pathlib import Path
 
 
@@ -40,6 +46,40 @@ def cpu_codegen() -> Generator[None, None, None]:
         stack.enter_context(
             patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden"))
         )
+        yield
+
+
+# The config every Gluon ring test starts from: tensor-descriptor operands, one
+# persistent worker a SM, a two-stage ring (read-only: tests spread it).
+GLUON_RING_CONFIG: Mapping[str, object] = MappingProxyType(
+    {
+        "indexing": "tensor_descriptor",
+        "pid_type": "persistent_blocked",
+        "num_sm_multiplier": 1,
+        "num_stages": 2,
+    }
+)
+
+
+@contextmanager
+def gluon_cpu_codegen() -> Generator[None, None, None]:
+    """Generate Gluon (``backend="gluon"``) source in a CPU-only process for a
+    148-SM sm100 target: kernels trace on ``cuda:0`` as on the GPU
+    (``cute_codegen.cuda_metadata_trace``, so kernels with cross-loop
+    dependencies bind), the Gluon, warp-specialization and tensor-descriptor
+    probes report support, the ring lowering sees 2048 thread slots a SM, and
+    initializing CUDA fails the test."""
+    device = SimpleNamespace(max_threads_per_multi_processor=2048)
+    with ExitStack() as stack:
+        stack.enter_context(cuda_metadata_trace())
+        for name, value in (
+            ("torch.cuda.get_device_properties", device),
+            ("helion._compat.supports_gluon", True),
+            ("helion._compat._supports_tensor_descriptor", True),
+            ("helion.language.loops._supports_warp_specialize", True),
+            ("helion.autotuner.config_spec.num_compute_units", 148),
+        ):
+            stack.enter_context(patch(name, return_value=value))
         yield
 
 

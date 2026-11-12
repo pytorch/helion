@@ -1,6 +1,7 @@
-"""The gluon backend's analyses as plain functions: the ring's register budgets,
-waits and paced fills, the pipeliner's load arguments, the native kernels'
-compile options and the names its ``tl`` resolves. They run on CPU."""
+"""The gluon backend on CPU: its analyses as plain functions (the ring's
+register budgets, waits and paced fills, the pipeliner's load arguments, the
+native kernels' compile options and the names its ``tl`` resolves), and whole
+kernels' generated Gluon source (``gluon_cpu_codegen``)."""
 
 from __future__ import annotations
 
@@ -17,6 +18,9 @@ import torch
 import helion
 from helion._compat import gluon_api_available
 from helion._testing import TestCase
+from helion._testing.triton_codegen import GLUON_RING_CONFIG as _RING
+from helion._testing.triton_codegen import gluon_cpu_codegen
+import helion.language as hl
 from helion.runtime.settings import _get_backend
 
 if _get_backend() != "triton" or not gluon_api_available():
@@ -32,6 +36,92 @@ from helion._compiler.triton import gluon_ring
 from helion._compiler.triton.gluon_ops import tl_namespace
 
 pytestmark = pytest.mark.cpu_only
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def _w13x(
+    x: torch.Tensor, w1: torch.Tensor, w3: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Two weights of one shape read in one K loop (a gate/up pair)."""
+    m, k = x.size()
+    n = w1.size(0)
+    out1 = torch.empty([n, m], dtype=torch.float32, device=x.device)
+    out3 = torch.empty([n, m], dtype=torch.float32, device=x.device)
+    for tile_n, tile_m in hl.tile([n, m]):
+        acc1 = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+        acc3 = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc1 = hl.dot(w1[tile_n, tile_k], x[tile_m, tile_k].T, acc=acc1)
+            acc3 = hl.dot(w3[tile_n, tile_k], x[tile_m, tile_k].T, acc=acc3)
+        out1[tile_n, tile_m] = acc1
+        out3[tile_n, tile_m] = acc3
+    return out1, out3
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def _two_pairs(x: torch.Tensor, w1: torch.Tensor, w3: torch.Tensor) -> torch.Tensor:
+    """A task with two K loops, one after the other, each reading two weights
+    of one shape (two same-shape dots each)."""
+    m, k = x.size()
+    n = w1.size(0)
+    out = torch.empty([n, m], dtype=torch.float32, device=x.device)
+    for tile_n, tile_m in hl.tile([n, m]):
+        a1 = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+        a3 = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            a1 = hl.dot(w1[tile_n, tile_k], x[tile_m, tile_k].T, acc=a1)
+            a3 = hl.dot(w3[tile_n, tile_k], x[tile_m, tile_k].T, acc=a3)
+        b1 = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+        b3 = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            b1 = hl.dot(w3[tile_n, tile_k], x[tile_m, tile_k].T, acc=b1)
+            b3 = hl.dot(w1[tile_n, tile_k], x[tile_m, tile_k].T, acc=b3)
+        out[tile_n, tile_m] = a1 + a3 - b1 * b3
+    return out
+
+
+class TestAccumulatorRings(TestCase):
+    def test_a_dot_takes_a_ring_without_a_live_accumulator(self) -> None:
+        """Two K loops of a task, one after the other, with two same-shape dots
+        each, when tensor memory holds only two rings: the first loop's dots
+        take one each; in the second, the first dot shares the first ring and
+        the second, live with it, takes the other (not the first again)."""
+        x = torch.empty([256, 1024], dtype=torch.bfloat16)
+        w1 = torch.empty([256, 1024], dtype=torch.bfloat16)
+        with gluon_cpu_codegen():
+            code = _two_pairs.bind((x, w1, torch.empty_like(w1))).to_triton_code(
+                helion.Config(
+                    **_RING,
+                    # Two 128x128 accumulator rings take all 512 columns.
+                    block_sizes=[128, 128, 64, 64],
+                    range_warp_specializes=[True, None, None],
+                )
+            )
+        self.assertIn("warp_specialize", code)
+        self.assertEqual(code.count("= _helion_gluon.acc_buffers("), 2)
+        claims = re.findall(r"acc_claim\((_helion_acc\d)", code)
+        self.assertEqual(
+            claims, ["_helion_acc0", "_helion_acc1", "_helion_acc0", "_helion_acc1"]
+        )
+
+    def test_dots_of_one_loop_share_no_accumulator_ring(self) -> None:
+        """Two dots of one K loop whose accumulator rings tensor memory cannot
+        both hold do not share one (both accumulators are live through the
+        loop): the ring falls back."""
+        x = torch.empty([256, 1024], dtype=torch.bfloat16)
+        w1 = torch.empty([256, 1024], dtype=torch.bfloat16)
+        config = helion.Config(
+            **_RING,
+            # A 128x256 accumulator ring takes all 512 columns.
+            block_sizes=[128, 256, 64],
+            range_warp_specializes=[True, None],
+        )
+        with gluon_cpu_codegen():
+            bound = _w13x.bind((x, w1, torch.empty_like(w1)))
+            with self.assertLogs("helion._compiler.triton.gluon_ring", "INFO") as logs:
+                code = bound.to_triton_code(config)
+        self.assertIn("holds an accumulator live with this one", "\n".join(logs.output))
+        self.assertNotIn("warp_specialize", code)
 
 
 class TestWorkerRegisters(TestCase):

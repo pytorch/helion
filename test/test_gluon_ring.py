@@ -19,14 +19,8 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessGluon
+from helion._testing.triton_codegen import GLUON_RING_CONFIG as RING
 import helion.language as hl
-
-RING = {
-    "indexing": "tensor_descriptor",
-    "pid_type": "persistent_blocked",
-    "num_sm_multiplier": 1,
-    "num_stages": 2,
-}
 
 
 @helion.kernel(static_shapes=True, backend="gluon")
@@ -1012,6 +1006,32 @@ class TestGluonRing(TestCase):
         ):
             config = helion.Config(block_sizes=[128, 64, 64], **{**RING, **extra})
             self.assertNotIn("warp_specialize", bound.to_triton_code(config))
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_loops_one_after_another_share_an_accumulator_ring(self) -> None:
+        """Dots of two K loops of a task, one after the other, are never live
+        together: when tensor memory has no room for the second's ring it
+        shares the first's, and the ring stays."""
+        x = torch.randn([512, 1024], device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn([1024, 512], device=DEVICE, dtype=torch.bfloat16)
+        z = torch.randn([1024, 512], device=DEVICE, dtype=torch.bfloat16)
+        code, out = code_and_output(
+            mm_two_loops,
+            (x, y, z),
+            # A 128x256 accumulator ring takes all 512 columns.
+            block_sizes=[128, 256, 64, 64],
+            range_warp_specializes=[True, None, None],
+            **RING,
+        )
+        torch.testing.assert_close(
+            out,
+            2 * (x.float() @ y.float()) - x.float() @ z.float(),
+            atol=2e-2,
+            rtol=1e-2,
+        )
+        self.assertIn("warp_specialize", code)
+        self.assertEqual(code.count("= _helion_gluon.acc_buffers("), 1)
 
     @skipIfRefEager("checks generated code")
     @skipUnlessGluon()
