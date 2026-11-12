@@ -1476,8 +1476,9 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             num_warps=1,
         )
         compiled = bound.compile_config(config)
-        # The precompiler gets placeholders for the launcher-owned state.
-        self.assertTrue(_triton_compile(compiled, (x,), config, bound))
+        # The precompiler gets placeholders for the launcher-owned state
+        # (``_triton_compile`` returns the error that kept it from compiling).
+        self.assertIsNone(_triton_compile(compiled, (x,), config, bound))
 
     @skipIfRefEager("compile-only launcher arguments have no eager reference")
     def test_compile_only_launch_args_mirror_launcher_state(self) -> None:

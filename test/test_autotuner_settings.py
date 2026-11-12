@@ -35,8 +35,10 @@ from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfXPU
+from helion._testing.search_harness import mock_kernel
 from helion._testing.search_harness import mock_search
 from helion._testing.search_harness import prepare_search
+from helion._testing.search_harness import skip_accuracy_baseline
 from helion.autotuner import DifferentialEvolutionSearch
 from helion.autotuner import LFBOPatternSearch
 from helion.autotuner import LFBOTreeSearch
@@ -87,6 +89,44 @@ class TestWorkerStartTimeoutSetting(TestCase):
             self.assertEqual(Settings().autotune_worker_start_timeout, 15)
         with without_env_var("HELION_AUTOTUNE_WORKER_START_TIMEOUT"):
             self.assertIsNone(Settings().autotune_worker_start_timeout)
+
+
+class _NarrowingSearch(BaseSearch):
+    """A search that narrows the compile deadline, as
+    ``set_adaptive_compile_timeout`` does, then picks the default config or,
+    with ``finds_none``, finds no config."""
+
+    finds_none = False
+
+    def _autotune(self) -> helion.Config:
+        self.settings.autotune_compile_timeout = 5
+        if self.finds_none:
+            raise exc.NoConfigFound
+        return self.config_spec.default_config()
+
+
+class TestAdaptiveCompileTimeout(TestCase):
+    def test_a_search_restores_the_compile_timeout_it_narrowed(self) -> None:
+        # The kernel's settings are shared by every shape the kernel is bound
+        # to: the next shape's search inherited the deadline this one
+        # narrowed, so its precompiles (and a precompiled accuracy baseline)
+        # were killed sooner than configured.
+        for finds_none in (False, True):
+            with self.subTest(finds_none=finds_none):
+                settings = Settings(
+                    autotune_compile_timeout=60, autotune_log_level=logging.CRITICAL
+                )
+                search = _NarrowingSearch(
+                    mock_kernel(settings, get_cached_path=lambda config: None), ()
+                )
+                search.finds_none = finds_none
+                with skip_accuracy_baseline():
+                    if finds_none:
+                        with self.assertRaises(exc.NoConfigFound):
+                            search.autotune()
+                    else:
+                        search.autotune()
+                self.assertEqual(settings.autotune_compile_timeout, 60)
 
 
 @onlyBackends(["triton", "cute"])
