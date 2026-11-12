@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from contextlib import nullcontext
 import dataclasses
 import hashlib
+import itertools
 import logging
 from typing import TYPE_CHECKING
 from typing import cast
@@ -18,6 +19,8 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import Buffer
 from torch._inductor.ir import ComputedBuffer
 from torch._inductor.ir import FinalizeCodegenResult
+from torch._inductor.ir import FixedLayout
+from torch._inductor.ir import FlexibleLayout
 from torch._inductor.ir import IRNode
 from torch._inductor.ir import Layout
 from torch._inductor.ir import MultiOutputLayout
@@ -42,6 +45,8 @@ import torch.utils._pytree as pytree
 from torch.utils._sympy.symbol import SymT
 from torch.utils._sympy.symbol import free_symbol_is_type
 
+from ...language import memory_ops
+from ...language.loops import static_range
 from .._dynamo.higher_order_ops import _rebuild_container_args
 from .._dynamo.higher_order_ops import get_helion_kernel
 from .._dynamo.higher_order_ops import helion_kernel_wrapper_functional
@@ -51,6 +56,7 @@ from .._dynamo.variables import _HOST_SEMANTIC_INPUT_NORMALIZATION
 from .._dynamo.variables import _REQUIRES_ISOLATED_LOWERING
 from .._dynamo.variables import _get_flat_output
 from ..ast_extension import ExtendedAST
+from ..ast_extension import LoopType
 from ..ast_extension import unparse
 from ..ast_read_writes import ReadWrites
 from ..compile_environment import HELION_STATIC_DIMS_ATTR
@@ -59,6 +65,9 @@ from ..generate_ast import generate_ast
 from ..indexing_strategy import SubscriptIndexing
 from ..output_header import _active_library_imports
 from ..output_header import get_needed_import_lines
+from ..type_info import CallableType
+from ..type_info import SequenceType
+from ..variable_origin import FlattenOrigin
 from helion._compat import torch_uses_template_producer_fusion
 from helion.runtime.config import Config
 from helion.runtime.config_cache import ConfigCache
@@ -257,6 +266,7 @@ class HelionTemplateBuffer(TemplateBuffer):
         mutated_inputs: Iterable[IRNode] | None = None,
         allowed_prologue_inps: OrderedSet[str] | None = None,
         named_inputs: dict[str, IRNode] | None = None,
+        stand_in_fields: dict[str, frozenset[str]] | None = None,
     ) -> None:
         self._helion_kernel = kernel
         self._bound_kernel = bound_kernel
@@ -270,6 +280,11 @@ class HelionTemplateBuffer(TemplateBuffer):
         self._symbolic_strides = frozenset(symbolic_strides)
         self._tuning_bound_kernel: BoundKernel | None = None
         self._fusion_metadata: _FusionMetadata | None = None
+        # What the generated code reads, beyond the device loads a fused
+        # prologue replaces, of the parameters each input buffer is passed
+        # for: what a prologue source must match to be passed in its place
+        # (see ``_reads_besides_loads``).
+        self._stand_in_fields = stand_in_fields or {}
 
         tb_self = self  # capture for closure
 
@@ -333,8 +348,38 @@ class HelionTemplateBuffer(TemplateBuffer):
         ``_finalize_codegen`` (called after Inductor has
         processed epilogue/prologue subgraphs).
         """
-        # 1. Set up fusion hooks (requires V.kernel context).
+        # 1. Set up fusion hooks (requires V.kernel context).  The hooks pass
+        #    the first source of each prologue for every parameter the buffer
+        #    is passed for and the rest as extra inputs.  Inductor collects the
+        #    sources in a frozenset, so order them (``_stand_ins_first``): one
+        #    the generated code can use in the parameters' place first, so the
+        #    choice does not follow the string hash seed.  A source an earlier
+        #    kernel mutated is read under its MutationOutput's name, which
+        #    names no tensor: pass the mutated buffer, as Inductor's
+        #    ``KernelArgs.input`` does.
+        real_name = V.graph.scheduler.mutation_real_name
+        kernel._prologue_sources = {
+            buf_name: _stand_ins_first(
+                OrderedSet(real_name.get(s, s) for s in sources),
+                V.graph.get_buffer(buf_name),
+                self._stand_in_fields.get(buf_name, ()),
+            )
+            for buf_name, sources in kernel._prologue_sources.items()
+        }
         kernel._setup_fusion_hooks()
+        named_inputs = self._named_inputs  # pyrefly: ignore[missing-attribute]
+        for param_name, source in kernel._prologue_source_buffers.items():
+            buf_name = named_inputs[param_name].get_name()
+            fields = self._stand_in_fields.get(buf_name)
+            if fields and (
+                source is None
+                or not _can_stand_in_for(source, V.graph.get_buffer(buf_name), fields)
+            ):
+                raise RuntimeError(
+                    f"Helion kernel {self._helion_kernel.name!r}: the prologue "
+                    f"fused into parameter {param_name!r} has no source buffer "
+                    "the host code can use in its place"
+                )
         self._refresh_range_tree_node_symbols(kernel)
 
         # 2. Read pre-computed fusion metadata from kernel into a single object.
@@ -513,7 +558,11 @@ class HelionTemplateBuffer(TemplateBuffer):
             ReadWrites.from_list(host_def.body).reads
         )
         call_preamble, call_args = self._build_call_args(
-            call_order, constant_repr, self._prologue_source_buffers, self._extra_params
+            call_order,
+            constant_repr,
+            self._prologue_source_buffers,
+            self._extra_params,
+            host_params=_param_names(host_def),
         )
         imports = get_needed_import_lines(root)
 
@@ -651,12 +700,18 @@ class HelionTemplateBuffer(TemplateBuffer):
         constant_repr: dict[str, str],
         prologue_source_buffers: dict[str, str | None],
         extra_params: list[tuple[str, str]],
+        host_params: Collection[str],
     ) -> tuple[list[str], list[str]]:
-        """Compute ``(call_preamble, call_args)`` for the kernel invocation."""
+        """Compute ``(call_preamble, call_args)`` for the kernel invocation.
+
+        ``host_params`` are the generated host function's parameters.
+        """
         preamble: list[str] = []
         # Sourceless prologues (e.g. ones_like) are fully inlined by the
-        # prologue hook — their param should be dropped from the call args
-        # and removed from the host function signature.
+        # prologue hook — their param is dropped from the call args and from
+        # the host function signature.  One whose device load turned out dead
+        # never reached the hook and kept its parameter; it reads nothing else
+        # (see ``_reads_besides_loads``), so it is passed ``None``.
         sourceless_prologues: set[str] = {
             param_name
             for param_name, source in prologue_source_buffers.items()
@@ -675,7 +730,7 @@ class HelionTemplateBuffer(TemplateBuffer):
                 return result
 
             if param_name in sourceless_prologues:
-                return None
+                return "None" if param_name in host_params else None
 
             source_buf = prologue_source_buffers.get(param_name)
 
@@ -708,6 +763,7 @@ class HelionTemplateBuffer(TemplateBuffer):
         mutated_input_names: list[str],
         direct_aliases: dict[int, IRNode],
         *,
+        bound_kernel: BoundKernel,
         on_tensor_leaf: Callable[[str, Any, list[tuple[type, int]], int], None]
         | None = None,
         fusion_enabled: bool = False,
@@ -742,6 +798,33 @@ class HelionTemplateBuffer(TemplateBuffer):
                 for dep in inp.get_read_writes().reads
             )
         }
+        # A producer can replace a parameter whose size, stride, dtype, device
+        # or values the generated code reads only when one of its sources can
+        # be passed in its place (see ``_reads_besides_loads``).
+        # One source stands in for every parameter a buffer is passed for.
+        stand_in_fields: dict[str, frozenset[str]] = {}
+        if fusion_enabled:
+            reads = _reads_besides_loads(bound_kernel, realized_inputs.keys())
+            for param_name, fields in reads.items():
+                buf_name = realized_inputs[param_name].get_name()
+                stand_in_fields[buf_name] = (
+                    stand_in_fields.get(buf_name, frozenset()) | fields
+                )
+        # Checked only for buffers no other rule keeps unfused, as the check
+        # may freeze a source's layout.
+        unfused_inp_names = (
+            mutated_inp_names
+            | container_inp_names
+            | mutation_dependent_inp_names
+            | size_indexed_inp_names
+        )
+        no_stand_in_inp_names = {
+            buf_name
+            for buf_name, fields in stand_in_fields.items()
+            if buf_name not in unfused_inp_names
+            and isinstance(producer := V.graph.get_buffer(buf_name), ComputedBuffer)
+            and not _ensure_stand_in(producer, fields)
+        }
         buf = cls(
             layout=MultiOutputLayout(device=dev),  # pyrefly: ignore[bad-argument-type]
             inputs=inputs,
@@ -749,12 +832,12 @@ class HelionTemplateBuffer(TemplateBuffer):
             allowed_prologue_inps=OrderedSet(
                 inp.get_name()
                 for inp in inputs  # type: ignore[union-attr]
-                if inp.get_name() not in mutated_inp_names
-                and inp.get_name() not in container_inp_names
-                and inp.get_name() not in mutation_dependent_inp_names
-                and inp.get_name() not in size_indexed_inp_names
+                if inp.get_name() not in unfused_inp_names
+                and inp.get_name() not in no_stand_in_inp_names
             ),
             named_inputs=realized_inputs,
+            bound_kernel=bound_kernel,
+            stand_in_fields=stand_in_fields,
             **buffer_kwargs,
         )
         buf.allow_prologue_fusion = fusion_enabled
@@ -1039,17 +1122,18 @@ class HelionTemplateBuffer(TemplateBuffer):
         cache_modifier: ast.AST | None,
         codegen_load: Callable[..., ast.expr],
     ) -> ast.expr:
-        """Emit prologue variables + single ``<LOAD_INPUT_{param_name}>`` placeholder.
+        """Emit prologue variables + a ``<LOAD_INPUT_{param_name}>`` placeholder.
 
         For non-prologue params, delegates to ``codegen_load`` unchanged.
         For prologue params, emits index/mask variable definitions and a
         ``<LOAD_INPUT_{param_name}>`` placeholder (expanded at finalize time
-        by the hook closure), then returns a reference to the result variable.
+        by the hook closure, at every site it is emitted at) where no earlier
+        emission is in scope, then returns a copy of the result variable.
 
-        ``state.codegen.prologue_first_indexing`` tracks which params this
-        codegen pass has already emitted (for multi-output deduplication).
-        It belongs to the pass: a kernel ``generate_ast`` regenerates after a
-        rejected first pass emits every placeholder again.
+        ``state.codegen.prologue_first_indexing`` and ``prologue_blocks``
+        track what this codegen pass has emitted. They belong to the pass: a
+        kernel ``generate_ast`` regenerates after a rejected first pass emits
+        every placeholder again.
         """
         assert self._fusion_metadata is not None
         param_name = state.device_function.tensor_arg(tensor).name
@@ -1067,37 +1151,23 @@ class HelionTemplateBuffer(TemplateBuffer):
         prologue_vars = self._fusion_metadata.prologue_vars[param_name]
         result_name = prologue_vars["result"]
 
-        # For multi-output kernels the same input may be loaded at multiple
-        # store sites.  The prologue hook is only registered once per input,
-        # so only emit the placeholder + variable definitions on the first
-        # encounter; subsequent references just reuse the result variable.
-        # Prologue variables emitted once; reuse is safe because all loads
-        # of the same fused input use the same subscript (same tile indices).
-        prologue_first_indexing = state.codegen.prologue_first_indexing
+        # The same input may be loaded at several sites: the store sites of a
+        # multi-output kernel, or the copies of one load that reduction loops
+        # emit, one per loop. The placeholder expands at every site it is
+        # emitted at (Inductor replaces each occurrence), so it is emitted
+        # again wherever no earlier emission is in scope; a site inside the
+        # block of an earlier one reuses its result variable. All sites use
+        # the same subscript (``load_form`` keeps inputs loaded in two forms
+        # unfused).
+        codegen = state.codegen
+        prologue_first_indexing = codegen.prologue_first_indexing
+        blocks = codegen.prologue_blocks.setdefault(param_name, [])
+        in_scope = any(
+            block is enclosing
+            for block in blocks
+            for enclosing in codegen.statements_stack
+        )
         if param_name not in prologue_first_indexing:
-            xindex_name = prologue_vars["xindex"]
-            xmask_name = prologue_vars["xmask"]
-
-            # Compute linearized offset + mask from SubscriptIndexing
-            indexing = SubscriptIndexing.create(state, tensor, [*subscript], extra_mask)
-            offset_str = ast.unparse(indexing.index_expr)
-            prologue_first_indexing[param_name] = ", ".join(indexing.dim_index_exprs)
-            mask_str = (
-                ast.unparse(indexing.mask_expr) if indexing.has_mask() else "True"
-            )
-
-            # Emit prologue variable definitions as AST statements (prevents DCE of
-            # referenced variables like indices_0, indices_1).
-            state.add_statement(f"{xindex_name} = {offset_str}")
-            state.add_statement(f"{xmask_name} = {mask_str}")
-
-            # Emit single placeholder statement (preamble + result assignment).
-            state.add_statement(
-                ast.Expr(
-                    value=ast.Name(id=f"<LOAD_INPUT_{param_name}>", ctx=ast.Load())
-                )
-            )
-
             # Exempt param from DCE only if it has a source buffer — the
             # tensor pointer appears only in finalize_hook string substitutions.
             # Sourceless prologues (e.g. ones_like) are fully inlined by the
@@ -1107,21 +1177,51 @@ class HelionTemplateBuffer(TemplateBuffer):
                 state.device_function.placeholder_args.add(param_name)
             else:
                 state.device_function.sourceless_prologue_params.add(param_name)
-        else:
-            # Validate that the second load uses the same subscript as the first.
-            per_dim = SubscriptIndexing.compute_per_dim_indexing(
+        # The linearized offset + mask where the placeholder is emitted;
+        # elsewhere only the per-dimension offsets, to check them.
+        indexing = (
+            None
+            if in_scope
+            else SubscriptIndexing.create(state, tensor, [*subscript], extra_mask)
+        )
+        dims = (
+            SubscriptIndexing.compute_per_dim_indexing(
                 state, tensor, [*subscript], extra_mask
             )
-            new_offset = ", ".join(per_dim.dim_index_exprs)
-            first_offset = prologue_first_indexing[param_name]
-            assert new_offset == first_offset, (
-                f"Prologue param {param_name} loaded with different subscripts "
-                f"at multiple store sites — fusion requires identical tile "
-                f"indices. First: {first_offset}, second: {new_offset}"
+            if indexing is None
+            else indexing
+        ).dim_index_exprs
+        offset = ", ".join(dims)
+        first_offset = prologue_first_indexing.setdefault(param_name, offset)
+        assert offset == first_offset, (
+            f"Prologue param {param_name} loaded with different subscripts "
+            f"at several sites — fusion requires identical tile indices. "
+            f"First: {first_offset}, second: {offset}"
+        )
+        if indexing is not None:
+            mask_str = (
+                ast.unparse(indexing.mask_expr) if indexing.has_mask() else "True"
             )
+            # Emit prologue variable definitions as AST statements (prevents DCE of
+            # referenced variables like indices_0, indices_1).
+            state.add_statement(
+                f"{prologue_vars['xindex']} = {ast.unparse(indexing.index_expr)}"
+            )
+            state.add_statement(f"{prologue_vars['xmask']} = {mask_str}")
+            # Emit single placeholder statement (preamble + result assignment).
+            state.add_statement(
+                ast.Expr(
+                    value=ast.Name(id=f"<LOAD_INPUT_{param_name}>", ctx=ast.Load())
+                )
+            )
+            blocks.append(codegen.statements_stack[-1])
 
-        # Return variable reference (hook will assign fused value to this name).
-        return ast.Name(id=result_name, ctx=ast.Load())
+        # A copy of the result (which the hook assigns): code that rebinds the
+        # loaded value (``a = x[tile]; a = a + 1``) must not rebind the result
+        # a later load of the input reuses.
+        loaded = state.device_function.new_var(f"{result_name}_load", dce=True)
+        state.add_statement(f"{loaded} = {result_name}")
+        return ast.Name(id=loaded, ctx=ast.Load())
 
 
 def _function_def(root: ast.Module, name: str) -> ast.FunctionDef:
@@ -1130,6 +1230,12 @@ def _function_def(root: ast.Module, name: str) -> ast.FunctionDef:
         for node in root.body
         if isinstance(node, ast.FunctionDef) and node.name == name
     )
+
+
+def _param_names(function: ast.FunctionDef) -> list[str]:
+    """The parameters of ``function`` in positional order, keyword-only last."""
+    args = function.args
+    return [arg.arg for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs)]
 
 
 def _strip_host_annotations(root: ast.Module, host_name: str) -> None:
@@ -1228,6 +1334,392 @@ def _read_offset_uses_size_vars(dep: MemoryDep) -> bool:
     return free_symbol_is_type(
         sympy.expand(sympy.Add(dep.index, sympy.Mul(-1, flat))),
         (SymT.SIZE, SymT.PRECOMPUTED_SIZE, SymT.UNBACKED_INT),
+    )
+
+
+# What the generated code can read of a kernel's tensor argument, beyond the
+# device loads a fused prologue replaces (see ``_reads_besides_loads``).
+_SIZE = "size"
+_STRIDE = "stride"
+_DTYPE = "dtype"
+_DEVICE = "device"
+_VALUES = "values"
+# Named at all (``x is None``): any source will do, but not a dropped parameter.
+_REFERENCED = "referenced"
+_LAYOUT_FIELDS = frozenset({_SIZE, _STRIDE, _DTYPE, _DEVICE})
+_METADATA_ATTRIBUTES = {
+    "shape": frozenset({_SIZE}),
+    "ndim": frozenset({_SIZE}),
+    "dtype": frozenset({_DTYPE}),
+    "itemsize": frozenset({_DTYPE}),
+    "device": frozenset({_DEVICE}),
+    "is_cuda": frozenset({_DEVICE}),
+}
+_METADATA_METHODS = {
+    "size": frozenset({_SIZE}),
+    "dim": frozenset({_SIZE}),
+    "numel": frozenset({_SIZE}),
+    "stride": frozenset({_STRIDE}),
+    "is_contiguous": frozenset({_SIZE, _STRIDE}),
+    "element_size": frozenset({_DTYPE}),
+    "new_empty": frozenset({_DTYPE, _DEVICE}),
+    "new_zeros": frozenset({_DTYPE, _DEVICE}),
+    "new_ones": frozenset({_DTYPE, _DEVICE}),
+    "new_full": frozenset({_DTYPE, _DEVICE}),
+}
+_LIKE_FACTORIES = (
+    torch.empty_like,
+    torch.zeros_like,
+    torch.ones_like,
+    torch.full_like,
+)
+
+
+def _reads_besides_loads(
+    bound_kernel: BoundKernel, params: Iterable[str]
+) -> dict[str, frozenset[str]]:
+    """What the generated code reads of each of ``params`` other than through
+    the device loads (``x[tile]``, ``hl.load(x, ...)``) a fused prologue
+    replaces: the size, stride, dtype, device, or values of the tensor.
+
+    A fused prologue's output buffer is never allocated: the kernel call passes
+    one of the prologue's source buffers in its place, or drops the parameter
+    when the prologue reads none, and everything but those device loads sees
+    the substituted buffer (``torch.empty_like(x)``, ``x.size(0)``,
+    ``x.clone()``, the strides a dynamic-shape kernel indexes with).  Dtypes,
+    devices and ``x is None`` in device code are compile-time constants, and
+    under static shapes so are sizes and strides in device code and grid loop
+    bounds.  A parameter without a device load, or whose device code
+    generation reads (``device=x.device`` for a host factory call,
+    ``get_num_sm(x.device)`` for a persistent kernel), must at least stay in
+    the kernel call, which a prologue that reads no buffer does not allow.
+    """
+    host_function = bound_kernel.host_function
+    assert host_function is not None
+    params = set(params)
+    static_shapes = bound_kernel.settings.static_shapes
+    reads: dict[str, set[str]] = {name: set() for name in params}
+    # The forms (see ``load_form``) each parameter is loaded in.
+    loaded: dict[str, set[tuple[object, ...]]] = {}
+    visits = itertools.count()
+    # The tensors whose device code generation may read, whatever the config.
+    origin = host_function.first_tensor_origin(bound_kernel.env.device)
+    for name in (
+        host_function.first_tensor_param(),
+        None if origin is None else origin.host_str(),
+    ):
+        if name in reads:
+            reads[name].add(_DEVICE)
+
+    def static_value(node: ast.AST) -> object:
+        """The callable or class ``node`` names, if any."""
+        node_type = cast("ExtendedAST", node)._type_info
+        return node_type.value if isinstance(node_type, CallableType) else None
+
+    def callee(node: ast.Call) -> object:
+        return static_value(node.func)
+
+    def param_name(node: ast.AST) -> str | None:
+        return node.id if isinstance(node, ast.Name) and node.id in params else None
+
+    def metadata_read(node: ast.AST) -> tuple[str, frozenset[str], ast.AST] | None:
+        """``(param, fields, child holding the param)`` for a metadata read."""
+        if isinstance(node, ast.Attribute) and node.attr in _METADATA_ATTRIBUTES:
+            if (name := param_name(node.value)) is not None:
+                return name, _METADATA_ATTRIBUTES[node.attr], node.value
+        if isinstance(node, ast.Call):
+            func = node.func
+            if (
+                isinstance(func, ast.Attribute)
+                and func.attr in _METADATA_METHODS
+                and (name := param_name(func.value)) is not None
+            ):
+                return name, _METADATA_METHODS[func.attr], func
+            if node.args and (name := param_name(node.args[0])) is not None:
+                fn = callee(node)
+                if fn in _LIKE_FACTORIES:
+                    return name, _LAYOUT_FIELDS, node.args[0]
+                if fn is len:
+                    return name, frozenset({_SIZE}), node.args[0]
+                # Any source is a tensor; other type checks (nn.Parameter)
+                # may tell a source from the producer, so they read values.
+                if (
+                    fn is isinstance
+                    and len(node.args) == 2
+                    and static_value(node.args[1]) is torch.Tensor
+                ):
+                    return name, frozenset({_REFERENCED}), node.args[0]
+        if (
+            isinstance(node, ast.Compare)
+            and all(isinstance(op, (ast.Is, ast.IsNot)) for op in node.ops)
+            and all(
+                isinstance(c, ast.Constant) and c.value is None
+                for c in node.comparators
+            )
+            and (name := param_name(node.left)) is not None
+        ):
+            return name, frozenset({_REFERENCED}), node.left
+        return None
+
+    def loaded_param(node: ast.AST) -> ast.AST | None:
+        """The parameter ``Name`` a device load reads, if any."""
+        if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load):
+            base = node.value
+        elif (
+            isinstance(node, ast.Call) and node.args and callee(node) is memory_ops.load
+        ):
+            base = node.args[0]
+        else:
+            return None
+        return base if param_name(base) is not None else None
+
+    def load_form(
+        node: ast.AST, block: tuple[object, ...], targets: frozenset[str]
+    ) -> tuple[object, ...]:
+        """The form of a device load: its index and enclosing blocks (loop
+        bodies, ``if`` and ``else`` branches, outermost first) when the index
+        names only enclosing loop variables, constants and constant slices
+        (``x[i, j]`` and ``hl.load(x, [i, j])`` alike), else the load itself,
+        as a mask or a computed index may differ between loads written the
+        same way (see ``form_count``)."""
+
+        def plain(element: ast.AST | None) -> bool:
+            if isinstance(element, ast.Slice):
+                parts = (element.lower, element.upper, element.step)
+                return all(p is None or isinstance(p, ast.Constant) for p in parts)
+            return isinstance(element, ast.Constant) or (
+                isinstance(element, ast.Name) and element.id in targets
+            )
+
+        if isinstance(node, ast.Subscript):
+            index, rest = node.slice, []
+        else:
+            call = cast("ast.Call", node)
+            index = call.args[1] if len(call.args) > 1 else None
+            rest = [*call.args[2:], *call.keywords]
+        elements = index.elts if isinstance(index, (ast.Tuple, ast.List)) else [index]
+        if rest or not all(plain(e) for e in elements):
+            # One per visit: an unrolled tuple loop repeats its body's nodes.
+            return ("load", next(visits))
+        return ("plain", block, tuple(ast.dump(cast("ast.AST", e)) for e in elements))
+
+    def form_count(forms: set[tuple[object, ...]]) -> int:
+        """How many forms of load ``forms`` are: loads at one index are one
+        when one of them is in a block around all the others' (the generated
+        code reuses that load's prologue in the inner blocks, or emits it
+        again where it comes first); any other load is its own."""
+        chains_by_index: dict[object, list[tuple[object, ...]]] = {}
+        count = 0
+        for form in forms:
+            if form[0] != "plain":
+                count += 1
+                continue
+            chains_by_index.setdefault(form[2], []).append(
+                cast("tuple[object, ...]", form[1])
+            )
+        for chains in chains_by_index.values():
+            enclosed = any(
+                all(chain[: len(outer)] == outer for chain in chains)
+                for outer in chains
+            )
+            count += 1 if enclosed else 2
+        return count
+
+    def visit(
+        node: ast.AST,
+        on_device: bool,
+        constant_shapes: bool,
+        block: tuple[object, ...] = (),
+        targets: frozenset[str] = frozenset(),
+        unrolled: frozenset[str] = frozenset(),
+    ) -> None:
+        if isinstance(node, ast.For):
+            grid = cast("ExtendedAST", node)._loop_type is LoopType.GRID
+            iter_shapes = static_shapes if grid else constant_shapes
+            visit(node.target, on_device, constant_shapes, block, targets, unrolled)
+            visit(node.iter, on_device, iter_shapes, block, targets, unrolled)
+            names = {n.id for n in ast.walk(node.target) if isinstance(n, ast.Name)}
+            # hl.static_range, and a loop over a tuple the device IR unrolls
+            # (``cols = (1, 2); for c in cols``), unroll into one block, where
+            # a load indexed by the variable is a load per iteration at
+            # another index.
+            if (
+                isinstance(node.iter, ast.Call) and callee(node.iter) is static_range
+            ) or isinstance(cast("ExtendedAST", node.iter)._type_info, SequenceType):
+                inner, inner_unrolled = targets, unrolled | names
+            else:
+                inner, inner_unrolled = targets | names, unrolled
+            for i, stmts in enumerate((node.body, node.orelse)):
+                for stmt in stmts:
+                    visit(
+                        stmt,
+                        on_device or grid,
+                        iter_shapes,
+                        (*block, (id(node), i)),
+                        frozenset(inner),
+                        frozenset(inner_unrolled),
+                    )
+            return
+        if isinstance(node, (ast.If, ast.While)):
+            visit(node.test, on_device, constant_shapes, block, targets, unrolled)
+            for i, stmts in enumerate((node.body, node.orelse)):
+                for stmt in stmts:
+                    visit(
+                        stmt,
+                        on_device,
+                        constant_shapes,
+                        (*block, (id(node), i)),
+                        targets,
+                        unrolled,
+                    )
+            return
+        if isinstance(
+            node, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
+        ):
+            # The device IR unrolls a comprehension: a load indexed by one of
+            # its variables is a load per element.
+            names = {
+                n.id
+                for gen in node.generators
+                for n in ast.walk(gen.target)
+                if isinstance(n, ast.Name)
+            }
+            inner_unrolled = unrolled | names
+            for child in ast.iter_child_nodes(node):
+                visit(child, on_device, constant_shapes, block, targets, inner_unrolled)
+            return
+        skip: ast.AST | None = None
+        if (read := metadata_read(node)) is not None:
+            name, fields, skip = read
+            if on_device:
+                fields -= {_DTYPE, _DEVICE, _REFERENCED}
+            if constant_shapes:
+                fields -= {_SIZE, _STRIDE}
+            reads[name].update(fields)
+        elif (name := param_name(node)) is not None:
+            reads[name].add(_VALUES)
+        elif on_device and (skip := loaded_param(node)) is not None:
+            name = cast("ast.Name", skip).id
+            forms = loaded.setdefault(name, set())
+            form = load_form(node, block, targets)
+            forms.add(form)
+            # In an hl.static_range body, a load indexed by its variable, or
+            # by anything else not plain (``j = i + 1; x[tile, j]``), is a
+            # load per unrolled iteration.
+            if unrolled and (
+                form[0] == "load"
+                or any(
+                    isinstance(n, ast.Name) and n.id in unrolled for n in ast.walk(node)
+                )
+            ):
+                forms.add(("unrolled", next(visits)))
+        for child in ast.iter_child_nodes(node):
+            if child is not skip:
+                visit(child, on_device, constant_shapes, block, targets, unrolled)
+
+    for stmt in host_function.body:
+        visit(stmt, False, False)
+    # merge_reduction_dims loads a parameter through a flattened view
+    # (``x.flatten(1, 2)``) the device code names instead of the parameter, so
+    # its prologue would not replace those loads.
+    for tensor_origin in host_function.tensor_to_origin.values():
+        if isinstance(tensor_origin, FlattenOrigin):
+            name = tensor_origin.value.host_str()
+            if name in reads:
+                reads[name].add(_VALUES)
+    for name in params:
+        if name not in loaded:
+            reads[name].add(_REFERENCED)
+            continue
+        if form_count(loaded[name]) > 1:
+            # A fused prologue replaces one form of load; the others, with
+            # another index, mask or block, would need the parameter's own
+            # values.
+            reads[name].add(_VALUES)
+        if not static_shapes:
+            # Device loads index with the strides and sizes of the host tensor.
+            reads[name].update((_SIZE, _STRIDE))
+    return {name: frozenset(fields) for name, fields in reads.items() if fields}
+
+
+# How to read each field of ``_reads_besides_loads`` off a buffer.
+_FIELD_GETTERS: dict[str, Callable[[IRNode], object]] = {
+    _SIZE: lambda node: list(node.get_size()),
+    _STRIDE: lambda node: list(node.get_stride()),
+    _DTYPE: lambda node: node.get_dtype(),
+    _DEVICE: lambda node: node.get_device(),
+}
+
+
+def _can_stand_in_for(
+    source_name: str, producer: IRNode, fields: Collection[str]
+) -> bool:
+    """Whether buffer ``source_name`` can be passed in place of ``producer`` to
+    code that reads ``fields`` of it (see ``_reads_besides_loads``)."""
+    if _VALUES in fields:
+        return False
+    source = V.graph.try_get_buffer(source_name)
+    # A mutation's output (NoneLayout) is no tensor to pass.
+    if source is None or isinstance(source, MutationOutput):
+        return False
+    if _STRIDE in fields and not isinstance(source.get_layout(), FixedLayout):
+        return False  # Inductor may still change it.
+    return _fields_match(source, producer, fields)
+
+
+def _fields_match(source: IRNode, producer: IRNode, fields: Collection[str]) -> bool:
+    # ``_REFERENCED`` asks only for a source, which this is.
+    return all(
+        _FIELD_GETTERS[field](source) == _FIELD_GETTERS[field](producer)
+        for field in fields
+        if field != _REFERENCED
+    )
+
+
+def _ensure_stand_in(producer: ComputedBuffer, fields: Collection[str]) -> bool:
+    """Whether a buffer ``producer`` reads can stand in for it to code reading
+    ``fields``, freezing the layout of one that needs it: a source whose
+    layout Inductor has not decided yet (an intermediate buffer, during
+    lowering) but matches as it stands is frozen, so it stays a match."""
+    sources = [
+        dep.name
+        for dep in producer.get_read_writes().reads
+        if isinstance(dep, MemoryDep)
+    ]
+    if any(_can_stand_in_for(name, producer, fields) for name in sources):
+        return True
+    if _VALUES in fields:
+        return False
+    for name in sources:
+        source = V.graph.try_get_buffer(name)
+        if (
+            isinstance(source, Buffer)
+            and isinstance(source.get_layout(), FlexibleLayout)
+            and _fields_match(source, producer, fields)
+        ):
+            # Exactly the strides that matched: as_fixed() may pad them.
+            source.freeze_layout_with_exact_strides(
+                source.get_stride()  # pyrefly: ignore[bad-argument-type]
+            )
+            return True
+    return False
+
+
+def _stand_ins_first(
+    sources: Iterable[str], producer: IRNode, fields: Collection[str]
+) -> tuple[str, ...]:
+    """``sources`` in a fixed order: those that can stand in for ``producer``
+    to code reading ``fields`` first, then those with its whole layout, then
+    by name."""
+    return tuple(
+        sorted(
+            sources,
+            key=lambda name: (
+                not _can_stand_in_for(name, producer, fields),
+                not _can_stand_in_for(name, producer, _LAYOUT_FIELDS),
+                name,
+            ),
+        )
     )
 
 

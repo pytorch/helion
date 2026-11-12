@@ -574,6 +574,26 @@ class HostFunction:
             result.append(self._device_ir.debug_str())
         return "\n\n".join(result)
 
+    def first_tensor_param(self) -> str | None:
+        """The first tensor parameter, whose device code generation gives a
+        host factory call that names none (``device=x.device``)."""
+        return next(
+            (
+                name
+                for name, value in self.params.arguments.items()
+                if isinstance(value, torch.Tensor)
+            ),
+            None,
+        )
+
+    def first_tensor_origin(self, device: torch.device) -> Origin | None:
+        """The first host tensor on ``device``, whose device host-side helpers
+        read (``get_num_sm(x.device)`` for a persistent kernel)."""
+        return next(
+            (o for t, o in self.tensor_to_origin.items() if t.device == device),
+            None,
+        )
+
     def codegen_function_def(
         self,
         statements: list[ast.AST],
