@@ -1944,7 +1944,7 @@ class CuteBackend(Backend):
         # completed_matmul_sum -> device_ir -> ``from helion import Config``
         # fails while helion/__init__ is still importing.
         from ..inductor_lowering import PointwiseLowering
-        from .cute_reshape import REBOUND_CHECK_TARGETS
+        from ..rebound_dims import REBOUND_CHECK_TARGETS
         from .cute_reshape import check_pointwise_rebound_block_ids
         from .repeated_block_ids import check_repeated_block_ids
         from .view_subtile import check_view_coord_consumers

@@ -30,12 +30,7 @@ from ... import exc
 from ...language._tracing_ops import _for_loop
 from ...language._tracing_ops import _for_loop_step
 from ...language._tracing_ops import _new_var
-from ...language.inline_asm_ops import inline_asm_elementwise
-from ...language.matmul_ops import dot as hl_dot
 from ...language.memory_ops import store
-from ...language.reduce_ops import _reduce
-from ...language.scan_ops import _associative_scan
-from ...language.view_ops import join
 from ...language.view_ops import split
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
@@ -45,6 +40,12 @@ from ..compile_environment import _symint_expr
 from ..host_function import HostFunction
 from ..indexing_strategy import _get_tile_with_offset_info
 from ..indexing_strategy import compute_slice_size
+from ..rebound_dims import REBOUND_CHECK_TARGETS
+from ..rebound_dims import VIEW_TARGETS
+from ..rebound_dims import block_extent
+from ..rebound_dims import operand_positions
+from ..rebound_dims import rebound_consumer_dims
+from ..rebound_dims import rebound_operands
 from ..tile_strategy import DeviceGridState
 from ..tile_strategy import DeviceLoopState
 from ..tile_strategy import PerThreadFlattenedTileStrategy
@@ -54,6 +55,7 @@ from .cute_fx_walk import reach_matmul_anchors
 from .emitters.memory_access import _cute_resolve_active_slice_block_id
 from .indexing import CuteShapeChainView
 from .indexing import is_cute_shape_chain_target
+from .literal_dims import check_literal_slot_dims
 from .scalar_lowering import scalar_lowering_context
 from .split_exchange import emitted_definitions
 
@@ -1304,16 +1306,6 @@ def _reshape_source_thread_coords(
     return source_coords
 
 
-# Reshape targets (``codegen_cute_reshape``).
-_VIEW_TARGETS = frozenset(
-    {
-        torch.ops.aten.reshape.default,
-        torch.ops.aten._unsafe_view.default,
-        torch.ops.aten.view.default,
-    }
-)
-
-
 # The views ``_resolve_shape_chain_expr`` maps a thread's coordinates through.
 _CHAIN_PROOF_VIEW_TARGETS = frozenset(
     {
@@ -1371,7 +1363,7 @@ def _chain_keeps_thread_elements(
         and target in _CHAIN_PROOF_VIEW_TARGETS
     ):
         source_shape = _tile_shape_hint(source_val, env, config)
-        if target in _VIEW_TARGETS:
+        if target in VIEW_TARGETS:
             source_coords = _reshape_source_thread_coords(
                 cg, coords, shape, source_shape
             )
@@ -1544,7 +1536,7 @@ def _reshape_value_consumer(
                 return "a store of a value computed from it"
             continue
         if (
-            target in _VIEW_TARGETS
+            target in VIEW_TARGETS
             and relabeled[0] in views
             and _reshape_keeps_thread_elements_through_chain(
                 ctx,
@@ -1888,70 +1880,6 @@ def rebound_block_dims(
     return rebound
 
 
-def operand_positions(
-    env: CompileEnvironment,
-    value: torch.Tensor,
-    consumer_sizes: Sequence[int | torch.SymInt],
-    consumer_block_ids: Sequence[int | None],
-    *,
-    lower_rank_by_block_id: bool,
-) -> list[int]:
-    """The consumer dim each dim of ``value`` meets (see ``rebound_block_dims``).
-
-    Right-aligned, so a negative position is a dim the consumer does not have;
-    a lower-rank pointwise operand is placed as
-    ``TileDispatch.broadcast_expand_dims`` places it.
-    """
-    offset = len(consumer_block_ids) - value.ndim
-    if not (lower_rank_by_block_id and 0 < value.ndim < len(consumer_block_ids)):
-        return [dim + offset for dim in range(value.ndim)]
-    consumer_canonical = [
-        None if block_id is None else env.canonical_block_id(block_id)
-        for block_id in consumer_block_ids
-    ]
-    matched: list[int] = []
-    used: set[int] = set()
-    for size in value.shape:
-        block_id = env.get_block_id(size)
-        canonical = None if block_id is None else env.canonical_block_id(block_id)
-        match = None
-        if canonical is not None:
-            match = next(
-                (
-                    position
-                    for position, candidate in enumerate(consumer_canonical)
-                    if position not in used and candidate == canonical
-                ),
-                None,
-            )
-        else:
-            match = next(
-                (
-                    position
-                    for position, candidate in enumerate(consumer_canonical)
-                    if position not in used
-                    and candidate is None
-                    and env.known_equal(size, consumer_sizes[position])
-                ),
-                None,
-            )
-        if match is None:
-            match = max(
-                position
-                for position in range(len(consumer_block_ids))
-                if position not in used
-            )
-        matched.append(match)
-        used.add(match)
-    return sorted(matched)
-
-
-def block_extent(env: CompileEnvironment, config: Config, block_id: int) -> int | None:
-    """``block_id``'s extent under ``config`` (``None`` while it is symbolic)."""
-    extent = env.block_sizes[env.canonical_block_id(block_id)].from_config(config)
-    return extent if isinstance(extent, int) else None
-
-
 def tensor_dim_block_ids(
     env: CompileEnvironment, sizes: Sequence[int | torch.SymInt]
 ) -> list[int | None]:
@@ -2068,9 +1996,6 @@ def subscript_rebound_block_dims(
     value (argument ``value_index`` of the op) is checked against the block
     the subscript addresses it with (``check_literal_slot_dims``).
     """
-    # Local import: literal_dims imports this module.
-    from .literal_dims import check_literal_slot_dims
-
     env = CompileEnvironment.current()
     config = state.device_function.config
     slot_sizes, slot_block_ids = _subscript_slot_dims(state, tensor, subscript)
@@ -2099,113 +2024,6 @@ def describe_rebound_block_dims(rebound: Sequence[tuple[int, int, int]]) -> str:
         f"dim {dim} (block id {value_block_id}) bound to block id {consumer_block_id}"
         for dim, value_block_id, consumer_block_id in rebound
     )
-
-
-# Custom lowerings that combine several tile operands per thread and so need
-# ``check_pointwise_rebound_block_ids`` like a PointwiseLowering: where, stack,
-# hl.join, hl.inline_asm_elementwise, the tuple forms of hl.reduce /
-# hl.associative_scan (whose combine function pairs the inputs' elements) and
-# the matmuls with an accumulator, which the SIMT fallback adds per thread.
-REBOUND_CHECK_TARGETS = frozenset(
-    {
-        torch.ops.aten.where.self,
-        torch.ops.aten.stack.default,
-        join,
-        inline_asm_elementwise,
-        _reduce,
-        _associative_scan,
-        torch.ops.aten.addmm.default,
-        torch.ops.aten.baddbmm.default,
-        hl_dot,
-        torch.ops.aten.gather.default,
-    }
-)
-
-_MATMUL_WITH_ACCUMULATOR = frozenset(
-    {torch.ops.aten.addmm.default, torch.ops.aten.baddbmm.default, hl_dot}
-)
-
-
-def _rebound_operands(node: Node) -> list[Node]:
-    """The operands of ``node`` whose elements are combined per thread.
-
-    A matmul's lhs / rhs have their own layout logic; only its accumulator
-    (``addmm(acc, ...)``, ``baddbmm(acc, ...)``, ``hl.dot(..., acc=acc)``) is
-    added element-wise to the product.
-    """
-    if node.target in _MATMUL_WITH_ACCUMULATOR:
-        if node.target is hl_dot:
-            acc = node.args[2] if len(node.args) > 2 else node.kwargs.get("acc")
-        else:
-            acc = node.args[0] if node.args else None
-        return [acc] if isinstance(acc, Node) else []
-    if node.target is torch.ops.aten.gather.default:
-        # The index is read per thread and selects along ``dim`` of the input
-        # the thread addresses by its own block coordinates.
-        index = node.args[2] if len(node.args) > 2 else node.kwargs.get("index")
-        return [index] if isinstance(index, Node) else []
-    return list(node.all_input_nodes)
-
-
-def _rebound_consumer_dims(
-    node: Node,
-) -> tuple[list[int | torch.SymInt], bool] | None:
-    """The dims an operand of ``node`` is compared against, and whether a
-    lower-rank operand is placed by block id.
-
-    Only a PointwiseLowering expands a lower-rank operand by block id
-    (``TileDispatch.broadcast_expand_dims``).  ``tl.where``, the inline asm,
-    ``hl.join``, the combine functions of a tuple reduce / scan and the
-    matmul accumulator receive their operands unexpanded and so right-align
-    them: a stack's or join's operands meet the result without the stacked
-    (last) dim, a tuple reduce or scan's inputs meet each other, a
-    tuple-result inline asm's operands meet its (broadcast) outputs.  A
-    single-input reduce or scan has nothing to re-bind against.
-    """
-    value = node.meta.get("val")
-    target = node.target
-    if target is torch.ops.aten.stack.default or target is join:
-        if not isinstance(value, torch.Tensor):
-            return None
-        sizes: list[int | torch.SymInt] = [*value.shape]
-        if target is join:
-            dim = value.ndim - 1
-        else:
-            dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
-            assert isinstance(dim, int)
-            dim %= value.ndim
-        del sizes[dim]
-        return sizes, False
-    if target is _reduce or target is _associative_scan:
-        is_tuple_input = (
-            node.args[4] if len(node.args) > 4 else node.kwargs.get("is_tuple_input")
-        )
-        if not is_tuple_input:
-            return None
-        first = next(
-            (
-                operand.meta["val"]
-                for operand in node.all_input_nodes
-                if isinstance(operand.meta.get("val"), torch.Tensor)
-            ),
-            None,
-        )
-        return None if first is None else ([*first.shape], False)
-    if target is inline_asm_elementwise:
-        if isinstance(value, (list, tuple)):
-            value = value[0] if value else None
-        return ([*value.shape], False) if isinstance(value, torch.Tensor) else None
-    if target is torch.ops.aten.gather.default:
-        source = node.args[0] if node.args else None
-        source_val = source.meta.get("val") if isinstance(source, Node) else None
-        if not isinstance(source_val, torch.Tensor):
-            return None
-        return [*source_val.shape], False
-    if not isinstance(value, torch.Tensor):
-        return None
-    if target is torch.ops.aten.where.self or target in _MATMUL_WITH_ACCUMULATOR:
-        return [*value.shape], False
-    return [*value.shape], True
 
 
 def _fx_subscript_dims(
@@ -2321,7 +2139,7 @@ def kernel_may_rebind_block_ids(graphs: Sequence[GraphInfo]) -> bool:
                 )
             ):
                 continue
-            consumer = _rebound_consumer_dims(node)
+            consumer = rebound_consumer_dims(node)
             if consumer is None or not consumer[0]:
                 continue
             sizes, lower_rank_by_block_id = consumer
@@ -2334,7 +2152,7 @@ def kernel_may_rebind_block_ids(graphs: Sequence[GraphInfo]) -> bool:
                 rebinds(
                     operand.meta.get("val"), sizes, block_ids, lower_rank_by_block_id
                 )
-                for operand in _rebound_operands(node)
+                for operand in rebound_operands(node)
             ):
                 return True
     return False
@@ -2367,7 +2185,7 @@ def check_pointwise_rebound_block_ids(
     """
     from ..generate_ast import GenerateAST
 
-    consumer = _rebound_consumer_dims(node)
+    consumer = rebound_consumer_dims(node)
     if consumer is None or not consumer[0]:
         return {}
     consumer_sizes, lower_rank_by_block_id = consumer
@@ -2390,7 +2208,7 @@ def check_pointwise_rebound_block_ids(
         )
     )
     pending: list[tuple[Node, torch.Tensor, list[tuple[int, int, int]]]] = []
-    for operand in _rebound_operands(node):
+    for operand in rebound_operands(node):
         operand_val = operand.meta.get("val")
         if not isinstance(operand_val, torch.Tensor):
             continue
