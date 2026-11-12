@@ -24,6 +24,7 @@ import torch
 import helion
 from helion._testing import DEVICE
 from helion._testing import code_and_output
+from helion._testing import import_example
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfNotCUDA
 import helion.language as hl
@@ -43,42 +44,8 @@ SCALAR_ATOMIC = "cute.arch.atomic_add("
 LOAD_LIST = "_lane_unroll_loads_"
 
 
-def _combine(
-    left_values: torch.Tensor,
-    left_indices: torch.Tensor,
-    right_values: torch.Tensor,
-    right_indices: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return (
-        torch.where(
-            left_indices == right_indices, left_values + right_values, right_values
-        ),
-        right_indices,
-    )
-
-
-def _segmented_reduction(
-    indices: torch.Tensor, input_data: torch.Tensor, num_nodes: int
-) -> torch.Tensor:
-    """``examples/segment_reduction.py::segmented_reduction_helion``."""
-    num_elements, num_features = input_data.shape
-    output = torch.zeros(
-        (num_nodes, num_features), dtype=input_data.dtype, device=input_data.device
-    )
-    for tile_e, tile_f in hl.tile([num_elements, num_features]):
-        vals = input_data[tile_e, tile_f]
-        idxs = indices[tile_e]
-        idxs_next = hl.load(
-            indices, [tile_e.index + 1], extra_mask=tile_e.index < num_elements - 1
-        )
-        tuple_in = (vals, idxs.float().unsqueeze(1).expand_as(vals))
-        out_vals, _ = hl.associative_scan(_combine, tuple_in, dim=0)
-        mask = (idxs != idxs_next) | (
-            tile_e.index % tile_e.block_size == tile_e.block_size - 1
-        )
-        segment_vals = torch.where(mask.unsqueeze(1), out_vals, 0.0)
-        hl.atomic_add(output, [idxs, tile_f], segment_vals)
-    return output
+# The example's kernel function, which the tests bind for the CuTe backend.
+_segmented_reduction = import_example("segment_reduction").segmented_reduction_helion.fn
 
 
 def _scatter_where(
@@ -829,24 +796,20 @@ def _reference(indices: torch.Tensor, x: torch.Tensor, num_nodes: int) -> torch.
 
 
 def _index_patterns(num_elements: int, num_nodes: int) -> dict[str, torch.Tensor]:
-    """Sorted segment ids whose last row never belongs to node 0.
-
-    The example masks the next-row index of the last row with 0, so a
-    partial last tile whose last row is node 0 does not flag it as a
-    segment end (the Triton backend drops that sum too); the study inputs
-    (sorted random ids) never end on node 0 either.
+    """Sorted segment ids, one of them a single segment on node 0: the
+    kernel masks the next-row id of the last row with 0, so that row also
+    ends its segment explicitly, which a partial last tile on node 0 needs.
     """
     generator = torch.Generator().manual_seed(1)
     sorted_random = torch.randint(
         0, num_nodes, (num_elements,), generator=generator
     ).sort()[0]
-    sorted_random[-1] = num_nodes - 1
     # Segments of 33 rows straddle every 16- and 32-row tile boundary; the
     # last node ids stay empty.
     spans = torch.arange(num_elements) // 33
     return {
         "sorted_random": sorted_random,
-        "single_segment": torch.ones(num_elements, dtype=torch.int64),
+        "single_segment": torch.zeros(num_elements, dtype=torch.int64),
         "one_row_segments": torch.arange(num_elements) % num_nodes,
         "tile_spanning": spans.clamp(max=num_nodes - 1),
     }
@@ -885,6 +848,12 @@ _GPU_CONFIGS: dict[str, dict[str, Any]] = {
 
 @pytest.mark.cuda
 @skipIfNotCUDA()
+# 36 cases, the full product: the six configs are distinct lowerings (lane
+# unrolls of 16, 8 and 4, 2-wide vectors, strided vector and scalar lanes);
+# the shapes end their row tiles evenly (4096) or not (2000 in 32-row tiles,
+# 1000 in 16- and 32-row tiles), the last with a partial vector of columns
+# (98); fast_math switches every lowering's zero-add elision, which must
+# keep each flush, a partial last tile's last row included.
 @pytest.mark.parametrize("fast_math", [False, True])
 @pytest.mark.parametrize("name", sorted(_GPU_CONFIGS))
 @pytest.mark.parametrize(
@@ -904,7 +873,13 @@ def test_segmented_reduction_matches_index_add(
             kernel, (indices, x, num_nodes), **_GPU_CONFIGS[name]
         )
         expected = _reference(indices, x, num_nodes)
-        torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-3), pattern
+        torch.testing.assert_close(
+            out,
+            expected,
+            rtol=1e-4,
+            atol=1e-3,
+            msg=lambda m, pattern=pattern: f"{pattern}: {m}",
+        )
         if name.startswith("strip") and num_features % 4 == 0:
             assert VECTOR_ATOMIC in code
         # A partial column tile keeps every load inside the per-element
@@ -916,7 +891,11 @@ def test_segmented_reduction_matches_index_add(
         y = torch.randn_like(x)
         _, out = code_and_output(kernel, (indices, y, num_nodes), **_GPU_CONFIGS[name])
         torch.testing.assert_close(
-            out, _reference(indices, y, num_nodes), rtol=1e-4, atol=1e-3
+            out,
+            _reference(indices, y, num_nodes),
+            rtol=1e-4,
+            atol=1e-3,
+            msg=lambda m, pattern=pattern: f"{pattern}: {m}",
         )
 
 

@@ -168,6 +168,15 @@ def _is_known_host_value(value: object) -> bool:
 
 # Capture Python-library identities before user code can replace module attrs.
 _NATIVE_TENSOR_CLASS = torch.Tensor
+# The receivers of an operator lookup (``torch.ops.prims.fma``), and with
+# the overload it ends in, the values such a lookup yields: torch's own
+# classes, whose attribute lookup and equality run no user protocol.
+_TORCH_OPS_LOOKUP_TYPES = (
+    type(torch.ops),
+    torch._ops._OpNamespace,
+    torch._ops.OpOverloadPacket,
+)
+_TORCH_OPS_VALUE_TYPES = (*_TORCH_OPS_LOOKUP_TYPES, torch._ops.OpOverload)
 _KNOWN_HOST_CONSTRUCTORS = (
     abs,
     all,
@@ -1411,6 +1420,11 @@ class LiteralType(TypeInfo):
             # Native Tensor method lookup does not invoke a user descriptor.
             # Python replacements still go through opaque effect tracking.
             result = descriptor
+        elif any(type(self.value) is kind for kind in _TORCH_OPS_LOOKUP_TYPES):
+            # ``torch.ops.<namespace>.<op>.<overload>`` resolves a registered
+            # operator: torch's own lookup, which runs no user protocol and
+            # touches no tensor, so the storage proofs survive it.
+            result = getattr(self.value, attr)
         else:
             with _track_host_storage_effects(self.value, origin):
                 result = getattr(self.value, attr)
@@ -1447,6 +1461,7 @@ class LiteralType(TypeInfo):
                     types.MethodDescriptorType,
                     types.ModuleType,
                     type,
+                    *_TORCH_OPS_VALUE_TYPES,
                 )
             )
         )
@@ -2143,7 +2158,7 @@ class NumericType(TypeInfo):
 
         if isinstance(left, (torch.SymInt | torch.SymBool | torch.SymFloat)):
             vleft = left._sympy_()
-        elif isinstance(right, int | float | bool):
+        elif isinstance(left, int | float | bool):
             vleft = sympy.sympify(left)
         else:
             return False

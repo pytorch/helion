@@ -30,11 +30,25 @@ from helion._testing import skipUnlessCuteAvailable
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallasTpu
 from helion._testing.reduction_inputs import exact_fp32_sum_input
+from helion._testing.row_iota_kernels import half_row_fill
 from helion.autotuner import IntegerFragment
 import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+if _get_backend() in ("triton", "tileir"):
+    import triton
+
+
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def half_row_iota(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([x.size(0)], dtype=torch.float32, device=x.device)
+    for tile_m in hl.tile(x.size(0)):
+        row = x[tile_m, :].to(torch.float32)
+        n = row.size(1) // 2
+        out[tile_m] = row.sum(-1) + hl.arange(n).to(torch.float32).sum(-1)
+    return out
 
 
 @helion.kernel()
@@ -482,6 +496,24 @@ class TestReductions(RefEagerTestBase, TestCase):
                 )(full)
 
     @onlyBackends(["triton"])
+    @skipIfRefEager("checks a compiled nested loop's captured scalar")
+    def test_nested_loop_reads_a_scalar_derived_from_a_full_slice_size(self):
+        # With dynamic shapes the nested loop reads n = row.size(1) // 2
+        # through the outer floordiv the interpreter records, which its skip
+        # of values that are exactly the block size symbol keeps.
+        kernel = helion.kernel(
+            half_row_fill, static_shapes=False, autotune_effort="none"
+        )
+        x = torch.randn(64, 200, device=DEVICE)
+        expected = torch.zeros(64, 200, device=DEVICE)
+        expected[:, :100] = x.sum(-1, keepdim=True) + 100
+        for chunk in (None, 64):
+            _, actual = code_and_output(
+                kernel, (x,), block_sizes=[16], reduction_loops=[chunk]
+            )
+            torch.testing.assert_close(actual, expected)
+
+    @onlyBackends(["triton"])
     @skipIfRefEager("checks compiled reduction padding")
     def test_flattened_padded_reduction_dims(self):
         @helion.kernel(static_shapes=True, autotune_effort="none")
@@ -500,6 +532,123 @@ class TestReductions(RefEagerTestBase, TestCase):
         x = -torch.rand(4, 4, 8, device=DEVICE) - 1
         _, output = code_and_output(flat_amax, (x,), block_sizes=[2])
         torch.testing.assert_close(output, x.flatten(1).amax(1))
+
+    @onlyBackends(["triton", "cute"])
+    @parametrize("static_shapes", (False, True))
+    def test_slice_from_a_scalar_derived_from_a_full_slice_size(self, static_shapes):
+        """``row.size(1)`` of a full slice reads the row's extent, so
+        ``x[tile, n:]`` for ``n = row.size(1) // 2`` is the row's second half,
+        and the slice's own extent is the rest of the row."""
+
+        @helion.kernel(static_shapes=static_shapes, autotune_effort="none")
+        def half_row_sum(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([x.size(0)], dtype=torch.float32, device=x.device)
+            for tile in hl.tile(x.size(0)):
+                row = x[tile, :].to(torch.float32)
+                n = row.size(1) // 2
+                out[tile] = row.sum(-1) + x[tile, n:].to(torch.float32).sum(-1)
+            return out
+
+        # Half of 200 columns is half of neither the row's block (256) nor a
+        # 64-column chunk of its loop.
+        x = torch.randn(64, 200, device=DEVICE)
+        for chunk in (None, 64):
+            _code, output = code_and_output(
+                half_row_sum, (x,), block_sizes=[16], reduction_loops=[chunk]
+            )
+            torch.testing.assert_close(output, x.sum(-1) + x[:, 100:].sum(-1))
+
+    @onlyBackends(["triton", "cute"])
+    @parametrize("static_shapes", (False, True))
+    def test_scalars_from_a_full_slice_size_in_a_nested_loop(self, static_shapes):
+        """A float and a bool computed from a full slice's size reach a nested
+        loop as computed from its extent, constants with static shapes: at 200
+        columns the half is 100 and the row is narrower than 220, which the
+        block size (256) is not."""
+
+        @helion.kernel(static_shapes=static_shapes, autotune_effort="none")
+        def scaled(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(y)
+            for tile_m in hl.tile(x.size(0)):
+                width = x[tile_m, :].size(1)
+                scale = width / 2
+                narrow = width < 220
+                for tile_k in hl.tile(y.size(1)):
+                    out[tile_m, tile_k] = y[tile_m, tile_k] * scale + narrow
+            return out
+
+        y = torch.randn(64, 128, device=DEVICE)
+        # At 64 columns the CuTe default config is invalid since #4407: the
+        # slice's dim is registered as a reduction loop and the two tiles
+        # leave it no thread (InvalidConfig at bind, on origin/main too).
+        widths = (200,) if _get_backend() == "cute" else (64, 200)
+        for width in widths:
+            x = torch.randn(64, width, device=DEVICE)
+            torch.testing.assert_close(scaled(x, y), y * (width / 2) + 1)
+
+    @onlyBackends(["triton"])
+    def test_arange_of_a_scalar_from_a_full_slice_size(self):
+        """An ``hl.arange`` of a scalar computed from a full slice's size is as
+        long as the row's extent makes it: at 129 columns, in a block of 256,
+        it sums 64 indices."""
+
+        x = torch.randn(64, 129, device=DEVICE)
+        torch.testing.assert_close(half_row_iota(x), x.sum(-1) + 63 * 64 / 2)
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("checks a compile-time error")
+    def test_arange_of_a_scalar_from_a_full_slice_size_is_a_power_of_two(self):
+        """At 200 columns half a full slice's size is 100, which Triton itself
+        refuses as an ``hl.arange`` length (a power of two), rather than Helion
+        emitting an arange of 128 under a dim without a mask.  This pins
+        Triton's own error and its wording: a change that pads and masks such
+        a range, or refuses it in Helion, replaces the check."""
+
+        with self.assertRaisesRegex(
+            triton.compiler.errors.CompilationError, "power of 2"
+        ):
+            half_row_iota(torch.randn(64, 200, device=DEVICE))
+
+    @onlyBackends(["triton"])
+    def test_factor_beside_an_arange_of_a_full_slice_size_in_a_nested_loop(self):
+        """A nested loop that reads a scalar computed from a full slice's size
+        as an ``hl.arange`` length, for which its capture keeps the value it
+        traced as, multiplies by the value the extent gives: 64 at 129
+        columns, not half the block (128).  The arange adds its minimum, 0
+        whatever its length.  (CuTe refuses the arange, see
+        test_cute_size_derived_range.py.)"""
+
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def scaled(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(y)
+            for tile_m in hl.tile(x.size(0)):
+                n = x[tile_m, :].size(1) // 2
+                for tile_k in hl.tile(y.size(1)):
+                    first = hl.arange(n).to(torch.float32).amin(-1)
+                    out[tile_m, tile_k] = y[tile_m, tile_k] * n + first
+            return out
+
+        x = torch.randn(64, 129, device=DEVICE)
+        y = torch.randn(64, 32, device=DEVICE)
+        torch.testing.assert_close(scaled(x, y), y * 64)
+
+    @onlyBackends(["triton", "cute"])
+    @parametrize("static_shapes", (False, True))
+    def test_full_slice_size_divided_by_an_int_argument(self, static_shapes):
+        """A full slice's size divided by an int argument, which traces as an
+        unbacked symbol with a hint of its own, binds and reads the extent."""
+
+        @helion.kernel(static_shapes=static_shapes, autotune_effort="none")
+        def scaled(x: torch.Tensor, k: int) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                row = x[tile, :]
+                out[tile, :] = row * (row.size(1) / k) + row.size(1) // k
+            return out
+
+        # 200 / 8 and 200 // 8 are exact: 25, where the block (256) gives 32.
+        x = torch.randn(64, 200, device=DEVICE)
+        torch.testing.assert_close(scaled(x, 8), x * 25.0 + 25)
 
     @onlyBackends(["triton"])
     def test_multi_dim_reduction_of_scalar_constant(self):
