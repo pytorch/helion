@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import logging
 from typing import TYPE_CHECKING
 
@@ -23,9 +24,20 @@ from .triton.launcher import get_num_xcd as get_num_xcd
 from .triton.launcher import set_triton_allocator as set_triton_allocator
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import torch
 
+    from .._compiler.cross_loop_timeline import TimelineMeta
+
 log: logging.Logger = logging.getLogger(__name__)
+
+
+def _timeline_register(meta: TimelineMeta) -> Callable[[torch.Tensor], None]:
+    # Imported here: ``python -m helion.runtime.timeline`` runs the module.
+    from . import timeline
+
+    return functools.partial(timeline.register, meta=meta)
 
 
 def default_launcher(
@@ -46,6 +58,7 @@ def default_launcher(
     _persistent_state_process_group_name: str | None = None,
     _persistent_state_rank_digest: str | None = None,
     _persistent_state_rank_shares: tuple[int, ...] = (),
+    _timeline: tuple[int, TimelineMeta] | None = None,
     _minimum_resident_programs: int = 0,
     ptx_options: str | None = None,
     launch_cooperative_grid: bool = False,
@@ -73,6 +86,10 @@ def default_launcher(
             _persistent_state_process_group_name=_persistent_state_process_group_name,
             _persistent_state_rank_digest=_persistent_state_rank_digest,
             _persistent_state_rank_shares=_persistent_state_rank_shares,
+            _timeline=_timeline,
+            _timeline_register=None
+            if _timeline is None
+            else _timeline_register(_timeline[1]),
             _minimum_resident_programs=_minimum_resident_programs,
             ptx_options=ptx_options,
             launch_cooperative_grid=launch_cooperative_grid,

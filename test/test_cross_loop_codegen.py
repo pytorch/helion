@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import os
+import tempfile
 from types import SimpleNamespace
 from typing import Any
 from typing import cast
@@ -49,6 +51,7 @@ from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
 from helion.autotuner.benchmark_provider import _triton_compile
 import helion.language as hl
+from helion.runtime import timeline
 from helion.runtime.triton.launcher import compile_only_launch_args
 
 
@@ -2824,6 +2827,87 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                     "tile_dependency_raw_dispatch_ticket" in code,
                     pipeline == "dynamic",
                 )
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_megakernel_timeline_records_every_task(self) -> None:
+        x = torch.arange(8 * 4, device=DEVICE, dtype=torch.float32).reshape(8, 4)
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.dict(timeline._buffers, clear=True),
+        ):
+            for pipeline in ("static", "dynamic"):
+                kernel = helion.kernel(
+                    readiness_counter_chain.fn,
+                    static_shapes=True,
+                    autotune_effort="none",
+                    megakernel_timeline=os.path.join(directory, pipeline),
+                )
+                for launch in range(3):
+                    code, out = code_and_output(
+                        kernel,
+                        (x + launch,),
+                        pid_type="persistent_blocked",
+                        cross_loop_pipeline=pipeline,
+                        num_sm_multiplier=1,
+                        num_warps=1,
+                    )
+                    torch.testing.assert_close(
+                        out, torch.sum(x + launch + 1).reshape(1)
+                    )
+                # Root 3 waits for the chain: a ready stamp (a task word's
+                # third) follows its spin.
+                self.assertRegex(code, r"\* 4 \+ 2\), tl\.inline_asm_elementwise\(")
+            # A config that compiles no megakernel records nothing, and says so.
+            with self.assertLogs("helion._compiler.generate_ast", "WARNING"):
+                code, _ = code_and_output(
+                    kernel,
+                    (x,),
+                    pid_type="persistent_blocked",
+                    cross_loop_pipeline="barrier",
+                )
+            self.assertNotIn("tile_dependency_timeline", code)
+            paths = sorted(timeline.write())
+            self.assertEqual(
+                [os.path.basename(path) for path in paths],
+                [
+                    f"{pipeline}.readiness_counter_chain.0.cuda{x.device.index or 0}.txt"
+                    for pipeline in ("dynamic", "static")
+                ],
+            )
+            for path in paths:
+                recorded = timeline.load(path)
+                self.assertEqual(
+                    [launch.epoch for launch in recorded.launches], [1, 2, 3]
+                )
+                tasks = sum(count for count, _name in recorded.roots.values())
+                self.assertEqual(tasks, 32 + 16 + 4 + 1)
+                for launch in recorded.launches:
+                    self.assertEqual(len(launch.tasks), tasks)
+                    # Root 3 waits for root 2: it is ready no earlier than root
+                    # 2's tasks start (an unstamped ready would read as its start).
+                    self.assertGreaterEqual(
+                        min(t.ready for t in launch.tasks if t.root == 3),
+                        max(t.start for t in launch.tasks if t.root == 2),
+                    )
+                    # Roots 1 and 2 run as continuations, each inside the task
+                    # whose arrival completed it.
+                    for child, parent in ((1, 0), (2, 1)):
+                        for task in (t for t in launch.tasks if t.root == child):
+                            self.assertTrue(
+                                any(
+                                    p.worker == task.worker
+                                    and p.start <= task.start <= task.end <= p.end
+                                    for p in launch.tasks
+                                    if p.root == parent
+                                )
+                            )
+                    for task in launch.tasks:
+                        _sm, entry, leave = launch.workers[task.worker]
+                        self.assertLessEqual(entry, task.start)
+                        self.assertLessEqual(task.start, task.ready)
+                        self.assertLessEqual(task.ready, task.end)
+                        self.assertLessEqual(task.end, leave)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")

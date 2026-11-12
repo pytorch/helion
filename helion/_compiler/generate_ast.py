@@ -1484,6 +1484,16 @@ def _generate_ast(
                         raise
                     raise failure from error
             env.backend.after_device_codegen(codegen, func, config)
+            if (
+                env.settings.megakernel_timeline is not None
+                and codegen.device_function.timeline is None
+            ):
+                log.warning(
+                    "megakernel_timeline is set, but %s compiles no megakernel "
+                    "with this config (no tile dependencies, or "
+                    "cross_loop_pipeline='barrier'): nothing is recorded",
+                    func.name,
+                )
             try:
                 if _bounded_cache_request is None:
                     kernel_def = codegen.device_function.codegen_function_def()
