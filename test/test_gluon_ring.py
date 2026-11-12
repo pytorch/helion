@@ -350,6 +350,29 @@ def mm_after_flag(x: torch.Tensor, y: torch.Tensor, flag: torch.Tensor) -> torch
 
 
 @helion.kernel(static_shapes=True, backend="gluon")
+def scale_then_w13x(
+    x: torch.Tensor, w1: torch.Tensor, w3: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Two weights of one shape read in one K loop (a gate/up pair)."""
+    m, k = x.size()
+    n = w1.size(0)
+    y = torch.empty_like(x)
+    out1 = torch.empty([n, m], dtype=torch.float32, device=x.device)
+    out3 = torch.empty([n, m], dtype=torch.float32, device=x.device)
+    for tile_r, tile_c in hl.tile([m, k]):
+        y[tile_r, tile_c] = x[tile_r, tile_c] * 2
+    for tile_n, tile_m in hl.tile([n, m]):
+        acc1 = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+        acc3 = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc1 = hl.dot(w1[tile_n, tile_k], y[tile_m, tile_k].T, acc=acc1)
+            acc3 = hl.dot(w3[tile_n, tile_k], y[tile_m, tile_k].T, acc=acc3)
+        out1[tile_n, tile_m] = acc1
+        out3[tile_n, tile_m] = acc3
+    return out1, out3
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
 def scale_by_last_row(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile_m in hl.tile(x.size(0)):
@@ -1012,6 +1035,31 @@ class TestGluonRing(TestCase):
         ):
             config = helion.Config(block_sizes=[128, 64, 64], **{**RING, **extra})
             self.assertNotIn("warp_specialize", bound.to_triton_code(config))
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_dots_of_one_loop_share_no_accumulator_ring(self) -> None:
+        """Two dots of one K loop whose accumulator rings tensor memory cannot
+        both hold do not share one (both accumulators are live through the
+        loop): the ring falls back."""
+        x = torch.randn([256, 1024], device=DEVICE, dtype=torch.bfloat16)
+        w1 = torch.randn([256, 1024], device=DEVICE, dtype=torch.bfloat16)
+        bound = scale_then_w13x.bind((x, w1, torch.randn_like(w1)))
+        slots = len(bound.config_spec.range_warp_specialize)
+        config = helion.Config(
+            **RING,
+            # A 128x256 accumulator ring takes all 512 columns.
+            block_sizes=[32, 64, 128, 256, 64],
+            range_warp_specializes=[None] * (slots - 1) + [True],
+            cross_loop_pipeline="static",
+            num_warps=4,
+        )
+        with self.assertLogs("helion._compiler.triton.gluon_ring", "INFO") as logs:
+            code = bound.to_triton_code(config)
+        self.assertIn(
+            "no tensor memory for an accumulator ring", "\n".join(logs.output)
+        )
+        self.assertNotIn("warp_specialize", code)
 
     @skipIfRefEager("checks generated code")
     @skipUnlessGluon()
