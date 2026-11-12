@@ -33,7 +33,18 @@ class LogRegistry:
     log_levels: dict[str, int] = field(default_factory=dict)
 
 
-_LOG_REGISTRY = LogRegistry({"all": ["helion"]})
+# ``megakernel``: a megakernel's schedule, its root barriers and why, the
+# transport of its cross-rank dependencies and why a ring falls back.
+_LOG_REGISTRY = LogRegistry(
+    {
+        "all": ["helion"],
+        "megakernel": [
+            "helion.megakernel",
+            "helion._compiler.tile_dependency",
+            "helion._compiler.triton.gluon_ring",
+        ],
+    }
+)
 
 
 def parse_log_value(value: str) -> None:

@@ -4701,6 +4701,8 @@ class TileDependencyRelation:
     producer_site_id: int | None
     consumer_site_id: int | None
     incidence: Incidence | None
+    # Why ``incidence`` is None (the scheduler's root-barrier explanations).
+    failure: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -5822,18 +5824,21 @@ def _symbolic_dependency_incidence(
     consumer_access: TileAccess,
     consumer_domain: CoordinateDomain,
     prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
-) -> Incidence | None:
+) -> Incidence | str:
+    """Which producer tasks each consumer task depends on, or why that has no
+    exact form."""
     # A masked access touches a subset of its tile: the tile over-approximates
     # what it may write or read, so a wait on it is still sufficient.
-    if (
-        not producer_access.layout_is_symbolically_exact
-        or not consumer_access.layout_is_symbolically_exact
-        or producer_access.allocation_id != consumer_access.allocation_id
-    ):
-        return None
+    for side, access in (("producer", producer_access), ("consumer", consumer_access)):
+        if not access.layout_is_symbolically_exact:
+            return f"the {side}'s tensor has a data-dependent shape, stride or offset"
+    if producer_access.allocation_id != consumer_access.allocation_id:
+        return "the accesses are of different allocations"
     producer_layout = _access_layout(producer_access, prove_nonnegative)
     consumer_layout = _access_layout(consumer_access, prove_nonnegative)
     producer_dimensions, consumer_dimensions = producer_layout[4], consumer_layout[4]
+    # Why the tensors' own axes give no incidence (the byte-address form then may).
+    axes_failure = "a tensor's strides are not provably injective"
     if producer_dimensions is not None and consumer_dimensions is not None:
         producer_geometry = tuple(
             (producer_layout[0][axis], producer_layout[1][axis])
@@ -5871,6 +5876,11 @@ def _symbolic_dependency_incidence(
                     )
                 )
             )
+        axes_failure = (
+            "the two views share no axes"
+            if shared is None
+            else "the views start at different offsets"
+        )
         if (
             shared is not None
             and producer_access.storage_offset == consumer_access.storage_offset
@@ -5896,6 +5906,7 @@ def _symbolic_dependency_incidence(
                 allocation_domain=coordinate_domain,
                 axis_runs=consumer_runs,
             )
+            axes_failure = _map_failure(producer_map, consumer_map)
             if producer_map is not None and consumer_map is not None:
                 incidence = _access_incidence(
                     producer_map, consumer_map, prove_nonnegative
@@ -5909,13 +5920,15 @@ def _symbolic_dependency_incidence(
     producer_offset = sympy.Integer(0) if common_offset else producer_layout[2]
     consumer_offset = sympy.Integer(0) if common_offset else consumer_layout[2]
     storage_sizes = []
-    for layout, offset in (
-        (producer_layout, producer_offset),
-        (consumer_layout, consumer_offset),
+    for side, layout, offset in (
+        ("producer", producer_layout, producer_offset),
+        ("consumer", consumer_layout, consumer_offset),
     ):
         span = layout[3]
         if span is None or not _is_provably_nonnegative(offset, prove_nonnegative):
-            return None
+            return (
+                f"{axes_failure}; the {side}'s storage span or offset is not provable"
+            )
         # pyrefly: ignore [unsupported-operation]
         end = sympy.simplify(offset + span)
         if end.is_zero is True:
@@ -5953,9 +5966,26 @@ def _symbolic_dependency_incidence(
         allocation_domain=allocation_domain,
         prove_nonnegative=prove_nonnegative,
     )
-    if producer_map is None or consumer_map is None:
-        return None
-    return _access_incidence(producer_map, consumer_map, prove_nonnegative)
+    incidence = (
+        None
+        if producer_map is None or consumer_map is None
+        else _access_incidence(producer_map, consumer_map, prove_nonnegative)
+    )
+    if incidence is None:
+        return (
+            f"{axes_failure}; as addresses, {_map_failure(producer_map, consumer_map)}"
+        )
+    return incidence
+
+
+def _map_failure(producer: _AccessMap | None, consumer: _AccessMap | None) -> str:
+    if producer is None or consumer is None:
+        side = "producer" if producer is None else "consumer"
+        return (
+            f"the {side}'s tile is no affine address range of its task (rows of "
+            "a wider tensor, a scale other than 1, or an unprovable bound)"
+        )
+    return "the two tiles' overlap has no exact form"
 
 
 def _coordinate_domain_for_axes(
@@ -6099,6 +6129,21 @@ def instantiate_symbolic_dependencies(
                 continue
             for producer_site_id, producer_domain in producer_endpoints:
                 for consumer_site_id, consumer_domain in consumer_endpoints:
+                    incidence: Incidence | str = (
+                        "a loop does not start at 0 or has a step"
+                    )
+                    if axes_have_canonical_origins and (
+                        dependency_graph.noncanonical_axes.isdisjoint(
+                            (*producer_domain.axis_order, *consumer_domain.axis_order)
+                        )
+                    ):
+                        incidence = _symbolic_dependency_incidence(
+                            producer_access=producer_access,
+                            producer_domain=producer_domain,
+                            consumer_access=consumer_access,
+                            consumer_domain=consumer_domain,
+                            prove_nonnegative=prove_nonnegative,
+                        )
                     result.append(
                         TileDependencyRelation(
                             dependency_id=access_dependency.dependency_id,
@@ -6107,23 +6152,8 @@ def instantiate_symbolic_dependencies(
                             consumer_root=edge.consumer_root,
                             producer_site_id=producer_site_id,
                             consumer_site_id=consumer_site_id,
-                            incidence=(
-                                _symbolic_dependency_incidence(
-                                    producer_access=producer_access,
-                                    producer_domain=producer_domain,
-                                    consumer_access=consumer_access,
-                                    consumer_domain=consumer_domain,
-                                    prove_nonnegative=prove_nonnegative,
-                                )
-                                if axes_have_canonical_origins
-                                and dependency_graph.noncanonical_axes.isdisjoint(
-                                    (
-                                        *producer_domain.axis_order,
-                                        *consumer_domain.axis_order,
-                                    )
-                                )
-                                else None
-                            ),
+                            incidence=None if isinstance(incidence, str) else incidence,
+                            failure=incidence if isinstance(incidence, str) else None,
                         )
                     )
     return tuple(result)
