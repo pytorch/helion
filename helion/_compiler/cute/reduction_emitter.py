@@ -108,9 +108,12 @@ from .reduce_call import ReduceScope
 from .reduce_call import runtime_lane_expr
 from .reduction_coordinates import reduced_block_ids
 from .reduction_lanes import WARP_THREADS
+from .reduction_lanes import fits_row_packets
 from .reduction_lanes import looped_reduction_lanes
+from .reduction_lanes import masked_row_lanes
+from .reduction_lanes import requested_lane_unroll
 from .reduction_lanes import tiled_row_threads
-from .reduction_lanes import trims_padded_lanes
+from .reduction_lanes import whole_vector_lanes
 from .register_tile_admission import RegisterTileUnsupported
 from .resident_reductions import ResidentReductionLayout
 from .resident_reductions import feature_index_expression
@@ -356,7 +359,9 @@ def _configured_block_entry(
     )
 
 
-def _live_lane_extent(lane_extent: int, numel: object, threads: int) -> int:
+def _live_lane_extent(
+    lane_extent: int, numel: object, threads: int, *, proven_bounds: bool, unroll: int
+) -> int:
     """The scalar lanes of a masked persistent row that hold an element.
 
     The row walks its padded extent (768 elements pad to 1024) in lanes of
@@ -366,10 +371,16 @@ def _live_lane_extent(lane_extent: int, numel: object, threads: int) -> int:
     the value ``_mask_to`` substitutes, after every live lane.  For torch's
     reductions that value is the combine's identity (``hl.reduce`` folds its
     ``other`` instead, ``_block_has_user_reduce``).  Those trailing lanes
-    are dropped.
+    are dropped, as far as ``masked_row_lanes`` lets them.
     """
     if isinstance(numel, (int, sympy.Integer)) and int(numel) > 0:
-        return min(lane_extent, -(-int(numel) // threads))
+        return masked_row_lanes(
+            int(numel),
+            threads,
+            lane_extent,
+            proven_bounds=proven_bounds,
+            unroll=unroll,
+        )
     return lane_extent
 
 
@@ -412,6 +423,33 @@ def _block_has_user_reduce(fn: DeviceFunction, block_index: int) -> bool:
     return any(
         block_id is None or env.canonical_block_id(block_id) == canonical
         for block_id in map(_reduced_block_id, _kernel_calls(fn, (_reduce,)))
+    )
+
+
+def _scanned_block_id(node: torch.fx.Node) -> int | None:
+    """The block a scan node runs along, or None for a dim of no block (the
+    scan lowering then matches the dim's extent against the blocks,
+    ``_resolve_dim_block_id``).  Read from its first input, which has its
+    shape: a scan of a tuple has no value of its own in the graph."""
+    inputs = node.args[1]
+    first = cast(
+        "torch.fx.Node", inputs[0] if isinstance(inputs, (tuple, list)) else inputs
+    )
+    value = cast("torch.Tensor", first.meta["val"])
+    return CompileEnvironment.current().get_block_id(
+        value.shape[cast("int", node.args[2]) % value.ndim]
+    )
+
+
+def _block_is_scanned(fn: DeviceFunction, block_index: int) -> bool:
+    """Whether a scan may run along ``block_index`` (``_scanned_block_id`` is
+    the block or None).  Normalization's lane model reads the same blocks
+    from ``cute_scanned_block_ids``."""
+    env = CompileEnvironment.current()
+    canonical = env.canonical_block_id(block_index)
+    return any(
+        block_id is None or env.canonical_block_id(block_id) == canonical
+        for block_id in map(_scanned_block_id, _kernel_calls(fn, (_associative_scan,)))
     )
 
 
@@ -1272,13 +1310,13 @@ class CutePersistentReductionEmitter(
             and not strategy._cute_resident_reduction
             and not _block_has_user_reduce(fn, block_index)
         ):
-            live = _live_lane_extent(lane_extent, numel, strategy._thread_count)
-            if not isinstance(numel, (int, sympy.Integer)) or trims_padded_lanes(
-                int(numel),
+            lane_extent = _live_lane_extent(
+                lane_extent,
+                numel,
                 strategy._thread_count,
                 proven_bounds=fn.config.config.get("cute_proven_bounds") is True,
-            ):
-                lane_extent = live
+                unroll=requested_lane_unroll(fn.config.config),
+            )
         if lane_extent is not None:
             strategy._synthetic_cute_lane_var = fn.new_var(
                 f"synthetic_lane_{block_index}",
@@ -1305,6 +1343,30 @@ class CutePersistentReductionEmitter(
             # one-warp vector loads exactly as a 32-thread request does.
             if requested_vec > 1 and lane_extent == requested_vec:
                 strategy._cute_reduction_vec_width = requested_vec
+            elif (
+                whole_vector_lanes(lane_extent, requested_vec)
+                and fits_row_packets(
+                    env.config_spec.cute_row_itemsizes.get(
+                        env.canonical_block_id(block_index)
+                    ),
+                    requested_vec,
+                    env.config_spec.target_device_capability,
+                )
+                and not shared_axis
+                and not strategy._unpadded_extent
+                and not strategy._cute_register_tile_predicted
+                # The parallel scans walk the cyclic lanes
+                # (``PersistentReductionStrategy.cute_lane_axis``).
+                and not _block_is_scanned(fn, block_index)
+            ):
+                # Several V-wide chunks per thread, ``threads * V`` elements
+                # apart: each lane step of the constexpr loop reads element
+                # ``lane % V`` of chunk ``lane // V``, so consecutive threads
+                # hold consecutive vectors and a scalar access of another
+                # tensor on the row (an unaligned one) spans ``threads * V``
+                # elements per warp instruction instead of the whole row.
+                strategy._cute_reduction_vec_width = requested_vec
+                strategy._cute_reduction_vec_chunks = lane_extent // requested_vec
         if strategy._unpadded_extent and strategy._cute_reduction_vec_width <= 1:
             raise exc.BackendUnsupported(
                 "cute",
@@ -1580,6 +1642,7 @@ class CutePersistentReductionEmitter(
         assert synthetic_lane_var is not None
         axis = strategy._get_thread_axis()
         vec_width = strategy._cute_reduction_vec_width
+        chunks = strategy._cute_reduction_vec_chunks
         if vec_width > 1:
             # With exactly one V-wide chunk per thread, blocked and strided
             # layouts coincide: thread ``t`` owns ``[t*V, (t+1)*V)``.
@@ -1587,6 +1650,10 @@ class CutePersistentReductionEmitter(
             # so memory lowering can splice one LDG/STG vector around the
             # constexpr per-element loop.  The dummy one-trip outer loop is
             # retained only as a container and elided by ``wrap_body``.
+            # Several chunks per thread keep the one constexpr loop over all
+            # of the thread's elements; chunk ``c`` starts ``c * threads * V``
+            # past the thread's base, and the late branch-local vectorizer
+            # places one packet per chunk.
             base_index_var = strategy.fn.new_var(
                 f"reduction_lane_base_{block_idx}", dce=False
             )
@@ -1596,8 +1663,9 @@ class CutePersistentReductionEmitter(
                 f"({strategy._index_init_expr(block_size_var, env.index_type(), block_idx)})"
                 f" * {vec_width}"
             )
-            vec_for = _create_lane_loop(synthetic_lane_var, vec_width, [])
-            vec_iter = expr_from_string(f"cutlass.range_constexpr({vec_width})")
+            lane_count = vec_width * chunks
+            vec_for = _create_lane_loop(synthetic_lane_var, lane_count, [])
+            vec_iter = expr_from_string(f"cutlass.range_constexpr({lane_count})")
             assert isinstance(vec_iter, ast.expr)
             vec_for.iter = vec_iter
             lane_body: list[ast.AST] = [
@@ -1608,7 +1676,7 @@ class CutePersistentReductionEmitter(
             context.lane_body = lane_body
             context.vloop = vec_for
             context.vec_lane_var = synthetic_lane_var
-            current_grid.add_lane_loop(block_idx, synthetic_lane_var, vec_width)
+            current_grid.add_lane_loop(block_idx, synthetic_lane_var, lane_count)
             current_grid.vec_lane_wrappers[synthetic_lane_var] = VecLaneWrapper(
                 outer_for=outer_for,
                 vloop=vec_for,
@@ -1621,20 +1689,31 @@ class CutePersistentReductionEmitter(
             # the lane loops of the other full-slice axes it encloses, so a
             # load addressed by one of their lanes can become one packet
             # (the branch-local persistent vectorizer widens the markers
-            # inside each sunk V-loop; this pass widens none itself).
-            strategy.fn.cute_state.lanes.vloop_sink_wrappers[synthetic_lane_var] = (
-                CuteVloopWrapperFact(
-                    block_id=block_idx,
-                    vec_width=vec_width,
-                    lane_var=synthetic_lane_var,
-                    vec_lane_var=synthetic_lane_var,
-                    base_index_var=base_index_var,
-                    index_var=strategy.index_var(block_idx),
-                    mask_var=strategy._mask_var,
-                    uniform_vector_mask=strategy._mask_var is None,
+            # inside each sunk V-loop; this pass widens none itself).  A
+            # loop over several chunks is not one V-loop and is not sunk.
+            if chunks == 1:
+                strategy.fn.cute_state.lanes.vloop_sink_wrappers[synthetic_lane_var] = (
+                    CuteVloopWrapperFact(
+                        block_id=block_idx,
+                        vec_width=vec_width,
+                        lane_var=synthetic_lane_var,
+                        vec_lane_var=synthetic_lane_var,
+                        base_index_var=base_index_var,
+                        index_var=strategy.index_var(block_idx),
+                        mask_var=strategy._mask_var,
+                        uniform_vector_mask=strategy._mask_var is None,
+                    )
                 )
-            )
-            index_expr = f"{base_index_var} + cutlass.Int32({synthetic_lane_var})"
+                index_expr = f"{base_index_var} + cutlass.Int32({synthetic_lane_var})"
+            else:
+                strategy.fn.cute_state.lanes.chunked_reduction_lanes[
+                    synthetic_lane_var
+                ] = vec_width
+                index_expr = (
+                    f"{base_index_var} + cutlass.Int32({synthetic_lane_var}"
+                    f" // {vec_width} * {strategy._thread_count * vec_width}"
+                    f" + {synthetic_lane_var} % {vec_width})"
+                )
         else:
             # A scalar synthetic lane over a grid of one-vector tile
             # wrappers becomes a trace-time loop OUTSIDE those wrappers

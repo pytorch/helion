@@ -13,6 +13,19 @@ Python remainder by such a divisor (``_cute_python_mod``, the ``e % d`` of
 a de-linearized ``x[e // d, e % d]``) becomes the base's remainder plus the
 lane: the base's is a multiple of V below the divisor.
 
+Under ``cute_uniform_lane_compares`` (``compare_bases``), a comparison of a
+lane offset with an integer bound that is a multiple of V (``offset <
+bound`` or ``offset >= bound``, either way round) compares the base
+instead: no lane offset reaches the next multiple of V.  A chunk's tile
+mask ``index < extent`` and the bounds of its de-linearized coordinates
+then cost one compare per vector instead of one per lane: a Python
+remainder by a positive constant also has a known factor there (the gcd
+of its dividend's and the divisor), so the in-row bound ``r % d < d``
+compares the base's remainder.  The remainder gets it on its own, under
+integer casts or through a name bound to it, not inside a larger sum or
+product (``row * 192 + (r % 192)`` has no known factor).  Without the knob
+a remainder has factor 1, as before, and the code is the knob-off code.
+
 Facts are proved syntactically on the generated kernel body.  A name's known
 factor follows integer constants, constexpr values, sums (gcd), products and
 integer casts of integer expressions (``scalar_integer``), and a staged
@@ -24,14 +37,23 @@ are recognized, with lane offsets spelled ``base + lane`` or ``base +
 cutlass.Int32(lane)`` (the cast form only for a traced base, whose type the
 sum keeps), and sums of a lane offset and an integer multiple of V
 (``row * d + offset``, whose base is ``row * d + base``).  The offset's
-name is replaced by its base under its casts, so the quotient or remainder
-keeps its type.  Facts follow straight-line code: a loop forgets the names
-it assigns before its body, except the integers it carries in and preserves
-(the next iteration's lane base of a software-pipelined loop), whose facts
-are weakened over passes on a copy of the body until they hold at every
-iteration; an ``if`` forgets the names either branch assigns, and a body
-with statements ``simplify_proven_bounds`` cannot model is left alone.  The
-rewrite is an integer identity, so it changes no result.
+name is replaced by its base under its casts, so the quotient, remainder or
+comparison keeps its type.  Facts follow straight-line code: a loop forgets
+the names it assigns before its body, except the integers it carries in and
+preserves (the next iteration's lane base of a software-pipelined loop),
+whose facts are weakened over passes over the body (a vector loop's on a
+copy) until they hold at every iteration; an ``if`` forgets the names
+either branch assigns, and a body with statements
+``simplify_proven_bounds`` cannot model is left alone.
+
+The rewrites are integer identities: every integer and boolean keeps its
+value.  The comparisons' only numeric effect is FMA contraction where
+per-lane selects kept products unfused: once a whole mask is one value per
+vector, LLVM may merge the lanes' masked branches and contract a product
+the mask guarded into the add that reads it, where per-lane masks keep the
+two in separate basic blocks.  Those elements can differ by about one ulp,
+as under ``cute_lane_unroll``, so the comparison rewrite is a knob, off by
+default.
 """
 
 from __future__ import annotations
@@ -63,6 +85,22 @@ if TYPE_CHECKING:
 
 # A constant this size reads the same through every integer cast.
 _INT32_MAX = (1 << 31) - 1
+# The operand of a comparison, operator or call, that a lane offset may hold
+# for the comparison to keep its answer once the offset becomes its base:
+# the first in ``offset < bound`` and ``offset >= bound``, the second in
+# ``bound > offset`` and ``bound <= offset``.
+_OFFSET_OPERAND: tuple[tuple[type[ast.cmpop], int], ...] = (
+    (ast.Lt, 0),
+    (ast.GtE, 0),
+    (ast.Gt, 1),
+    (ast.LtE, 1),
+)
+_COMPARISON_CALL_OPERAND: dict[str, int] = {
+    "operator.lt": 0,
+    "operator.ge": 0,
+    "operator.gt": 1,
+    "operator.le": 1,
+}
 
 
 def _cast_argument(node: ast.expr) -> ast.expr | None:
@@ -102,6 +140,11 @@ class _Facts:
     # its aliases), with all of them: once renamed they are one variable, so
     # a write to any is a write to all.
     merged: Mapping[str, frozenset[str]]
+    # ``cute_uniform_lane_compares`` (``compare_bases``): a Python remainder
+    # by a positive constant is an integer with a known factor, and a
+    # comparison of a lane offset with a multiple of the width compares the
+    # offset's base.
+    uniform_compares: bool
 
     def copy(self) -> _Facts:
         return _Facts(
@@ -110,12 +153,22 @@ class _Facts:
             dict(self.factor),
             dict(self.constant),
             self.merged,
+            self.uniform_compares,
         )
+
+    def empty_like(self) -> _Facts:
+        """No facts about any name, under this one's merged names and
+        comparison mode."""
+        return _Facts(set(), set(), {}, {}, self.merged, self.uniform_compares)
 
     def with_merged(self, names: Iterable[str]) -> set[str]:
         return with_merged_names(names, self.merged)
 
     def is_integer(self, node: ast.expr) -> bool:
+        remainder = _strip_casts(node)
+        if self.uniform_compares and _is_python_mod(remainder):
+            assert isinstance(remainder, ast.Call)
+            return all(self.is_integer(argument) for argument in remainder.args)
         return _integer_expression(node, "", self.integer)
 
     def is_traced(self, node: ast.expr) -> bool:
@@ -159,6 +212,13 @@ class _Facts:
         node = _strip_casts(node)
         if isinstance(node, ast.Name):
             return self.factor.get(node.id, 1)
+        if self.uniform_compares and _is_python_mod(node):
+            assert isinstance(node, ast.Call)
+            # ``a - d * floor(a / d)`` for a positive divisor ``d``.
+            divisor = self.constant_of(node.args[1])
+            if divisor is None or divisor <= 0:
+                return 1
+            return math.gcd(self._factor(node.args[0]), divisor)
         if isinstance(node, ast.BinOp):
             left = self._factor(node.left)
             right = self._factor(node.right)
@@ -197,6 +257,7 @@ class _Facts:
             {name: factor for name, factor in self.factor.items() if name in names},
             {name: value for name, value in self.constant.items() if name in names},
             self.merged,
+            self.uniform_compares,
         )
 
     def meet(self, other: _Facts) -> _Facts:
@@ -216,6 +277,7 @@ class _Facts:
                 if name in integer and other.constant.get(name) == value
             },
             self.merged,
+            self.uniform_compares,
         )
 
     def update(self, other: _Facts) -> None:
@@ -226,7 +288,7 @@ class _Facts:
 
     def key(self) -> tuple[frozenset[object], ...]:
         """The facts as a hashable value (within one pass, whose merged
-        names are fixed)."""
+        names and ``uniform_compares`` are fixed)."""
         return (
             frozenset(self.integer),
             frozenset(self.traced),
@@ -240,19 +302,26 @@ _CARRY_ROUNDS = 4
 
 
 class _Rewriter:
-    def __init__(self, facts: _Facts) -> None:
+    def __init__(
+        self,
+        facts: _Facts,
+        *,
+        in_trial: bool = False,
+        carried_cache: dict[tuple[object, ...], _Facts] | None = None,
+    ) -> None:
         self.facts = facts
-
-    # Set on the rewriters of ``carried_facts``'s passes over a copy of a
-    # loop body, which need only the facts it leaves: a loop nested there
-    # takes the facts it carries without a pass over its own body.
-    in_trial = False
-    # The facts ``carried_facts`` found, by loop and facts at its entry,
-    # shared by every rewriter of one pass: the passes over an outer loop's
-    # body meet each nested loop again, which would otherwise repeat its own
-    # passes at every level, exponential in the nesting depth.  A loop is
-    # rewritten only after its last lookup.
-    carried_cache: dict[tuple[object, ...], _Facts] | None = None
+        # Set on the rewriters of ``carried_facts``'s passes over a copy of a
+        # loop body, which need only the facts it leaves: a loop nested there
+        # takes the facts it carries without a pass over its own body.
+        self.in_trial = in_trial
+        # The facts ``carried_facts`` found, by loop and facts at its entry,
+        # shared by every rewriter of one pass: the passes over an outer
+        # loop's body meet each nested loop again, which would otherwise
+        # repeat its own passes at every level, exponential in the nesting
+        # depth.  A loop is rewritten only after its last lookup.
+        self.carried_cache: dict[tuple[object, ...], _Facts] = (
+            {} if carried_cache is None else carried_cache
+        )
 
     def body(self, statements: list[ast.stmt]) -> None:
         for statement in statements:
@@ -300,7 +369,7 @@ class _Rewriter:
         """Facts of ``loop``'s counter, from its bounds at loop entry."""
         assert isinstance(loop.target, ast.Name)
         target = loop.target.id
-        facts = _Facts(set(), set(), {}, {}, self.facts.merged)
+        facts = self.facts.empty_like()
         if is_staged_loop(loop):
             facts.integer.add(target)
             facts.traced.add(target)
@@ -323,8 +392,6 @@ class _Rewriter:
         ):
             # Nothing carried: ``find_carried_facts`` returns at once.
             return self.find_carried_facts(loop, assigned, counter)
-        if self.carried_cache is None:
-            self.carried_cache = {}
         key = (loop, self.facts.key())
         if key not in self.carried_cache:
             self.carried_cache[key] = self.find_carried_facts(loop, assigned, counter)
@@ -347,18 +414,18 @@ class _Rewriter:
         if not names:
             return carried
         for _ in range(_CARRY_ROUNDS):
-            trial = _Rewriter(self.facts.copy())
+            trial = _Rewriter(
+                self.facts.copy(), in_trial=True, carried_cache=self.carried_cache
+            )
             trial.facts.forget(assigned)
             trial.facts.update(carried)
-            trial.in_trial = True
-            trial.carried_cache = self.carried_cache
             vector = loop_extent(loop, kinds=("constexpr",), minimum=2) is not None
             trial.iteration(deep_clone(loop) if vector else loop, counter)
             weakened = carried.meet(trial.facts.restricted(names))
             if weakened == carried:
                 return carried
             carried = weakened
-        return _Facts(set(), set(), {}, {}, self.facts.merged)
+        return self.facts.empty_like()
 
     def iteration(self, loop: ast.For, counter: _Facts) -> None:
         """Rewrite ``loop``'s body under the current facts."""
@@ -501,14 +568,57 @@ class _Rewriter:
     ) -> ast.expr:
         """``value`` with each ``offset // d`` (``offset`` a lane-offset
         expression, ``d`` a positive multiple of the width) dividing the
-        offset's base instead and each ``_cute_python_mod(offset, d)`` taking
-        the base's remainder plus the lane."""
+        offset's base instead, each ``_cute_python_mod(offset, d)`` taking
+        the base's remainder plus the lane, and, with ``compare_bases``, each
+        comparison of an offset with an integer multiple of the width
+        comparing the base."""
         facts = self.facts
 
         def base_of(node: ast.expr) -> ast.expr | None:
             return self.offset_base(node, lane, bases, width)
 
+        def compared_base(offset: ast.expr, bound: ast.expr) -> ast.expr | None:
+            # ``base + lane < bound`` iff ``base < bound`` when both are
+            # multiples of the width: the lane stays below the next one.
+            # (``factor_of`` is 1 for a bound that may not be an integer.)
+            if not facts.uniform_compares or facts.factor_of(bound) % width:
+                return None
+            if (base := base_of(offset)) is not None:
+                return base
+            # An offset spelled in place, ``base + lane`` (a remainder this
+            # rewrite turned into the base's remainder plus the lane).
+            base = self.lane_offset_base(offset, lane)
+            if base is None or facts.factor_of(base) % width:
+                return None
+            return reparse_expr(base)
+
+        def compare_offset(operands: list[ast.expr], side: int | None) -> None:
+            """Replace ``operands[side]``, a lane offset compared with the
+            other operand, with its base where that keeps the answer."""
+            if side is not None:
+                base = compared_base(operands[side], operands[1 - side])
+                if base is not None:
+                    operands[side] = base
+
         class BaseTerms(ast.NodeTransformer):
+            def visit_Compare(self, node: ast.Compare) -> ast.AST:
+                visited = self.generic_visit(node)
+                assert isinstance(visited, ast.Compare)
+                if len(visited.ops) != 1:
+                    return visited
+                operands = [visited.left, *visited.comparators]
+                side = next(
+                    (
+                        side
+                        for op, side in _OFFSET_OPERAND
+                        if isinstance(visited.ops[0], op)
+                    ),
+                    None,
+                )
+                compare_offset(operands, side)
+                visited.left, visited.comparators = operands[0], operands[1:]
+                return visited
+
             def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
                 visited = self.generic_visit(node)
                 assert isinstance(visited, ast.BinOp)
@@ -526,6 +636,11 @@ class _Rewriter:
             def visit_Call(self, node: ast.Call) -> ast.AST:
                 visited = self.generic_visit(node)
                 assert isinstance(visited, ast.Call)
+                side = _COMPARISON_CALL_OPERAND.get(call_path_str(visited.func) or "")
+                if side is not None:
+                    if len(visited.args) == 2 and not visited.keywords:
+                        compare_offset(visited.args, side)
+                    return visited
                 if not _is_python_mod(visited):
                     return visited
                 divisor = facts.constant_of(visited.args[1])
@@ -552,10 +667,13 @@ def divide_vector_bases(
     *,
     constexpr_values: Mapping[str, int],
     rename_groups: Mapping[str, str] | None = None,
+    compare_bases: bool = False,
 ) -> list[ast.stmt]:
     """Rewrite each lane quotient of a vector loop to its base's quotient,
-    and each lane remainder to its base's remainder plus the lane, where the
-    identity is proved (see the module docstring).
+    each lane remainder to its base's remainder plus the lane, and, with
+    ``compare_bases``, each comparison of a lane offset with a multiple of
+    the width to compare its base, where the identity is proved (see the
+    module docstring).
 
     ``rename_groups`` maps the names ``ast_rename`` will merge to their
     shared name.  The body still spells a loop-carried value and its aliases
@@ -568,6 +686,7 @@ def divide_vector_bases(
             {},
             dict(constexpr_values),
             merged_names(rename_groups or {}),
+            compare_bases,
         )
         _Rewriter(facts).body(body)
     return body

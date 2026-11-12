@@ -3,8 +3,10 @@
 The jam (``cute/jam_grid_lanes.py``) only reorders the work of independent
 lanes, loads the lanes' consecutive elements as one vector and reduces the
 lanes' values in one fragment reduce of the scalar reduces' combine order, so
-each kernel matches its knob-off twin bit for bit at the same config.  The
-codegen side is ``test_cute_jam_grid_lanes_codegen.py``.
+each kernel matches its knob-off twin bit for bit at the same config.  Adds
+into a privatized atomic target, whose order is unspecified, are summed per
+cell; exact integer sums keep those bitwise too.  The codegen side is
+``test_cute_jam_grid_lanes_codegen.py``.
 """
 
 from __future__ import annotations
@@ -17,10 +19,13 @@ from helion._testing import DEVICE
 from helion._testing.cute_grid_lane_jam_kernels import HEAD_ROWS_CONFIG
 from helion._testing.cute_grid_lane_jam_kernels import ROW_NORM_CONFIG
 from helion._testing.cute_grid_lane_jam_kernels import SCALAR_ROWS_CONFIG
+from helion._testing.cute_grid_lane_jam_kernels import SCATTER_CONFIG
 from helion._testing.cute_grid_lane_jam_kernels import bias_softmax
+from helion._testing.cute_grid_lane_jam_kernels import bucket_grad_scatter
 from helion._testing.cute_grid_lane_jam_kernels import doubled_rows_plus_one
 from helion._testing.cute_grid_lane_jam_kernels import head_bias
 from helion._testing.cute_grid_lane_jam_kernels import head_bias_softmax_bwd
+from helion._testing.cute_grid_lane_jam_kernels import head_quotients
 from helion._testing.cute_grid_lane_jam_kernels import heads_config
 from helion._testing.cute_grid_lane_jam_kernels import heads_innermost_bias
 from helion._testing.cute_grid_lane_jam_kernels import invariant_rows_over_heads
@@ -51,6 +56,31 @@ def test_jam_is_bitwise_the_rolled_head_loop(keys: int) -> None:
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
     reference = torch.softmax(scores.float() + bias.float(), dim=-1)
     torch.testing.assert_close(actual.float(), reference, rtol=2e-2, atol=1e-3)
+
+
+def test_jammed_quotients_are_bitwise_the_rolled_head_loop() -> None:
+    # Zeros and infinities among the inputs.
+    torch.manual_seed(0)
+    scores = torch.randn(2, 8, 4, 512, device=DEVICE, dtype=torch.bfloat16)
+    bias = heads_innermost_bias(2, 8, 4, 512, DEVICE)
+    scores.view(-1)[::97] = 0
+    # The bias is a heads-innermost view, so it is marked by position.
+    positions = torch.arange(bias.numel(), device=DEVICE).view(bias.shape)
+    bias.masked_fill_(positions % 89 == 0, float("inf"))
+    results = [
+        helion.kernel(
+            head_quotients,
+            backend="cute",
+            static_shapes=True,
+            config=helion.Config(**heads_config(1, 512), cute_grid_lane_jam=jam),
+        )(scores, bias)
+        for jam in (False, True)
+    ]
+    assert torch.equal(results[1].view(torch.int16), results[0].view(torch.int16))
+    x, y = scores.float(), bias.float()
+    torch.testing.assert_close(
+        results[1].float(), (x / y + y / (x + 1.0)).bfloat16().float(), rtol=0, atol=0
+    )
 
 
 def test_a_head_invariant_store_is_bitwise_the_rolled_head_loop() -> None:
@@ -247,3 +277,29 @@ def test_rows_read_back_after_an_in_place_store_match_eager() -> None:
     assert torch.equal(on_x.view(torch.int16), off_x.view(torch.int16))
     assert torch.equal(on_out.view(torch.int16), off_out.view(torch.int16))
     torch.testing.assert_close(on_out, x * 2 + 1, rtol=0, atol=0)
+
+
+def test_jammed_privatized_adds_match_eager() -> None:
+    # Integer gradients sum exactly in any order, so combining the lanes'
+    # adds per cell (a reordering of the copy's adds) must match the rolled
+    # loop and eager bit for bit.  Four buckets give each thread's eight
+    # lanes cells in common.
+    torch.manual_seed(0)
+    grads = torch.randint(-4, 5, (16, 2, 8, 256), device=DEVICE).to(torch.bfloat16)
+    buckets = torch.randint(0, 4, (8, 256), device=DEVICE) * 7
+    results = []
+    for jam in (False, True):
+        out = torch.zeros(32, 2, device=DEVICE)
+        helion.kernel(
+            bucket_grad_scatter,
+            backend="cute",
+            static_shapes=True,
+            config=helion.Config(**SCATTER_CONFIG, cute_grid_lane_jam=jam),
+        )(grads, buckets, out)
+        results.append(out)
+    total = grads.double().sum(0)
+    expected = torch.zeros(32, 2, device=DEVICE, dtype=torch.float64)
+    for head in range(2):
+        expected[:, head].index_add_(0, buckets.flatten(), total[head].flatten())
+    assert torch.equal(results[0], expected.float())
+    assert torch.equal(results[1], expected.float())

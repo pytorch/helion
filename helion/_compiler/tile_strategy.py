@@ -3672,7 +3672,14 @@ class PerThreadNDTileStrategy(_LaneContextOwner, NDTileStrategy):
                 )
                 if (
                     vec_width > 1
-                    and uses_thread_axis
+                    # No thread axis is needed: an axis on one thread (by
+                    # config, demoted past the third thread axis, or fitted
+                    # to a shared extent of 1) walks its whole block in the
+                    # lane loop, ``base = offset + outer*V``, as a thread's
+                    # blocked span does.  The step must be 1: a stepped
+                    # grid's elements are not contiguous, so a V-wide chunk
+                    # from ``base`` would read the wrong ones.
+                    and step in (None, 1)
                     and elements_per_thread % vec_width == 0
                     # A matmul fallback may suppress root lane loops AFTER
                     # loads already hoisted into the wrapper (cute_mma's

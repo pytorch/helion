@@ -16,11 +16,15 @@ import ast
 import contextlib
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 import pytest
 import torch
 
 import helion
+from helion._compiler.backend_registry import repair_backend_codegen
+from helion._compiler.cute import atomic_ops
+from helion._compiler.cute._ast_pass_utils import EXACT_DIVISION_HELPERS
 from helion._compiler.cute.autotune.heuristics.cute import CuteGridLaneJamHeuristic
 from helion._compiler.cute.autotune.heuristics.cute import CuteReductionLaneJamHeuristic
 from helion._compiler.device_ir import ReductionLoopGraphInfo
@@ -29,10 +33,14 @@ from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_grid_lane_jam_kernels import HEAD_ROWS_CONFIG
 from helion._testing.cute_grid_lane_jam_kernels import ROW_NORM_CONFIG
 from helion._testing.cute_grid_lane_jam_kernels import SCALAR_ROWS_CONFIG
+from helion._testing.cute_grid_lane_jam_kernels import SCATTER_CONFIG
 from helion._testing.cute_grid_lane_jam_kernels import bias_softmax
+from helion._testing.cute_grid_lane_jam_kernels import bucket_grad_scatter
+from helion._testing.cute_grid_lane_jam_kernels import bucket_grad_scatter_twice
 from helion._testing.cute_grid_lane_jam_kernels import doubled_rows_plus_one
 from helion._testing.cute_grid_lane_jam_kernels import head_bias
 from helion._testing.cute_grid_lane_jam_kernels import head_bias_softmax_bwd
+from helion._testing.cute_grid_lane_jam_kernels import head_quotients
 from helion._testing.cute_grid_lane_jam_kernels import heads_config
 from helion._testing.cute_grid_lane_jam_kernels import hinted_head_rows
 from helion._testing.cute_grid_lane_jam_kernels import invariant_rows_over_heads
@@ -284,9 +292,34 @@ def test_each_lane_keeps_its_own_division_redo() -> None:
     assert len(redos) == 8
     for lane, redo in enumerate(redos):
         assert f"_helion_exdiv_min_0_lane{lane}" in ast.unparse(redo.test)
+    # The jam copies the exact division's helpers like any other arithmetic:
+    # every one the render calls is registered as such.
+    assert {
+        name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and (name := node.func.id).startswith("_cute_exact_")
+    } <= EXACT_DIVISION_HELPERS
     # The passes themselves load the heads as one packet per key.
     vector, _ = _bias_loads(code)
     assert len(vector) == 1
+
+
+def test_quotients_jam_the_head_lanes() -> None:
+    """The jam copies a key's two fp32 quotients per lane like any other
+    arithmetic."""
+    kernel = helion.kernel(head_quotients, backend="cute", static_shapes=True)
+    scores = torch.empty(2, 8, 4, 512, dtype=torch.bfloat16)
+    bias = torch.empty(2, 4, 512, 8, dtype=torch.bfloat16).permute(0, 3, 1, 2)
+    with cpu_render_target(reduction_smem_budget_bytes=232448):
+        bound = cpu_bind(kernel, (scores, bias))
+        code = bound.to_code(
+            bound.config_spec.normalized_config(
+                helion.Config(**heads_config(1, 512), cute_grid_lane_jam=True)
+            )
+        )
+    assert "for lane_1 in range(8)" not in code, code
 
 
 def test_jam_batches_the_lanes_shared_memory_reduces() -> None:
@@ -1201,3 +1234,143 @@ def test_a_dynamic_shape_gets_no_head_rows_seed() -> None:
     # knob would change nothing.
     with _head_rows_bound(head_bias(8, 4, 512, "cpu"), static_shapes=False) as bound:
         assert _jam_seed(bound) is None
+
+
+def _scatter_code(
+    kernel: object = bucket_grad_scatter,
+    *,
+    out_dtype: torch.dtype = torch.float32,
+    **knobs: object,
+) -> str:
+    """``kernel`` (``bucket_grad_scatter`` or a variant) at ``SCATTER_CONFIG``
+    with the jam on, plus ``knobs``, for 16 x 2 x 8 x 256 bf16 gradients and
+    a 32 x 2 ``out_dtype`` target."""
+    bound_kernel = helion.kernel(kernel, backend="cute", static_shapes=True)
+    with cpu_render_target(reduction_smem_budget_bytes=232448):
+        bound = cpu_bind(
+            bound_kernel,
+            (
+                torch.empty(16, 2, 8, 256, dtype=torch.bfloat16),
+                torch.empty(8, 256, dtype=torch.int64),
+                torch.empty(32, 2, dtype=out_dtype),
+            ),
+        )
+        config = {**SCATTER_CONFIG, "cute_grid_lane_jam": True, **knobs}
+        return bound.to_code(
+            bound.config_spec.normalized_config(helion.Config(**config))
+        )
+
+
+def _private_adds(code: str) -> list[int]:
+    """How many ``if`` tests guard each add into the shared-memory copy of
+    ``out``, in order."""
+    depths: list[int] = []
+
+    def walk(stmts: list[ast.stmt], depth: int) -> None:
+        for stmt in stmts:
+            if isinstance(stmt, ast.If):
+                walk(stmt.body, depth + 1)
+                walk(stmt.orelse, depth + 1)
+            elif isinstance(stmt, ast.For):
+                walk(stmt.body, depth)
+            elif (
+                isinstance(stmt, ast.Expr)
+                and isinstance(stmt.value, ast.Call)
+                and ast.unparse(stmt.value.func) == "cute.arch.atomic_add"
+                and "_private_out.iterator" in ast.unparse(stmt.value.args[0])
+            ):
+                depths.append(depth)
+
+    (kernel,) = [
+        node
+        for node in ast.parse(code).body
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("_helion_")
+    ]
+    walk(kernel.body, 0)
+    return depths
+
+
+def test_privatized_adds_jam_into_the_batch_loop() -> None:
+    # The eight key lanes jam into the batch sum's loop, which loads each
+    # batch's eight keys of the gradient as one packet; each lane's add goes
+    # to the shared-memory copy only where no earlier lane addresses its
+    # cell, carrying the later lanes' values for that cell in lane order.
+    # Each lane's value is bound to a name once.
+    code = _scatter_code()
+    assert "for lane_2 in range(8)" not in code
+    assert code.count(_BIAS_PACKET) == 1
+    assert _private_adds(code) == list(range(8))
+    for lane in range(8):
+        assert code.count(f"cutlass.Float32(total_lane{lane})") == 1
+    for lane in range(1, 8):
+        assert (
+            f"_jam_add = _jam_add + _jam_val_{lane} "
+            f"if _jam_cell_{lane} == _jam_cell else _jam_add"
+        ) in code
+    off = _scatter_code(cute_grid_lane_jam=False)
+    assert "for lane_2 in range(8)" in off
+    assert _private_adds(off) == [0]
+
+
+def test_global_atomic_adds_keep_the_lane_loop() -> None:
+    # Without the shared-memory copy each add is a global atomic, which the
+    # jam does not reorder.
+    code = _scatter_code(cute_privatize_atomics=False)
+    assert "for lane_2 in range(8)" in code
+    assert "_jam_cell" not in code
+
+
+def test_two_adds_into_the_copy_keep_the_lane_loop() -> None:
+    # The jam combines the lanes' copies of a copy's one add
+    # (``_private_atomics``); combining each of two adds' copies on its own
+    # would be as sound, but such a body keeps the lane loop.
+    code = _scatter_code(bucket_grad_scatter_twice)
+    assert "for lane_2 in range(8)" in code
+    assert _private_adds(code) == [0, 0]
+
+
+def _positive_count_scatter(
+    grads: torch.Tensor, buckets: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    """``bucket_grad_scatter`` adding the positive int32 totals only: the
+    lowering skips a zero int add (``if v: cute.arch.atomic_add(...)``)."""
+    _, heads, q_len, k_len = grads.shape
+    for tile_h, tile_q, tile_k in hl.tile([heads, q_len, k_len]):
+        total = torch.sum(grads[:, tile_h, tile_q, tile_k].to(torch.int32), dim=0)
+        head = tile_h.index.unsqueeze(1).unsqueeze(2)
+        hl.atomic_add(
+            out,
+            [buckets[tile_q, tile_k].unsqueeze(0), head],
+            torch.where(total > 0, total, 0),
+        )
+    return out
+
+
+def test_an_add_in_a_per_lane_branch_keeps_the_lane_loop() -> None:
+    # Each lane's add sits in a branch on its own total, so the lanes'
+    # copies of the add would not sit side by side to combine; issuing the
+    # eight adds one after another measured slower than the lane loop.
+    code = _scatter_code(_positive_count_scatter, out_dtype=torch.int32)
+    assert "for lane_2 in range(8)" in code
+    assert "_jam_cell" not in code
+
+
+def test_privatized_adds_combine_under_another_addend_keyword() -> None:
+    # Some CUTLASS wheels name the addend ``value``; the lowering follows
+    # the installed signature, and so does the combining.  A process's first
+    # CuTe dispatch reloads the codegen modules, which would rebind the
+    # resolver patched below.
+    repair_backend_codegen("cute")
+    resolve = atomic_ops._resolve_cute_atomic_kwargs
+    with patch.object(
+        atomic_ops,
+        "_resolve_cute_atomic_kwargs",
+        lambda func, names: [
+            "value" if n == "val" else n for n in resolve(func, names)
+        ],
+    ):
+        code = _scatter_code()
+    assert "for lane_2 in range(8)" not in code
+    assert _private_adds(code) == list(range(8))
+    assert "value=_jam_add" in code
+    assert "val=" not in code

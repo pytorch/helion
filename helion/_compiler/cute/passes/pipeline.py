@@ -623,6 +623,9 @@ def _fuse_two_pass_loads(s: _DeviceBodyState) -> None:
             if ctx.config.get("cute_scratch_forwarding", False)
             else frozenset()
         ),
+        # Not where a later pass needs a sweep's own values: the split of
+        # rolled vector sums and the rolled cluster online pair.
+        carry_vector_values=not (_independent_reduction(s) or _cluster_warp_online(s)),
     )
 
 
@@ -670,6 +673,7 @@ def _vectorize_branch_local_persistent_fragments(s: _DeviceBodyState) -> None:
         proven_tensor_stride_values=s.ctx.proven_tensor_stride_values,
         wide_packet_hints=hint_wide_packets(s.ctx.config.cute_wide_packet_hints),
         rename_groups=s.ctx.rename_groups,
+        chunked_lanes=s.fn.cute_state.lanes.chunked_reduction_lanes,
     )
 
 
@@ -707,6 +711,21 @@ def _bounded_cache_cache(s: _DeviceBodyState) -> None:
     assert request is not None
     s.kernel_body, s.private_fragments = request.cache(
         s.kernel_body, s.ctx.constexpr_values, s.ctx.rename_groups
+    )
+
+
+def _peel_vector_tails(s: _DeviceBodyState) -> None:
+    from ..peel_vector_tails import peel_vector_tails
+    from ..peel_vector_tails import tensor_facts
+    from ..smem_footprint import persistent_loop
+
+    s.kernel_body = peel_vector_tails(
+        s.kernel_body,
+        s.ctx.constexpr_values,
+        thread_block_dims=s.ctx.exact_thread_block_dims,
+        tensor_facts=tensor_facts(s.fn),
+        new_var=s.ctx.new_var,
+        persistent_loop=persistent_loop(s.fn.pid),
     )
 
 
@@ -1174,6 +1193,9 @@ def _pack_bf16_recurrences(s: _DeviceBodyState) -> None:
 # The gate of ``split_rolled_vector_sums``, which matches a rolled sum's loop
 # whole: ``peel_partial_chunks`` leaves the loops it would split to it.
 _independent_reduction = _config_flag("cute_independent_reduction")
+# ``fuse_rolled_cluster_online_pair``'s knob: the pair moves a rolled sweep's
+# exponentials into the frame of a CTA's or warp's own maximum.
+_cluster_warp_online = _config_flag("cute_cluster_warp_online")
 
 
 def _peel_partial_chunks(s: _DeviceBodyState) -> None:
@@ -1245,6 +1267,7 @@ def _divide_vector_bases(s: _DeviceBodyState) -> None:
         s.kernel_body,
         constexpr_values=s.ctx.constexpr_values,
         rename_groups=s.ctx.rename_groups,
+        compare_bases=s.ctx.config.config.get("cute_uniform_lane_compares") is True,
     )
 
 
@@ -1420,6 +1443,16 @@ def _wants_exact_division_redo(s: _DeviceBodyState) -> bool:
     )
 
 
+def _cut_carried_values(s: _DeviceBodyState) -> None:
+    # ``fuse_two_pass_loads`` left each later sweep computing the V-loop
+    # values it carries; the passes since saw and rewrote those statements,
+    # and the exact division's redo copies recompute from them.  Elsewhere
+    # the sweep now reads the fragment, and what only fed the value goes.
+    from ..cut_carried_values import cut_carried_values
+
+    s.kernel_body = cut_carried_values(s.kernel_body, s.ctx.rename_groups)
+
+
 def _hoist_exact_invariant_divisions(s: _DeviceBodyState) -> None:
     # Without fast_math, hoist the divisor-only work of an fp32
     # ``x / d`` with a loop-invariant divisor as the Markstein
@@ -1511,6 +1544,47 @@ def _lower_scalar_policy_loads(s: _KernelDefState) -> None:
     # Keep ordinary load/effect recognition intact through all memory
     # scheduling, including the late published/register-producer cuts.
     s.definition.body = lower_scalar_policy_loads(s.definition.body)
+
+
+def _pack_half_extremum_folds(s: _KernelDefState) -> None:
+    from ..half_extremum_folds import pack_half_extremum_folds
+
+    s.definition.body = pack_half_extremum_folds(
+        s.definition.body,
+        target_device_capability=s.ctx.target_device_capability,
+    )
+
+
+def _pair_lane_math(s: _KernelDefState) -> None:
+    from ..pair_lane_math import pair_lane_math
+
+    # After the renames: each running value is one name, so the pairing sees
+    # which lane statements are ordered by it.
+    renames = s.ctx.rename_groups
+    s.definition.body = pair_lane_math(
+        s.definition.body,
+        fast_math=s.ctx.fast_math,
+        target_device_capability=s.ctx.target_device_capability,
+        tensor_dtypes={
+            renames.get(name, name): dtype
+            for name, dtype in s.ctx.tensor_dtypes_str_skip.items()
+        },
+        constants=s.ctx.constexpr_values,
+        parameters=frozenset(
+            argument.arg
+            for argument in (
+                *s.definition.args.posonlyargs,
+                *s.definition.args.args,
+                *s.definition.args.kwonlyargs,
+            )
+        ),
+    )
+
+
+def _select_native_warp_reductions(s: _KernelDefState) -> None:
+    from ..native_warp_reduction import select_native_warp_reductions
+
+    s.definition.body = select_native_warp_reductions(s.definition.body)
 
 
 def _lower_packet_store_policy(s: _KernelDefState) -> None:
@@ -1644,6 +1718,9 @@ DEVICE_BODY_PASSES: tuple[DeviceBodyPass, ...] = (
         _bounded_cache_cache,
         requires=("bounded_cache_prepared",),
         provides=("bounded_cache_cached", "private_fragments"),
+    ),
+    DeviceBodyPass(
+        "peel_vector_tails", _config_flag("cute_tail_peel"), _peel_vector_tails
     ),
     DeviceBodyPass(
         "vectorize_affine_tile_lanes",
@@ -1862,10 +1939,17 @@ DEVICE_BODY_PASSES: tuple[DeviceBodyPass, ...] = (
         provides=("exact_divisions_hoisted",),
     ),
     DeviceBodyPass(
+        "cut_carried_values",
+        _always,
+        _cut_carried_values,
+        requires=("exact_divisions_hoisted",),
+        provides=("carried_values_cut",),
+    ),
+    DeviceBodyPass(
         "jam_grid_lanes",
         _config_flag("cute_grid_lane_jam"),
         _jam_grid_lanes,
-        requires=("exact_divisions_hoisted",),
+        requires=("exact_divisions_hoisted", "carried_values_cut"),
     ),
 )
 
@@ -1922,6 +2006,25 @@ KERNEL_DEF_PASSES: tuple[KernelDefPass, ...] = (
         _always,
         _validate_shared_arenas,
         requires=(RENAMED, "published_scalars_lowered", "register_producers_lowered"),
+    ),
+    KernelDefPass(
+        "pack_half_extremum_folds",
+        _config_flag("cute_pair_lane_math"),
+        _pack_half_extremum_folds,
+        requires=(RENAMED,),
+    ),
+    KernelDefPass(
+        "pair_lane_math",
+        _config_flag("cute_pair_lane_math"),
+        _pair_lane_math,
+        requires=(RENAMED,),
+    ),
+    KernelDefPass(
+        "select_native_warp_reductions",
+        _config_flag("cute_warp_fp32_redux"),
+        _select_native_warp_reductions,
+        # Last: every earlier pass recognizes the shuffle reductions by name.
+        requires=(RENAMED,),
     ),
 )
 

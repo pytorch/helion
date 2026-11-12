@@ -43,7 +43,7 @@ statement, so the lanes' copies of a statement sit side by side::
 Then the lanes' copies of a scalar load whose lane index addresses its
 tensor's stride-1 dimension become one vector load (``_vectorize_loads``),
 and the lanes' copies of a shared-memory grouped reduce become one fragment
-reduce (``_batch_reduces``), which combines every value in the order the
+reduce (``_batched_reduce``), which combines every value in the order the
 scalar reduce it replaces does.  Each lane computes the same values in the
 same order as in the rolled loop; only the order of work belonging to
 different lanes changes, so the results are bitwise the rolled loop's.
@@ -51,6 +51,16 @@ When the tile spans the row, each device loop runs once and a two-pass
 kernel's second loop reloads what its first loaded: such loops become
 straight-line code and a load of an address an earlier load read takes that
 load's value (``_LoadReuse``).
+
+The one exception to bitwise results are the adds into a privatized atomic
+target's shared-memory copy (``cute_privatize_atomics``), whose order the
+knob leaves unspecified.  T5's bias-gradient scatter adds each key's
+batch-summed gradient into the cell of its relative-position bucket, and
+neighbouring keys mostly share a bucket; the copy's fp32 adds are
+compare-and-swap loops that serialize on a contended cell.  The lanes'
+copies of such an add become one add per cell the lanes address
+(``_combined_atomic``): a thread sums its lanes' values for a cell in lane
+order and adds the sum once.
 
 That reordering is exact when the lanes share nothing the jam reorders, which
 the pass proves on the lane loop's body and fails closed otherwise (the body
@@ -77,8 +87,13 @@ is left as it is):
   lane stores to its own elements and reads back only those (a workspace
   row the first sweep stores and the second reads).  Loads, stores, the
   shared-memory grouped reduces (each traced call takes a buffer of its own
-  and synchronizes the CTA around it) and barriers are the only effects;
-  any other call that is not a proven pure computation rejects the body.
+  and synchronizes the CTA around it), barriers and the adds into a
+  privatized atomic target's shared-memory copy are the only effects; any
+  other call that is not a proven pure computation rejects the body.  Such
+  an add is admitted when the body names the copy nowhere else, so no lane
+  reads what another adds, and it is the copy's one add in the body, outside
+  every loop of it and every branch that runs per lane, the shape
+  ``_combined_atomic`` handles (``_private_atomics``).
 - Structure: the lane loop has a literal extent of at most ``_MAX_LANES``,
   its copies trace at most ``_MAX_UNROLLED_STATEMENTS`` statements (the
   loads-first lane unroll's budget), its lane index is the tile offset plus
@@ -108,6 +123,7 @@ from ..ast_extension import statement_from_string
 from ..ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from ..ast_read_writes import ReadWrites
 from ..ast_read_writes import ast_rename
+from ._ast_pass_utils import EXACT_DIVISION_HELPERS
 from ._ast_pass_utils import _is_proven_relocatable_call
 from ._ast_pass_utils import call_path_str
 from ._ast_pass_utils import deep_clone
@@ -170,8 +186,6 @@ _LOAD_KINDS = frozenset(
     {"load", "arch_load", "packet", "hinted_packet", "masked_packet"}
 )
 _STORE_KINDS = frozenset({"store", "flush"})
-# Pure register helpers of the exact fp32 division (``exact_division.py``).
-_EXACT_DIVISION_PREFIX = "_cute_exact_div_"
 _LOOP_ITERATORS = frozenset({"range", "cutlass.range", "cutlass.range_constexpr"})
 _BARRIER = "cute.arch.sync_threads"
 _TWO_STAGE = ReduceScope.SHARED_TWO_STAGE.value
@@ -498,6 +512,46 @@ def _load_pointer(access: PacketAccess | None) -> ast.expr | None:
     return None
 
 
+def _private_atomic_site(call: ast.Call) -> tuple[str, str] | None:
+    """The tensor a relaxed CTA-scope scalar ``cute.arch.atomic_add`` adds
+    into, through ``(copy.iterator + cute.crd2idx(coord, copy.layout))
+    .llvm_ptr`` (the privatized atomics' spelling), and the keyword of its
+    addend, the one besides ``sem`` and ``scope`` (``val``, or the name the
+    installed CUTLASS gives it: ``_resolve_cute_atomic_kwargs``), or None."""
+    addends = [
+        keyword.arg for keyword in call.keywords if keyword.arg not in ("sem", "scope")
+    ]
+    if not (
+        call_path_str(call.func) == "cute.arch.atomic_add"
+        and len(call.args) == 1
+        and len(addends) == 1
+        and addends[0] is not None
+        and {
+            keyword.arg: ast.unparse(keyword.value)
+            for keyword in call.keywords
+            if keyword.arg in ("sem", "scope")
+        }
+        == {"sem": "'relaxed'", "scope": "'cta'"}
+    ):
+        return None
+    pointer = call.args[0]
+    if not (
+        isinstance(pointer, ast.Attribute)
+        and pointer.attr == "llvm_ptr"
+        and isinstance(pointer.value, ast.BinOp)
+        and isinstance(pointer.value.op, ast.Add)
+        and isinstance(iterator := pointer.value.left, ast.Attribute)
+        and iterator.attr == "iterator"
+        and isinstance(iterator.value, ast.Name)
+        and isinstance(index := pointer.value.right, ast.Call)
+        and call_path_str(index.func) == "cute.crd2idx"
+        and len(index.args) == 2
+        and ast.unparse(index.args[1]) == f"{iterator.value.id}.layout"
+    ):
+        return None
+    return iterator.value.id, addends[0]
+
+
 def _compared_names(compare: ast.Compare) -> set[str]:
     """The names a comparison reads outside the memory accesses in it: a
     loaded boolean (``keep[...].load() != 0``) addresses its element by the
@@ -653,6 +707,10 @@ class _Jam:
         self.dead_allocations: list[ast.Assign] = []
         # The tensors the body stores to (``_check_memory``).
         self.stored: set[str] = set()
+        # The body's adds into privatized atomic targets the jam reorders
+        # (``_private_atomics``), by ``id``: the copy each adds into and the
+        # keyword of its addend (``_private_atomic_site``).
+        self.private_atomics: dict[int, tuple[str, str]] = {}
 
     # ------------------------------------------------------------- analysis
 
@@ -675,7 +733,9 @@ class _Jam:
         copies = [self._lane_copy(body, lane) for lane in range(self.extent)]
         jammed = self._merge(body, copies)
         self._vectorize_loads(jammed)
-        jammed = self._batch_reduces(jammed)
+        jammed = self._rewrite_groups(jammed, self._batched_reduce)
+        if self.private_atomics:
+            jammed = self._rewrite_groups(jammed, self._combined_atomic)
         jammed = _LoadReuse(
             self.constexpr_values, self.new_var, self.tensors, frozenset(self.stored)
         ).run(jammed)
@@ -1066,6 +1126,7 @@ class _Jam:
             and isinstance(stmt.value, ast.List)
             and not stmt.value.elts
         }
+        private_atomics = self._private_atomics(body)
         for node in (n for stmt in body for n in ast.walk(stmt)):
             if (
                 isinstance(node, ast.Subscript)
@@ -1075,7 +1136,7 @@ class _Jam:
                 # ``x[i, j]`` (CuTe's ``torch.gather``) reads ``x`` without a
                 # pointer the checks below parse.
                 raise _Decline("a tensor accessed by subscript")
-            if not isinstance(node, ast.Call):
+            if not isinstance(node, ast.Call) or id(node) in private_atomics:
                 continue
             access = match_packet_access(node)
             loaded_pointer = _load_pointer(access)
@@ -1110,7 +1171,7 @@ class _Jam:
                 # place the register checks do not see.
                 or (name in GROUPED_SHARED_REDUCES and name != _TWO_STAGE_FRAGMENT)
                 or is_cta_reduce_call(node)
-                or (name is not None and name.startswith(_EXACT_DIVISION_PREFIX))
+                or name in EXACT_DIVISION_HELPERS
                 # A load the matcher does not parse would escape the memory
                 # checks: it declines.
                 or _is_proven_relocatable_call(node, allow_load=False)
@@ -1144,6 +1205,80 @@ class _Jam:
                 if other != tensor
             ):
                 raise _Decline("a store into a tensor that may alias a loaded one")
+
+    def _private_atomics(self, body: Sequence[ast.stmt]) -> set[int]:
+        """The calls of the body's adds into privatized atomic targets that
+        the jam may reorder, with the pointer arithmetic in them (the add's
+        value and coordinates are checked like any other operand).
+
+        Such an add is a relaxed CTA-scope ``cute.arch.atomic_add``
+        statement into a shared-memory copy the code before the loop
+        allocates (``atomic_privatization.py``): the body names the copy,
+        or a view of it, nowhere else, so no lane reads what another lane
+        adds.  It is also the copy's only add in the body and sits in no
+        loop of it nor in a branch that runs per lane (``_jams``), whose
+        lanes' copies would not sit side by side: the shape
+        ``_combined_atomic`` was written and measured for (T5's scatter).
+        Combining the lanes' copies of each of several adds on its own, or
+        those in a jammed loop, would be as sound, as the privatized adds
+        leave their order unspecified, but such bodies keep the lane loop, as
+        does an add the lanes would issue uncombined.  The statements are
+        recorded in ``self.private_atomics``."""
+        allocated = {
+            cast("ast.Name", stmt.targets[0]).id
+            for stmt in self.preceding
+            if isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and isinstance(stmt.value, ast.Call)
+            and call_path_str(stmt.value.func) == "cute.make_tensor"
+            and stmt.value.args
+            and isinstance(stmt.value.args[0], ast.Call)
+            and call_path_str(stmt.value.args[0].func) == "cute.arch.alloc_smem"
+        }
+        sites: dict[str, list[tuple[ast.Expr, str]]] = {}
+        for stmt in self._unlooped_statements(body):
+            if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+                site = _private_atomic_site(stmt.value)
+                if site is not None:
+                    copy, addend = site
+                    sites.setdefault(copy, []).append((stmt, addend))
+        referenced = [
+            node.id
+            for stmt in body
+            for node in ast.walk(stmt)
+            if isinstance(node, ast.Name)
+        ]
+        admitted: set[int] = set()
+        for copy, statements in sites.items():
+            views = {copy}
+            for stmt in self.preceding:
+                if names_read(stmt) & views:
+                    views |= names_written(stmt)
+            if (
+                copy not in allocated
+                or copy in self.tensors
+                or len(statements) != 1
+                or sum(name in views for name in referenced) != 2
+            ):
+                continue
+            ((stmt, addend),) = statements
+            self.private_atomics[id(stmt)] = (copy, addend)
+            call = cast("ast.Call", stmt.value)
+            pointer = cast("ast.Attribute", call.args[0])
+            admitted |= {id(call), id(cast("ast.BinOp", pointer.value).right)}
+        return admitted
+
+    def _unlooped_statements(self, stmts: Sequence[ast.stmt]) -> list[ast.stmt]:
+        """``stmts`` and the statements of their branches that every lane
+        runs alike (``_jams``), outside every loop."""
+        result: list[ast.stmt] = []
+        for stmt in stmts:
+            result.append(stmt)
+            if isinstance(stmt, ast.If) and self._jams(stmt):
+                result.extend(self._unlooped_statements(stmt.body))
+                result.extend(self._unlooped_statements(stmt.orelse))
+        return result
 
     def _shared_by_lanes(
         self, tensor: str, accesses: Sequence[_Pointer | None]
@@ -1503,11 +1638,18 @@ class _Jam:
             return stmt.value
         return None
 
-    # -------------------------------------------------------- batched reduces
+    # ------------------------------------------------- rewritten lane copies
 
-    def _batch_reduces(self, stmts: list[ast.stmt]) -> list[ast.stmt]:
-        """Replace each run of the lanes' copies of a shared-memory two-stage
-        reduce by one fragment reduce of all lanes' values."""
+    def _rewrite_groups(
+        self,
+        stmts: list[ast.stmt],
+        rewrite: Callable[[Sequence[ast.stmt]], list[ast.stmt] | None],
+    ) -> list[ast.stmt]:
+        """Replace each run of the lanes' copies of a statement
+        (``_group_at``), at any depth, by what ``rewrite`` makes of it: one
+        fragment reduce of all lanes' values for a shared-memory two-stage
+        reduce (``_batched_reduce``), one add per cell for a privatized
+        atomic add (``_combined_atomic``); None keeps the copies."""
         result: list[ast.stmt] = []
         position = 0
         while position < len(stmts):
@@ -1515,14 +1657,14 @@ class _Jam:
             for field in ("body", "orelse"):
                 inner = getattr(stmt, field, None)
                 if isinstance(inner, list):
-                    setattr(stmt, field, self._batch_reduces(inner))
+                    setattr(stmt, field, self._rewrite_groups(inner, rewrite))
             group = self._group_at(stmts, position)
-            batched = self._batched_reduce(group) if group is not None else None
-            if batched is None:
+            rewritten = rewrite(group) if group is not None else None
+            if rewritten is None:
                 result.append(stmt)
                 position += 1
                 continue
-            result.extend(batched)
+            result.extend(rewritten)
             position += self.extent
         return result
 
@@ -1602,6 +1744,71 @@ class _Jam:
             replace_node(part, call, expr_from_string(f"{results}[{lane}]"))
             batched.append(part)
         return batched
+
+    # ------------------------------------------------------ combined adds
+
+    def _combined_atomic(self, group: Sequence[ast.stmt]) -> list[ast.stmt] | None:
+        """The lanes' copies of a privatized atomic add
+        (``_private_atomics``), summed per cell into one add each.
+
+        A thread's lanes often add into one cell (keys that share a bucket),
+        and the copy's fp32 adds are compare-and-swap loops that serialize
+        on a contended cell.  Each lane's cell is its linear index into the
+        copy and its value is bound to a name, both once; a lane adds the
+        values of its own and every later lane that addresses its cell, in
+        lane order, and only the first lane of a cell adds into the copy.
+        That reorders the adds into a cell, which the privatized adds leave
+        in no particular order already (``atomic_privatization.py``); int32
+        adds are exact either way."""
+        template = getattr(group[0], _JAM_GROUP_ATTR)[0]
+        if template not in self.private_atomics:
+            return None
+        copy, addend = self.private_atomics[template]
+        calls = [cast("ast.Call", cast("ast.Expr", part).value) for part in group]
+        values = [
+            next(kw.value for kw in call.keywords if kw.arg == addend) for call in calls
+        ]
+        cells = [self.new_var("_jam_cell") for _ in group]
+        vals = [self.new_var("_jam_val") for _ in group]
+        sums = [self.new_var("_jam_add") for _ in group]
+        combined: list[ast.stmt] = []
+        for cell, val, call, value in zip(cells, vals, calls, values, strict=True):
+            pointer = cast("ast.BinOp", cast("ast.Attribute", call.args[0]).value)
+            combined.extend(
+                (
+                    statement_from_string(f"{cell} = {ast.unparse(pointer.right)}"),
+                    statement_from_string(f"{val} = {ast.unparse(value)}"),
+                )
+            )
+        for lane, (cell, total) in enumerate(zip(cells, sums, strict=True)):
+            combined.append(statement_from_string(f"{total} = {vals[lane]}"))
+            combined.extend(
+                statement_from_string(
+                    f"{total} = ({total} + {vals[later]}) "
+                    f"if {cells[later]} == {cell} else {total}"
+                )
+                for later in range(lane + 1, len(group))
+            )
+        for lane, (cell, total, call) in enumerate(
+            zip(cells, sums, calls, strict=True)
+        ):
+            add = deep_clone(call)
+            add.args[0] = cast(
+                "ast.expr", expr_from_string(f"({copy}.iterator + {cell}).llvm_ptr")
+            )
+            for keyword in add.keywords:
+                if keyword.arg == addend:
+                    keyword.value = cast("ast.expr", expr_from_string(total))
+            stmt: ast.stmt = create(ast.Expr, value=add)
+            # Nested tests rather than a chain of ``and``: the DSL expands
+            # a boolean operator's operands once per later operand.
+            for earlier in reversed(cells[:lane]):
+                test = statement_from_string(f"if {cell} != {earlier}:\n    pass")
+                assert isinstance(test, ast.If)
+                test.body = [stmt]
+                stmt = test
+            combined.append(stmt)
+        return combined
 
 
 class _LoadReuse:

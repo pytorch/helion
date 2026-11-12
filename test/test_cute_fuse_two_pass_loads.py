@@ -663,10 +663,12 @@ _STORING_SWEEPS = {
         ("trips", "reduction_lane_7", False),
         ("trips", "roffset_7 + 2 * reduction_lane_7", False),
         ("trips", "roffset_7 * 8 + reduction_lane_7", True),
-        # Under a constexpr trip count, each trip must step past all its
-        # lanes' elements.
+        # A constexpr trip count runs the fused sweeps for at most four trips
+        # (the fragment's cap), which must store apart as four static trips
+        # do: trips that interleave with the lanes too.
         ("constexpr trips", "roffset_7 + 2 * reduction_lane_7", False),
         ("constexpr trips", "roffset_7 * 2 + reduction_lane_7", True),
+        ("constexpr trips", "roffset_7 + 32 * reduction_lane_7", True),
         # Each trip steps 2**32 elements, which an Int32 index wraps back
         # onto the same eight.
         ("trips", "cutlass.Int32(roffset_7 * 536870912) + reduction_lane_7", False),
@@ -1661,6 +1663,19 @@ def test_scaled_workspace_reload_packets_match_eager() -> None:
             torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-1)
 
 
+def _hot_path(code: str) -> str:
+    """The kernel's code with the bodies of the exact division's redo
+    branches emptied: their copies of the consume sweep reload what the hot
+    path reads from a fused cache."""
+    from helion._testing.cute_codegen import exact_division_redo_branches
+
+    tree = ast.parse(code)
+    for branch in exact_division_redo_branches(tree):
+        branch.body = [ast.Pass()]
+    return ast.unparse(tree)
+
+
+@onlyBackends(["cute"])
 class TestCuteFuseTwoPassLoads(TestCase):
     def test_fuser_fires_with_vec_hoist(self) -> None:
         """When the vec hoist runs, the two sweeps' loads use names like
@@ -1686,23 +1701,24 @@ class TestCuteFuseTwoPassLoads(TestCase):
         # Cache fragment allocated.
         self.assertIn("_fuse_cache_", code)
         # When the load-pipeline pass is OFF the consume sweep just
-        # reads from cache so the kernel has 1 ``cute.arch.load`` total.
+        # reads from cache so the hot path has 1 ``cute.arch.load`` total.
         # With pipelining ON the reduce sweep's load is hoisted into a
         # prologue + per-iter prefetch (2 load sites), so the total is
         # 2. The consume sweep emits NO load (cache hit) either way.
-        load_count = code.count("cute.arch.load(")
+        hot = _hot_path(code)
+        load_count = hot.count("cute.arch.load(")
         self.assertTrue(
             load_count in {1, 2},
             f"expected 1 or 2 cute.arch.load sites, got {load_count}",
         )
-        # The consume sweep (second top-level ``for tile_offset`` loop)
+        # The consume sweep (last top-level ``for tile_offset`` loop)
         # must not contain a gmem load.
         consume_marker = "for tile_offset_2 in range"
-        consume_start = code.rfind(consume_marker)
+        consume_start = hot.rfind(consume_marker)
         self.assertGreater(consume_start, 0)
         self.assertNotIn(
             "cute.arch.load(",
-            code[consume_start:],
+            hot[consume_start:],
             "consume sweep must read from _fuse_cache_, not gmem",
         )
 
@@ -1723,10 +1739,11 @@ class TestCuteFuseTwoPassLoads(TestCase):
         ref = torch.nn.functional.softmax(x, dim=1)
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
         self.assertIn("_fuse_cache_", code)
-        consume_start = code.rfind("for tile_offset_2 in range")
+        hot = _hot_path(code)
+        consume_start = hot.rfind("for tile_offset_2 in range")
         self.assertGreater(consume_start, 0)
-        self.assertNotIn("cute.arch.load(", code[consume_start:])
-        self.assertNotIn("_cute_load_", code[consume_start:])
+        self.assertNotIn("cute.arch.load(", hot[consume_start:])
+        self.assertNotIn("_cute_load_", hot[consume_start:])
 
     def test_carried_word0_mask_matches_the_recomputed_mask(self) -> None:
         """The later sweeps read the first sweep's word0 mask and dropped-out

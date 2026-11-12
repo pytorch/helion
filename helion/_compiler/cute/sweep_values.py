@@ -14,15 +14,17 @@ so that equal numbers mean equal values, for the same iteration of the sweeps'
 identical loops.  It walks the statements forward with an environment from
 names to numbers.  Leaves are constants, globals and kernel arguments, the
 loop indices (which stand for the iteration and so compare equal across
-sweeps: the fuser groups only sweeps over the same indices), and loads the
-fuser proved equal to a first-sweep load.  A pure expression (operators,
-casts, ``cute.math``, pure inline asm) is numbered by its operator and its
-operands' numbers.  Anything else (another load, a call with effects, a name
-written by a nested statement or carried around a sweep or lane loop) is a
-leaf of its own definition, equal only to reads of that definition.  Names
-compare through the final rename's groups: a loop carry written as
-``v_2 = acc_copy_0 + sum_1`` rebinds ``acc``.  A carried value's element type
-follows the DSL's promotion rules, Python scalars included.
+sweeps: the fuser groups only sweeps over the same indices) and a V-loop's
+lane index likewise, and loads the fuser proved equal to a first-sweep load.
+A V-loop's body (a packet's lanes) is numbered statement by statement, and
+after the loop each name it wrote is a leaf of the loop.  A pure expression
+(operators, casts, ``cute.math``, pure inline asm) is numbered by its
+operator and its operands' numbers.  Anything else (another load, a call with
+effects, a name written by a nested statement or carried around a sweep or
+lane loop) is a leaf of its own definition, equal only to reads of that
+definition.  Names compare through the final rename's groups: a loop carry
+written as ``v_2 = acc_copy_0 + sum_1`` rebinds ``acc``.  A carried value's
+element type follows the DSL's promotion rules, Python scalars included.
 
 ``plan_cut`` then chooses which recomputed values a later sweep reads from a
 fragment: walking the sweep backward, the first live value that the first
@@ -41,12 +43,14 @@ from dataclasses import dataclass
 import functools
 import itertools
 from typing import TYPE_CHECKING
+from typing import cast
 
 from ..ast_read_writes import ReadWrites
 from ._ast_pass_utils import _is_proven_relocatable_call
 from ._ast_pass_utils import assigned_name
 from ._ast_pass_utils import call_path_str
 from ._ast_pass_utils import live_in
+from ._ast_pass_utils import loop_extent
 from ._ast_pass_utils import names_written
 from .pure_lane_packets import inline_asm_operands
 from .pure_lane_packets import is_pure_scalar_assembly
@@ -618,16 +622,22 @@ class SweepValues:
                     )
                 env[name] = numbers[id(statement)] = number
                 continue
-            for written in bound_names(statement):
-                name = self.canonical(written)
-                env[name] = self.leaf(
-                    "site",
-                    scope,
-                    id(statement),
-                    name,
-                    dtype=self._binding_dtypes.get(written),
-                )
+            self.overwrite(statement, env, scope=scope)
         return numbers
+
+    def overwrite(
+        self, statement: ast.stmt, env: dict[str, int], *, scope: int | None
+    ) -> None:
+        """Make every name ``statement`` writes a leaf of that statement."""
+        for written in bound_names(statement):
+            name = self.canonical(written)
+            env[name] = self.leaf(
+                "site",
+                scope,
+                id(statement),
+                name,
+                dtype=self._binding_dtypes.get(written),
+            )
 
 
 def bound_names(node: ast.AST) -> set[str]:
@@ -644,7 +654,8 @@ def number_sweep(
     *,
     loads: Mapping[int, int],
 ) -> dict[int, int]:
-    """Number one sweep's ``container`` statements.
+    """Number one sweep's ``container`` statements, and those of the bodies
+    of its V-loops (``vector_lane_loop``), by statement id.
 
     ``loops`` are the sweep loop and its lane loop, outermost first; ``env``
     holds the enclosing names at the sweep loop and ``prefix`` the sweep
@@ -671,7 +682,34 @@ def number_sweep(
     if lane is not outer:
         assert isinstance(lane.target, ast.Name)
         carry(lane, skip={values.canonical(lane.target.id)})
-    return values.run(container, env, loads=loads, scope=id(outer))
+    numbers: dict[int, int] = {}
+    for statement in container:
+        found = vector_lane_loop(statement)
+        if found is None:
+            numbers.update(values.run([statement], env, loads=loads, scope=id(outer)))
+            continue
+        # A V-loop's body is numbered too: its lane index compares equal
+        # across sweeps like the loop indices, and a name it writes reads,
+        # before its first write in a lane, what the lane before left.
+        # After the loop each name it wrote holds its last lane's value.
+        vloop, lane, _width = found
+        lane_index = values.canonical(lane)
+        carry(vloop, skip={lane_index})
+        env[lane_index] = values.index(len(loops))
+        numbers.update(values.run(vloop.body, env, loads=loads, scope=id(outer)))
+        values.overwrite(vloop, env, scope=id(outer))
+    return numbers
+
+
+def vector_lane_loop(statement: ast.stmt) -> tuple[ast.For, str, int] | None:
+    """``statement`` when it is a V-loop, ``for v in
+    cutlass.range_constexpr(V)`` (the lanes of a packet the DSL unrolls while
+    tracing), with its lane variable and width."""
+    width = loop_extent(statement, kinds=("constexpr",), minimum=None)
+    if width is None:
+        return None
+    loop = cast("ast.For", statement)
+    return loop, cast("ast.Name", loop.target).id, width
 
 
 @dataclass
