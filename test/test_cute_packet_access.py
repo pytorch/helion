@@ -26,7 +26,8 @@ from helion._compiler.cute.packet_flush_names import PACKET_FLUSH_L2_EVICT_LAST
 from helion._compiler.cute.packet_flush_names import PACKET_FLUSH_STREAMING
 from helion._compiler.cute.persistent_branch_vec import PACKET_STORE_BYTES
 
-# Grammar and table pins over the AST: they run on every backend row.
+# Grammar and table pins over the AST and the emitted strings: no GPU.
+pytestmark = pytest.mark.cpu_only
 
 _U16 = "cutlass.Uint16"
 _U32 = "cutlass.Uint32"

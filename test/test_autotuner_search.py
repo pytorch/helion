@@ -159,12 +159,16 @@ class TestAutotunerSearch(AutotunerTestCase):
             torch.randn([512, 512], device=DEVICE),
         )
         bound_kernel = _get_examples_matmul().bind(args)
-        bound_kernel.settings.autotune_precompile = None
-        # Smoke test of the RandomSearch loop itself; skip the benchmark
-        # worker subprocess (seconds of startup overhead).
-        bound_kernel.settings.autotune_benchmark_subprocess = False
-        random.seed(123)
-        best = RandomSearch(bound_kernel, args, 5).autotune()
+        # The settings belong to the matmul example's kernel, which other tests
+        # share: restore them afterwards.  Smoke test of the RandomSearch loop
+        # itself; skip the benchmark worker subprocess (seconds of startup
+        # overhead).
+        with (
+            patch.object(bound_kernel.settings, "autotune_precompile", None),
+            patch.object(bound_kernel.settings, "autotune_benchmark_subprocess", False),
+        ):
+            random.seed(123)
+            best = RandomSearch(bound_kernel, args, 5).autotune()
         fn = bound_kernel.compile_config(best)
         torch.testing.assert_close(fn(*args), args[0] @ args[1], rtol=1e-2, atol=1e-1)
 

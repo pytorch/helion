@@ -29,6 +29,7 @@ from helion._testing import TestCase
 from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import pairwise
 from helion._testing import skipIfCute
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfRefEager
@@ -5689,11 +5690,21 @@ def _nested_broadcast_gather(col, val, table, flat: hl.constexpr):
     return out
 
 
+# The first shape leaves a masked tail on every extent, the second mixes exact
+# and ragged ones; ``flat`` gathers through ``hl.load`` on the flattened table
+# instead of a 3-D subscript; ``reverse`` reverses the order of the four grid
+# axes; ``static_shapes`` bakes the extents in.  They are independent knobs, so
+# all pairs of them (six cases) replace the full product of sixteen.
 @skipUnlessBackends(["cute"])
-@pytest.mark.parametrize("shape", [(3, 5, 7, 9, 11), (4, 3, 8, 5, 6)])
-@pytest.mark.parametrize("flat", [False, True])
-@pytest.mark.parametrize("reverse", [False, True])
-@pytest.mark.parametrize("static_shapes", [False, True])
+@pytest.mark.parametrize(
+    ("shape", "flat", "reverse", "static_shapes"),
+    pairwise(
+        shape=[(3, 5, 7, 9, 11), (4, 3, 8, 5, 6)],
+        flat=[False, True],
+        reverse=[False, True],
+        static_shapes=[False, True],
+    ),
+)
 def test_cute_nested_broadcast_alias_values(shape, flat, reverse, static_shapes):
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.tile_dispatch import TileStrategyDispatch

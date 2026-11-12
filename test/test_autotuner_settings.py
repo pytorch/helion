@@ -35,6 +35,8 @@ from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfXPU
+from helion._testing.search_harness import mock_search
+from helion._testing.search_harness import prepare_search
 from helion.autotuner import DifferentialEvolutionSearch
 from helion.autotuner import LFBOPatternSearch
 from helion.autotuner import LFBOTreeSearch
@@ -89,33 +91,6 @@ class TestWorkerStartTimeoutSetting(TestCase):
 
 @onlyBackends(["triton", "cute"])
 class TestAutotuneBudget(TestCase):
-    def _make_search(self, settings: Settings) -> BaseSearch:
-        # NOTE: construct via __init__ (mock kernel) instead of hand-mirroring
-        # its attributes, so new __init__ fields don't need to be added here.
-        config_spec = SimpleNamespace(
-            backend=SimpleNamespace(supports_precompile=lambda: True),
-            default_config=lambda: helion.Config(block_sizes=[1]),
-            compiler_seed_timeout_retry_repetitions=None,
-            cute_flash_search_enabled=False,
-        )
-        kernel = SimpleNamespace(
-            settings=settings,
-            config_spec=config_spec,
-            format_kernel_decorator=lambda config, s: "decorator",
-            to_triton_code=lambda config: "code",
-            maybe_log_repro=lambda log_func, args, config=None: None,
-            supports_subprocess_benchmark=lambda: False,
-            env=SimpleNamespace(process_group_name=None),
-        )
-        search = BaseSearch(kernel, ())
-        with patch.object(
-            LocalBenchmarkProvider,
-            "_compute_baseline",
-            return_value=(None, [], None),
-        ):
-            search._prepare()
-        return search
-
     def test_setting_default_is_none(self) -> None:
         with without_env_var("HELION_AUTOTUNE_BUDGET_SECONDS"):
             settings = Settings()
@@ -235,7 +210,7 @@ class TestAutotuneBudget(TestCase):
             autotune_budget_seconds=None,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
         search._autotune_budget_start = time.perf_counter() - 1e9
         self.assertEqual(list(search._budgeted_range(1, 4)), [1, 2, 3])
 
@@ -244,7 +219,7 @@ class TestAutotuneBudget(TestCase):
             autotune_budget_seconds=600,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
         self.assertEqual(list(search._budgeted_range(1, 4)), [1, 2, 3])
 
     def test_budget_stops_range_when_elapsed_exceeds(self) -> None:
@@ -252,7 +227,7 @@ class TestAutotuneBudget(TestCase):
             autotune_budget_seconds=1,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
         search._autotune_budget_start = time.perf_counter() - 2.0
         search.log = Mock()
         self.assertEqual(list(search._budgeted_range(10)), [])
@@ -263,7 +238,7 @@ class TestAutotuneBudget(TestCase):
             autotune_budget_seconds=600,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
         search.config_spec.cute_flash_search_enabled = True
         search.kernel.env.process_group_name = "autotune"
 
@@ -280,7 +255,7 @@ class TestAutotuneBudget(TestCase):
             autotune_budget_seconds=600,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
         search.kernel.env.process_group_name = "autotune"
 
         with patch(
@@ -305,17 +280,12 @@ class TestAutotuneBudget(TestCase):
             autotune_budget_seconds=60,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
         search._autotune_budget_start = time.perf_counter() - 100.0
         self.assertEqual(list(search._budgeted_range(1)), [])
 
         search._prepared = False
-        with patch.object(
-            LocalBenchmarkProvider,
-            "_compute_baseline",
-            return_value=(None, [], None),
-        ):
-            search._prepare()
+        prepare_search(search)
         self.assertEqual(list(search._budgeted_range(1)), [0])
 
     def test_budget_zero_immediately_exhausts(self) -> None:
@@ -323,7 +293,7 @@ class TestAutotuneBudget(TestCase):
             autotune_budget_seconds=0,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
         time.sleep(0.001)
         self.assertEqual(list(search._budgeted_range(10)), [])
 
@@ -429,7 +399,7 @@ class TestAutotuneBudget(TestCase):
             autotune_budget_seconds=1,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
         self.assertEqual(
             search.benchmark_provider.budget_exceeded_fn,
             search._autotune_budget_exceeded,
