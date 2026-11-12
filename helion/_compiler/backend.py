@@ -14,6 +14,7 @@ from typing import Callable
 from typing import Sequence
 
 import torch
+from torch._inductor.ops_handler import OpsHandler
 
 from .. import exc
 from .ast_extension import expr_from_string
@@ -25,7 +26,6 @@ if TYPE_CHECKING:
     import contextlib
 
     import sympy
-    from torch._inductor.ops_handler import OpsHandler
 
     from ..autotuner.config_fragment import ConfigSpecFragment
     from ..autotuner.config_priors import ValuePrior
@@ -71,7 +71,8 @@ if TYPE_CHECKING:
     from .tile_strategy import TileStrategy
     from .tile_strategy import VecLaneWrapper
 
-    InductorOpOverrides = OpsHandler[Any]
+# Defined at runtime so ``helion.backend_api`` can re-export it.
+InductorOpOverrides = OpsHandler[Any]
 
 log: logging.Logger = logging.getLogger(__name__)
 
@@ -761,9 +762,10 @@ class Backend(abc.ABC):
         """Whether the reduction-loop block size is inlined as a module-level
         literal instead of a constexpr kernel param.
 
-        FlyDSL's scf.for step must be a value produced inside the loop, not an
-        external constexpr param, so it inlines the block size as a literal.
-        Other backends return False and use a constexpr kernel param.
+        Backends whose loops lower to an MLIR ``scf.for`` (e.g. the out-of-tree
+        helion-flydsl) need the step to be a value produced inside the loop, not
+        an external constexpr param, so they inline the block size as a
+        literal.  Other backends return False and use a constexpr kernel param.
         """
         return False
 
@@ -1247,9 +1249,8 @@ class Backend(abc.ABC):
 
         Called once per rollable rdim during device_ir analysis, after the shared
         ``ReductionLoopSpec`` has been appended. Default: no-op. Backends that need
-        additional tuning knobs per reduction block (e.g. flydsl's
-        ``cute_vector_widths``) override this instead of adding a name-check in
-        device_ir.
+        additional tuning knobs per reduction block (e.g. a vector width per
+        reduction) override this instead of adding a name-check in device_ir.
         """
         return
 
@@ -1263,9 +1264,10 @@ class Backend(abc.ABC):
     ) -> str:
         """Wrap the looped-reduction accumulator init expression, if needed.
 
-        FlyDSL's runtime scf.for carries the accumulator as an iter_arg whose init
-        type must match the per-thread vector the loop body yields, so it wraps
-        the scalar seed in ``fx.Vector.filled(...)``. Identity by default.
+        A backend whose runtime loop carries the accumulator as a loop-carried
+        value (e.g. an MLIR ``scf.for`` iter_arg) may need its init type to match
+        the per-thread vector the loop body yields, and wraps the scalar seed
+        accordingly. Identity by default.
         """
         return acc_full
 
@@ -1466,7 +1468,7 @@ class Backend(abc.ABC):
 
         Defaults to ``cast_ast``. Backends that write casts as ``value.to(dtype)``
         must override this, because a bare number has no ``.to()`` method --
-        FlyDSL, for example, uses ``fx.Float16(5)`` instead.
+        such a backend constructs the typed scalar directly instead.
         """
         return self.cast_ast(x, target_dtype)
 
@@ -1476,7 +1478,7 @@ class Backend(abc.ABC):
 
         Tile-level backends (Triton, etc.) broadcast-expand a sub-rank operand up
         to the output rank. Backends whose per-thread vectors carry the tile/row
-        axis implicitly (e.g. FlyDSL) return False to skip the expansion.
+        axis implicitly return False to skip the expansion.
         """
         return True
 
@@ -2331,6 +2333,27 @@ class Backend(abc.ABC):
         """Generate preamble statements for scalar arguments in the device function.
 
         Backends can override to dereference scalar refs, etc.
+        """
+        return []
+
+    def kernel_prologue(self, fn: DeviceFunction) -> list[ast.stmt]:
+        """Statements to splice into a device function after body codegen.
+
+        Called after the body has been generated and dead-code eliminated, so
+        a backend can emit helpers (e.g. shared-memory declarations) only when
+        body codegen recorded that it needs them.  The statements go after the
+        PDL wait and the scalar-argument preamble and before ``fn.preamble``
+        and the body; they are not dead-code eliminated but do go through
+        variable renaming.
+
+        Called once per ``generate_ast`` pass, for the one device function that
+        pass emits.  ``pre_codegen`` runs earlier in the same pass, so reset
+        any per-pass state there; a backend instance may serve several passes.
+
+        ``fn`` is passed only so the backend can tell which device function
+        this is.  None of its attributes are covered by
+        ``BACKEND_API_VERSION``, and the backend must not modify it; contribute
+        only through the returned statements.
         """
         return []
 

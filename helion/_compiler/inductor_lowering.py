@@ -508,8 +508,9 @@ class InductorLowering(Lowering):
             if isinstance(fake_val := n.meta["val"], torch.Tensor):
                 # Don't expand scalars (0-D tensors) - let Triton handle broadcasting naturally
                 # Expanding scalars with [None, None] creates incorrect broadcast shapes
-                # The expands_broadcast_dims() check lets FlyDSL skip the
-                # Triton-style [None, :] expand its per-thread vectors don't need.
+                # The expands_broadcast_dims() check lets thread-level backends
+                # skip the Triton-style [None, :] expand their per-thread vectors
+                # don't need.
                 if (
                     fake_val.ndim < ndim
                     and fake_val.ndim > 0

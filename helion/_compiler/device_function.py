@@ -9,6 +9,7 @@ import itertools
 import math
 import threading
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import NamedTuple
 from typing import Protocol
 from typing import TypeVar
@@ -480,10 +481,9 @@ class DeviceFunction:
             tuple[str, tuple[str, ...], tuple[ast.stmt, ...], bool]
         ] = []
         self.triton_outlined_helper_constexprs: dict[str, int] = {}
-        # FlyDSL: (tensor_name, is_vec, is_rolled_col) → loop-invariant buffer/
-        # div/copy-atom setup, memoized per generated function so load and store
-        # reuse the same lifted AST vars.
-        self._flydsl_setup: dict[tuple[object, ...], dict[str, int | str]] = {}
+        # Per-backend codegen state for this function, keyed by backend name
+        # (covered by helion.backend_api; see docs/api/backend_api.md).
+        self.backend_codegen_state: dict[str, Any] = {}
         # Pallas: id(fake_tensor) → [DimensionTiling], recorded during `plan_tiling`
         self.pallas_tensor_dim_tilings: dict[int, list[DimensionTiling]] = {}
         # Pallas: tensor dimensions selected by scalar metadata indexed by one
@@ -1328,6 +1328,7 @@ class DeviceFunction:
         scalar_preamble: list[ast.AST] = []
         for arg in param_args:
             scalar_preamble.extend(backend.scalar_arg_preamble(arg))
+        kernel_prologue = backend.kernel_prologue(self)
 
         function_decorator = backend.function_decorator_for_args(param_args)
         decorators = (
@@ -1351,6 +1352,7 @@ class DeviceFunction:
             [
                 *[statement_from_string(pdl[op]) for op in env.pdl_entry],
                 *scalar_preamble,
+                *kernel_prologue,
                 *self.preamble,
                 *self.body,
                 *[statement_from_string(pdl[op]) for op in env.pdl_exit],
@@ -1364,7 +1366,10 @@ class DeviceFunction:
             constexpr_to_inline=constexpr_to_inline,
             wrapper_only_params=wrapper_only_params,
             bounded_cache_request=bounded_cache_request,
-            body_start=len(env.pdl_entry) + len(scalar_preamble) + len(self.preamble),
+            body_start=len(env.pdl_entry)
+            + len(scalar_preamble)
+            + len(kernel_prologue)
+            + len(self.preamble),
         )
         kernel_body, extra_args = backend.finalize_device_body(
             kernel_body, body_context

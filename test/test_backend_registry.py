@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import contextlib
+import importlib.metadata
+import os
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 from typing import cast
 import unittest
 from unittest import mock
@@ -16,8 +20,10 @@ from helion._compiler.backend import BackendState
 from helion._compiler.backend_registry import _REGISTRY
 from helion._compiler.backend_registry import all_reserved_launch_param_names
 from helion._compiler.backend_registry import get_backend_class
+from helion._compiler.backend_registry import install_hint
 from helion._compiler.backend_registry import list_backends
 from helion._compiler.backend_registry import register_compiler_backend
+from helion._compiler.backend_registry import registered_backends
 from helion._compiler.backend_registry import registry_generation
 from helion._compiler.backend_registry import repair_backend_codegen
 from helion._compiler.backend_registry import unregister_compiler_backend
@@ -27,6 +33,10 @@ from helion.language._decorators import APIFunc
 from helion.language._decorators import BackendDispatchTable
 from helion.language._decorators import api
 from helion.language._decorators import codegen
+from helion.runtime.settings import Settings
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 pytestmark = pytest.mark.cpu_only
 
@@ -37,8 +47,92 @@ class TestBackendRegistry(unittest.TestCase):
         for expected in ("triton", "pallas", "cute", "tileir", "metal"):
             self.assertIn(expected, names)
 
+    @contextlib.contextmanager
+    def _moved_out_backend(
+        self, *, installed: bool, cached: dict[str, object] | None = None
+    ) -> Iterator[None]:
+        # Entry points as they are now; ``cached`` is the discovery result.
+        eps = []
+        if installed:
+            eps.append(
+                importlib.metadata.EntryPoint(
+                    name="flydsl",
+                    value="helion_flydsl.backend:FlyDSLBackend",
+                    group=backend_registry.PLUGIN_ENTRY_POINT_GROUP,
+                )
+            )
+        with (
+            mock.patch.object(backend_registry, "_PLUGIN_ENTRY_POINTS", cached),
+            mock.patch.object(importlib.metadata, "entry_points", return_value=eps),
+            mock.patch.dict(_REGISTRY),
+            mock.patch.dict(os.environ),
+        ):
+            _REGISTRY.pop("flydsl", None)  # in case the plugin is installed
+            os.environ.pop("HELION_DISABLE_BACKEND_PLUGINS", None)
+            os.environ.pop("HELION_BACKEND", None)
+            yield
+
+    def test_moved_out_backend_points_to_its_package(self) -> None:
+        # FlyDSL now ships as the helion-flydsl plugin; without it installed,
+        # both ways of selecting it say how to get it.
+        with self._moved_out_backend(installed=False, cached={}):
+            with self.assertRaisesRegex(ValueError, "pip install helion-flydsl"):
+                get_backend_class("flydsl")
+            with (
+                mock.patch.dict(os.environ, {"HELION_BACKEND": "flydsl"}),
+                self.assertRaisesRegex(ValueError, "pip install helion-flydsl"),
+            ):
+                Settings()
+            # Not installed: unsetting the variable would not help.
+            with (
+                mock.patch.dict(os.environ, {"HELION_DISABLE_BACKEND_PLUGINS": "1"}),
+                self.assertRaisesRegex(ValueError, "pip install helion-flydsl"),
+            ):
+                get_backend_class("flydsl")
+
+    def test_moved_out_backend_hint_when_plugins_disabled(self) -> None:
+        with (
+            self._moved_out_backend(installed=True),
+            mock.patch.dict(os.environ, {"HELION_DISABLE_BACKEND_PLUGINS": "1"}),
+        ):
+            with self.assertRaisesRegex(ValueError, "HELION_DISABLE_BACKEND_PLUGINS"):
+                get_backend_class("flydsl")
+            self.assertNotIn("pip install", install_hint("flydsl"))
+
+    def test_moved_out_backend_hint_after_late_enable(self) -> None:
+        # Discovered while disabled, then re-enabled: only a restart helps.
+        with self._moved_out_backend(installed=True, cached={}):
+            with self.assertRaisesRegex(ValueError, "restart the process"):
+                get_backend_class("flydsl")
+            with (
+                mock.patch.dict(os.environ, {"HELION_BACKEND": "flydsl"}),
+                self.assertRaisesRegex(ValueError, "restart the process"),
+            ):
+                Settings()
+
+    def test_install_hint_ignores_invalid_disable_value(self) -> None:
+        for installed in (False, True):
+            with (
+                self.subTest(installed=installed),
+                self._moved_out_backend(installed=installed, cached={}),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "HELION_DISABLE_BACKEND_PLUGINS": "maybe",
+                        "HELION_BACKEND": "flydsl",
+                    },
+                ),
+            ):
+                self.assertNotIn("is set", install_hint("flydsl"))
+                with self.assertRaisesRegex(
+                    ValueError, "HELION_BACKEND must be one of"
+                ) as ctx:
+                    Settings()
+                self.assertIsNone(ctx.exception.__cause__)
+                self.assertTrue(ctx.exception.__suppress_context__)
+
     def test_get_backend_class_and_instantiate_all(self) -> None:
-        for name in list_backends():
+        for name in registered_backends():
             cls = get_backend_class(name)
             instance = cls()
             self.assertIsInstance(instance, Backend)
@@ -179,6 +273,12 @@ class TestBackendRegistry(unittest.TestCase):
         self.assertNotIn("_test_late_debug_key", config_spec.debug_keys())
         self.assertEqual(get_heuristics("_test_late"), ())
         self.assertFalse(_tunable_name_conflicts("_test_late_key"))
+
+    def test_reregister_same_class_is_noop(self) -> None:
+        repaired = frozenset({"triton"})
+        with mock.patch.object(backend_registry, "_REPAIRED_CODEGEN_NAMES", repaired):
+            register_compiler_backend(get_backend_class("triton"))
+            self.assertIs(backend_registry._REPAIRED_CODEGEN_NAMES, repaired)
 
     def test_all_reserved_launch_param_names_is_union(self) -> None:
         result = all_reserved_launch_param_names()

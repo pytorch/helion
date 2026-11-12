@@ -24,7 +24,7 @@ the `HELION_BACKEND` environment variable or the `backend=` argument of
 * [CuTe DSL](#cute-backend-cuda-13), for NVIDIA Blackwell GPUs: `HELION_BACKEND=cute`
 * [Pallas], for Google TPUs: `HELION_BACKEND=pallas`
 * Metal, for Apple GPUs (experimental): `HELION_BACKEND=metal`
-* FlyDSL, for AMD GPUs (experimental): `HELION_BACKEND=flydsl`
+* FlyDSL, for AMD GPUs (experimental), as the separate `helion-flydsl` package: `pip install helion-flydsl`, then `HELION_BACKEND=flydsl`
 
 ```python
 @helion.kernel(backend="cute")
@@ -318,6 +318,13 @@ export HELION_BACKEND=tileir
 ```
 
 For detailed documentation, see the [TileIR Backend Guide](docs/tileir_backend.md).
+
+## Out-of-tree Backends
+
+Backends can ship as separate packages that Helion discovers through the
+`helion.backends` entry point (see `docs/api/backend_api.md`). The FlyDSL
+(AMD ROCm) backend is one: `pip install helion-flydsl`, then select it with
+`HELION_BACKEND=flydsl` or `@helion.kernel(backend="flydsl")`.
 
 ## CuTe Backend (CUDA 13+)
 
