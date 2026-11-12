@@ -84,6 +84,7 @@ from .argreduce import codegen_packed_reduction
 from .device_state import CuteVloopWrapperFact
 from .fold_lane_reductions import fold_site_key
 from .integer_loop_reduction import defer_collective
+from .lane_cluster_split import cluster_split_races
 from .lane_loops.markers import HELION_VECTOR_REDUCTION_OWNER_ATTR
 from .lane_loops.markers import _create_lane_loop
 from .lane_loops.markers import _grouped_two_stage_reduce_stmts
@@ -901,6 +902,18 @@ class CutePersistentReductionEmitter(
             )
         )
 
+    def prove_lanes_keep_threads(
+        self, threads: int, numel: object, size_hint: int
+    ) -> bool:
+        # Past one warp, a row that walks synthetic lanes (its padded extent
+        # is wider than its threads, or it is a merged tiled extent) folds
+        # them to a warp.  A vector row, a register tile or a resident row
+        # would keep its threads, but they count as folding here.
+        return threads <= _CUTE_WARP_REDUCTION_THREADS or (
+            next_power_of_2(max(1, size_hint)) <= threads
+            and not self.prove_merged_tiled_extent(numel)
+        )
+
     def plan_synthetic_lanes(
         self,
         lane_extent: int | None,
@@ -1085,6 +1098,11 @@ class CutePersistentReductionEmitter(
                 and sibling._cute_axis_partner is None
                 and sibling._cute_requested_threads == requested
                 and sibling._thread_count == requested
+                # Another root's block shares no CTA with this one, whose
+                # root's own blocks would take the axis it leaves them.
+                and strategy.fn.tile_strategy.blocks_share_one_root(
+                    strategy.block_index, sibling.block_index
+                )
             ):
                 partner_numel = env.block_sizes[sibling.block_index].numel
                 if (
@@ -1905,11 +1923,6 @@ class CuteLoopedReductionEmitter(
             or _block_has_indexed_reduction(strategy.fn, strategy.block_index)
         ):
             return
-        # Statements outside the roll loop execute once per cluster CTA —
-        # benign for plain (idempotent) stores, but a read-modify-write
-        # would repeat ``cluster_n`` times.
-        if HostFunction.current().device_ir.has_atomic_ops():
-            return
         # Sibling thread axes (e.g. a multi-row grid tile with block_m > 1)
         # would make the whole-CTA cluster reduce fold unrelated rows.
         grid_state = state.codegen.current_grid_state
@@ -1939,6 +1952,10 @@ class CuteLoopedReductionEmitter(
         # Cluster rank-relative begin/end expressions use cutlass.Int32.
         # A logical extent can fit while the padded final slice overflows.
         if static_numel and slice_len * cl > 2**31 - 1:
+            return
+        # Statements outside the roll loop execute once per cluster CTA —
+        # benign only for plain stores of a tensor nothing else accesses.
+        if cluster_split_races(strategy, strategy.block_index):
             return
         strategy._cute_rolled_cluster_n = cl
         strategy._cute_rolled_cluster_slice_len = slice_len

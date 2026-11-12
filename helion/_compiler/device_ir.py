@@ -136,6 +136,7 @@ if TYPE_CHECKING:
 
     from ..autotuner.config_spec import AccumulatorFact
     from ..autotuner.config_spec import MemoryOpFact
+    from .backend import Backend
     from .compile_environment import BlockSizeInfo
     from .cute.execution_plans import CuTeGridExecutionPlan
     from .device_function import DeviceFunction
@@ -1233,8 +1234,8 @@ class DeviceIR:
 
         Used to gate optimizations that would replay side effects — e.g.
         the CuTe cluster row-split executes every non-rolled statement once
-        per cluster CTA, which is benign for plain (idempotent) stores but
-        would repeat a read-modify-write ``cluster_n`` times.
+        per cluster CTA, which would repeat an atomic update ``cluster_n``
+        times (that split checks plain loads and stores separately).
         """
         if self._has_atomic_ops is None:
             from helion.language.atomic_ops import ATOMIC_OPS
@@ -3985,6 +3986,12 @@ def _root_loop_has_canonical_task_origin(
     """Return whether local PIDs map to zero-based, unit-stride coordinates."""
     if not isinstance(iter_expr, ast.Call) or not iter_expr.args:
         return False
+    if any(isinstance(arg, ast.Starred) for arg in iter_expr.args) or any(
+        keyword.arg is None for keyword in iter_expr.keywords
+    ):
+        # ``hl.tile(*ranges)`` or ``hl.grid(n, **options)``: the begin and
+        # the step are not spelled out.
+        return False
     if len(iter_expr.args) == 1 or (
         len(iter_expr.args) >= 2
         and isinstance(iter_expr.args[1], ast.Constant)
@@ -4326,40 +4333,10 @@ def _install_dependency_phases(
             graph_info.phase_index = phase_index
 
 
-# Operations whose lowering has a faster approximate form under the fast_math
-# setting on the Triton and CuTe backends (``inductor_lowering`` and the cute
-# ``exp2_fastmath`` / ``exact_division`` / gelu templates), by the name the
-# warning reports them under.
-_FAST_MATH_SENSITIVE_TARGETS: dict[object, str] = {
-    torch.ops.aten.reciprocal.default: "reciprocal",
-    torch.ops.aten.exp.default: "exp",
-    torch.ops.aten.exp2.default: "exp2",
-    torch.ops.aten.sigmoid.default: "sigmoid",
-    torch.ops.aten.rsqrt.default: "rsqrt",
-    torch.ops.aten.erf.default: "erf",
-    torch.ops.aten.gelu.default: "gelu",
-}
-# Triton only: under fast_math the max/min reductions and torch.maximum /
-# torch.minimum lower to ``tl.max`` / ``tl.maximum`` without the NaN
-# propagation torch has (``TritonBackend.reduction_expr``, ``overrides.py``);
-# the CuTe backend keeps the NaN-propagating forms either way.
-_FAST_MATH_SENSITIVE_TRITON_TARGETS: dict[object, str] = {
-    torch.ops.aten.amax.default: "max/min reductions",
-    torch.ops.aten.amin.default: "max/min reductions",
-    torch.ops.aten.maximum.default: "maximum/minimum",
-    torch.ops.aten.minimum.default: "maximum/minimum",
-}
-
-
-def fast_math_sensitive_ops(device_ir: DeviceIR, backend: str) -> list[str]:
+def fast_math_sensitive_ops(device_ir: DeviceIR, backend: Backend) -> list[str]:
     """Names of the floating-point operations in ``device_ir`` that the
     ``fast_math`` setting would lower to approximate forms on ``backend``,
-    sorted."""
-    from .inductor_lowering import _is_plain_true_division
-
-    targets = dict(_FAST_MATH_SENSITIVE_TARGETS)
-    if backend == "triton":
-        targets.update(_FAST_MATH_SENSITIVE_TRITON_TARGETS)
+    sorted (``Backend.fast_math_name``)."""
     names: set[str] = set()
     for graph_info in device_ir.graphs:
         for node in graph_info.graph.nodes:
@@ -4368,9 +4345,7 @@ def fast_math_sensitive_ops(device_ir: DeviceIR, backend: str) -> list[str]:
             val = node.meta.get("val")
             if not (isinstance(val, torch.Tensor) and val.dtype.is_floating_point):
                 continue
-            name = targets.get(node.target)
-            if name is None and _is_plain_true_division(node):
-                name = "fp32 division"
+            name = backend.fast_math_name(node)
             if name is not None:
                 names.add(name)
     return sorted(names)
@@ -4382,7 +4357,7 @@ def warn_fast_math_unused(device_ir: DeviceIR) -> None:
     env = CompileEnvironment.current()
     if env.settings.fast_math or not env.backend.warns_fast_math_unused:
         return
-    ops = fast_math_sensitive_ops(device_ir, env.backend.name)
+    ops = fast_math_sensitive_ops(device_ir, env.backend)
     if ops:
         warning(exc.FastMathUnused(", ".join(ops)))
 

@@ -510,7 +510,7 @@ def _f32(*shape: int) -> torch.Tensor:
             lambda: (_f32(128, 1024),),
             3,
             ("t_lane_stash", "v_1_lane_stash"),
-            "cute.math.exp2(",
+            "cute.math.exp(",
             id="column-softmax",
         ),
         # Load, sum combine; the squared deviations in the level-1 nest, sum
@@ -1565,7 +1565,7 @@ def test_column_softmax_chains_two_register_tile_levels(
     code = bound.to_code(config)
     assert "for synthetic_lane_1 in range(" not in code
     assert code.count("for synthetic_lane_1 in cutlass.range_constexpr(") == 3
-    assert code.count("cute.math.exp2(") == 1
+    assert code.count("cute.math.exp(") == 1
     assert code.count("cute.arch.load(x.iterator") == 1
     compiled = bound.compile_config(config)
     for _ in range(2):

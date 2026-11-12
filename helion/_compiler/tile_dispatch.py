@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import functools
 import math
 from typing import TYPE_CHECKING
 
@@ -8,8 +9,8 @@ import sympy
 import torch
 
 from .. import exc
-from .._compat import shape_env_size_hint
 from .._utils import next_power_of_2
+from . import active_blocks
 from .compile_environment import CompileEnvironment
 from .compile_environment import _symint_sympy_expr
 from .device_function import DeviceFunction
@@ -17,8 +18,12 @@ from .device_function import find_block_size_symbols
 from .device_ir import ForLoopGraphInfo
 from .device_ir import ReductionLoopGraphInfo
 from .device_ir import RootGraphInfo
+from .device_ir import codegen_node_order
 from .device_ir import control_flow_child_graph_ids
 from .host_function import HostFunction
+from .inductor_lowering import ReductionLowering
+from .per_thread_planning import MAX_THREADS_PER_BLOCK
+from .per_thread_planning import extent_size_hint
 from .reduction_strategy import LoopedReductionStrategy
 from .reduction_strategy import PersistentReductionStrategy
 from .reduction_strategy import ReductionStrategy
@@ -29,9 +34,11 @@ from .tile_strategy import TileStrategy
 from .tile_strategy import compacted_dim_groups
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import ItemsView
     from collections.abc import Iterable
     from collections.abc import Iterator
+    from collections.abc import Mapping
     from collections.abc import Sequence
 
     from .. import Config
@@ -76,6 +83,37 @@ class BlockIDStrategyMapping:
     def clear(self) -> None:
         self._block_id_to_strategy.clear()
         self._block_id_to_any_strategy.clear()
+
+
+def reduction_strategy_block_ids(
+    fn: DeviceFunction, live_graph_ids: frozenset[int] | None
+) -> list[int]:
+    """The reduction blocks that get a reduction strategy.
+
+    Every reduction block codegen still uses, except one used only on the
+    untaken side of a branch that is constant for this config (outside
+    ``live_graph_ids``, the result of ``Backend.constexpr_live_graph_ids``)
+    and the broadcast aliases of a grid tile
+    (``Backend.inactive_broadcast_alias_block_ids``).  The per-thread planner
+    reserves a thread axis for them before they exist
+    (``plan_per_thread_loop_strategy``).
+    """
+    env = CompileEnvironment.current()
+    backend = env.backend
+    active_block_ids = HostFunction.current().device_ir.codegen_active_block_ids
+    if live_graph_ids is not None:
+        # A reduction dim used only on the untaken side of a constant
+        # branch is never emitted; its strategy would only claim an axis.
+        live = backend.constexpr_live_block_ids(fn, live_graph_ids)
+        active_block_ids = live if active_block_ids is None else active_block_ids & live
+    inactive_aliases = backend.inactive_broadcast_alias_block_ids(fn)
+    return [
+        bs.block_id
+        for bs in env.block_sizes
+        if bs.reduction
+        and bs.block_id not in inactive_aliases
+        and (active_block_ids is None or bs.block_id in active_block_ids)
+    ]
 
 
 class TileStrategyDispatch:
@@ -232,7 +270,8 @@ class TileStrategyDispatch:
         in a lane loop overlaps its neighboring lane iterations. Resolve the
         maximum before creating reductions or emitting any lane coordinates.
         Only existing SIMT tile axes are widened; scalar and MMA axes keep
-        their ownership model.
+        their ownership model.  A backend surface's ``block_size_default`` may
+        model this widening before any strategy exists: change them together.
         """
         dims = self.thread_block_dims()
         updates: list[tuple[PerThreadNDTileStrategy, dict[int, int]]] = []
@@ -323,25 +362,7 @@ class TileStrategyDispatch:
         fn.tile_strategy = self
         env = CompileEnvironment.current()
         max_threads = env.backend.max_reduction_threads()
-        active_block_ids = HostFunction.current().device_ir.codegen_active_block_ids
-        inactive_aliases = self._inactive_broadcast_aliases(fn)
-
-        if self._constexpr_live_graph_ids is not None:
-            # A reduction dim used only on the untaken side of a constant
-            # branch is never emitted; its strategy would only claim an axis.
-            live = env.backend.constexpr_live_block_ids(
-                fn, self._constexpr_live_graph_ids
-            )
-            active_block_ids = (
-                live if active_block_ids is None else active_block_ids & live
-            )
-        rdims = [
-            bs.block_id
-            for bs in env.block_sizes
-            if bs.reduction
-            and bs.block_id not in inactive_aliases
-            and (active_block_ids is None or bs.block_id in active_block_ids)
-        ]
+        rdims = reduction_strategy_block_ids(fn, self._constexpr_live_graph_ids)
         reduction_loop_block_ids = env.config_spec.rollable_reduction_block_ids()
         for block_id in rdims:
             reduction_loop = env.config_spec.reduction_loops.config_get(
@@ -351,13 +372,7 @@ class TileStrategyDispatch:
             # Non-rolled dimensions must stay persistent so graph selection and
             # strategy selection remain consistent.
             if max_threads is not None and block_id in reduction_loop_block_ids:
-                numel = env.block_sizes[block_id].numel
-                if isinstance(numel, sympy.Integer):
-                    size_hint = int(numel)
-                elif isinstance(numel, sympy.Expr):
-                    size_hint = shape_env_size_hint(env.shape_env, numel)
-                else:
-                    size_hint = env.size_hint(numel)
+                size_hint = extent_size_hint(block_id)
                 if reduction_loop is None:
                     if size_hint > max_threads:
                         # Too many elements for a single warp; force a looped
@@ -370,13 +385,6 @@ class TileStrategyDispatch:
                 fn, block_id, reduction_loop
             )
             self._register_strategy([block_id], strategy)
-
-    def _inactive_broadcast_aliases(self, fn: DeviceFunction) -> set[int]:
-        """Reduction blocks that alias a registered tile's coordinates; they get
-        no strategy (``Backend.inactive_broadcast_alias_block_ids``)."""
-        return CompileEnvironment.current().backend.inactive_broadcast_alias_block_ids(
-            fn, self.strategies
-        )
 
     def codegen_grid(self, state: CodegenState, block_ids: list[int]) -> None:
         strategy = self._root_grid_strategy(state, block_ids)
@@ -673,14 +681,10 @@ class TileStrategyDispatch:
         walked = set().union(*root_loops)
         loop_strategies = self.strategies[num_grids:]
         branches: list[list[TileStrategy]] = []
-        for i, grid_strat in enumerate(grid_strategies):
+        for i, (grid_strat, (grid_max, next_min)) in enumerate(
+            zip(grid_strategies, self._root_block_ranges(), strict=True)
+        ):
             branch: list[TileStrategy] = [grid_strat]
-            grid_max = max(grid_strat.block_ids)
-            next_min = (
-                min(grid_strategies[i + 1].block_ids)
-                if i + 1 < num_grids
-                else float("inf")
-            )
             for ls in loop_strategies:
                 loop = tuple(ls.block_ids)
                 if (
@@ -723,6 +727,211 @@ class TileStrategyDispatch:
                 for root_id in HostFunction.current().device_ir.root_ids
             ]
         return self._root_loop_ids
+
+    def _root_block_ranges(self) -> list[tuple[float, float]]:
+        """For each root loop, the open range of the block ids of its loops
+        and reductions: above its grid's, below the next root's."""
+        num_grids = len(HostFunction.current().device_ir.grid_block_ids)
+        grid_strategies = self.strategies[:num_grids]
+        return [
+            (
+                max(grid_strat.block_ids),
+                min(grid_strategies[i + 1].block_ids)
+                if i + 1 < num_grids
+                else float("inf"),
+            )
+            for i, grid_strat in enumerate(grid_strategies)
+        ]
+
+    def shared_launch_reduction_threads(
+        self,
+        block_id: int,
+        requested: int,
+        keeps_threads: Callable[[int], bool] | None = None,
+    ) -> int | None:
+        """The threads of a reduction over ``block_id``, which is being added,
+        in a kernel whose root loops share one launch: ``requested`` fitted to
+        that launch, or ``None`` to leave the count to
+        ``Backend.adjust_reduction_thread_count``.  ``keeps_threads`` tells
+        whether a persistent reduction keeps a count once it plans its lanes;
+        a looped one passes ``None`` and keeps any.
+
+        Root loops and ``hl.barrier()`` phases never run in one CTA at the
+        same time, so a reduction does not split the CTA's threads with
+        another root's tiles and reductions.  The roots share the launch
+        instead, the per-axis maximum of their thread shapes
+        (:meth:`thread_block_dims`), and the reduction gets what that launch
+        leaves its axis: the first axis its root's earlier reductions leave,
+        since reductions come first (:meth:`thread_axis_for_strategy`).  Where
+        another root already runs threads on that axis, the reduction takes
+        exactly that many: a reduction narrower than its launch axis is
+        refused, because the surplus lanes would join its cross-lane combine.
+        So the roots' order shapes the launch: an earlier root's reduction can
+        widen an axis past what a later one asks for, which then keeps its old
+        budget and runs on the wider axis, every surplus thread repeating its
+        work (a row sum's root widening x to 64 ahead of a softmax that asks
+        for 4).
+        That is the count the strategy starts from: past one warp, a
+        persistent reduction walking its row in a lane loop folds its threads
+        to a warp afterwards (``plan_synthetic_lanes``) and would then be
+        refused on another root's wider axis, so it takes that axis only where
+        ``keeps_threads`` says the count survives.
+
+        A threaded reduction also reserves one more leading axis kernel-wide
+        (:meth:`reserved_reduction_axes`), which moves every tile up one axis,
+        so the count must leave the moved layout launchable: no tile may leave
+        the launch's three axes (it would run as a lane loop in every thread)
+        and every axis must stay within the backend's extent limits.  ``None``
+        when it does not, when the reduction is narrower than its axis or
+        would fold below it, when a reduction block is shared between roots
+        (same-size full slices of several roots get one block id, which the
+        root ranges place in one root only, so the axes derived here would not
+        be the ones the other root's CTA runs), when roots share a registered
+        block size (their grids' block ids, which the ranges cannot tell
+        apart), in a kernel of one root, and for layouts this does not model
+        (a backend whose sections do not share axes, a collective layout
+        ordering the axes, an axis past the launch's three, a second reduction
+        of a root already running a threaded one: on the next axis its lane
+        loops' stores would vary along the first one's threads, which the CuTe
+        lane splitter refuses; full slices no reduction reduces each take an
+        axis).
+
+        A root that claims no thread of a launch axis runs its body on every
+        thread of that axis: a store writes the same value from each, the
+        thread barriers, placed for the whole launch, order a
+        read-modify-write, and the backend holds an atomic to the leader
+        thread of each launch axis its own loops do not claim, so the threads
+        given to a reduction here repeat no root's atomics.
+
+        The execution plans that lay a root out otherwise (a register tile
+        puts its root's tiles below the reduction) are chosen later, once the
+        strategies exist, so this sizes the reductions-first layout; the
+        launch a plan leads to is checked again when the code is generated.
+        """
+        env = CompileEnvironment.current()
+        device_ir = HostFunction.current().device_ir
+        if (
+            requested <= 1
+            or len(device_ir.grid_block_ids) <= 1
+            or not env.backend.shares_sibling_thread_axes()
+            or not env.backend.reduction_axis_first()
+            or self._collective_sibling_thread_axes
+        ):
+            return None
+        ranges = self._root_block_ranges()
+        index = next(
+            (i for i, (low, high) in enumerate(ranges) if low < block_id < high),
+            None,
+        )
+        # Roots over one registered block size share their grid's block ids,
+        # so the ranges cannot tell their loops and reductions apart.
+        if index is None or any(low >= high for low, high in ranges):
+            return None
+        low, high = ranges[index]
+        if any(
+            not low < other < high or not self._roots_using(other) <= {index}
+            for other in {block_id, *self._root_reduction_block_ids[index]}
+        ):
+            return None
+        threaded = [
+            strategy
+            for strategy in self.strategies
+            if isinstance(strategy, ReductionStrategy)
+            and low < strategy.block_index < high
+            and strategy.thread_axes_used()
+        ]
+        if threaded and self._reduced_block_ids & {
+            block_id,
+            *(strategy.block_index for strategy in threaded),
+        }:
+            return None
+        axis = sum(strategy.thread_axes_used() for strategy in threaded)
+        dims = self.thread_block_dims()
+        if axis >= len(dims) or math.prod(dims) > MAX_THREADS_PER_BLOCK:
+            return None
+        reserved = self.reserved_reduction_axes()
+        if axis < reserved and dims[axis] > 1:
+            # Exactly another root's threads on the axis, which its lanes
+            # must not fold narrower.
+            threads = dims[axis]
+            if (
+                requested < threads
+                or threads & (threads - 1)
+                or (keeps_threads is not None and not keeps_threads(threads))
+            ):
+                return None
+        else:
+            threads = requested
+            while threads > 1 and threads * math.prod(dims) > MAX_THREADS_PER_BLOCK:
+                threads //= 2
+        if threads > 1:
+            # The tiles sit above the reserved axes; one more reserved axis
+            # moves each up by one, and the one on the last axis off the launch.
+            tiles = list(dims[reserved:])
+            if tiles and tiles[-1] > 1:
+                return None
+            moved = [*dims[:reserved], 1, *tiles[:-1]][: len(dims)]
+            moved[axis] = max(moved[axis], threads)
+            limits = env.backend.thread_axis_extent_limits() or ()
+            if math.prod(moved) > MAX_THREADS_PER_BLOCK or any(
+                extent > limit for extent, limit in zip(moved, limits, strict=False)
+            ):
+                return None
+        return threads
+
+    @functools.cached_property
+    def _reduced_block_ids(self) -> frozenset[int]:
+        """The blocks a lowered reduction of the kernel reduces (a full slice
+        no reduction reduces is a reduction block, not one of these)."""
+        return frozenset(
+            lowering.block_index
+            for graph in self._device_function.codegen.codegen_graphs
+            for node in graph.graph.nodes
+            if isinstance(lowering := node.meta.get("lowering"), ReductionLowering)
+        )
+
+    @functools.cached_property
+    def _root_reduction_block_ids(self) -> list[frozenset[int]]:
+        """For each root loop, the reduction blocks of the graphs it runs."""
+        device_ir = HostFunction.current().device_ir
+        graphs = self._device_function.codegen.codegen_graphs
+        env = CompileEnvironment.current()
+        result = []
+        for root_id in device_ir.root_ids:
+            reached = {
+                graph_id
+                for graph_id, _node in codegen_node_order(
+                    graphs, [root_id], repeat_conditions=False, unreached=False
+                )
+            }
+            result.append(
+                frozenset(
+                    block_id
+                    for block_id in active_blocks.active_block_ids(
+                        [graphs[graph_id] for graph_id in reached], (), env
+                    )
+                    if env.block_sizes[block_id].reduction
+                )
+            )
+        return result
+
+    def _roots_using(self, block_id: int) -> set[int]:
+        """The indices of the root loops whose graphs use reduction block
+        ``block_id``."""
+        return {
+            index
+            for index, used in enumerate(self._root_reduction_block_ids)
+            if block_id in used
+        }
+
+    def blocks_share_one_root(self, first: int, second: int) -> bool:
+        """Whether reduction blocks ``first`` and ``second`` are used by one
+        root loop and by no other (always, in a kernel of one root): only
+        then do they run in the same CTAs and nowhere else."""
+        if len(HostFunction.current().device_ir.grid_block_ids) <= 1:
+            return True
+        roots = self._roots_using(first)
+        return len(roots) == 1 and roots == self._roots_using(second)
 
     def _branch_by_tile_loops(
         self, branches: list[list[TileStrategy]]
@@ -1232,6 +1441,13 @@ class TileStrategyDispatch:
         if expr is None or expr.isdigit():
             return None
         return expr
+
+    def synthetic_thread_axes(self) -> Mapping[int, int]:
+        """The thread extent of each launch axis the body claims outside the
+        strategies (``Backend.synthetic_thread_axis_sizes``: on CuTe, the free
+        ``hl.arange`` dims' axes)."""
+        codegen = self._device_function.codegen
+        return codegen.backend.synthetic_thread_axis_sizes(codegen)
 
     def symbolic_thread_axes(self) -> dict[int, str]:
         """The launch axes whose thread extent is only known at launch, by axis.

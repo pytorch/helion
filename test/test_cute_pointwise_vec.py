@@ -96,6 +96,18 @@ def _bias_add2d(x: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="cute", static_shapes=True)
+def _gather_rows(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """The embedding gather whose seeds test_cute_pointwise_resident_seeds.py
+    pins, run here; keep the two copies the same kernel."""
+    out = torch.empty(
+        [x.size(0), weight.size(1)], dtype=weight.dtype, device=weight.device
+    )
+    for tile_b, tile_e in hl.tile([x.size(0), weight.size(1)]):
+        out[tile_b, tile_e] = weight[x[tile_b], tile_e]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
 def _tile_index_bias(x: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile_m, tile_n in hl.tile(x.size()):
@@ -278,6 +290,35 @@ class TestCutePointwiseVec(TestCase):
         )
         self.assertIn("ir.VectorType.get([8], cutlass.Uint16.mlir_type)", code)
         torch.testing.assert_close(out, x + y)
+
+    def test_wide_row_packet_seed_masks_a_ragged_row(self) -> None:
+        """The wide row-packet seed of a 384-wide bf16 row: eight strided
+        lanes of 16-element packets over a 256-wide tile, so each row's
+        second tile is half masked.  It gathers the rows exactly, with and
+        without proven bounds."""
+        idx = torch.randint(4096, (256,), device=DEVICE, dtype=torch.int32)
+        weight = torch.randn(4096, 384, device=DEVICE, dtype=torch.bfloat16)
+        spec = _gather_rows.bind((idx, weight)).config_spec
+        # The cute_pdl twins only change the launch.
+        seeds = [
+            seed
+            for seed in spec.compiler_seed_configs
+            if seed.config.get("cute_min_blocks_per_mp") == 1
+            and not seed.config.get("cute_pdl")
+        ]
+        self.assertEqual(
+            sorted(bool(seed.config.get("cute_proven_bounds")) for seed in seeds),
+            [False, True],
+        )
+        for seed in seeds:
+            with self.subTest(proven_bounds=seed.config.get("cute_proven_bounds")):
+                # Only a guard that this run masks a second tile; the CPU test
+                # test_wide_row_packets_round_a_row_down_to_a_power_of_two_tile
+                # pins the seed.
+                self.assertEqual(seed.config["block_sizes"][1], 256)
+                code, out = code_and_output(_gather_rows, (idx, weight), **seed.config)
+                self.assertIn("ir.VectorType.get([16], cutlass.Uint16.mlir_type)", code)
+                self.assertTrue(torch.equal(out, weight[idx]))
 
     def test_index_independent_store_keeps_wrapper(self) -> None:
         """Regression: a store whose VALUE reads no per-lane vars must keep
@@ -774,6 +815,351 @@ class TestCutePointwiseVec(TestCase):
                 self.assertEqual(packet in code, expect_packet)
                 expected = graph_input[:, start : start + 128] * 2 + 1
                 self.assertTrue(torch.equal(out, expected))
+
+    @unittest.skipUnless(
+        supports_torch_compile_template_lowering(),
+        "this PyTorch build lacks Helion's Inductor template lowering",
+    )
+    def test_dynamic_lane_length_under_torch_compile_takes_scalar_loads(
+        self,
+    ) -> None:
+        """Under ``torch.compile(dynamic=True)`` Inductor binds the kernel to
+        placeholder inputs (a 64-long weight) and runs its code at every
+        weight length.  A packet proven from the placeholder's length would
+        load the last partial packet of a 255-long weight from offset 0, so
+        lanes 248-254 would read weights 0-6: the weight stays on scalar loads,
+        exact at each length."""
+
+        @helion.kernel(
+            backend="cute",
+            static_shapes=False,
+            config=helion.Config(
+                block_sizes=[4, 2], cute_vector_widths=[8, 8], num_threads=[4, 2, 32]
+            ),
+        )
+        def head_rms_norm(q: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            tokens, heads, head_dim = q.shape
+            out = torch.empty_like(q)
+            for tile_t, tile_h in hl.tile([tokens, heads]):
+                x = q[tile_t, tile_h, :].float()
+                rstd = torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + 1e-6)
+                # Lanes past the end of a shorter weight read zeros.
+                cols = hl.arange(head_dim)
+                out[tile_t, tile_h, :] = (x * rstd * weight[cols].float()).to(q.dtype)
+            return out
+
+        def f(q: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            return head_rms_norm(q, weight) + 1
+
+        compiled = torch.compile(f, fullgraph=True, backend="inductor", dynamic=True)
+        torch._dynamo.reset()
+        with fresh_cache():
+            for tokens, heads, length in ((64, 8, 255), (32, 4, 250)):
+                with self.subTest(length=length):
+                    q = torch.randn(
+                        tokens, heads, 256, dtype=torch.bfloat16, device=DEVICE
+                    )
+                    # A static head dim gives hl.arange its extent.
+                    torch._dynamo.mark_static(q, 2)
+                    weight = torch.randn(length, dtype=torch.bfloat16, device=DEVICE)
+                    out, codes = run_and_get_code(compiled, q, weight)
+                    if length == 255:
+                        self.assertEqual(len(codes), 1)
+                    for code in codes:
+                        self.assertIn("weight.iterator", code)
+                        self.assertNotIn("cute.arch.load(weight.iterator", code)
+                    x = q.float()
+                    rstd = torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + 1e-6)
+                    padded = torch.zeros(256, dtype=torch.float32, device=DEVICE)
+                    padded[:length] = weight.float()
+                    expected = (x * rstd * padded).to(q.dtype) + 1
+                    torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
+
+    @unittest.skipUnless(
+        supports_torch_compile_template_lowering(),
+        "this PyTorch build lacks Helion's Inductor template lowering",
+    )
+    def test_dynamic_reduction_length_under_torch_compile_masks_each_lane(
+        self,
+    ) -> None:
+        """Under ``torch.compile(dynamic=True)`` Inductor binds the kernel to
+        a 64-column placeholder and runs its code at every row length.  Eight
+        lanes masked as one packet, proven from the placeholder's length,
+        would add columns 61-63 of a 64-wide buffer to each 61-column row."""
+
+        @helion.kernel(
+            backend="cute",
+            static_shapes=False,
+            config=helion.Config(
+                block_sizes=[1],
+                reduction_loops=[32],
+                num_threads=[1, 4],
+                cute_vector_widths=[8, 1],
+            ),
+        )
+        def row_logsumexp(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(x.shape[0], dtype=torch.float32, device=x.device)
+            for row in hl.tile(x.shape[0]):
+                values = x[row, :].float()
+                maximum = values.amax(-1)
+                denominator = torch.exp(values - maximum[:, None]).sum(-1)
+                out[row] = denominator.log() + maximum
+            return out
+
+        def f(x: torch.Tensor) -> torch.Tensor:
+            return row_logsumexp(x) + 1
+
+        compiled = torch.compile(f, fullgraph=True, backend="inductor", dynamic=True)
+        torch._dynamo.reset()
+        buffer = torch.randn(48, 64, dtype=torch.bfloat16, device=DEVICE)
+        with fresh_cache():
+            for length in (64, 61):
+                with self.subTest(length=length):
+                    x = buffer[:, :length]
+                    out, codes = run_and_get_code(compiled, x)
+                    for code in codes:
+                        self.assertNotIn("cute.arch.load(x.iterator", code)
+                    expected = torch.logsumexp(x.float(), dim=-1) + 1
+                    torch.testing.assert_close(out, expected, atol=1e-4, rtol=1e-4)
+
+    @unittest.skipUnless(
+        supports_torch_compile_template_lowering(),
+        "this PyTorch build lacks Helion's Inductor template lowering",
+    )
+    def test_symbolic_inner_stride_under_torch_compile_takes_scalar_loads(
+        self,
+    ) -> None:
+        """A graph viewing its input at a dynamic column step has a symbolic
+        inner stride, and Inductor binds the kernel to a placeholder whose
+        inner stride is 1 (its sizes stay static).  Eight-lane packets
+        proven from that stride would sum eight adjacent columns of the
+        step-2 view instead of every other one."""
+
+        @helion.kernel(
+            backend="cute",
+            static_shapes=False,
+            config=helion.Config(
+                block_sizes=[1], num_threads=[1, 8], cute_vector_widths=[8, 1]
+            ),
+        )
+        def row_sum(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(x.shape[0], dtype=torch.float32, device=x.device)
+            for row in hl.tile(x.shape[0]):
+                out[row] = x[row, :].float().sum(-1)
+            return out
+
+        def f(buffer: torch.Tensor, step: int) -> torch.Tensor:
+            return row_sum(buffer.as_strided((48, 64), (128, step))) + 1
+
+        compiled = torch.compile(f, fullgraph=True, backend="inductor", dynamic=True)
+        torch._dynamo.reset()
+        buffer = torch.randn(48, 128, dtype=torch.bfloat16, device=DEVICE)
+        torch._dynamo.mark_static(buffer)
+        with fresh_cache():
+            for step in (1, 2):
+                with self.subTest(step=step):
+                    out, codes = run_and_get_code(compiled, buffer, step)
+                    for code in codes:
+                        self.assertNotIn("cute.arch.load(x.iterator", code)
+                    x = buffer.as_strided((48, 64), (128, step))
+                    expected = x.float().sum(-1) + 1
+                    torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+
+    @unittest.skipUnless(
+        supports_torch_compile_template_lowering(),
+        "this PyTorch build lacks Helion's Inductor template lowering",
+    )
+    def test_static_graph_under_torch_compile_takes_the_bound_layout_proofs(
+        self,
+    ) -> None:
+        """Inductor's render of a static graph proves what the binding's
+        cache key fixes (the bound signature, ``keyed_hint``), short of base
+        alignment past 16 bytes: a row logsumexp's register-row copies, a
+        matmul's asynchronous operand copies and an in-place state update's
+        proven bounds.  While those proofs read live example inputs, which
+        no Inductor render has, the copies were scalar and the state
+        update's config was refused.  Each graph matches eager."""
+
+        @helion.kernel(
+            backend="cute",
+            static_shapes=True,
+            config=helion.Config(
+                block_sizes=[1],
+                num_threads=[1, 256],
+                reduction_loops=[16384],
+                cute_vector_widths=[4, 1],
+                cute_lane_layouts=["strided", "blocked"],
+                cute_reduction_reloads=["register"],
+                cute_cluster_n=2,
+                cute_cluster_warp_online=True,
+                cute_scalar_epilogue=True,
+                cute_register_row=True,
+                cute_warp_fp32_redux=True,
+                cute_register_row_tensor_copy=True,
+            ),
+        )
+        def row_logsumexp(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(x.shape[0], dtype=torch.float32, device=x.device)
+            for row in hl.tile(x.shape[0]):
+                values = x[row, :].float()
+                maximum = values.amax(-1)
+                denominator = torch.exp(values - maximum[:, None]).sum(-1)
+                out[row] = denominator.log() + maximum
+            return out
+
+        @helion.kernel(
+            backend="cute",
+            static_shapes=True,
+            config=helion.Config(
+                block_sizes=[64, 32, 64],
+                num_threads=[4, 32, 1],
+                cute_collective_copy="async",
+                cute_collective_mma=True,
+            ),
+        )
+        def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.shape
+            _, n = y.shape
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        @helion.kernel(
+            backend="cute",
+            static_shapes=False,
+            config=helion.Config(
+                block_sizes=[128],
+                num_threads=[8, 16],
+                cute_vector_widths=[8, 1, 1, 1],
+                pid_type="xyz",
+                cute_proven_bounds=True,
+            ),
+        )
+        def state_update(
+            state_indices: torch.Tensor, state: torch.Tensor, packed: torch.Tensor
+        ) -> torch.Tensor:
+            batches = state_indices.size(0)
+            heads = hl.specialize(state.size(1))
+            rows = hl.specialize(state.size(2))
+            width = hl.specialize(state.size(3))
+            out = torch.empty(
+                [batches, heads, rows], dtype=state.dtype, device=state.device
+            )
+            for tile_batch, tile_head, tile_row in hl.tile(
+                [batches, heads, rows], block_size=[1, 1, None]
+            ):
+                batch_index = tile_batch.id
+                head_index = tile_head.id
+                state_index = state_indices[batch_index]
+                cols = hl.arange(width)
+                state_values = state[state_index, head_index, tile_row, cols].float()
+                packed_values = packed[batch_index, head_index, cols].float()
+                updated = state_values + packed_values[None, :]
+                out[batch_index, head_index, tile_row] = updated.sum(-1).to(state.dtype)
+                state[state_index, head_index, tile_row, cols] = updated
+            return out
+
+        def compile_and_run(f: object, *args: torch.Tensor) -> tuple[object, list[str]]:
+            compiled = torch.compile(
+                f, fullgraph=True, backend="inductor", dynamic=False
+            )
+            torch._dynamo.reset()
+            with fresh_cache():
+                return run_and_get_code(compiled, *args)
+
+        with self.subTest(kernel="row_logsumexp"):
+            x = torch.randn(3, 32000, device=DEVICE)
+            out, codes = compile_and_run(lambda x: row_logsumexp(x) + 1, x)
+            self.assertIn("_cute_complete_row_tensor_copy(", "\n".join(codes))
+            expected = torch.logsumexp(x, dim=-1) + 1
+            torch.testing.assert_close(out, expected, atol=1e-4, rtol=1e-4)
+
+        with self.subTest(kernel="matmul"):
+            x = torch.randn(256, 256, dtype=torch.bfloat16, device=DEVICE)
+            y = torch.randn(256, 256, dtype=torch.bfloat16, device=DEVICE)
+            out, codes = compile_and_run(lambda x, y: matmul(x, y) + 1, x, y)
+            self.assertEqual("\n".join(codes).count("cp_async_shared_global("), 2)
+            expected = (x.float() @ y.float()).to(x.dtype) + 1
+            torch.testing.assert_close(out, expected, atol=2e-1, rtol=2e-2)
+
+        with self.subTest(kernel="state_update"):
+            state_indices = torch.tensor([2, 0], dtype=torch.int32, device=DEVICE)
+            state = torch.randn(3, 3, 128, 128, dtype=torch.bfloat16, device=DEVICE)
+            packed = torch.randn(2, 3, 128, dtype=torch.bfloat16, device=DEVICE)
+            expected_state = state.clone()
+            indices = state_indices.long()
+            updated = expected_state[indices].float() + packed.float()[:, :, None, :]
+            expected_state[indices] = updated.to(state.dtype)
+            expected = updated.sum(-1).to(state.dtype) + 1
+            out, codes = compile_and_run(
+                lambda i, s, p: state_update(i, s, p) + 1, state_indices, state, packed
+            )
+            self.assertIn("_cute_proven_bounds_", "\n".join(codes))
+            torch.testing.assert_close(out, expected, atol=5e-2, rtol=2e-2)
+            torch.testing.assert_close(state, expected_state, atol=0, rtol=0)
+
+    @unittest.skipUnless(
+        supports_torch_compile_template_lowering(),
+        "this PyTorch build lacks Helion's Inductor template lowering",
+    )
+    def test_eager_after_torch_compile_runs_the_eager_code(self) -> None:
+        """Inductor tunes its configs on a binding of its own.  Its render of
+        a row logsumexp proves the input only 16-byte aligned, so the
+        eight-lane fp32 packets (32 bytes) stay scalar there; a later eager
+        call tunes the kernel's binding and runs the packets ``to_code``
+        shows, not the render's scalar loads."""
+        from helion._testing.cute_flash import compile_and_source
+
+        @helion.kernel(
+            backend="cute",
+            static_shapes=True,
+            # Two configs, both of eight-lane packets, so that the lowering
+            # tunes rather than taking a config the user gave.
+            configs=[
+                helion.Config(
+                    block_sizes=[1],
+                    num_threads=[1, num_threads],
+                    reduction_loops=[16384],
+                    cute_vector_widths=[8, 1],
+                )
+                for num_threads in (256, 128)
+            ],
+            autotune_benchmark_subprocess=False,
+        )
+        def row_logsumexp(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(x.shape[0], dtype=torch.float32, device=x.device)
+            for row in hl.tile(x.shape[0]):
+                values = x[row, :].float()
+                maximum = values.amax(-1)
+                denominator = torch.exp(values - maximum[:, None]).sum(-1)
+                out[row] = denominator.log() + maximum
+            return out
+
+        packet = "cute.arch.load(x.iterator"
+        x = torch.randn(3, 32000, device=DEVICE)
+        expected = torch.logsumexp(x, dim=-1)
+        compiled = torch.compile(
+            lambda x: row_logsumexp(x) + 1,
+            fullgraph=True,
+            backend="inductor",
+            dynamic=False,
+        )
+        torch._dynamo.reset()
+        with fresh_cache():
+            out, codes = run_and_get_code(compiled, x)
+            self.assertNotIn(packet, "\n".join(codes))
+            torch.testing.assert_close(out, expected + 1, atol=1e-4, rtol=1e-4)
+            bound = row_logsumexp.bind((x,))
+            self.assertIsNone(bound._config)
+            eager = row_logsumexp(x)
+            assert bound._config is not None
+            _, source = compile_and_source(bound, bound._config)
+            self.assertIn(packet, source)
+            torch.testing.assert_close(eager, expected, atol=1e-4, rtol=1e-4)
 
 
 if __name__ == "__main__":

@@ -539,15 +539,7 @@ class FragmentMemoryEmitter(FragmentContext):
         # A scalar or broadcast value does not describe the indexed write
         # domain. Use the same destination shape rule as fake tensor loads.
         shape = self.shape(
-            SubscriptIndexing.compute_shape(
-                output,
-                [
-                    index.meta["val"] if isinstance(index, Node) else index
-                    for index in indices
-                ],
-            )
-            if store
-            else output.shape
+            SubscriptIndexing.node_shape(node) if store else output.shape
         )
         extra_mask = node.args[3] if store else node.args[2]
         mask_value = values[extra_mask] if isinstance(extra_mask, Node) else extra_mask
@@ -631,7 +623,12 @@ class FragmentMemoryEmitter(FragmentContext):
                 ):
                     block = None
                 if isinstance(index, slice):
-                    assert index == slice(None)
+                    if index != slice(None):
+                        # The coordinates of a bounded slice would need its
+                        # start and length in the address.
+                        raise exc.BackendUnsupported(
+                            "cute", "a computed fragment through a bounded slice"
+                        )
                     expression = selected_coordinates(ordinal, coords)[0]
                 elif block is not None:
                     expression = f"({self.offsets[block]}) + ({selected_coordinates(ordinal, coords)[0]})"

@@ -34,6 +34,7 @@ from .._compiler.cute.flash_facts import FlashEnv
 from .._compiler.cute.flash_facts import FlashSurfaceFacts
 from .._utils import indexing_uses_tensor_descriptor
 from .._utils import prev_power_of_2
+from .._utils import widest_halvable
 from ..exc import InvalidConfig
 from ..runtime.config import _copy_config_structure
 from ..runtime.triton.launcher import get_num_xcd
@@ -704,11 +705,12 @@ class PointwiseElementwiseFact(NamedTuple):
 def shrink_block_sizes_for_numel_constraints(
     constraints: list[TensorNumelConstraint],
     block_sizes: list[int],
-    min_sizes: list[int],
+    min_sizes: Sequence[int | None],
 ) -> None:
     """Shrink *block_sizes* in-place so every *constraint* is satisfied.
 
-    Halves the largest involved block size first for balanced tiles.
+    Halves the largest involved block size first for balanced tiles, never
+    below its entry of *min_sizes* (``None``: a size that never shrinks).
     Fixed-point loop handles cross-constraint interactions.
     """
     prev = list(block_sizes)
@@ -717,13 +719,9 @@ def shrink_block_sizes_for_numel_constraints(
             while not constraint.check_fn(
                 *(block_sizes[i] for i in constraint.block_indices)
             ):
-                best_idx: int | None = None
-                best_val = -1
-                for i in constraint.block_indices:
-                    can_halve = block_sizes[i] // 2 >= min_sizes[i]
-                    if can_halve and block_sizes[i] > best_val:
-                        best_val = block_sizes[i]
-                        best_idx = i
+                best_idx = widest_halvable(
+                    (i, block_sizes[i], min_sizes[i]) for i in constraint.block_indices
+                )
                 if best_idx is None:
                     log.warning(
                         "tensor numel constraint unsatisfiable at minimum "
@@ -735,6 +733,17 @@ def shrink_block_sizes_for_numel_constraints(
         if block_sizes == prev:
             break
         prev = list(block_sizes)
+
+
+def fit_thread_count(threads: int, block_size: int) -> int:
+    """The largest power of two at most ``threads`` that divides
+    ``block_size`` (at least 1): a ``num_threads`` entry fitted to its block.
+    ``NumThreadsSpec`` takes any whole number of warps, and halving one that
+    is not a power of two (96) never divides a power-of-two block."""
+    threads = prev_power_of_2(threads, block_size)
+    while threads > 1 and block_size % threads != 0:
+        threads //= 2
+    return threads
 
 
 DEFAULT_NUM_WARPS = 4
@@ -934,7 +943,23 @@ class ConfigSpec:
         self.cute_indexed_reduction_block_ids: set[int] = set()
         # Non-reduction tiles that execute simultaneously. Sibling loops and
         # separate roots reuse physical axes during CuTe launch planning.
-        self.cute_tile_loop_paths: tuple[TileLoopPath, ...] = ()
+        # Their paths (``cute_tile_loop_paths``), each with the reduction
+        # blocks it runs beside: used between the path's root and its
+        # innermost loop, or inside that loop.
+        self.cute_tile_loop_path_reductions: dict[TileLoopPath, frozenset[int]] = {}
+        # The static size of each block on the ``cute_tile_loop_paths`` that
+        # no config tunes: a fixed ``hl.tile`` block size, or an ``hl.grid``'s
+        # step (``hl.grid(0, 64, 8)`` records 8, although its loop runs one
+        # thread per index).
+        self.cute_tile_fixed_block_sizes: dict[int, int] = {}
+        # The blocks on those paths whose fixed size is not a static int: an
+        # expression of tunables (``block_size=next_power_of_2(bm)``), or
+        # another SymInt such as a dynamic size or an int argument.
+        self.cute_tile_symbolic_fixed_blocks: frozenset[int] = frozenset()
+        # The path of each tile strategy a launch builds, ending at its
+        # blocks: every root's grid and every tile loop, so a path repeats
+        # when loops share their blocks.
+        self.cute_tile_strategy_paths: tuple[TileLoopPath, ...] = ()
         self.cute_inactive_tile_block_ids: set[int] = set()
         # Whether fp32 matmuls stay exact (dot_precision ieee / tf32x3): the
         # SIMT GEMM knob's precondition, recorded by DeviceIR.
@@ -1483,6 +1508,13 @@ class ConfigSpec:
         }
 
     @property
+    def cute_tile_loop_paths(self) -> tuple[TileLoopPath, ...]:
+        """The CuTe tile loop paths: the keys of
+        ``cute_tile_loop_path_reductions``, which records each path's
+        reductions."""
+        return tuple(self.cute_tile_loop_path_reductions)
+
+    @property
     def compiler_coverage_groups(self) -> tuple[CompilerCoverageGroup, ...]:
         return self._compiler_coverage_groups
 
@@ -1902,6 +1934,68 @@ class ConfigSpec:
                 "or 16, or an N tile of at least 16"
             )
 
+    def clamp_bounded_block_sizes(self, config: dict[str, Any]) -> None:
+        """Clamp inner block sizes that are bounded by an outer block (e.g.
+        ``hl.tile(outer.begin, outer.end)``) to the outer's block size in
+        ``config``, which the inner extent can never exceed, and fit the
+        ``num_threads`` entries of the clamped blocks to their new sizes.  A
+        block keeps its minimum and its structural pin, as ``_normalize``
+        does: below the minimum it stays at the minimum, wider than its
+        extent, and a pinned block stays at its pin.  ``config`` holds
+        normalized ``block_sizes`` and ``num_threads``."""
+        block_sizes_list = config.get("block_sizes")
+        if not isinstance(block_sizes_list, list):
+            return
+        # The new size of each block the clamp changes, by block id.
+        clamped: dict[int, int] = {}
+        new_block_sizes = list(block_sizes_list)
+        for i, spec in enumerate(self.block_sizes):
+            bb = spec.bounded_by_block_id
+            minimum = spec.shrink_minimum
+            if (
+                bb is None
+                or minimum is None
+                or i >= len(new_block_sizes)
+                or new_block_sizes[i] is None
+            ):
+                continue
+            try:
+                outer_index = self.block_sizes.block_id_to_index(bb)
+            except KeyError:
+                continue
+            outer_val = (
+                new_block_sizes[outer_index]
+                if outer_index < len(new_block_sizes)
+                else None
+            )
+            if (
+                isinstance(outer_val, int)
+                and isinstance(new_block_sizes[i], int)
+                and new_block_sizes[i] > max(outer_val, minimum)
+            ):
+                new_block_sizes[i] = clamped[spec.block_id] = max(outer_val, minimum)
+        if not clamped:
+            return
+        config["block_sizes"] = new_block_sizes
+        num_threads = config.get("num_threads")
+        if not isinstance(num_threads, list):
+            return
+        new_num_threads = list(num_threads)
+        # Fit the slots of the clamped blocks, found by block id: the two
+        # sequences need not share an order.
+        for i, nt_spec in enumerate(self.num_threads):
+            if i >= len(new_num_threads):
+                break
+            num_thread = new_num_threads[i]
+            if (
+                nt_spec.block_id not in clamped
+                or type(num_thread) is not int
+                or num_thread <= 0
+            ):
+                continue
+            new_num_threads[i] = fit_thread_count(num_thread, clamped[nt_spec.block_id])
+        config["num_threads"] = new_num_threads
+
     def normalize(
         self,
         config: helion.Config | dict[str, object],
@@ -1918,7 +2012,7 @@ class ConfigSpec:
             _cute_register_tiles: If False, a CuTe persistent reduction whose
                 threads cannot cover its extent is looped even when the config
                 spells out a per-thread register tile
-                (``_cute_config_forms_register_tile``).  ``generate_ast`` uses
+                (``cute_config_forms_register_tile``).  ``generate_ast`` uses
                 it to regenerate a kernel whose register tile the lowering
                 rejected as the config without the register tile.
         """
@@ -2053,58 +2147,9 @@ class ConfigSpec:
 
         surface.normalize_after_sequences(self, config, fix_invalid=_fix_invalid)
 
-        # Clamp inner block sizes that are bounded by an outer block
-        # (e.g. ``hl.tile(outer.begin, outer.end)``): at this point the
-        # outer's concrete block size for this config is known, and the
-        # inner extent can never exceed it.
-        block_sizes_list = config.get("block_sizes")
-        if isinstance(block_sizes_list, list):
-            changed = False
-            new_block_sizes = list(block_sizes_list)
-            for i, spec in enumerate(self.block_sizes):
-                bb = spec.bounded_by_block_id
-                if (
-                    bb is None
-                    or i >= len(new_block_sizes)
-                    or new_block_sizes[i] is None
-                ):
-                    continue
-                try:
-                    outer_index = self.block_sizes.block_id_to_index(bb)
-                except KeyError:
-                    continue
-                outer_val = (
-                    new_block_sizes[outer_index]
-                    if outer_index < len(new_block_sizes)
-                    else None
-                )
-                if (
-                    isinstance(outer_val, int)
-                    and isinstance(new_block_sizes[i], int)
-                    and new_block_sizes[i] > outer_val
-                ):
-                    new_block_sizes[i] = outer_val
-                    changed = True
-            if changed:
-                config["block_sizes"] = new_block_sizes
-                num_threads = config.get("num_threads")
-                if isinstance(num_threads, list):
-                    new_num_threads = list(num_threads)
-                    for i, (block_size, num_thread) in enumerate(
-                        zip(new_block_sizes, new_num_threads, strict=False)
-                    ):
-                        if (
-                            type(block_size) is not int
-                            or type(num_thread) is not int
-                            or num_thread <= 0
-                        ):
-                            continue
-                        if num_thread > block_size:
-                            num_thread = 1 << (max(block_size, 1).bit_length() - 1)
-                        while num_thread > 1 and block_size % num_thread != 0:
-                            num_thread //= 2
-                        new_num_threads[i] = max(num_thread, 1)
-                    config["num_threads"] = new_num_threads
+        # The sequences are normalized, so each outer block's size for this
+        # config is known: clamp the inner blocks it bounds.
+        self.clamp_bounded_block_sizes(config)
 
         if self.supports_config_key("num_threads"):
             num_threads = cast("list[int]", config.get("num_threads", []))
@@ -2797,12 +2842,10 @@ class ConfigSpec:
             or not self.tensor_numel_constraints
         ):
             return
-        min_sizes = [
-            max(self.block_sizes[i].min_size, self.block_sizes[i].structural_pin or 1)
-            for i in range(len(block_sizes))
-        ]
         shrink_block_sizes_for_numel_constraints(
-            self.tensor_numel_constraints, block_sizes, min_sizes
+            self.tensor_numel_constraints,
+            block_sizes,
+            [self.block_sizes[i].shrink_minimum for i in range(len(block_sizes))],
         )
 
     def shrink_block_sizes_once(self, config: helion.Config) -> helion.Config | None:
@@ -2816,17 +2859,11 @@ class ConfigSpec:
         block_sizes = config.config.get("block_sizes")
         if not isinstance(block_sizes, list) or not block_sizes:
             return None
-        best_idx: int | None = None
-        best_val = -1
-        for i, value in enumerate(block_sizes):
-            if not isinstance(value, int):
-                continue
-            if self.block_sizes[i].structural_pin is not None:
-                # Normalization would restore the pinned size: no progress.
-                continue
-            if value // 2 >= max(self.block_sizes[i].min_size, 1) and value > best_val:
-                best_val = value
-                best_idx = i
+        best_idx = widest_halvable(
+            (i, value, self.block_sizes[i].shrink_minimum)
+            for i, value in enumerate(block_sizes)
+            if isinstance(value, int)
+        )
         if best_idx is None:
             return None
         shrunk = [*block_sizes]
@@ -3331,6 +3368,26 @@ class L2GroupingSpec(_PowerOfTwoBlockIdItem):
         return 1
 
 
+def generic_block_size_default(total_ndim: int, reduction_numel: int) -> int:
+    """The default size of each of ``total_ndim`` block sizes beside reduction
+    loops whose padded extents multiply to ``reduction_numel``."""
+    if total_ndim <= 2 and reduction_numel <= 128:
+        return 32
+    if total_ndim >= 3 and reduction_numel > 1:
+        # With 3+ tiled dimensions and a non-trivial reduction/full-slice
+        # dimension, the total tensor numel (default^total_ndim *
+        # reduction_numel) grows quickly and can cause Triton JIT
+        # compilation to hang or exceed shared memory limits.
+        # Compute a default that keeps total numel <= 32768 (safe for
+        # 64KB shared memory with 2-byte elements like bf16).
+        target = 32768
+        per_dim = int((target / reduction_numel) ** (1.0 / total_ndim))
+        return max(1, 1 << (per_dim.bit_length() - 1)) if per_dim >= 1 else 1
+    if reduction_numel <= 256:
+        return 16
+    return 1
+
+
 class BlockSizeSpec(_PowerOfTwoBlockIdItem):
     def __init__(
         self,
@@ -3436,6 +3493,15 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         self.structural_pin = value
         self.structural_pin_reason = reason
 
+    @property
+    def shrink_minimum(self) -> int | None:
+        """The smallest size shrinking may give this block, or ``None`` when
+        it is structurally pinned: normalization restores the pinned size, so
+        shrinking makes no progress."""
+        if self.structural_pin is not None:
+            return None
+        return max(self.min_size, 1)
+
     def update_min(self, value: int) -> None:
         self.min_size = assert_integer_power_of_two(max(value, self.min_size))
         if self.max_size < self.min_size:
@@ -3486,26 +3552,23 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         self.max_size = min(self.max_size, next_power_of_2(max(value, 1)))
 
     def _fragment(self, base: ConfigSpec) -> BlockSizeFragment:
-        total_ndim = len(base.block_sizes)
         reduction_numel = _product(
             [next_power_of_2(spec.size_hint) for spec in base.reduction_loops]
         )
-        if total_ndim <= 2 and reduction_numel <= 128:
-            default = 32
-        elif total_ndim >= 3 and reduction_numel > 1:
-            # With 3+ tiled dimensions and a non-trivial reduction/full-slice
-            # dimension, the total tensor numel (default^total_ndim *
-            # reduction_numel) grows quickly and can cause Triton JIT
-            # compilation to hang or exceed shared memory limits.
-            # Compute a default that keeps total numel <= 32768 (safe for
-            # 64KB shared memory with 2-byte elements like bf16).
-            target = 32768
-            per_dim = int((target / reduction_numel) ** (1.0 / total_ndim))
-            default = max(1, 1 << (per_dim.bit_length() - 1)) if per_dim >= 1 else 1
-        elif reduction_numel <= 256:
-            default = 16
-        else:
-            default = 1
+        return self._fragment_with_default(
+            base,
+            base.search_surface.block_size_default(
+                base,
+                self,
+                generic_block_size_default(len(base.block_sizes), reduction_numel),
+            ),
+        )
+
+    def _fragment_with_default(
+        self, base: ConfigSpec, default: int
+    ) -> BlockSizeFragment:
+        """The fragment around ``default``, the size the search surface gives
+        the block, which this fits to the block's bounds."""
         low = min(max(self.min_size, self.autotuner_min), self.max_size)
         # Clamp the default within the dimension so allow_overshoot only widens
         # the autotuner *search*, never the default (non-autotuned) block size.

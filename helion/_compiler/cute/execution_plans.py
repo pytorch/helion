@@ -188,6 +188,12 @@ def _plan_matmul_execution(
     )
     if scalar_strategy is None:
         return
+    # The warp-MMA tiles give lane ``l`` of thread ``t`` column
+    # ``l * threads + t``, the cyclic lanes; a row of V-wide vectors holds
+    # element ``l % V`` of its chunk ``l // V`` there instead, so its stores
+    # would take other columns.
+    if scalar_strategy._cute_reduction_vec_width > 1:
+        return
     scalar_block_id = scalar_strategy.block_index
     scalar_threads = tile_strategy.thread_extent_for_block_id(scalar_block_id)
     if scalar_threads is None or scalar_threads < 8 or scalar_threads % 8 != 0:

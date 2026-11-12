@@ -5,11 +5,12 @@ and score-modified attention), ``cute/flex_match`` / ``cute/flex_bwd_match``
 (FlexAttention forward / backward), ``cute/cute_flash_gated`` and
 ``cute/cute_flash_bwd`` (the dense backward), and of the FX-level admission
 analyses (``binary_pair``, ``node_tensor``).  Every helper reads one FX node
-(or one block-size entry) and returns a plain value; none mutates a graph or
-reads the compile environment.  The host-scalar readers (``symnode_expr``,
-``symnode_sympy``, ``scale_operand``, ``split_scale``) return the traced
-SymInt / SymFloat's sympy expression so symbol identity survives to codegen
-(``DeviceFunction.sympy_expr`` lifts it as the kernel argument it came from).
+(or one block-size entry, or the root grids of a device IR) and returns a
+plain value; none mutates a graph or reads the compile environment.  The
+host-scalar readers (``symnode_expr``, ``symnode_sympy``, ``scale_operand``,
+``split_scale``) return the traced SymInt / SymFloat's sympy expression so
+symbol identity survives to codegen (``DeviceFunction.sympy_expr`` lifts it
+as the kernel argument it came from).
 
 Literal acceptance differs per family and is explicit here: the dense
 matchers accept Python numbers and ``aten.scalar_tensor(c)`` only
@@ -32,6 +33,7 @@ if TYPE_CHECKING:
     from collections.abc import Container
 
     from ...compile_environment import CompileEnvironment
+    from ...device_ir import DeviceIR
 
 _aten = torch.ops.aten
 
@@ -301,3 +303,21 @@ def packed_f32x2_multiply(node: object) -> tuple[torch.fx.Node, torch.fx.Node] |
     if not (isinstance(lhs, torch.fx.Node) and isinstance(rhs, torch.fx.Node)):
         return None
     return lhs, rhs
+
+
+def root_grid_origin_is_canonical(device_ir: DeviceIR) -> bool:
+    """Whether every root grid axis of ``device_ir`` has a canonical task
+    origin: it starts at the literal 0 in steps of 1
+    (``device_ir.noncanonical_task_origin_block_ids``, which counts a range
+    the call does not spell out, ``hl.tile(*ranges)``, as non-canonical).
+    The fused attention bodies number the root grid's work items from 0 in
+    steps of 1 (they decode an axis as ``pid // div % extent`` and never add
+    its begin), so a kernel whose grid starts elsewhere or strides
+    (``hl.tile([1, 0], ...)``, ``hl.grid(1, n)``, ``hl.grid(0, n, 2)``)
+    stays on the general path."""
+    noncanonical = device_ir.noncanonical_task_origin_block_ids
+    return not any(
+        block_id in noncanonical
+        for block_ids in device_ir.grid_block_ids
+        for block_id in block_ids
+    )

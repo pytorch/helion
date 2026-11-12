@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from itertools import starmap
 from typing import TYPE_CHECKING
-from typing import cast
 
 import torch
 from torch.fx import Node
@@ -72,12 +71,7 @@ def lane_private_load(node: Node, env: CompileEnvironment) -> bool:
                 or target.target is not _tracing_ops._host_tensor
             ):
                 return False
-            indices = [
-                x.meta["val"] if isinstance(x, Node) else x
-                for x in cast("list[object]", user.args[1])
-            ]
-            shape = SubscriptIndexing.compute_shape(target.meta["val"], indices)
-            if not same_shape(shape):
+            if not same_shape(SubscriptIndexing.node_shape(user)):
                 return False
             continue
         if not isinstance(value, torch.Tensor) or not same_shape(value.shape):

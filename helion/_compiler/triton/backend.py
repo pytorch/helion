@@ -59,6 +59,20 @@ def _triton_jit_supports_do_not_specialize() -> bool:
 _warned_unavailable_options: set[str] = set()
 
 
+# Under fast_math Triton also lowers torch.sigmoid with libdevice's fast exp
+# and divide (``inductor_lowering``), and the max/min reductions and
+# torch.maximum / torch.minimum to ``tl.max`` / ``tl.maximum`` without the NaN
+# propagation torch has (``TritonBackend.reduction_expr``, ``overrides.py``);
+# the CuTe backend keeps its sigmoid and the NaN-propagating forms either way.
+_TRITON_FAST_MATH: dict[object, str] = {
+    torch.ops.aten.sigmoid.default: "sigmoid",
+    torch.ops.aten.amax.default: "max/min reductions",
+    torch.ops.aten.amin.default: "max/min reductions",
+    torch.ops.aten.maximum.default: "maximum/minimum",
+    torch.ops.aten.minimum.default: "maximum/minimum",
+}
+
+
 class TritonBackend(Backend):
     """Triton code generation backend."""
 
@@ -117,6 +131,9 @@ class TritonBackend(Backend):
     @property
     def warns_fast_math_unused(self) -> bool:
         return True
+
+    def fast_math_name(self, node: torch.fx.Node) -> str | None:
+        return _TRITON_FAST_MATH.get(node.target) or super().fast_math_name(node)
 
     @property
     def supports_autotune_multi(self) -> bool:

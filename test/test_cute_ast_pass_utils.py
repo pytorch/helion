@@ -17,8 +17,12 @@ from helion._compiler.cute._ast_pass_utils import assigned_name
 from helion._compiler.cute._ast_pass_utils import call_path
 from helion._compiler.cute._ast_pass_utils import call_path_str
 from helion._compiler.cute._ast_pass_utils import constexpr_v_loop
+from helion._compiler.cute._ast_pass_utils import dealias_shared_nodes
+from helion._compiler.cute._ast_pass_utils import deep_clone
 from helion._compiler.cute._ast_pass_utils import expand_lane
 from helion._compiler.cute._ast_pass_utils import exposed_reads
+from helion._compiler.cute._ast_pass_utils import is_staged_loop
+from helion._compiler.cute._ast_pass_utils import is_trace_time_test
 from helion._compiler.cute._ast_pass_utils import is_vloop
 from helion._compiler.cute._ast_pass_utils import live_in
 from helion._compiler.cute._ast_pass_utils import loop_extent
@@ -32,6 +36,8 @@ from helion._compiler.cute._ast_pass_utils import replace_call
 from helion._compiler.cute._ast_pass_utils import replace_node
 from helion._compiler.cute._ast_pass_utils import same_expr
 from helion._compiler.cute._ast_pass_utils import substitute_names
+
+pytestmark = pytest.mark.cpu_only
 
 LOOPS = [
     "for v in range(4): pass",
@@ -1550,6 +1556,36 @@ def test_loop_extent_rejects_multi_argument_and_wrapped_extents() -> None:
         assert loop_extent(ast.parse(source).body[0], minimum=None) is None
 
 
+def test_staged_loops_and_trace_time_tests_follow_the_dsl_preprocessor() -> None:
+    # The preprocessor stages a ``for`` over ``range`` / ``range_dynamic``
+    # under any prefix and unrolls every other one; an ``if`` / ``while`` on
+    # ``const_expr`` / ``target_version`` runs as Python (the rule
+    # ``hoist_loop_invariant_recip`` and ``smem_footprint`` share).
+    for source, staged in (
+        ("for v in range(4): pass", True),
+        ("for v in cutlass.range(n, unroll=2): pass", True),
+        ("for v in cutlass.range_dynamic(n): pass", True),
+        ("for v in make().range(n): pass", True),
+        ("for v in cutlass.range_constexpr(4): pass", False),
+        ("for v in values: pass", False),
+        ("for v in (a, b): pass", False),
+        ("for v in enumerate(values): pass", False),
+        ("for v in ranges[0](n): pass", False),
+    ):
+        loop = ast.parse(source).body[0]
+        assert isinstance(loop, ast.For)
+        assert is_staged_loop(loop) is staged, source
+    for source, trace_time in (
+        ("cutlass.const_expr(flag)", True),
+        ("const_expr(flag)", True),
+        ("cutlass.target_version(exact_version='13.0')", True),
+        ("flag", False),
+        ("tid == 0", False),
+        ("cutlass.Boolean(flag)", False),
+    ):
+        assert is_trace_time_test(parse_expr(source)) is trace_time, source
+
+
 @pytest.mark.parametrize("source", NAME_CASES)
 def test_name_collectors_pin_legacy_copies(source: str) -> None:
     tree = ast.parse(source)
@@ -1739,3 +1775,27 @@ def test_expand_lane_rewrites_loads_only() -> None:
     expand_lane(tree, "lane", 4, 3)
     assert ast.unparse(tree) == "lane = ptr[lane * 4 + 3] + (lane * 4 + 3)"
     assert isinstance(expr_from_string("lane * 4 + 3"), ast.expr)
+
+
+def test_dealias_shared_nodes_copies_repeated_positions_with_their_markers() -> None:
+    first, second = ast.parse(
+        "for lane in range(4):\n    pass\nfor lane in range(4):\n    pass"
+    ).body
+    assert isinstance(first, ast.For) and isinstance(second, ast.For)
+    shared = ast.parse("value = (x.iterator + lane).load()").body[0]
+    shared.marker = "kept"  # pyrefly: ignore[missing-attribute]
+    first.body = second.body = [shared]
+    body: list[ast.stmt] = [first, second]
+    rendered = ast.unparse(ast.Module(body=body, type_ignores=[]))
+
+    dealias_shared_nodes(body)
+
+    nodes = [node for stmt in body for node in ast.walk(stmt)]
+    assert len({id(node) for node in nodes}) == len(nodes)
+    assert first.body is not second.body
+    assert first.body[0] is shared
+    copy = second.body[0]
+    assert copy is not shared
+    assert getattr(copy, "marker", None) == "kept"
+    assert ast.unparse(ast.Module(body=body, type_ignores=[])) == rendered
+    assert ast.dump(deep_clone(shared)) == ast.dump(shared)

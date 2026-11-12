@@ -685,7 +685,7 @@ def _combination_conflict(cg: CodegenInterface, node: torch.fx.Node) -> str | No
     consumer = rebound_consumer_dims(node)
     if consumer is None:
         return "split-view operands it cannot align"
-    sizes, lower_rank_by_block_id = consumer
+    sizes, pointwise_placement = consumer
     env = CompileEnvironment.current()
     block_ids = tensor_dim_block_ids(env, sizes)
     entries: list[list[tuple[torch.fx.Node, torch.Tensor, int]]] = [[] for _ in sizes]
@@ -695,7 +695,7 @@ def _combination_conflict(cg: CodegenInterface, node: torch.fx.Node) -> str | No
         if not isinstance(value, torch.Tensor):
             continue
         positions = operand_positions(
-            env, value, sizes, block_ids, lower_rank_by_block_id=lower_rank_by_block_id
+            env, value, sizes, block_ids, pointwise_placement=pointwise_placement
         )
         for dim, position in enumerate(positions):
             if position >= 0:

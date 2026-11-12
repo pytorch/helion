@@ -22,6 +22,12 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import skipIfNotCUDA
+from helion._testing.cute_reverse_scan_kernels import reverse_scan_then_centering
+from helion._testing.cute_reverse_scan_kernels import (
+    reverse_scan_then_centering_with_totals,
+)
+from helion._testing.cute_reverse_scan_kernels import reverse_scan_then_column_sums
+from helion._testing.cute_reverse_scan_kernels import reverse_scan_then_row_sums
 import helion.language as hl
 
 pytest.importorskip("cutlass")
@@ -131,6 +137,20 @@ def _flat_cumsum_reverse(x: torch.Tensor) -> torch.Tensor:
     for tile in hl.tile(x.size(0)):
         out[tile] = hl.cumsum(x[tile], dim=0, reverse=True)
     return out
+
+
+_reverse_scan_then_row_sums = helion.kernel(
+    reverse_scan_then_row_sums, backend="cute", static_shapes=True
+)
+_reverse_scan_then_column_sums = helion.kernel(
+    reverse_scan_then_column_sums, backend="cute", static_shapes=True
+)
+_reverse_scan_then_centering = helion.kernel(
+    reverse_scan_then_centering, backend="cute", static_shapes=True
+)
+_reverse_scan_then_centering_with_totals = helion.kernel(
+    reverse_scan_then_centering_with_totals, backend="cute", static_shapes=True
+)
 
 
 def _run(
@@ -338,3 +358,75 @@ def test_multi_tile_flat_serial_fallback_scans_block_local_rows(numel: int) -> N
     code, out = _run(_flat_cumsum_reverse, (x,), **config)
     assert _SERIAL_RESCAN in code
     torch.testing.assert_close(out, _flipped_cumsum(x, 0, 128), rtol=1e-4, atol=1e-4)
+
+
+@skipIfNotCUDA()
+def test_reverse_scan_lane_loop_around_interchanged_reductions() -> None:
+    # Each scan's descending lane loop also wraps a device loop reducing over
+    # those lanes; the interchange reruns the reduction in a second nest and
+    # drops the first nest's dead partial stores or empty column loop.
+    x = torch.randn(64, 128, device=DEVICE)
+    y = torch.randn(64, 32, 128, device=DEVICE)
+    code, (out, totals) = _run(
+        _reverse_scan_then_row_sums,
+        (x, y),
+        block_sizes=[32, 32],
+        num_threads=[32, 32, 1],
+    )
+    assert code.count("for synthetic_lane_1 in range(127, -1, -1):") == 2
+    assert code.count("(totals.iterator") == 1
+    torch.testing.assert_close(out, _flipped_cumsum(x, 1, 128), rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(totals, y.sum(-1), rtol=1e-4, atol=1e-4)
+    x = torch.randn(37, 100, device=DEVICE)
+    w = torch.randn(37, device=DEVICE)
+    code, (sums, suffix) = _run(
+        _reverse_scan_then_column_sums,
+        (x, w),
+        block_sizes=[8, 32],
+        num_threads=[1, 32],
+        cute_vector_widths=[1, 1],
+        cute_lane_layouts=["strided", "strided"],
+    )
+    assert code.count("for lane_0 in range(7, -1, -1):") == 2
+    assert code.count("for tile_offset_1 in range(") == 1
+    torch.testing.assert_close(sums, x.sum(0), rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(suffix, _flipped_cumsum(w, 0, 8), rtol=1e-4, atol=1e-4)
+
+
+@skipIfNotCUDA()
+def test_reverse_scan_lane_loop_around_an_in_place_update() -> None:
+    # The descending lane loop also wraps an in-place row update: the first
+    # nest's partial store of ``y`` is dropped, so the final nest centers the
+    # rows the kernel started from.
+    x = torch.randn(64, 128, device=DEVICE)
+    y = torch.randn(64, 32, 128, device=DEVICE)
+    expected = y - y.sum(-1, keepdim=True)
+    code, (out, centered) = _run(
+        _reverse_scan_then_centering,
+        (x, y),
+        block_sizes=[32, 32],
+        num_threads=[32, 32, 1],
+    )
+    assert code.count("for synthetic_lane_1 in range(127, -1, -1):") == 3
+    assert code.count("(y.iterator") == 3
+    torch.testing.assert_close(out, _flipped_cumsum(x, 1, 128), rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(centered, expected, rtol=1e-4, atol=1e-4)
+
+
+@skipIfNotCUDA()
+def test_reverse_scan_lane_loop_around_an_in_place_update_with_totals() -> None:
+    # The first nest keeps its load of ``y`` ahead of the dropped partial
+    # store: each iteration of the loop over ``k`` loads only the row it
+    # updates, so the totals add up the rows the kernel started from.
+    x = torch.randn(64, 128, device=DEVICE)
+    y = torch.randn(64, 8, 128, device=DEVICE)
+    expected = y - y.sum(-1, keepdim=True)
+    expected_totals = y.sum(1)
+    code, (out, centered, totals) = _run(
+        _reverse_scan_then_centering_with_totals, (x, y), num_threads=[32, 1]
+    )
+    assert code.count("for synthetic_lane_1 in range(127, -1, -1):") == 3
+    assert code.count("(y.iterator") == 4
+    torch.testing.assert_close(out, _flipped_cumsum(x, 1, 128), rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(centered, expected, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(totals, expected_totals, rtol=1e-4, atol=1e-4)

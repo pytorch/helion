@@ -16,8 +16,9 @@ reduce sites of its own but shares the value and literal helpers:
   per-element values site A max-reduces, with the register caches written
   alongside its fold;
 * :func:`_prove` -- the rolled pair's frame and purity proof (sweep B folds
-  ``exp2((x - m) * C)`` of the same elements under the same mask, the
-  maximum escapes only into those subtractions);
+  ``exp2((x - m) * C)`` or ``exp(x - m)`` (:func:`_exponent`) of the same
+  elements under the same mask, the maximum escapes only into those
+  subtractions);
 * :func:`_wrap_sites` -- the one-trip owners that give top-level rolled
   finalizers the shape the proofs expect (erased again by the passes).
 
@@ -184,17 +185,56 @@ class _Inliner(ast.NodeTransformer):
         return node
 
 
-def _is_exp2(call: ast.AST) -> TypeGuard[ast.Call]:
+def _is_cute_math_call(call: ast.AST, name: str) -> TypeGuard[ast.Call]:
     return (
         isinstance(call, ast.Call)
         and len(call.args) == 1
         and isinstance(call.func, ast.Attribute)
-        and call.func.attr == "exp2"
+        and call.func.attr == name
         and isinstance(call.func.value, ast.Attribute)
         and call.func.value.attr == "math"
         and isinstance(call.func.value.value, ast.Name)
         and call.func.value.value.id == "cute"
     )
+
+
+def _is_exp2(call: ast.AST) -> TypeGuard[ast.Call]:
+    return _is_cute_math_call(call, "exp2")
+
+
+def _exponent(call: ast.AST) -> tuple[ast.expr, float | None] | None:
+    """The exponent of an online-softmax exponential and its base-2 scale.
+
+    ``exp2(shift * C)`` (``C`` a positive finite float literal, the
+    ``fast_math`` and ``torch.exp2`` spelling) gives ``(shift, C)``; the
+    natural ``exp(shift)`` (``torch.exp`` without ``fast_math``) gives
+    ``(shift, None)``.  Keywords are left to the caller.
+    """
+    if _is_cute_math_call(call, "exp"):
+        return call.args[0], None
+    if not _is_exp2(call):
+        return None
+    argument = call.args[0]
+    if (
+        isinstance(argument, ast.BinOp)
+        and isinstance(argument.op, ast.Mult)
+        and isinstance(argument.right, ast.Constant)
+        and type(argument.right.value) is float
+        and math.isfinite(argument.right.value)
+        and argument.right.value > 0
+    ):
+        return argument.left, argument.right.value
+    return None
+
+
+def _exponential_src(difference: str, scale: float | None, *, ftz: bool) -> str:
+    """``exp(difference)`` in the spelling of an exponent of ``scale``
+    (:func:`_exponent`): ``exp2((difference) * scale)``, ``ftz`` choosing its
+    flush-to-zero form, or the natural ``exp(difference)`` for ``None``,
+    whose exact form has no denormal fixup to drop."""
+    if scale is None:
+        return f"cute.math.exp({difference})"
+    return f"cute.math.exp2(({difference}) * {scale!r}, fastmath={ftz!r})"
 
 
 def _strip_fp32_casts(node: ast.expr) -> ast.expr:
@@ -627,7 +667,7 @@ def _pure_assignments(statements: list[ast.stmt]) -> list[ast.Assign] | None:
 
 def _prove(
     body: list[ast.stmt], site_a: _Site, site_b: _Site
-) -> tuple[str, float, list[ast.Name]] | None:
+) -> tuple[str, float | None, list[ast.Name]] | None:
     tail = site_a.for_node.body[site_a.stmt_idx + 1 :]
     if len(tail) != 1 or not is_name_assign(tail[0]):
         return None
@@ -679,7 +719,7 @@ def _prove(
     terms = elements.values(term, sum_chain, caches)
     if terms is None or len(terms) != len(max_values):
         return None
-    scales: set[float] = set()
+    scales: set[float | None] = set()
     for max_value, sum_term in zip(max_values, terms, strict=True):
         max_domain, value = _domain(ast.parse(max_value, mode="eval").body, -math.inf)
         sum_domain, exponential = _domain(ast.parse(sum_term, mode="eval").body, 0.0)
@@ -690,7 +730,8 @@ def _prove(
         while _float32(exponential):
             assert isinstance(exponential, ast.Call)
             exponential = exponential.args[0]
-        if not _is_exp2(exponential):
+        exponent = _exponent(exponential)
+        if exponent is None:
             return None
         assert isinstance(exponential, ast.Call)
         if any(
@@ -700,17 +741,7 @@ def _prove(
             for keyword in exponential.keywords
         ):
             return None
-        argument = exponential.args[0]
-        if not (
-            isinstance(argument, ast.BinOp)
-            and isinstance(argument.op, ast.Mult)
-            and isinstance(argument.right, ast.Constant)
-            and type(argument.right.value) is float
-            and math.isfinite(argument.right.value)
-            and argument.right.value > 0
-        ):
-            return None
-        shift = argument.left
+        shift, scale = exponent
         while _float32(shift):
             assert isinstance(shift, ast.Call)
             shift = shift.args[0]
@@ -723,7 +754,7 @@ def _prove(
             == _under_domain(value, max_domain)
         ):
             return None
-        scales.add(argument.right.value)
+        scales.add(scale)
     if len(scales) != 1:
         return None
     dependent = {maximum}
@@ -824,10 +855,11 @@ class OnlinePairCandidate:
 @dataclasses.dataclass(frozen=True)
 class OnlinePairMatch(OnlinePairCandidate):
     """A candidate whose rolled proof holds: ``maximum`` is the name sweep B
-    subtracts (at ``subtractions``), ``scale`` the exponent's constant."""
+    subtracts (at ``subtractions``), ``scale`` the exponent's constant
+    (``None`` for the natural ``exp``, see :func:`_exponent`)."""
 
     maximum: str
-    scale: float
+    scale: float | None
     subtractions: list[ast.Name]
 
 

@@ -15,9 +15,10 @@ from ._ast_pass_utils import is_name_assign
 from ._ast_pass_utils import reparse_expr
 from .analysis.online_pair import _assigned_name
 from .analysis.online_pair import _domain
+from .analysis.online_pair import _exponent
+from .analysis.online_pair import _exponential_src
 from .analysis.online_pair import _float32
 from .analysis.online_pair import _Inliner
-from .analysis.online_pair import _is_exp2
 from .analysis.online_pair import _literal
 from .analysis.online_pair import _loads
 from .analysis.online_pair import _stmt
@@ -111,7 +112,7 @@ class _Proof:
     next_maximum: str
     maximum: str
     denominator: str
-    scale: float
+    scale: float | None
     safe_ftz: bool
 
 
@@ -358,19 +359,14 @@ def _prove(
         return None
     while _float32(exponential):
         exponential = exponential.args[0]
-    if not _is_exp2(exponential) or exponential.keywords:
+    exponent = (
+        _exponent(exponential)
+        if isinstance(exponential, ast.Call) and not exponential.keywords
+        else None
+    )
+    if exponent is None:
         return None
-    argument = exponential.args[0]
-    if not (
-        isinstance(argument, ast.BinOp)
-        and isinstance(argument.op, ast.Mult)
-        and isinstance(argument.right, ast.Constant)
-        and type(argument.right.value) is float
-        and math.isfinite(argument.right.value)
-        and argument.right.value > 0
-    ):
-        return None
-    shift = argument.left
+    shift, scale = exponent
     while _float32(shift):
         shift = shift.args[0]
     if not (
@@ -412,12 +408,15 @@ def _prove(
     ):
         return None
     alpha = _canonical(update.args[1], scalar_definitions)
+    alpha_exponent = (
+        _exponent(alpha) if isinstance(alpha, ast.Call) and not alpha.keywords else None
+    )
     total = _canonical(update.args[2], tail_definitions)
     if not (
-        _is_exp2(alpha)
-        and not alpha.keywords
-        and ast.unparse(alpha.args[0])
-        == f"cutlass.Float32({maximum} - {next_maximum}) * {argument.right.value!r}"
+        alpha_exponent is not None
+        and alpha_exponent[1] == scale
+        and ast.unparse(alpha_exponent[0])
+        == f"cutlass.Float32({maximum} - {next_maximum})"
         and _float32(total)
         and isinstance(total.args[0], ast.Name)
         and total.args[0].id == _assigned_name(sum_statement)
@@ -481,7 +480,7 @@ def _prove(
         next_maximum,
         maximum,
         denominator,
-        argument.right.value,
+        scale,
         initial_values.get(maximum) == -math.inf
         and initial_values.get(denominator) == 0.0,
     )
@@ -611,9 +610,12 @@ def lower_online_chunk_reduction(
             result.append(_clone(statement))
         result.append(
             _stmt(
-                f"{exponents} = cute.math.exp2(({values} - "
-                f"{proof.next_maximum}) * {proof.scale!r}, "
-                f"fastmath={proof.safe_ftz!r})"
+                f"{exponents} = "
+                + _exponential_src(
+                    f"{values} - {proof.next_maximum}",
+                    proof.scale,
+                    ftz=proof.safe_ftz,
+                )
             )
         )
         sum_statement = _clone(cast("ast.Assign", loop.body[proof.sum_call_index]))

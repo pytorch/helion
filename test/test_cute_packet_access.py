@@ -17,9 +17,12 @@ import pytest
 
 from helion._compiler.cute.cache_policy_loads import CachePolicy
 from helion._compiler.cute.packet_access import PacketAccess
+from helion._compiler.cute.packet_access import call_write_roots
+from helion._compiler.cute.packet_access import is_store_call
 from helion._compiler.cute.packet_access import match_packet_access
 from helion._compiler.cute.packet_access import render_masked_packet_load
 from helion._compiler.cute.packet_access import render_packet_load
+from helion._compiler.cute.packet_access import store_pointer
 from helion._compiler.cute.packet_access import vector_type_parts
 from helion._compiler.cute.packet_flush_names import PACKET_FLUSH_HELPER_NAMES
 from helion._compiler.cute.packet_flush_names import PACKET_FLUSH_L2_EVICT_LAST
@@ -305,6 +308,84 @@ def test_non_calls_and_malformed_vector_types() -> None:
     assert match_packet_access(_parse("x.load(1)")) is None
     assert match_packet_access(_parse("x.store()")) is None
     assert match_packet_access(_parse("x.store(a, b)")) is None
+
+
+def _inline_asm(pure: bool) -> str:
+    return (
+        "_cute_inline_asm_elementwise(a, asm='', constraints='=f,f', "
+        f"dtype=cutlass.Float32, is_pure={pure})"
+    )
+
+
+def _iterator_roots(pointer: ast.expr) -> frozenset[str] | None:
+    """The tensors whose ``.iterator`` an address reads, None if none."""
+    roots = frozenset(
+        node.value.id
+        for node in ast.walk(pointer)
+        if isinstance(node, ast.Attribute)
+        and node.attr == "iterator"
+        and isinstance(node.value, ast.Name)
+    )
+    return roots or None
+
+
+@pytest.mark.parametrize(
+    ("source", "store", "pointer", "roots"),
+    [
+        # ``ptr.store(value)`` writes through its receiver, ``cute.arch``
+        # calls in the address included; ``cute.arch.store`` takes it first.
+        (
+            "(x.iterator + cute.arch.thread_idx()[0]).store(v)",
+            True,
+            "x.iterator + cute.arch.thread_idx()[0]",
+            frozenset({"x"}),
+        ),
+        (
+            "cute.arch.store(x.iterator + 1, v)",
+            True,
+            "x.iterator + 1",
+            frozenset({"x"}),
+        ),
+        (
+            "_cute_store_u32_vec(y.iterator + 4, values)",
+            True,
+            "y.iterator + 4",
+            frozenset({"y"}),
+        ),
+        # A write whose destination is no address operand may write memory
+        # it does not name.
+        ("cute.copy(atom, source, target)", True, None, None),
+        ("_cute_rank1_store_f32(target, v)", True, None, None),
+        # Inline asm declared pure writes nothing, impure asm and an unknown
+        # call may write anything, and a load writes nothing.
+        (
+            _inline_asm(pure=True),
+            False,
+            None,
+            frozenset(),
+        ),
+        (
+            _inline_asm(pure=False),
+            False,
+            None,
+            None,
+        ),
+        # Warp shuffles and the pure selects of ``cutlass`` write nothing.
+        ("cute.arch.shuffle_sync_bfly(value, offset=1)", False, None, frozenset()),
+        ("cutlass.select_(mask, a, b)", False, None, frozenset()),
+        ("mystery(x.iterator)", False, None, None),
+        ("(x.iterator + 1).load()", False, None, frozenset()),
+    ],
+)
+def test_the_write_recognizers(
+    source: str, store: bool, pointer: str | None, roots: frozenset[str] | None
+) -> None:
+    call = ast.parse(source, mode="eval").body
+    assert isinstance(call, ast.Call)
+    assert is_store_call(call) is store
+    address = store_pointer(call)
+    assert (None if address is None else ast.unparse(address)) == pointer
+    assert call_write_roots(call, _iterator_roots) == roots
 
 
 def test_cache_policy_of_keywords() -> None:

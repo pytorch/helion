@@ -9682,7 +9682,7 @@ def plan_tcgen05_pipeline(
         rhs_rank3_grouped_proof.k_mask if rhs_rank3_grouped_proof is not None else None
     )
     if requested_schedule is not None:
-        from .memory_ops import runtime_tensor_has_specialized_alignment
+        from .memory_ops import tensor_has_specialized_base_alignment
 
         lhs_source_fake = lhs_info.source_fake
         rhs_source_fake = rhs_info.source_fake
@@ -9748,7 +9748,7 @@ def plan_tcgen05_pipeline(
             "aligned_shared_rhs_bases": (
                 not tcgen05_shared_rhs
                 or all(
-                    runtime_tensor_has_specialized_alignment(env, tensor, 16)
+                    tensor_has_specialized_base_alignment(env, tensor, 16)
                     for tensor in (lhs_source_fake, rhs_source_fake)
                 )
             ),

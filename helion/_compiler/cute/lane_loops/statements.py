@@ -54,6 +54,8 @@ from ..address_maps import Load
 from ..cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
 from .markers import _find_lane_reduce_call
 from .markers import _is_lane_reduce_marker_assign
+from .owner_guards import _VECTOR_ATOMIC_HELPERS
+from .owner_guards import _is_atomic_helper
 from .owner_guards import _memory_write_calls
 
 if TYPE_CHECKING:
@@ -137,19 +139,6 @@ _PERSISTENT_VEC_LOAD = "_helion_persistent_branch_vec_load"
 _PERSISTENT_VEC_STORE = "_helion_persistent_branch_vec_store"
 _PERSISTENT_VEC_STORE_ADDRESS = 3
 _RANGE_CALLS = frozenset({"range", "cutlass.range", "cutlass.range_constexpr"})
-# Float max / min emulated with integer atomics (``cute/atomic_helpers.py``).
-_ATOMIC_HELPERS = frozenset(
-    {
-        "_cute_atomic_max_float32",
-        "_cute_atomic_min_float32",
-        "_cute_warp_fetch_add_int32",
-    }
-)
-# The relaxed ``red.global.add.v{2,4}.f32`` flush of a vectorized atomic site
-# (``cute/atomic_ops.py``): one packet of consecutive elements.
-_VECTOR_ATOMIC_HELPERS = frozenset(
-    {"_cute_red_add_f32_vec", "_cute_red_add_f16_vec", "_cute_red_add_bf16_vec"}
-)
 # The vector type argument of a 16-byte ``cute.arch.load``, the store
 # protocol's register-only conversion of a whole byte packet and the layout
 # arithmetic of an atomic's address.
@@ -232,14 +221,15 @@ def _is_list_append(call: ast.Call) -> bool:
 
 
 def _is_atomic_call(call: ast.Call) -> bool:
-    """``cute.arch.atomic_*(ptr, ...)`` or one of the float max / min helpers."""
+    """``cute.arch.atomic_*(ptr, ...)`` or an atomic called by bare name: a
+    generated atomic helper or an ``atomic_*`` function
+    (``owner_guards._is_atomic_helper``).  A pointer's ``atomic_*`` method is
+    not one, unlike in ``owner_guards._is_atomic_call``."""
     if isinstance(call.func, ast.Attribute):
         return call.func.attr.startswith("atomic_") and (
             ast.unparse(call.func.value) == "cute.arch"
         )
-    return isinstance(call.func, ast.Name) and (
-        call.func.id in _ATOMIC_HELPERS or call.func.id in _VECTOR_ATOMIC_HELPERS
-    )
+    return isinstance(call.func, ast.Name) and _is_atomic_helper(call.func.id)
 
 
 def _uniform_lanes_of(call: ast.Call) -> frozenset[str]:

@@ -20,6 +20,11 @@ HELION_LANE_LOOP_VAR_ATTR = "_helion_lane_loop_var"
 # whose tile axes the atomic is uniform (``cute/atomic_ops.py``); the lane-loop
 # distribution pins the atomic to their first lane when it runs inside them.
 HELION_ATOMIC_UNIFORM_LANES_ATTR = "_helion_atomic_uniform_lanes"
+# On a CuTe atomic call: the launch thread axes its guard decided at the call,
+# the ones the atomic varies along and the ones it runs on the leader of
+# (``cute/atomic_ops.py``); an axis the launch claims after the call gets its
+# leader once codegen is done (``guard_atomics_on_later_thread_axes``).
+HELION_ATOMIC_THREAD_AXES_ATTR = "_helion_atomic_thread_axes"
 # On a CuTe ``cute.arch.sync_threads()`` statement: the barrier ordering every
 # thread's accesses around a release / acquire atomic (``cute/atomic_ops.py``),
 # ``"release"`` before the atomic or ``"acquire"`` after it.  The lane-loop

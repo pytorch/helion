@@ -36,6 +36,7 @@ from helion._compiler.cute.device_state import Tcgen05GroupedSchedulerMode
 from helion._compiler.cute.flash_policy import get_flash_target_policy
 from helion._compiler.cute.flash_tuning import FlashPackedExp2Mode
 from helion._compiler.cute.flash_tuning import FlashSoftmaxLowering
+from helion._compiler.cute.reduce_call import use_interleaved_shared_reduce
 from helion._compiler.cute.state import cute_env_state
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._compiler.cute.tcgen05_config import facts
@@ -199,6 +200,14 @@ def cute_sigmoid(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="cute")
+def cute_sigmoid_multiply_add(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(out.size()):
+        out[tile] = torch.sigmoid(x[tile]) * 2.0 + 1.0
+    return out
+
+
+@helion.kernel(backend="cute")
 def cute_pointwise_chain(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(out.size()):
@@ -232,6 +241,17 @@ def cute_cancelling_math(x: torch.Tensor) -> torch.Tensor:
         out[2, tile] = torch.log1p(value)
         out[3, tile] = torch.exp2(value)
     return out
+
+
+def _exp(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size()):
+        out[tile] = torch.exp(x[tile])
+    return out
+
+
+cute_exp = helion.kernel(backend="cute")(_exp)
+cute_exp_fast_math = helion.kernel(backend="cute", fast_math=True)(_exp)
 
 
 @helion.kernel(backend="cute")
@@ -641,6 +661,21 @@ def cute_matmul_direct(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     )
     for tile_m, tile_n, tile_k in hl.tile([m, n, k]):
         out[tile_m, tile_n] = torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
+    return out
+
+
+# A kernel with a config keeps the config schema without the CuTe structural
+# passes, whose full-slice matmul tiling gives N and K block sizes of their own.
+@helion.kernel(
+    backend="cute",
+    config=helion.Config(block_sizes=[32], indexing="block_ptr"),
+    static_shapes=True,
+)
+def cute_grouped_n_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, _n = x.size()
+    out = torch.empty([m, y.size(1)], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        out[tile_m, :] = x[tile_m, :] @ y[:, :]
     return out
 
 
@@ -11929,6 +11964,36 @@ class TestCuteBackend(TestCase):
         (x,) = args
         torch.testing.assert_close(out, torch.sigmoid(x), rtol=1e-3, atol=1e-3)
 
+    def test_pointwise_float64_sigmoid_stays_float64(self) -> None:
+        # The fp32 contract (rcp.approx of ex2.approx) has no float64 form; a
+        # float64 sigmoid is the IEEE quotient of the float64 exp, as eager
+        # computes it, not an fp32 result widened back (about 5e-8 off).
+        x = torch.cat(
+            [
+                torch.linspace(-750.0, 750.0, 4093, dtype=torch.float64),
+                torch.randn(4096, dtype=torch.float64) * 8,
+                torch.tensor(
+                    [float("inf"), float("-inf"), float("nan"), 0.0, -0.0, 1e-300],
+                    dtype=torch.float64,
+                ),
+            ]
+        ).to(DEVICE)
+        code, out = code_and_output(cute_sigmoid, (x,))
+        self.assertIn("cute.math.exp(", code)
+        self.assertNotIn("approx=True", code)
+        torch.testing.assert_close(
+            out, torch.sigmoid(x), rtol=0, atol=0, equal_nan=True
+        )
+
+    def test_pointwise_float64_sigmoid_then_multiply_add_compiles(self) -> None:
+        # fuse_fma must not contract the float64 sigmoid with the multiply-add:
+        # the DSL's fma takes one numeric type, and the Python literals would
+        # come in as Float32 beside the Float64 sigmoid.
+        x = (torch.randn(4096, dtype=torch.float64) * 8).to(DEVICE)
+        code, out = code_and_output(cute_sigmoid_multiply_add, (x,))
+        self.assertNotIn("cute.math.fma(", code)
+        torch.testing.assert_close(out, torch.sigmoid(x) * 2.0 + 1.0)
+
     def test_pointwise_chain(self) -> None:
         args = (
             torch.randn(65, 23, device=DEVICE, dtype=torch.float32),
@@ -12073,6 +12138,38 @@ class TestCuteBackend(TestCase):
         torch.testing.assert_close(out, expected, rtol=1e-6, atol=0, equal_nan=True)
         for name in ("erfc", "expm1", "log1p", "exp2"):
             self.assertIn(f"cute.math.{name}(", code)
+
+    def test_pointwise_exp_reduces_its_argument_exactly(self) -> None:
+        # exp2(x * log2(e)) rounds the product first: 2 + 1.17 |x| ulp, about
+        # 60 near the overflow threshold.  Without fast_math exp is libdevice's
+        # expf (eager's), within 2 ulp of float64 down to the denormal
+        # results, and a float64 exp stays in float64 (with fast_math too:
+        # there is no float64 fast form).
+        special = [float("nan"), float("inf"), -float("inf"), 0.0, -0.0]
+        x = torch.cat(
+            [
+                torch.tensor(special, device=DEVICE, dtype=torch.float64),
+                torch.linspace(-104.0, 89.0, 8192, device=DEVICE, dtype=torch.float64),
+            ]
+        )
+        for kernel, dtype, rtol, atol in (
+            # Two ulp of a normal result and of a denormal one.
+            (cute_exp, torch.float32, 2.0**-22, 2.0**-148),
+            (cute_exp, torch.float64, 2.0**-51, 0.0),
+            (cute_exp_fast_math, torch.float64, 2.0**-51, 0.0),
+        ):
+            with self.subTest(dtype=str(dtype), fast_math=kernel.settings.fast_math):
+                value = x.to(dtype)
+                code, out = code_and_output(kernel, (value,))
+                torch.testing.assert_close(
+                    out,
+                    torch.exp(value.double()).to(dtype),
+                    rtol=rtol,
+                    atol=atol,
+                    equal_nan=True,
+                )
+                self.assertIn("cute.math.exp(", code)
+                self.assertNotIn("cute.math.exp2(", code)
 
     def test_pointwise_remainder_and_fmod(self) -> None:
         # remainder takes the divisor's sign (Python), fmod the dividend's (C);
@@ -12475,8 +12572,6 @@ class TestCuteBackend(TestCase):
         (``pre < 32``, a partial butterfly) and the block form (``pre >= 32``,
         every thread writes) both reduce each sibling over its ``span // pre``
         threads, for every group of the CTA, and broadcast the result."""
-        from helion._compiler.cute.reduce_helpers import _use_interleaved_shared_reduce
-
         for pre, span in [
             (2, 64),
             (4, 128),
@@ -12485,7 +12580,7 @@ class TestCuteBackend(TestCase):
             (64, 512),
             (256, 512),
         ]:
-            self.assertTrue(_use_interleaved_shared_reduce(pre, span))
+            self.assertTrue(use_interleaved_shared_reduce(pre, span))
             x = torch.randn(2, pre, span // pre, device=DEVICE, dtype=torch.float32)
             for kernel, expected in (
                 (cute_interleaved_reduce_sum, x.sum(dim=2, keepdim=True)),
@@ -12499,9 +12594,9 @@ class TestCuteBackend(TestCase):
                     torch.testing.assert_close(
                         out, expected.expand_as(x), rtol=1e-5, atol=1e-5
                     )
-        self.assertFalse(_use_interleaved_shared_reduce(1, 64))
-        self.assertFalse(_use_interleaved_shared_reduce(3, 48))
-        self.assertFalse(_use_interleaved_shared_reduce(48, 96))
+        self.assertFalse(use_interleaved_shared_reduce(1, 64))
+        self.assertFalse(use_interleaved_shared_reduce(3, 48))
+        self.assertFalse(use_interleaved_shared_reduce(48, 96))
 
     def test_permute_transposes_tile_values(self) -> None:
         """The slot re-binds the transposed tile's dims: the store exchanges
@@ -15948,24 +16043,36 @@ class TestCuteBackend(TestCase):
         torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
         self.assertNotIn("cute.gemm", code)
 
-    def test_matmul_direct_grouped_n_uses_mma(self) -> None:
-        @helion.kernel(
-            backend="cute",
-            config=helion.Config(block_sizes=[32], indexing="block_ptr"),
-            static_shapes=True,
-        )
-        def grouped_n_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, _n = x.size()
-            out = torch.empty([m, y.size(1)], dtype=x.dtype, device=x.device)
-            for tile_m in hl.tile(m):
-                out[tile_m, :] = x[tile_m, :] @ y[:, :]
-            return out
-
+    def test_matmul_direct_grouped_n_declines_one_vector_rows(self) -> None:
+        # The direct warp-MMA tiles give lane ``l`` of thread ``t`` column
+        # ``l * threads + t``.  A row of one V-wide vector per thread (4 over
+        # 32 threads, 8 over 16) holds column ``t * V + l`` there instead, so
+        # those configs take another lowering and store every column where it
+        # belongs.
         args = (
             torch.randn(256, 128, device=DEVICE, dtype=HALF_DTYPE),
             torch.randn(128, 128, device=DEVICE, dtype=HALF_DTYPE),
         )
-        code, out = code_and_output(grouped_n_matmul, args)
+        expected = (args[0].float() @ args[1].float()).to(HALF_DTYPE)
+        for row_threads, width in ((32, 4), (16, 8)):
+            with self.subTest(row_threads=row_threads, width=width):
+                code, out = code_and_output(
+                    cute_grouped_n_matmul,
+                    args,
+                    block_sizes=[32],
+                    indexing="block_ptr",
+                    num_threads=[32, row_threads],
+                    cute_vector_widths=[width, 1],
+                )
+                torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
+                self.assertNotIn("cute.nvgpu.warp.MmaF16BF16Op", code)
+
+    def test_matmul_direct_grouped_n_uses_mma(self) -> None:
+        args = (
+            torch.randn(256, 128, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(128, 128, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        code, out = code_and_output(cute_grouped_n_matmul, args)
         expected = args[0].float() @ args[1].float()
         torch.testing.assert_close(out, expected.to(out.dtype), atol=1e-1, rtol=1e-2)
         self.assertIn("cute.gemm", code)
@@ -16178,50 +16285,36 @@ class TestCuteBackend(TestCase):
         self.assertIn("dot_serial_result", code)
 
     def test_matmul_direct_grouped_n_respects_mma_override(self) -> None:
-        @helion.kernel(
-            backend="cute",
-            config=helion.Config(block_sizes=[32], indexing="block_ptr"),
-            static_shapes=True,
-        )
-        def grouped_n_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, _n = x.size()
-            out = torch.empty([m, y.size(1)], dtype=x.dtype, device=x.device)
-            for tile_m in hl.tile(m):
-                out[tile_m, :] = x[tile_m, :] @ y[:, :]
-            return out
-
         args = (
             torch.randn(256, 128, device=DEVICE, dtype=HALF_DTYPE),
             torch.randn(128, 128, device=DEVICE, dtype=HALF_DTYPE),
         )
-        with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "universal"}, clear=False):
-            code, out = code_and_output(grouped_n_matmul, args)
+        # Compiled configs stay cached on the kernel: compile this one under
+        # the override, and drop that build for the tests after it.
+        cute_grouped_n_matmul.reset()
+        try:
+            with patch.dict(
+                os.environ, {"HELION_CUTE_MMA_IMPL": "universal"}, clear=False
+            ):
+                code, out = code_and_output(cute_grouped_n_matmul, args)
+        finally:
+            cute_grouped_n_matmul.reset()
         expected = args[0].float() @ args[1].float()
         torch.testing.assert_close(out, expected.to(out.dtype), atol=1e-1, rtol=1e-2)
         self.assertNotIn("cute.gemm", code)
 
     def test_matmul_direct_grouped_n_mismatched_threads_falls_back(self) -> None:
-        @helion.kernel(
-            backend="cute",
-            config=helion.Config(
-                block_sizes=[64],
-                num_threads=[32],
-                indexing="block_ptr",
-            ),
-            static_shapes=True,
-        )
-        def grouped_n_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, _n = x.size()
-            out = torch.empty([m, y.size(1)], dtype=x.dtype, device=x.device)
-            for tile_m in hl.tile(m):
-                out[tile_m, :] = x[tile_m, :] @ y[:, :]
-            return out
-
         args = (
             torch.randn(256, 128, device=DEVICE, dtype=HALF_DTYPE),
             torch.randn(128, 128, device=DEVICE, dtype=HALF_DTYPE),
         )
-        code, out = code_and_output(grouped_n_matmul, args)
+        code, out = code_and_output(
+            cute_grouped_n_matmul,
+            args,
+            block_sizes=[64],
+            num_threads=[32],
+            indexing="block_ptr",
+        )
         expected = args[0].float() @ args[1].float()
         torch.testing.assert_close(out, expected.to(out.dtype), atol=1e-1, rtol=1e-2)
         self.assertNotIn("cute.gemm", code)

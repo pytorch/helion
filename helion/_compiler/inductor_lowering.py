@@ -67,6 +67,7 @@ from .node_masking import mask_node_inputs
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
+    from collections.abc import Sequence
 
     from torch.utils._ordered_set import OrderedSet
 
@@ -699,6 +700,45 @@ class FakeGraphLowering(GraphLowering):
         super().__init__(dummy_gm(), shape_env=env.shape_env)
         # Ensure Inductor helpers see a valid current device
         self.current_device = env.device
+
+
+def size1_reduction_positions(
+    value_sizes: Sequence[int | torch.SymInt],
+    result_sizes: Sequence[int | torch.SymInt],
+) -> list[int] | None:
+    """The result dim each dim of a size-1 reduction's input meets, or
+    ``None`` when ``value_sizes`` are no such input's.
+
+    Inductor lowers a reduction whose reduced dims all have extent 1
+    element-wise (``Reduction.create``; ``PointwiseLowering`` then reshapes
+    the result, ``_reshape_for_size1_reduction``), which is how a pointwise
+    operand gets more dims than the result: ``x[tile][:, :, None].sum(-1)``
+    reads a ``[tile0, tile1, 1]`` input for a ``[tile0, tile1]`` result.  The
+    result drops the reduced dims and keeps the others in order, so the
+    input's dims wider than 1 meet the result's in order, where
+    right-aligning would pair ``tile1`` with ``tile0``.  A dim of extent 1,
+    reduced or kept, binds nothing and meets none (-1).  Dims wider than 1
+    that do not pair up, in order and with known-equal extents (a size-1
+    reduction keeps its kept dims' very sizes), make no such input.  The
+    backends' dim analyses place such an operand by it (CuTe's
+    ``operand_positions``, Metal's ``positional_rebind``).
+    """
+    env = CompileEnvironment.current()
+
+    def wide(sizes: Sequence[int | torch.SymInt]) -> list[int]:
+        return [dim for dim, size in enumerate(sizes) if not env.known_equal(size, 1)]
+
+    value_dims = wide(value_sizes)
+    result_dims = wide(result_sizes)
+    if len(value_dims) != len(result_dims) or not all(
+        env.known_equal(value_sizes[dim], result_sizes[position])
+        for dim, position in zip(value_dims, result_dims, strict=True)
+    ):
+        return None
+    positions = [-1] * len(value_sizes)
+    for dim, position in zip(value_dims, result_dims, strict=True):
+        positions[dim] = position
+    return positions
 
 
 class PointwiseLowering(InductorLowering):
@@ -1674,13 +1714,13 @@ class GenerateASTFromInductor(DefaultHandler):
         ``div.approx.ftz.f32``: cheaper at the same 2 ulp, but a subnormal
         divisor gives +-inf, a subnormal quotient flushes to zero and a
         divisor above 2**126 gives 0, so it is only emitted when the
-        ``fast_math`` setting opts the kernel into approximations -- the same
-        contract the CuTe backend follows (IEEE divide by default, approximate
-        reciprocal multiply under the setting).  Like Triton's ``/``, the
-        result stays fp32 (half-precision and integer operands are promoted
-        to fp32 first); the consumer casts.  TileIR shares the Triton codegen
-        but has no libdevice ``fast_dividef``, so it keeps ``/`` under the
-        setting.
+        ``fast_math`` setting opts the kernel into approximations -- the CuTe
+        backend's contract too: IEEE by default, and under the setting
+        ``div.approx.ftz`` for an fp32 quotient (its 16-bit quotients stay
+        exact).  Like Triton's ``/``, the result stays fp32 (half-precision
+        and integer operands are promoted to fp32 first); the consumer casts.
+        TileIR shares the Triton codegen but has no libdevice
+        ``fast_dividef``, so it keeps ``/`` under the setting.
 
         A quotient its node truncates (``div`` with ``rounding_mode="trunc"``;
         the floor mode's comes through ``div_rn``) is the correctly rounded

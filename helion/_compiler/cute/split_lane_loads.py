@@ -31,6 +31,15 @@ Only fires when every value flowing from the load phase into the compute
 phase is the lane-base or a hoisted vec load (checked), and only on loops
 whose hoist vars use the ``_tile_unroll_vec_`` naming of the tile_unroll
 protocol.
+
+Both phases are trace-time copies of the lane body, so the trace (and
+ptxas's time on it) grows with ``U`` copies of ``V`` elements, as do the
+registers holding the U loads until their lanes compute.  The split takes at
+most ``_MAX_UNROLLED_LANES`` copies, the bound of the knob's unroll
+(``cute/unroll_lane_loads.py``), and ``_MAX_SPLIT_ELEMENTS`` elements per
+thread.  A longer loop stays rolled (a huge block over few threads gave
+``range_constexpr(131072)``, which never finished compiling);
+``cute_lane_unroll`` unrolls it in bounded blocks.
 """
 
 from __future__ import annotations
@@ -41,8 +50,15 @@ from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ._ast_pass_utils import assigned_name
 from ._ast_pass_utils import loop_extent
+from .unroll_lane_loads import _MAX_UNROLLED_LANES
 
 _LOAD_PREFIX = "_tile_unroll_vec_"
+# Elements per thread (``U * V``) the two phases unroll.  Compile time grows
+# faster than linearly in it (a relu/BatchNorm-backward pointwise body: 4 s at
+# 256 elements, 16 s at 512, 101 s at 1024); on B200 the split of one- and
+# two-input bf16 kernels ran 1.5-5x slower than the rolled loop at 1024 and
+# faster or even at 512.
+_MAX_SPLIT_ELEMENTS = 512
 
 
 def _names_read(node: ast.AST) -> set[str]:
@@ -60,6 +76,20 @@ def _is_const_range_loop(loop: ast.For) -> tuple[str, int] | None:
         return None
     assert isinstance(loop.target, ast.Name)
     return loop.target.id, extent
+
+
+def _lane_width(stmts: list[ast.stmt]) -> int:
+    """Elements one lane computes: the most trace-time copies a statement of
+    its compute phase gets, the product of the ``range_constexpr`` extents
+    around it (the V-loop's V in a plain lane body; 1 without one)."""
+    width = 1
+    for stmt in stmts:
+        nested = [
+            node for node in ast.iter_child_nodes(stmt) if isinstance(node, ast.stmt)
+        ]
+        extent = loop_extent(stmt, kinds=("constexpr",)) or 1
+        width = max(width, extent * _lane_width(nested))
+    return width
 
 
 def _try_split(loop: ast.For, counter: int) -> list[ast.stmt] | None:
@@ -86,11 +116,13 @@ def _try_split(loop: ast.For, counter: int) -> list[ast.stmt] | None:
     rest = body[idx:]
     if not rest:
         return None
+    reps = match[1]
+    if reps > _MAX_UNROLLED_LANES or reps * _lane_width(rest) > _MAX_SPLIT_ELEMENTS:
+        return None
     # Phase 1 writes only the lane base and the hoisted loads; both are
     # re-derived (base) or forwarded (loads) into phase 2, so no other
     # dataflow can leak across the split.
     lane_var = loop.target.id
-    reps = match[1]
     list_names = [f"_lane_loads_{counter}_{i}" for i in range(len(load_stmts))]
     out: list[ast.stmt] = []
     for list_name in list_names:

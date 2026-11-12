@@ -214,7 +214,7 @@ def _load_needs_eviction_tunable(node: torch.fx.Node) -> bool:
 
 # Ops that touch no memory: they route tensors through SSA values and subgraphs,
 # read metadata, only debug or only warm a cache (a prefetch orders nothing).
-_TENSOR_ROUTING_OPS = (
+TENSOR_ROUTING_OPS = (
     _tracing_ops._phi,
     _tracing_ops._new_var,
     _tracing_ops._for_loop,
@@ -232,7 +232,7 @@ _TENSOR_ROUTING_OPS = (
 
 def _may_access_memory_unseen(node: torch.fx.Node, state: CompilerState) -> bool:
     """Whether a side-effecting Helion op or an op on symmetric memory hides accesses."""
-    if node.target in _TENSOR_ROUTING_OPS:
+    if node.target in TENSOR_ROUTING_OPS:
         return False
     # Peer views, and the local copies other ranks reach through theirs.
     symmetric = {*state.peer_views, *(v[0] for v in state.peer_views.values() if v)}

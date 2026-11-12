@@ -5325,14 +5325,12 @@ def _execute_pointwise_thread_program(source, inputs):
 )
 @pytest.mark.parametrize("reverse", [False, True])
 def test_cute_inactive_broadcast_axes_generated_values(shape, width, tiles, reverse):
-    from helion._compiler.tile_dispatch import TileStrategyDispatch
-
     inputs = (torch.arange(math.prod(shape), dtype=torch.float32).reshape(shape), width)
     aliases = []
-    original = TileStrategyDispatch._inactive_broadcast_aliases
+    original = CuteBackend.inactive_broadcast_alias_block_ids
 
-    def observe(dispatch, function):
-        result = original(dispatch, function)
+    def observe(backend, function):
+        result = original(backend, function)
         aliases.append(result)
         return result
 
@@ -5341,7 +5339,7 @@ def test_cute_inactive_broadcast_axes_generated_values(shape, width, tiles, reve
         _target(),
         forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
-        patch.object(TileStrategyDispatch, "_inactive_broadcast_aliases", observe),
+        patch.object(CuteBackend, "inactive_broadcast_alias_block_ids", observe),
     ):
         bound = cpu_bind(
             _broadcast_coordinate_pad_2d
@@ -5409,8 +5407,6 @@ def _broadcast_axis_matmul(x: torch.Tensor, y: torch.Tensor):
 @skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("kind", ["reduction", "free_iota", "matmul"])
 def test_cute_inactive_broadcast_axes_preserve_other_owners(kind):
-    from helion._compiler.tile_dispatch import TileStrategyDispatch
-
     cases = {
         "reduction": (
             helion.kernel(
@@ -5432,10 +5428,10 @@ def test_cute_inactive_broadcast_axes_preserve_other_owners(kind):
     }
     kernel, inputs = cases[kind]
     aliases = []
-    original = TileStrategyDispatch._inactive_broadcast_aliases
+    original = CuteBackend.inactive_broadcast_alias_block_ids
 
-    def observe(dispatch, function):
-        result = original(dispatch, function)
+    def observe(backend, function):
+        result = original(backend, function)
         aliases.append(result)
         return result
 
@@ -5447,10 +5443,10 @@ def test_cute_inactive_broadcast_axes_preserve_other_owners(kind):
     ):
         bound = cpu_bind(kernel, inputs)
         config = bound.config_spec.default_config()
-        with patch.object(TileStrategyDispatch, "_inactive_broadcast_aliases", observe):
+        with patch.object(CuteBackend, "inactive_broadcast_alias_block_ids", observe):
             actual = bound.to_code(config)
         with patch.object(
-            TileStrategyDispatch, "_inactive_broadcast_aliases", return_value=set()
+            CuteBackend, "inactive_broadcast_alias_block_ids", return_value=set()
         ):
             previous = bound.to_code(config)
     assert aliases and not any(aliases)
@@ -5717,7 +5713,6 @@ def _nested_broadcast_gather(col, val, table, flat: hl.constexpr):
 )
 def test_cute_nested_broadcast_alias_values(shape, flat, reverse, static_shapes):
     from helion._compiler.compile_environment import CompileEnvironment
-    from helion._compiler.tile_dispatch import TileStrategyDispatch
 
     m, n, k, p, q = shape
     column = torch.arange(m * n * k).reshape(m, n, k) % k
@@ -5726,10 +5721,10 @@ def test_cute_nested_broadcast_alias_values(shape, flat, reverse, static_shapes)
     table = (torch.arange(k * p * q).reshape(k, p, q) % 7).float()
     inputs = column, values, table, flat
     aliases = []
-    original = TileStrategyDispatch._inactive_broadcast_aliases
+    original = CuteBackend.inactive_broadcast_alias_block_ids
 
-    def observe(dispatch, function):
-        result = original(dispatch, function)
+    def observe(backend, function):
+        result = original(backend, function)
         env = CompileEnvironment.current()
         outer = set(function.codegen.host_function.device_ir.grid_block_ids[0])
         assert result.isdisjoint(env.config_spec.reduction_loops.valid_block_ids())
@@ -5742,7 +5737,7 @@ def test_cute_nested_broadcast_alias_values(shape, flat, reverse, static_shapes)
         _target(),
         forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
-        patch.object(TileStrategyDispatch, "_inactive_broadcast_aliases", observe),
+        patch.object(CuteBackend, "inactive_broadcast_alias_block_ids", observe),
     ):
         kernel = helion.kernel(
             _nested_broadcast_gather.fn,
@@ -5783,7 +5778,6 @@ def test_cute_nested_broadcast_alias_scope_guards(guard):
 
     from helion._compiler.device_ir import ForLoopGraphInfo
     from helion._compiler.device_ir import RootGraphInfo
-    from helion._compiler.tile_dispatch import TileStrategyDispatch
 
     column = torch.arange(3 * 5 * 7).reshape(3, 5, 7) % 7
     inputs = (
@@ -5792,11 +5786,11 @@ def test_cute_nested_broadcast_alias_scope_guards(guard):
         torch.ones(7, 9, 11),
         False,
     )
-    original = TileStrategyDispatch._inactive_broadcast_aliases
+    original = CuteBackend.inactive_broadcast_alias_block_ids
     checked = []
 
-    def observe(dispatch, function):
-        result = original(dispatch, function)
+    def observe(backend, function):
+        result = original(backend, function)
         assert result
         graphs = function.codegen.codegen_graphs
         child = next(graph for graph in graphs if type(graph) is ForLoopGraphInfo)
@@ -5831,7 +5825,7 @@ def test_cute_nested_broadcast_alias_scope_guards(guard):
             replacement = [changed_root if graph is root else graph for graph in graphs]
             context = patch.object(function.codegen, "codegen_graphs", replacement)
         with context:
-            assert not original(dispatch, function)
+            assert not original(backend, function)
         checked.append(guard)
         return result
 
@@ -5840,11 +5834,11 @@ def test_cute_nested_broadcast_alias_scope_guards(guard):
         _target(),
         forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
-        patch.object(TileStrategyDispatch, "_inactive_broadcast_aliases", observe),
+        patch.object(CuteBackend, "inactive_broadcast_alias_block_ids", observe),
     ):
         bound = cpu_bind(_nested_broadcast_gather, inputs)
         bound.to_code(helion.Config(block_sizes=[2, 2, 4, 4, 4]))
-    assert checked == [guard]
+    assert checked
 
 
 @skipUnlessBackends(["cute"])

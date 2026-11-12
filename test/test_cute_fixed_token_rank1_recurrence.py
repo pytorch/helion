@@ -10,6 +10,7 @@ import pytest
 import torch
 
 import helion
+from helion._compat import supports_torch_compile_template_lowering
 from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
 from helion._testing.cute_fixed_token_rank1 import fixed_rank1
@@ -62,6 +63,7 @@ class TestCuteFixedTokenRank1Recurrence(unittest.TestCase):
         capability: tuple[int, int] = (10, 3),
         fast_math: bool = True,
         shrink_sequence_axis: bool = False,
+        dynamic_graph_tuning: bool = False,
     ) -> str:
         with (
             cpu_render_target(capability=capability, fake_device_sm_count=148),
@@ -89,13 +91,22 @@ class TestCuteFixedTokenRank1Recurrence(unittest.TestCase):
                     shrink_sequence_axis,
                 )
             )
-            return bound.to_code(
-                _config(
-                    block_v,
-                    num_warps=num_warps,
-                    loop_order=loop_order,
-                )
+            config = _config(
+                block_v,
+                num_warps=num_warps,
+                loop_order=loop_order,
             )
+            if dynamic_graph_tuning:
+                from helion._compiler._inductor.template_buffer import (
+                    inductor_call_facts,
+                )
+
+                # What the lowering's tuner compiles for a dynamic-shape
+                # graph: the binding's code, from its example inputs, under
+                # the graph's facts.
+                with inductor_call_facts(bound, symbolic_input_layouts=True):
+                    return bound.to_code(config)
+            return bound.to_code(config)
 
     def test_structural_match_emits_grouped_two_phase_kernel(self) -> None:
         code = self._code()
@@ -128,6 +139,21 @@ class TestCuteFixedTokenRank1Recurrence(unittest.TestCase):
         )
         self.assertIn("(4, 2, (128 + _BLOCK_SIZE_2 - 1) // _BLOCK_SIZE_2)", code)
         self.assertNotIn("fixed_rank1_work =", code)
+
+    @unittest.skipUnless(
+        supports_torch_compile_template_lowering(),
+        "this PyTorch build lacks Helion's Inductor template lowering",
+    )
+    def test_dynamic_graph_tuning_compiles_the_generic_lowering(self) -> None:
+        # The schedule bakes the binding's exact sizes into the kernel, which
+        # a dynamic-shape graph's calls need not have.  Its render has no
+        # example input to plan from and takes the generic lowering; the
+        # tuner compiles from its binding's example inputs, and takes it too
+        # rather than timing a schedule the render never emits.
+        self.assertNotIn(
+            "fixed_rank1_codegen_abi_version",
+            self._code(dynamic_graph_tuning=True),
+        )
 
     def test_num_warps_selects_key_split_and_launcher_block(self) -> None:
         for num_warps, key_split, threads in ((2, 2, 64), (4, 4, 128)):

@@ -33,6 +33,8 @@ tensor copy declines without a shape.
 
 Stages.  ``DEVICE_BODY_PROLOGUE`` runs over the context built from the
 rendered body (the launch shape still the strategies' raw inference); its
+first entry issues each atomic on the leader thread of the launch axes
+claimed after it (``guard_atomics_on_later_thread_axes``), and its other
 entries lower the collective matmuls and decide the launch shape (the
 gathered-MMA extension of the signature, the owned block dims, the bounded
 cache plan's block).  ``freeze_pass_context`` then seals the launch shape and
@@ -67,7 +69,6 @@ from typing import cast
 
 import sympy
 import torch
-from torch._subclasses.fake_tensor import FakeTensor
 from torch.utils._sympy.symbol import SymT
 from torch.utils._sympy.symbol import symbol_is_type
 
@@ -236,7 +237,10 @@ def _block_grid_dims(
     # For an exact in-place vector state-update pattern the state-load
     # pipeliner may stage future rows through a private-per-thread cp.async
     # ring; its matcher (and the proven-bounds simplifier) consume the exact
-    # grid extents proved from cache-keyed runtime size facts.
+    # grid extents proved from cache-keyed runtime size facts: the
+    # ``input_tensor_metadata`` fact keys the bound kernel on exact input
+    # sizes, so each traced size hint is the size every call it serves has
+    # (``CompileEnvironment.keyed_hint``).
     from ...program_id import XYZProgramIDs
 
     xyz_pid = (
@@ -248,7 +252,6 @@ def _block_grid_dims(
     )
     xyz_grid = xyz_pid is not None
     exact_grid_extent_values: dict[sympy.Expr, int] = {}
-    ambiguous_grid_extent_expressions: set[sympy.Expr] = set()
     if xyz_grid and "input_tensor_metadata" in env.compiler_fact_specialization_facts:
         for argument in fn.arguments:
             if not isinstance(argument, TensorArg) or isinstance(
@@ -258,26 +261,12 @@ def _block_grid_dims(
             fake_tensor = argument.fake_value
             if env.tensor_input_source(fake_tensor) is None:
                 continue
-            runtime_tensor = env.runtime_value_for_tensor(fake_tensor)
-            if not isinstance(runtime_tensor, torch.Tensor) or isinstance(
-                runtime_tensor, FakeTensor
-            ):
-                continue
-            for dimension, size in enumerate(fake_tensor.shape):
+            for size in fake_tensor.shape:
                 if isinstance(size, int):
                     continue
-                try:
+                value = env.keyed_hint(size)
+                if value is not None:
                     expression = env.shape_env.replace(size._sympy_())
-                    value = int(runtime_tensor.size(dimension))
-                    if value != int(env.size_hint(size)):
-                        continue
-                except (RuntimeError, TypeError, ValueError):
-                    continue
-                previous = exact_grid_extent_values.get(expression)
-                if previous is not None and previous != value:
-                    ambiguous_grid_extent_expressions.add(expression)
-                    exact_grid_extent_values.pop(expression, None)
-                elif expression not in ambiguous_grid_extent_expressions:
                     exact_grid_extent_values[expression] = value
     block_grid_dims: list[int | None] = [None, None, None]
     if xyz_pid is not None:
@@ -439,8 +428,15 @@ def _has_exact_thread_block_dims(s: _DeviceBodyState) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Prologue: the collective lowerings and the launch shape
+# Prologue: the atomics' leader guards, the collective lowerings and the
+# launch shape
 # ---------------------------------------------------------------------------
+
+
+def _guard_atomics_on_later_thread_axes(s: _DeviceBodyState) -> None:
+    from ..atomic_ops import guard_atomics_on_later_thread_axes
+
+    guard_atomics_on_later_thread_axes(s.kernel_body, s.fn)
 
 
 def _lower_uniform_comparisons(s: _DeviceBodyState) -> None:
@@ -567,6 +563,7 @@ def _fuse_two_pass_loads(s: _DeviceBodyState) -> None:
         proven_disjoint_tensor_pairs=ctx.proven_disjoint_tensor_pairs,
         proven_tensor_stride_values=ctx.proven_tensor_stride_values,
         dynamic_trip_counts=ctx.dynamic_trip_counts,
+        rename_groups=ctx.rename_groups,
     )
 
 
@@ -585,6 +582,7 @@ def _vectorize_branch_local_persistent_fragments(s: _DeviceBodyState) -> None:
         proven_disjoint_tensor_pairs=s.ctx.proven_disjoint_tensor_pairs,
         proven_tensor_stride_values=s.ctx.proven_tensor_stride_values,
         wide_packet_hints=hint_wide_packets(s.ctx.config.cute_wide_packet_hints),
+        rename_groups=s.ctx.rename_groups,
     )
 
 
@@ -928,6 +926,7 @@ def _prefetch_reduction_packets(s: _DeviceBodyState) -> None:
         reload_modes=ctx.reload_modes,
         argument_names=set(ctx.argument_names),
         proven_disjoint_tensor_pairs=ctx.proven_disjoint_tensor_pairs,
+        rename_groups=ctx.rename_groups,
     )
 
 
@@ -963,7 +962,7 @@ def _wants_pipelined_state_loads(s: _DeviceBodyState) -> bool:
 
 
 def _pipeline_state_loads(s: _DeviceBodyState) -> None:
-    from ..memory_ops import runtime_tensor_has_specialized_alignment
+    from ..memory_ops import tensor_has_specialized_base_alignment
     from ..pipeline_state_loads import TensorMetadata
     from ..pipeline_state_loads import pipeline_state_loads
 
@@ -998,7 +997,7 @@ def _pipeline_state_loads(s: _DeviceBodyState) -> None:
             arg.name
             for arg in fn.arguments
             if isinstance(arg, TensorArg)
-            and runtime_tensor_has_specialized_alignment(env, arg.fake_value, 4)
+            and tensor_has_specialized_base_alignment(env, arg.fake_value, 4)
         ),
         proven_tensor_size_values=ctx.proven_tensor_size_values,
         proven_disjoint_tensor_pairs=ctx.proven_disjoint_tensor_pairs,
@@ -1355,6 +1354,11 @@ LAUNCH_SHAPE = "launch_shape"
 RENAMED = "renamed"
 
 DEVICE_BODY_PROLOGUE: tuple[DeviceBodyPass, ...] = (
+    DeviceBodyPass(
+        "guard_atomics_on_later_thread_axes",
+        _always,
+        _guard_atomics_on_later_thread_axes,
+    ),
     DeviceBodyPass(
         "lower_uniform_comparisons",
         _always,

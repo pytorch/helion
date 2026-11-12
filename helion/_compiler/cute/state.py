@@ -206,6 +206,11 @@ class CuteCodegenState:
     # ``resident_while_plan``'s memo for this pass's graph copies, which die
     # with the pass (``cute/resident_while.py``).
     resident_while_plans: ResidentWhileMemo = dataclasses.field(default_factory=dict)
+    # Whether the kernel's device code holds a float of one byte (fp8, the
+    # packed fp4 pair or an e8m0 scale), so that an integer's conversion to a
+    # float adds 0.0; None until the first such conversion asks
+    # (``handler_ops.integer_to_float_expr``).
+    holds_8bit_floats: bool | None = None
 
     def declare_matmul(self) -> None:
         """A matmul lowering declared itself: ``uses_matmul`` and one more

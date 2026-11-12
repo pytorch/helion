@@ -560,7 +560,7 @@ def test_the_spread_pad_stays_off_both_families_here(cpu_only: None) -> None:
     # 118784 bytes already hold one 128-thread CTA per SM (past the 115713
     # byte footprint of one wave), and the tcgen05 kernel reserves its
     # storage through the DSL's ``SmemAllocator`` at the per-block maximum,
-    # which the pad's literal sum cannot see and must not pad on top of (a
+    # which the pad's footprint cannot bound and must not pad on top of (a
     # pad there failed every launch).  Knob on with the spread renders the
     # knob-on module.
     bound = _kernel()._bind_isolated(_cpu_args((1, 4, 256, 64)))

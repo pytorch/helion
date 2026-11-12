@@ -10,6 +10,7 @@ to be bound to; the flash and mma_dag families live in ``flash_surface`` and
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Literal
@@ -19,7 +20,9 @@ from typing import cast
 import torch
 
 from ...._compat import target_device_capability as get_target_device_capability
+from ...._utils import next_power_of_2
 from ...._utils import prev_power_of_2
+from ...._utils import widest_halvable
 from ....autotuner.compiler_refinement import compiler_refinement_policy
 from ....autotuner.config_fragment import BooleanFragment
 from ....autotuner.config_fragment import ConfigSpecFragment
@@ -27,6 +30,7 @@ from ....autotuner.config_fragment import EnumFragment
 from ....autotuner.config_spec import _CUTE_LANE_UNROLL_CHOICES
 from ....autotuner.config_spec import ReductionLoopSpec
 from ....autotuner.config_spec import _as_sequence
+from ....autotuner.config_spec import generic_block_size_default
 from ....autotuner.search_surface import BackendSearchSurface
 from ....exc import InvalidConfig
 from ..block_scaled_config import block_scaled_choices
@@ -185,9 +189,11 @@ if TYPE_CHECKING:
 
     from ....autotuner.block_id_sequence import BlockIdSequence
     from ....autotuner.config_generation import ConfigGeneration
+    from ....autotuner.config_spec import BlockSizeSpec
     from ....autotuner.config_spec import ConfigSpec
     from ....autotuner.config_spec import MatmulFact
     from ....runtime.config import Config
+    from ..loop_nesting import TileLoopPath
 
 
 # How a fp32 quotient by a loop-invariant divisor is lowered
@@ -792,7 +798,7 @@ def _cute_config_forms_one_vector_lane(
     return isinstance(vec, int) and vec > 1 and rl_spec.size_hint // requested == vec
 
 
-def _cute_config_forms_register_tile(
+def cute_config_forms_register_tile(
     config_spec: ConfigSpec,
     config: dict[str, object],
     rl_spec: ReductionLoopSpec,
@@ -2470,6 +2476,222 @@ def normalize_after_sequences(
         config["cute_lane_layouts"] = canonical_layouts
 
 
+# A persistent reduction nested in a tile keeps at least a warp of the
+# thread budget when config generation repairs the tile.
+_NESTED_REDUCTION_THREAD_FLOOR = 32
+
+
+def _reduction_axis_block_ids(config_spec: ConfigSpec) -> set[int]:
+    return config_spec.reduction_block_ids | {
+        spec.block_id for spec in config_spec.reduction_loops
+    }
+
+
+def _tile_axis_threads(
+    config_spec: ConfigSpec,
+    config: Mapping[str, object],
+    reduction_block_ids: set[int],
+) -> dict[int, tuple[str, int]]:
+    """``{block_id: (source, threads)}`` of every non-reduction tile axis
+    of ``config`` that takes more than one thread; ``source`` names the
+    config sequence the count comes from (``num_threads`` when set, else
+    ``block_sizes``).
+
+    ``num_threads`` also carries per-rolled-rdim slots (the reduction's own
+    thread count), plus static persistent-rdim slots that have no
+    ``reduction_loops`` entry.  Only NON-reduction tile axes consume the
+    budget the reduction competes for.  Values are resolved by block id
+    because the two sequences need not share an order.
+    """
+    block_sizes = cast("list[int]", config.get("block_sizes", []) or [])
+    num_threads = cast("list[int]", config.get("num_threads", []) or [])
+    axes: dict[int, tuple[str, int]] = {}
+    for nt_spec in config_spec.num_threads:
+        if nt_spec.block_id in reduction_block_ids:
+            continue
+        nt = config_spec.num_threads.config_get(num_threads, nt_spec.block_id, 0)
+        source = "num_threads"
+        if not isinstance(nt, int) or nt <= 0:
+            bs = config_spec.block_sizes.config_get(block_sizes, nt_spec.block_id, 1)
+            nt = bs if isinstance(bs, int) and bs > 1 else 1
+            source = "block_sizes"
+        if nt > 1:
+            axes[nt_spec.block_id] = (source, nt)
+    return axes
+
+
+def _thread_count(axes: Mapping[int, tuple[str, int]]) -> int:
+    """The threads the tile axes of ``_tile_axis_threads`` take together."""
+    count = 1
+    for _, threads in axes.values():
+        count *= threads
+    return count
+
+
+def _bounded_blocks(config_spec: ConfigSpec) -> dict[int, list[BlockSizeSpec]]:
+    """The block size specs each block bounds (``bounded_by_block_id``),
+    keyed by that block's id."""
+    bounded: dict[int, list[BlockSizeSpec]] = {}
+    for spec in config_spec.block_sizes:
+        if spec.bounded_by_block_id is not None:
+            bounded.setdefault(spec.bounded_by_block_id, []).append(spec)
+    return bounded
+
+
+def _halving_clamps_bounded_block(
+    config_spec: ConfigSpec,
+    bounded: Mapping[int, list[BlockSizeSpec]],
+    block_sizes: list[int],
+    block_id: int,
+) -> bool:
+    """Whether halving block ``block_id`` clamps a block it bounds
+    (``ConfigSpec.clamp_bounded_block_sizes``), which then loses threads
+    too.  ``bounded`` is ``_bounded_blocks(config_spec)``."""
+    half = config_spec.block_sizes.config_get(block_sizes, block_id, 1) // 2
+    return any(
+        config_spec.block_sizes.config_get(block_sizes, spec.block_id, 1) > half
+        for spec in bounded.get(block_id, ())
+    )
+
+
+def _bounded_block_stays_wider(
+    config_spec: ConfigSpec,
+    bounded: Mapping[int, list[BlockSizeSpec]],
+    block_sizes: list[int],
+    block_id: int,
+    size: int,
+) -> bool:
+    """Whether a block that ``block_id`` bounds (or one those bound) is wider
+    than ``size`` and cannot shrink to it: clamping it to an outer block of
+    ``size`` keeps it at its minimum or structural pin
+    (``ConfigSpec.clamp_bounded_block_sizes``), wider than its extent.
+    ``bounded`` is ``_bounded_blocks(config_spec)``."""
+    for spec in bounded.get(block_id, ()):
+        if config_spec.block_sizes.config_get(block_sizes, spec.block_id, 1) <= size:
+            continue
+        minimum = spec.shrink_minimum
+        if (
+            minimum is None
+            or size < minimum
+            or _bounded_block_stays_wider(
+                config_spec, bounded, block_sizes, spec.block_id, size
+            )
+        ):
+            return True
+    return False
+
+
+def _tile_axis_shrink_minimum(
+    config_spec: ConfigSpec,
+    bounded: Mapping[int, list[BlockSizeSpec]],
+    block_sizes: list[int],
+    block_id: int,
+    source: str,
+    threads: int,
+) -> int | None:
+    """The smallest count the repair may halve a tile axis to, or ``None``
+    when it may not halve (``widest_halvable``): a ``num_threads`` entry
+    halves down to one thread; a block size stops at its minimum, a
+    structurally pinned one never shrinks, and neither does an outer block
+    whose halving leaves a block it bounds wider than its extent, which
+    would idle that block's threads."""
+    if source == "num_threads":
+        return 1
+    if _bounded_block_stays_wider(
+        config_spec, bounded, block_sizes, block_id, threads // 2
+    ):
+        return None
+    return config_spec.block_sizes.block_id_lookup(block_id).shrink_minimum
+
+
+def _shrink_tile_for_nested_reduction(
+    config_spec: ConfigSpec,
+    config: dict[str, object],
+    reduction_block_ids: set[int],
+    max_threads: int,
+) -> int:
+    """Repair a generated config whose tile leaves its persistent reductions
+    no thread budget: halve the widest tile axis until the tile takes at
+    most ``max_threads`` threads (or no axis can shrink further).  Returns
+    the threads the tile then takes.
+
+    The default config can need this: ``block_sizes=[32, 32]`` around a
+    persistent reduction of a middle dim (BatchNorm's split-reduction
+    partials) gives the tile all 1024 threads.  ``normalize_reduction_threads``
+    calls it for the ``fix_invalid`` configs (the default config and search
+    candidates) it would otherwise reject.  By then the sequences are
+    normalized, the bounded blocks clamped and the reductions past their
+    thread threshold rolled; the repair applies the clamp again after each
+    halving, and no other step in between reads the sizes it halves.
+    """
+    # Root loops run one at a time and the launch takes the per-axis maximum
+    # of their tiles; the codegen gives a reduction what that shared launch
+    # leaves it (``TileStrategyDispatch.shared_launch_reduction_threads``).
+    # The budget multiplies the tile axes of every root instead, a
+    # conservative bound on that maximum, and the repair shrinks against the
+    # product too: it never sizes chunks for threads the reduction does not
+    # get, though it can shrink a tile the launch had room for.  It only
+    # turns a rejected config into one that renders, so a multi-root kernel
+    # keeps a valid default.
+    num_threads = cast("list[int] | None", config.get("num_threads"))
+    values = {
+        "block_sizes": list(cast("list[int]", config["block_sizes"])),
+        "num_threads": list(num_threads or []),
+    }
+    sequences = {
+        "block_sizes": config_spec.block_sizes,
+        "num_threads": config_spec.num_threads,
+    }
+    bounded = _bounded_blocks(config_spec)
+    while True:
+        axes = _tile_axis_threads(config_spec, values, reduction_block_ids)
+        tile_threads = _thread_count(axes)
+        if tile_threads <= max_threads:
+            break
+        # Of equally wide axes, one whose halving clamps no block it bounds
+        # goes first (an inner block before its outer one), so a bounded pair
+        # gives up half its threads per step, not three quarters.
+        candidates = sorted(
+            axes.items(),
+            key=lambda item: (
+                item[1][0] == "block_sizes"
+                and _halving_clamps_bounded_block(
+                    config_spec, bounded, values["block_sizes"], item[0]
+                )
+            ),
+        )
+        widest = widest_halvable(
+            (
+                block_id,
+                threads,
+                _tile_axis_shrink_minimum(
+                    config_spec,
+                    bounded,
+                    values["block_sizes"],
+                    block_id,
+                    source,
+                    threads,
+                ),
+            )
+            for block_id, (source, threads) in candidates
+        )
+        if widest is None:
+            break
+        source, threads = axes[widest]
+        # The largest power of two below the count: half of a power of two,
+        # and 64 of a 96-thread slot, which divides the block size as a power
+        # of two does.
+        values[source][sequences[source].block_id_to_index(widest)] = prev_power_of_2(
+            threads - 1
+        )
+        # Halving an outer block clamps the blocks it bounds.
+        config_spec.clamp_bounded_block_sizes(values)
+    config["block_sizes"] = values["block_sizes"]
+    if num_threads is not None:
+        config["num_threads"] = values["num_threads"]
+    return tile_threads
+
+
 def normalize_reduction_threads(
     config_spec: ConfigSpec,
     config: dict[str, object],
@@ -2478,31 +2700,38 @@ def normalize_reduction_threads(
     register_tiles: bool,
 ) -> None:
     register_tile = False
-    if config_spec.max_reduction_threads is not None and config_spec.reduction_loops:
-        nt_list = cast("list[int]", config.get("num_threads", []) or [])
-        bs_list = cast("list[int]", config.get("block_sizes", []) or [])
-        # ``num_threads`` also carries per-rolled-rdim slots (the
-        # reduction's own thread count), plus static persistent-rdim slots
-        # that have no ``reduction_loops`` entry.  Only NON-reduction tile
-        # axes consume the budget the reduction competes for.  Resolve all
-        # values by block id because the two sequences need not share an
-        # order.
-        reduction_block_ids = config_spec.reduction_block_ids | {
-            spec.block_id for spec in config_spec.reduction_loops
-        }
-        other_threads = 1
-        for nt_spec in config_spec.num_threads:
-            if nt_spec.block_id in reduction_block_ids:
-                continue
-            nt = config_spec.num_threads.config_get(nt_list, nt_spec.block_id, 0)
-            if not isinstance(nt, int) or nt <= 0:
-                bs = config_spec.block_sizes.config_get(bs_list, nt_spec.block_id, 1)
-                nt = bs if isinstance(bs, int) and bs > 1 else 1
-            if nt > 1:
-                other_threads *= nt
-        available = max(1, config_spec.max_reduction_threads // other_threads)
+    budget = config_spec.max_reduction_threads
+    if budget is not None and config_spec.reduction_loops:
+        reduction_block_ids = _reduction_axis_block_ids(config_spec)
+        other_threads = _thread_count(
+            _tile_axis_threads(config_spec, config, reduction_block_ids)
+        )
+        available = max(1, budget // other_threads)
         reduction_loops = config.get("reduction_loops", [])
         if isinstance(reduction_loops, list):
+            # The persistent reductions of more than one element, which the
+            # loop below rejects when the tile leaves them under two threads.
+            # The reduction-loop cap in ``ConfigSpec.normalize`` already
+            # rolled the ones past their thread threshold, and a rolled
+            # reduction is never rejected: its threads scale down to what the
+            # tile leaves.  Nor is a pinned one, which stays persistent.
+            persistent = [
+                spec.size_hint
+                for spec, loop in zip(
+                    config_spec.reduction_loops, reduction_loops, strict=False
+                )
+                if loop is None and spec.size_hint > 1 and not spec.pinned
+            ]
+            if fix_invalid and available < 2 and persistent:
+                # Leave each a warp, or its extent if smaller.
+                other_threads = _shrink_tile_for_nested_reduction(
+                    config_spec,
+                    config,
+                    reduction_block_ids,
+                    budget // min(max(persistent), _NESTED_REDUCTION_THREAD_FLOOR),
+                )
+                available = max(1, budget // other_threads)
+            nt_list = cast("list[int]", config.get("num_threads", []) or [])
             new_loops = list(reduction_loops)
             changed = False
             for i, spec in enumerate(config_spec.reduction_loops):
@@ -2515,18 +2744,19 @@ def normalize_reduction_threads(
                     # budget there is no thread budget left for the reduction
                     # axis. A chunk of 1 is invalid (LoopedReductionStrategy
                     # requires block_size > 1) and a persistent reduction
-                    # could not place a single reduction thread.  Reject
-                    # the config so the autotuner skips it.
+                    # could not place a single reduction thread.  Generated
+                    # configs were repaired above; reject an explicit config,
+                    # or one whose tile could not shrink far enough, so the
+                    # autotuner skips it.
                     if available < 2:
                         raise InvalidConfig(
                             f"cute backend: reduction axis {i} has no thread "
                             f"budget left (non-reduction axes use "
-                            f"{other_threads} of {config_spec.max_reduction_threads} "
-                            f"threads)."
+                            f"{other_threads} of {budget} threads)."
                         )
                     forms_register_tile = (
                         register_tiles
-                        and _cute_config_forms_register_tile(
+                        and cute_config_forms_register_tile(
                             config_spec, config, spec, available
                         )
                     )
@@ -2541,7 +2771,18 @@ def normalize_reduction_threads(
                     chunk = min(spec.size_hint, available)
                     if config_spec.max_reduction_loop is not None:
                         chunk = min(chunk, config_spec.max_reduction_loop)
-                    new_loops[i] = chunk
+                    # The chunk the flat search space holds for it, so that a
+                    # config the autotuner records flattens back to the one
+                    # it benchmarks: a power of two from the fragment's 8,
+                    # past the threads left where the extent allows (a rolled
+                    # reduction's threads scale down to them).  An extent of
+                    # at most 8 has no such chunk.
+                    flat = explicit_reduction_chunk(config_spec, spec, chunk)
+                    new_loops[i] = (
+                        flat
+                        if isinstance(flat, int) and flat < spec.size_hint
+                        else chunk
+                    )
                     changed = True
                 elif (
                     new_loops[i] is None
@@ -2553,7 +2794,7 @@ def normalize_reduction_threads(
                         int,
                     )
                     and 0 < requested < spec.size_hint
-                    and _cute_config_forms_register_tile(
+                    and cute_config_forms_register_tile(
                         config_spec, config, spec, available
                     )
                 ):
@@ -3410,6 +3651,13 @@ def cute_flat_fields(
         if config_spec.cute_warp_aggregated_atomics_enabled:
             fields["cute_warp_aggregated_atomics"] = BooleanFragment()
         if len(config_spec.cute_lane_layouts) > 0 and not config_spec.matmul_facts:
+            # Seeded, not searched: the masked rolled cluster seeds it only
+            # on some extents, and a search space that depends on the extent
+            # breaks ``autotune_multi``, which shares configs across the
+            # shapes of one structural fingerprint.
+            fields["cute_warp_fp32_redux"] = EnumFragment(
+                (False, True), search_choices=(False,)
+            )
             for key in (
                 "cute_independent_reduction",
                 "cute_cluster_warp_online",
@@ -3418,7 +3666,6 @@ def cute_flat_fields(
                 "cute_scalar_epilogue",
                 "cute_scalar_epilogue_keep_inputs",
                 "cute_scalar_epilogue_owner_fold",
-                "cute_warp_fp32_redux",
                 "cute_register_tile_warp_fold",
                 "cute_register_tile_store_first",
                 "cute_replicated_reduction",
@@ -3896,6 +4143,218 @@ def explicit_reduction_chunk(
     return value
 
 
+def block_size_default(
+    config_spec: ConfigSpec, block: BlockSizeSpec, default: int
+) -> int:
+    """The default size of ``block``: an inner tile loop's share of the
+    threads where a wide reduction collapsed the defaults to 1.
+
+    The collapse is meant for the grid tiles (one row per CTA, so a wide
+    reduction gets the thread budget); an inner tile loop left at block size
+    1 would walk its whole extent one element at a time in every thread.  It
+    gets instead the share that balances its serial steps against those of
+    the reduction loops on its paths (``cute_tile_loop_path_reductions``:
+    the ones its root runs before or after the loop or inside it, in the same
+    CTA for the same rows): ``sqrt(threads * extent / reduction_numel)``
+    rounded down to a power of two, where ``threads`` is the reduction thread
+    budget over the threads of the blocks outside the loop, ``extent`` the
+    product of the loop's padded block extents and ``reduction_numel`` that
+    of those reduction loops.  A loop as wide as the reduction gets 32 of the
+    1024 threads, one the reduction dwarfs keeps 1, and no share passes
+    ``threads`` or, per block, the default of a kernel without reduction
+    loops.  A multi-dimensional ``hl.tile`` splits its share evenly over its
+    blocks, rounding in favour of the outer ones.
+
+    The blocks outside the loop are its root's grid tiles and the loops
+    enclosing it, each at its fixed size where ``block_size=`` gives one
+    (``cute_tile_fixed_block_sizes``).  Each takes a thread axis of its own,
+    so nested loops are sized from the outside in, each against the threads
+    its enclosing loops leave.
+
+    The reduction gets the threads the tile loops and grids leave it
+    (``CuteBackend.adjust_reduction_thread_count``), so the shares are then
+    halved, the widest first, until it keeps 16 threads (half a warp), or
+    until each is back at its collapsed default where the other blocks leave
+    it fewer: with fewer threads the reduction sums a wide row serially and
+    loses fp32 accuracy, and more would only take threads from the loops.
+
+    A loop keeps the collapsed default when no reduction loop of its own
+    root is on its paths (another root's reductions run on that root's grid
+    for other rows), when a reduction off its paths (another root's over
+    another extent, one in a sibling loop) takes threads of the launch
+    beside its own, which the shares do not count, when loops at another
+    depth or in the other nesting order share its block size, or when it
+    surrounds such a block of more than one thread (``_inner_loop_shares``).
+    A loop bounded by an outer block (``hl.tile(tile_m.begin, tile_m.end)``)
+    counts at most that block's size.  Every loop keeps it
+    when a fixed block size on the paths is not a static int
+    (``cute_tile_symbolic_fixed_blocks``: an expression of tunables, a
+    dynamic size or an int argument): its threads are not known here.
+    """
+    if default > 1 or block.block_id in config_spec.grid_block_ids:
+        return default
+    return _inner_loop_shares(config_spec, default).get(block.block_id, default)
+
+
+def _inner_loop_shares(config_spec: ConfigSpec, default: int) -> dict[int, int]:
+    """The ``block_size_default`` shares of the inner tile loop blocks that
+    get one, by block id.
+
+    Only a block that every path reaches through the same loops (the same
+    levels above it and the same level) gets one: the launch gives a block a
+    single thread axis, the one its level has on the first path through it
+    (``TileStrategyDispatch.thread_axis_for_strategy``), which the body only
+    agrees with when the loops around the block do.  So loops that share a
+    block size (``hl.register_block_size``) at different depths or in both
+    nesting orders keep the collapsed default, which takes no axis where it
+    is 1.  Where it is more (``hl.register_block_size(2, n)``), the block
+    still takes an axis after those of the blocks around and before it in
+    each place, so none of those gets a share either.
+    """
+    if config_spec.cute_tile_symbolic_fixed_blocks or any(
+        size < 1 for size in config_spec.cute_tile_fixed_block_sizes.values()
+    ):
+        # Counted as one thread, such a block (``hl.tile(m,
+        # block_size=next_power_of_2(bm))``) would let the shares take the
+        # reduction's threads.  A descending ``hl.grid``'s negative step is
+        # no thread count either.
+        return {}
+    # The budget is CuTe's (``CuteBackend.max_reduction_threads``): never None.
+    budget = cast("int", config_spec.max_reduction_threads)
+    paths = config_spec.cute_tile_loop_paths
+    specs = {spec.block_id: spec for spec in config_spec.block_sizes}
+    cap = generic_block_size_default(len(config_spec.block_sizes), 1)
+    # Where the paths through each loop block reach it, at every depth it
+    # takes on each: the levels up to its own, and its index in that level.
+    places: dict[int, set[tuple[TileLoopPath, int]]] = {}
+    for path in paths:
+        for depth in range(1, len(path)):
+            for index, block_id in enumerate(path[depth]):
+                places.setdefault(block_id, set()).add((path[: depth + 1], index))
+    # The threads of each block: its fixed size, or its default.
+    collapsed = {
+        **config_spec.cute_tile_fixed_block_sizes,
+        **{
+            block_id: spec._fragment_with_default(config_spec, default).default()
+            for block_id, spec in specs.items()
+        },
+    }
+    # A block in several places keeps its collapsed default, and one of more
+    # than one thread still takes an axis, counted after those of the blocks
+    # around it and before it: a share for any of them would move its axis on
+    # some paths only.
+    pinned = {
+        other
+        for block_id, place in places.items()
+        if len(place) > 1 and collapsed.get(block_id, 1) > 1
+        for prefix, index in place
+        for other in (*(b for level in prefix[:-1] for b in level), *prefix[-1][:index])
+    }
+    # The blocks that get a share, by the levels up to their loop's, from the
+    # outside in.
+    loops: dict[TileLoopPath, list[int]] = {}
+    for _, _, block_id, prefix in sorted(
+        (len(prefix), index, block_id, prefix)
+        for block_id, place in places.items()
+        if block_id in specs and block_id not in config_spec.grid_block_ids
+        if len(place) == 1 and block_id not in pinned
+        for prefix, index in place
+    ):
+        loops.setdefault(prefix, []).append(block_id)
+    sized = dict(collapsed)
+    shares: dict[int, int] = {}
+    for prefix, blocks in loops.items():
+        on = [path for path in paths if path[: len(prefix)] == prefix]
+        beside = {
+            reduction
+            for path in on
+            for reduction in config_spec.cute_tile_loop_path_reductions.get(path, ())
+        }
+        if not beside >= config_spec.reduction_block_ids or len(beside) > 1:
+            # A reduction off the loop's paths (another root's, or one in a
+            # sibling loop) takes threads of the shared launch too
+            # (``CuteBackend.adjust_reduction_thread_count``), which the
+            # launch model below does not count.  So does a second reduction
+            # block on them, as when two roots share the loop's blocks
+            # (``hl.register_block_size``) and reduce over different extents.
+            continue
+        extents = [
+            next_power_of_2(loop.size_hint)
+            for loop in config_spec.reduction_loops
+            if loop.block_id in beside
+        ]
+        if not extents:
+            continue
+        threads = budget
+        for other in {b for level in prefix for b in level}.difference(blocks):
+            threads //= sized.get(other, 1)
+        # A loop bounded by an outer block (``hl.tile(tile_m.begin,
+        # tile_m.end)``) spans at most that block, to which the config's
+        # normalization clamps it (``ConfigSpec.clamp_bounded_block_sizes``).
+        widths = {
+            b: next_power_of_2(specs[b].size_hint)
+            if (outer := specs[b].bounded_by_block_id) is None
+            else min(next_power_of_2(specs[b].size_hint), sized.get(outer, 1))
+            for b in blocks
+        }
+        extent = math.prod(widths.values())
+        share = prev_power_of_2(
+            math.isqrt(threads * extent // math.prod(extents)),
+            min(threads, cap ** len(blocks)),
+        )
+        bits = share.bit_length() - 1
+        for position, block_id in enumerate(blocks):
+            want = 1 << -(-bits // (len(blocks) - position))
+            sized[block_id] = shares[block_id] = (
+                specs[block_id]
+                ._fragment_with_default(config_spec, min(want, cap, widths[block_id]))
+                .default()
+            )
+            bits = max(0, bits - (shares[block_id].bit_length() - 1))
+
+    def launch_threads(sizes: dict[int, int]) -> int:
+        """What a reduction's threads are divided by: the threads of every
+        tile loop and grid at ``sizes``.  Other roots' count too, as the
+        reduction shares their launch
+        (``TileStrategyDispatch.shared_launch_reduction_threads``) when the
+        roots reduce over one block; roots that reduce over different
+        extents get no shares.  A block of one thread takes no axis, and
+        each block runs as many threads as the widest block on its axis
+        (``TileStrategyDispatch._normalize_shared_tile_thread_extents``).
+
+        Defaults are computed before any tile strategy exists, so this models
+        ``CuteBackend.adjust_reduction_thread_count`` instead of calling it,
+        sibling loops included: they multiply, although they take turns on
+        one axis.  Change them together.
+        """
+        axes: list[int] = []
+        axis_threads: dict[int, int] = {}
+        for path in config_spec.cute_tile_strategy_paths:
+            axis = sum(sizes.get(b, 1) > 1 for level in path[:-1] for b in level)
+            for block_id in path[-1]:
+                if (size := sizes.get(block_id, 1)) > 1:
+                    axis_threads[axis] = max(axis_threads.get(axis, 1), size)
+                    axes.append(axis)
+                    axis += 1
+        return math.prod(axis_threads[axis] for axis in axes)
+
+    # The reduction keeps half a warp, or what the collapsed defaults and
+    # fixed sizes leave it where that is less.
+    limit = budget // max(1, min(16, budget // launch_threads(collapsed)))
+    while launch_threads(sized) > limit:
+        halved = widest_halvable(
+            (block_id, share, collapsed[block_id]) for block_id, share in shares.items()
+        )
+        if halved is None:
+            break
+        sized[halved] = shares[halved] = (
+            specs[halved]
+            ._fragment_with_default(config_spec, shares[halved] // 2)
+            .default()
+        )
+    return shares
+
+
 class CuteSearchSurface(BackendSearchSurface):
     """The CuTe backend's search surface (``CuteBackend.config_spec_extension``).
 
@@ -4090,6 +4549,11 @@ class CuteSearchSurface(BackendSearchSurface):
         self, config_spec: ConfigSpec, loop: ReductionLoopSpec, value: object
     ) -> object:
         return explicit_reduction_chunk(config_spec, loop, value)
+
+    def block_size_default(
+        self, config_spec: ConfigSpec, block: BlockSizeSpec, default: int
+    ) -> int:
+        return block_size_default(config_spec, block, default)
 
     def family_fragments(
         self, config_spec: ConfigSpec, family: str

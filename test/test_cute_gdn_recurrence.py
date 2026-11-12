@@ -397,8 +397,8 @@ def _captured_plan(
     captured: list[object] = []
     original = gdn_recurrence._plan_gdn_recurrence
 
-    def capture(graphs: object, tile_strategy: object) -> object:
-        result = original(graphs, tile_strategy)  # type: ignore[arg-type]
+    def capture(admitted: object, tile_strategy: object) -> object:
+        result = original(admitted, tile_strategy)  # type: ignore[arg-type]
         captured.append(result)
         return result
 
@@ -2419,6 +2419,49 @@ def test_mma_dag_warp_mode_replaces_the_tcgen05_schedule() -> None:
     )
     assert _PLAN_KIND in off
     assert _DAG_MMA not in off
+
+
+@pytest.mark.cpu_only
+def test_declined_configs_compute_the_schedules_exponentials() -> None:
+    """Without fast_math the configs the schedule declines (the SIMT and dag
+    lowerings) compute the gate ``exp(g_last - g)`` and the rescale
+    ``exp(g_last)`` as the schedule does, ``exp2(x * log2 e)`` keeping
+    denormals, so the configs differ only in reduction order; a target
+    without the schedule keeps the exactly reduced ``cute.math.exp``.
+
+    The FMA scale hoist would distribute the gate's product over the chunk
+    loop's invariant ``g_last``; it needs fast_math, and this pins that gate
+    end to end: the product stays whole without the setting, and the hoist
+    fires under it."""
+    template_exp2 = re.compile(
+        r"cute\.math\.exp2\(cutlass\.Float32\(\w+\) \* 1\.4426950408889634\)"
+    )
+    # A 256-row dstate tile is not admitted: the SIMT lowering.
+    shape = {"batch": 1, "heads": 2, "seqlen": 448, "dhead": 64, "dstate": 256}
+    simt: dict[str, object] = {"cute_collective_mma": True}
+    fast_math = helion.kernel(
+        cast("Any", _example_module()).helion_gdn_fwd_h.fn, fast_math=True
+    )
+    with patch.dict(os.environ, HELION_CUTE_MMA_IMPL="universal"):
+        declined = _code(chunk=128, block_v=256, shape=shape, overrides=simt)
+        hoisted = _code(
+            chunk=128, block_v=256, shape=shape, overrides=simt, kernel=fast_math
+        )
+        sm90 = _code(
+            chunk=128, block_v=256, shape=shape, overrides=simt, capability=(9, 0)
+        )
+    dag = _code(chunk=64, block_v=32, shape=_SMALL_SHAPE, overrides=_DAG_WARP)
+    assert _SIMT_FALLBACK in declined
+    assert _DAG_MMA in dag
+    assert len(template_exp2.findall(declined)) == 2
+    for code in (declined, dag):
+        assert _PLAN_KIND not in code
+        assert template_exp2.search(code)
+        assert "cute.math.exp(" not in code
+        assert "_helion_scaled_" not in code
+    assert "_helion_scaled_" in hoisted
+    assert sm90.count("cute.math.exp(") == 2
+    assert "cute.math.exp2(" not in sm90
 
 
 def test_mma_dag_declines_a_ragged_chunk_loop() -> None:

@@ -13,6 +13,8 @@ from .config_fragment import ConfigSpecFragment
 from .config_fragment import assert_integer_power_of_two
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from . import ConfigSpec
 
     _T = TypeVar("_T")
@@ -153,6 +155,19 @@ class BlockIdSequence(MutableSequence[_BlockIdItemT]):
         if index >= len(config):
             return default
         return config[index]
+
+    def config_get_for_tile(
+        self, config: list[_T], block_ids: Sequence[int]
+    ) -> _T | None:
+        """The value of ``config`` for the tile over ``block_ids``, as code
+        generation reads a loop order: that of the item holding the tile's
+        first block (``config_get``; ``_remove_duplicates`` keeps one item of
+        the tiles that share a block), or None for a tile of one block, which
+        has no order to configure even where its block is in another tile's
+        item."""
+        if len(block_ids) < 2:
+            return None
+        return self.config_get(config, block_ids[0])
 
     def fingerprint(self) -> tuple[int, ...]:
         """Return structural metadata for fingerprinting."""

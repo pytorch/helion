@@ -151,6 +151,7 @@ from .plan_facts import (
 from .plan_facts import tcgen05_plan_orientation as _tcgen05_plan_orientation
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Hashable
     from collections.abc import Sequence
 
@@ -685,6 +686,43 @@ def _cute_current_stream() -> object:
     """
     _gmem, _make_ptr, current_stream_obj = _get_cute_launcher_imports()
     return cast("Any", current_stream_obj)()
+
+
+# ``standalone_launcher._standalone_ensure_cuda_context``, imported on the first
+# launch after torch initializes CUDA: that module loads cutlass and
+# ``cuda.bindings``, which a CPU-only process may not have.
+_STANDALONE_ENSURE_CUDA_CONTEXT: Callable[[], None] | None = None
+
+
+def _ensure_cuda_context() -> None:
+    """Make the current device's primary CUDA context current on this thread,
+    before every launch (the fast relaunch included).
+
+    Without a current context the compiled host code of a launch that sets
+    function attributes (``cudaFuncSetAttribute``, ``cuKernelGetAttribute``)
+    aborts the process (the CuTe DSL runtime's ``cuda_dialect_assert_success``:
+    "invalid device context"), and a thread can lack one at any launch.  A new
+    thread starts without one until a runtime-API call initializes it there,
+    PyTorch's autograd device threads among them (c10 skips ``cudaSetDevice``
+    for the device a thread already defaults to), and other code can clear
+    the context, or pop one it pushed on a thread that had none, after one was
+    made current.  The check is the exported launcher's
+    (``standalone_launcher._standalone_ensure_cuda_context``, one
+    ``cuCtxGetCurrent`` call when a context is current, which keeps that
+    module Helion-free), imported and run once torch has initialized CUDA.
+    """
+    global _STANDALONE_ENSURE_CUDA_CONTEXT
+    check = _STANDALONE_ENSURE_CUDA_CONTEXT
+    if check is None:
+        if not torch.cuda.is_initialized():
+            # No CUDA work in this process yet (a stub launch in a CPU-only
+            # test): nothing to make current, and libcuda may not even be
+            # installed.
+            return
+        from .standalone_launcher import _standalone_ensure_cuda_context as check
+
+        _STANDALONE_ENSURE_CUDA_CONTEXT = check
+    check()
 
 
 @dataclass(frozen=True)
@@ -3711,6 +3749,7 @@ def default_cute_launcher(
     *args: object,
     **kwargs: object,
 ) -> object:
+    _ensure_cuda_context()
     pending = prepare_capture_launch(cute_kernel, args, grid)
     result = _default_cute_launcher_untracked(cute_kernel, grid, *args, **kwargs)
     if pending is not None:

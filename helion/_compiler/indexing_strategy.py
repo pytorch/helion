@@ -9,6 +9,7 @@ import threading
 from typing import TYPE_CHECKING
 from typing import ClassVar
 from typing import NamedTuple
+from typing import cast
 
 import sympy
 import torch
@@ -2271,6 +2272,19 @@ class SubscriptIndexing(NamedTuple):
                 f"{{offset}} + {env.backend.zeros_expr(shape_str, env.index_type())}"
             )
         return expr_from_string(expand, offset=self.index_expr)
+
+    @staticmethod
+    def node_shape(node: torch.fx.Node) -> list[int | torch.SymInt]:
+        """``compute_shape`` of the tensor a traced load or store subscripts
+        (``args[0]``) by its subscript (``args[1]``).  Every node of the
+        subscript, including slice bounds traced under dynamic shapes, is
+        read as its traced value."""
+        target = node.args[0]
+        assert isinstance(target, torch.fx.Node)
+        indices = torch.fx.node.map_arg(node.args[1], lambda index: index.meta["val"])
+        return SubscriptIndexing.compute_shape(
+            target.meta["val"], cast("list[object]", indices)
+        )
 
     @staticmethod
     def compute_shape(

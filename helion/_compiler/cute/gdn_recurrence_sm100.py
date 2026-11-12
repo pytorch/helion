@@ -61,8 +61,9 @@ the loads overlap the setup (the other warps prefetch the first chunk's rows
 into L2 at kernel entry, a few hundred nanoseconds before that burst can
 issue), stages the raw ``g`` rows of a chunk through the same ring with
 ``cp.async`` a full ring depth ahead, and publishes
-the per-row gate vector ``exp(g_last - g_row)`` (the ordinary exact ``exp2(x *
-log2 e)`` lowering) together with the tile through the stage's full barrier.
+the per-row gate vector ``exp(g_last - g_row)`` (``exp2(x * log2 e)`` keeping
+denormals; see ``gdn_recurrence``) together with the tile through the stage's
+full barrier.
 Every computed chunk is full: only the last chunk can be ragged, and it is
 never computed, so the source kernel's ``row < seqlen`` gate mask holds for
 every row the device code touches and it carries no mask of its own.  One

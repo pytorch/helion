@@ -77,6 +77,8 @@ from .cute_fx_walk import aux_tensor_load_kind
 from .cute_fx_walk import build_inner_outputs_index
 from .cute_fx_walk import build_inner_outputs_index_from_graphs
 from .cute_fx_walk import walk_carrier_to_tcgen05_matmul
+from .dtypes import narrow_common_dtype
+from .dtypes import round_scalar
 from .gelu_tanh_approx import FAST_MATH_UNARY_OPS
 from .gelu_tanh_approx import fast_math_unary_template
 from .math_templates import SIGMOID_TEMPLATE
@@ -520,16 +522,17 @@ _ERF_TEMPLATE = "cute.math.erf({inner})"
 # The chain renderer retains each result's dtype rounding separately.
 _SIGMOID_TEMPLATE = SIGMOID_TEMPLATE.format(x="{inner}")
 
-# SiLU also accepts an explicit division-based decomposition. Keep its
-# existing arithmetic form separate from the standalone sigmoid contract.
-_LOG2_E = 1.4426950408889634
-# ``silu(x) = x * sigmoid(x)``. The chain renderer always binds
-# ``{inner}`` to a fresh local before formatting, so the two
-# references to ``{inner}`` here resolve to a single SSA name (no
-# source-size blowup).
-_SILU_TEMPLATE = (
-    f"(({{inner}}) * (1.0 / (1.0 + cute.math.exp2(-({{inner}}) * {_LOG2_E!r}))))"
-)
+# The two silu decompositions ``_classify_silu`` folds compute what the
+# pointwise lowering computes for them, so a fused epilogue and an unfused
+# one agree bit for bit (``_silu_step``).  The chain renderer always binds
+# ``{inner}`` to a fresh local before formatting, so the repeated ``{inner}``
+# resolves to a single SSA name (no source-size blowup).
+# ``x * sigmoid(x)``: the sigmoid contract, with or without ``fast_math``.
+_SILU_SIGMOID_TEMPLATE = f"(({{inner}}) * {_SIGMOID_TEMPLATE})"
+# ``x / (1 + exp(-x))`` without ``fast_math``: the IEEE quotient of the
+# exactly reduced ``cute.math.exp`` (no reciprocal-then-multiply, which
+# rounds twice).
+_SILU_DIVISION_TEMPLATE = "(({inner}) / (1.0 + cute.math.exp(-({inner}))))"
 
 
 def _add_const_template(scalar: float) -> str:
@@ -711,6 +714,31 @@ def _promote_bool_operand(
     if result_dtype is None or not result_dtype.is_floating_point:
         return None
     return _UnaryTensorExpr(step=_BOOL_TO_FLOAT_STEP, operand=expr)
+
+
+def _common_dtype_operand(
+    expr: _TensorExpr, node: torch.fx.Node, other: torch.fx.Node
+) -> _TensorExpr:
+    """``expr``, the tensor operand ``node`` of a binary op beside ``other``,
+    converted as torch converts it: rounded to a 16-bit common dtype it does
+    not carry (``acc.to(torch.bfloat16) * scale[()]`` rounds the 0-d fp32
+    scale to bf16 before the product).  A host scalar is no tensor and keeps
+    its value."""
+    val = node.meta.get("val")
+    if not isinstance(val, torch.Tensor) or not isinstance(
+        other.meta.get("val"), torch.Tensor
+    ):
+        return expr
+    common = narrow_common_dtype(node, other)
+    if common is None or val.dtype in (common, torch.bool):
+        return expr
+    return _UnaryTensorExpr(
+        step=_UnaryOp(
+            op_name=f"to_{common}",
+            template=_round_epilogue_expression("{inner}", common),
+        ),
+        operand=expr,
+    )
 
 
 def _operand_dtype_matches(
@@ -1311,6 +1339,22 @@ def _is_one_plus_exp_neg_of(node: object, carrier: torch.fx.Node) -> bool:
     )
 
 
+def _silu_step(*, division: bool) -> _UnaryOp:
+    """The silu chain step, rendered as the pointwise lowering computes the
+    matched form (``x / (1 + exp(-x))`` when ``division``, else
+    ``x * sigmoid(x)``) in the current settings.
+
+    Under ``fast_math`` the pointwise quotient is ``div.approx.ftz``, which
+    multiplies by ``rcp.approx.ftz``, of ``exp2(-x * log2(e))`` on
+    ``ex2.approx.ftz``: the sigmoid form.  The scalar-only ``div.approx``
+    intrinsic cannot take the chain's TensorSSA; the two differ only where
+    the quotient flushes a denormal product (``|x|`` below ``2**-125``).
+    """
+    if division and not CompileEnvironment.current().settings.fast_math:
+        return _UnaryOp(op_name="silu", template=_SILU_DIVISION_TEMPLATE)
+    return _UnaryOp(op_name="silu", template=_SILU_SIGMOID_TEMPLATE)
+
+
 def _classify_silu(
     cur: torch.fx.Node,
 ) -> tuple[_UnaryOp, torch.fx.Node] | None:
@@ -1335,9 +1379,11 @@ def _classify_silu(
       inductor lowering tables in ``helion._compiler.device_ir``).
       This is the shape T13 / T17 / T26 hit in practice.
 
-    The same ``_SILU_TEMPLATE`` (``x * (1 / (1 + exp2(-x * log2_e)))``)
-    renders both forms. The pattern only matches when the inner
-    references point at the *same* carrier FX node — divergent
+    Each form renders the pointwise lowering's math for it
+    (``_silu_step``): the mul form ``x * sigmoid(x)`` with the sigmoid
+    contract, the div form the IEEE quotient of the exact ``exp`` (the
+    sigmoid form under ``fast_math``). The pattern only matches when the
+    inner references point at the *same* carrier FX node — divergent
     operands fall through to the generic binary classifier.
 
     Returns ``None`` if ``cur`` is not a silu shape so the caller can
@@ -1356,16 +1402,16 @@ def _classify_silu(
         if not (isinstance(lhs, torch.fx.Node) and isinstance(rhs, torch.fx.Node)):
             return None
         if _is_sigmoid_of(rhs, lhs):
-            return _UnaryOp(op_name="silu", template=_SILU_TEMPLATE), lhs
+            return _silu_step(division=False), lhs
         if _is_sigmoid_of(lhs, rhs):
-            return _UnaryOp(op_name="silu", template=_SILU_TEMPLATE), rhs
+            return _silu_step(division=False), rhs
         return None
     # ``div(carrier, add(exp(neg(carrier)), 1))`` form — inductor decomp.
     if target is torch.ops.aten.div.Tensor:
         if not isinstance(lhs, torch.fx.Node):
             return None
         if _is_one_plus_exp_neg_of(rhs, lhs):
-            return _UnaryOp(op_name="silu", template=_SILU_TEMPLATE), lhs
+            return _silu_step(division=True), lhs
         return None
     return None
 
@@ -1441,6 +1487,9 @@ def _classify_binary(
             return None
         if aux_expr is None:
             return None
+        aux_expr = _common_dtype_operand(
+            aux_expr, rhs if forward_form else lhs, carrier
+        )
         op_name = _BINARY_OP_NAMES[target]
         current_expr = _CurrentTensorExpr()
         return (
@@ -1740,7 +1789,7 @@ def _classify_comparison(
     def rounded(scalar: float, operand: torch.fx.Node) -> float | None:
         dtype = _node_tensor_dtype(operand)
         assert dtype is not None
-        value = torch.tensor(scalar, dtype=dtype).item()
+        value = round_scalar(scalar, dtype)
         return value if math.isfinite(value) else None
 
     if lhs_expr is not None and rhs_expr is not None:

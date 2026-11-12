@@ -4,6 +4,9 @@ The scalar backend gives each block id one lane coordinate. Unexempted
 repeated axes therefore require a complete fragment owner; this guard rejects
 them if no such owner accepts the root. Explicit view coordinates, broadcasts
 and the separately proved scalar/matmul paths retain their existing behavior.
+
+A store whose subscript indexes two axes by one block is refused here too
+(``_check_store_target``).
 """
 
 from __future__ import annotations
@@ -17,10 +20,12 @@ from ...language._tracing_ops import _host_tensor
 from ...language.memory_ops import load
 from ...language.memory_ops import store
 from ..compile_environment import CompileEnvironment
+from ..indexing_strategy import is_block_size_index
 from ..matmul_utils import matmul_operand_indices
 from .completed_matmul_sum import match_matmul_sum_path
 from .cute_reshape import CUTE_DIM_LOCAL_COORD_META
 from .matmul_utils import _CUTE_RHS_VIEW_PASSTHROUGH_TARGETS
+from .memory_ops import _cute_expand_broadcast_dim
 
 if TYPE_CHECKING:
     from torch.fx.node import Node
@@ -101,7 +106,14 @@ def scalar_repeated_block_id(
 
 
 def check_repeated_block_ids(cg: CodegenInterface, node: Node) -> None:
-    """Refuse repeated scalar coordinates when no complete owner handled them."""
+    """Refuse repeated scalar coordinates when no complete owner handled them,
+    and a store whose subscript repeats a block (``_check_store_target``)."""
+    if node.target is store:
+        # Stack tensors address each stacked tile through their own offset
+        # lowering, not through one lane coordinate per block id.
+        if not _is_stack_tensor_access(node):
+            _check_store_target(cg, node)
+        return
     env = CompileEnvironment.current()
     # Keep the graph proof off the common non-repeated-node path.
     block_id = scalar_repeated_block_id(env, node)
@@ -120,6 +132,84 @@ def check_repeated_block_ids(cg: CodegenInterface, node: Node) -> None:
         f"of one tensor ({node.target}); the SIMT lowering maps each block id "
         "to one lane",
     )
+
+
+def _check_store_target(cg: CodegenInterface, node: Node) -> None:
+    """Raise ``BackendUnsupported`` when a store's subscript indexes two axes
+    of one tensor by one block and its value does not span both: ``out[c, r,
+    c] = y[None, :, :]`` broadcasts the value along both of ``c``'s axes, and
+    the per-lane store, one lane coordinate for both, writes only their
+    diagonal where eager writes the whole tile.  An axis takes the block of
+    its tile, or of the dims a tensor index contributes as Helion's indexing
+    shapes them (``out[c, idx[c]]``, ``out[c, c.index + 1]``; tensor indices
+    broadcast together give their dims once).  Not counted: full slices,
+    whose sharing of a reduction dim is beyond this check, and a block of one
+    element in the config being compiled, whose diagonal is the whole tile.
+    Exempt: a value whose own shape repeats the block (checked on its own
+    node), and the stores ``_codegen_cute_store_expand_broadcast_tile``
+    lowers, whose ``expand`` value is broadcast along a tile of the block and
+    whose other axis is a tensor index: a loop walks the broadcast axis."""
+    index_arg = node.args[1]
+    if not isinstance(index_arg, (list, tuple)):
+        return
+    env = CompileEnvironment.current()
+    indices = [
+        index.meta.get("val") if isinstance(index, torch.fx.Node) else index
+        for index in index_arg
+    ]
+    tensors = [index for index in indices if isinstance(index, torch.Tensor)]
+    together = env.should_broadcast_tensor_indexers(indices)
+    axes: dict[int, list[int]] = {}
+    for position, index in enumerate(indices):
+        if isinstance(index, torch.SymInt) and is_block_size_index(index):
+            sizes: list[int | torch.SymInt] = [index]
+        elif isinstance(index, torch.Tensor) and not together:
+            sizes = env.tensor_indexer_dims(index)
+        elif isinstance(index, torch.Tensor) and tensors:
+            # Broadcast together, the tensor indices give their shape once.
+            sizes, tensors = env.tensor_indexer_broadcast_shape(tensors), []
+        else:
+            continue
+        for size in sizes:
+            resolved = (
+                env.resolve_block_id(size) if isinstance(size, torch.SymInt) else None
+            )
+            if resolved is None:
+                continue
+            canonical = env.canonical_block_id(resolved)
+            extent = cg.device_function.resolved_block_size(canonical)
+            if not (isinstance(extent, int) and extent <= 1):
+                axes.setdefault(canonical, []).append(position)
+    value = node.args[2]
+    if not isinstance(value, torch.fx.Node) or not isinstance(
+        value.meta.get("val"), torch.Tensor
+    ):
+        value = None
+    broadcast = _cute_expand_broadcast_dim(value) if value is not None else None
+    for block_id, positions in axes.items():
+        if len(positions) < 2:
+            continue
+        if (
+            value is not None
+            and repeated_block_id(
+                env, value.meta["val"], value.meta.get(CUTE_DIM_LOCAL_COORD_META)
+            )
+            == block_id
+        ):
+            continue
+        others = [position for position in positions if position != broadcast]
+        if (
+            broadcast is not None
+            and len(others) == len(positions) - 1 == 1
+            and isinstance(indices[broadcast], torch.SymInt)
+            and isinstance(indices[others[0]], torch.Tensor)
+        ):
+            continue
+        raise exc.BackendUnsupported(
+            "cute",
+            f"a store subscript indexes two axes of one tensor by block id "
+            f"{block_id}; the SIMT lowering maps each block id to one lane",
+        )
 
 
 def _is_stack_tensor_access(node: Node) -> bool:

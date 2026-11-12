@@ -59,6 +59,7 @@ from helion._compiler.variable_origin import NameOrigin
 from helion._testing import DEVICE
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
+from helion._testing.binding_state import with_binding_state
 from helion.autotuner.base_cache import BoundKernelInMemoryCacheKey
 import helion.language as hl
 from helion.language.constexpr import ConstExpr
@@ -428,6 +429,7 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
         env._runtime_arg_values_by_name = contextvars.ContextVar(
             "test_runtime_arg_values", default=None
         )
+        with_binding_state(env)
         env.tensor_input_source = lambda _tensor: source  # type: ignore[method-assign]
 
         backing = torch.empty(17, dtype=torch.bfloat16)
@@ -520,6 +522,7 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
         env._runtime_arg_values_by_name = contextvars.ContextVar(
             "test_late_rekey_runtime_args", default=None
         )
+        with_binding_state(env)
         env.tensor_input_source = lambda _tensor: source  # type: ignore[method-assign]
 
         backing = torch.empty(17, dtype=torch.bfloat16)

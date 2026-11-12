@@ -26,9 +26,9 @@ from .._ast_pass_utils import _is_proven_relocatable_assignment
 from .._ast_pass_utils import _self_addend
 from .._ast_pass_utils import assigned_name
 from .._ast_pass_utils import call_path_str
+from ..lane_loops.markers import _int_literal
 from ..lane_loops.owner_guards import _guard_stmt_with_owner
 from ..lane_loops.owner_guards import _linear_thread_axis_strides
-from ..lane_loops.owner_guards import _literal_int_expr
 from ..lane_loops.owner_guards import _resolve_scalar_definition
 from ..lane_loops.owner_guards import _store_enclosing_predicates
 from ..lane_loops.owner_guards import _store_thread_axes
@@ -337,7 +337,7 @@ def _collect_statement_provenance(
 def _call_keyword_int(call: ast.Call, name: str) -> int | None:
     for keyword in call.keywords:
         if keyword.arg == name:
-            return _literal_int_expr(keyword.value)
+            return _int_literal(keyword.value)
     return None
 
 

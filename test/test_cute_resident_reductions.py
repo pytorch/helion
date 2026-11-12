@@ -478,6 +478,17 @@ def test_resident_declines_alias_rebinding() -> None:
     assert "resident_state" not in _rewrite(source)
 
 
+def test_resident_declines_a_descending_lane_loop() -> None:
+    # The schedule re-emits the feature lanes ascending, inside the row loop:
+    # a reverse scan's descending lane loop would lose its order.
+    ascending = f"for lane in range({_FEATURES}):"
+    source = _source()
+    assert ascending in source
+    descending = f"for lane in range({_FEATURES - 1}, -1, -1):"
+    assert "resident_state" in _rewrite(source)
+    assert "resident_state" not in _rewrite(source.replace(ascending, descending))
+
+
 def test_resident_handles_partial_row_groups() -> None:
     assert "resident_state" in _rewrite(_source(rows=3), group_rows=2)
 

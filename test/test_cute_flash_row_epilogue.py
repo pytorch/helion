@@ -14,6 +14,7 @@ import torch
 import helion
 from helion._compiler.cute import cute_flash
 from helion._compiler.cute import flash_row_epilogue
+from helion._compiler.cute.dtypes import round_scalar
 from helion._compiler.cute.flash_row_epilogue import ROW
 from helion._compiler.cute.flash_row_epilogue import VEC
 from helion._compiler.cute.flash_row_epilogue import FlashRowEpilogueProgram
@@ -21,6 +22,9 @@ from helion._compiler.cute.flash_row_epilogue import RowEpilogueOp
 from helion._testing import DEVICE
 from helion._testing import skipUnlessCuteAvailable
 from helion._testing.cute_aux import cpu_codegen
+from helion._testing.flash_row_programs import match_row_program
+from helion._testing.flash_row_programs import row_accumulator
+from helion._testing.flash_row_programs import row_value
 import helion.language as hl
 
 pytest.importorskip("cutlass")
@@ -255,6 +259,158 @@ def _projection_residual(
     return out.view(q_in.size())
 
 
+@helion.kernel(backend="cute", static_shapes=True)
+def _bf16_scaled_gate(
+    q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor
+) -> torch.Tensor:
+    """``o * (v * 0.3)`` with the gate computed in bf16, which rounds it."""
+    m_dim = q_in.size(-2)
+    n_dim = k_in.size(-2)
+    head_dim = hl.specialize(q_in.size(-1))
+    q_view = q_in.reshape([-1, m_dim, head_dim])
+    v_view = v_in.reshape([-1, n_dim, head_dim])
+    k_view = k_in.reshape([-1, n_dim, head_dim])
+    out = torch.empty_like(q_view)
+    qk_scale = (1.0 / math.sqrt(head_dim)) * 1.44269504
+    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+        m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+        l_i = torch.full_like(m_i, 1.0)
+        acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+        qt = q_view[tile_b, tile_m, :]
+        for tile_n in hl.tile(v_view.size(1)):
+            kt = k_view[tile_b, tile_n, :]
+            qk = torch.bmm(qt * qk_scale, kt.transpose(1, 2), torch.float32)
+            m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+            qk = qk - m_ij[:, :, None]
+            p = torch.exp2(qk)
+            l_ij = torch.sum(p, -1)
+            alpha = torch.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, :, None]
+            vt = v_view[tile_b, tile_n, :]
+            acc = torch.baddbmm(acc, p.to(vt.dtype), vt)
+            m_i = m_ij
+        o = acc / l_i[:, :, None]
+        g = v_view[tile_b, tile_m, :] * 0.3
+        out[tile_b, tile_m, :] = (o * g).to(out.dtype)
+    return out.view(q_in.size())
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _bf16_gate_into_store(
+    q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor
+) -> torch.Tensor:
+    """``o.to(bf16) * v``: a bf16 product whose rounding is the store's."""
+    m_dim = q_in.size(-2)
+    n_dim = k_in.size(-2)
+    head_dim = hl.specialize(q_in.size(-1))
+    q_view = q_in.reshape([-1, m_dim, head_dim])
+    v_view = v_in.reshape([-1, n_dim, head_dim])
+    k_view = k_in.reshape([-1, n_dim, head_dim])
+    out = torch.empty_like(q_view)
+    qk_scale = (1.0 / math.sqrt(head_dim)) * 1.44269504
+    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+        m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+        l_i = torch.full_like(m_i, 1.0)
+        acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+        qt = q_view[tile_b, tile_m, :]
+        for tile_n in hl.tile(v_view.size(1)):
+            kt = k_view[tile_b, tile_n, :]
+            qk = torch.bmm(qt * qk_scale, kt.transpose(1, 2), torch.float32)
+            m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+            qk = qk - m_ij[:, :, None]
+            p = torch.exp2(qk)
+            l_ij = torch.sum(p, -1)
+            alpha = torch.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, :, None]
+            vt = v_view[tile_b, tile_n, :]
+            acc = torch.baddbmm(acc, p.to(vt.dtype), vt)
+            m_i = m_ij
+        o = acc / l_i[:, :, None]
+        out[tile_b, tile_m, :] = o.to(out.dtype) * v_view[tile_b, tile_m, :]
+    return out.view(q_in.size())
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _bf16_scaled_sum(
+    q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor
+) -> torch.Tensor:
+    """``o * sum(v * 0.3)`` in bf16: a rounded gate feeds a rounded sum."""
+    m_dim = q_in.size(-2)
+    n_dim = k_in.size(-2)
+    head_dim = hl.specialize(q_in.size(-1))
+    q_view = q_in.reshape([-1, m_dim, head_dim])
+    v_view = v_in.reshape([-1, n_dim, head_dim])
+    k_view = k_in.reshape([-1, n_dim, head_dim])
+    out = torch.empty_like(q_view)
+    qk_scale = (1.0 / math.sqrt(head_dim)) * 1.44269504
+    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+        m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+        l_i = torch.full_like(m_i, 1.0)
+        acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+        qt = q_view[tile_b, tile_m, :]
+        for tile_n in hl.tile(v_view.size(1)):
+            kt = k_view[tile_b, tile_n, :]
+            qk = torch.bmm(qt * qk_scale, kt.transpose(1, 2), torch.float32)
+            m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+            qk = qk - m_ij[:, :, None]
+            p = torch.exp2(qk)
+            l_ij = torch.sum(p, -1)
+            alpha = torch.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, :, None]
+            vt = v_view[tile_b, tile_n, :]
+            acc = torch.baddbmm(acc, p.to(vt.dtype), vt)
+            m_i = m_ij
+        o = acc / l_i[:, :, None]
+        g = v_view[tile_b, tile_m, :] * 0.3
+        s = torch.sum(g, dim=-1, keepdim=True)
+        out[tile_b, tile_m, :] = (o * s).to(out.dtype)
+    return out.view(q_in.size())
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _bf16_literal_rows(
+    q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor
+) -> torch.Tensor:
+    """Literals beside bf16 ``v``: compares against 0.3 and 0.0, a where
+    selecting 0.3 and a bf16 ``full`` of 0.3, and ``o`` times a compare."""
+    m_dim = q_in.size(-2)
+    n_dim = k_in.size(-2)
+    head_dim = hl.specialize(q_in.size(-1))
+    q_view = q_in.reshape([-1, m_dim, head_dim])
+    v_view = v_in.reshape([-1, n_dim, head_dim])
+    k_view = k_in.reshape([-1, n_dim, head_dim])
+    out = torch.empty_like(q_view)
+    qk_scale = (1.0 / math.sqrt(head_dim)) * 1.44269504
+    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
+        m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
+        l_i = torch.full_like(m_i, 1.0)
+        acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float32)
+        qt = q_view[tile_b, tile_m, :]
+        for tile_n in hl.tile(v_view.size(1)):
+            kt = k_view[tile_b, tile_n, :]
+            qk = torch.bmm(qt * qk_scale, kt.transpose(1, 2), torch.float32)
+            m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+            qk = qk - m_ij[:, :, None]
+            p = torch.exp2(qk)
+            l_ij = torch.sum(p, -1)
+            alpha = torch.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, :, None]
+            vt = v_view[tile_b, tile_n, :]
+            acc = torch.baddbmm(acc, p.to(vt.dtype), vt)
+            m_i = m_ij
+        o = acc / l_i[:, :, None]
+        v = v_view[tile_b, tile_m, :]
+        g = torch.where(v > 0.0, v, 0.3) * (v + torch.full_like(v, 0.3))
+        out[tile_b, tile_m, :] = (torch.where(v > 0.3, o, 0.0) + o * (v < 0.0) + g).to(
+            out.dtype
+        )
+    return out.view(q_in.size())
+
+
 def _ref_gated(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     y = torch.nn.functional.scaled_dot_product_attention(q, k, v).float()
     return (y * v.float()).to(q.dtype)
@@ -274,6 +430,34 @@ def _ref_projection_residual(
     y = torch.nn.functional.scaled_dot_product_attention(q, k, v).float()
     g = v.float()
     return (y * g - (y * g).sum(dim=-1, keepdim=True) * g).to(q.dtype)
+
+
+def _ref_bf16_scaled_gate(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    y = torch.nn.functional.scaled_dot_product_attention(q, k, v).float()
+    return (y * (v * 0.3).float()).to(q.dtype)
+
+
+def _ref_bf16_scaled_sum(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    y = torch.nn.functional.scaled_dot_product_attention(q, k, v).float()
+    return (y * (v * 0.3).sum(dim=-1, keepdim=True).float()).to(q.dtype)
+
+
+def _ref_bf16_gate_into_store(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    return torch.nn.functional.scaled_dot_product_attention(q, k, v) * v
+
+
+def _ref_bf16_literal_rows(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    y = torch.nn.functional.scaled_dot_product_attention(q, k, v).float()
+    g = torch.where(v > 0.0, v, 0.3) * (v + torch.full_like(v, 0.3))
+    return (torch.where(v > 0.3, y, 0.0) + y * (v < 0.0) + g).to(q.dtype)
 
 
 def _ref_xsa(
@@ -328,6 +512,61 @@ def test_row_program_detected_for_xsa_like_kernel() -> None:
     # The value-norm pass never reads the accumulator, so it can run before the loop.
     assert flash_row_epilogue.hoistable_passes(program) == 1
     assert program.op(program.output).op == "sub"
+
+
+def _expression(program: FlashRowEpilogueProgram, name: str) -> str:
+    """The program's value ``name`` as nested ops, a cast spelled as its
+    dtype (``bfloat16(...)``) and a reduction as its kind."""
+    op = program.op(name)
+    args = ", ".join(_expression(program, arg) for arg in op.inputs)
+    if op.op == "cast":
+        return f"{str(op.attrs[0]).removeprefix('torch.')}({args})"
+    if op.op == "const":
+        return repr(op.attrs[0])
+    if op.op == "reduce":
+        return f"{op.attrs[0]}({args})"
+    return f"{op.op}({args})" if args else op.op
+
+
+@pytest.mark.cpu_only
+def test_row_program_rounds_arithmetic_in_bf16() -> None:
+    # A bf16 product in the gate (``v * 0.3``) and a bf16 sum are rounded to
+    # bf16 as torch rounds them; the product feeding the store
+    # (``o.to(bf16) * v``) is left to the store's rounding.
+    expected = {
+        _bf16_scaled_gate: "mul(o_norm, bfloat16(mul(aux, 0.3)))",
+        _bf16_scaled_sum: "mul(o_norm, bfloat16(sum(bfloat16(mul(aux, 0.3)))))",
+        _bf16_gate_into_store: "mul(bfloat16(o_norm), aux)",
+        _gated_output: "mul(o_norm, float32(aux))",
+    }
+    with cpu_codegen():
+        for kernel, expression in expected.items():
+            bound = kernel.bind(_meta_args((2, 8, 1024, 64)))
+            assert bound.config_spec.cute_flash_search_enabled, kernel
+            program = _graph_plan(bound).row_epilogue
+            assert program is not None
+            assert _expression(program, program.output) == expression
+
+
+@pytest.mark.cpu_only
+def test_row_program_rounds_literals_while_binding() -> None:
+    # The matcher runs while the kernel binds, under fake-tensor mode with
+    # the arguments' device as the default, where a tensor's ``item()`` is
+    # an unbacked symbol.  The compare's literal, the where's literal branch
+    # and the bf16 constant are rounded there all the same, to
+    # bf16(0.3) = 0.30078125, and the compare ``o`` multiplies by is 0.0 or
+    # 1.0 in fp32.
+    with cpu_codegen():
+        bound = _bf16_literal_rows.bind(_meta_args((2, 8, 1024, 64)))
+        assert bound.config_spec.cute_flash_search_enabled
+        program = _graph_plan(bound).row_epilogue
+    assert program is not None
+    consts = [op.attrs[0] for op in program.ops if op.op == "const"]
+    assert consts.count(0.30078125) == 3 and 0.3 not in consts
+    (mask,) = [op.name for op in program.ops if op.op == "lt"]
+    assert [
+        op.attrs for op in program.ops if op.op == "cast" and op.inputs == (mask,)
+    ] == [(torch.float32,)]
 
 
 @skipUnlessCuteAvailable("requires the supported CuTe DSL")
@@ -517,6 +756,22 @@ class _Float32:
         return float(value)  # pyrefly: ignore [bad-argument-type]
 
 
+class _Narrow(float):
+    """A 16-bit register value of the emitted code."""
+
+
+def _narrow(dtype: torch.dtype) -> Callable[[object], _Narrow]:
+    """The ``cutlass.BFloat16`` / ``Float16`` conversion: rounds to ``dtype``."""
+    return lambda value: _Narrow(round_scalar(float(value), dtype))  # pyrefly: ignore [bad-argument-type]
+
+
+def _fp32_lanes(*operands: tuple[float, ...]) -> None:
+    """The packed ``f32x2`` ops take fp32 registers only: the DSL fails to
+    verify the instruction on a 16-bit or a Boolean operand."""
+    for operand in operands:
+        assert not any(isinstance(lane, (_Narrow, bool)) for lane in operand), operand
+
+
 def _run_emitted(
     program: FlashRowEpilogueProgram,
     o_row: list[float],
@@ -538,7 +793,17 @@ def _run_emitted(
     def packed_op(
         fn: Callable[[float, float], float],
     ) -> Callable[..., tuple[float, float]]:
-        return lambda x, y: (fn(x[0], y[0]), fn(x[1], y[1]))
+        def op(x: tuple[float, float], y: tuple[float, float]) -> tuple[float, float]:
+            _fp32_lanes(x, y)
+            return fn(x[0], y[0]), fn(x[1], y[1])
+
+        return op
+
+    def packed_fma(
+        x: tuple[float, float], y: tuple[float, float], c: tuple[float, float]
+    ) -> tuple[float, float]:
+        _fp32_lanes(x, y, c)
+        return x[0] * y[0] + c[0], x[1] * y[1] + c[1]
 
     namespace: dict[str, object] = {
         "alloc": lambda: [math.nan] * _CHUNK,
@@ -548,8 +813,8 @@ def _run_emitted(
         "store_out": store_out,
         "cutlass": types.SimpleNamespace(
             Float32=_Float32(),
-            BFloat16=_Float32(),
-            Float16=_Float32(),
+            BFloat16=_narrow(torch.bfloat16),
+            Float16=_narrow(torch.float16),
             range_constexpr=range,
             select_=lambda c, a, b: a if c else b,
         ),
@@ -569,10 +834,7 @@ def _run_emitted(
                 rcp=lambda x, approx=False, ftz=False: 1.0 / x,
             ),
             arch=types.SimpleNamespace(
-                fma_packed_f32x2=lambda x, y, c: (
-                    x[0] * y[0] + c[0],
-                    x[1] * y[1] + c[1],
-                ),
+                fma_packed_f32x2=packed_fma,
                 add_packed_f32x2=packed_op(operator.add),
                 sub_packed_f32x2=packed_op(operator.sub),
                 mul_packed_f32x2=packed_op(operator.mul),
@@ -727,6 +989,56 @@ def test_row_epilogue_emitter_folds_one_product_per_consumer(
         assert "fma" not in code
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("packed", (True, False))
+def test_row_epilogue_roundings_keep_fp32_lanes(packed: bool) -> None:
+    # o * bf16(a0 * 0.3) + bf16(sum(bf16(a0 * 0.3))): a cast to bf16 rounds
+    # and widens back to fp32, so the packed f32x2 products and the sum's
+    # packed accumulators read fp32 lanes holding the rounded values.
+    ops = [
+        _O,
+        _A0,
+        RowEpilogueOp("c", ROW, "const", (), (0.3,)),
+        _mul("g", "a0", "c"),
+        RowEpilogueOp("gr", VEC, "cast", ("g",), (torch.bfloat16,)),
+        _mul("m", "o", "gr"),
+        _reduce_sum("r", "gr"),
+        RowEpilogueOp("rr", ROW, "cast", ("r",), (torch.bfloat16,)),
+        RowEpilogueOp("s", VEC, "add", ("m", "rr")),
+    ]
+    program = _program(ops, "s", 1)
+    torch.manual_seed(0)
+    o_row = torch.randn(_HEAD_DIM, dtype=torch.float64).tolist()
+    aux_row = torch.randn(_HEAD_DIM, dtype=torch.float64).tolist()
+    result = _run_emitted(program, o_row, [aux_row], packed)
+    gates = [round_scalar(a * 0.3, torch.bfloat16) for a in aux_row]
+    total = round_scalar(sum(gates), torch.bfloat16)
+    expected = [x * g + total for x, g in zip(o_row, gates, strict=True)]
+    assert result == pytest.approx(expected, rel=1e-12, abs=1e-12)
+    prologue, epilogue = _emit(program, packed)
+    code = prologue + "\n" + epilogue
+    assert code.count("cutlass.BFloat16(") == code.count(
+        "cutlass.Float32(cutlass.BFloat16("
+    )
+    assert ("add_packed_f32x2(" in code) is packed
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("packed", (True, False))
+def test_row_epilogue_compare_operand_keeps_fp32_lanes(packed: bool) -> None:
+    # o * (o > 0.3): the matcher converts the compare to fp32 (0.0 or 1.0),
+    # so the packed product reads fp32 lanes rather than Booleans.
+    graph = torch.fx.Graph()
+    o = row_accumulator(graph)
+    mask = row_value(graph, torch.ops.aten.gt.Scalar, (o, 0.3), torch.bool)
+    value = row_value(graph, torch.ops.aten.mul.Tensor, (o, mask), torch.float32)
+    program = match_row_program(graph, o, value)
+    assert program is not None
+    torch.manual_seed(0)
+    o_row = torch.randn(_HEAD_DIM, dtype=torch.float64).tolist()
+    assert _run_emitted(program, o_row, [], packed) == [x * (x > 0.3) for x in o_row]
+
+
 @skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_row_epilogue_emitter_forms_agree_bitwise_on_the_xsa_program() -> None:
     # Same pairs, same accumulators, same folds: the two instruction forms
@@ -820,6 +1132,49 @@ def test_row_programs_with_folded_products_match_reference(
     )
     code = bound.to_code(config)
     assert "cute.arch.fma_packed_f32x2(" in code or kernel is _gated_output
+    out = bound.compile_config(config)(q, k, v)
+    torch.testing.assert_close(
+        out.float(), reference(q, k, v).float(), rtol=2e-2, atol=2e-2
+    )
+
+
+@pytest.mark.parametrize(
+    "kernel, reference",
+    (
+        pytest.param(_bf16_scaled_gate, _ref_bf16_scaled_gate, id="rounded_gate"),
+        pytest.param(_bf16_scaled_sum, _ref_bf16_scaled_sum, id="rounded_sum"),
+        pytest.param(
+            _bf16_gate_into_store, _ref_bf16_gate_into_store, id="rounded_operand"
+        ),
+        pytest.param(_bf16_literal_rows, _ref_bf16_literal_rows, id="literals"),
+    ),
+)
+@pytest.mark.parametrize("family", ("fa4", "row_mma"))
+def test_row_programs_that_round_to_bf16_match_reference(
+    kernel: helion.Kernel, reference: Callable[..., torch.Tensor], family: str
+) -> None:
+    # The FA4 output epilogue and the register-MMA row programs evaluate the
+    # program on packed f32x2 pairs: a rounding keeps its lanes fp32, which
+    # those ops take (a bf16 register fails the DSL's verifier there).
+    torch.manual_seed(0)
+    q = torch.randn(1, 4, 1024, 128, dtype=torch.bfloat16, device=DEVICE)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    bound = kernel.bind((q, k, v))
+    assert bound.config_spec.cute_flash_search_enabled
+    persistence = (
+        {"cute_flash_persistent": True, "cute_flash_epi_tma": True}
+        if family == "fa4"
+        else {"cute_flash_persistent": False}
+    )
+    config = bound._normalized_config_copy(
+        helion.Config(
+            block_sizes=[1, 128, 128], cute_flash_pipeline_family=family, **persistence
+        )
+    )
+    code = bound.to_code(config)
+    assert "cutlass.Float32(cutlass.BFloat16(" in code
+    assert "cute.arch.mul_packed_f32x2(" in code
     out = bound.compile_config(config)(q, k, v)
     torch.testing.assert_close(
         out.float(), reference(q, k, v).float(), rtol=2e-2, atol=2e-2

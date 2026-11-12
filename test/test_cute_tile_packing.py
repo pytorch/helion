@@ -210,3 +210,63 @@ def test_tile_pack_is_refused_under_l2_grouping() -> None:
             _row_scale.fn, backend="cute", static_shapes=True, config=config
         )
         torch.testing.assert_close(kernel(x, s), expected, rtol=0, atol=0)
+
+
+def _add_one_per_row(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for row in hl.grid(x.size(0)):
+        for a, b, c in hl.tile([x.size(1), x.size(2), x.size(3)]):
+            out[row, a, b, c] = x[row, a, b, c] + 1
+    return out
+
+
+def test_repair_packs_only_tiles_that_fit_one_block() -> None:
+    """Packing two tiles of 4 x 256 threads per CTA asked for 2048 threads,
+    and the launch fell back to the packed axis alone, ``block=(2, 1, 1)``:
+    each tile ran on one thread.  The autotuner's repair drops the pack, so
+    the tile launches its own threads and the output is exact."""
+    x = torch.randn(4, 64, 64, 256, device=DEVICE, dtype=torch.bfloat16)
+    drawn = helion.Config(
+        block_sizes=[32, 1, 256],
+        num_threads=[4, 0, 256],
+        loop_orders=[[2, 1, 0]],
+        flatten_loops=[True],
+        cute_vector_widths=[4, 8, 4, 4],
+        cute_lane_layouts=["blocked", "strided", "strided", "blocked"],
+        cute_tiles_per_block=2,
+    )
+    bound = helion.kernel(_add_one_per_row, backend="cute", static_shapes=True).bind(
+        (x,)
+    )
+    generation = ConfigGeneration(bound.config_spec)
+    repaired = generation.unflatten(generation.flatten(drawn))
+    assert repaired.config["cute_tiles_per_block"] == 1
+    assert "block=(256, 4, 1)" in bound.to_code(repaired)
+    bound.set_config(repaired)
+    torch.testing.assert_close(bound(x), x + 1, rtol=0, atol=0)
+
+
+def _add_one_below_rows(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    n, a, b = x.shape
+    for outer in hl.tile(n, block_size=1):
+        for ta, tb, tc in hl.tile([outer.begin, 0, 0], [outer.end, a, b]):
+            out[ta, tb, tc] = x[ta, tb, tc] + 1
+    return out
+
+
+def test_auto_counts_fit_beside_the_packed_tiles() -> None:
+    """Eight packed tiles of an auto-threaded 8 x 32 tile took 256 threads
+    each, 2048 together: the launch fell back to the packed axis alone
+    (``block=(8, 1, 1)``) and each tile ran on one thread.  The planner fits
+    the auto counts into the 128 threads the pack leaves each tile, and the
+    output is exact."""
+    x = torch.randn(64, 8, 32, device=DEVICE, dtype=torch.bfloat16)
+    config = helion.Config(
+        block_sizes=[1, 8, 32], num_threads=[1, 0, 0], cute_tiles_per_block=8
+    )
+    kernel = helion.kernel(
+        _add_one_below_rows, backend="cute", static_shapes=True, config=config
+    )
+    assert "block=(8, 8, 16)" in kernel.bind((x,)).to_code(config)
+    torch.testing.assert_close(kernel(x), x + 1, rtol=0, atol=0)

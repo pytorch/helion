@@ -37,6 +37,11 @@ from torch.fx import Node
 from ...language import _tracing_ops
 from ...language import memory_ops
 from ...language import view_ops
+from .dtypes import float_literal
+from .dtypes import narrow_common_dtype
+from .dtypes import promotion_operand
+from .dtypes import round_scalar
+from .math_templates import SIGMOID_TEMPLATE
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -94,6 +99,42 @@ _UNARY: dict[object, str] = {
     torch.ops.aten.reciprocal.default: "reciprocal",
     torch.ops.aten.square.default: "square",
 }
+_COMPARE_TARGETS: frozenset[object] = frozenset(
+    target
+    for target, name in _BINARY.items()
+    if name in ("gt", "lt", "ge", "le", "eq", "ne")
+)
+# Ops whose result is one of their value operands, its negation or magnitude,
+# or NaN (a select, a max or min, a clamp, a max with zero): a 16-bit float
+# type holds the result whenever it holds every value operand.
+_SELECTING_TARGETS: frozenset[object] = frozenset(
+    {
+        torch.ops.aten.neg.default,
+        torch.ops.aten.abs.default,
+        torch.ops.aten.relu.default,
+        torch.ops.aten.maximum.default,
+        torch.ops.aten.minimum.default,
+        torch.ops.aten.clamp_min.default,
+        torch.ops.aten.clamp_min.Tensor,
+        torch.ops.aten.clamp_max.default,
+        torch.ops.aten.clamp_max.Tensor,
+        torch.ops.aten.clamp.default,
+        torch.ops.aten.where.self,
+        torch.ops.aten.amax.default,
+        torch.ops.aten.amin.default,
+    }
+)
+# The ops the program computes a value with (``_rounded_result``).
+_COMPUTING_TARGETS: frozenset[object] = frozenset(
+    {
+        *_REDUCTIONS,
+        *_BINARY,
+        *_UNARY,
+        torch.ops.aten.where.self,
+        torch.ops.aten.clamp.default,
+        torch.ops.aten.pow.Tensor_Scalar,
+    }
+)
 _IDENTITY_TARGETS: frozenset[object] = frozenset(
     {
         torch.ops.aten.unsqueeze.default,
@@ -124,7 +165,8 @@ class RowEpilogueOp:
     ``op`` is one of the leaf kinds ``o_norm`` (normalized accumulator chunk),
     ``aux`` (extra tensor chunk, ``attrs=(index,)``), ``scalar`` (symbolic
     kernel argument, ``attrs=(index,)``), ``const`` (``attrs=(value,)``), or a
-    computed kind: ``cast`` (``attrs=(torch.dtype,)``), ``reduce``
+    computed kind: ``cast`` (``attrs=(torch.dtype,)``; it rounds to the type,
+    and the value stays fp32 like every other), ``reduce``
     (``attrs=("sum"|"amax"|"amin",)``), ``where``, ``clamp``, or a name from
     ``_BINARY`` / ``_UNARY`` / ``pow`` (``attrs=(exponent,)``).
     """
@@ -190,6 +232,65 @@ LAST_REJECTED: list[object] = []
 def _tensor_val(node: Node) -> torch.Tensor | None:
     value = node.meta.get("val")
     return value if isinstance(value, torch.Tensor) else None
+
+
+def _held_by(
+    arg: object, dtype: torch.dtype, common: torch.dtype | None = None
+) -> bool:
+    """Whether the 16-bit float type ``dtype`` holds the operand ``arg``: a
+    tensor of that type (every such value the program admits is one it
+    holds) or one ``_operands`` converts to it (``common``, the op's common
+    dtype: a 0-d fp32 tensor beside bf16), a literal it represents exactly,
+    or a masked repeat or absent bound (``None``)."""
+    if arg is None:
+        return True
+    if isinstance(arg, (int, float)) and not isinstance(arg, bool):
+        return round_scalar(arg, dtype) == float(arg)
+    value = promotion_operand(arg)
+    return isinstance(value, torch.Tensor) and dtype in (value.dtype, common)
+
+
+def _value_operands(node: Node) -> tuple[object, ...]:
+    """The operands of a ``_SELECTING_TARGETS`` node its result can be."""
+    if node.target is torch.ops.aten.where.self:
+        return tuple(node.args[1:3])
+    if node.target in _REDUCTIONS or node.target in _UNARY:
+        return tuple(node.args[:1])
+    return tuple(node.args[:3])
+
+
+def _rounded_result(node: Node) -> torch.dtype | None:
+    """The 16-bit float type the program rounds ``node``'s result to, as
+    torch rounds it, or None.  The program computes in fp32, so an op with a
+    16-bit result takes a cast to that type, unless its result is one of its
+    value operands, their negation or magnitude (``_SELECTING_TARGETS``) and
+    the type holds each of them: every 16-bit value the program computes is
+    one that type holds (a load, a cast, a constant rounded to its type, or
+    a selecting op of such values)."""
+    value = _tensor_val(node)
+    if (
+        node.target not in _COMPUTING_TARGETS
+        or value is None
+        or value.dtype not in (torch.float16, torch.bfloat16)
+    ):
+        return None
+    common = _operand_dtype(node)
+    if node.target in _SELECTING_TARGETS and all(
+        _held_by(arg, value.dtype, common) for arg in _value_operands(node)
+    ):
+        return None
+    return value.dtype
+
+
+def _operand_dtype(node: Node) -> torch.dtype | None:
+    """The 16-bit float type torch converts the operands of the binary
+    ``node`` to first, their common dtype (a 0-d fp32 tensor beside bf16),
+    or None."""
+    if node.target not in _BINARY:
+        return None
+    # A masked repeat (``None``, see ``_operands``) is the other operand.
+    lhs, rhs = node.args[:2]
+    return narrow_common_dtype(rhs if lhs is None else lhs, lhs if rhs is None else rhs)
 
 
 def _value_kind(node: Node, head_dim: int) -> str:
@@ -277,6 +378,8 @@ def match_flash_row_epilogue(
         return None
     ops: list[RowEpilogueOp] = []
     memo: dict[Node, str] = {}
+    # Operand conversions (``_operands``) by source value and dtype.
+    casts: dict[tuple[str, torch.dtype], str] = {}
     aux_names: list[str] = []
     aux_dtypes: list[torch.dtype] = []
     scalar_exprs: list[sympy.Expr] = []
@@ -290,9 +393,14 @@ def match_flash_row_epilogue(
         ops.append(RowEpilogueOp(name, kind, op, inputs, attrs))
         return name
 
-    def const(value: object) -> str:
+    def const(value: object, node: Node | None = None) -> str:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise _Unsupported
+        # A 16-bit tensor constant holds the value its dtype rounds it to: a
+        # bf16 ``full(..., 0.3)`` is 0.30078125.
+        tensor = None if node is None else _tensor_val(node)
+        if tensor is not None and tensor.dtype in (torch.float16, torch.bfloat16):
+            value = round_scalar(value, tensor.dtype)
         return emit(ROW, "const", (), (float(value),))
 
     def visit(node: Node) -> str:
@@ -330,13 +438,13 @@ def match_flash_row_epilogue(
                 scalar_exprs.append(expr)
             name = emit(ROW, "scalar", (), (index,))
         elif target is torch.ops.aten.scalar_tensor.default and node.args:
-            name = const(node.args[0])
+            name = const(node.args[0], node)
         elif target in (torch.ops.aten.full.default, _tracing_ops._new_var) or (
             target is torch.ops.aten.full and len(node.args) >= 2
         ):
             if target is _tracing_ops._new_var:
                 raise _Unsupported
-            name = const(node.args[1])
+            name = const(node.args[1], node)
         elif target in _IDENTITY_TARGETS or _is_identity_subscript(node):
             if not node.args or not isinstance(node.args[0], Node):
                 raise _Unsupported
@@ -406,7 +514,7 @@ def match_flash_row_epilogue(
         elif target in _BINARY:
             if len(node.args) != 2 or node.kwargs:
                 raise _Unsupported
-            operands = _operands(node)
+            operands = _operands(node, _operand_dtype(node))
             name = emit(_value_kind(node, head_dim), _BINARY[target], operands)
         elif target in _UNARY:
             if len(node.args) != 1 or node.kwargs or not isinstance(node.args[0], Node):
@@ -416,6 +524,8 @@ def match_flash_row_epilogue(
             )
         else:
             raise _Unsupported
+        if (dtype := _rounded_result(node)) is not None:
+            name = emit(_value_kind(node, head_dim), "cast", (name,), (dtype,))
         memo[node] = name
         return name
 
@@ -424,8 +534,63 @@ def match_flash_row_epilogue(
             return visit(arg)
         return const(arg)
 
-    def _operands(node: Node) -> tuple[str, ...]:
-        return tuple(_operand(arg) for arg in node.args)
+    def _cast(name: str, dtype: torch.dtype) -> str:
+        key = (name, dtype)
+        if key not in casts:
+            casts[key] = emit(_lookup(ops, name).kind, "cast", (name,), (dtype,))
+        return casts[key]
+
+    def _operands(node: Node, dtype: torch.dtype | None = None) -> tuple[str, ...]:
+        """Operands of a lowered pointwise node, each converted to ``dtype``,
+        the node's 16-bit common dtype, as torch converts it: a tensor of
+        another dtype, and in a compare a scalar too (``bf16 > 0.3`` tests
+        against ``bf16(0.3)``; arithmetic keeps a scalar's value).  A Boolean
+        value operand of a float result is 0.0 or 1.0 in fp32, as torch
+        promotes it: the packed ``f32x2`` ops take fp32 lanes only.
+        """
+        result = _tensor_val(node)
+        if (
+            result is not None
+            and result.dtype is torch.bool
+            and node.target in _BINARY
+            and node.target not in _COMPARE_TARGETS
+        ):
+            # Boolean arithmetic (``mask * mask``) has no fp32 lanes.
+            raise _Unsupported
+        resolved = []
+        for index, arg in enumerate(node.args):
+            if arg is None:
+                # An input the lowering does not read.
+                resolved.append(_operand(arg))
+                continue
+            operand = promotion_operand(arg)
+            if dtype is not None and isinstance(arg, (int, float)):
+                if node.target in _COMPARE_TARGETS and not isinstance(arg, bool):
+                    arg = round_scalar(arg, dtype)
+                resolved.append(_operand(arg))
+                continue
+            name = _operand(arg)
+            if (
+                isinstance(operand, torch.Tensor)
+                and operand.dtype is torch.bool
+                and result is not None
+                and result.dtype.is_floating_point
+                and not (node.target is torch.ops.aten.where.self and index == 0)
+            ):
+                name = _cast(name, torch.float32)
+            elif dtype is not None and (
+                (
+                    isinstance(operand, torch.Tensor)
+                    and operand.dtype not in (dtype, torch.bool)
+                )
+                or (
+                    node.target in _COMPARE_TARGETS
+                    and not isinstance(operand, (torch.Tensor, bool))
+                )
+            ):
+                name = _cast(name, dtype)
+            resolved.append(name)
+        return tuple(resolved)
 
     try:
         output = visit(store.args[2])
@@ -560,7 +725,12 @@ def render_op(op: RowEpilogueOp, atom: Callable[[str], str]) -> str:
     if kind == "cast":
         dtype = op.attrs[0]
         assert isinstance(dtype, torch.dtype)
-        return f"{_DTYPE_STR[dtype]}({a[0]})"
+        if dtype is torch.float32:
+            return f"cutlass.Float32({a[0]})"
+        # The program computes in fp32: a 16-bit cast rounds and widens back,
+        # so every lane stays an fp32 value, which the packed ``f32x2`` ops
+        # and the reduction accumulators require.
+        return f"cutlass.Float32({_DTYPE_STR[dtype]}({a[0]}))"
     if kind == "add":
         return f"({a[0]} + {a[1]})"
     if kind == "sub":
@@ -604,10 +774,7 @@ def render_op(op: RowEpilogueOp, atom: Callable[[str], str]) -> str:
         fn = "cute.math.max" if kind == "maximum" else "cute.math.min"
         return f"{fn}({a[0]}, {a[1]}, propagate_nan=True)"
     if kind == "sigmoid":
-        return (
-            f"cute.math.rcp(1.0 + cute.math.exp2(({a[0]}) * -1.4426950408889634, "
-            "fastmath=True), approx=True, ftz=True)"
-        )
+        return SIGMOID_TEMPLATE.format(x=a[0])
     if kind in _SCALAR_MATH:
         return _SCALAR_MATH[kind].format(a=a[0])
     raise AssertionError(f"unrenderable row epilogue op {kind!r}")
@@ -740,7 +907,7 @@ def emit_row_epilogue(
         if op.op == "scalar":
             return scalar_names[_attr_int(op)]
         if op.op == "const":
-            return f"cutlass.Float32({_attr_float(op)!r})"
+            return f"cutlass.Float32({float_literal(_attr_float(op))})"
         return var(name)
 
     def fill(

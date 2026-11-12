@@ -14,6 +14,8 @@ from typing import cast
 
 from ..ast_extension import clone_ast
 from ..ast_extension import statement_from_string
+from ..ast_read_writes import ReadWrites
+from ._ast_pass_utils import _canonical_name
 from ._ast_pass_utils import assigned_name
 from ._ast_pass_utils import names_read
 from ._ast_pass_utils import names_stored_or_deleted
@@ -327,15 +329,53 @@ def _packet(
     return name, call, width, dtype, roots
 
 
+def _bound_before(statements: list[ast.stmt], stop: int) -> set[str]:
+    """The names a scalar assignment binds before ``stop``, other than from a
+    load or a store (or a ``_cute_`` load, store or atomic helper), that no
+    later statement there writes.  The region a prefetch reads them in
+    checks its own stores apart, so a name bound by ``n = n + 1``, by ``c =
+    offs[0]`` or by ``c = k * 2`` before ``k = 1`` is as available as any:
+    a prefetch needs a bound name, not the definition that still spells its
+    value which ``fuse_two_pass_loads`` inlines into a key."""
+    bound: set[str] = set()
+    for statement in statements[:stop]:
+        bound -= set(ReadWrites.from_ast(statement).writes)
+        if (
+            isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+            and not any(
+                isinstance(node, ast.Call)
+                and (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr in ("load", "store")
+                    or isinstance(node.func, ast.Name)
+                    and node.func.id.startswith(
+                        ("_cute_load_", "_cute_store_", "_cute_atomic_")
+                    )
+                )
+                for node in ast.walk(statement.value)
+            )
+        ):
+            bound.add(statement.targets[0].id)
+    return bound
+
+
 def _index_context(
-    statements: list[ast.stmt], stop: int, constants: dict[str, int], proof: _Proof
+    statements: list[ast.stmt],
+    stop: int,
+    constants: dict[str, int],
+    proof: _Proof,
+    merged: set[str],
 ) -> _Context:
     """Read-only integer value snapshots before the producer sweep.
 
     The loop-bound prover supplies architectural coordinate ranges and rejects
     signed-index overflow. Analyze assignments in source order so a copied
     scalar keeps its old value after the original name is rebound. Do not run
-    its AST rewriter: the global tail masks must remain unchanged.
+    its AST rewriter: the global tail masks must remain unchanged. A name in
+    ``merged`` gets no snapshot: the final rename merges it with another name,
+    whose writes rebind it too (``stop_next = stop + 64`` rebinds ``stop``).
     """
     context = _Context()
     for name, integer in constants.items():
@@ -351,7 +391,7 @@ def _index_context(
         )
         for name in names_stored_or_deleted(statement):
             context.values.pop(name, None)
-        if target is not None and value is not None:
+        if target is not None and value is not None and target not in merged:
             context.values[target] = value
     return context
 
@@ -437,8 +477,14 @@ def prefetch_reduction_packets(
     reload_modes: dict[int, str],
     argument_names: set[str],
     proven_disjoint_tensor_pairs: set[frozenset[str]],
+    rename_groups: dict[str, str] | None = None,
 ) -> list[ast.stmt]:
-    """Prefetch at most one consumer packet in an explicit register-prefetch mode."""
+    """Prefetch at most one consumer packet in an explicit register-prefetch mode.
+
+    ``rename_groups`` maps each name to the name the final rename gives it:
+    the checks compare names through it, so ``start_next = start + 64``
+    writes ``start``.
+    """
     if (
         "register_prefetch" not in reload_modes.values()
         or os.environ.get("HELION_FUSER_MODE") is not None
@@ -456,14 +502,38 @@ def prefetch_reduction_packets(
         *_STORES,
         *_COLLECTIVES,
     }
-    if argument_names & reserved or names_stored_or_deleted(module) & (
-        reserved | tensors | set(constexpr_values)
-    ):
+    groups = rename_groups or {}
+
+    def canonical(names: set[str]) -> set[str]:
+        return {_canonical_name(name, groups) for name in names}
+
+    # The final rename makes a store of a name it merges into one of these a
+    # store of that name: ``stop_next = stop + 64`` rebinds the constexpr
+    # ``stop``.
+    if argument_names & reserved or canonical(
+        names_stored_or_deleted(module)
+    ) & canonical(reserved | tensors | set(constexpr_values)):
         return body
     classified = _containers(body, constexpr_values)
     if classified is None:
         return body
     private, lists, used_slots = classified
+
+    # Names the final rename merges with another name of the body. The move
+    # chooses and renames the statements it copies, and the packet's reads it
+    # rewrites, by spelling: a packet held under such a name or whose address
+    # depends on one is not moved, and such a name has no value for the
+    # single-trip proof.
+    spellings: dict[str, set[str]] = {}
+    for node in ast.walk(module):
+        if isinstance(node, ast.Name):
+            spellings.setdefault(_canonical_name(node.id, groups), set()).add(node.id)
+    merged = {name for names in spellings.values() if len(names) > 1 for name in names}
+    # The rename may rebind a private buffer or list to a tensor under another
+    # name of its group (``cache_next = weight`` makes ``cache`` the tensor),
+    # so a merged one is not private.
+    private -= merged
+    lists -= merged
     helper = _CuteFuseTwoPassLoads(
         constexpr_values,
         thread_block_dims,
@@ -482,7 +552,7 @@ def prefetch_reduction_packets(
         ):
             continue
         proof = _Proof(thread_block_dims)
-        context = _index_context(body, first_index, constexpr_values, proof)
+        context = _index_context(body, first_index, constexpr_values, proof, merged)
         domain = _domain(first, constexpr_values, proof=proof, context=context)
         other = _domain(last, constexpr_values, proof=proof, context=context)
         if domain is None or other is None or domain[2] != other[2]:
@@ -509,7 +579,7 @@ def prefetch_reduction_packets(
             argument_names
             | set(constexpr_values)
             | {"cute", "cutlass", "ir"}
-            | set(helper._pure_definitions_before(body, first_index))
+            | _bound_before(body, first_index)
         )
         induction = {cast("ast.Name", first.target).id} | (
             {domain[2][0]} if domain[2] else set()
@@ -522,10 +592,11 @@ def prefetch_reduction_packets(
                 for s in loop.body
                 if isinstance(s, ast.For)
             )
+        canonical_induction = canonical(induction)
         if any(
             isinstance(n, ast.Name)
             and isinstance(n.ctx, ast.Store)
-            and n.id in induction
+            and _canonical_name(n.id, groups) in canonical_induction
             and id(n) not in induction_targets
             for n in ast.walk(region_ast)
         ):
@@ -535,6 +606,8 @@ def prefetch_reduction_packets(
             if packet is None:
                 continue
             name, call, width, dtype, roots = packet
+            if name in merged:
+                continue
             if used_slots + slots * width > _CACHE_SLOTS or not _effects_safe(
                 region, private, lists, tensors, roots, proven_disjoint_tensor_pairs
             ):
@@ -571,6 +644,9 @@ def prefetch_reduction_packets(
             valid = True
             while needed:
                 current = needed.pop()
+                if current in merged:
+                    valid = False
+                    break
                 if current in selected or current in induction:
                     continue
                 if current in defs:
