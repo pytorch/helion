@@ -1451,6 +1451,10 @@ class TestCrossLoopScheduler(TestCase):
         )
         self.assertEqual(plan.readiness_counters, ())
         self.assertEqual(plan.root_barrier_edges, frozenset(((0, 1),)))
+        self.assertEqual(
+            set(plan.barrier_reasons.values()),
+            {"the producer's tensor has a data-dependent shape, stride or offset"},
+        )
 
         dynamic = build_static_pipeline_plan(
             dependency_graph=graph,
@@ -1462,6 +1466,37 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(dynamic.dispatch_mode, "dynamic")
         self.assertEqual(dynamic.root_barrier_edges, plan.root_barrier_edges)
         self.assertEqual(dynamic.root_barrier_arrival_count(0), 4)
+
+    def test_barrier_reasons_name_only_the_dependencies_without_counters(self) -> None:
+        # tmp_0's dependency has an exact counter, tmp_1's has none: the barrier
+        # tmp_1 forces also orders tmp_0, which is not reported as a cause.
+        graph = _dependency_graph(
+            [[10], [20]],
+            _access(root=0, kind="store", block_id=10),
+            _access(root=1, kind="load", block_id=20),
+            _access(root=0, kind="store", block_id=10, allocation_id=1, exact=False),
+            _access(root=1, kind="load", block_id=20, allocation_id=1, exact=False),
+        )
+        roots, sites = instantiate_coordinate_domains(
+            graph, axis_geometry={10: (4, 16), 20: (4, 16)}
+        )
+        assert all(root is not None for root in roots)
+        root_domains = tuple(root for root in roots if root is not None)
+        plan = build_static_pipeline_plan(
+            dependency_graph=graph,
+            root_task_orders=tuple(_dense(root) for root in root_domains),
+            site_domains=sites,
+            worker_count=4,
+        )
+        self.assertEqual(plan.root_barrier_edges, frozenset(((0, 1),)))
+        allocations = {
+            dependency.dependency_id: edge.allocation_id
+            for edge in graph.edges
+            for dependency in edge.access_dependencies
+        }
+        self.assertEqual(
+            {allocations[dependency] for dependency, *_ in plan.barrier_reasons}, {1}
+        )
 
     def test_exhausted_relation_budget_uses_root_barrier(self) -> None:
         graph = _dependency_graph(
@@ -1484,6 +1519,9 @@ class TestCrossLoopScheduler(TestCase):
 
         self.assertEqual(plan.readiness_counters, ())
         self.assertEqual(plan.root_barrier_edges, frozenset(((0, 1),)))
+        self.assertEqual(
+            set(plan.barrier_reasons.values()), {"the scheduler's work budget ran out"}
+        )
 
     def test_relation_budget_degrades_monotonically_to_root_barrier(self) -> None:
         budgets = (0, 1, 2, 4, 8, 12, 16, 32, 64, 128, 192)

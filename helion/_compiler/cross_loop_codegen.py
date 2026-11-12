@@ -23,6 +23,8 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
+from .cross_loop_report import log_root_barriers
+from .cross_loop_report import log_schedule
 from .cross_loop_scheduler import CrossLoopDispatchMode
 from .cross_loop_scheduler import ReadinessConsumer
 from .cross_loop_scheduler import ReadinessCounterPlan
@@ -2377,6 +2379,13 @@ def emit_cross_loop_schedule(
         ),
         prove_nonnegative=CompileEnvironment.current().known_nonnegative,
         cross_loop_dispatch_mode=dispatch_mode,
+    )
+    device_ir = HostFunction.current().device_ir
+    log_root_barriers(
+        static_pipeline_plan, dependency_graph, device_ir, device_function.name
+    )
+    log_schedule(
+        static_pipeline_plan, dependency_graph, device_ir, device_function.name
     )
     # StaticPipelinePlan accepts only a fixed physical task universe.  Convert
     # task-family offsets only after that invariant has been established.

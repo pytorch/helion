@@ -2691,17 +2691,25 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         x = torch.arange(32 * 32, device=DEVICE, dtype=torch.float32).reshape(32, 32)
         for pipeline in ("static", "dynamic"):
             with self.subTest(pipeline=pipeline):
-                for launch in range(2):
-                    code, out = code_and_output(
-                        nested_two_axis_consumer,
-                        (x + launch,),
-                        block_sizes=[8, 8],
-                        pid_type="persistent_blocked",
-                        cross_loop_pipeline=pipeline,
-                        num_sm_multiplier=1,
-                        num_warps=1,
-                    )
-                    torch.testing.assert_close(out, ((x + launch) + 1) * 2)
+                with self.assertLogs("helion.megakernel", "INFO") as logs:
+                    for launch in range(2):
+                        code, out = code_and_output(
+                            nested_two_axis_consumer,
+                            (x + launch,),
+                            block_sizes=[8, 8],
+                            pid_type="persistent_blocked",
+                            cross_loop_pipeline=pipeline,
+                            num_sm_multiplier=1,
+                            num_warps=1,
+                        )
+                        torch.testing.assert_close(out, ((x + launch) + 1) * 2)
+                report = "\n".join(logs.output)
+                # The barrier, the store and load it orders, and why.
+                self.assertIn("waits for every task of root 0", report)
+                self.assertIn("tmp stored at line", report)
+                self.assertIn("tmp loaded at line", report)
+                self.assertIn("the nested loop's wait has no supported counter", report)
+                self.assertIn("root 0 -> root 1 (tmp): root barrier", report)
                 self.assertNotIn("tile_dependency_nested_loop_wait", code)
                 self.assertIn("tile_dependency_root_barrier_wait", code)
                 self.assertEqual(
