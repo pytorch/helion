@@ -7,11 +7,18 @@ import logging
 import os
 from pathlib import Path
 import tempfile
+from typing import TYPE_CHECKING
 import unittest
+from unittest.mock import Mock
 
 import pytest
 
+from helion import exc
+from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.config_spec import SearchDimensionInfo
+from helion.autotuner.handoff import _HandoffStop
+from helion.autotuner.logger import AutotuningLogger
+from helion.autotuner.metrics import AutotuneMetrics
 from helion.autotuner.search_space_logger import DimensionStats
 from helion.autotuner.search_space_logger import SearchSpaceReport
 from helion.autotuner.search_space_logger import SearchSpaceTracker
@@ -19,6 +26,10 @@ from helion.autotuner.search_space_logger import _dimension_from_info
 from helion.autotuner.search_space_logger import analyze_search_space
 from helion.autotuner.search_space_logger import canonical_config_id
 from helion.runtime.config import Config
+from helion.runtime.settings import Settings
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 pytestmark = pytest.mark.cpu_only
 
@@ -633,6 +644,91 @@ class TestConfigOverridesAndACF(unittest.TestCase):
         acf = next(d for d in report.dimensions if d.name == "advanced_controls_file")
         self.assertEqual(acf.cardinality, 1)
         self.assertEqual(acf.possible_values, ["a.acf"])
+
+
+def _no_config() -> Config:
+    raise exc.NoConfigFound
+
+
+def _fake_search(settings: Settings, autotune: Callable[[], Config]) -> BaseSearch:
+    """object.__new__(BaseSearch) with only the attributes the logging path reads."""
+    search = object.__new__(BaseSearch)
+    search.settings = settings
+    search.log = AutotuningLogger(settings)
+    search.args = ()
+    search.kernel = Mock()
+    search.kernel.format_kernel_decorator.return_value = "@helion.kernel(...)"
+    search.kernel.get_cached_path.return_value = None
+    search.kernel.is_cacheable.return_value = False
+    search.benchmark_provider = Mock()
+    search.benchmark_provider.compile_deadline_cascade.return_value = None
+    search._prepare = Mock()
+    search._search_space_tracker = SearchSpaceTracker(
+        _report(dimensions=[_dim("num_warps", 6, [1, 2, 4, 8, 16, 32])])
+    )
+    search._autotune_metrics = AutotuneMetrics()
+    search._finalize_autotune_metrics = Mock()
+    search._autotune = autotune
+    return search
+
+
+class TestReportOnSearchFailure(unittest.TestCase):
+    """The end-of-run report must also be emitted when the search raises."""
+
+    def test_failed_search_still_logs_report(self) -> None:
+        search = _fake_search(Settings(autotune_log_search_space=True), _no_config)
+        with (
+            self.assertLogs(search.log._logger, level="INFO") as captured,
+            self.assertRaises(exc.NoConfigFound),
+        ):
+            search.autotune()
+        joined = "\n".join(captured.output)
+        self.assertIn("Autotune Search Space Analysis", joined)
+        self.assertIn("Outcome: failed (NoConfigFound)", joined)
+
+    def test_handoff_stop_logs_report_with_handoff_outcome(self) -> None:
+        def handoff_stop() -> Config:
+            raise _HandoffStop
+
+        search = _fake_search(Settings(autotune_log_search_space=True), handoff_stop)
+        with (
+            self.assertLogs(search.log._logger, level="INFO") as captured,
+            self.assertRaises(_HandoffStop),
+        ):
+            search.autotune()
+        joined = "\n".join(captured.output)
+        self.assertIn("Autotune Search Space Analysis", joined)
+        self.assertIn("Outcome: handoff", joined)
+
+    def test_successful_search_logs_report_once(self) -> None:
+        config = Config(block_sizes=[32], num_warps=4)
+        search = _fake_search(Settings(autotune_log_search_space=True), lambda: config)
+        search._search_space_tracker.record_config(
+            _FakeConfig(block_sizes=[32], loop_orders=[0], num_warps=4)
+        )
+        with self.assertLogs(search.log._logger, level="INFO") as captured:
+            self.assertIs(search.autotune(), config)
+        joined = "\n".join(captured.output)
+        self.assertEqual(joined.count("Autotune Search Space Analysis"), 1)
+        self.assertIn("Autotuning complete", joined)
+        self.assertNotIn("Outcome:", joined)
+
+    def test_failed_search_saves_report_with_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            search = _fake_search(
+                Settings(
+                    autotune_log_search_space=True,
+                    autotune_log_search_space_path=os.path.join(d, "out.json"),
+                ),
+                _no_config,
+            )
+            with self.assertRaises(exc.NoConfigFound):
+                search.autotune()
+            data = json.loads(
+                Path(os.path.join(d, "out.kernel_under_test.json")).read_text()
+            )
+        self.assertEqual(data["outcome"], "failed")
+        self.assertEqual(data["error_type"], "NoConfigFound")
 
 
 if __name__ == "__main__":
