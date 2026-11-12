@@ -1,4 +1,4 @@
-"""CPU codegen tests: the loads-first split of a grid lane loop is bounded.
+"""CPU codegen tests: the trace-time unrolls of a lane loop are bounded.
 
 ``cute/split_lane_loads.py`` rewrites a vectorized grid lane loop, which walks
 ``U = block_size / (num_threads * V)`` packets per thread, into a load phase
@@ -12,7 +12,9 @@ threads gave ``range_constexpr(131072)``, which never finished compiling.  So
 does one whose copies would trace more than ``_MAX_UNROLLED_STATEMENTS``
 statements (a long body costs far more per element than a short one), and a
 lane body holding a rolled loop, which every trace-time copy (of the split or
-of the ``cute_lane_unroll`` unroll) would repeat.
+of the ``cute_lane_unroll`` unroll) would repeat.  The forced full unroll of
+a cross-lane fold's lane loop, the fallback when its loads-first form
+declines, refuses a loop past the same lane and statement bounds.
 """
 
 from __future__ import annotations
@@ -26,10 +28,14 @@ import pytest
 import torch
 
 import helion
+from helion import exc
 from helion._compiler.ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from helion._compiler.cute.split_lane_loads import _MAX_SPLIT_ELEMENTS
+from helion._compiler.cute.split_lane_loads import _lane_width
 from helion._compiler.cute.unroll_lane_loads import _MAX_UNROLLED_LANES
+from helion._compiler.cute.unroll_lane_loads import _MAX_UNROLLED_STATEMENTS
 from helion._compiler.cute.unroll_lane_loads import _trace_size
+from helion._compiler.cute.unroll_lane_loads import unroll_lane_loads
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
@@ -355,3 +361,88 @@ def test_trace_size_counts_literal_constexpr_ranges() -> None:
     body = "for v in cutlass.range_constexpr({}):\n    x = y\n"
     assert _trace_size(ast.parse(body.format("2, 10, 2")).body) == 1 + 4
     assert _trace_size(ast.parse(body.format("cute.size(t)")).body) == 1 + 1
+
+
+@pytest.mark.parametrize(
+    ("lanes", "width", "terms", "unrolled"),
+    [
+        # 64 lanes of a 16-element one-term fold: 1088 statements.
+        (64, 16, 1, True),
+        (32, 16, 8, True),
+        # 64 lanes of 16 elements of eight terms: past the statement bound.
+        (64, 16, 8, False),
+    ],
+)
+def test_forced_fold_unroll_stays_within_the_unroll_bounds(
+    lanes: int, width: int, terms: int, unrolled: bool
+) -> None:
+    # The cases straddle the statement bound, which the trace's time follows,
+    # not the elements: the first fold has as many as the last.
+    assert unrolled == (
+        lanes <= _MAX_UNROLLED_LANES
+        and lanes * (1 + width * terms) <= _MAX_UNROLLED_STATEMENTS
+    )
+    # A lane body without loads: the loads-first form declines, so the forced
+    # unroll of the fold's lane loop falls back to unrolling it in place.
+    source = "\n".join(
+        [
+            f"for lane_0 in range({lanes}):",
+            f"    for v in cutlass.range_constexpr({width}):",
+            *(f"        acc = acc + lane_0 * v * {term}" for term in range(terms)),
+        ]
+    )
+    (loop,) = ast.parse(source).body
+    setattr(loop, HELION_LANE_LOOP_VAR_ATTR, "lane_0")
+    if not unrolled:
+        with pytest.raises(exc.BackendUnsupported, match="statements unrolled"):
+            unroll_lane_loads([loop], 1, lambda name: name, forced_full={"lane_0"})
+        return
+    body, fired = unroll_lane_loads(
+        [loop], 1, lambda name: name, forced_full={"lane_0"}
+    )
+    assert not fired
+    assert f"for lane_0 in cutlass.range_constexpr({lanes}):" in ast.unparse(body)
+
+
+@pytest.mark.parametrize("bounds", ["16", "0, 16", "15, -1, -1", "0, 32, 2", "V"])
+def test_lane_width_counts_every_spelling_of_a_constexpr_range(bounds: str) -> None:
+    """A lane's 16 elements, whatever the spelling of its V-loop's range: a
+    start, a negative or larger step, a constexpr bound."""
+    loop = ast.parse(f"for v in cutlass.range_constexpr({bounds}):\n    x = y\n").body
+    assert _lane_width(loop, {"V": 16}) == 16
+
+
+@pytest.mark.parametrize("statements", [400, 640])
+def test_forced_loads_first_unroll_stays_within_the_statement_bound(
+    statements: int,
+) -> None:
+    # 16 lanes, each loading one 16-wide packet ahead of the statements: the
+    # loads-first form of the fold's forced unroll holds 16 packets, within
+    # ``_MAX_LIVE_PACKETS``.  With 400 its copies stay within the statement
+    # bound and it takes that form; with 640 they would trace past it, so it
+    # declines, and the in-place fallback refuses the loop.
+    packet = (
+        "    packet = cute.arch.load(x.iterator + lane_0 * 16,"
+        " ir.VectorType.get([16], cutlass.Float32.mlir_type))"
+    )
+    source = "\n".join(
+        [
+            "for lane_0 in range(16):",
+            packet,
+            *(f"    acc = acc + packet[{i % 16}] * {i}" for i in range(statements)),
+        ]
+    )
+    (loop,) = ast.parse(source).body
+    setattr(loop, HELION_LANE_LOOP_VAR_ATTR, "lane_0")
+    size = _trace_size(loop.body)
+    assert size is not None
+    if 16 * size <= _MAX_UNROLLED_STATEMENTS:
+        assert statements == 400
+        body, _fired = unroll_lane_loads(
+            [loop], 1, lambda name: name, forced_full={"lane_0"}
+        )
+        assert "_lane_unroll_loads_0" in ast.unparse(ast.Module(body, []))
+    else:
+        assert statements == 640
+        with pytest.raises(exc.BackendUnsupported, match="statements unrolled"):
+            unroll_lane_loads([loop], 1, lambda name: name, forced_full={"lane_0"})

@@ -1315,6 +1315,7 @@ def _normalize_cute_vector_reductions(
         "cute_replicated_reduction",
         "cute_vector_packet_unroll",
         "cute_grid_lane_jam",
+        "cute_scratch_forwarding",
     ):
         if key in config and type(config[key]) is not bool:
             if fix_invalid:
@@ -4004,10 +4005,19 @@ def cute_flat_fields(
                 "cute_vector_packet_unroll",
                 "cute_unpadded_rows",
                 "cute_grid_lane_jam",
+                "cute_scratch_forwarding",
             ):
+                # A workspace a later sweep reads back beside the lane jam's
+                # operand opens ``cute_scratch_forwarding``: the kernel's
+                # structure, so the search space is the same at every extent
+                # (its twin seeds it only where the jam seed's reloads stay
+                # in registers).
                 seeded = any(
                     seed.config.get(key) is True
                     for seed in config_spec.compiler_seed_configs
+                ) or (
+                    key == "cute_scratch_forwarding"
+                    and config_spec.cute_scratch_forwarding_sites
                 )
                 fields[key] = EnumFragment(
                     (False, True),
@@ -4047,9 +4057,14 @@ def cute_flat_fields(
                 cast("int", seed.config.get("cute_lane_unroll", 1)) > 1
                 for seed in config_spec.compiler_seed_configs
             )
+            # A reduction over a strided full slice opens both knobs at every
+            # extent: the strided seeds that sink it fit only some extents,
+            # and a knob only they opened would change the search space
+            # (``structural_fingerprint``) between shapes.
+            sink_open = sink_seeded or config_spec.cute_strided_reduction_sites
             fields["cute_vloop_sink"] = EnumFragment(
                 (False, True),
-                search_choices=(False, True) if sink_seeded else (False,),
+                search_choices=(False, True) if sink_open else (False,),
             )
             # A lone persistent row walks synthetic lanes at many extents
             # and threads (``CutePersistentLaneUnrollHeuristic`` seeds the
@@ -4058,7 +4073,7 @@ def cute_flat_fields(
             fields["cute_lane_unroll"] = EnumFragment(
                 _CUTE_LANE_UNROLL_CHOICES,
                 search_choices=_CUTE_LANE_UNROLL_CHOICES
-                if sink_seeded
+                if sink_open
                 or unroll_seeded
                 or cute_lone_row_reduction(config_spec) is not None
                 else (1,),
@@ -4440,8 +4455,10 @@ def prepare_flat_config(config_spec: ConfigSpec, config: dict[str, object]) -> N
 # triton's evict_last equivalent, which keeps up to ~L2-size of a streaming
 # input resident across other traffic (+1.7% on fp32 elementwise mul on B200).
 # Matching explicit L1/L2 priorities preserve a packet for later row passes or
-# evict it after its final use.  Both reach 16-, 8- and 4-byte packets; 32-byte
-# packets (SM100+) only under the cute_wide_packet_hints knob.
+# evict it after its final use.  Both reach 16-, 8- and 4-byte packets; the
+# unpredicated 32-byte packet (SM100+) only under the cute_wide_packet_hints
+# knob, while the predicated packets of a masked row strip carry them at every
+# width up to 64 bytes.
 CUTE_EVICTION_POLICIES: tuple[str, ...] = (
     "",
     "first",

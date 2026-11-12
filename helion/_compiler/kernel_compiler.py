@@ -84,6 +84,8 @@ class KernelCompiler:
                 if rewrite_ast:
                     hf.backend_rewrote_ast = self.customize_ast(hf)
                 self.propagate_types(hf)
+                # Before lowering, whose analyses ask for it.
+                self.find_kernel_local_scratch(hf)
                 self.env.check_config_values_unspecialized()
                 self.finalize_config()
                 self.lower(hf)
@@ -145,6 +147,12 @@ class KernelCompiler:
         """
         with measure("HostFunction.customize_ast"):
             return self.backend.customize_ast(hf)
+
+    def find_kernel_local_scratch(self, hf: HostFunction) -> None:
+        from .scratch_tensors import find_kernel_local_scratch
+
+        with measure("HostFunction.find_kernel_local_scratch"):
+            find_kernel_local_scratch(hf)
 
     def propagate_types(self, hf: HostFunction) -> None:
         from .type_propagation import propagate_types

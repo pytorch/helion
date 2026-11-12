@@ -71,6 +71,49 @@ def test_a_head_invariant_store_is_bitwise_the_rolled_head_loop() -> None:
     torch.testing.assert_close(results[1], expected, rtol=0, atol=0)
 
 
+def test_forwarded_head_rows_are_bitwise_the_rolled_head_loop() -> None:
+    # Register reloads and a forwarded workspace: each lane's copy of the
+    # caches holds what its own store wrote, read back through the move.
+    torch.manual_seed(0)
+    scores = torch.randn(16, 4, 512, device=DEVICE, dtype=torch.bfloat16) * 4
+    grad = torch.randn(16, 4, 512, device=DEVICE, dtype=torch.bfloat16)
+    bias = head_bias(8, 4, 512, DEVICE)
+    logits = scores.float() + bias.repeat(2, 1, 1)
+    row_max = logits.amax(-1)
+    row_sum = torch.exp(logits - row_max[..., None]).sum(-1)
+    args = (grad, scores, bias, row_max, row_sum)
+    kernels = [
+        helion.kernel(
+            head_bias_softmax_bwd,
+            backend="cute",
+            static_shapes=True,
+            config=helion.Config(
+                **{
+                    **HEAD_ROWS_CONFIG,
+                    "cute_reduction_reloads": ["register"],
+                    "cute_scratch_forwarding": True,
+                    "cute_grid_lane_jam": jam,
+                }
+            ),
+        )
+        for jam in (False, True)
+    ]
+    rolled, jammed = (kernel.bind(args).to_code() for kernel in kernels)
+    assert jammed != rolled
+    assert "mov.b32" in jammed
+    assert not [
+        line
+        for line in jammed.splitlines()
+        if "probs_ws.iterator" in line and ".load()" in line
+    ]
+    results = [kernel(*args) for kernel in kernels]
+    assert torch.equal(results[1].view(torch.int16), results[0].view(torch.int16))
+    probs = torch.exp(logits - row_max[..., None]) / row_sum[..., None]
+    total = (grad.float() * probs).sum(-1, keepdim=True)
+    reference = probs * (grad.float() - total)
+    torch.testing.assert_close(results[1].float(), reference, rtol=2e-2, atol=1e-3)
+
+
 @pytest.mark.parametrize("kept", [False, True])
 def test_jammed_rows_are_bitwise_the_rolled_row_loop(kept: bool) -> None:
     # ``kept``: the rows also load a boolean mask per element.
@@ -109,42 +152,82 @@ def test_rows_updated_in_place_are_bitwise_the_rolled_head_loop() -> None:
     torch.testing.assert_close(results[1], x * 2, rtol=0, atol=0)
 
 
+def _head_rows_inputs(
+    keys: int,
+) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+    """``head_bias_softmax_bwd``'s arguments over 16 rows of four queries
+    and ``keys`` keys, and the eager result."""
+    torch.manual_seed(0)
+    scores = torch.randn(16, 4, keys, device=DEVICE, dtype=torch.bfloat16) * 4
+    grad = torch.randn(16, 4, keys, device=DEVICE, dtype=torch.bfloat16)
+    bias = head_bias(8, 4, keys, DEVICE)
+    logits = scores.float() + bias.repeat(2, 1, 1)
+    row_max = logits.amax(-1)
+    row_sum = torch.exp(logits - row_max[..., None]).sum(-1)
+    probs = torch.exp(logits - row_max[..., None]) / row_sum[..., None]
+    total = (grad.float() * probs).sum(-1, keepdim=True)
+    reference = probs * (grad.float() - total)
+    return (grad, scores, bias, row_max, row_sum), reference
+
+
+def _assert_head_rows_jam_is_bitwise(
+    config: dict[str, object], args: tuple[torch.Tensor, ...], reference: torch.Tensor
+) -> None:
+    """``config`` with and without ``cute_grid_lane_jam`` stores the same
+    bits, and matches eager."""
+    results = [
+        helion.kernel(
+            head_bias_softmax_bwd,
+            backend="cute",
+            static_shapes=True,
+            config=helion.Config(**{**config, "cute_grid_lane_jam": jam}),
+        )(*args)
+        for jam in (False, True)
+    ]
+    assert torch.equal(results[1].view(torch.int16), results[0].view(torch.int16))
+    torch.testing.assert_close(results[1].float(), reference, rtol=2e-2, atol=1e-3)
+
+
 @pytest.mark.parametrize(
     "knobs",
     [
         {},
         {"block_sizes": [8, 1]},
         {"cute_reduction_reloads": ["register"]},
+        {"cute_reduction_reloads": ["register"], "cute_vector_widths": [4, 1, 1]},
     ],
-    ids=["four_heads", "eight_heads", "register_reloads"],
+    ids=["four_heads", "eight_heads", "register_reloads", "four_keys_per_thread"],
 )
 def test_head_rows_are_bitwise_the_rolled_head_loop(knobs: dict[str, object]) -> None:
     # Eight heads: two packets of four fp32 bias elements per key; register
-    # reloads: a register cache per lane.
-    torch.manual_seed(0)
-    scores = torch.randn(16, 4, 512, device=DEVICE, dtype=torch.bfloat16) * 4
-    grad = torch.randn(16, 4, 512, device=DEVICE, dtype=torch.bfloat16)
-    bias = head_bias(8, 4, 512, DEVICE)
-    logits = scores.float() + bias.repeat(2, 1, 1)
-    row_max = logits.amax(-1)
-    row_sum = torch.exp(logits - row_max[..., None]).sum(-1)
-    args = (grad, scores, bias, row_max, row_sum)
-    results = [
-        helion.kernel(
-            head_bias_softmax_bwd,
-            backend="cute",
-            static_shapes=True,
-            config=helion.Config(
-                **{**HEAD_ROWS_CONFIG, **knobs}, cute_grid_lane_jam=jam
-            ),
-        )(*args)
-        for jam in (False, True)
+    # reloads: a register cache per lane; four keys per thread: the jam
+    # seed's alternate, each lane's keys loaded in packets.
+    args, reference = _head_rows_inputs(512)
+    _assert_head_rows_jam_is_bitwise({**HEAD_ROWS_CONFIG, **knobs}, args, reference)
+
+
+@pytest.mark.parametrize("keys_per_thread", [4, 8])
+def test_the_wide_seeds_are_bitwise_the_rolled_head_loop(keys_per_thread: int) -> None:
+    # The jam seed's alternates as the heuristic plants them for T5's
+    # 1024-key rows: 128 threads of four keys (two packets each in the
+    # chunk) or eight fill a 1024-key chunk.  Before sm_100 a lane loads at
+    # most 16 bytes whole, and the eight-key seed is not planted.
+    if keys_per_thread == 8 and torch.cuda.get_device_capability() < (10, 0):
+        pytest.skip("the eight-key seed needs 32-byte packets (sm_100)")
+    args, reference = _head_rows_inputs(1024)
+    bound = helion.kernel(
+        head_bias_softmax_bwd, backend="cute", static_shapes=True
+    ).bind(args)
+    (seed,) = [
+        seed.config
+        for seed in bound.config_spec.compiler_seed_configs
+        if seed.config.get("cute_grid_lane_jam")
+        and seed.config.get("cute_vector_widths") == [keys_per_thread, 1, 1]
+        and not seed.config.get("cute_scratch_forwarding")
     ]
-    assert torch.equal(results[1].view(torch.int16), results[0].view(torch.int16))
-    probs = torch.exp(logits - row_max[..., None]) / row_sum[..., None]
-    total = (grad.float() * probs).sum(-1, keepdim=True)
-    reference = probs * (grad.float() - total)
-    torch.testing.assert_close(results[1].float(), reference, rtol=2e-2, atol=1e-3)
+    assert seed["num_threads"] == [1, 1, 128]
+    assert seed["reduction_loops"] == [1024]
+    _assert_head_rows_jam_is_bitwise(seed, args, reference)
 
 
 def test_rows_read_back_after_an_in_place_store_match_eager() -> None:

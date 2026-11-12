@@ -37,6 +37,7 @@ DEVICE_BODY_PROLOGUE_NAMES = [
 DEVICE_BODY_PASS_NAMES = [
     "finalize_shared_reduce_groups",
     "fuse_two_pass_loads",
+    "drop_scratch_stores",
     "vectorize_branch_local_persistent_fragments",
     "hoist_warp_reduce_from_vloop",
     "eliminate_duplicate_cluster_maxima",
@@ -66,7 +67,9 @@ DEVICE_BODY_PASS_NAMES = [
     "hoist_packed_factored_reductions",
     "pack_bf16_recurrences",
     "divide_vector_bases",
+    "peel_partial_chunks",
     "simplify_proven_loop_bounds",
+    "merge_unproven_peels",
     "simplify_proven_bounds",
     "fuse_cluster_online_pair",
     "lower_register_row_reduction",

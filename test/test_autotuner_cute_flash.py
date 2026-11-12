@@ -8180,6 +8180,7 @@ class TestCuteAutotuner(TestCase):
                 "cute_lane_unroll",
                 "cute_unpadded_rows",
                 "cute_grid_lane_jam",
+                "cute_scratch_forwarding",
                 "cute_pdl",
                 "cute_pdl_release",
                 "cute_pdl_spread",

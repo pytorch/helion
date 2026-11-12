@@ -76,6 +76,7 @@ from ... import exc
 from ..compile_environment import CompileEnvironment
 from ..compile_environment import FixedBlockSizeSource
 from . import target_facts
+from .cache_hint_forms import L2_POLICY_FORMS
 from .cute_warp_mma_gemm import warp_mma_warp_layout
 from .fx_matcher import _is_call
 
@@ -471,13 +472,11 @@ MMA_DAG_KEYS: tuple[str, ...] = (
 # policy its cp.async packets carry (``cp.async.cg.shared.global.L2::cache_
 # hint`` with a ``createpolicy.fractional.L2::evict_*`` word).  cp.async.cg
 # bypasses L1, so the L1-only priorities ("first" / "last") leave the packet
-# plain; the L2 and two-level priorities hint the L2, and "streaming" (the
-# ``ld.global.cs`` operator: evict-first at both levels) hints evict_first.
+# plain; an L2 cache-policy family hints its descriptor's policy
+# (``L2_POLICY_FORMS``), and "streaming" (the ``ld.global.cs`` operator:
+# evict-first at both levels) hints evict_first.
 MMA_DAG_L2_HINTS: dict[str, str] = {
-    "l2_last": "evict_last",
-    "l1_l2_last": "evict_last",
-    "l1_l2_first": "evict_first",
-    "nc_l2_first": "evict_first",
+    **{family: policy for family, (_, policy) in L2_POLICY_FORMS.items()},
     "streaming": "evict_first",
 }
 # The one policy value per rendered packet form (the normalizer's canonical

@@ -1723,6 +1723,15 @@ class CuteBackend(Backend):
     def dynamo_captures_kernel_launch(self) -> bool:
         return False
 
+    @property
+    def drops_unread_scratch_arguments(self) -> bool:
+        # A late pass may leave a scratch tensor unread (its loads forwarded,
+        # its stores dropped); the launcher's keywords hold no positions into
+        # its arguments, and the wrapper plans' argument positions are
+        # resolved after the drop (``finalize_host_statements`` runs after
+        # ``drop_unused_scratch_arguments``).
+        return True
+
     def validate_environment(self) -> None:
         from .cutedsl_compat import check_cute_backend_requirements
 

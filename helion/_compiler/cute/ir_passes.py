@@ -50,13 +50,14 @@ def canonicalize_traced_graphs_pass(
     func: HostFunction | None, device_ir: DeviceIR, analysis: DeviceIRAnalysis | None
 ) -> None:
     """Graph rewrites that must precede ``prepare_graph_lowerings``:
-    reduction canonicalization, scaled-contraction and MXFP8 exposure, the
-    no-op store / accumulation / u32-multiply peepholes, affine-reduction
-    factoring under ``fast_math`` and the half-precision atomic output
-    promotion (a host-AST rewrite as well as a graph one)."""
+    reduction canonicalization, the one-hot sum fold, scaled-contraction and
+    MXFP8 exposure, the no-op store / accumulation / u32-multiply peepholes,
+    affine-reduction factoring under ``fast_math`` and the half-precision
+    atomic output promotion (a host-AST rewrite as well as a graph one)."""
     from .canonicalize_reductions import canonicalize_reductions
     from .elide_split_join import elide_split_join_roundtrips
     from .fold_noop_stores import fold_noop_stores
+    from .fold_one_hot_reductions import fold_one_hot_reductions
     from .fuse_mm_accumulation import fuse_mm_accumulation
     from .fuse_native_s2f6 import fuse_native_s2f6
     from .fuse_u32_multiply import fuse_u32_multiply
@@ -64,6 +65,7 @@ def canonicalize_traced_graphs_pass(
     from .scaled_contraction import expose_scaled_contractions
 
     canonicalize_reductions(device_ir)
+    fold_one_hot_reductions(device_ir)
     scaled_contractions = expose_scaled_contractions(device_ir)
     for graph_info in device_ir.graphs:
         elide_split_join_roundtrips(graph_info.graph)
@@ -255,7 +257,10 @@ _STAGE_PASSES: dict[DeviceIRStage, tuple[StagePass, ...]] = {
     DeviceIRStage.AFTER_MULTI_ROOT_PID_RESTRICTION: (
         search_surface.restrict_tcgen05_multi_root_search,
     ),
-    DeviceIRStage.AFTER_ANALYSIS: (search_surface.record_tile_loop_facts,),
+    DeviceIRStage.AFTER_ANALYSIS: (
+        search_surface.record_tile_loop_facts,
+        search_surface.record_scratch_forwarding_sites,
+    ),
     DeviceIRStage.AFTER_KERNEL_MATMUL_FACT: (
         search_surface.register_matmul_alias_specializations,
     ),

@@ -227,4 +227,43 @@ def test_row_mask_predicates_the_whole_packet() -> None:
     assert isinstance(pointer, ast.IfExp), ast.unparse(pointer)
     assert "mask_0" in ast.unparse(pointer.test)
     assert not _load_calls(vloop), ast.unparse(vloop)
+    # The product only reaches the store, guarded by the same row mask: a
+    # masked-off lane is never written, so it needs no zero
+    # (``store_only_loads``).
+    assert "else cutlass.Float32(0)" not in ast.unparse(vloop)
+
+
+@skipUnlessBackends(["cute"])
+def test_row_mask_keeps_the_packet_zero_for_an_atomic() -> None:
+    @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+    def scale_and_add_rows(
+        x: torch.Tensor, acc: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        rows, cols = x.size()
+        out = torch.empty_like(x)
+        for tile_r, tile_c in hl.tile([rows, cols]):
+            scaled = x[tile_r, tile_c] * 2.0
+            out[tile_r, tile_c] = scaled
+            hl.atomic_add(acc, [tile_r, tile_c], scaled)
+        return out, acc
+
+    # ``scale_rows`` with the product also added atomically, a consumer
+    # ``store_only_loads`` does not model: the packet's masked-off lanes keep
+    # their zero.
+    code = _generate(
+        scale_and_add_rows,
+        (torch.empty((35, 256)), torch.zeros((35, 256))),
+        block_sizes=[4, 256],
+        num_threads=[0, 64],
+        cute_vector_widths=[1, 4],
+    )
+    function = _device_function(ast.parse(code))
+    vloop = _vector_loop(function)
+    packets = [
+        call for call in _packet_loads(function) if "x.iterator" in ast.unparse(call)
+    ]
+    assert len(packets) == 1, code
+    pointer = packets[0].args[0]
+    assert isinstance(pointer, ast.IfExp), ast.unparse(pointer)
+    assert "mask_0" in ast.unparse(pointer.test)
     assert "else cutlass.Float32(0)" in ast.unparse(vloop)
