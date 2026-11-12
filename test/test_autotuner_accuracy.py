@@ -37,6 +37,7 @@ from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfXPU
+from helion._testing.search_harness import mock_search
 from helion.autotuner import AccuracyCheck
 from helion.autotuner import DifferentialEvolutionSearch
 from helion.autotuner import PatternSearch
@@ -1406,52 +1407,14 @@ class TestMismatchTolerance(TestCase):
 
 @onlyBackends(["triton", "cute"])
 class TestAutotuneIgnoreErrors(TestCase):
-    def _make_search(
-        self, settings: Settings, *, args: tuple[object, ...] = ()
-    ) -> BaseSearch:
-        # NOTE: construct via __init__ (mock kernel) instead of hand-mirroring
-        # its attributes, so new __init__ fields don't need to be added here.
-        config_spec = SimpleNamespace(
-            default_config=lambda: helion.Config(block_sizes=[1]),
-            cute_flash_search_enabled=False,
-            compiler_seed_timeout_retry_repetitions=None,
-            backend=SimpleNamespace(
-                supports_precompile=lambda: True,
-                autotune_config_is_viable=lambda _config_spec, _config: True,
-                should_deduplicate_generated_sources=lambda config_spec: False,
-                get_do_bench=lambda: None,
-                classify_autotune_exception=lambda error: None,
-                probe_long_autotune_kernels=lambda _config_spec: False,
-            ),
-        )
-        kernel = SimpleNamespace(
-            settings=settings,
-            config_spec=config_spec,
-            format_kernel_decorator=lambda config, s: "decorator",
-            to_triton_code=lambda config: "code",
-            maybe_log_repro=lambda log_func, args, config=None: None,
-            supports_subprocess_benchmark=lambda: False,
-            env=SimpleNamespace(process_group_name=None, device=DEVICE),
-        )
-        search = BaseSearch(kernel, args)
-        with patch.object(
-            LocalBenchmarkProvider,
-            "_compute_baseline",
-            return_value=(None, [], None),
-        ):
-            search._prepare()
-        return search
-
     def _make_compile_failure_search(self) -> BaseSearch:
-        search = self._make_search(
+        return mock_search(
             Settings(
                 autotune_precompile=None,
                 autotune_log_level=logging.CRITICAL,
-            )
+            ),
+            compile_config=None,
         )
-        search.kernel.env = SimpleNamespace(process_group_name=None, device=DEVICE)
-        search.kernel.compile_config = None
-        return search
 
     def _run_late_compile_failures(
         self,
@@ -1495,7 +1458,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_ignore_errors=False,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
 
         def bad_fn(*_args):
             raise RuntimeError("boom")
@@ -1512,7 +1475,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_ignore_errors=False,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
 
         def bad_fn(*_args):
             raise RuntimeError("failed to translate module to LLVM IR")
@@ -1529,7 +1492,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_ignore_errors=False,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
 
         def bad_fn(*_args):
             raise torch.cuda.OutOfMemoryError("CUDA out of memory")
@@ -1546,7 +1509,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_ignore_errors=True,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
 
         def bad_fn(*_args):
             raise RuntimeError("boom")
@@ -1564,7 +1527,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_precompile=None,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
         calls = []
 
         class FakeJITFunction:
@@ -1588,7 +1551,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_precompile=None,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
 
         class FakeJITFunction:
             def __init__(self) -> None:
@@ -1617,7 +1580,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_precompile=None,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
 
         class FakeJITFunction:
             def clear_fast_path_caches(self) -> None:
@@ -1639,7 +1602,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_precompile=None,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings, args=("arg0",))
+        search = mock_search(settings, ("arg0",))
 
         def compiled_fn(*_args):
             return None
@@ -1669,7 +1632,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_ignore_errors=True,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
 
         def bad_fn(*_args):
             raise RuntimeError("boom")
@@ -1692,7 +1655,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_ignore_errors=False,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
 
         def bad_fn(*_args):
             raise RuntimeError("test error with meaningful message")
@@ -1719,7 +1682,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_ignore_errors=False,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
 
         original_exception = RuntimeError("original error in except block")
 
@@ -1753,7 +1716,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_precompile=None,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
 
         call_count = 0
 
@@ -1823,7 +1786,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             with self.subTest(error=error, ignore=ignore, level=level):
                 output = io.StringIO()
                 with redirect_stderr(output):
-                    search = self._make_search(
+                    search = mock_search(
                         Settings(
                             autotune_precompile=None,
                             autotune_ignore_errors=ignore,
@@ -2096,7 +2059,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_log_level=logging.CRITICAL,
             autotune_compile_timeout=5,
         )
-        search = self._make_search(settings, args=("arg0",))
+        search = mock_search(settings, ("arg0",))
 
         parent_pid = os.getpid()
         lazy_calls: list[int] = []
@@ -2157,7 +2120,7 @@ class TestAutotuneIgnoreErrors(TestCase):
                     autotune_ignore_errors=False,
                     autotune_log_level=logging.CRITICAL,
                 )
-                search = self._make_search(settings, args=("arg0",))
+                search = mock_search(settings, ("arg0",))
 
                 def fake_compiled_fn(
                     *fn_args: object, _launcher: Callable[..., object]
@@ -2184,7 +2147,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_ignore_errors=True,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings, args=("arg0",))
+        search = mock_search(settings, ("arg0",))
 
         def fake_compiled_fn(
             *fn_args: object, _launcher: Callable[..., object]
@@ -2210,7 +2173,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_ignore_errors=True,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings, args=("arg0",))
+        search = mock_search(settings, ("arg0",))
 
         def fake_compiled_fn(
             *fn_args: object, _launcher: Callable[..., object]

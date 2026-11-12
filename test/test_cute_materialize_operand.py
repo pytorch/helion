@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import dataclasses
 from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
@@ -11,48 +10,28 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test.test_cute_materialized_fission import _CpuRefMode
-
 import helion
-from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.state import cute_env_state
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import compile_reference
 from helion._testing.cute_codegen import cpu_target
+from helion._testing.cute_codegen import reference_host_function
+from helion._testing.cute_codegen import run_cpu_reference
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import InvalidConfig
 import helion.language as hl
-from helion.runtime.ref_mode import RefMode
-from helion.runtime.ref_mode import RefModeContext
 
 matmul_bf16_int4 = import_example("int4_gemm").matmul_bf16_int4
 
 pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
     from collections.abc import Iterator
     from typing import Any
 
     from helion.runtime.kernel import BoundKernel
     from helion.runtime.kernel import Kernel
-
-
-class _OperandCpuRefMode(_CpuRefMode):
-    def __torch_function__(
-        self,
-        func: Callable[..., Any],
-        types: list[type[object]],
-        args: tuple[object, ...] = (),
-        kwargs: dict[str, object] | None = None,
-    ) -> Any:
-        if func is torch.mm and kwargs is not None and "out_dtype" in kwargs:
-            lhs, rhs = args
-            assert isinstance(lhs, torch.Tensor) and isinstance(rhs, torch.Tensor)
-            dtype = kwargs["out_dtype"]
-            assert dtype is torch.float32
-            return torch.mm(lhs.float(), rhs.float())
-        return super().__torch_function__(func, types, args, kwargs)
 
 
 @pytest.fixture(autouse=True)
@@ -297,15 +276,7 @@ def _reference(
     materialized_operand: bool = False,
 ) -> torch.Tensor:
     if transformed:
-        assert bound.host_function is not None
-        with bound.env, bound.host_function:
-            definition = bound.host_function.codegen_function_def(
-                bound.host_function.body
-            )
-        definition = ast.parse(ast.unparse(ast.fix_missing_locations(definition))).body[
-            0
-        ]
-        assert isinstance(definition, ast.FunctionDef)
+        definition = reference_host_function(bound)
         roots = [node for node in definition.body if isinstance(node, ast.For)]
         assert len(roots) == 2
         for root, blocks in zip(roots, ((4, 8), (8, 4)), strict=True):
@@ -333,28 +304,10 @@ def _reference(
             result = definition.body[-1]
             assert isinstance(result, ast.Return)
             result.value = ast.Name(id=plan.materialized_names[-1], ctx=ast.Load())
-        namespace = dict(bound.kernel.fn.__globals__)
-        namespace["_default_cute_launcher"] = None
-        exec(
-            compile(
-                ast.fix_missing_locations(
-                    ast.Module(body=[definition], type_ignores=[])
-                ),
-                "<materialization-reference>",
-                "exec",
-            ),
-            namespace,
-        )
-        function = namespace[definition.name]
+        function = compile_reference(bound, definition, "<materialization-reference>")
     else:
         function = bound.kernel.fn
-    env = CompileEnvironment(
-        torch.device("cpu"), dataclasses.replace(bound.settings, ref_mode=RefMode.EAGER)
-    )
-    context = RefModeContext(env, None)
-    context.func_mode = _OperandCpuRefMode()
-    with context:
-        result = function(*args)
+    result = run_cpu_reference(bound, function, args)
     assert isinstance(result, torch.Tensor)
     return result
 

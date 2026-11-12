@@ -561,6 +561,7 @@ def _inputs(operands: str) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
     return (x, y, scale), expected
 
 
+@pytest.mark.cuda
 @_sm100_gpu
 @pytest.mark.parametrize("case", sorted(_CASES), ids=sorted(_CASES))
 def test_admitted_fp32_row_geometry_compiles_and_runs(case: str) -> None:

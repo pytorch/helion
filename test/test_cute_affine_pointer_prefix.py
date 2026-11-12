@@ -468,6 +468,7 @@ def _save_case(
     (directory / "result.json").write_text(json.dumps(record, indent=2) + "\n")
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype_name", DTYPES)
 @pytest.mark.parametrize("rank", [2, 3], ids=["2d", "3d"])
@@ -516,6 +517,7 @@ def test_pointer_prefix_add_into_cuda(rank: int, dtype_name: str) -> None:
         )
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_original_aot_add_dynamic_cuda() -> None:
     _check_source()

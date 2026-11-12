@@ -5,10 +5,12 @@ from __future__ import annotations
 import ast
 from contextlib import ExitStack
 from contextlib import contextmanager
+import dataclasses
 import importlib.util
 import sys
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
+from typing import cast
 from unittest import SkipTest
 from unittest.mock import patch
 
@@ -26,6 +28,9 @@ from .._compiler.cute.full_tile_bounds import prove_full_tile_launch
 from .._compiler.cute.target_facts import B200
 from .._utils import triton_is_available
 from ..runtime.config import Config
+from ..runtime.ref_mode import RefMode
+from ..runtime.ref_mode import RefModeContext
+from ..runtime.ref_mode import RefModeTorchFunctionMode
 from . import cpu_render_target
 from . import default_cute_mma_support
 from . import patch_cute_mma_support
@@ -34,6 +39,7 @@ from . import patch_target_facts
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Generator
+    from collections.abc import Sequence
     from pathlib import Path
     from types import ModuleType
     from typing import Any
@@ -434,3 +440,88 @@ def cuda_metadata_trace() -> Generator[None, None, None]:
     finally:
         torch.set_num_threads(old_threads)
         assert torch.cuda.is_initialized() == initial_cuda_state
+
+
+def _fp32_product(lhs: object, rhs: object) -> torch.Tensor:
+    lhs, rhs = cast("torch.Tensor", lhs), cast("torch.Tensor", rhs)
+    assert lhs.device.type == rhs.device.type == "cpu"
+    return lhs.float() @ rhs.float()
+
+
+class CpuRefMode(RefModeTorchFunctionMode):
+    """The ref-mode torch function mode for a reference run on CPU, where
+    ``torch.mm`` has no ``out_dtype``: ``hl.dot``'s ``torch.mm(lhs, rhs,
+    out_dtype=torch.float32)`` and an ``addmm`` into an FP32 accumulator
+    multiply the operands in FP32 explicitly."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._func_handlers[torch.mm] = self._handle_mm
+
+    def _handle_mm(
+        self, args: tuple[object, ...], kwargs: dict[str, object]
+    ) -> torch.Tensor:
+        if "out_dtype" not in kwargs:
+            return cast("Callable[..., torch.Tensor]", torch.mm)(*args, **kwargs)
+        assert kwargs["out_dtype"] is torch.float32
+        return _fp32_product(*args)
+
+    def _handle_mm_with_bias(
+        self,
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
+        mm_func: object,
+        op_name: str,
+    ) -> torch.Tensor:
+        assert op_name == "addmm"
+        bias = cast("torch.Tensor", args[0])
+        assert bias.dtype is torch.float32 and bias.device.type == "cpu"
+        result = _fp32_product(*args[1:3])
+        alpha = cast("float", kwargs.get("alpha", 1))
+        if alpha != 1:
+            result = result * alpha
+        # As torch.addmm: a zero beta ignores the bias, NaN and Inf included.
+        beta = cast("float", kwargs.get("beta", 1))
+        return result if beta == 0 else result + beta * bias
+
+
+def reference_host_function(bound: BoundKernel[object]) -> ast.FunctionDef:
+    """The host function ``bound`` generates, parsed back from its source for
+    a test to edit (to give its ``hl.tile`` loops block sizes, say) before
+    ``compile_reference`` builds it."""
+    host = bound.host_function
+    assert host is not None
+    with bound.env, host:
+        definition = host.codegen_function_def(list(host.body))
+    parsed = ast.parse(ast.unparse(ast.fix_missing_locations(definition))).body[0]
+    assert isinstance(parsed, ast.FunctionDef)
+    return parsed
+
+
+def compile_reference(
+    bound: BoundKernel[object], definition: ast.FunctionDef, filename: str
+) -> Callable[..., object]:
+    """``definition``, a host function of ``bound``, compiled into the
+    kernel's globals without the CuTe launcher, for ``run_cpu_reference``."""
+    namespace = dict(bound.kernel.fn.__globals__)
+    namespace["_default_cute_launcher"] = None
+    module = ast.Module(body=[definition], type_ignores=[])
+    exec(compile(ast.fix_missing_locations(module), filename, "exec"), namespace)
+    return namespace[definition.name]
+
+
+def run_cpu_reference(
+    bound: BoundKernel[object], fn: Callable[..., object], args: Sequence[object]
+) -> object:
+    """``fn(*args)`` in ref mode EAGER on CPU under ``CpuRefMode``, with the
+    settings of ``bound``: the kernel's function, or a host function
+    ``compile_reference`` built."""
+    with patch_target_facts(capability=(10, 0), num_sm=148, is_hip=False):
+        env = CompileEnvironment(
+            torch.device("cpu"),
+            dataclasses.replace(bound.settings, ref_mode=RefMode.EAGER),
+        )
+    context = RefModeContext(env, None)
+    context.func_mode = CpuRefMode()
+    with context:
+        return fn(*args)

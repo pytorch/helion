@@ -32,6 +32,10 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
 
+# The CPU lane runs the codegen checks; the GPU lane runs the numerics
+# (``_GPU_TESTS``, marked ``cuda``).
+pytestmark = pytest.mark.cpu_only
+
 CPU = torch.device("cpu")
 
 VECTOR_ATOMIC = "_cute_red_add_f32_vec("
@@ -879,6 +883,7 @@ _GPU_CONFIGS: dict[str, dict[str, Any]] = {
 }
 
 
+@pytest.mark.cuda
 @skipIfNotCUDA()
 @pytest.mark.parametrize("fast_math", [False, True])
 @pytest.mark.parametrize("name", sorted(_GPU_CONFIGS))
@@ -915,6 +920,7 @@ def test_segmented_reduction_matches_index_add(
         )
 
 
+@pytest.mark.cuda
 @skipIfNotCUDA()
 def test_elided_scatter_matches_the_unelided_sum() -> None:
     """``fast_math`` elision vs every add issued, on +0.0, -0.0, NaN, inf and

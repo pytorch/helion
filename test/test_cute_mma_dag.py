@@ -17,6 +17,7 @@ import itertools
 import os
 from pathlib import Path
 import re
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
@@ -8556,6 +8557,47 @@ def test_a_half_addmm_into_an_fp32_accumulator_is_a_dot() -> None:
         (node,) = nodes
         assert dag.accumulating_addmm_dtype(node) is None
         assert not dag._is_dot(node)
+
+
+def test_the_standalone_export_carries_the_shared_ptx_rows() -> None:
+    # ``_mma_dag_runtime`` re-exports ``stg_b32`` / ``unpack_f16x2`` from
+    # ``device/ptx.py``: the export has to carry the table builder with its
+    # rows and bind the re-exports to them.  (The warp_mma GEMM family renders
+    # the rows too but its launch plan is not exportable yet.)
+    # test_cute_standalone.py runs the export with ``helion`` unimportable,
+    # in the slow tier.
+    bound = _bind_fn(
+        _accumulating_addmm,
+        _accumulating_addmm_inputs(),
+        cute_materialize_transformed_operands=False,
+    )
+    with bound.env:
+        default = bound.config_spec.default_config()
+        config = bound.config_spec.normalized_config(
+            helion.Config(
+                **{
+                    **default.config,
+                    "cute_mma_dag": "warp",
+                    # The TMA ring adds a descriptor-preparation plan the
+                    # exporter refuses; per-thread packets leave the alias plan.
+                    "cute_mma_dag_loads": "lane",
+                }
+            )
+        )
+    code = bound.to_code(config)
+    for name in ("stg_b32", "unpack_f16x2"):
+        assert f"{RT}.{name}(" in code, name
+    # The export reads the SM count from the device properties: the modelled
+    # B200's 148.
+    with patch(
+        "torch.cuda.get_device_properties",
+        return_value=SimpleNamespace(multi_processor_count=148),
+    ):
+        code = bound.to_code(
+            config, options=helion.OutputCodeOptions(allow_helion_deps=False)
+        )
+    assert "_make_standalone_ptx" in code
+    assert "_make_standalone_mma_dag_runtime" in code
 
 
 def test_a_pointwise_operand_over_loaded_tiles_is_a_pass_chain() -> None:

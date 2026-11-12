@@ -10,9 +10,6 @@ from typing import cast
 import pytest
 import torch
 
-from test.test_cute_collective_tf32 import _config as _jagged_config
-from test.test_cute_collective_tf32 import _jagged_inputs
-from test.test_cute_collective_tf32 import _kernel as _jagged_kernel
 from test.test_cute_contiguous_copy import _evaluate_copy
 from test.test_cute_contiguous_copy import _plan
 
@@ -22,6 +19,9 @@ from helion._compiler.cute.contiguous_copy import recipe_has_integer_result
 from helion._compiler.cute.scalar_recipe import build_recipe
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_collective import collective_config
+from helion._testing.cute_collective import collective_kernel
+from helion._testing.cute_collective import jagged_inputs
 import helion.language as hl
 
 pytestmark = pytest.mark.cpu_only
@@ -238,15 +238,15 @@ def test_original_jagged_async_copy_retains_alignment_guard(
     shape: tuple[int, int, int, int], compute: str
 ) -> None:
     batch, rows, k, n = shape
-    arguments = _jagged_inputs(batch=batch, rows=rows, k=k, n=n)
-    config = _jagged_config(
+    arguments = jagged_inputs(batch=batch, rows=rows, k=k, n=n)
+    config = collective_config(
         128 if compute == "tcgen05" else 32,
         32 if n == 32 else 64,
         64,
         compute=compute,
         copy="async_cached",
     )
-    source = cpu_bind(_jagged_kernel(), arguments).to_code(config)
+    source = cpu_bind(collective_kernel(), arguments).to_code(config)
     assert "collective_a_raw" in source and "collective_b_raw" in source
     if compute == "warp":
         # The warp MMA partitions the raw FP32 ring and rounds in registers.
@@ -259,7 +259,7 @@ def test_original_jagged_async_copy_retains_alignment_guard(
         assert "cute.arch.cvt_f32_tf32(collective_b_raw[" in source
     offsets, a, b, bias = arguments
     unaligned_a = torch.empty(a.numel() + 1, dtype=a.dtype)[1:].view_as(a)
-    unaligned = cpu_bind(_jagged_kernel(), (offsets, unaligned_a, b, bias)).to_code(
+    unaligned = cpu_bind(collective_kernel(), (offsets, unaligned_a, b, bias)).to_code(
         config
     )
     assert "collective_a_raw" not in unaligned

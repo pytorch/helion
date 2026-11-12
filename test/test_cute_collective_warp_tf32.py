@@ -8,16 +8,15 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from test.test_cute_collective_tf32 import _config
-from test.test_cute_collective_tf32 import _jagged_inputs
-from test.test_cute_collective_tf32 import _kernel
-from test.test_cute_collective_tf32 import _round_tf32
-
 import helion
 from helion._compiler.cute.autotune.heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._testing import cpu_render_target
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_collective import collective_config
+from helion._testing.cute_collective import collective_kernel
+from helion._testing.cute_collective import jagged_inputs
+from helion._testing.cute_collective import round_tf32
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
@@ -60,10 +59,12 @@ def test_computed_tail_uses_tf32_warp_fragments(
     cpu_only: None, tile: tuple[int, int, int], static_shapes: bool
 ) -> None:
     bound = cpu_bind(
-        _kernel(batched=True, static_shapes=static_shapes),
+        collective_kernel(batched=True, static_shapes=static_shapes),
         (torch.empty((3, 130, 78)), torch.empty((3, 78, 70))),
     )
-    source = bound.to_code(_config(*tile, compute="warp", copy="async_cached"))
+    source = bound.to_code(
+        collective_config(*tile, compute="warp", copy="async_cached")
+    )
     assert "warp.MmaTF32Op((16, 8, 8))" in source
     assert "CopyUniversalOp(), cutlass.TFloat32, num_bits_per_copy=32" in source
     assert "cvt_f32_tf32" in source
@@ -78,10 +79,10 @@ def test_warp_precision_policy_keeps_fp32_fallback(
     cpu_only: None, precision: str
 ) -> None:
     bound = cpu_bind(
-        _kernel(precision=precision),
-        _jagged_inputs(batch=3, rows=137, k=64, n=64),
+        collective_kernel(precision=precision),
+        jagged_inputs(batch=3, rows=137, k=64, n=64),
     )
-    source = bound.to_code(_config(32, 32, 32, compute="warp"))
+    source = bound.to_code(collective_config(32, 32, 32, compute="warp"))
     assert "MmaTF32Op" not in source and "cvt_f32_tf32" not in source
     assert "cute.gemm(" not in source
     assert "cutlass.Float16" not in source and "cutlass.BFloat16" not in source
@@ -93,9 +94,9 @@ def test_warp_precision_policy_keeps_fp32_fallback(
 def test_warp_tf32_requires_sm80_or_newer(
     cpu_only: None, capability: tuple[int, int], enabled: bool
 ) -> None:
-    bound = cpu_bind(_kernel(), _jagged_inputs(batch=3, rows=137, k=64, n=64))
+    bound = cpu_bind(collective_kernel(), jagged_inputs(batch=3, rows=137, k=64, n=64))
     bound.config_spec.target_device_capability = capability
-    source = bound.to_code(_config(32, 32, 32, compute="warp"))
+    source = bound.to_code(collective_config(32, 32, 32, compute="warp"))
     assert ("MmaTF32Op" in source) is enabled
     with bound.env:
         assert bound.host_function is not None
@@ -110,9 +111,9 @@ def test_warp_tf32_requires_sm80_or_newer(
 def test_async_tf32_rounds_in_registers_with_one_barrier_per_stage(
     cpu_only: None, stages: int
 ) -> None:
-    arguments = _jagged_inputs(batch=3, rows=137, k=128, n=64)
-    bound = cpu_bind(_kernel(), arguments)
-    config = _config(32, 32, 32, compute="warp", copy="async_cached")
+    arguments = jagged_inputs(batch=3, rows=137, k=128, n=64)
+    bound = cpu_bind(collective_kernel(), arguments)
+    config = collective_config(32, 32, 32, compute="warp", copy="async_cached")
     config.config["cute_collective_stages"] = stages
     source = bound.to_code(config)
     tree = ast.parse(source)
@@ -211,9 +212,9 @@ def test_async_tf32_rounds_in_registers_with_one_barrier_per_stage(
 def test_single_stage_async_tf32_keeps_shared_publication_barriers(
     cpu_only: None,
 ) -> None:
-    arguments = _jagged_inputs(batch=3, rows=137, k=128, n=64)
-    bound = cpu_bind(_kernel(), arguments)
-    config = _config(32, 32, 32, compute="warp", copy="async_cached")
+    arguments = jagged_inputs(batch=3, rows=137, k=128, n=64)
+    bound = cpu_bind(collective_kernel(), arguments)
+    config = collective_config(32, 32, 32, compute="warp", copy="async_cached")
     config.config["cute_collective_stages"] = 1
     source = bound.to_code(config)
     assert "tf32_round_slot" not in source
@@ -257,10 +258,10 @@ def test_fp32_seed_uses_exact_register_accumulator(cpu_only: None) -> None:
 
 
 def test_collective_kernel_honors_cute_pdl(cpu_only: None) -> None:
-    arguments = _jagged_inputs(batch=3, rows=137, k=64, n=64)
-    bound = cpu_bind(_kernel(), arguments)
+    arguments = jagged_inputs(batch=3, rows=137, k=64, n=64)
+    bound = cpu_bind(collective_kernel(), arguments)
     bound.config_spec.target_device_capability = (10, 0)
-    config = _config(32, 32, 32, compute="warp", copy="async_cached")
+    config = collective_config(32, 32, 32, compute="warp", copy="async_cached")
     config.config["cute_collective_stages"] = 4
     config.config["cute_pdl"] = True
     source = bound.to_code(config)
@@ -315,9 +316,9 @@ def test_warp_tf32_computed_tail_and_mutating_graph(
         b = torch.randn((3, 78, 72), device=CUDA_DEVICE)[:, :, :70]
     else:
         b = torch.randn(3 * 78 * 70 + 1, device=CUDA_DEVICE)[1:].view(3, 78, 70)
-    kernel = _kernel(batched=True, static_shapes=static_shapes)
+    kernel = collective_kernel(batched=True, static_shapes=static_shapes)
     bound = kernel.bind((a, b))
-    config = _config(*tile, compute="warp", copy=copy)
+    config = collective_config(*tile, compute="warp", copy=copy)
     source = bound.to_code(config)
     assert "MmaTF32Op" in source and "TmemAllocator" not in source
     bound.set_config(config)
@@ -327,7 +328,7 @@ def test_warp_tf32_computed_tail_and_mutating_graph(
 
     def expected() -> torch.Tensor:
         return (
-            torch.bmm(_round_tf32(a * 0.75).double(), _round_tf32(b).double()).float()
+            torch.bmm(round_tf32(a * 0.75).double(), round_tf32(b).double()).float()
             + 0.25
         )
 
@@ -356,12 +357,12 @@ def test_warp_tf32_jagged_pipeline_reuse_and_mutated_offsets(
 ) -> None:
     _require_sm80()
     torch.manual_seed(20260912)
-    arguments = _jagged_inputs(batch=3, rows=137, k=256, n=64, device=CUDA_DEVICE)
+    arguments = jagged_inputs(batch=3, rows=137, k=256, n=64, device=CUDA_DEVICE)
     offsets, a, b, bias = arguments
     lengths = torch.tensor([0, 67, 70], dtype=torch.int64)
-    kernel = _kernel()
+    kernel = collective_kernel()
     bound = kernel.bind(arguments)
-    config = _config(*tile, compute="warp", copy="async_cached")
+    config = collective_config(*tile, compute="warp", copy="async_cached")
     config.config["cute_collective_stages"] = stages
     source = bound.to_code(config)
     assert "MmaTF32Op" in source and "TmemAllocator" not in source
@@ -377,7 +378,7 @@ def test_warp_tf32_jagged_pipeline_reuse_and_mutated_offsets(
         bias.normal_()
 
     def expected() -> torch.Tensor:
-        left, right = _round_tf32(a).double(), _round_tf32(b).double()
+        left, right = round_tf32(a).double(), round_tf32(b).double()
         pieces = []
         begin = 0
         for group, count in enumerate(lengths.tolist()):
@@ -418,9 +419,7 @@ def test_warp_tf32_keeps_fp32_seed_without_half_conversion(k: int) -> None:
     bound.set_config(config)
 
     def expected() -> torch.Tensor:
-        return (
-            _round_tf32(a).double() @ _round_tf32(b).double() + seed.double()
-        ).float()
+        return (round_tf32(a).double() @ round_tf32(b).double() + seed.double()).float()
 
     def run() -> torch.Tensor:
         return bound(a, b, seed)
