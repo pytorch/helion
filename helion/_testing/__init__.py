@@ -336,8 +336,14 @@ def skipIfRocm(reason: str) -> Callable[[Callable], Callable]:
 
 @functools.cache
 def _has_fbtriton() -> bool:
-    # Meta's fbtriton distribution owns the triton package.
-    return "fbtriton" in importlib.metadata.packages_distributions().get("triton", ())
+    # Meta's fbtriton distribution owns the triton package. Looked up by name:
+    # packages_distributions() reads every distribution's file list, which
+    # raises in a fbcode par.
+    try:
+        importlib.metadata.distribution("fbtriton")
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    return True
 
 
 def skipIfFbTriton(reason: str) -> Callable[[Callable], Callable]:
