@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import ast
 from collections import Counter
+import functools
 import random
 import re
 import textwrap
@@ -70,7 +71,8 @@ pytestmark = pytest.mark.cpu_only
 
 FAST = "_cute_exact_div_fast_f32("
 BOUNDS = "_cute_exact_div_bounds_f32("
-REDO = "if _cute_exact_div_redo_f32("
+# Either window test: of ``|x|`` or of the bits of a nonnegative dividend.
+REDO = "if _cute_exact_div_redo_"
 ANY_EXACT = "_cute_exact_div"
 HOISTED = "_helion_exdiv_"
 # Ragged shapes: a row count no row block above one divides (every
@@ -292,6 +294,12 @@ ROWS_KERNELS: list[tuple[helion.Kernel, helion.Kernel]] = [
     (rolled_rows_two_sums, rolled_rows_two_sums_plain),
     (chained_divisions, chained_divisions_plain),
 ]
+# On a ragged shape a sweep whose masked selects are tested by row and packet
+# masks that guard each of its flushes, and which carries nothing, takes the
+# redo form (``_selects_guard_the_region``): chained_divisions' store sweep.
+# Every other sweep of the rows kernels accumulates its quotients and keeps
+# the plain division there.
+RAGGED_STORE_SWEEP_KERNELS = (chained_divisions,)
 
 SOFTMAX_CONFIG: dict[str, Any] = {
     # The campaign's softmax_acf shape-1 winner (rolled sweeps, 128 threads).
@@ -430,9 +438,10 @@ SEVERAL_ROWS_CONFIGS: list[dict[str, Any]] = [
 # masked zero dividend (``... if mask else cutlass.Float32(0)``) made the
 # redo fire for those threads in every row while the rest kept the
 # speculative pass, and the sum of the quotients' squares differed from the
-# plain render by 1 ulp in two rows.  Every operand a select reaches now
-# keeps the plain division; on an exact axis (no select) the same configs
-# take the redo form.
+# plain render by 1 ulp in two rows.  A dividend a select reaches now keeps
+# the plain division, unless its loop only flushes packets under the
+# select's test (a store sweep); on an exact axis (no select) the same
+# configs take the redo form.
 ONE_ROW_PACKET_CONFIGS: list[dict[str, Any]] = [
     {
         "block_sizes": [1],
@@ -532,6 +541,13 @@ def _render(kernel: helion.Kernel, args: tuple[object, ...], **config: Any) -> s
     return _kernel_body(_bind(kernel, args).to_code(helion.Config(**config)))
 
 
+@functools.cache
+def _softmax_render(plain: bool = False) -> str:
+    """The 4096x4096 softmax at ``SOFTMAX_CONFIG``, rendered once per module."""
+    x = torch.empty(4096, 4096, dtype=torch.float16)
+    return _render(softmax_plain if plain else softmax, (x,), **SOFTMAX_CONFIG)
+
+
 def _kernel_body(code: str) -> str:
     """The device function text: no module header (imports of helpers used
     by other kernels rendered in this process can appear there) and no
@@ -541,11 +557,11 @@ def _kernel_body(code: str) -> str:
 
 
 def _redo_copies(code: str) -> list[str]:
-    """The bodies of the ``if _cute_exact_div_redo_f32(...)`` statements."""
+    """The bodies of the ``if _cute_exact_div_redo_*(...)`` statements."""
     tree = ast.parse(textwrap.dedent(code))
     copies = []
     for node in ast.walk(tree):
-        if isinstance(node, ast.If) and "_cute_exact_div_redo_f32" in ast.unparse(
+        if isinstance(node, ast.If) and "_cute_exact_div_redo_" in ast.unparse(
             node.test
         ):
             copies.append("\n".join(ast.unparse(stmt) for stmt in node.body))
@@ -668,7 +684,7 @@ def test_the_setting_and_the_pass_switch_keep_the_plain_divide(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     x = torch.empty(4096, 4096, dtype=torch.float16)
-    code = _render(softmax_plain, (x,), **SOFTMAX_CONFIG)
+    code = _softmax_render(plain=True)
     assert ANY_EXACT not in code and "v_7 = v_6 / sum_1" in code
     # The knob's plain form renders exactly what the setting off renders,
     # and so does the retired guard form (repaired to plain by the config
@@ -1358,10 +1374,14 @@ def test_a_register_cache_written_from_a_select_taints_its_reloads() -> None:
 
 
 def test_a_masked_divisor_keeps_the_redo() -> None:
-    """The divisor is one value for every thread of the sweep (a row scale,
-    a row sum): a masked one (``s[tile_m]`` loaded as a masked packet for a
-    partial row block) fires the redo for all of them alike, which mixes
-    nothing, so only the dividend is held to the select rule."""
+    """The divisor is loop invariant: a partial row block loads its row
+    scale as a masked packet (``s[tile_m] if mask else 0``), one value for
+    every thread of the row either way, so the select changes nothing about
+    which threads redo.  A masked row's zero empties the admitted window,
+    and the row redoes with ``div.rn``'s infinities and NaNs.  So only the
+    dividend is held to the select rule, even in this sweep, which
+    accumulates and stores in the loop and whose select's test is no
+    conjunction of names."""
     source = (
         "_dvec = cute.arch.load(y.iterator, ir.VectorType.get([4], cutlass.Uint32.mlir_type))\n"
         "d = cutlass.Uint32(_dvec[0]).bitcast(cutlass.Float32) if m < n else cutlass.Float32(0)\n"
@@ -1677,6 +1697,35 @@ def test_independent_reduction_keeps_its_partial_accumulators() -> None:
     exact = _render(jsd, args, **INDEPENDENT_JSD_CONFIG)
     assert ANY_EXACT in exact
     assert _without_exact_additions(exact) == plain
+
+
+# The store sweep's exp read from the fragment the row-sum sweep filled
+# (``fuse_two_pass_loads`` carries a V-loop's values under the register reload
+# policies).
+CARRIED = re.compile(r"(v_\d+) = cutlass\.Float32\(_fuse_cache_\d+\[")
+
+
+def test_a_redo_copy_recomputes_the_carried_values() -> None:
+    """The redo copy recomputes the carried exp from the store sweep's own
+    statements, which every pass up to the exact division saw and rewrote
+    (``cut_carried_values`` makes the cut after it), instead of reading the
+    fragment that carries it."""
+    code = _softmax_render()
+    (carried,) = set(CARRIED.findall(code))
+    (copy,) = _redo_copies(code)
+    assert f"{carried} = cute.math.exp(" in copy
+    assert not CARRIED.search(copy)
+
+
+def test_independent_reduction_keeps_the_v_loop_values_recomputed() -> None:
+    """``split_rolled_vector_sums`` splits a V-loop's sum only as the plain
+    sweep spells it: under ``cute_independent_reduction`` no V-loop value is
+    carried, since a fragment write would stop the split and change the
+    summation order."""
+    assert CARRIED.search(_softmax_render(plain=True))
+    x = torch.empty(4096, 4096, dtype=torch.float16)
+    code = _render(softmax_plain, (x,), **INDEPENDENT_SOFTMAX_CONFIG)
+    assert "_cute_rolled_sum_" in code and not CARRIED.search(code)
 
 
 def test_several_rows_per_thread_renders_roll_back_the_lane_accumulators() -> None:

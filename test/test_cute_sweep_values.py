@@ -17,12 +17,20 @@ import ast
 import functools
 import re
 import textwrap
+from typing import cast
 
 import pytest
 import torch
 
 import helion
+from helion._compiler.cute.cut_carried_values import _read_carried_values
+from helion._compiler.cute.cut_carried_values import cut_carried_values
+from helion._compiler.cute.fuse_fma import fuse_fma
+from helion._compiler.cute.fuse_two_pass_loads import FUSE_CARRIED_READ_ATTR
+from helion._compiler.cute.fuse_two_pass_loads import FUSE_CARRY_ATTR
+from helion._compiler.cute.fuse_two_pass_loads import FUSE_CARRY_DEAD_ATTR
 from helion._compiler.cute.fuse_two_pass_loads import _arch_scalar_dtype
+from helion._compiler.cute.fuse_two_pass_loads import _CuteFuseTwoPassLoads
 from helion._compiler.cute.fuse_two_pass_loads import _load_kind
 from helion._compiler.cute.fuse_two_pass_loads import _scalar_load_key
 from helion._compiler.cute.fuse_two_pass_loads import fuse_two_pass_loads
@@ -32,9 +40,11 @@ from helion._compiler.cute.sweep_values import _promoted
 from helion._compiler.cute.sweep_values import _scalar_dtype
 from helion._testing import cpu_render_target
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_sweep_kernels import THIRD_SOFTMAX_CONFIG
 from helion._testing.cute_sweep_kernels import center_fp8_row
 from helion._testing.cute_sweep_kernels import center_fp8_row_config
 from helion._testing.cute_sweep_kernels import dropout_layernorm
+from helion._testing.cute_sweep_kernels import third_softmax
 import helion.language as hl
 
 pytestmark = pytest.mark.cpu_only
@@ -191,10 +201,370 @@ def test_register_policy_carries_a_transcendental() -> None:
     assert "_cute_exact_div_fast_f32" in sweeps[2]
 
 
+@functools.cache
+def _rolled_sweeps(name: str, reload: str, vector: int) -> tuple[str, ...]:
+    """``_sweeps`` for a rolled reduction: each row's 512 elements in one
+    chunk over 128 threads, each thread's elements in packets of ``vector``
+    lanes, a V-loop per sweep when ``vector > 1``."""
+    fn, args, settings = _KERNELS[name]
+    with cpu_render_target(reduction_smem_budget_bytes=232448):
+        kernel = helion.kernel(fn, backend="cute", static_shapes=True, **settings)
+        bound = cpu_bind(kernel, args())
+        config = helion.Config(
+            block_sizes=[1],
+            num_threads=[1, 128],
+            reduction_loops=[512],
+            cute_vector_widths=[vector, 1],
+            cute_reduction_reloads=[reload],
+        )
+        code = bound.to_code(bound.config_spec.normalized_config(config))
+    device = next(
+        node
+        for node in ast.parse(code).body
+        if isinstance(node, ast.FunctionDef) and node.name == f"_helion_{name}"
+    )
+    return (
+        ast.unparse(device),
+        *(ast.unparse(node) for node in device.body if isinstance(node, ast.For)),
+    )
+
+
+@pytest.mark.parametrize("vector", [1, 4])
+def test_register_policy_carries_a_transcendental_of_a_rolled_sweep(
+    vector: int,
+) -> None:
+    # In packets, each sweep's elements run in a V-loop: the normalize
+    # sweep reads the sum sweep's exp from a fragment of a slot per lane.
+    _, *sweeps = _rolled_sweeps("softmax", "register", vector)
+    assert [sweep.count("cute.math.exp(") for sweep in sweeps] == [0, 1, 0]
+    read = re.search(r"cutlass\.Float32\(_fuse_cache_\d+\[([^\]]*)\]\)", sweeps[2])
+    assert read is not None
+    assert (f"* {vector} + reduction_vec_lane_" in read.group(1)) == (vector > 1)
+
+
+def test_gmem_policy_recomputes_a_transcendental_of_a_rolled_sweep() -> None:
+    _, *sweeps = _rolled_sweeps("softmax", "gmem", 4)
+    assert [sweep.count("cute.math.exp(") for sweep in sweeps] == [0, 1, 1]
+
+
+@functools.cache
+def _rolled_cluster_softmax(fast_math: bool, pair: bool) -> str:
+    """The softmax of 32768-element rows over a cluster of four CTAs (two
+    4096-element chunks each, 128 threads x 8-lane packets) under the
+    register policy, with ``cute_cluster_warp_online`` set to ``pair``."""
+    with cpu_render_target(reduction_smem_budget_bytes=232448):
+        kernel = helion.kernel(
+            softmax, backend="cute", static_shapes=True, fast_math=fast_math
+        )
+        bound = cpu_bind(kernel, (torch.empty(64, 32768, dtype=torch.float16),))
+        config = helion.Config(
+            block_sizes=[1],
+            num_threads=[1, 128],
+            reduction_loops=[4096],
+            cute_vector_widths=[8, 1],
+            cute_reduction_reloads=["register"],
+            cute_cluster_n=4,
+            cute_cluster_warp_online=pair,
+            cute_exact_div_form="plain",
+        )
+        return bound.to_code(bound.config_spec.normalized_config(config))
+
+
+@pytest.mark.parametrize("fast_math", [False, True])
+def test_rolled_cluster_pair_keeps_its_sweeps_values(fast_math: bool) -> None:
+    # The rolled online-softmax pair moves the sum sweep's exp into the frame
+    # of a CTA's or warp's own maximum after the fuser runs (under fast_math
+    # the write sweep rescales cached copies of it), so an exp carried from
+    # there would skip the rescale.  Under cute_cluster_warp_online no
+    # V-loop value is carried and the pair forms; without the knob the write
+    # sweep reads the carried exp.
+    paired = _rolled_cluster_softmax(fast_math, pair=True)
+    assert "_cute_grouped_reduce_cluster(" not in paired
+    assert not re.search(r"cutlass\.Float32\(_fuse_cache_\d+\[", paired)
+    if fast_math:
+        assert "_pair_exp_cache_0[" in paired.split("_pair_rescale_0 = ")[1]
+    else:
+        assert paired.count("_cute_grouped_reduce_cluster_warp_online_pair(") == 1
+    unpaired = _rolled_cluster_softmax(fast_math, pair=False)
+    assert unpaired.count("_cute_grouped_reduce_cluster(") == 2
+    assert re.search(r"cutlass\.Float32\(_fuse_cache_\d+\[", unpaired)
+
+
 def test_auto_policy_recomputes_a_transcendental() -> None:
     _, *sweeps = _sweeps("softmax", "auto")
     assert sweeps[1].count("cute.math.exp(") == 1
     assert sweeps[2].count("cute.math.exp(") == 1
+
+
+def _vloop_sweeps(
+    first: list[str],
+    later: list[str],
+    *,
+    between: str = "",
+    trips: int = 2,
+    lanes: int = 8,
+    fma: bool = False,
+    rename_groups: dict[str, str] | None = None,
+) -> tuple[str, str]:
+    """Two rolled sweeps of ``trips`` chunks over ``lanes`` lanes of 4-lane
+    V-loops (``first`` and ``later`` are their V-loop bodies, over the lane
+    variables ``vec_lane_1`` and ``vec_lane_2``), through the fusion and the
+    cut (both comparing names through ``rename_groups``), with ``fuse_fma``
+    in between when ``fma``: the device body and the later sweep."""
+
+    def sweep(lane: str, inner: list[str]) -> str:
+        return (
+            f"for roffset_7 in range(0, {32 * trips}, 32):\n"
+            f"    for reduction_lane_7 in range({lanes}):\n"
+            f"        for {lane} in cutlass.range_constexpr(4):\n"
+            + "".join(f"            {line}\n" for line in inner)
+        )
+
+    body = fuse_two_pass_loads(
+        ast.parse(
+            sweep("vec_lane_1", first) + between + sweep("vec_lane_2", later)
+        ).body,
+        reload_modes={7: "register"},
+        tensor_dtypes={"x": "cutlass.Float32", "out": "cutlass.Float32"},
+        proven_disjoint_tensor_pairs={frozenset(("x", "out"))},
+        rename_groups=rename_groups,
+    )
+    body = cut_carried_values(fuse_fma(body) if fma else body, rename_groups)
+    return ast.unparse(ast.Module(body=body, type_ignores=[])), ast.unparse(body[-1])
+
+
+def _vloop_load(lane: str, offset: str = "") -> str:
+    return (
+        f"w = (x.iterator + {offset}roffset_7 + reduction_lane_7 * 4 + {lane}).load()"
+    )
+
+
+_SUM = "acc = acc + e"
+_STORE = "(out.iterator + roffset_7 + reduction_lane_7 * 4 + vec_lane_2).store(e)"
+
+
+@pytest.mark.parametrize("first_reads_the_product", [False, True])
+def test_a_carried_value_a_later_pass_rewrote_differently_is_recomputed(
+    first_reads_the_product: bool,
+) -> None:
+    # fuse_fma contracts ``p - 1.1`` into one fma only where nothing else
+    # reads ``p``: when the first sweep also sums ``p``, its exp rounds the
+    # product and the later sweep's does not, so the later sweep keeps its
+    # own (the redo copy's, and the gmem policy's, value).
+    def chain(lane: str, n: int) -> list[str]:
+        # Each sweep's own names, as the codegen spells them.
+        return [
+            _vloop_load(lane),
+            f"f_{n} = cutlass.Float32(w)",
+            f"p_{n} = f_{n} * 1.1",
+            f"d_{n} = p_{n} - 1.1",
+            f"e = cute.math.exp(d_{n})",
+        ]
+
+    extra = ["acc2 = acc2 + p_1"] if first_reads_the_product else []
+    code, later = _vloop_sweeps(
+        [*chain("vec_lane_1", 1), _SUM, *extra],
+        [*chain("vec_lane_2", 2), _STORE],
+        fma=True,
+    )
+    assert ("_fuse_cache_" in later) is not first_reads_the_product
+    assert ("cute.math.fma(" in later) is first_reads_the_product
+    # The cut given up, the fragment goes too: its declaration and the first
+    # sweep's writes.
+    assert ("_fuse_cache_" in code) is not first_reads_the_product
+
+
+def test_a_v_loop_load_through_a_fragment_an_alias_rewrites_is_recomputed() -> None:
+    # ``q[0] = 8`` changes ``offs[0]`` between the sweeps: the later sweep's
+    # loads read other elements than the first sweep's.
+    def inner(lane: str) -> list[str]:
+        return [_vloop_load(lane, "offs[0] + "), "e = cute.math.exp(w)"]
+
+    for between, carried in (("", True), ("q = offs\nq[0] = 8\n", False)):
+        code, later = _vloop_sweeps(
+            [*inner("vec_lane_1"), _SUM],
+            [*inner("vec_lane_2"), _STORE],
+            between="q = offs\n" + between,
+        )
+        assert ("_fuse_cache_" in later) is carried
+        assert ("cute.math.exp(" in later) is not carried
+
+
+@pytest.mark.parametrize(
+    ("between", "lane"),
+    [("", "vec_lane_1"), ("saved = vec_lane_1\n", "saved")],
+    ids=["directly", "through-a-name"],
+)
+def test_a_later_v_loop_reading_the_first_lane_is_recomputed(
+    between: str, lane: str
+) -> None:
+    # After its loop ``vec_lane_1`` holds the first sweep's last lane: a later
+    # V-loop loading at it, directly or through a name bound between the
+    # sweeps, reads one element in every lane.
+    code, later = _vloop_sweeps(
+        [_vloop_load("vec_lane_1"), "e = cute.math.exp(w)", _SUM],
+        [_vloop_load(lane), "e = cute.math.exp(w)", _STORE],
+        between=between,
+    )
+    assert "_fuse_cache_" not in code
+    assert "cute.math.exp(" in later
+
+
+@pytest.mark.parametrize("renamed", [False, True])
+@pytest.mark.parametrize("operand", ["load", "index"])
+@pytest.mark.parametrize("sweep", ["first", "later"])
+def test_a_v_loop_that_rebinds_its_lane_carries_nothing(
+    sweep: str, operand: str, renamed: bool
+) -> None:
+    # A value's fragment slot is the lane its V-loop's variable names where
+    # the slot is written or read.  Past ``vec_lane_1 = 3 - vec_lane_1`` (or a
+    # ``vec_lane_1_next`` the final rename merges into it), the first sweep
+    # would write each lane's exp, of an operand read at the lane before, to
+    # the mirrored lane's slot, or the later one read the mirrored lane's.
+    def inner(lane: str, rebinds: bool) -> list[str]:
+        target = f"{lane}_next" if renamed else lane
+        return [
+            _vloop_load(lane)
+            if operand == "load"
+            else f"w = cutlass.Float32(roffset_7 + reduction_lane_7 * 4 + {lane})",
+            *([f"{target} = 3 - {lane}"] if rebinds else []),
+            "e = cute.math.exp(w)",
+        ]
+
+    code, later = _vloop_sweeps(
+        [*inner("vec_lane_1", sweep == "first"), _SUM],
+        [*inner("vec_lane_2", sweep == "later"), _STORE],
+        rename_groups={f"vec_lane_{n}_next": f"vec_lane_{n}" for n in (1, 2)}
+        if renamed
+        else None,
+    )
+    assert "_fuse_cache_" not in code
+    assert "cute.math.exp(" in later
+
+
+def test_a_carried_value_with_one_of_two_alike_operands_rewritten_is_recomputed() -> (
+    None
+):
+    # ``da`` and ``db`` compute one value in each sweep.  The first sweep also
+    # sums both products, the later one only ``pb_2``, so fuse_fma contracts
+    # ``da_2`` alone: the later exp rounds differently and keeps its own.
+    def chain(lane: str, n: int) -> list[str]:
+        return [
+            _vloop_load(lane),
+            f"f_{n} = cutlass.Float32(w)",
+            f"pa_{n} = f_{n} * 1.1",
+            f"pb_{n} = f_{n} * 1.1",
+            f"da_{n} = pa_{n} - 1.1",
+            f"db_{n} = pb_{n} - 1.1",
+            f"e = cute.math.exp(da_{n} + db_{n})",
+        ]
+
+    code, later = _vloop_sweeps(
+        [*chain("vec_lane_1", 1), _SUM, "acc2 = acc2 + pa_1", "acc3 = acc3 + pb_1"],
+        [*chain("vec_lane_2", 2), _STORE, "acc4 = acc4 + pb_2"],
+        fma=True,
+    )
+    # No fragment is left behind either, in the later sweep or the first.
+    assert "_fuse_cache_" not in code
+    assert "cute.math.fma(" in later
+
+
+def test_a_carried_exp_whose_product_rounds_differently_is_recomputed() -> None:
+    # Only the store sweep's ``x / 3 - 0.5`` contracts into an FMA, so its exp
+    # rounds differently from the first sweep's and is not carried.
+    with cpu_render_target(reduction_smem_budget_bytes=232448):
+        kernel = helion.kernel(third_softmax, backend="cute", static_shapes=True)
+        bound = cpu_bind(kernel, (torch.empty(64, 512, dtype=torch.float16),))
+        code = bound.to_code(
+            helion.Config(**THIRD_SOFTMAX_CONFIG, cute_reduction_reloads=["register"])
+        )
+    assert "cute.math.fma(" in code
+    assert not re.search(r"cutlass\.Float32\(_fuse_cache_\d+\[", code)
+
+
+def _scalar_sweeps(first: list[str], later: list[str], after: str = "") -> str:
+    """Two sweeps of 2 chunks over 8 lanes (``first`` and ``later`` are
+    their lane-loop bodies), then ``after``, through the fusion and the cut."""
+
+    def sweep(inner: list[str]) -> str:
+        return (
+            "for roffset_7 in range(0, 64, 32):\n"
+            "    for reduction_lane_7 in range(8):\n"
+            + "".join(f"        {line}\n" for line in inner)
+        )
+
+    body = fuse_two_pass_loads(
+        ast.parse(sweep(first) + sweep(later) + after).body,
+        reload_modes={7: "register"},
+        tensor_dtypes={"x": "cutlass.Float32", "out": "cutlass.Float32"},
+        proven_disjoint_tensor_pairs={frozenset(("x", "out"))},
+    )
+    return ast.unparse(ast.Module(body=cut_carried_values(body), type_ignores=[]))
+
+
+@pytest.mark.parametrize("read_after", [False, True])
+def test_a_load_read_after_its_sweep_stays_a_cache_read(read_after: bool) -> None:
+    # The later sweep's exp is carried, so only a read after the loop keeps
+    # its load of ``w``: from the fragment, as without the carry.
+    load = "w = (x.iterator + roffset_7 + reduction_lane_7).load()"
+    store = "(out.iterator + roffset_7 + reduction_lane_7).store(e)"
+    code = _scalar_sweeps(
+        [load, "e = cute.math.exp(w)", "acc = acc + e"],
+        [load, "e = cute.math.exp(w)", store],
+        after="last = w\n" if read_after else "",
+    )
+    assert code.count("(x.iterator") == 1
+    assert ("w = _fuse_cache_" in code) is read_after
+
+
+def test_a_marked_statement_binding_no_plain_name_keeps_what_it_reads() -> None:
+    # A later pass made a marked assignment augmented: it stays, and so does
+    # the marked statement it reads.  A loop the cut empties keeps a pass.
+    body = ast.parse(
+        "x = cute.math.exp(w)\nacc += x\nfor i in range(4):\n    t = cute.math.exp(w)\n"
+    ).body
+    loop = cast("ast.For", body[2])
+    for stmt in (body[0], body[1], loop.body[0]):
+        setattr(stmt, FUSE_CARRY_DEAD_ATTR, True)
+    code = ast.unparse(ast.Module(body=cut_carried_values(body), type_ignores=[]))
+    assert code == "x = cute.math.exp(w)\nacc += x\nfor i in range(4):\n    pass"
+
+
+def test_a_carried_value_takes_its_nearest_read() -> None:
+    # Copies of a V-loop body share a read's name: each carried statement
+    # takes the read right before it.
+    block = ast.parse(
+        "c = _fuse_cache_0[0]\n"
+        "e = cute.math.exp(w)\n"
+        "c = _fuse_cache_0[1]\n"
+        "e = cute.math.exp(w)\n"
+    ).body
+    for read in (block[0], block[2]):
+        setattr(read, FUSE_CARRIED_READ_ATTR, True)
+    for stmt in (block[1], block[3]):
+        setattr(stmt, FUSE_CARRY_ATTR, "c")
+    _read_carried_values(block, {id(block[3])})
+    assert ast.unparse(ast.Module(body=block, type_ignores=[])) == (
+        "c = _fuse_cache_0[0]\ne = cute.math.exp(w)\ne = _fuse_cache_0[1]"
+    )
+
+
+@pytest.mark.parametrize(("trips", "carried"), [(256, True), (512, False)])
+def test_a_carried_v_loop_fragment_stays_within_the_register_cap(
+    trips: int, carried: bool
+) -> None:
+    # A value of a 4-lane V-loop takes a slot per lane and chunk: 1024 slots
+    # at 256 chunks, as many as a register fragment holds, 2048 at 512.
+    code, later = _vloop_sweeps(
+        [_vloop_load("vec_lane_1"), "e = cute.math.exp(w)", _SUM],
+        [_vloop_load("vec_lane_2"), "e = cute.math.exp(w)", _STORE],
+        trips=trips,
+        lanes=1,
+    )
+    assert ("_fuse_cache_" in later) is carried
+    assert all(
+        int(slots) <= 1024 for slots in re.findall(r"make_rmem_tensor\((\d+)", code)
+    )
 
 
 def test_carried_value_of_a_python_scalar_product_is_rounded_once() -> None:
@@ -249,6 +619,66 @@ def test_raw_byte_loads_cache_in_the_dtype_they_name() -> None:
     # Four 1024-element chunks of eight lanes per thread.
     assert "cute.make_rmem_tensor(32, cutlass.Uint8)" in code
     assert code.count("cute.arch.load(x.iterator") == 1
+
+
+def _fp8_softmax(x: torch.Tensor) -> torch.Tensor:
+    rows, n = x.shape
+    out = torch.empty([rows, n], dtype=torch.bfloat16, device=x.device)
+    for tile_r in hl.tile(rows):
+        v = x[tile_r, :].to(torch.float32)
+        e = torch.exp(v - torch.amax(v, dim=-1, keepdim=True))
+        out[tile_r, :] = (e / e.sum(-1, keepdim=True)).to(out.dtype)
+    return out
+
+
+def test_raw_byte_lane_loads_take_the_dtype_they_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """At V = 8 an fp8 row loads raw bytes in its V-loops
+    (``cute.arch.load(ptr, cutlass.Uint8)``).  The numbering of the carried
+    values types each such load as the Uint8 it names, as a cached load's
+    fragment does, not as the tensor's fp8."""
+    seen: list[dict[str, str]] = []
+    plan = _CuteFuseTwoPassLoads._plan_sweep_values
+
+    def recording(
+        self: _CuteFuseTwoPassLoads, *args: object, **kwargs: object
+    ) -> object:
+        seen.append(dict(cast("dict[str, str]", kwargs["load_dtypes"])))
+        return plan(self, *args, **kwargs)  # pyrefly: ignore[bad-argument-type]
+
+    monkeypatch.setattr(_CuteFuseTwoPassLoads, "_plan_sweep_values", recording)
+    kernel = helion.kernel(_fp8_softmax, backend="cute", static_shapes=True)
+    with cpu_render_target(reduction_smem_budget_bytes=232448):
+        bound = cpu_bind(kernel, (torch.empty(8, 4096, dtype=torch.float8_e4m3fn),))
+        spec = bound.config_spec
+        (rdim,) = spec.reduction_loops.valid_block_ids()
+        code = bound.to_code(
+            spec.normalized_config(
+                helion.Config(
+                    block_sizes=[1],
+                    reduction_loops=[1024],
+                    num_threads=[
+                        128 if block_id == rdim else 1
+                        for block_id in spec.num_threads.valid_block_ids()
+                    ],
+                    cute_vector_widths=[
+                        8 if block_id == rdim else 1
+                        for block_id in spec.cute_vector_widths.valid_block_ids()
+                    ],
+                    cute_reduction_reloads=["register"],
+                )
+            )
+        )
+    assert "cutlass.range_constexpr(8)" in code
+    raw = {
+        key: dtype
+        for dtypes in seen
+        for key, dtype in dtypes.items()
+        if key.endswith(", cutlass.Uint8)")
+    }
+    assert raw
+    assert set(raw.values()) == {"cutlass.Uint8"}
 
 
 @pytest.mark.parametrize(

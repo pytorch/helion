@@ -104,3 +104,21 @@ def test_cluster_reductions_key_on_device_sync() -> None:
         sources = source_dependencies.referenced_helper_sources({"helper": helper})
         assert sources is not None
         assert "_compiler/cute/device/sync.py" in dict(sources)
+
+
+def test_reduce_helpers_key_on_their_routing_alone() -> None:
+    # The shared reduces dispatch on ``reduce_routing``, which keys them;
+    # ``reduce_call``, the passes' vocabulary, stays out of every key, so an
+    # edit to it leaves compiled kernels cached.
+    pytest.importorskip("cutlass")
+    from helion._compiler.cute import reduce_helpers
+
+    sources = source_dependencies.referenced_helper_sources(
+        {"helper": reduce_helpers._cute_grouped_reduce_shared_two_stage}
+    )
+    assert sources is not None
+    assert "_compiler/cute/reduce_routing.py" in dict(sources)
+    assert "_compiler/cute/reduce_call.py" not in dict(sources)
+    common = source_dependencies._COMMON_DEPENDENCIES
+    assert "_compiler/cute/reduce_routing.py" in common
+    assert "_compiler/cute/reduce_call.py" not in common

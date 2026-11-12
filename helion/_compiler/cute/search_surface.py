@@ -186,7 +186,10 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
     env = CompileEnvironment.current()
     env_state = cute_env_state(env)
     register_lane_vector_width_specs(config_spec)
+    from .half_extremum_folds import has_half_extremum_reduction
     from .hoist_loop_invariant_recip import has_hoistable_fp32_divisions
+    from .pair_lane_math import has_fp32_arithmetic
+    from .pair_lane_math import has_pairable_exps_or_divisions
     from .signed_bitfield import has_signed_byte_field
     from .tile_packing import tile_pack_counts
 
@@ -196,6 +199,21 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
     # division hoist can apply, so its form is tunable.
     config_spec.cute_exact_division_sites = has_hoistable_fp32_divisions(
         info.graph for info in device_ir.graphs
+    )
+    # Exps (sigmoids lower through one), exact divisions or fp32 products,
+    # sums and differences to pair over vector lanes in Blackwell's packed
+    # fp32 instructions, or half-precision maxima to fold as half2 words;
+    # not in a kernel with a matmul (its facts are recorded by now).
+    config_spec.cute_pair_lane_math_sites = (
+        config_spec.target_device_capability is not None
+        and config_spec.target_device_capability >= (10, 0)
+        and not env.settings.fast_math
+        and not config_spec.matmul_facts
+        and (
+            has_pairable_exps_or_divisions(device_ir)
+            or has_fp32_arithmetic(device_ir)
+            or has_half_extremum_reduction(device_ir)
+        )
     )
 
     # A reduction over a strided full slice beside a contiguous grid tile:
@@ -211,11 +229,31 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
         and any(has_signed_byte_field(info.graph) for info in device_ir.graphs)
     )
     # The reductions that may roll along a bool row a load reads: their byte
-    # packets are tunable (``cute_bool_byte_packets``).
+    # packets are tunable (``cute_bool_byte_packets``), not in a kernel with
+    # a matmul (its facts are recorded by now).
     from .memory_ops import bool_reduction_row_blocks
 
-    config_spec.cute_bool_byte_packet_sites = bool_reduction_row_blocks(
-        device_ir, config_spec
+    config_spec.cute_bool_byte_packet_blocks = (
+        frozenset()
+        if config_spec.matmul_facts
+        else bool_reduction_row_blocks(env, device_ir, config_spec)
+    )
+    # A device loop over a static extent that loads a float tensor along its
+    # tile: running its complete tiles apart, their lanes in packets, is
+    # tunable (``cute_tail_peel``).
+    from .peel_vector_tails import tail_peel_blocks
+
+    config_spec.cute_tail_peel_blocks = (
+        frozenset()
+        if config_spec.matmul_facts
+        else tail_peel_blocks(device_ir, config_spec)
+    )
+    # A max, a min or an ``any`` whose warp reduction ``redux.sync`` takes on
+    # this target: ``cute_warp_fp32_redux`` is tunable.
+    from .native_warp_reduction import has_native_redux_reduction
+
+    config_spec.cute_native_redux_sites = has_native_redux_reduction(
+        device_ir, config_spec.target_device_capability
     )
     # Enable the flash-attention autotune surface when
     # the dense flash dataflow is detected, analogous to how a matmul
@@ -601,11 +639,42 @@ def register_grid_tile_slots(
             register_tensor_alias_specializations(env)
 
 
+def row_itemsizes(env: CompileEnvironment, device_ir: DeviceIR) -> dict[int, int]:
+    """Per block, the widest element of a value a load or a store moves
+    along it: the block is one of the value's dims (a full slice
+    ``x[row, :]`` included), and a stored value has the tensor's dtype
+    (``store`` converts it while tracing).  A persistent row holds several
+    packets per thread only where they fit (``fits_row_packets``)."""
+    from ...language.memory_ops import load
+    from ...language.memory_ops import store
+
+    widest: dict[int, int] = {}
+    for info in device_ir.graphs:
+        for node in info.graph.nodes:
+            if node.op != "call_function" or node.target not in (load, store):
+                continue
+            moved = node if node.target is load else node.args[2]
+            value = moved.meta.get("val") if isinstance(moved, torch.fx.Node) else None
+            if not isinstance(value, torch.Tensor):
+                continue
+            for size in value.shape:
+                if (
+                    isinstance(size, torch.SymInt)
+                    and (block_id := env.get_block_id(size)) is not None
+                ):
+                    block_id = env.canonical_block_id(block_id)
+                    widest[block_id] = max(
+                        widest.get(block_id, 0), value.dtype.itemsize
+                    )
+    return widest
+
+
 def register_reduction_layout_slots(
     func: HostFunction | None, device_ir: DeviceIR, analysis: DeviceIRAnalysis | None
 ) -> None:
     """Per static reduction block: ``num_threads``, vector width, lane layout
-    and reload slots, whether or not the block rolls into a loop."""
+    and reload slots, whether or not the block rolls into a loop; and the
+    widest element moved along each block (``cute_row_itemsizes``)."""
     env = CompileEnvironment.current()
     # Every reduction dim has exactly one roller result, in ``rdims`` order;
     # only the dim itself is read here.
@@ -625,7 +694,9 @@ def register_reduction_layout_slots(
     # The blocks the ``hl.reduce`` calls reduce, None for a call that reduces
     # every dim or a dim of no block (``_block_has_user_reduce``).
     from ...language.reduce_ops import _reduce
+    from ...language.scan_ops import _associative_scan
     from .reduction_emitter import _reduced_block_id
+    from .reduction_emitter import _scanned_block_id
 
     user_reduced = [
         _reduced_block_id(node)
@@ -633,6 +704,15 @@ def register_reduction_layout_slots(
         for node in graph_info.graph.nodes
         if node.target is _reduce
     ]
+    # Likewise the blocks the scans run along (``_block_is_scanned``).
+    scanned = [
+        _scanned_block_id(node)
+        for graph_info in device_ir.graphs
+        for node in graph_info.graph.nodes
+        if node.target is _associative_scan
+    ]
+    # The packets a persistent row may hold (``fits_row_packets``).
+    env.config_spec.cute_row_itemsizes = row_itemsizes(env, device_ir)
     for rdim in rdims:
         # Reduction lowering materializes output-range blocks even
         # when the range is exactly an already-active tile symbol.
@@ -654,6 +734,11 @@ def register_reduction_layout_slots(
             for block_id in user_reduced
         ):
             env.config_spec.cute_user_reduce_block_ids.add(rdim.block_id)
+        if any(
+            block_id is None or env.canonical_block_id(block_id) == rdim.block_id
+            for block_id in scanned
+        ):
+            env.config_spec.cute_scanned_block_ids.add(rdim.block_id)
         if rdim.block_id not in num_thread_blocks:
             env.config_spec.num_threads.append(
                 NumThreadsSpec(

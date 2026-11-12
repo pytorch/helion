@@ -188,6 +188,17 @@ def roll_loops(code: str, target: str = "roffset_1") -> list[ast.For]:
     ]
 
 
+def exact_division_redo_branches(tree: ast.AST) -> list[ast.If]:
+    """The exact division's redo branches in ``tree``: its
+    ``if _cute_exact_div_redo_*(...)`` statements."""
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and "_cute_exact_div_redo_" in ast.unparse(node.test)
+    ]
+
+
 @contextmanager
 def mock_cuda_unavailable() -> Generator[None, None, None]:
     """Model CPU code generation without filling process-wide device caches.

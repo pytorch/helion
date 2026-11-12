@@ -14365,6 +14365,7 @@ class TestCuteLowerings(unittest.TestCase):
             _synthetic_cute_lane_var="synthetic_lane_0",
             _synthetic_cute_lane_extent=4,
             _cute_reduction_vec_width=1,
+            _cute_reduction_vec_chunks=1,
             _cute_resident_reduction=False,
             # ``__init__`` predicts the register tile; this lane stays rolled.
             _cute_register_tile_predicted=False,

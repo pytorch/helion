@@ -36,8 +36,8 @@ from helion._compiler.cute.device_state import Tcgen05GroupedSchedulerMode
 from helion._compiler.cute.flash_policy import get_flash_target_policy
 from helion._compiler.cute.flash_tuning import FlashPackedExp2Mode
 from helion._compiler.cute.flash_tuning import FlashSoftmaxLowering
-from helion._compiler.cute.reduce_call import use_interleaved_shared_reduce
-from helion._compiler.cute.reduce_call import use_strided_warp_reduce
+from helion._compiler.cute.reduce_routing import use_interleaved_shared_reduce
+from helion._compiler.cute.reduce_routing import use_strided_warp_reduce
 from helion._compiler.cute.state import cute_env_state
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._compiler.cute.tcgen05_config import facts
@@ -16269,6 +16269,30 @@ class TestCuteBackend(TestCase):
         self.assertIn("cute.gemm", code)
         self.assertIn("cute.nvgpu.warp.MmaF16BF16Op", code)
         self.assertNotIn("dot_serial_result", code)
+
+    def test_matmul_direct_grouped_n_declines_vectorized_rows(self) -> None:
+        # The direct warp-MMA tiles give lane ``l`` of thread ``t`` column
+        # ``l * threads + t``.  A row of 4-wide vectors holds element
+        # ``l % 4`` of its chunk ``l // 4`` there instead (one vector per
+        # thread over 32 threads, four chunks over 8), so those configs take
+        # another lowering and store every column where it belongs.
+        args = (
+            torch.randn(256, 128, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(128, 128, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        expected = (args[0].float() @ args[1].float()).to(HALF_DTYPE)
+        for row_threads in (8, 32):
+            with self.subTest(row_threads=row_threads):
+                code, out = code_and_output(
+                    cute_grouped_n_matmul,
+                    args,
+                    block_sizes=[32],
+                    indexing="block_ptr",
+                    num_threads=[32, row_threads],
+                    cute_vector_widths=[4, 1],
+                )
+                torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
+                self.assertNotIn("cute.nvgpu.warp.MmaF16BF16Op", code)
 
     def test_matmul_direct_grouped_n_rounds_to_declared_dtype(self) -> None:
         # The direct warp-MMA path accumulates in fp32; a bf16 x bf16 matmul

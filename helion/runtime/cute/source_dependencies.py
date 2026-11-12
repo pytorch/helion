@@ -16,9 +16,9 @@ _PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 
 # Ordinary generated kernels import these helpers without a wrapper plan.
 # Include their implementations and transitive support (the cluster helpers,
-# the shared reduce routing ``reduce_helpers`` imports from ``reduce_call``)
-# in every key; a generated import statement alone cannot identify the
-# compiled device code.
+# the reduce routing ``reduce_helpers`` imports from ``reduce_routing``) in
+# every key; a generated import statement alone cannot identify the compiled
+# device code.
 # The host wrapper emitters are keyed whole as well: they write the ``@cute.jit``
 # wrapper text (and ``flash_flex`` the tile counts baked into it), which the
 # key does not otherwise see; so are the two tables whose results the
@@ -41,7 +41,7 @@ _COMMON_DEPENDENCIES = (
     "runtime/cute/plan_facts.py",
     "runtime/cute/register_tensor.py",
     "_compiler/cute/reduce_helpers.py",
-    "_compiler/cute/reduce_call.py",
+    "_compiler/cute/reduce_routing.py",
     "_compiler/cute/cluster_helpers.py",
     "_compiler/cute/device/sync.py",
     "_compiler/cute/vec_utils.py",

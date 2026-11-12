@@ -8,11 +8,11 @@ import cutlass.cute as cute
 
 from .device.sync import store_shared_remote_f32
 from .device.sync import store_shared_remote_f32x2
-from .reduce_call import cooperative_column_share
-from .reduce_call import cooperative_column_slots
-from .reduce_call import use_interleaved_shared_reduce
-from .reduce_call import use_serial_block_reduce
-from .reduce_call import use_strided_warp_reduce
+from .reduce_routing import cooperative_column_share
+from .reduce_routing import cooperative_column_slots
+from .reduce_routing import use_interleaved_shared_reduce
+from .reduce_routing import use_serial_block_reduce
+from .reduce_routing import use_strided_warp_reduce
 
 try:
     from cutlass.base_dsl.enums import Arch
@@ -130,6 +130,19 @@ def _warp_reduce_any(value: cute.Numeric, *, threads_in_group: int) -> cute.Nume
         operator.or_,
         threads_in_group=threads_in_group,
     )
+
+
+@cute.jit
+def _warp_reduce_or_native(
+    value: cute.Numeric, *, threads_in_group: int
+) -> cute.Numeric:
+    """``|`` over a whole warp of 32-bit integers in one ``redux.sync``, else
+    the shuffle reduction."""
+    if cutlass.const_expr(
+        type(value) in (cutlass.Int32, cutlass.Uint32) and threads_in_group == 32
+    ):
+        return cute.arch.warp_redux_sync(value, "or")
+    return _warp_reduce_any(value, threads_in_group=threads_in_group)
 
 
 # Reduction type -> (warp_op, combine): the warp-level shuffle reduction and

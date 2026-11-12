@@ -28,6 +28,7 @@ from typing import cast
 import sympy
 import torch
 from torch._subclasses import FakeTensor
+from torch.fx.experimental.symbolic_shapes import statically_known_true
 from torch.fx.node import map_arg
 
 from ... import exc
@@ -150,14 +151,13 @@ _CUTE_BYTE_PACKED_DTYPES = frozenset({torch.uint8, torch.int8, torch.float4_e2m1
 
 
 def bool_reduction_row_blocks(
-    device_ir: DeviceIR, config_spec: ConfigSpec
+    env: CompileEnvironment, device_ir: DeviceIR, config_spec: ConfigSpec
 ) -> frozenset[int]:
     """The reduction blocks that ``reduction_loops`` may roll (a pinned slot's
-    dim stays persistent) along which a load reads a bool tensor: where
+    dim stays persistent) along which a load reads a bool tensor in its last
+    dim, which a lane's packet walks (``lane_on_stride1``): where
     ``cute_bool_byte_packets`` can apply.  Structure only, no extents.  A dim
-    is matched by its block's size symbol, so this needs no current host
-    function (the coverage registration runs after binding)."""
-    env = CompileEnvironment.current()
+    is matched by its block's size symbol."""
     rollable = {
         env.block_sizes[spec.block_id].symbol(): spec.block_id
         for spec in config_spec.reduction_loops
@@ -175,13 +175,11 @@ def bool_reduction_row_blocks(
                 and isinstance(tensor := source.meta.get("val"), torch.Tensor)
                 and tensor.dtype is torch.bool
                 and isinstance(value, torch.Tensor)
+                and value.ndim
+                and isinstance(size := value.shape[-1], torch.SymInt)
+                and (expr := _symint_expr(size)) in rollable
             ):
-                blocks.update(
-                    rollable[expr]
-                    for size in value.shape
-                    if isinstance(size, torch.SymInt)
-                    and (expr := _symint_expr(size)) in rollable
-                )
+                blocks.add(rollable[expr])
     return frozenset(blocks)
 
 
@@ -420,6 +418,36 @@ def tensor_has_specialized_base_alignment(
         return False
     signature = _bound_vec_alignment_signature(env, env.tensor_input_source(tensor))
     return signature is not None and signature[0] % alignment == 0
+
+
+def tensor_proven_base_alignment(
+    env: CompileEnvironment,
+    tensor: torch.Tensor,
+    candidates: tuple[int, ...] = (16, 8, 4),
+) -> int | None:
+    """The widest of ``candidates`` (bytes, widest first) that ``tensor``'s
+    data pointer is proven aligned to, or None: the residue of its offset
+    into storage no input owns (a fresh allocation, 16-byte aligned), or of
+    its offset from an input viewing the same storage whose base alignment
+    the cache key backs (``tensor_has_specialized_base_alignment``)."""
+    inputs = list(env.input_sources)
+    storage = id(tensor.untyped_storage())
+    owned = any(id(source.untyped_storage()) == storage for source in inputs)
+    offset = tensor.storage_offset() * tensor.element_size()
+    for alignment in candidates:
+        if not owned and statically_known_true(offset % alignment == 0):
+            return alignment
+        if any(
+            id(source.untyped_storage()) == storage
+            and tensor_has_specialized_base_alignment(env, source, alignment)
+            and statically_known_true(
+                (offset - source.storage_offset() * source.element_size()) % alignment
+                == 0
+            )
+            for source in inputs
+        ):
+            return alignment
+    return None
 
 
 def tensor_has_specialized_dim_multiple(

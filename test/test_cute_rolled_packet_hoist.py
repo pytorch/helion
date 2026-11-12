@@ -179,9 +179,9 @@ def test_register_reloads_serve_the_consume_sweep_from_the_packets() -> None:
 
 @functools.cache
 def _mask_sum_config(
-    spec: ConfigSpec, vec_width: int, reduction_loop: int | None
+    spec: ConfigSpec, vec_width: int, reduction_loop: int | None, threads: int = 64
 ) -> helion.Config:
-    """64 threads on the row of ``_mask_sum``, rolled in
+    """``threads`` threads on the row of ``_mask_sum``, rolled in
     ``reduction_loop``-element chunks or persistent, under
     ``cute_bool_byte_packets``."""
     (rdim,) = spec.reduction_loops.valid_block_ids()
@@ -189,7 +189,7 @@ def _mask_sum_config(
         block_sizes=[1],
         reduction_loops=[reduction_loop],
         num_threads=[
-            64 if block_id == rdim else 1
+            threads if block_id == rdim else 1
             for block_id in spec.num_threads.valid_block_ids()
         ],
         cute_vector_widths=[
@@ -200,11 +200,13 @@ def _mask_sum_config(
     )
 
 
-def _mask_sum_code(n: int, vec_width: int, reduction_loop: int | None) -> str:
+def _mask_sum_code(
+    n: int, vec_width: int, reduction_loop: int | None, threads: int = 64
+) -> str:
     """``mask[tile_r, :].to(torch.float32).sum(-1)`` over 8 x ``n`` bools
     (``_mask_sum_config``)."""
     bound = _mask_sum_bound(n)
-    config = _mask_sum_config(bound.config_spec, vec_width, reduction_loop)
+    config = _mask_sum_config(bound.config_spec, vec_width, reduction_loop, threads)
     with mock_cuda_unavailable():
         return bound.to_code(config)
 
@@ -224,23 +226,31 @@ def _mask_sum_bound(n: int) -> BoundKernel:
 
 
 @pytest.mark.parametrize(
-    ("n", "vec_width", "reduction_loop", "packet"),
+    ("n", "vec_width", "reduction_loop", "threads", "packet"),
     [
-        pytest.param(_N, 8, 1024, "cutlass.Uint64", id="rolled-v8"),
+        pytest.param(_N, 8, 1024, 64, "cutlass.Uint64", id="rolled-v8"),
         # A row that ends inside its last chunk masks that chunk: its byte
         # packets are predicated on the chunk, as an integer carrier's are.
-        pytest.param(3000, 8, 1024, "cutlass.Uint64", id="rolled-v8-ragged"),
+        pytest.param(3000, 8, 1024, 64, "cutlass.Uint64", id="rolled-v8-ragged"),
         # 16 bytes is wider than one packed integer: scalar loads, as before.
-        pytest.param(_N, 16, 1024, None, id="rolled-v16"),
+        pytest.param(_N, 16, 1024, 64, None, id="rolled-v16"),
+        # Lanes of one element: four per thread, which V8 does not divide,
+        # or threads that cover the chunk.
+        pytest.param(_N, 8, 1024, 256, None, id="rolled-v8-four-per-thread"),
+        pytest.param(_N, 8, 64, 128, None, id="rolled-v8-covered-chunk"),
         # A persistent row (one 8-byte vector per thread) keeps its
         # per-element loads.
-        pytest.param(512, 8, None, None, id="persistent-v8"),
+        pytest.param(512, 8, None, 64, None, id="persistent-v8"),
     ],
 )
 def test_bool_byte_packets_only_where_one_integer_holds_them(
-    n: int, vec_width: int, reduction_loop: int | None, packet: str | None
+    n: int,
+    vec_width: int,
+    reduction_loop: int | None,
+    threads: int,
+    packet: str | None,
 ) -> None:
-    code = _mask_sum_code(n, vec_width, reduction_loop)
+    code = _mask_sum_code(n, vec_width, reduction_loop, threads)
     if reduction_loop is None:
         assert "roffset_" not in code, code
     packets, scalars = _loads(code, "mask")
@@ -252,22 +262,27 @@ def test_bool_byte_packets_only_where_one_integer_holds_them(
 
 
 @pytest.mark.parametrize(
-    ("n", "vec_width", "reduction_loop", "kept"),
+    ("n", "vec_width", "reduction_loop", "threads", "kept"),
     [
-        pytest.param(_N, 8, 1024, True, id="rolled-v8"),
-        pytest.param(_N, 16, 1024, False, id="rolled-v16"),
-        pytest.param(_N, 1, 1024, False, id="rolled-v1"),
-        pytest.param(512, 8, None, False, id="persistent-v8"),
+        pytest.param(_N, 8, 1024, 64, True, id="rolled-v8"),
+        pytest.param(_N, 16, 1024, 64, False, id="rolled-v16"),
+        pytest.param(_N, 1, 1024, 64, False, id="rolled-v1"),
+        # V8 requested, but lanes of one element (as loaded above).
+        pytest.param(_N, 8, 1024, 256, False, id="rolled-v8-four-per-thread"),
+        pytest.param(_N, 8, 64, 128, False, id="rolled-v8-covered-chunk"),
+        pytest.param(512, 8, None, 64, False, id="persistent-v8"),
     ],
 )
 def test_an_inert_bool_byte_packets_knob_turns_off(
-    n: int, vec_width: int, reduction_loop: int | None, kept: bool
+    n: int, vec_width: int, reduction_loop: int | None, threads: int, kept: bool
 ) -> None:
-    # Where no bool row rolls at a width one packed integer holds, the knob
-    # changes no code, so normalization turns it off: the search would
-    # otherwise compile and measure the same code twice.
+    # Where no bool row rolls in lanes of a width one packed integer holds,
+    # the knob changes no code, so normalization turns it off: the search
+    # would otherwise compile and measure the same code twice.
     spec = _mask_sum_bound(n).config_spec
-    config = spec.normalized_config(_mask_sum_config(spec, vec_width, reduction_loop))
+    config = spec.normalized_config(
+        _mask_sum_config(spec, vec_width, reduction_loop, threads)
+    )
     assert config.config["cute_bool_byte_packets"] is kept
     assert spec.normalized_config(config) == config
 
@@ -292,17 +307,31 @@ def _row_sum(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _mask_column_sum(mask: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([mask.size(1)], dtype=torch.float32, device=mask.device)
+    for tile_n in hl.tile(mask.size(1)):
+        out[tile_n] = mask[:, tile_n].to(torch.float32).sum(0)
+    return out
+
+
 def test_bool_byte_packets_are_offered_for_a_rollable_bool_row() -> None:
     # The knob opens on structure alone: the mask sum offers it at every
     # width (its search fingerprint does not change), a sum without a bool
     # row does not and rejects an explicit value.
     specs = [_mask_sum_bound(n).config_spec for n in (_N, 3000, 600)]
-    assert all(spec.cute_bool_byte_packet_sites for spec in specs)
+    assert all(spec.cute_bool_byte_packet_blocks for spec in specs)
     assert len({spec.structural_fingerprint() for spec in specs}) == 1
+    # A column sum reads the bool rows across their stride-1 dim, which a
+    # packet would walk: no knob.
+    kernel = helion.kernel(_mask_column_sum, backend="cute", static_shapes=True)
+    with mock_cuda_unavailable():
+        column = cpu_bind(kernel, (torch.empty(_N, 64, dtype=torch.bool),))
+    assert column.config_spec.reduction_loops.valid_block_ids()
+    assert not column.config_spec.cute_bool_byte_packet_blocks
     kernel = helion.kernel(_row_sum, backend="cute", static_shapes=True)
     with mock_cuda_unavailable():
         spec = cpu_bind(kernel, (torch.empty(_ROWS, _N),)).config_spec
-    assert not spec.cute_bool_byte_packet_sites
+    assert not spec.cute_bool_byte_packet_blocks
     with pytest.raises(exc.InvalidConfig, match="cute_bool_byte_packets requires"):
         spec.normalized_config(helion.Config(cute_bool_byte_packets=True))
     # An explicit False, as a config tuned where the knob applies carries it,
@@ -322,14 +351,13 @@ def test_a_pinned_reduction_slot_offers_no_bool_byte_packets() -> None:
     spec = bound.config_spec
     device_ir = bound.host_function.device_ir
     (slot,) = spec.reduction_loops
-    with bound.env:
-        assert bool_reduction_row_blocks(device_ir, spec) == {slot.block_id}
-        spec.reduction_loops[0] = ReductionLoopSpec(
-            block_id=slot.block_id,
-            size_hint=slot.size_hint,
-            persistent_reason="rolled by older versions",
-        )
-        assert not bool_reduction_row_blocks(device_ir, spec)
+    assert bool_reduction_row_blocks(bound.env, device_ir, spec) == {slot.block_id}
+    spec.reduction_loops[0] = ReductionLoopSpec(
+        block_id=slot.block_id,
+        size_hint=slot.size_hint,
+        persistent_reason="rolled by older versions",
+    )
+    assert not bool_reduction_row_blocks(bound.env, device_ir, spec)
 
 
 def test_bool_byte_packets_are_covered_on_rolled_seeds() -> None:

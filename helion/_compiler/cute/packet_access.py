@@ -165,6 +165,31 @@ class PacketAccess:
         or None when a keyword is not a string-valued cache hint."""
         return CachePolicy.from_load_keywords(self.keywords)
 
+    def flushed_values(self) -> tuple[str, tuple[int, int] | None] | None:
+        """``(collector, lanes)`` of a ``flush``: ``VALUES`` names the list
+        collecting the lane values (``lanes`` None, all of it) or is a
+        constant slice of it, ``collector[lo:hi]`` (``lanes`` ``(lo, hi)``: a
+        lane loop of several chunks flushes one slice per chunk).  None for
+        any other ``VALUES`` or kind."""
+        if self.kind != "flush":
+            return None
+        values = self.call.args[1]
+        if isinstance(values, ast.Name):
+            return values.id, None
+        if (
+            isinstance(values, ast.Subscript)
+            and isinstance(values.value, ast.Name)
+            and isinstance(values.slice, ast.Slice)
+            and values.slice.step is None
+            and isinstance(lower := values.slice.lower, ast.Constant)
+            and isinstance(upper := values.slice.upper, ast.Constant)
+            and type(lower.value) is int
+            and type(upper.value) is int
+            and 0 <= lower.value < upper.value
+        ):
+            return values.value.id, (lower.value, upper.value)
+        return None
+
 
 def vector_type_parts(node: ast.AST) -> tuple[int | None, str | None] | None:
     """``(V, "cutlass.T")`` of ``ir.VectorType.get([V], cutlass.T.mlir_type)``;

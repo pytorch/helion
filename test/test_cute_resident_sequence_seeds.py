@@ -8,6 +8,8 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from test.cute_population_contracts import checked_initial_population
+
 import helion
 from helion._compiler.cute.autotune.heuristics.cute_resident_sequence import (
     CuteResidentSequenceHeuristic,
@@ -96,7 +98,8 @@ def _initial_population(
             initial_population=profile.initial_population if count is None else count,
             initial_population_strategy=InitialPopulationStrategy.FROM_RANDOM,
         )
-        flats = search._generate_initial_population_flat()
+        # The budgeted rows; compiler coverage witnesses follow them.
+        flats = checked_initial_population(search)[: search.initial_population]
         configs = [search.config_gen.unflatten(flat) for flat in flats]
         assert [search.config_gen.flatten(config) for config in configs] == flats
         assert configs[0] == search.config_gen.unflatten(

@@ -4,11 +4,12 @@
 (``_cute_config_forms_lane_loop``).  For a persistent reduction row the
 prediction follows ``CutePersistentReductionEmitter.plan_synthetic_lanes``
 with the rules both apply: a thread count whose lanes do not tile the padded
-row drops to a power of two (``tiled_row_threads``), the row then runs on one
-warp unless one vector per thread covers it, and a masked row walks only its
-live lanes (``trims_padded_lanes``).  Each case renders on CPU with the knob forced
-through normalization, and the knob must be kept exactly where that render
-unrolls a lane loop.
+row drops to a power of two (``tiled_row_threads``), and the row then runs on
+one warp unless one vector per thread covers it.  A masked row walks only its
+live lanes (``masked_row_lanes``), which the knob rounds up to its multiple;
+the model counts its padded lanes, which form a lane loop where those do.
+Each case renders on CPU with the knob forced through normalization, and the
+knob must be kept exactly where that render unrolls a lane loop.
 """
 
 from __future__ import annotations
@@ -22,6 +23,9 @@ import torch
 
 import helion
 from helion._compiler.cute.autotune import search_surface
+from helion._compiler.cute.reduction_lanes import masked_row_lanes
+from helion._compiler.cute.reduction_lanes import requested_lane_unroll
+from helion._compiler.cute.reduction_lanes import walks_live_lanes
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_native_compile
@@ -76,12 +80,15 @@ def _kept_and_unrolled(kernel: helion.Kernel, width: int, config: helion.Config)
     spec = bound.config_spec
     normalized = spec.normalized_config(config)
     kept = normalized.config["cute_lane_unroll"] != 1
-    with patch.object(
-        search_surface, "_cute_config_forms_lane_loop", return_value=True
+    # ``to_code`` normalizes the config again, so the knob stays forced
+    # through the render.
+    with (
+        patch.object(search_surface, "_cute_config_forms_lane_loop", return_value=True),
+        mock_cuda_unavailable(),
+        forbid_native_compile(),
     ):
         forced = spec.normalized_config(config)
-    assert forced.config["cute_lane_unroll"] == 8
-    with mock_cuda_unavailable(), forbid_native_compile():
+        assert forced.config["cute_lane_unroll"] == 8
         code = bound.to_code(forced)
     return kept, "_lane_unroll_loads_" in code
 
@@ -98,9 +105,9 @@ def _kept_and_unrolled(kernel: helion.Kernel, width: int, config: helion.Config)
         # threads take it, one 16-wide vector each.
         pytest.param(1024, 96, 16, False, id="rounded-to-a-vector-row"),
         pytest.param(1024, 96, 1, True, id="rounded-then-one-warp"),
-        # 600 elements on one warp walk 19 live lanes, which no factor
-        # divides.
-        pytest.param(600, 32, 1, False, id="odd-live-lanes"),
+        # 600 elements on one warp hold 19 live lanes, which no factor
+        # divides: the knob walks them rounded up to 24.
+        pytest.param(600, 32, 1, True, id="odd-live-lanes"),
         pytest.param(768, 32, 1, True, id="even-live-lanes"),
     ],
 )
@@ -113,28 +120,83 @@ def test_the_knob_stays_where_a_row_lane_loop_unrolls(
     )
 
 
+def test_a_row_of_several_vectors_per_thread_takes_no_unroll() -> None:
+    # 64 threads give a 1024-wide row 16 lanes, not one 8-wide vector each:
+    # the row runs on one warp, whose 32 lanes are four vectors per thread,
+    # walked by one constexpr loop.
+    assert _kept_and_unrolled(_row_center, 1024, _config(64, 8)) == (False, False)
+
+
 def test_an_hl_reduce_row_keeps_its_padded_lanes() -> None:
     # ``hl.reduce`` folds its ``other`` into the padded slots, so the code
-    # keeps all 32 lanes of a 600-wide row on one warp, where the model,
-    # which cannot see the ``hl.reduce``, counts the 19 live ones and resets
-    # the knob.  The render takes no unroll of that loop either, so the
-    # reset loses nothing.
-    assert _kept_and_unrolled(_padded_count, 600, _config(32, 1)) == (False, False)
+    # keeps all 32 lanes of a 600-wide row on one warp, and the knob unrolls
+    # them.  The model counts a masked row's padded lanes, which form a lane
+    # loop as the lanes the code walks under the knob do.
+    assert _kept_and_unrolled(_padded_count, 600, _config(32, 1)) == (True, True)
     bound, _ = _bind(_padded_count, 600)
+    config = helion.Config(**dict(_config(32, 1).config, cute_lane_unroll=1))
     with mock_cuda_unavailable(), forbid_native_compile():
-        code = bound.to_code(bound.config_spec.normalized_config(_config(32, 1)))
+        code = bound.to_code(config)
     assert "for synthetic_lane_1 in range(32):" in code, code
 
 
-@pytest.mark.parametrize(("width", "kept"), [(768, True), (600, False)])
-def test_proven_bounds_trim_the_lanes_the_code_trims(width: int, kept: bool) -> None:
-    # Under cute_proven_bounds a masked row keeps its 32 padded lanes only
-    # when its live lanes cover it exactly (768 = 24 x 32); a 600-wide row
-    # walks its 19 live lanes, as without the flag (``trims_padded_lanes``,
-    # which the code generator asks too).  A CPU bind refuses the flag's
-    # rendering, so this asks the model alone.
-    bound, _ = _bind(_row_center, width)
-    config = dict(_config(32, 1).config, cute_proven_bounds=True)
+@pytest.mark.parametrize(
+    ("width", "proven_bounds", "unroll", "live"),
+    [
+        pytest.param(768, False, 1, True, id="768"),
+        # Under cute_proven_bounds live lanes covering the row exactly (768 =
+        # 24 x 32) keep the padded ones; 600 elements leave 19, trimmed.
+        pytest.param(768, True, 1, False, id="768-proven-bounds"),
+        pytest.param(600, True, 1, True, id="600-proven-bounds"),
+        # Under the knob 24 live lanes take a factor; 19 take none and are
+        # rounded up (``masked_row_lanes``).
+        pytest.param(768, False, 8, True, id="768-unrolled"),
+        pytest.param(600, False, 8, False, id="600-unrolled"),
+        pytest.param(600, True, 8, False, id="600-proven-bounds-unrolled"),
+    ],
+)
+def test_the_rows_that_walk_only_their_live_lanes(
+    width: int, proven_bounds: bool, unroll: int, live: bool
+) -> None:
+    # The seed heuristic asks this rule; the code generator asks
+    # ``masked_row_lanes``.  A CPU bind refuses the proven-bounds rendering,
+    # so this asks the rule alone.
     assert (
-        search_surface._cute_config_forms_lane_loop(bound.config_spec, config) is kept
+        walks_live_lanes(width, 32, proven_bounds=proven_bounds, unroll=unroll) is live
     )
+
+
+@pytest.mark.parametrize(
+    ("width", "proven_bounds", "unroll", "lanes"),
+    [
+        # 19 live lanes of 32: walked as they are, or rounded up to the knob.
+        (600, False, 1, 19),
+        (600, False, 2, 20),
+        (600, False, 8, 24),
+        (600, True, 8, 24),
+        # 24 live lanes take a factor; under proven bounds a row the live
+        # lanes cover exactly keeps its padded count.
+        (768, False, 8, 24),
+        (768, True, 1, 32),
+    ],
+)
+def test_the_lanes_a_masked_row_walks(
+    width: int, proven_bounds: bool, unroll: int, lanes: int
+) -> None:
+    assert (
+        masked_row_lanes(width, 32, 32, proven_bounds=proven_bounds, unroll=unroll)
+        == lanes
+    )
+
+
+@pytest.mark.parametrize(
+    ("config", "unroll"),
+    [
+        ({"cute_lane_unroll": 8}, 8),
+        ({}, 1),
+        # Under sinking an odd row keeps its live lanes.
+        ({"cute_lane_unroll": 8, "cute_vloop_sink": True}, 1),
+    ],
+)
+def test_the_unroll_the_lane_loops_take(config: dict[str, object], unroll: int) -> None:
+    assert requested_lane_unroll(config) == unroll

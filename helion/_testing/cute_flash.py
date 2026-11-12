@@ -30,6 +30,7 @@ from unittest.mock import patch
 import torch
 
 from .._compiler.cute import cute_flash
+from .._compiler.cute import cute_flash_gated
 from .._compiler.cute.autotune.config_generation_ext import cute_generation_extension
 from .._compiler.cute.autotune.flash_surface import enable_cute_flash_search
 from .._compiler.cute.backend import CuteBackend
@@ -47,6 +48,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from collections.abc import Sequence
 
+    from .._compiler.cute.cute_flash_gated import GatedAttentionMatch
     from ..runtime.kernel import BoundKernel
     from ..runtime.kernel import ConfigLike
     from ..runtime.kernel import Kernel
@@ -58,6 +60,7 @@ __all__ = [
     "compiled_source",
     "flash_config_spec",
     "frozen_overrides",
+    "gated_attention_match",
     "memoized_flash_fragments",
     "render_flash_config",
     "seeds_per_codegen_branch",
@@ -327,6 +330,15 @@ def compiled_source(bound: BoundKernel[Any], config: ConfigLike) -> str:
     """
     bound.set_config(config)
     return compile_and_source(bound, config)[1]
+
+
+def gated_attention_match(bound: BoundKernel[Any]) -> GatedAttentionMatch | None:
+    """The config-independent gated-attention matcher
+    (``cute_flash_gated.match_gated_attention``) on ``bound``'s device IR."""
+    env, host_function = bound.env, bound.host_function
+    assert env is not None and host_function is not None
+    with env, host_function:
+        return cute_flash_gated.match_gated_attention(host_function.device_ir)
 
 
 def compile_and_run(

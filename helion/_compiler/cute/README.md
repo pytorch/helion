@@ -144,7 +144,7 @@ reads the config; the caller that owns the site passes what it decided.
 | `memory_ops.py` + `emitters/memory_access.py` | loads, stores and packet forms; the index / address / region / mask builders the atomic and scan lowerings reuse |
 | `emitters/lane_packets.py` (`LanePacketEmitter`) | register-tile vector packet loads and stores |
 | `emitters/persistent_item_loop.py`, `emitters/role_item_loop.py` (`RoleItemLoop`) | the work-item loop of a warp role, as text (flash) and as AST (tcgen05 scheduler roles) |
-| `reduction_emitter.py` (`CuteReductionEmitter`), `reduce_call.py`, `reduce_ops.py`, `argreduce.py` | tile / warp / block reductions and argreductions behind `ReductionStrategy` |
+| `reduction_emitter.py` (`CuteReductionEmitter`), `reduce_call.py`, `reduce_routing.py`, `reduce_ops.py`, `argreduce.py` | tile / warp / block reductions and argreductions behind `ReductionStrategy` |
 | `atomic_ops.py`, `scan_ops.py` (`_CuteScanEmitter`), `cute_reshape.py`, `view_ops.py`, `tile_ops.py`, `aten_lowering.py`, `matmul_ops.py` / `matmul_fallback.py` | the `@_decorators.codegen(op, "cute")` handlers of the language ops (registered by `_codegen_modules.py`) |
 | `cute_epilogue.py`, `fragment_epilogue.py`, `scalar_epilogue.py` | pointwise epilogue chains over fragments and scalars |
 | `indexing.py`, `packet_access.py`, `pipeline_smem.py` (`SmemArena`), `scalar_recipe.py` | index algebra, the memory-access call grammar, SMEM pricing, scalar staging recipes |
@@ -252,8 +252,8 @@ everything the passes read besides the body, built once per render
 (`build_pass_context`).  `DEVICE_BODY_PROLOGUE` issues each atomic on the
 leader thread of the launch axes claimed after it, lowers the collective
 matmuls and decides the launch shape; `freeze_pass_context` seals it;
-`DEVICE_BODY_PASSES` (from `finalize_shared_reduce_groups` to
-`hoist_exact_invariant_divisions`) rewrite the body; `KERNEL_DEF_PASSES` run
+`DEVICE_BODY_PASSES` (from `finalize_shared_reduce_groups` to `jam_grid_lanes`)
+rewrite the body; `KERNEL_DEF_PASSES` run
 after `ast_rename` over the `FunctionDef`; `test/test_cute_pass_pipeline.py`
 pins the three tables' order.  Every entry is a
 `DeviceBodyPass(name, gate, run, requires, provides)`; `requires` / `provides`

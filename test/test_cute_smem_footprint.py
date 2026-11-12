@@ -10,7 +10,7 @@ dispatch of a multi-root launch keeps both), no ``while`` body.  The
 shared-memory grouped reduces allocate one buffer per traced call, sized as
 their dispatcher sizes it: the expected sizes below evaluate the helper
 bodies' own ``alloc_smem`` arithmetic from ``reduce_helpers.py`` and the
-routing comes from the dispatch predicates of ``reduce_call``.
+routing comes from the dispatch predicates of ``reduce_routing``.
 ``check_smem_budget`` makes a kernel past the per-block maximum
 ``BackendUnsupported`` at codegen instead of a libNVVM failure.
 """
@@ -27,12 +27,12 @@ import pytest
 import torch
 
 import helion
-from helion._compiler.cute import reduce_call
+from helion._compiler.cute import reduce_routing
 from helion._compiler.cute import target_facts
 from helion._compiler.cute.pdl_release import spread_pad_bytes
 from helion._compiler.cute.reduce_call import GROUPED_REDUCE_HELPERS
-from helion._compiler.cute.reduce_call import use_interleaved_shared_reduce
-from helion._compiler.cute.reduce_call import use_serial_block_reduce
+from helion._compiler.cute.reduce_routing import use_interleaved_shared_reduce
+from helion._compiler.cute.reduce_routing import use_serial_block_reduce
 from helion._compiler.cute.smem_footprint import RootDispatch
 from helion._compiler.cute.smem_footprint import SmemFootprint
 from helion._compiler.cute.smem_footprint import smem_footprint
@@ -434,11 +434,13 @@ FRAGMENT = "_cute_grouped_reduce_shared_two_stage_fragment"
 PAIR = "_cute_grouped_reduce_cluster_online_pair"
 WARP_PAIR = "_cute_grouped_reduce_cluster_warp_online_pair"
 
+# Read as text, so the DSL is not imported.
+_REDUCE_HELPERS_SOURCE = (
+    Path(reduce_routing.__file__).with_name("reduce_helpers.py").read_text()
+)
 _HELPERS = {
     node.name: node
-    for node in ast.parse(
-        Path(reduce_call.__file__).with_name("reduce_helpers.py").read_text()
-    ).body
+    for node in ast.parse(_REDUCE_HELPERS_SOURCE).body
     if isinstance(node, ast.FunctionDef)
 }
 
@@ -448,10 +450,10 @@ def _helper_buffer(function: str, index: int = 0, **values: int) -> int:
     ``reduce_helpers.<function>``: its size expression evaluated over
     ``values`` and the integer assignments ahead of it (the helper's own
     arithmetic, read as text so the DSL is not imported, with the
-    ``reduce_call`` sizes it calls)."""
+    ``reduce_routing`` sizes it calls)."""
     namespace: dict[str, object] = {
         "__builtins__": {},
-        "cooperative_column_slots": reduce_call.cooperative_column_slots,
+        "cooperative_column_slots": reduce_routing.cooperative_column_slots,
         **values,
     }
     pending: list[ast.stmt] = list(_HELPERS[function].body)
@@ -582,18 +584,12 @@ def test_every_grouped_reduce_buffer_is_sized_like_its_helper() -> None:
 
 
 def test_the_sized_dispatchers_are_the_ones_that_allocate() -> None:
-    # Read as text, so the DSL is not imported: a dispatcher allocates when
-    # it reaches an ``alloc_smem`` through the module's functions (by name:
-    # the interleaved dispatcher picks its body into a variable first).
-    source = Path(reduce_call.__file__).with_name("reduce_helpers.py").read_text()
-    functions = {
-        node.name: node
-        for node in ast.parse(source).body
-        if isinstance(node, ast.FunctionDef)
-    }
+    # A dispatcher allocates when it reaches an ``alloc_smem`` through the
+    # module's functions (by name: the interleaved dispatcher picks its body
+    # into a variable first).
     allocating = {
         name
-        for name, function in functions.items()
+        for name, function in _HELPERS.items()
         if any(
             isinstance(node, ast.Attribute) and node.attr == "alloc_smem"
             for node in ast.walk(function)
@@ -603,9 +599,9 @@ def test_the_sized_dispatchers_are_the_ones_that_allocate() -> None:
         name: {
             node.id
             for node in ast.walk(function)
-            if isinstance(node, ast.Name) and node.id in functions
+            if isinstance(node, ast.Name) and node.id in _HELPERS
         }
-        for name, function in functions.items()
+        for name, function in _HELPERS.items()
     }
     while (
         grown := {name for name, names in references.items() if names & allocating}
@@ -617,14 +613,14 @@ def test_the_sized_dispatchers_are_the_ones_that_allocate() -> None:
 
 
 def test_the_two_stage_buffer_follows_the_dispatcher_routing() -> None:
-    # The dispatcher routes on the predicates of ``reduce_call`` (read as
-    # text: it calls them by name), and so does the walk.
-    source = Path(reduce_call.__file__).with_name("reduce_helpers.py").read_text()
+    # The dispatcher routes on the predicates of ``reduce_routing`` (it calls
+    # them by name), and so does the walk.
     dispatcher = ast.unparse(_HELPERS[TWO_STAGE])
     assert "use_serial_block_reduce(pre, group_span, group_count)" in dispatcher
     assert "use_interleaved_shared_reduce(pre, group_span)" in dispatcher
-    assert "from .reduce_call import use_serial_block_reduce" in source
-    assert "from .reduce_call import use_interleaved_shared_reduce" in source
+    source = _REDUCE_HELPERS_SOURCE
+    assert "from .reduce_routing import use_serial_block_reduce" in source
+    assert "from .reduce_routing import use_interleaved_shared_reduce" in source
     # Every routing outcome: whole-CTA and grouped, power-of-two and odd
     # sibling counts below and above a warp, spans up to a full CTA.
     for pre, span, count in product(

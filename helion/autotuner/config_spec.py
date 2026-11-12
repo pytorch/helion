@@ -948,6 +948,15 @@ class ConfigSpec:
         # fold the user's ``other``, which need not be the combine's
         # identity, so such a row never runs unpadded.
         self.cute_user_reduce_block_ids: set[int] = set()
+        # The reduction blocks a scan may run along (``_block_is_scanned``):
+        # their parallel scans walk the cyclic lanes, so such a row never
+        # holds several packets per thread.
+        self.cute_scanned_block_ids: set[int] = set()
+        # Set by DeviceIR analysis: per block, the widest element of a value
+        # a load or a store moves along it (``row_itemsizes``).  A persistent
+        # row holds several packets per thread only where they fit
+        # (``fits_row_packets``).
+        self.cute_row_itemsizes: dict[int, int] = {}
         # Non-reduction tiles that execute simultaneously. Sibling loops and
         # separate roots reuse physical axes during CuTe launch planning.
         # Their paths (``cute_tile_loop_paths``), each with the reduction
@@ -1039,13 +1048,19 @@ class ConfigSpec:
         self.cute_signed_bitfield_bf16_available = False
         # Set by DeviceIR analysis: the reductions whose ``reduction_loops``
         # slot may roll (is not pinned) along which a load reads a bool
-        # tensor; ``cute_bool_byte_packets`` is tunable when there are any
-        # (``bool_reduction_row_blocks``).
-        self.cute_bool_byte_packet_sites: frozenset[int] = frozenset()
+        # tensor, none in a kernel with a matmul; ``cute_bool_byte_packets``
+        # is tunable when there are any (``bool_reduction_row_blocks``).
+        self.cute_bool_byte_packet_blocks: frozenset[int] = frozenset()
+        # Set by DeviceIR analysis: the blocks of the device loops over a
+        # static extent that load a float tensor along their tile, none in a
+        # kernel with a matmul; ``cute_tail_peel`` is tunable when there are
+        # any (``tail_peel_blocks``).
+        self.cute_tail_peel_blocks: frozenset[int] = frozenset()
         # Set by DeviceIR analysis: an fp32 quotient whose divisor is a
         # scalar or a broadcast row value (``hoist_loop_invariant_recip``'s
         # exact hoist can apply), so ``cute_exact_div_form`` is tunable.
         self.cute_exact_division_sites = False
+        self.cute_pair_lane_math_sites = False
         self.cute_scaled_mma_available = False
         self.cute_mxfp8_fused_scales_available = False
         self.cute_mxfp8_sf_tma_available = False
@@ -1059,6 +1074,10 @@ class ConfigSpec:
         self.cute_warp_aggregated_atomics_enabled = False
         self.cute_privatize_atomics_enabled = False
         self.cute_packet_prefetch_enabled = False
+        # Set by DeviceIR analysis: a max, a min or an ``any`` reduction whose
+        # warp reduction ``cute_warp_fp32_redux`` takes natively on the target
+        # (``has_native_redux_reduction``), so the knob is tunable.
+        self.cute_native_redux_sites = False
         self.range_unroll_factors: BlockIdSequence[RangeUnrollFactorSpec] = (
             BlockIdSequence()
         )
@@ -3957,6 +3976,9 @@ class CuteVectorWidthSpec(_BlockIdItem):
     V=1 disables vectorization (scalar loads). V=2/4/8/16 emits
     ``cute.arch.load(..., ir.VectorType.get([V], elem_dtype.mlir_type))``
     for the inner reduction load. SM100+ also admits 32-byte vectors.
+    A persistent reduction row whose threads each hold a multiple of V
+    elements keeps that many V-wide packets per thread, ``threads * V``
+    elements apart (one packet when V covers the thread's slice).
     """
 
     def __init__(

@@ -17,6 +17,7 @@ from helion._compiler.cute.autotune.heuristics.cute import (
 from helion._compiler.cute.autotune.heuristics.cute import _reversed_root_loop_orders
 from helion._testing import cpu_render_target
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.sink_softmax_kernels import sink_normalize
 import helion.language as hl
 
 pytestmark = pytest.mark.cpu_only
@@ -228,3 +229,69 @@ def test_wide_row_packets_round_a_row_down_to_a_power_of_two_tile(
         assert seed.config["num_threads"] == num_threads
         assert cast("list[int]", seed.config["cute_vector_widths"])[-1] == 16
         spec.normalized_config(seed)
+
+
+@pytest.mark.parametrize(
+    ("width", "seeded"),
+    [(1000, True), (1024, False), (600, False)],
+    ids=["ragged", "power of two", "under 7/8 of its tile"],
+)
+def test_narrow_rows_seed_a_whole_row_tile(width: int, seeded: bool) -> None:
+    """Where the pointwise seed flattens a row too narrow for a CTA of
+    packets, a row whose length is no power of two also gets a tile of its
+    own: a packet per thread across the row, a row per thread row and the
+    lanes' math paired.  Its kernel splits no flat offset by the row length
+    and loads the broadcast mask as packets.  A power-of-two row, whose flat
+    split is shifts and masks, and a row that would leave more than an
+    eighth of its tile masked keep the flattened seeds alone."""
+    bound = _bind(
+        sink_normalize,
+        torch.empty((8, 64, width), dtype=torch.bfloat16),
+        torch.empty((64, width), dtype=torch.bfloat16),
+        torch.empty((8, 64)),
+    )
+    seeds = bound.config_spec.compiler_seed_configs
+    assert seeds[0].config["flatten_loops"] == [True]
+    rows = [s for s in seeds if s.config.get("cute_pair_lane_math")]
+    if not seeded:
+        assert rows == []
+        return
+    # The seed and its proven-bounds counterpart.
+    assert sorted(bool(s.config.get("cute_proven_bounds")) for s in rows) == [
+        False,
+        True,
+    ]
+    for seed in rows:
+        assert _geometry(seed) == ((1, 1, 1024), (1, 1, 128))
+        assert seed.config["cute_vector_widths"] == [1, 1, 8]
+        assert not any(cast("list[bool]", seed.config.get("flatten_loops", [])))
+    code = bound.to_code(rows[0])
+    assert f"% {width}" not in code and f"// {width}" not in code
+    assert code.count("ir.VectorType.get([8], cutlass.Uint16.mlir_type)") == 2
+    assert "_cute_exp_f32x2_parts(" in code
+
+
+@pytest.mark.parametrize(
+    ("queries", "geometry"),
+    [(64, ((1, 2, 512), (1, 2, 64))), (1, ((2, 1, 512), (2, 1, 64)))],
+    ids=["queries", "heads"],
+)
+def test_a_row_tile_takes_its_rows_from_an_outer_axis_long_enough(
+    queries: int, geometry: tuple[tuple[int, ...], tuple[int, ...]]
+) -> None:
+    """A 504-wide row spans 64 lanes of eight, so a 128-thread CTA takes two
+    rows: from the queries' axis, or from the heads when it holds one."""
+    bound = _bind(
+        sink_normalize,
+        torch.empty((8, queries, 504), dtype=torch.bfloat16),
+        torch.empty((queries, 504), dtype=torch.bfloat16),
+        torch.empty((8, queries)),
+    )
+    rows = [
+        s
+        for s in bound.config_spec.compiler_seed_configs
+        if s.config.get("cute_pair_lane_math")
+    ]
+    assert rows
+    for seed in rows:
+        assert _geometry(seed) == geometry

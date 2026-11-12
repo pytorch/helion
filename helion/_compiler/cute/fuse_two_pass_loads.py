@@ -44,7 +44,9 @@ Later sweeps also read the first sweep's expensive pure values from
 fragments (``sweep_values``): the results of pure inline asm, such as the
 Philox chain of a word0 ``hl.rand`` draw, and with the explicit ``register``
 policy transcendentals.  The computation and the loads only those values
-needed are then removed from the later sweeps.
+needed are then removed from the later sweeps; for a value computed in a
+V-loop (a packet's lanes, one fragment slot per lane) that happens in
+``cut_carried_values``, after the exact division.
 """
 
 from __future__ import annotations
@@ -56,6 +58,7 @@ import functools
 import itertools
 import re
 from typing import TYPE_CHECKING
+from typing import NamedTuple
 from typing import cast
 
 from ..ast_extension import clone_ast
@@ -67,10 +70,13 @@ from ._ast_pass_utils import _canonical_name
 from ._ast_pass_utils import _is_proven_relocatable_call
 from ._ast_pass_utils import assigned_name
 from ._ast_pass_utils import call_path_str
+from ._ast_pass_utils import deep_clone
 from ._ast_pass_utils import is_name_assign
 from ._ast_pass_utils import live_in
+from ._ast_pass_utils import loop_extent
 from ._ast_pass_utils import loop_live_end
 from ._ast_pass_utils import names_read
+from ._ast_pass_utils import substitute_names
 from ._ast_pass_utils import tensor_roots_may_alias
 from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
 from .packet_access import call_write_roots
@@ -86,6 +92,7 @@ from .sweep_values import heavy_cost
 from .sweep_values import is_pure_expression
 from .sweep_values import number_sweep
 from .sweep_values import plan_cut
+from .sweep_values import vector_lane_loop
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -99,6 +106,31 @@ AUTO_REGISTER_CACHE_ELEMENTS = 64
 # each sweep of a tile iteration reads only the slots an earlier sweep of the
 # same iteration wrote (``jam_grid_lanes`` gives each lane a copy).
 FUSE_CACHE_PREFIX = "_fuse_cache_"
+# A V-loop value carried from the first sweep replaces its later sweep's
+# statement only in ``cut_carried_values``, after the exact division: the
+# read of its fragment goes in ahead of the statement now
+# (``FUSE_CARRIED_READ_ATTR``, so later passes rewrite its slot with the loop),
+# the statement records the read's name (``FUSE_CARRY_ATTR``) and the
+# statements the cut leaves dead are marked (``FUSE_CARRY_DEAD_ATTR``).
+# Until then the sweep still computes the value, so the passes in between see
+# the statements they would see without the carry, and the exact division's
+# redo copy recomputes it from them as they are.
+FUSE_CARRY_ATTR = "_helion_fuse_carry"
+FUSE_CARRY_DEAD_ATTR = "_helion_fuse_carry_dead"
+FUSE_CARRIED_READ_ATTR = "_helion_fuse_carried_read"
+# The passes in between may rewrite the two sweeps differently (``fuse_fma``
+# contracts a product only where nothing else reads it), so the cut first
+# checks that the value still is the first sweep's.  Each statement of the
+# group's sweeps whose value the numbering also finds in the first sweep
+# records ``(plan, number, is_load)``, in ``FUSE_TWIN_FIRST_ATTR`` in the
+# first sweep and ``FUSE_TWIN_LATER_ATTR`` in a later one (sets: a statement
+# can take part in several groups).  The first sweep's statement whose value
+# a fragment carries records ``(plan, number)`` in ``FUSE_CARRY_SOURCE_ATTR``,
+# and the statement the carry replaces in ``FUSE_CARRY_TWIN_ATTR``.
+FUSE_TWIN_FIRST_ATTR = "_helion_fuse_twin_first"
+FUSE_TWIN_LATER_ATTR = "_helion_fuse_twin_later"
+FUSE_CARRY_SOURCE_ATTR = "_helion_fuse_carry_source"
+FUSE_CARRY_TWIN_ATTR = "_helion_fuse_carry_twin"
 
 _PERSISTENT_BRANCH_VEC_LOAD = "_helion_persistent_branch_vec_load"
 
@@ -1216,6 +1248,25 @@ _OPAQUE_MOVES = {
 FORWARDED_DTYPES = frozenset(_OPAQUE_MOVES)
 
 
+class _PacketStore(NamedTuple):
+    """A packet flush into a scratch tensor whose lanes a later sweep reads
+    back (``_CuteFuseTwoPassLoads._forwardable_packet_store``)."""
+
+    # The load of the element one lane stores, in the V-loop's names.
+    load: ast.expr
+    root: str
+    vloop: ast.For
+    # The V-loop's position in the flush's container.
+    vloop_index: int
+    # The lane's ``vals.append(value.bitcast(carrier))``, and its position in
+    # the V-loop's body.
+    append: ast.stmt
+    append_index: int
+    # ``dtype(name)``: the lane's value, bound to a name.
+    value: ast.expr
+    width: int
+
+
 def _opaque_copy(value: str, dtype: str) -> str:
     """``value`` through a register move the optimizer cannot see through.
 
@@ -1249,12 +1300,25 @@ class _CuteFuseTwoPassLoads:
         binding_dtypes: Mapping[str, str] | None = None,
         rename_groups: dict[str, str] | None = None,
         forwardable_tensors: Collection[str] = (),
+        carry_vector_values: bool = True,
     ) -> None:
         super().__init__()
         self._counter = 0
+        # Numbers each sweep-values plan, for the twins' records.
+        self._plans = 0
         # Kernel-local scratch tensors (``scratch_tensors``): a later sweep's
         # load of what a first sweep stored there reads the stored value.
         self._forwardable = set(forwardable_tensors)
+        # Whether V-loop values are carried: not where a later pass needs a
+        # sweep's own values.  Under ``cute_independent_reduction``,
+        # ``split_rolled_vector_sums`` splits a V-loop's sum by lane only as
+        # the plain sweep spells it (a fragment write in the loop would stop
+        # the split and change the summation order).  Under
+        # ``cute_cluster_warp_online``, ``fuse_rolled_cluster_online_pair``
+        # moves the first sweep's values into the frame of a CTA's or warp's
+        # own maximum and rewrites the write sweep's before the cut, so a
+        # carried value would skip the pair's rescale.
+        self._carry_vector_values = carry_vector_values
         self._constexpr_values = constexpr_values or {}
         # Names the final rename merges: the checks and liveness compare
         # canonical names.
@@ -1436,15 +1500,17 @@ class _CuteFuseTwoPassLoads:
         first_loop: ast.For,
         step: ast.expr,
         trip: int,
-        dynamic_trip: bool,
         cache_size: int,
+        vector_lane: tuple[str, int] | None = None,
     ) -> bool:
         """Whether a later sweep may read the values a store wrote in the
         first sweep ``first_loop`` (``trip`` steps of ``step``, of
         ``cache_size // trip`` lanes each) from each iteration's cache slot:
         the store writes the element the load ``key`` names
         (``__scalar_load__(PTR, DTYPE)``), and a reload reads the last write
-        to its element, so no two iterations may write one element.
+        to its element, so no two iterations may write one element.  A packet
+        store's lanes each write one too, their V-loop's variable and width
+        ``vector_lane``: a slot per lane.
 
         Nor may two threads, other than replicas of one row storing its values
         alike: a thread coordinate (``cute.arch.thread_idx()[axis]``) the
@@ -1456,21 +1522,23 @@ class _CuteFuseTwoPassLoads:
         A key that reads nothing the loop writes takes one slot, which every
         iteration overwrites as it does the element.  Otherwise the pointer
         must be affine in the sweep indices, with known integer coefficients
-        ``a`` (the loop index's, times its step) and ``b`` (the lane's), and
-        ``a * dt + b * dl`` nonzero modulo 2**32 (indices may narrow through
-        Int32) for every other pair of iterations; under a constexpr trip
-        count, the fused sweeps run only while it is at most ``trip`` (their
-        fragment's trace-time cap), so for every other pair of those, and the
-        loop index must also step past every lane's element.  A key may read
-        no other name the loop writes: ``idx + lane`` after ``idx = idx - 1``
-        names one element in every iteration."""
+        ``a`` (the loop index's, times its step), ``b`` (the lane's) and ``c``
+        (a packet's V-loop lane's), and ``a * dt + b * dl + c * dv`` nonzero
+        modulo 2**32 (indices may narrow through Int32) for every other pair
+        of iterations; under a constexpr trip count, the fused sweeps run only
+        while it is at most ``trip`` (their fragment's trace-time cap), so for
+        every other pair of those.  A key may read no other name the loop
+        writes: ``idx + lane`` after ``idx = idx - 1`` names one element in
+        every iteration."""
         bound = self._key_reads(key) & self._bound(first_loop)
         if not bound:
             return True
         indices = [
             cast("ast.Name", loop.target).id for loop in self._sweep_loops(first_loop)
         ]
-        if bound - {self._canonical(index) for index in indices}:
+        # A packet's lanes also read their V-loop's variable.
+        lane_names = [*indices, *(vector_lane[:1] if vector_lane is not None else ())]
+        if bound - {self._canonical(index) for index in lane_names}:
             return False
         load = ast.parse(key, mode="eval").body
         assert isinstance(load, ast.Call) and load.args
@@ -1489,7 +1557,7 @@ class _CuteFuseTwoPassLoads:
             )
 
         a = b = 0
-        if trip > 1 or dynamic_trip:
+        if trip > 1:
             outer = coefficient(indices[0])
             step_value = _scale_value(
                 step, self._constexpr_values, self._proven_tensor_stride_values
@@ -1503,21 +1571,24 @@ class _CuteFuseTwoPassLoads:
             if lane is None:
                 return False
             b = lane
-        if dynamic_trip and not (
-            a != 0 and abs(a) >= lanes * abs(b) and (lanes == 1 or b != 0)
-        ):
-            return False
+        c, width = 0, 1
+        if vector_lane is not None and vector_lane[1] > 1:
+            vector = coefficient(vector_lane[0])
+            if vector is None:
+                return False
+            c, width = vector, vector_lane[1]
         threads = [
             (coefficient(name), self._thread_block_dims[axis])
             for axis, name in sorted(axes.items())
         ]
-        if not _apart_across_threads([(a, trip), (b, lanes)], threads):
+        if not _apart_across_threads([(a, trip), (b, lanes), (c, width)], threads):
             return False
         return all(
-            (a * dt + b * dl) % (1 << 32)
+            (a * dt + b * dl + c * dv) % (1 << 32)
             for dt in range(trip)
             for dl in range(1 - lanes, lanes)
-            if dt > 0 or dl > 0
+            for dv in range(1 - width, width)
+            if (dt, dl, dv) > (0, 0, 0)
         )
 
     def _forwardable_store(self, stmt: ast.stmt) -> tuple[ast.expr, str] | None:
@@ -1551,6 +1622,314 @@ class _CuteFuseTwoPassLoads:
         assert isinstance(load, ast.expr)
         return load, root
 
+    def _forwardable_packet_store(
+        self, container: list[ast.stmt], index: int
+    ) -> _PacketStore | None:
+        """The packet store ``container[index]`` into a scratch tensor whose
+        lanes a later sweep's per-lane loads read back: an unmasked flush
+        ``_cute_store_*_vec(ptr, vals)`` after the container's constexpr
+        V-loop, where ``vals`` is bound to ``[]`` by the last statement
+        naming it before that loop, and each of the loop's ``width`` lanes
+        appends one value unconditionally (no ``break``, ``continue`` or
+        ``return`` ends a lane early), a name converted to the tensor's
+        dtype and bit-cast to the packet's carrier, in the only statement of
+        the loop naming the list; nothing names it between the loop and the
+        flush.  The loop binds the lane's element index
+        ``rindex = base + cutlass.Int32(lane)`` to the base the flush's
+        pointer names; neither the loop nor a statement between it and the
+        flush binds a name the pointer reads."""
+        stmt = container[index]
+        if not (
+            self._forwardable
+            and isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Call)
+        ):
+            return None
+        access = match_packet_access(stmt.value)
+        flushed = access.flushed_values() if access is not None else None
+        if access is None or flushed is None or flushed[1] is not None:
+            return None
+        collector = flushed[0]
+        roots = _tensor_arg_roots(access.pointer, self._forwardable)
+        if (
+            roots is None
+            or len(roots) != 1
+            or any(isinstance(node, ast.IfExp) for node in ast.walk(access.pointer))
+        ):
+            return None
+        (root,) = roots
+        dtype = self._tensor_dtypes.get(root)
+        if dtype not in _OPAQUE_MOVES:
+            return None
+        loops = [
+            position
+            for position in range(index)
+            if isinstance(container[position], ast.For)
+        ]
+        if not loops:
+            return None
+        vloop = cast("ast.For", container[loops[-1]])
+        width = loop_extent(vloop, kinds=("constexpr",))
+        if width is None:
+            return None
+        lane = cast("ast.Name", vloop.target).id
+        # A loop that rebinds its variable runs its lanes in another order,
+        # and one that may end a lane early skips that lane's append.
+        if self._canonical(lane) in self._bound(*vloop.body) or _exits_early(vloop):
+            return None
+        # The list as the final rename spells it, read or bound.
+        group = self._canonical(collector)
+
+        def names_list(stmt: ast.stmt) -> bool:
+            return group in self._reads(stmt) | self._bound(stmt)
+
+        before = [stmt for stmt in container[: loops[-1]] if names_list(stmt)]
+        if (
+            not before
+            or not is_name_assign(before[-1])
+            or not isinstance(empty := cast("ast.Assign", before[-1]).value, ast.List)
+            or empty.elts
+            or any(names_list(stmt) for stmt in container[loops[-1] + 1 : index])
+        ):
+            return None
+        appends = [
+            position for position, inner in enumerate(vloop.body) if names_list(inner)
+        ]
+        if len(appends) != 1:
+            return None
+        append = vloop.body[appends[0]]
+        if not (
+            isinstance(append, ast.Expr)
+            and isinstance(append.value, ast.Call)
+            and isinstance(append.value.func, ast.Attribute)
+            and append.value.func.attr == "append"
+            and isinstance(append.value.func.value, ast.Name)
+            and append.value.func.value.id == collector
+            and len(append.value.args) == 1
+            and not append.value.keywords
+        ):
+            return None
+        bits = append.value.args[0]
+        # The value is written to the cache too: a name, not an expression
+        # to evaluate twice.
+        if not (
+            isinstance(bits, ast.Call)
+            and isinstance(bits.func, ast.Attribute)
+            and bits.func.attr == "bitcast"
+            and isinstance(value := bits.func.value, ast.Call)
+            and call_path_str(value.func) == dtype
+            and len(value.args) == 1
+            and not value.keywords
+            and isinstance(value.args[0], ast.Name)
+        ):
+            return None
+        # The lane's element index and the base it adds the lane to.
+        bases: dict[str, str] = {}
+        for inner in vloop.body[: appends[0]]:
+            name = assigned_name(inner)
+            if (
+                name is not None
+                and isinstance(inner, ast.Assign)
+                and isinstance(inner.value, ast.BinOp)
+                and isinstance(inner.value.op, ast.Add)
+                and isinstance(inner.value.left, ast.Name)
+                and ast.unparse(inner.value.right) == f"cutlass.Int32({lane})"
+            ):
+                bases[name] = inner.value.left.id
+        pointer_names = [
+            node.id for node in ast.walk(access.pointer) if isinstance(node, ast.Name)
+        ]
+        candidates = [
+            name for name, base in bases.items() if pointer_names.count(base) == 1
+        ]
+        if len(candidates) != 1:
+            return None
+        (element,) = candidates
+        base = bases[element]
+        # The flush writes the lanes from the element its pointer names, one
+        # apart: the base must count elements, and nothing the pointer reads
+        # may be bound by the loop, its variable included, or between it and
+        # the flush.  The key spells such a name as each lane sees it; the
+        # flush reads its value after the last lane.
+        if _index_coefficient(
+            access.pointer,
+            base,
+            self._constexpr_values,
+            self._proven_tensor_stride_values,
+        ) != 1 or {self._canonical(name) for name in names_read(access.pointer)} & (
+            self._bound(vloop, *container[loops[-1] + 1 : index])
+        ):
+            return None
+        # Each lane's element is the pointer's with the lane added to its
+        # base: the name only, not an attribute spelled like it.
+        offset = f"({base} + cutlass.Int32({lane}))"
+        load = substitute_names(
+            deep_clone(access.pointer),
+            {base: expr_from_string(offset)},
+            clone=lambda _node: expr_from_string(offset),
+        )
+        return _PacketStore(
+            load=cast("ast.expr", expr_from_string(f"({ast.unparse(load)}).load()")),
+            root=root,
+            vloop=vloop,
+            vloop_index=loops[-1],
+            append=append,
+            append_index=appends[0],
+            value=value,
+            width=width,
+        )
+
+    def _reads_first_lanes(
+        self,
+        load: ast.expr,
+        alias: dict[str, str],
+        lane: str,
+        definitions: dict[str, ast.expr],
+        first_lanes: Collection[str],
+    ) -> bool:
+        """Whether ``load``, in a later sweep's V-loop over ``lane``, reads
+        one of the first sweep's lane variables ``first_lanes`` through a
+        value defined outside the loop, like ``saved = vec_lane_1`` between
+        the sweeps.  That is the first sweep's last lane, one element for
+        every lane, which renaming the loop's own lane to the first sweep's
+        would make look like each lane's own in the key."""
+        text = _canonical_load_text(
+            load,
+            {**alias, lane: "_fuse_own_lane"},
+            definitions,
+            tensor_dtypes=self._tensor_dtypes,
+        )
+        return not _key_names(text).isdisjoint(first_lanes)
+
+    def _packet_lane_matches(
+        self,
+        container: list[ast.stmt],
+        packets: dict[str, _PacketStore],
+        alias: dict[str, str],
+        scope_definitions: dict[str, ast.expr],
+        *,
+        analysis: _AnalysisCache,
+    ) -> list[tuple[ast.For, int, ast.Assign, str]]:
+        """The per-lane loads in ``container``'s V-loops of an element a
+        forwarded packet stores, ``(v_loop, index in its body, load, key)``:
+        keyed as the first sweep's lanes are (``packets``, by key), with the
+        lane variable of a V-loop as wide as the packet standing for the
+        first sweep's, as the key spells it."""
+        matches: list[tuple[ast.For, int, ast.Assign, str]] = []
+        if not packets:
+            return matches
+        first_lanes = {
+            key: cast("ast.Name", packet.vloop.target).id
+            for key, packet in packets.items()
+        }
+        for j, stmt in enumerate(container):
+            width = loop_extent(stmt, kinds=("constexpr",))
+            if width is None:
+                continue
+            vloop = cast("ast.For", stmt)
+            lane = cast("ast.Name", vloop.target).id
+            # A read of a first sweep's lane variable is its last value, which
+            # the rename would turn into this loop's index; a loop that
+            # rebinds its own runs its lanes in another order.
+            if (set(first_lanes.values()) - {lane}) & names_read(
+                vloop
+            ) or self._canonical(lane) in self._bound(*vloop.body):
+                continue
+            loop_definitions = self._iteration_definitions(
+                self._pure_definitions_before(
+                    container, j, scope_definitions, analysis=analysis
+                ),
+                vloop,
+            )
+            for index, inner in enumerate(vloop.body):
+                if not (
+                    is_name_assign(inner) and _load_kind(inner.value) == "unmasked"
+                ):
+                    continue
+                definitions = self._pure_definitions_before(
+                    vloop.body, index, loop_definitions, analysis=analysis
+                )
+                if self._reads_first_lanes(
+                    inner.value, alias, lane, definitions, first_lanes.values()
+                ):
+                    continue
+                for key, packet in packets.items():
+                    if packet.width != width:
+                        continue
+                    candidate = _canonical_load_text(
+                        inner.value,
+                        {**alias, lane: first_lanes[key]},
+                        definitions,
+                        tensor_dtypes=self._tensor_dtypes,
+                    )
+                    if candidate == key:
+                        matches.append((vloop, index, cast("ast.Assign", inner), key))
+                        break
+        return matches
+
+    def _lane_loop(self, statement: ast.stmt) -> tuple[ast.For, str, int] | None:
+        """``vector_lane_loop(statement)`` for a V-loop whose values may be
+        carried: not one whose body rebinds its lane variable, through any
+        name the final rename merges with it.  A value's fragment slot is the
+        lane that variable names where the slot is written or read, so a
+        rebound variable names another lane's slot."""
+        found = vector_lane_loop(statement)
+        if found is None or self._canonical(found[1]) in self._bound(*found[0].body):
+            return None
+        return found
+
+    def _vector_lane_loads(
+        self,
+        container: list[ast.stmt],
+        scope_definitions: dict[str, ast.expr],
+        alias: dict[str, str],
+        lanes: dict[int, str],
+        *,
+        analysis: _AnalysisCache,
+    ) -> list[tuple[ast.Assign, str, str, int]]:
+        """The scalar loads in the bodies of ``container``'s V-loops,
+        ``(load, key, lane variable, width)``: keyed with ``alias`` and, in a
+        V-loop of a width ``lanes`` names, its lane variable standing for
+        that name."""
+        result: list[tuple[ast.Assign, str, str, int]] = []
+        for j, stmt in enumerate(container):
+            found = self._lane_loop(stmt)
+            if found is None:
+                continue
+            vloop, lane, width = found
+            # A read of a first sweep's lane variable is its last value, which
+            # the rename would turn into this loop's index.
+            if (set(lanes.values()) - {lane}) & names_read(vloop):
+                continue
+            lane_alias = {**alias, lane: lanes[width]} if width in lanes else alias
+            loop_definitions = self._iteration_definitions(
+                self._pure_definitions_before(
+                    container, j, scope_definitions, analysis=analysis
+                ),
+                vloop,
+            )
+            for index, inner in enumerate(vloop.body):
+                if not (
+                    is_name_assign(inner)
+                    and _load_kind(inner.value) in ("masked", "unmasked")
+                ):
+                    continue
+                definitions = self._pure_definitions_before(
+                    vloop.body, index, loop_definitions, analysis=analysis
+                )
+                if lanes and self._reads_first_lanes(
+                    inner.value, alias, lane, definitions, lanes.values()
+                ):
+                    continue
+                key = _canonical_load_text(
+                    inner.value,
+                    lane_alias,
+                    definitions,
+                    tensor_dtypes=self._tensor_dtypes,
+                )
+                result.append((cast("ast.Assign", inner), key, lane, width))
+        return result
+
     def _new_cache_name(self) -> str:
         name = f"{FUSE_CACHE_PREFIX}{self._counter}"
         self._counter += 1
@@ -1560,6 +1939,12 @@ class _CuteFuseTwoPassLoads:
         """A name for a forwarded store's value (not a cache: other passes
         recognize caches by ``FUSE_CACHE_PREFIX``)."""
         name = f"_fuse_stored_{self._counter}"
+        self._counter += 1
+        return name
+
+    def _new_carried_name(self) -> str:
+        """A name for the read of a carried V-loop value (not a cache)."""
+        name = f"_fuse_carried_{self._counter}"
         self._counter += 1
         return name
 
@@ -1711,15 +2096,31 @@ class _CuteFuseTwoPassLoads:
         invariant_keys: set[str],
         transcendentals: bool,
         live_out: Callable[[], frozenset[str]],
-    ) -> tuple[SweepValues, dict[int, ast.stmt], list[Cut | None]] | None:
+        lane_slot_cap: int,
+    ) -> (
+        tuple[
+            SweepValues,
+            dict[int, ast.stmt],
+            list[Cut | None],
+            dict[int, tuple[str, int]],
+            int,
+        ]
+        | None
+    ):
         """Number the group's sweeps and choose, per later sweep, the values
         it reads from the first sweep instead of recomputing them.
 
         ``*_loads`` give the load statements proven to read a first-sweep
         load's value (its key), in the first sweep, each later sweep and the
-        statements between the loops.  Returns the numbering, the first
-        sweep's statement computing each number, and each later sweep's cut,
-        or None when no sweep saves enough to carry anything.
+        statements between the loops.  Returns None when no sweep saves
+        enough to carry anything, else the numbering, the first sweep's
+        statement computing each number, each later sweep's cut, and the
+        V-loop of each first-sweep statement and cut statement that sits in
+        one, ``(lane variable, width)`` by statement id: a value of a V-loop
+        of the first sweep is carried, per lane, into a V-loop of the same
+        width of a later sweep (one fragment slot per lane, at most
+        ``lane_slot_cap`` slots per value), and the plan's number in the
+        twins' records (``FUSE_TWIN_FIRST_ATTR``).
         """
         values = SweepValues(
             transcendentals=transcendentals,
@@ -1763,11 +2164,25 @@ class _CuteFuseTwoPassLoads:
         first_loops = self._sweep_loops(first_loop)
         first_numbers = number(first_loop, first_loads)
         first: dict[int, ast.stmt] = {}
+        lane_slots: dict[int, tuple[str, int]] = {}
         for statement in first_loops[-1].body:
             value = first_numbers.get(id(statement))
             if value is not None:
                 first.setdefault(value, statement)
+            if not self._carry_vector_values:
+                continue
+            for lane, width, inner in self._vector_lane_statements(statement):
+                value = first_numbers.get(id(inner))
+                if (
+                    value is not None
+                    and value not in first
+                    and (width <= lane_slot_cap or not values.values[value].variant)
+                ):
+                    first[value] = inner
+                    lane_slots[id(inner)] = (lane, width)
         cuts: list[Cut | None] = []
+        # Each numbered later sweep's container and numbers (the twins).
+        later_numbers: list[tuple[list[ast.stmt], dict[int, int]]] = []
         for loop, loads in zip(later_loops, later_loads, strict=True):
             loops = self._sweep_loops(loop)
             # The loop indices compare equal across sweeps: ``_try_fuse``
@@ -1776,21 +2191,161 @@ class _CuteFuseTwoPassLoads:
             if len(loops) != len(first_loops):
                 cuts.append(None)
                 continue
+            container = loops[-1].body
+            numbers_k = number(loop, loads)
+            later_numbers.append((container, numbers_k))
+            live_after = self._live_after_container(body, loops, live_out)
+            lane_target = self._canonical(cast("ast.Name", loops[-1].target).id)
             cut = plan_cut(
                 values,
-                loops[-1].body,
-                number(loop, loads),
-                first,
-                live_after=self._live_after_container(body, loops, live_out),
-                loop_targets={self._canonical(cast("ast.Name", loops[-1].target).id)},
+                container,
+                numbers_k,
+                # A V-loop value is carried into a V-loop only (its slots
+                # are per lane).
+                {
+                    value: statement
+                    for value, statement in first.items()
+                    if id(statement) not in lane_slots
+                },
+                live_after=live_after,
+                loop_targets={lane_target},
                 reads=self._reads,
                 assigned=self._assigned,
                 removable=self._removable,
             )
+            # Then each V-loop's body, from the first sweep's V-loop values
+            # of its width; live at its end is what the rest of the
+            # container, around the container loop, reads.
+            live_end = set(live_after)
+            while True:
+                head = live_in(
+                    container, live_end, reads=self._reads, assigned=self._assigned
+                )
+                grown = live_end | (head - {lane_target})
+                if grown == live_end:
+                    break
+                live_end = grown
+            for index, statement in enumerate(container):
+                found = self._lane_loop(statement)
+                if found is None:
+                    continue
+                vloop, lane, width = found
+                lane_first = {
+                    value: inner
+                    for value, inner in first.items()
+                    if lane_slots.get(id(inner), ("", 0))[1] == width
+                }
+                if not lane_first:
+                    continue
+                lane_cut = plan_cut(
+                    values,
+                    vloop.body,
+                    numbers_k,
+                    lane_first,
+                    live_after=live_in(
+                        container[index + 1 :],
+                        live_end,
+                        reads=self._reads,
+                        assigned=self._assigned,
+                    ),
+                    loop_targets={self._canonical(lane)},
+                    reads=self._reads,
+                    assigned=self._assigned,
+                    removable=self._removable,
+                )
+                for statement_id in lane_cut.cached:
+                    lane_slots[statement_id] = (lane, width)
+                cut = Cut(
+                    {**cut.cached, **lane_cut.cached},
+                    cut.dead | lane_cut.dead,
+                    cut.saved + lane_cut.saved,
+                )
+            # A container statement only dead V-loop statements read (the
+            # packet hoist of a recomputed operand) is dead as well.
+            for statement in reversed(container):
+                target = self._assigned(statement)
+                if (
+                    target is not None
+                    and id(statement) not in cut.dead
+                    and id(statement) not in cut.cached
+                    and target not in live_end
+                    and self._removable(statement)
+                    and not self._read_outside(container, target, cut)
+                ):
+                    cut.dead.add(id(statement))
             cuts.append(cut if cut.cached and cut.saved >= MIN_SAVED_COST else None)
         if not any(cuts):
             return None
-        return values, first, cuts
+        plan = self._plans
+        self._plans += 1
+        if not any(
+            statement_id in lane_slots
+            for cut in cuts
+            if cut is not None
+            for statement_id in cut.cached
+        ):
+            # Scalar values only: the fuser makes their cuts itself.
+            return values, first, cuts, lane_slots, plan
+
+        def tag(statement: ast.stmt, attr: str, number: int) -> None:
+            record = (plan, number, values.is_load(number))
+            setattr(statement, attr, getattr(statement, attr, frozenset()) | {record})
+
+        for statement in first_loops[-1].body:
+            lane_statements = self._vector_lane_statements(statement)
+            for inner in (statement, *(inner for *_, inner in lane_statements)):
+                number = first_numbers.get(id(inner))
+                if number is not None:
+                    tag(inner, FUSE_TWIN_FIRST_ATTR, number)
+        for number, statement in first.items():
+            setattr(
+                statement,
+                FUSE_CARRY_SOURCE_ATTR,
+                getattr(statement, FUSE_CARRY_SOURCE_ATTR, frozenset())
+                | {(plan, number)},
+            )
+        for container, numbers_k in later_numbers:
+            for statement in container:
+                lane_statements = self._vector_lane_statements(statement)
+                for inner in (statement, *(inner for *_, inner in lane_statements)):
+                    number = numbers_k.get(id(inner))
+                    if number is not None and number in first:
+                        tag(inner, FUSE_TWIN_LATER_ATTR, number)
+        return values, first, cuts, lane_slots, plan
+
+    def _read_outside(self, container: list[ast.stmt], name: str, cut: Cut) -> bool:
+        """Whether a statement of ``container`` (a V-loop's body included)
+        that ``cut`` neither drops nor replaces with a carried value reads
+        ``name``."""
+        dead = cut.dead | cut.cached.keys()
+        name = self._canonical(name)
+        for statement in container:
+            if id(statement) in dead:
+                continue
+            found = vector_lane_loop(statement)
+            if found is None:
+                if name in self._reads(statement):
+                    return True
+                continue
+            vloop = found[0]
+            if name in self._reads(vloop.iter) or any(
+                id(inner) not in dead and name in self._reads(inner)
+                for inner in vloop.body
+            ):
+                return True
+        return False
+
+    def _vector_lane_statements(
+        self, statement: ast.stmt
+    ) -> list[tuple[str, int, ast.stmt]]:
+        """The body statements of ``statement`` when it is a V-loop whose
+        values may be carried (``_lane_loop``), with its lane variable and
+        width."""
+        found = self._lane_loop(statement)
+        if found is None:
+            return []
+        vloop, lane, width = found
+        return [(lane, width, inner) for inner in vloop.body]
 
     def _consumer_store_preserves_snapshot(
         self,
@@ -1827,8 +2382,11 @@ class _CuteFuseTwoPassLoads:
         bounds = _range_bounds(loop.iter)
         if bounds is None:
             return False
+        # The lanes the loop runs (a static trip count has static bounds).
         lane_extent = _trip_count_for(*bounds, self._constexpr_values)
-        if lane_extent is None:
+        lane_start = _static_int(bounds[0], self._constexpr_values)
+        lane_step = _static_int(bounds[2], self._constexpr_values)
+        if lane_extent is None or lane_start is None or lane_step is None:
             return False
         load_calls = _memory_load_calls(load_stmt.value)
         if len(load_calls) != 1:
@@ -1877,6 +2435,9 @@ class _CuteFuseTwoPassLoads:
                     store_definitions=snapshots[statement_index],
                     proven_tensor_stride_values=self._proven_tensor_stride_values,
                     loop_carried_names=unstable_names,
+                    # The loop's own values: it need not start at 0.
+                    lane_start=lane_start,
+                    lane_step=lane_step,
                 ):
                     return False
         return saw_aliasing_store
@@ -2300,7 +2861,69 @@ class _CuteFuseTwoPassLoads:
             # cache write of its own.
             forwarded_stores: dict[int, str] = {}
             stored_keys: set[str] = set()
+            # Forwarded packet stores by statement id, and by key: a later
+            # sweep's per-lane loads in a V-loop of the packet's width read
+            # what each lane appended, its lane variable standing for the
+            # first V-loop's (``_forwardable_packet_store``).
+            forwarded_packets: dict[int, tuple[str, _PacketStore]] = {}
+            packets_by_key: dict[str, _PacketStore] = {}
             for j, s in enumerate(first_container):
+                packet = (
+                    None
+                    if use_smem
+                    else self._forwardable_packet_store(first_container, j)
+                )
+                # Its fragment holds a slot per lane, ``cache_size * width``
+                # elements, which must fit the cap the loads' fragments meet.
+                if packet is not None and cache_size * packet.width > fragment_cap:
+                    packet = None
+                if packet is not None:
+                    lane_definitions = self._pure_definitions_before(
+                        packet.vloop.body,
+                        packet.append_index,
+                        self._iteration_definitions(
+                            self._pure_definitions_before(
+                                first_container,
+                                packet.vloop_index,
+                                first_scope_definitions,
+                                analysis=analysis,
+                            ),
+                            packet.vloop,
+                        ),
+                        analysis=analysis,
+                    )
+                    key = _canonical_load_text(
+                        packet.load,
+                        {},
+                        lane_definitions,
+                        tensor_dtypes=self._tensor_dtypes,
+                    )
+                    # As for a scalar store, and for each of its lanes.
+                    if not self._stores_distinct_elements(
+                        key,
+                        first_loop,
+                        step,
+                        trip,
+                        cache_size,
+                        vector_lane=(
+                            cast("ast.Name", packet.vloop.target).id,
+                            packet.width,
+                        ),
+                    ):
+                        continue
+                    tracked[key] = (
+                        j,
+                        "",
+                        "store",
+                        self._tensor_dtypes[packet.root],
+                        packet.width,
+                    )
+                    tracked_statements[key] = s
+                    forwarded_packets[id(s)] = (key, packet)
+                    packets_by_key[key] = packet
+                    tracked_tensor_roots[key] = frozenset({packet.root})
+                    stored_keys.add(key)
+                    continue
                 if (forward := self._forwardable_store(s)) is not None:
                     load, root = forward
                     first_definitions = self._pure_definitions_before(
@@ -2313,7 +2936,7 @@ class _CuteFuseTwoPassLoads:
                         tensor_dtypes=self._tensor_dtypes,
                     )
                     if not self._stores_distinct_elements(
-                        key, first_loop, step, trip, trip_expr is not None, cache_size
+                        key, first_loop, step, trip, cache_size
                     ):
                         continue
                     tracked[key] = (j, "", "store", self._tensor_dtypes[root], 1)
@@ -2377,6 +3000,42 @@ class _CuteFuseTwoPassLoads:
             )
             if not tracked and not carry_values:
                 continue
+            # For the numbering of carried values, where V-loop values are
+            # carried: the scalar loads in the first sweep's V-loops, by key,
+            # with their dtypes, and each width's lane variable, which a later
+            # V-loop's stands for.
+            first_vector_loads: dict[str, ast.Assign] = {}
+            vector_load_dtypes: dict[str, str] = {}
+            vector_lanes: dict[int, str] = {}
+            if carry_values and self._carry_vector_values:
+                for load, key, lane, width in self._vector_lane_loads(
+                    first_container,
+                    first_scope_definitions,
+                    {},
+                    {},
+                    analysis=analysis,
+                ):
+                    if width not in vector_lanes:
+                        vector_lanes[width] = lane
+                    if lane != vector_lanes[width] or key in first_vector_loads:
+                        continue
+                    first_vector_loads[key] = load
+                    # As for a tracked load: the dtype a masked load's default
+                    # or a ``cute.arch.load`` names (an fp8 raw byte is a
+                    # Uint8), else the tensor's.
+                    kind = _load_kind(load.value)
+                    dtype = (
+                        self._dtype_for_load_kind(load.value, kind)
+                        if kind is not None
+                        else None
+                    )
+                    if dtype is None and kind != "masked":
+                        dtype = _unmasked_load_tensor_dtype(
+                            load.value, self._tensor_dtypes
+                        )
+                    if dtype is not None:
+                        vector_load_dtypes[key] = dtype
+            shared_lanes = {self._canonical(lane) for lane in vector_lanes.values()}
 
             # Match loads in each subsequent sweep's container.
             # ``auto`` is a profitability policy, not an instruction to keep
@@ -2403,6 +3062,12 @@ class _CuteFuseTwoPassLoads:
                 self._proven_disjoint_tensor_pairs,
             )
             per_sweep_matches: list[list[tuple[int, str, str]]] = []
+            # Per sweep: the per-lane loads of a forwarded packet in its
+            # V-loop, ``(v_loop, index in its body, name, key)``.
+            per_sweep_lane_matches: list[list[tuple[ast.For, int, str, str]]] = []
+            # Per sweep: its V-loop loads proven to read a first-sweep V-loop
+            # load's value, by statement id (the numbering's input only).
+            per_sweep_vector_loads: list[dict[int, str]] = []
             matched_keys: set[str] = set()
             for (
                 body_idx,
@@ -2511,6 +3176,77 @@ class _CuteFuseTwoPassLoads:
                             matches.append((j, s.targets[0].id, key))
                             matched_keys.add(key)
                 per_sweep_matches.append(matches)
+                # The per-lane loads of a forwarded packet's elements, under
+                # the conditions a forwarded scalar store's loads meet.
+                lane_matches = [
+                    (vloop, lane_index, cast("str", assigned_name(load)), key)
+                    for vloop, lane_index, load, key in self._packet_lane_matches(
+                        container_k,
+                        packets_by_key,
+                        alias_k,
+                        scope_definitions,
+                        analysis=analysis,
+                    )
+                    # Both V-loops run the same lanes: the lane variable is
+                    # an index both sweeps loop over.
+                    if not self._key_reads(key)
+                    & (
+                        unstable
+                        - {
+                            self._canonical(
+                                cast("ast.Name", packets_by_key[key].vloop.target).id
+                            )
+                        }
+                    )
+                    and not (
+                        stores_elements
+                        and _subscript_reads(ast.parse(key, mode="eval"))
+                    )
+                    and not memory_order.has_aliasing_store_in(
+                        first_loop,
+                        tracked_tensor_roots[key],
+                        producer=tracked_statements[key],
+                    )
+                    and not memory_order.has_aliasing_store_in(
+                        loop_k, tracked_tensor_roots[key]
+                    )
+                    and not memory_order.has_aliasing_store_between(
+                        tracked_statements[key], load, tracked_tensor_roots[key]
+                    )
+                ]
+                per_sweep_lane_matches.append(lane_matches)
+                matched_keys.update(key for *_rest, key in lane_matches)
+                # Its V-loop loads of the elements a first-sweep V-loop load
+                # read, unchanged in between: equal values for the
+                # numbering, under the conditions a matched load meets.
+                vector_loads: dict[int, str] = {}
+                if first_vector_loads:
+                    for load, key, _lane, _width in self._vector_lane_loads(
+                        container_k,
+                        scope_definitions,
+                        alias_k,
+                        vector_lanes,
+                        analysis=analysis,
+                    ):
+                        producer = first_vector_loads.get(key)
+                        roots = _tensor_arg_roots(load.value, set(self._tensor_dtypes))
+                        if (
+                            producer is not None
+                            and not self._key_reads(key) & (unstable - shared_lanes)
+                            and not (
+                                stores_elements
+                                and _subscript_reads(ast.parse(key, mode="eval"))
+                            )
+                            and not memory_order.has_aliasing_store_in(
+                                first_loop, roots
+                            )
+                            and not memory_order.has_aliasing_store_in(loop_k, roots)
+                            and not memory_order.has_aliasing_store_between(
+                                producer, load, roots
+                            )
+                        ):
+                            vector_loads[id(load)] = key
+                per_sweep_vector_loads.append(vector_loads)
 
             # A load that reads the same element in every iteration needs one
             # slot, not one per lane.
@@ -2520,6 +3256,10 @@ class _CuteFuseTwoPassLoads:
             cuts: list[Cut | None] = [None] * len(sweeps)
             values: SweepValues | None = None
             first_values: dict[int, ast.stmt] = {}
+            twin_plan = -1
+            # The V-loop of each carried value's first statement and of each
+            # statement reading one, by statement id (``_plan_sweep_values``).
+            lane_slots: dict[int, tuple[str, int]] = {}
             if carry_values:
                 # Loads between the sweeps (a later sweep's lane-invariant
                 # prefix) that read a lane-invariant first-sweep load.
@@ -2560,47 +3300,79 @@ class _CuteFuseTwoPassLoads:
                     first_loop,
                     [loop_k for _, loop_k, *_rest in sweeps],
                     first_loads={
-                        id(statement): key
-                        for key, statement in tracked_statements.items()
-                        if key not in stored_keys
+                        **{
+                            id(statement): key
+                            for key, statement in tracked_statements.items()
+                            if key not in stored_keys
+                        },
+                        **{id(load): key for key, load in first_vector_loads.items()},
                     },
                     later_loads=[
                         {
-                            id(sweep[2][j]): key
-                            for j, _name, key in matches
-                            if key not in stored_keys
+                            **{
+                                id(sweep[2][j]): key
+                                for j, _name, key in matches
+                                if key not in stored_keys
+                            },
+                            **vector_loads,
                         }
-                        for sweep, matches in zip(
-                            sweeps, per_sweep_matches, strict=True
+                        for sweep, matches, vector_loads in zip(
+                            sweeps,
+                            per_sweep_matches,
+                            per_sweep_vector_loads,
+                            strict=True,
                         )
                     ],
                     scope_loads=scope_loads,
                     load_dtypes={
-                        key: dtype
-                        for key, (_j, _name, _kind, dtype, _w) in tracked.items()
-                        if dtype is not None and key not in stored_keys
+                        **{
+                            key: dtype
+                            for key, (_j, _name, _kind, dtype, _w) in tracked.items()
+                            if dtype is not None and key not in stored_keys
+                        },
+                        **vector_load_dtypes,
                     },
                     invariant_keys=invariant_keys,
                     transcendentals=transcendentals,
                     live_out=live_out,
+                    # A V-loop value takes ``cache_size`` slots per lane.
+                    lane_slot_cap=fragment_cap // cache_size,
                 )
                 if plan is not None:
-                    values, first_values, cuts = plan
-                    # Loads only the cut computation read are dead now.
-                    per_sweep_matches = [
-                        [
-                            match
-                            for match in matches
-                            if cut is None or id(sweep[2][match[0]]) not in cut.dead
-                        ]
-                        for sweep, matches, cut in zip(
-                            sweeps, per_sweep_matches, cuts, strict=True
+                    values, first_values, cuts, lane_slots, twin_plan = plan
+                    # Loads only the cut computation read are dead now, and
+                    # so is a packet whose lanes only dead V-loop statements
+                    # read; a load read after the sweep's loop is not.
+                    kept_matches: list[list[tuple[int, str, str]]] = []
+                    for sweep, matches, cut in zip(
+                        sweeps, per_sweep_matches, cuts, strict=True
+                    ):
+                        if cut is None:
+                            kept_matches.append(matches)
+                            continue
+                        live_after = self._live_after_container(
+                            new_body, self._sweep_loops(sweep[1]), live_out
                         )
-                    ]
+                        kept_matches.append(
+                            [
+                                match
+                                for match in matches
+                                if id(sweep[2][match[0]]) not in cut.dead
+                                and (
+                                    self._read_outside(sweep[2], match[1], cut)
+                                    or self._canonical(match[1]) in live_after
+                                )
+                            ]
+                        )
+                    per_sweep_matches = kept_matches
                     matched_keys = {
                         key
                         for matches in per_sweep_matches
                         for _j, _name, key in matches
+                    } | {
+                        key
+                        for lane_matches in per_sweep_lane_matches
+                        for *_rest, key in lane_matches
                     }
             if not matched_keys and values is None:
                 continue
@@ -2671,11 +3443,13 @@ class _CuteFuseTwoPassLoads:
                         assert value.dtype is not None
                         if not value.variant:
                             single_slot.add(cache)
+                        # A V-loop's value takes a slot per lane.
+                        width = lane_slots.get(id(first_values[number]), ("", 1))[1]
                         cache_decls.extend(
                             self._cache_declarations(
                                 cache,
                                 value.dtype,
-                                slots=cache_size if value.variant else 1,
+                                slots=cache_size * width if value.variant else 1,
                                 use_smem=False,
                                 trip=trip,
                                 trip_expr=trip_expr if value.variant else None,
@@ -2734,6 +3508,27 @@ class _CuteFuseTwoPassLoads:
             new_first_body: list[ast.stmt] = []
             analysis.clear()
             for s in first_container:
+                if (packet_entry := forwarded_packets.get(id(s))) is not None:
+                    key, packet = packet_entry
+                    if (entry := cache_names.get(key)) is not None:
+                        # Each lane's value goes to the cache next to its
+                        # append, in the tensor's dtype.
+                        cache, width = entry
+                        lane_body = packet.vloop.body
+                        at = lane_body.index(packet.append)
+                        slot = _slot_expr(
+                            cache_index,
+                            width,
+                            cast("ast.Name", packet.vloop.target).id,
+                        )
+                        lane_body.insert(
+                            at + 1,
+                            statement_from_string(
+                                f"{cache}[{slot}] = {ast.unparse(packet.value)}"
+                            ),
+                        )
+                    new_first_body.append(s)
+                    continue
                 key = forwarded_stores.get(id(s))
                 if key is not None:
                     entry = cache_names.get(key)
@@ -2801,6 +3596,25 @@ class _CuteFuseTwoPassLoads:
                                 statement_from_string(f"{cache}[{slot}] = {name}[{v}]")
                             )
             first_container[:] = new_first_body
+            # A carried value of a V-loop goes to its lane's slot there.
+            for s in first_container:
+                for lane, width, inner in self._vector_lane_statements(s):
+                    cache = value_writes.get(id(inner))
+                    if cache is None or id(inner) not in lane_slots:
+                        continue
+                    lane_body = cast("ast.For", s).body
+                    at = next(i for i, stmt in enumerate(lane_body) if stmt is inner)
+                    slot = (
+                        "0"
+                        if cache in single_slot
+                        else _slot_expr(cache_index, width, lane)
+                    )
+                    lane_body.insert(
+                        at + 1,
+                        statement_from_string(
+                            f"{cache}[{slot}] = {assigned_name(inner)}"
+                        ),
+                    )
 
             # Rewrite each subsequent sweep's container: replace each
             # matched load.  Scalar loads become a single cache read.
@@ -2816,9 +3630,70 @@ class _CuteFuseTwoPassLoads:
                 cache_index_k,
                 _alias_k,
                 _scope_definitions,
-            ), matches, cut in zip(sweeps, per_sweep_matches, cuts, strict=True):
-                if not matches and cut is None:
+            ), matches, lane_matches, cut in zip(
+                sweeps, per_sweep_matches, per_sweep_lane_matches, cuts, strict=True
+            ):
+                if not matches and not lane_matches and cut is None:
                     continue
+                for vloop, lane_index, name, key in lane_matches:
+                    # A forwarded packet lane, as a forwarded scalar store.
+                    cache, width = cache_names[key]
+                    slot = _slot_expr(
+                        cache_index_k, width, cast("ast.Name", vloop.target).id
+                    )
+                    vloop.body[lane_index] = statement_from_string(
+                        f"{name} = "
+                        + _opaque_copy(f"{cache}[{slot}]", self._cache_dtypes[cache])
+                    )
+                # A V-loop statement whose value is carried gets the read of
+                # its lane's slot ahead of it, and records the read's name;
+                # the statements the values make dead are marked.  The cut
+                # itself waits for ``cut_carried_values``, and so does the
+                # container's packet hoist of a recomputed operand
+                # (``deferred``).
+                deferred: set[int] = set()
+                needed: set[str] = set()
+                for statement in container_k if cut is not None else ():
+                    found = vector_lane_loop(statement)
+                    if found is None:
+                        continue
+                    assert cut is not None
+                    vloop, lane, _width = found
+                    lane_body: list[ast.stmt] = []
+                    for inner in vloop.body:
+                        if id(inner) in cut.dead:
+                            setattr(inner, FUSE_CARRY_DEAD_ATTR, True)
+                            needed |= self._reads(inner)
+                        elif id(inner) in cut.cached:
+                            cache = value_caches[cut.cached[id(inner)]]
+                            slot = (
+                                "0"
+                                if cache in single_slot
+                                else _slot_expr(
+                                    cache_index_k, lane_slots[id(inner)][1], lane
+                                )
+                            )
+                            name = self._new_carried_name()
+                            read = statement_from_string(
+                                f"{name} = {self._cache_dtypes[cache]}({cache}[{slot}])"
+                            )
+                            setattr(read, FUSE_CARRIED_READ_ATTR, True)
+                            setattr(inner, FUSE_CARRY_ATTR, name)
+                            setattr(
+                                inner,
+                                FUSE_CARRY_TWIN_ATTR,
+                                (twin_plan, cut.cached[id(inner)]),
+                            )
+                            lane_body.append(read)
+                            needed |= self._reads(inner)
+                        lane_body.append(inner)
+                    vloop.body[:] = lane_body
+                if cut is not None:
+                    for s in reversed(container_k):
+                        if id(s) in cut.dead and self._assigned(s) in needed:
+                            deferred.add(id(s))
+                            setattr(s, FUSE_CARRY_DEAD_ATTR, True)
+                            needed |= self._reads(s)
                 vec_extract_rewrites: list[
                     tuple[str, str, str, int, bool, int, str]
                 ] = []
@@ -2826,6 +3701,8 @@ class _CuteFuseTwoPassLoads:
                 matched_by_index = {j: key for j, _name, key in matches}
                 for statement_index, s in enumerate(container_k):
                     if cut is not None and id(s) in cut.dead:
+                        if id(s) in deferred:
+                            new_sweep_body.append(s)
                         continue
                     if cut is not None and id(s) in cut.cached:
                         cache = value_caches[cut.cached[id(s)]]
@@ -2931,10 +3808,10 @@ class _CuteFuseTwoPassLoads:
 
             rewritten = [
                 loop_k
-                for (_body_idx, loop_k, *_rest), matches, cut in zip(
-                    sweeps, per_sweep_matches, cuts, strict=True
+                for (_body_idx, loop_k, *_rest), matches, lane_matches, cut in zip(
+                    sweeps, per_sweep_matches, per_sweep_lane_matches, cuts, strict=True
                 )
-                if matches or cut is not None
+                if matches or lane_matches or cut is not None
             ]
             last_rewritten = rewritten[-1] if rewritten else first_loop
             if values is not None and not fallback_originals:
@@ -3075,6 +3952,7 @@ def fuse_two_pass_loads(
     binding_dtypes: Mapping[str, str] | None = None,
     rename_groups: dict[str, str] | None = None,
     forwardable_tensors: Collection[str] = (),
+    carry_vector_values: bool = True,
 ) -> list[ast.stmt]:
     """Apply two-pass load fusion to a list of statements (the device kernel
     body). Returns the (possibly modified) body.
@@ -3115,7 +3993,14 @@ def fuse_two_pass_loads(
     replace is removed only where nothing reads it, and ``binding_dtypes``
     gives the DSL type of names their binding statement does not show (the
     uniform cutoffs of a dropout mask), so a value computed from them has
-    one.
+    one.  A value computed in a V-loop (``cutlass.range_constexpr``, a
+    packet's lanes) is carried into a V-loop of the same width, one fragment
+    slot per lane; the later sweep's statement gives way to the fragment
+    read in ``cut_carried_values``, after the exact division.
+    ``carry_vector_values=False`` carries no V-loop value: under
+    ``cute_independent_reduction`` the split of a V-loop's sum matches only the
+    plain sweep, and under ``cute_cluster_warp_online`` the rolled
+    online-softmax pair moves the first sweep's values into another frame.
 
     ``forwardable_tensors`` names kernel-local scratch tensors
     (``scratch_tensors.kernel_local_scratch``).  A later sweep's load of what
@@ -3141,5 +4026,6 @@ def fuse_two_pass_loads(
         binding_dtypes=binding_dtypes,
         rename_groups=rename_groups,
         forwardable_tensors=forwardable_tensors,
+        carry_vector_values=carry_vector_values,
     )
     return transformer.transform(body)

@@ -283,6 +283,19 @@ def comparison_is_always_true(
 # ``_TRACE_TIME_TESTS`` (``cutlass.const_expr(...)``) runs as Python.
 _STAGED_RANGE_CALLS = frozenset({"range", "range_dynamic"})
 _TRACE_TIME_TESTS = frozenset({"const_expr", "target_version"})
+# The register helpers of the exact fp32 division (``exact_division.py``,
+# ``device/ptx.py``), by the names generated code calls them: pure
+# arithmetic.  A pass that meets them after the exact pass
+# (``jam_grid_lanes``) copies them like any other arithmetic; the passes
+# that emit them register each name here.
+EXACT_DIVISION_HELPERS = frozenset(
+    {
+        "_cute_exact_div_bounds_f32",
+        "_cute_exact_div_fast_f32",
+        "_cute_exact_div_fast_f32x2",
+        "_cute_exact_div_redo_f32",
+    }
+)
 
 
 def is_staged_loop(node: ast.For) -> bool:
@@ -934,6 +947,15 @@ _PURE_OPERATOR_CALLS = frozenset(
 _CHUNK_REDUCTION_HELPERS = CTA_REDUCES
 
 
+def is_pure_operator_call(path: str) -> bool:
+    """Whether the call path ``path`` (``call_path_str``) is an ``operator``
+    function of ``_PURE_OPERATOR_CALLS``, one that computes a value from its
+    operands and does nothing else."""
+    return (
+        path.startswith("operator.") and path.rsplit(".", 1)[-1] in _PURE_OPERATOR_CALLS
+    )
+
+
 def is_cta_reduce_call(call: ast.Call) -> bool:
     """Whether ``call`` combines a value across the threads of one CTA: a
     scalar reduce helper (``reduce_call.CTA_REDUCES``) or the DSL's warp
@@ -992,7 +1014,7 @@ def _is_proven_relocatable_call(
         # The MLIR vector type of a hoisted packet load: a pure type value.
         return True
     if name.startswith("operator."):
-        return name.rsplit(".", 1)[-1] in _PURE_OPERATOR_CALLS
+        return is_pure_operator_call(name)
     if name in {
         "cute.arch.block_dim",
         "cute.arch.block_idx",
