@@ -56,6 +56,9 @@ from helion._compiler.cute import device_state
 from helion._compiler.cute import kernel_generators
 from helion._compiler.cute import sink_vector_loops
 from helion._compiler.cute.autotune.heuristics.cute import CuteColumnReductionHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import (
+    CuteSplitColumnReductionHeuristic,
+)
 from helion._compiler.cute.fuse_fma import fuse_fma
 from helion._compiler.cute.lane_loops import root_passes
 from helion._compiler.cute.sink_vector_loops import VloopSinkNotApplied
@@ -1633,6 +1636,70 @@ def test_strided_reduction_heuristic_seeds_a_short_reduction_in_one_chunk(
         assert (([256], 16, 16) in seeds) is expected, (rows, seeds)
 
 
+@pytest.mark.parametrize(
+    ("width", "vec", "columns", "tile_threads", "packet_load"),
+    (
+        # Rows of 1026 bf16 elements are only 4-byte aligned (the BERT
+        # vocabulary gradient's 30522 too): 2-element vectors, four times
+        # the tile threads of a 16-byte vector, the wider tile first.
+        (1026, 2, 256, 128, "_cute_load_v4b_if("),
+        # 8-byte aligned rows of 1028: 4-element vectors, twice the tile
+        # threads of a 16-byte vector, the wider tile first.
+        (1028, 4, 256, 64, "_cute_load_v8b_if("),
+        # 16-byte aligned rows: the measured shape.
+        (1032, 8, 128, 16, "_cute_load_v16b_if("),
+    ),
+)
+def test_strided_reduction_heuristic_seeds_the_widest_aligned_vector(
+    cpu_only: None,
+    width: int,
+    vec: int,
+    columns: int,
+    tile_threads: int,
+    packet_load: str,
+) -> None:
+    """A column sum over a lone grid axis: the first seed's tile leaves a
+    jagged last tile, whose bounds mask on the vector fact's index the sink
+    evaluates at the vector's base, and the seeded config sinks predicated
+    packets with the vector threads on ``thread_idx[0]``."""
+    x = torch.empty(2048, width, dtype=torch.bfloat16)
+    bound = cpu_bind(_column_sum, (x,))
+    spec = bound.config_spec
+    seeds = [
+        seed.config
+        for seed in spec.compiler_seed_configs
+        if seed.config.get("cute_vloop_sink")
+    ]
+    assert seeds
+    (reduction,) = spec.reduction_loops.valid_block_ids()
+    (tile,) = spec.block_sizes.valid_block_ids()
+    threads = dict(
+        zip(spec.num_threads.valid_block_ids(), seeds[0]["num_threads"], strict=True)
+    )
+    widths = dict(
+        zip(
+            spec.cute_vector_widths.valid_block_ids(),
+            seeds[0]["cute_vector_widths"],
+            strict=True,
+        )
+    )
+    assert seeds[0]["block_sizes"] == [columns]
+    assert threads == {tile: tile_threads, reduction: 8}
+    assert widths[tile] == vec
+    code = bound.to_code(spec.normalized_config(helion.Config(**seeds[0])))
+    assert code.count(packet_load) == 8, code
+    assert _thread_axis_of(code, "offsets_base_0") == 0, code
+    assert _thread_axis_of(code, "_vsink_ptr") == 1, code
+
+
+def test_strided_reduction_heuristic_skips_rows_without_a_vector(
+    cpu_only: None,
+) -> None:
+    """Rows of an odd number of bf16 elements align no 2-element vector."""
+    bound = cpu_bind(_column_sum, (torch.empty(2048, 1025, dtype=torch.bfloat16),))
+    assert "cute_strided_reduction" not in bound.config_spec.autotuner_heuristics
+
+
 def test_strided_reduction_heuristic_skips_a_contiguous_row(cpu_only: None) -> None:
     """A row reduction over the stride-1 dim is already coalesced on the
     reduction threads: no strided-reduction seed."""
@@ -2311,6 +2378,152 @@ def test_column_reduction_heuristic_seeds_the_coalesced_layout(
     assert "cute_column_reduction" not in rows_bound.config_spec.autotuner_heuristics
 
 
+def _split_column_sum_fn(x: torch.Tensor, rows_per_split: hl.constexpr) -> torch.Tensor:
+    """Column sums of ``x``'s blocks of ``rows_per_split`` rows, the last one
+    partial: the serial loop walks a split's rows with an explicit tile and
+    masked loads, as Inductor's looped split reductions do."""
+    rows, n = x.size()
+    splits = (rows + rows_per_split - 1) // rows_per_split
+    out = torch.empty([splits, n], dtype=torch.float32, device=x.device)
+    for tile_s, tile_n in hl.tile([splits, n]):
+        acc = hl.zeros([tile_s, tile_n], dtype=torch.float32)
+        for tile_r in hl.tile(rows_per_split):
+            row = tile_s.index[:, None] * rows_per_split + tile_r.index[None, :]
+            valid = (row < rows) & (tile_r.index[None, :] < rows_per_split)
+            vals = hl.load(x, [row, tile_n], extra_mask=valid[:, :, None])
+            acc = acc + torch.sum(vals.to(torch.float32), dim=1)
+        out[tile_s, tile_n] = acc
+    return out
+
+
+split_column_sum_static = helion.kernel(
+    _split_column_sum_fn, backend="cute", static_shapes=True, autotune_effort="none"
+)
+split_column_sum_dynamic = helion.kernel(
+    _split_column_sum_fn, backend="cute", static_shapes=False, autotune_effort="none"
+)
+
+
+def test_split_column_reduction_heuristic_seeds_the_coalesced_layout(
+    cpu_only: None,
+) -> None:
+    """Splits of 600 rows of 64 contiguous bf16 columns, walked by an explicit
+    row loop: warp-sized CTAs with a shuffle combine per chunk, and
+    whole-split chunks with one cross-warp combine, both sinking the column
+    vector."""
+    x = torch.empty(4700, 64, dtype=torch.bfloat16)
+    bound = cpu_bind(split_column_sum_static, (x, 600))
+    spec = bound.config_spec
+    assert "cute_split_column_reduction" in spec.autotuner_heuristics
+    seeds = [seed.config for seed in spec.compiler_seed_configs]
+    assert [(seed["block_sizes"], seed["num_threads"]) for seed in seeds] == [
+        ([1, 16, 128], [1, 2, 16]),
+        ([1, 32, 1024], [1, 4, 128]),
+        ([1, 32, 128], [1, 4, 8]),
+    ]
+    for seed in seeds:
+        assert seed["cute_vector_widths"] == [1, 8, 1]
+        assert seed["cute_lane_layouts"] == ["blocked", "blocked", "strided"]
+        assert seed["cute_vloop_sink"] is True
+        assert seed["cute_lane_unroll"] == 8
+    # One seed of each family sinks: the per-chunk shuffle combine and the
+    # cross-warp fragment combine.
+    chunked = bound.to_code(spec.normalized_config(spec.compiler_seed_configs[0]))
+    assert "_vsink_vec" in chunked
+    assert "_cute_grouped_reduce_warp(" in chunked
+    assert FRAGMENT_REDUCE not in chunked
+    whole = bound.to_code(spec.normalized_config(spec.compiler_seed_configs[1]))
+    assert "_vsink_vec" in whole
+    assert FRAGMENT_REDUCE in whole
+    # Static extents and strides need no specialization; dynamic ones are
+    # proven through the exact input metadata.
+    heuristic = CuteSplitColumnReductionHeuristic
+    assert (
+        heuristic.register_facts(bound.env, bound.host_function.device_ir)
+        == frozenset()
+    )
+    dynamic = cpu_bind(split_column_sum_dynamic, (x, 600))
+    assert "cute_split_column_reduction" in dynamic.config_spec.autotuner_heuristics
+    assert heuristic.register_facts(dynamic.env, dynamic.host_function.device_ir) == {
+        "input_tensor_metadata"
+    }
+    # A column dim that is not contiguous, or a column extent that is not a
+    # multiple of the vector width (60 of 64 contiguous columns), gets no
+    # seed; a one-axis grid is the column heuristic's.
+    for kernel, args in (
+        (
+            split_column_sum_static,
+            (torch.empty(64, 4700, dtype=torch.bfloat16).t(), 600),
+        ),
+        (
+            split_column_sum_static,
+            (torch.empty(4700, 64, dtype=torch.bfloat16)[:, :60], 600),
+        ),
+        (col_reduce_sum_static, (torch.empty(4096, 4096, dtype=torch.bfloat16),)),
+    ):
+        declined = cpu_bind(kernel, args)
+        assert (
+            "cute_split_column_reduction"
+            not in declined.config_spec.autotuner_heuristics
+        )
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _batched_column_sum(x: torch.Tensor) -> torch.Tensor:
+    """Column sums of each of ``x``'s ``[rows, C]`` planes."""
+    batches, rows, n = x.size()
+    out = torch.empty([batches, n], dtype=torch.float32, device=x.device)
+    for tile_b, tile_c in hl.tile([batches, n]):
+        acc = hl.zeros([tile_b, tile_c], dtype=torch.float32)
+        for tile_r in hl.tile(rows):
+            acc = acc + torch.sum(x[tile_b, tile_r, tile_c].to(torch.float32), dim=1)
+        out[tile_b, tile_c] = acc
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _broadcast_sum_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """``a @ b`` as a broadcast product summed over ``k``."""
+    m, k = a.size()
+    n = b.size(1)
+    out = torch.empty([m, n], dtype=torch.float32, device=a.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = acc + torch.sum(
+                a[tile_m, tile_k][:, :, None].to(torch.float32)
+                * b[tile_k, tile_n][None, :, :].to(torch.float32),
+                dim=1,
+            )
+        out[tile_m, tile_n] = acc
+    return out
+
+
+def test_split_column_reduction_heuristic_takes_batched_and_broadcast_sums(
+    cpu_only: None,
+) -> None:
+    """The match takes any grid of two or more axes whose row loop reduces
+    the column tile's rows: a batched column sum and a broadcast-sum
+    contraction get the three seeds too, and a seed sinks the column
+    vector."""
+    a = torch.empty(64, 256, dtype=torch.bfloat16)
+    b = torch.empty(256, 64, dtype=torch.bfloat16)
+    for kernel, args in (
+        (_batched_column_sum, (torch.empty(8, 600, 64, dtype=torch.bfloat16),)),
+        (_broadcast_sum_matmul, (a, b)),
+    ):
+        bound = cpu_bind(kernel, args)
+        spec = bound.config_spec
+        assert "cute_split_column_reduction" in spec.autotuner_heuristics
+        sunk = [
+            seed
+            for seed in spec.compiler_seed_configs
+            if seed.config.get("cute_vloop_sink")
+        ]
+        assert len(sunk) == 3
+        assert "_vsink_vec" in bound.to_code(spec.normalized_config(sunk[0]))
+
+
 # GPU numerics for grid vector-loop sinking (``cute_vloop_sink``).
 #
 # Partial tiles on both axes, the interleaved (rows above columns) thread
@@ -2382,6 +2595,28 @@ class TestCuteVloopSink(TestCase):
             self.assertIn("_cute_red_add_f32_vec(", code)
         torch.testing.assert_close(out, x.sum(0), atol=1e-3, rtol=1e-4)
         torch.testing.assert_close(count, torch.ones_like(count))
+
+    def test_split_column_sum_seeds(self) -> None:
+        """A chunked seed and a whole-split one over 4700 rows in splits of
+        600: the last split and the last chunk of each split are partial."""
+        x = torch.randn(4700, 64, device=DEVICE, dtype=torch.bfloat16)
+        expected = torch.stack(
+            [x[row : row + 600].float().sum(0) for row in range(0, 4700, 600)]
+        )
+        bound = split_column_sum_static.bind((x, 600))
+        # This heuristic's chunked seed and its whole-split one, picked by
+        # shape: other heuristics may seed this kernel on a real device too.
+        wanted = [([1, 16, 128], [1, 2, 16]), ([1, 32, 1024], [1, 4, 128])]
+        seeds = [
+            seed
+            for seed in bound.config_spec.compiler_seed_configs
+            if (seed.config["block_sizes"], seed.config["num_threads"]) in wanted
+        ]
+        self.assertEqual(len(seeds), 2)
+        for seed in seeds:
+            with self.subTest(block_sizes=seed.config["block_sizes"]):
+                out = bound.compile_config(seed)(x, 600)
+                torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-3)
 
     def test_partial_tiles_on_both_axes(self) -> None:
         """1000 rows against a 4096-row block and 1000 columns against
@@ -2737,6 +2972,21 @@ class TestCuteVloopSink(TestCase):
             torch.testing.assert_close(
                 pooled, y.mean(1).to(x.dtype), atol=1e-2, rtol=1e-2
             )
+
+    def test_a_column_sum_over_4_byte_aligned_rows(self) -> None:
+        """The heuristic's first seed for rows of 1026 bf16 elements: 2-element
+        packets on 128 vector threads, the last 256-column tile jagged."""
+        x = torch.randn(2048, 1026, device=DEVICE, dtype=torch.bfloat16)
+        bound = _column_sum.bind((x,))
+        spec = bound.config_spec
+        seed = next(
+            spec.normalized_config(helion.Config(**seed.config))
+            for seed in spec.compiler_seed_configs
+            if seed.config.get("cute_vloop_sink")
+        )
+        bound.set_config(seed)
+        self.assertIn("_cute_load_v4b_if(", bound.to_code(seed))
+        torch.testing.assert_close(bound(x), x.float().sum(0), atol=1e-2, rtol=1e-3)
 
     def _check_channel_affine(self, rows: int, config: dict[str, Any]) -> None:
         """``config`` matches eager, and its output with the channel operands

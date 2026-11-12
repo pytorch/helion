@@ -118,6 +118,18 @@ def _overwrite_rows(x: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _keep_rows_into(x: torch.Tensor, keep_out: torch.Tensor) -> torch.Tensor:
+    # The bool row goes to a tensor the caller passes in.
+    out = torch.empty(x.shape, dtype=torch.bfloat16, device=x.device)
+    for row in hl.tile(x.size(0)):
+        data = x[row, :].to(torch.float32)
+        shifted = data - torch.amax(data, dim=-1, keepdim=True)
+        keep_out[row, :] = shifted > -1.0
+        out[row, :] = shifted.to(torch.bfloat16)
+    return out
+
+
 def _config(
     bound: BoundKernel, vec_width: int, policy: str = "default"
 ) -> helion.Config:
@@ -278,3 +290,35 @@ def test_cuda_masked_overwrite_matches_eager(dtype: torch.dtype) -> None:
     bound = _masked_overwrite_rows._bind_isolated((x, like))
     out = bound.compile_config(_config(bound, 8))(x, like)
     assert torch.equal(out.view(torch.uint8), expected.view(torch.uint8))
+
+
+def _keep_buffer(aligned: bool, device: torch.device | str) -> torch.Tensor:
+    # A bool argument at the start of its storage, or one byte into it.
+    storage = torch.zeros(37 * 32 + 1, dtype=torch.bool, device=device)
+    return storage[:-1].view(37, 32) if aligned else storage[1:].view(37, 32)
+
+
+@pytest.mark.parametrize("aligned", [True, False])
+def test_a_bool_argument_row_packs_when_its_base_is_aligned(aligned: bool) -> None:
+    # The bound kernel is keyed on the argument's base alignment, so a bool
+    # tensor passed in packs its row like one the kernel allocates, and one
+    # a byte into its storage keeps the scalar stores.
+    code = _code(_keep_rows_into, (_rows(), _keep_buffer(aligned, "cpu")), 8)
+    assert ("_cute_store_u8_vec(" in code) is aligned, code
+    assert (".store(cutlass.Boolean(" in code) is not aligned, code
+
+
+@pytest.mark.cuda
+@skipIfNotCUDA()
+@pytest.mark.parametrize("aligned", [True, False])
+def test_cuda_bool_argument_row_matches_eager(aligned: bool) -> None:
+    x = torch.randn((37, 32), dtype=torch.bfloat16, device=DEVICE)
+    keep_out = _keep_buffer(aligned, DEVICE)
+    bound = _keep_rows_into._bind_isolated((x, keep_out))
+    out = bound.compile_config(_config(bound, 8))(x, keep_out)
+    data = x.float()
+    shifted = data - data.amax(-1, keepdim=True)
+    assert torch.equal(keep_out, shifted > -1.0)
+    assert torch.equal(
+        out.view(torch.int16), shifted.to(torch.bfloat16).view(torch.int16)
+    )

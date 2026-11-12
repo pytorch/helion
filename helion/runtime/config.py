@@ -176,7 +176,10 @@ class Config(Mapping[str, object]):
         cute_replicated_reduction: bool | None = None,
         cute_vector_packet_unroll: bool | None = None,
         cute_vloop_sink: bool | None = None,
+        cute_grid_lane_jam: bool | None = None,
         cute_lane_unroll: int | None = None,
+        cute_unpadded_rows: bool | None = None,
+        cute_bool_byte_packets: bool | None = None,
         cute_wide_packet_hints: bool | None = None,
         cute_pdl: bool | None = None,
         cute_pdl_capture_overlap: bool | None = None,
@@ -271,12 +274,59 @@ class Config(Mapping[str, object]):
                 per-lane register accumulators, one grouped cross-thread combine
                 per row tile. Disabled by default. Kernels where nothing can be
                 sunk generate exactly the knob-off code.
+            cute_grid_lane_jam: Interleave the lanes of a grid lane loop into
+                the device loops it wraps: the lanes' copies of each
+                statement run side by side, their loads of consecutive
+                elements become one vector load and their grouped reduces
+                one fragment reduce. The results are bitwise unchanged.
+                Disabled by default; a lane loop the pass cannot prove
+                independent across lanes keeps the knob-off code.
             cute_lane_unroll: Unroll factor (1, 2, 4, 8, 16) for per-thread
-                lane loops: every unrolled lane's loads issue before the first
-                of them computes. It takes the row lane loop of a sunk vector
-                nest (with cute_vloop_sink), else the lane loops of tile axes
-                the config gives fewer threads than elements; kernels where no
-                loop takes it generate exactly the knob-off code.
+                lane loops: every unrolled lane's loads, the scalar loads of
+                its vector loop included, issue before the first of them
+                computes, and a vector loop's scalar loads issue before the
+                stores it makes after them even when the lane loop has a
+                single trip or stays rolled. It takes the row lane loop of a
+                sunk vector nest (with cute_vloop_sink), else the lane loops
+                of tile axes the config gives fewer threads than elements, of
+                looped reductions whose chunk spans more than one vector per
+                thread and of persistent reduction rows their threads do not
+                cover; kernels where no loop takes it generate exactly the
+                knob-off code. With the loads apart from the arithmetic, LLVM
+                may contract into one FMA a float multiply and add that the
+                knob-off code rounds separately (a product feeding an add
+                whose other operand is a masked load stays in that load's
+                branch there), so float results can round differently, and so
+                can values computed from them (a comparison, an integer cast,
+                an argmax). Integer and boolean values that do not depend on
+                such arithmetic, masks drawn from Philox words included, do
+                not change.
+            cute_unpadded_rows: Run a persistent reduction row whose static
+                length is not a power of two unpadded and unmasked when the
+                config gives it a whole number of warps that one vector per
+                thread covers exactly (768 = 96 threads x 8): the multi-warp
+                vector row, combined across warps through shared memory,
+                instead of one warp walking the padded row in masked scalar
+                lanes. Normalized away where no row has such a layout; a row
+                an ``hl.reduce`` reduces keeps its padded slots, which fold
+                the reduce's ``other``. A kept row that the code generator
+                then runs on another row's threads (a full slice beside
+                another) or as a resident reduction refuses the config. Off
+                by default.
+                The sums run in another order (a fold of each thread's vector,
+                then across lanes and warps, rather than across 32 scalar lanes
+                and one warp), and without the masked loads' branches LLVM may
+                contract float multiply-adds differently, so results can differ
+                from the padded row's by more than an ulp.
+            cute_bool_byte_packets: Load a bool row that a looped reduction
+                reads along its reduction dim as byte packets: one integer of
+                2, 4 or 8 bytes per lane, each element a byte compared against
+                zero, instead of one byte load per element. The packets cost
+                fewer instructions and load requests; where a later sweep
+                reloads the row from L2, the faster first sweep can leave less
+                of it there. Results are bitwise unchanged. Off by default;
+                offered to the autotuner for kernels whose looped reduction
+                reads a bool row.
             cute_wide_packet_hints: Carry the ``l2_last`` / ``l1_l2_first`` /
                 ``l1_l2_last`` load eviction policies onto 32-byte CuTe packets
                 (``cute_vector_widths`` 8 for fp32, 16 for bf16/fp16) through
@@ -469,7 +519,10 @@ class Config(Mapping[str, object]):
             "cute_replicated_reduction": cute_replicated_reduction,
             "cute_vector_packet_unroll": cute_vector_packet_unroll,
             "cute_vloop_sink": cute_vloop_sink,
+            "cute_grid_lane_jam": cute_grid_lane_jam,
             "cute_lane_unroll": cute_lane_unroll,
+            "cute_unpadded_rows": cute_unpadded_rows,
+            "cute_bool_byte_packets": cute_bool_byte_packets,
             "cute_wide_packet_hints": cute_wide_packet_hints,
             "cute_pdl": cute_pdl,
             "cute_pdl_capture_overlap": cute_pdl_capture_overlap,

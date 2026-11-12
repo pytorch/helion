@@ -14,7 +14,9 @@ division still takes a dividend the consume loop now reads from an fp32 load
 cache.  A write the vectorizer cannot resolve, or a call whose memory effects
 are unknown (impure inline asm), may write any packet: between the loops,
 and inside a lane loop, whose loads and stores it then keeps per lane.  The
-kernels render on CPU.
+split's copies, the owner-guarded ones included, keep the markers later
+passes read, but for the access regions in a rerun producer's nested loops,
+which run apart from the original's.  The kernels render on CPU.
 """
 
 from __future__ import annotations
@@ -26,11 +28,17 @@ import pytest
 import torch
 
 import helion
+from helion._compiler.ast_read_writes import HELION_ACCESS_REGIONS_ATTR
 from helion._compiler.cute import fuse_two_pass_loads as fuse_module
 from helion._compiler.cute.hoist_loop_invariant_recip import _picks_one_element
 from helion._compiler.cute.hoist_loop_invariant_recip import (
     hoist_exact_invariant_divisions,
 )
+from helion._compiler.cute.lane_loops.markers import _create_lane_loop
+from helion._compiler.cute.lane_loops.markers import _lane_reduce_marker_expr
+from helion._compiler.cute.lane_loops.markers import validate_lane_reduce_owners
+from helion._compiler.cute.lane_loops.owner_guards import _guard_stmt_with_owner
+from helion._compiler.cute.lane_loops.split import split_lane_loop_reductions
 from helion._compiler.cute.persistent_branch_vec import (
     vectorize_branch_local_persistent_fragments,
 )
@@ -526,3 +534,151 @@ for lane in range(4):
     # dividend alone decides.
     assert ("_cute_exact_div_fast_f32(cached, total" in code) is exact
     assert ("if _cute_exact_div_redo_f32(" in code) is exact
+
+
+def test_owner_guarded_copies_keep_the_store_markers() -> None:
+    # After the warp reduction, the store of the reduced value and the
+    # consume loop's store run on the owner lane only, each a guarded copy of
+    # its statement.  Both keep the access region the memory-op codegen
+    # recorded on the store call, which the barrier pass reads.
+    marker = _lane_reduce_marker_expr(
+        "partial", "sum", "cutlass.Float32(0)", 32, owner_lane="lane"
+    )
+    body = ast.parse(
+        f"partial = lane + 1\nreduced = {marker}\n"
+        "(out.iterator + 0).store(reduced)\n"
+        "(row.iterator + lane).store(partial + reduced)\n"
+    ).body
+    for statement in body[2:]:
+        assert isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call)
+        setattr(statement.value, HELION_ACCESS_REGIONS_ATTR, ast.unparse(statement))
+    loop = _create_lane_loop("lane", 8, body)
+    validate_lane_reduce_owners([loop])
+    result = split_lane_loop_reductions([loop])
+
+    guards = [
+        node
+        for statement in result
+        for node in ast.walk(statement)
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "cutlass.Int32(cute.arch.lane_idx()) % 32 == 0"
+    ]
+    stores = [guard.body[0] for guard in guards]
+    assert [ast.unparse(store) for store in stores] == [
+        "(out.iterator + 0).store(reduced)",
+        "(row.iterator + lane).store(partial + reduced)",
+    ]
+    for store in stores:
+        assert isinstance(store, ast.Expr)
+        assert getattr(store.value, HELION_ACCESS_REGIONS_ATTR, None) == ast.unparse(
+            store
+        )
+
+
+def test_the_consume_loop_copy_of_a_nested_loop_drops_its_regions() -> None:
+    """The consume loop reruns a producer holding a loop, whose copy runs
+    apart from the accumulate loop's: its accesses drop the regions that
+    name the original loop's tile begins, which the barrier pass would
+    cancel across the two copies, and the accumulate loop's keep theirs."""
+    marker = _lane_reduce_marker_expr(
+        "acc", "sum", "cutlass.Float32(0)", 32, owner_lane="lane"
+    )
+    body = ast.parse(
+        "acc = cutlass.Float32(0)\n"
+        "for k in range(4):\n"
+        "    acc = acc + (x.iterator + k * 8 + lane).load()\n"
+        f"reduced = {marker}\n"
+        "(row.iterator + lane).store(acc - reduced)\n"
+    ).body
+    (load,) = [
+        node
+        for node in ast.walk(body[1])
+        if isinstance(node, ast.Call) and ast.unparse(node).endswith(".load()")
+    ]
+    setattr(load, HELION_ACCESS_REGIONS_ATTR, "regions")
+    loop = _create_lane_loop("lane", 8, body)
+    validate_lane_reduce_owners([loop])
+    result = split_lane_loop_reductions(
+        [loop], proven_disjoint_tensor_pairs={frozenset(("x", "row"))}
+    )
+    loads = [
+        node
+        for statement in result
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Call) and ast.unparse(node).endswith(".load()")
+    ]
+    assert [getattr(node, HELION_ACCESS_REGIONS_ATTR, None) for node in loads] == [
+        "regions",
+        None,
+    ]
+
+
+def test_the_register_stash_reruns_drop_the_regions_of_a_nested_loop() -> None:
+    """The register stash runs the collective region once and reruns its
+    recomputable producers in the accumulate and consume loops: their copies
+    of a loop nested in such a producer drop its regions, as the consume
+    loop's copy does in the two-pass split, and the region's own copy keeps
+    them."""
+    marker = _lane_reduce_marker_expr(
+        "acc", "sum", "cutlass.Float32(0)", 1, owner_lane="lane"
+    )
+    body = ast.parse(
+        "bias = cutlass.Float32(0)\n"
+        "for k in range(2):\n"
+        "    bias = bias + (x.iterator + k * 8 + lane).load()\n"
+        "acc = 0.0\n"
+        "for step in range(2):\n"
+        "    acc_copy = acc\n"
+        "    partial = _cute_grouped_reduce_shared_two_stage("
+        "cutlass.Float32(lane + 1), 'sum', cutlass.Float32(0), "
+        "cutlass.Int32(0), cutlass.Int32(0), cutlass.Int32(0), "
+        "pre=1, group_span=64, group_count=1)\n"
+        "    acc_1 = acc_copy + partial\n"
+        f"reduced = {marker}\n"
+        "(out.iterator + lane).store(acc - reduced + bias)\n"
+    ).body
+    (load,) = [
+        node
+        for node in ast.walk(body[1])
+        if isinstance(node, ast.Call) and ast.unparse(node).endswith(".load()")
+    ]
+    setattr(load, HELION_ACCESS_REGIONS_ATTR, "regions")
+    loop = _create_lane_loop("lane", 8, body)
+    validate_lane_reduce_owners([loop])
+    result = split_lane_loop_reductions(
+        [loop], rename_groups={"acc_1": "acc", "acc": "acc"}
+    )
+    assert "lane_stash" in ast.unparse(ast.Module(body=result, type_ignores=[]))
+    regions = [
+        getattr(node, HELION_ACCESS_REGIONS_ATTR, None)
+        for statement in result
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Call) and ast.unparse(node).endswith(".load()")
+    ]
+    assert regions[0] == "regions"
+    assert len(regions) > 1
+    assert regions[1:] == [None] * (len(regions) - 1)
+
+
+def test_an_owner_guard_masks_a_conditional_persistent_store() -> None:
+    """A persistent vectorizer store may sit under an ``if``
+    (``_is_isolated_store_statement``): the guarded copy keeps the branch,
+    and its store takes the owner predicate as its mask and keeps its
+    markers, leaving the original alone."""
+    statement = ast.parse(
+        "if enabled:\n"
+        "    _helion_persistent_branch_vec_store(7, 8, 'cutlass.BFloat16', "
+        "y.iterator + lane_index, total, None)"
+    ).body[0]
+    assert isinstance(statement, ast.If) and isinstance(statement.body[0], ast.Expr)
+    store = statement.body[0].value
+    setattr(store, HELION_ACCESS_REGIONS_ATTR, "regions")
+    guarded = _guard_stmt_with_owner(statement, ["owner"])
+    assert ast.unparse(guarded) == (
+        "if enabled:\n"
+        "    _helion_persistent_branch_vec_store(7, 8, 'cutlass.BFloat16', "
+        "y.iterator + lane_index, total, owner)"
+    )
+    assert isinstance(guarded, ast.If) and isinstance(guarded.body[0], ast.Expr)
+    assert getattr(guarded.body[0].value, HELION_ACCESS_REGIONS_ATTR, None) == "regions"
+    assert ast.unparse(statement).endswith("total, None)")

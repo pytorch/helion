@@ -80,6 +80,7 @@ from ..tile_strategy import _clone_lane_loop_with_body
 from . import thread_budget
 from ._ast_pass_utils import _is_proven_relocatable_assignment
 from ._ast_pass_utils import assigned_name
+from ._ast_pass_utils import deep_clone
 from ._ast_pass_utils import loop_extent
 from .fuse_two_pass_loads import _is_store_call
 from .hoist_lane_invariant_reductions import _CUTLASS_SCALAR_TYPES
@@ -91,7 +92,6 @@ from .lane_loops.markers import _grouped_warp_reduce_expr
 from .lane_loops.markers import _is_lane_reduce_marker_assign
 from .lane_loops.markers import _LaneReduceMarker
 from .lane_loops.markers import _warp_reduce_expr
-from .lane_loops.owner_guards import _clone_stmt
 from .lane_loops.owner_guards import _guard_stmt_with_owner
 from .lane_loops.owner_guards import _lane_reduction_owner_exprs_for_statement
 from .lane_loops.owner_guards import _update_scalar_definitions
@@ -318,7 +318,7 @@ def _has_carry(nest: _Nest, rename_groups: dict[str, str]) -> bool:
     all_written: set[str] = set()
     renamed: list[ast.AST] = []
     for leaf in nest.leaves:
-        clone = _clone_stmt(leaf.stmt)
+        clone = deep_clone(leaf.stmt)
         ast_rename(clone, rename_groups)
         renamed.append(clone)
         all_written.update(ReadWrites.from_ast(clone).writes)
@@ -425,8 +425,10 @@ def _finalize_marker(
     shared_lane_expr = marker.shared_lane_expr or marker.group_lane_expr
     # One shared-memory column reduce for the whole tile: consecutive
     # reduction threads spanning several warps, or (any span) reduction
-    # threads interleaved above ``pre`` sibling coordinates, where the
-    # per-column masked-shuffle fold would cost ``pre`` shuffles per column.
+    # threads interleaved above ``pre`` sibling coordinates.  An in-warp
+    # interleaved sum or product could take the warp's partial butterfly
+    # instead (``use_strided_warp_reduce``), but that is unmeasured here and
+    # would change the tile's summation order, so it stays on this reduce.
     if (grouped and marker.group_pre > 1 or cross_warp) and marker.reduction_type in (
         "sum",
         "prod",
@@ -773,7 +775,7 @@ def lower_register_tile_lane_loop(
     flat: list[ast.AST] = []
     substitutions = {inner.var: "0" for inner in nest.loops if inner.extent == 1}
     for leaf in leaves:
-        clone = _clone_stmt(leaf.stmt)
+        clone = deep_clone(leaf.stmt)
         if substitutions:
             ast_rename(clone, substitutions)
         flat.append(clone)
@@ -826,17 +828,16 @@ def lower_register_tile_lane_loop(
         marker_dependencies.append((leaf.marker, dependent))
 
     def guarded(leaf: _Leaf) -> ast.AST:
-        stmt = _clone_stmt(leaf.stmt)
         if leaf.kind != "store":
-            return stmt
+            return deep_clone(leaf.stmt)
         owner_exprs = _lane_reduction_owner_exprs_for_statement(
-            stmt,
+            leaf.stmt,
             marker_list,  # type: ignore[arg-type]
             marker_dependencies,
             axes_before[leaf.index],
             defs_before[leaf.index],
         )
-        return _guard_stmt_with_owner(stmt, owner_exprs) if owner_exprs else stmt
+        return _guard_stmt_with_owner(leaf.stmt, owner_exprs)
 
     stash_name = {
         name: f"{name}_lane_stash" for name in sorted(stash_roots | stashed_post)
@@ -877,7 +878,7 @@ def lower_register_tile_lane_loop(
             return [accumulate(leaf)]
         if leaf.index not in phase1:
             return []
-        statements = [_clone_stmt(leaf.stmt)]
+        statements = [deep_clone(leaf.stmt)]
         if leaf.defines is not None and leaf.defines in stash_roots:
             statements.append(
                 statement_from_string(
@@ -909,9 +910,9 @@ def lower_register_tile_lane_loop(
             if leaf.defines is None or leaf.defines not in required:
                 return []
             if leaf.defines in index_only:
-                return [_clone_stmt(leaf.stmt)]
+                return [deep_clone(leaf.stmt)]
             if leaf.index in post and level[leaf.defines] == unit.position:
-                statements = [_clone_stmt(leaf.stmt)]
+                statements = [deep_clone(leaf.stmt)]
                 if leaf.defines in stashed_here:
                     statements.append(
                         statement_from_string(

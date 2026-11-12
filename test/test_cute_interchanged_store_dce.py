@@ -13,6 +13,7 @@ import torch
 import helion
 from helion import exc
 from helion._compiler import tile_strategy
+from helion._compiler.ast_read_writes import HELION_ACCESS_REGIONS_ATTR
 from helion._compiler.cute.interchanged_store_dce import _instances_never_meet
 from helion._compiler.cute.interchanged_store_dce import _serial_span
 from helion._compiler.cute.interchanged_store_dce import eliminate_interchanged_stores
@@ -240,6 +241,66 @@ def test_overwritten_stores_and_producers_preserve_cpu_results(
     )
     np.testing.assert_array_equal(after["output"].values.reshape(rows, 4), output)
     np.testing.assert_array_equal(after["column"].values, column)
+
+
+def _access_regions(nodes: list[ast.AST]) -> list[object]:
+    return [
+        getattr(node, HELION_ACCESS_REGIONS_ATTR, None)
+        for root in nodes
+        for node in ast.walk(root)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in ("load", "store")
+    ]
+
+
+def test_the_final_nest_drops_the_access_regions_it_copies() -> None:
+    """The final nest's serial loop is another loop over the first nest's
+    tiles, at another iteration at any moment: its copies drop the access
+    regions recorded in the first nest's loop, whose tile begins the
+    barrier pass would otherwise cancel across the two loops."""
+    loop = _program()
+    for node in ast.walk(loop):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            setattr(node, HELION_ACCESS_REGIONS_ATTR, "regions")
+    first, *final = interchange_lane_outside_serial_reductions(
+        [loop], proven_disjoint_tensor_pairs=_PAIRS
+    )
+    assert set(_access_regions([first])) == {"regions"}
+    assert set(_access_regions(final)) == {None}
+
+
+def test_the_final_nest_drops_the_regions_of_a_prefix_loop_it_reruns() -> None:
+    """The final nest reruns the lane prefix it needs ahead of its serial
+    loop: its copy of a device loop in that prefix runs apart from the first
+    nest's and drops the loop's access regions, where the first nest's copy
+    keeps them."""
+    loop = _lane_loop(
+        """
+for lane in range(4):
+    col = lane
+    bias = 0.0
+    for k in range(2):
+        bias = bias + (weight.iterator + k).load()
+    for row in range(rows):
+        index = row * 4 + col
+        mask = row < valid_rows and col < valid_cols
+        value = (source.iterator + index).load() if mask else 0.0
+        product = value * bias
+        reduced = _helion_lane_reduce(product, 'sum', 0.0, threads_in_group=1)
+        result = product - reduced * 2.0
+        if mask:
+            (output.iterator + index).store(result)
+"""
+    )
+    for node in ast.walk(loop.body[2]):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            setattr(node, HELION_ACCESS_REGIONS_ATTR, "regions")
+    first, *final = interchange_lane_outside_serial_reductions(
+        [loop], proven_disjoint_tensor_pairs=_PAIRS
+    )
+    assert "regions" in _access_regions([first])
+    assert set(_access_regions(final)) == {None}
 
 
 def test_disjoint_tensor_names_require_compiler_alias_facts() -> None:

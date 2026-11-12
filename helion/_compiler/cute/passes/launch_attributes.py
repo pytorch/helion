@@ -71,9 +71,11 @@ def module_statements(fn: DeviceFunction) -> list[ast.stmt]:
         # tunable: the epilogue-group block is one CTA per SM by SMEM
         # anyway, and a higher count would only cap its registers.
         min_blocks = fn.cute_state.tcgen05.min_blocks_per_mp
-    if isinstance(min_blocks, int) and min_blocks > 0:
+    if type(min_blocks) is int and min_blocks > 0:
         # ptxas ``minnctapersm``: caps registers so ``min_blocks`` CTAs
-        # stay resident per SM (occupancy over spills).
+        # stay resident per SM (occupancy over spills).  Past one CTA the
+        # launcher also passes a shared-memory carveout preference
+        # (``launch_descriptor.preferred_smem_carveout``).
         result.append(
             statement_from_string(
                 f"{fn.name}._helion_cute_min_blocks_per_mp = {min_blocks}"

@@ -49,6 +49,12 @@ HELION_LANE_ORDERED_ATTR = "_helion_lane_ordered"
 # CTA (``cute/block_uniform.py``), so a block-wide barrier may be placed inside
 # either side.
 HELION_BLOCK_UNIFORM_ATTR = "_helion_block_uniform"
+# On the CuTe ``cute.arch.sync_threads()`` a marked read-after-write load puts
+# before itself (``cute/memory_ops.py``): the frozenset of the tensor names
+# whose earlier stores it orders.  The barrier pass
+# (``cute/lane_loops/barriers.py``) removes the tag of one it counts on, so a
+# pass may treat only a still tagged barrier as ordering just those stores.
+HELION_RAW_BARRIER_TENSORS_ATTR = "_helion_raw_barrier_tensors"
 
 # Accessing these tensor attributes only reads host-side metadata, not tensor
 # storage.  Keep counting them as ordinary reads for liveness, but identify them

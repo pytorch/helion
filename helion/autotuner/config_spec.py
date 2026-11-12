@@ -941,6 +941,13 @@ class ConfigSpec:
         # before configs are normalized.
         self.reduction_block_ids: set[int] = set()
         self.cute_indexed_reduction_block_ids: set[int] = set()
+        # The reduction blocks with a static extent, and that extent (a
+        # dynamic one is planned from its hint and never runs unpadded).
+        self.cute_static_reduction_extents: dict[int, int] = {}
+        # The reduction blocks an ``hl.reduce`` may reduce: its padded slots
+        # fold the user's ``other``, which need not be the combine's
+        # identity, so such a row never runs unpadded.
+        self.cute_user_reduce_block_ids: set[int] = set()
         # Non-reduction tiles that execute simultaneously. Sibling loops and
         # separate roots reuse physical axes during CuTe launch planning.
         # Their paths (``cute_tile_loop_paths``), each with the reduction
@@ -1019,6 +1026,11 @@ class ConfigSpec:
         self.cute_async_load_pipeline_enabled = False
         self.cute_bf16x2_recurrence_enabled = False
         self.cute_signed_bitfield_bf16_available = False
+        # Set by DeviceIR analysis: the reductions whose ``reduction_loops``
+        # slot may roll (is not pinned) along which a load reads a bool
+        # tensor; ``cute_bool_byte_packets`` is tunable when there are any
+        # (``bool_reduction_row_blocks``).
+        self.cute_bool_byte_packet_sites: frozenset[int] = frozenset()
         # Set by DeviceIR analysis: an fp32 quotient whose divisor is a
         # scalar or a broadcast row value (``hoist_loop_invariant_recip``'s
         # exact hoist can apply), so ``cute_exact_div_form`` is tunable.

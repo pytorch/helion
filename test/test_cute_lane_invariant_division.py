@@ -97,6 +97,135 @@ def test_remainders_and_other_lanes_are_left_alone() -> None:
     assert "lane_term = (cutlass.Int32(vec_lane_0) + 8) // hw" in result
 
 
+REMAINDER = (
+    "        within = _cute_python_mod(cutlass.Int32(indices_0), cutlass.Int32(hw))\n"
+)
+
+
+@pytest.mark.parametrize(("hw", "divided"), [(784, True), (196, False)])
+def test_a_python_remainder_is_the_base_remainder_plus_the_lane(
+    hw: int, divided: bool
+) -> None:
+    """The base's remainder by 784 is a multiple of 8 below 784, so the lanes'
+    remainders follow it one by one; by 196 a vector can wrap around."""
+    result = _rewrite(REMAINDER, hw=hw)
+    rewritten = (
+        "within = _cute_python_mod(cutlass.Int32(lane_base_0), cutlass.Int32(hw))"
+        " + vec_lane_0"
+    )
+    assert (rewritten in result) is divided, result
+
+
+@pytest.mark.parametrize(("row_factor", "divided"), [("hw", True), ("4", False)])
+def test_a_multiple_of_the_vector_plus_an_offset_shifts_its_base(
+    row_factor: str, divided: bool
+) -> None:
+    """``row * 784 + offset``, the flat index of a de-linearized ``x[e // d, e
+    % d]``, is the lane offset of ``row * 784 + lane_base``; a row stride of 4
+    is no multiple of the vector width."""
+    result = _rewrite(
+        f"        flat = pid_flat * {row_factor} + indices_0\n"
+        "        channel = flat // hw\n"
+        "        within = _cute_python_mod(flat, hw)\n"
+    )
+    base = f"pid_flat * {row_factor} + lane_base_0"
+    assert (f"channel = ({base}) // hw" in result) is divided, result
+    assert (
+        f"within = _cute_python_mod({base}, hw) + vec_lane_0" in result
+    ) is divided, result
+
+
+STAGED = """
+for tile_offset in range(
+    cutlass.Int32({start}), cutlass.Int32(1024), cutlass.Int32(_BLOCK_SIZE_0)
+):
+    lane_base = tile_offset + cutlass.Int32(cute.arch.thread_idx()[0]) * 8
+    for v in cutlass.range_constexpr(8):
+        idx = lane_base + cutlass.Int32(v)
+        channel = idx // 784
+"""
+
+
+@pytest.mark.parametrize(("start", "divided"), [(0, True), (4, False)])
+def test_a_staged_loop_counter_has_the_factor_of_its_start_and_step(
+    start: int, divided: bool
+) -> None:
+    """A device loop's tile offset steps by the block size from its start."""
+    result = _divide(STAGED.format(start=start), {"_BLOCK_SIZE_0": 128})
+    assert ("channel = lane_base // 784" in result) is divided, result
+
+
+PIPELINED = """
+next_base = cutlass.Int32(cute.arch.thread_idx()[0]) * 8
+for tile_offset in range(
+    cutlass.Int32(0), cutlass.Int32(1024), cutlass.Int32(_BLOCK_SIZE_0)
+):
+    lane_base = next_base
+    next_base = (
+        tile_offset
+        + cutlass.Int32(_BLOCK_SIZE_0)
+        + cutlass.Int32(cute.arch.thread_idx()[0]) * {stride}
+    )
+    for v in cutlass.range_constexpr(8):
+        idx = lane_base + cutlass.Int32(v)
+        channel = idx // 784
+"""
+
+
+@pytest.mark.parametrize(("stride", "divided"), [(8, True), (4, False)])
+def test_a_lane_base_carried_across_iterations_keeps_its_factor(
+    stride: int, divided: bool
+) -> None:
+    """A software-pipelined device loop computes the next iteration's lane
+    base before the vector loop of this one: a multiple of 8 on entry and on
+    every update is one on every iteration; a multiple of 4 on update is not."""
+    result = _divide(PIPELINED.format(stride=stride), {"_BLOCK_SIZE_0": 128})
+    assert ("channel = lane_base // 784" in result) is divided, result
+
+
+def _nested_pipelined(depth: int) -> str:
+    """``depth`` staged loops, each advancing the lane base by 8, around a
+    vector loop that divides it."""
+    lines = ["base = cutlass.Int32(cute.arch.thread_idx()[0]) * 8"]
+    indent = ""
+    for level in range(depth):
+        lines += [
+            f"{indent}for step_{level} in range(4):",
+            f"{indent}    base = base + 8",
+        ]
+        indent += "    "
+    lines += [
+        f"{indent}for v in cutlass.range_constexpr(8):",
+        f"{indent}    idx = base + cutlass.Int32(v)",
+        f"{indent}    channel = idx // 784",
+    ]
+    return "\n".join(lines)
+
+
+def test_nested_carried_loops_pass_over_their_bodies_a_linear_number_of_times(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each loop finds the facts it carries in passes over its own body,
+    where a nested loop takes its carried facts as first found instead of
+    finding them again: six nested loops carrying the base pass over loop
+    bodies fewer than three times each (not once per enclosing pass),
+    and the vector still divides its base."""
+    from helion._compiler.cute.lane_invariant_division import _Rewriter
+
+    passes = 0
+    iteration = _Rewriter.iteration
+
+    def counted(self: _Rewriter, loop: ast.For, counter: object) -> None:
+        nonlocal passes
+        passes += 1
+        iteration(self, loop, counter)
+
+    monkeypatch.setattr(_Rewriter, "iteration", counted)
+    result = _divide(_nested_pipelined(6))
+    assert "channel = base // 784" in result, result
+    assert passes < 3 * 6, passes
+
+
 @pytest.mark.parametrize("cast", ["cutlass.Int64", "cutlass.Uint32"])
 def test_the_dividend_keeps_its_cast(cast: str) -> None:
     """Only the lane-offset name under the cast is replaced: the quotient keeps
@@ -179,6 +308,27 @@ def test_a_value_carried_under_an_alias_counts_as_reassigned(
         VECTOR.format(source=source), rename_groups=rename_groups if merged else None
     )
     assert ("channel = base // hw" in result) is not merged, result
+
+
+def test_a_name_merged_with_the_loop_counter_carries_no_facts() -> None:
+    """``j`` starts a multiple of 8 and each iteration leaves it ``i * 8``,
+    but a rename that merges ``j`` with the counter ``i`` makes it the
+    counter at the top of every iteration: ``base = j`` is ``i`` there, no
+    multiple of 8, so the lanes keep their quotients."""
+    source = """
+pid_flat = cutlass.Int32(cute.arch.block_idx()[0])
+hw = 784
+j = pid_flat * 8
+for i in range(1, 100):
+    base = j
+    for v in cutlass.range_constexpr(8):
+        idx = base + cutlass.Int32(v)
+        channel = idx // hw
+    j = i * 8
+"""
+    assert "channel = base // hw" in _divide(source)
+    merged = _divide(source, rename_groups={"i": "i", "j": "i"})
+    assert "channel = base // hw" not in merged, merged
 
 
 @pytest.mark.parametrize(

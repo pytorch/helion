@@ -37,6 +37,7 @@ from helion._compiler.cute.flash_policy import get_flash_target_policy
 from helion._compiler.cute.flash_tuning import FlashPackedExp2Mode
 from helion._compiler.cute.flash_tuning import FlashSoftmaxLowering
 from helion._compiler.cute.reduce_call import use_interleaved_shared_reduce
+from helion._compiler.cute.reduce_call import use_strided_warp_reduce
 from helion._compiler.cute.state import cute_env_state
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._compiler.cute.tcgen05_config import facts
@@ -85,12 +86,11 @@ cute = pytest.importorskip("cutlass.cute")
 
 mma_support = importlib.import_module("helion._compiler.cute.mma_support")
 get_cute_mma_support = mma_support.get_cute_mma_support
-_cute_grouped_reduce_shared_tree = importlib.import_module(
-    "helion._compiler.cute.reduce_helpers"
-)._cute_grouped_reduce_shared_tree
-_cute_grouped_reduce_shared_two_stage = importlib.import_module(
-    "helion._compiler.cute.reduce_helpers"
-)._cute_grouped_reduce_shared_two_stage
+_reduce_helpers = importlib.import_module("helion._compiler.cute.reduce_helpers")
+_cute_grouped_reduce_shared_tree = _reduce_helpers._cute_grouped_reduce_shared_tree
+_cute_grouped_reduce_shared_two_stage = (
+    _reduce_helpers._cute_grouped_reduce_shared_two_stage
+)
 _cute_flash = importlib.import_module("helion._compiler.cute.cute_flash")
 _cute_backend = importlib.import_module("helion._compiler.cute.backend")
 _attention_match = importlib.import_module(
@@ -573,6 +573,78 @@ def cute_interleaved_reduce_max(
         group_count=2,
     )
     out[group, lane_mod_pre, lane_in_group // pre] = result
+
+
+# ``(pre, span)`` of the strided warp reduce test: siblings across a whole
+# warp and a sub-warp span, then one lane per sibling, which keeps the masked
+# passes (``use_strided_warp_reduce``).
+_STRIDED_WARP_PAIRS = ((2, 32), (4, 32), (16, 32), (4, 16), (8, 8))
+# Each reduction type (a launch takes its index) and its identity, built in
+# the kernel.
+_STRIDED_WARP_REDUCTIONS = (
+    ("sum", lambda: cutlass.Float32(0.0)),
+    ("max", lambda: cutlass.Float32(float("-inf"))),
+    ("min", lambda: cutlass.Float32(float("inf"))),
+    ("prod", lambda: cutlass.Float32(1.0)),
+    ("any", lambda: cutlass.Int32(0)),
+)
+
+
+@cute.jit
+def _strided_warp_reduce_rows(
+    inp,
+    out,
+    ref,
+    reduction: cutlass.Constexpr[int],
+    fp32_redux: cutlass.Constexpr[int],
+):
+    """Row ``k`` reduces with the ``k``-th ``(pre, span)``: ``out`` by the
+    warp dispatcher, ``ref`` by one masked pass per sibling of the warp
+    reduction the dispatcher would otherwise run."""
+    lane = cutlass.Int32(cute.arch.thread_idx()[0])
+    reduction_type, identity = _STRIDED_WARP_REDUCTIONS[reduction]
+    warp_op, _ = _reduce_helpers._resolve_ops(
+        reduction_type, fp32_redux=bool(fp32_redux)
+    )
+    for k in cutlass.range_constexpr(len(_STRIDED_WARP_PAIRS)):
+        pre, span = _STRIDED_WARP_PAIRS[k]
+        out[k, lane] = _reduce_helpers._cute_grouped_reduce_warp(
+            inp[k, lane],
+            reduction_type,
+            identity(),
+            lane,
+            pre=pre,
+            group_span=span,
+            fp32_redux=bool(fp32_redux),
+        )
+        ref[k, lane] = _reduce_helpers._cute_grouped_reduce_warp_body(
+            inp[k, lane], warp_op, identity(), lane, pre=pre, group_span=span
+        )
+
+
+@cute.kernel
+def cute_strided_warp_reduce(
+    inp,
+    out,
+    ref,
+    reduction: cutlass.Constexpr[int],
+    fp32_redux: cutlass.Constexpr[int],
+):
+    _strided_warp_reduce_rows(inp, out, ref, reduction, fp32_redux)
+
+
+@cute.kernel
+def cute_strided_warp_reduce_routing(
+    inp,
+    out,
+    ref,
+    reduction: cutlass.Constexpr[int],
+    fp32_redux: cutlass.Constexpr[int],
+):
+    """The same rows for the routing test: a kernel of its own keeps its
+    own compiled launchers, so its launch traces the dispatcher whichever
+    test ran first in the process."""
+    _strided_warp_reduce_rows(inp, out, ref, reduction, fp32_redux)
 
 
 @helion.kernel(backend="cute")
@@ -12597,6 +12669,125 @@ class TestCuteBackend(TestCase):
         self.assertFalse(use_interleaved_shared_reduce(1, 64))
         self.assertFalse(use_interleaved_shared_reduce(3, 48))
         self.assertFalse(use_interleaved_shared_reduce(48, 96))
+
+    def test_strided_warp_reduce_matches_sibling_passes(self) -> None:
+        """``pre`` siblings interleaved in a warp: one partial butterfly gives
+        each sibling the bits of a masked full-span pass per sibling for
+        every reduction type, signed zeros (a sum maps -0.0 to +0.0), NaN
+        payloads, infinities and denormals included, and so does the
+        ``fp32_redux`` dispatch of the extrema."""
+        for pre, span in _STRIDED_WARP_PAIRS[:-1]:
+            self.assertTrue(use_strided_warp_reduce(pre, span))
+        # Without a shuffle the butterfly's combines with constant identities
+        # can fold away and keep a NaN payload the masked passes canonicalize.
+        self.assertFalse(use_strided_warp_reduce(8, 8))
+        self.assertFalse(use_strided_warp_reduce(1, 32))
+        self.assertFalse(use_strided_warp_reduce(4, 64))
+        self.assertFalse(use_strided_warp_reduce(3, 24))
+        self.assertFalse(use_strided_warp_reduce(8, 4))
+        gen = torch.Generator().manual_seed(0)
+        rows = len(_STRIDED_WARP_PAIRS)
+        # NaNs: torch's, one with a payload, and a negative one.
+        nans = torch.tensor(
+            [0x7FC00000, 0x7FC00001, 0xFFC00000 - (1 << 32)], dtype=torch.int32
+        ).view(torch.float32)
+        special = torch.cat(
+            [
+                torch.tensor([float("inf"), float("-inf"), 1e-40, -1e-40, 0.0, -0.0]),
+                nans,
+            ]
+        )
+
+        def floats(scale: float, offset: float) -> torch.Tensor:
+            x = torch.randn(rows, 32, generator=gen) * scale + offset
+            lanes = torch.rand(rows, 32, generator=gen) < 0.25
+            x[lanes] = special[
+                torch.randint(len(special), (int(lanes.sum()),), generator=gen)
+            ]
+            for k, (pre, span) in enumerate(_STRIDED_WARP_PAIRS):
+                # Sibling 1 of the first group: only negative zeros.
+                x[k, 1:span:pre] = -0.0
+            return x
+
+        x = floats(1.0, 0.0)
+        cases = [
+            ("sum", False, x, torch.sum),
+            ("max", False, x, torch.amax),
+            ("min", False, x, torch.amin),
+            # Factors near one keep the products finite.
+            ("prod", False, floats(0.1, 1.0), torch.prod),
+            ("any", False, (torch.rand(rows, 32, generator=gen) < 0.2).int(), None),
+            ("max", True, x, torch.amax),
+            ("min", True, x, torch.amin),
+        ]
+        names = [name for name, _identity in _STRIDED_WARP_REDUCTIONS]
+        for reduction_type, fp32_redux, values, reduce in cases:
+            with self.subTest(reduction_type=reduction_type, fp32_redux=fp32_redux):
+                values = values.to(DEVICE)
+                out = torch.full_like(values, 7)
+                ref = torch.full_like(values, 7)
+                default_cute_launcher(
+                    cute_strided_warp_reduce,
+                    (1,),
+                    values,
+                    out,
+                    ref,
+                    names.index(reduction_type),
+                    int(fp32_redux),
+                    block=(32, 1, 1),
+                )
+                self.assertTrue(
+                    torch.equal(out.view(torch.int32), ref.view(torch.int32))
+                )
+                for k, (pre, span) in enumerate(_STRIDED_WARP_PAIRS):
+                    grouped = values[k].view(32 // span, span // pre, pre)
+                    expected = (
+                        grouped.any(dim=1).int()
+                        if reduce is None
+                        else reduce(grouped, dim=1)
+                    )
+                    torch.testing.assert_close(
+                        out[k],
+                        expected[:, None, :].expand(-1, span // pre, -1).reshape(32),
+                        equal_nan=True,
+                    )
+                if reduction_type == "sum":
+                    # The negative zeros sum to +0.0, as the masked passes did.
+                    self.assertEqual(out[:, 1].view(torch.int32).tolist(), [0] * rows)
+
+    def test_fp32_redux_extrema_take_the_strided_warp_reduce_where_redux_cannot(
+        self,
+    ) -> None:
+        """``redux.sync`` reduces an fp32 value over a whole warp on the SM100
+        family; there the native extrema keep one pass per sibling.  A
+        narrower span falls back to the shuffle reduction, which the partial
+        butterfly matches bit for bit, so it takes the butterfly."""
+        x = torch.randn(len(_STRIDED_WARP_PAIRS), 32, device=DEVICE)
+        strided = _reduce_helpers._cute_grouped_reduce_warp_strided_body
+        with patch.object(
+            _reduce_helpers,
+            "_cute_grouped_reduce_warp_strided_body",
+            side_effect=strided,
+        ) as traced:
+            out = torch.empty_like(x)
+            ref = torch.empty_like(x)
+            default_cute_launcher(
+                cute_strided_warp_reduce_routing,
+                (1,),
+                x,
+                out,
+                ref,
+                2,  # min
+                1,
+                block=(32, 1, 1),
+            )
+        self.assertTrue(torch.equal(out, ref))
+        native = (
+            _reduce_helpers._REDUX_SYNC_AVAILABLE
+            and torch.cuda.get_device_capability()[0] == 10
+        )
+        spans = sorted({call.kwargs["group_span"] for call in traced.call_args_list})
+        self.assertEqual(spans, [16] if native else [16, 32])
 
     def test_permute_transposes_tile_values(self) -> None:
         """The slot re-binds the transposed tile's dims: the store exchanges

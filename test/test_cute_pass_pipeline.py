@@ -47,6 +47,7 @@ DEVICE_BODY_PASS_NAMES = [
     "merge_sibling_v_loops",
     "optimize_vector_reductions",
     "hoist_lane_invariant_reductions",
+    "hoist_lane_invariant_loads",
     "hoist_factored_reductions",
     "fuse_fp8_pair_decode",
     "hoist_loop_invariant_recips",
@@ -56,6 +57,7 @@ DEVICE_BODY_PASS_NAMES = [
     "plan_lane_unroll",
     "unroll_lane_loads",
     "fold_lane_reductions",
+    "stash_sibling_lane_loads",
     "split_lane_loads",
     "prefetch_reduction_packets",
     "pipeline_inner_loads",
@@ -78,6 +80,7 @@ DEVICE_BODY_PASS_NAMES = [
     "lower_scalar_epilogue",
     "lower_philox_packets",
     "hoist_exact_invariant_divisions",
+    "jam_grid_lanes",
 ]
 
 KERNEL_DEF_PASS_NAMES = [

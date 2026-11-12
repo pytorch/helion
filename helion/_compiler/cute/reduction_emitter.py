@@ -40,6 +40,7 @@ import logging
 import operator
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import Literal
 from typing import NoReturn
 from typing import TypeVar
 from typing import cast
@@ -94,6 +95,7 @@ from .integer_loop_reduction import defer_collective
 from .iota_utils import cute_arange_index_source
 from .iota_utils import cute_padded_range_length
 from .lane_cluster_split import cluster_split_races
+from .lane_loops.markers import HELION_REDUCTION_VLOOP_ATTR
 from .lane_loops.markers import HELION_VECTOR_REDUCTION_OWNER_ATTR
 from .lane_loops.markers import _create_lane_loop
 from .lane_loops.markers import _grouped_two_stage_reduce_stmts
@@ -105,6 +107,10 @@ from .reduce_call import ReduceCall
 from .reduce_call import ReduceScope
 from .reduce_call import runtime_lane_expr
 from .reduction_coordinates import reduced_block_ids
+from .reduction_lanes import WARP_THREADS
+from .reduction_lanes import looped_reduction_lanes
+from .reduction_lanes import tiled_row_threads
+from .reduction_lanes import trims_padded_lanes
 from .register_tile_admission import RegisterTileUnsupported
 from .resident_reductions import ResidentReductionLayout
 from .resident_reductions import feature_index_expression
@@ -116,6 +122,7 @@ from .synthetic_axes import record_strategy_axis_branch_path
 from .thread_budget import CUTE_REGISTER_TILE_MAX_ELEMENTS
 from .thread_budget import MAX_THREADS_PER_BLOCK
 from .tile_packing import packed_grid_block
+from .unpadded_rows import unpadded_row_layout
 
 if TYPE_CHECKING:
     from ..device_function import DeviceFunction
@@ -161,7 +168,7 @@ def _cute_reduction_smem_bytes(num_elements: int, dtype: torch.dtype) -> int:
 
 
 _CUTE_LOOPED_REDUCTION_MAX_ELEMENTS_PER_THREAD = 256
-_CUTE_WARP_REDUCTION_THREADS = 32
+_CUTE_WARP_REDUCTION_THREADS = WARP_THREADS
 
 
 def cute_looped_reduction_block_size(size_hint: int, max_threads: int) -> int:
@@ -331,6 +338,80 @@ def _cute_is_folded_matmul_contraction(block_index: int) -> bool:
     return (
         env.canonical_block_id(block_index) in matmul_contraction_block_ids()
         and not kernel_has_half_precision_matmul()
+    )
+
+
+def _configured_block_entry(
+    fn: DeviceFunction,
+    key: Literal["num_threads", "cute_vector_widths"],
+    block_index: int,
+    default: int,
+) -> int:
+    """The entry ``fn``'s config spells in ``key`` for ``block_index``, or
+    ``default``."""
+    spec = CompileEnvironment.current().config_spec
+    sequence = spec.num_threads if key == "num_threads" else spec.cute_vector_widths
+    return sequence.config_get(
+        cast("list[int]", fn.config.config.get(key, []) or []), block_index, default
+    )
+
+
+def _live_lane_extent(lane_extent: int, numel: object, threads: int) -> int:
+    """The scalar lanes of a masked persistent row that hold an element.
+
+    The row walks its padded extent (768 elements pad to 1024) in lanes of
+    ``threads`` consecutive elements, so with a static ``numel`` every lane
+    from ``ceil(numel / threads)`` on is masked in every thread: it loads
+    and stores nothing, and each reduction folds into its accumulator only
+    the value ``_mask_to`` substitutes, after every live lane.  For torch's
+    reductions that value is the combine's identity (``hl.reduce`` folds its
+    ``other`` instead, ``_block_has_user_reduce``).  Those trailing lanes
+    are dropped.
+    """
+    if isinstance(numel, (int, sympy.Integer)) and int(numel) > 0:
+        return min(lane_extent, -(-int(numel) // threads))
+    return lane_extent
+
+
+def _kernel_calls(
+    fn: DeviceFunction, targets: tuple[object, ...]
+) -> list[torch.fx.Node]:
+    """The nodes of ``fn``'s device graphs that call one of ``targets``."""
+    return [
+        node
+        for graph in fn.codegen.codegen_graphs
+        for node in graph.graph.nodes
+        if node.target in targets
+    ]
+
+
+def _reduced_block_id(node: torch.fx.Node) -> int | None:
+    """The block an ``hl.reduce`` node reduces, or None when it reduces every
+    dim or a dim of no block."""
+    dim = node.args[2] if len(node.args) > 2 else None
+    if dim is None:
+        return None
+    inputs = node.args[1]
+    first = cast(
+        "torch.fx.Node", inputs[0] if isinstance(inputs, (tuple, list)) else inputs
+    )
+    value = cast("torch.Tensor", first.meta["val"])
+    return CompileEnvironment.current().get_block_id(
+        value.shape[cast("int", dim) % value.ndim]
+    )
+
+
+def _block_has_user_reduce(fn: DeviceFunction, block_index: int) -> bool:
+    """Whether an ``hl.reduce`` may reduce ``block_index`` (``_reduced_block_id``
+    is the block or None).  Its masked elements fold the user's ``other`` (0
+    by default), which need not be its combine's identity: under a sum,
+    ``other=1.0`` counts the padded slots, so their number is part of its
+    result."""
+    env = CompileEnvironment.current()
+    canonical = env.canonical_block_id(block_index)
+    return any(
+        block_id is None or env.canonical_block_id(block_id) == canonical
+        for block_id in map(_reduced_block_id, _kernel_calls(fn, (_reduce,)))
     )
 
 
@@ -989,6 +1070,27 @@ class CutePersistentReductionEmitter(
             return next_power_of_2(size_hint)
         return None
 
+    def plan_unpadded_extent(
+        self, fn: DeviceFunction, block_index: int, numel: int
+    ) -> bool:
+        # ``cute_unpadded_rows``: a row whose length is not a power of two
+        # runs unpadded when the config gives it a whole number of warps that
+        # one vector per thread covers exactly (768 = 96 threads x 8), the
+        # multi-warp vector row ``plan_synthetic_lanes`` keeps.  A row an
+        # ``hl.reduce`` reduces keeps its padded slots, which fold the user's
+        # ``other`` (``cute_user_reduce_block_ids``).
+        if (
+            fn.config.config.get("cute_unpadded_rows") is not True
+            or block_index
+            in CompileEnvironment.current().config_spec.cute_user_reduce_block_ids
+        ):
+            return False
+        return unpadded_row_layout(
+            _configured_block_entry(fn, "num_threads", block_index, 0),
+            _configured_block_entry(fn, "cute_vector_widths", block_index, 1),
+            numel,
+        )
+
     def plan_max_threads(self, max_threads: int) -> int:
         strategy = self.strategy
         max_threads = cute_live_reduction_threads(max_threads)
@@ -1003,15 +1105,12 @@ class CutePersistentReductionEmitter(
 
     def plan_thread_count(self, size_hint: int, max_threads: int) -> None:
         strategy = self.strategy
-        env = CompileEnvironment.current()
         # Persistent reductions use the same per-block thread-count
         # knob as rolled reductions.  A smaller live subgroup keeps
         # unrelated tile axes from inflating the CTA and lets each
         # thread retain a short contiguous reduction fragment.
-        requested = env.config_spec.num_threads.config_get(
-            cast("list[int]", strategy.fn.config.config.get("num_threads", []) or []),
-            strategy.block_index,
-            0,
+        requested = _configured_block_entry(
+            strategy.fn, "num_threads", strategy.block_index, 0
         )
         if isinstance(requested, int):
             strategy._cute_requested_threads = requested
@@ -1062,6 +1161,7 @@ class CutePersistentReductionEmitter(
         size_hint: int,
         mask_var: str | None,
         merged_tiled_extent: bool,
+        numel: sympy.Expr,
     ) -> None:
         strategy = self.strategy
         env = CompileEnvironment.current()
@@ -1071,20 +1171,27 @@ class CutePersistentReductionEmitter(
         # count: each thread then walks its own lanes, the surplus masked
         # (``plan_axis_partner``), and no combine runs over this block.
         shared_axis = strategy._cute_axis_partner is not None
+        if strategy._unpadded_extent:
+            # ``plan_unpadded_extent`` admitted the config's layout, one vector
+            # per thread; nothing past the row may be addressed, so any other
+            # outcome refuses the config.
+            lane_extent = self._unpadded_lanes(size_hint, shared_axis)
         if (
             lane_extent is not None
             and not shared_axis
-            and strategy._thread_count * lane_extent
-            != next_power_of_2(max(1, size_hint))
+            and not strategy._unpadded_extent
         ):
             # Uneven synthetic slices would let an unmasked vector or
             # register row access beyond its padded reduction extent.
             # Keep a power-of-two live count within the thread budget
-            # so every slice fits, then plan the layout from that count.
-            strategy._thread_count = 1 << (strategy._thread_count.bit_length() - 1)
-            lane_extent = env.backend.create_synthetic_reduction_lanes(
-                strategy._thread_count, size_hint
-            )
+            # so every slice fits, then plan the layout from that count
+            # (``tiled_row_threads`` keeps threads whose slices tile it).
+            tiled = tiled_row_threads(strategy._thread_count, size_hint)
+            if tiled != strategy._thread_count:
+                strategy._thread_count = tiled
+                lane_extent = env.backend.create_synthetic_reduction_lanes(
+                    tiled, size_hint
+                )
         # A merged tiled axis can still contain a serial source lane
         # when its configured total extent fits in one warp. Keep an
         # explicit logical owner for the reduction; after wrapping,
@@ -1099,13 +1206,8 @@ class CutePersistentReductionEmitter(
         # dtype.
         requested_vec = 1
         if mask_var is None and not strategy._cute_resident_reduction:
-            configured_vec = env.config_spec.cute_vector_widths.config_get(
-                cast(
-                    "list[int]",
-                    fn.config.config.get("cute_vector_widths", []) or [],
-                ),
-                block_index,
-                1,
+            configured_vec = _configured_block_entry(
+                fn, "cute_vector_widths", block_index, 1
             )
             if isinstance(configured_vec, int) and configured_vec > 1:
                 requested_vec = configured_vec
@@ -1162,6 +1264,21 @@ class CutePersistentReductionEmitter(
             lane_extent = env.backend.create_synthetic_reduction_lanes(
                 strategy._thread_count, size_hint
             )
+        if (
+            lane_extent is not None
+            and mask_var is not None
+            # A resident row's registers span its whole feature extent,
+            # threads x lanes (``ResidentReductionLayout``).
+            and not strategy._cute_resident_reduction
+            and not _block_has_user_reduce(fn, block_index)
+        ):
+            live = _live_lane_extent(lane_extent, numel, strategy._thread_count)
+            if not isinstance(numel, (int, sympy.Integer)) or trims_padded_lanes(
+                int(numel),
+                strategy._thread_count,
+                proven_bounds=fn.config.config.get("cute_proven_bounds") is True,
+            ):
+                lane_extent = live
         if lane_extent is not None:
             strategy._synthetic_cute_lane_var = fn.new_var(
                 f"synthetic_lane_{block_index}",
@@ -1169,13 +1286,8 @@ class CutePersistentReductionEmitter(
             )
             strategy._synthetic_cute_lane_extent = lane_extent
             if strategy._cute_resident_reduction:
-                width = env.config_spec.cute_vector_widths.config_get(
-                    cast(
-                        "list[int]",
-                        fn.config.config.get("cute_vector_widths", []) or [],
-                    ),
-                    block_index,
-                    1,
+                width = _configured_block_entry(
+                    fn, "cute_vector_widths", block_index, 1
                 )
                 fn.cute_state.lanes.resident_reduction_layouts[
                     strategy._synthetic_cute_lane_var
@@ -1193,6 +1305,26 @@ class CutePersistentReductionEmitter(
             # one-warp vector loads exactly as a 32-thread request does.
             if requested_vec > 1 and lane_extent == requested_vec:
                 strategy._cute_reduction_vec_width = requested_vec
+        if strategy._unpadded_extent and strategy._cute_reduction_vec_width <= 1:
+            raise exc.BackendUnsupported(
+                "cute",
+                "cute_unpadded_rows: the row did not become one vector per thread",
+            )
+
+    def _unpadded_lanes(self, size_hint: int, shared_axis: bool) -> int:
+        """The lanes of an unpadded row: the config's vector width, when its
+        threads survived the thread budget whole."""
+        strategy = self.strategy
+        threads = strategy._thread_count
+        if shared_axis:
+            refusal = f"the {size_hint}-wide row runs on another block's threads"
+        elif strategy._cute_resident_reduction:
+            refusal = f"the {size_hint}-wide row is resident in registers"
+        elif threads != strategy._cute_requested_threads:
+            refusal = f"{threads} threads do not cover the {size_hint}-wide row exactly"
+        else:
+            return size_hint // threads
+        raise exc.BackendUnsupported("cute", f"cute_unpadded_rows: {refusal}")
 
     def check_shared_thread_extent(self, extent: int) -> None:
         strategy = self.strategy
@@ -1301,11 +1433,7 @@ class CutePersistentReductionEmitter(
         if (
             len(device_ir.grid_block_ids) != 1
             or env.config_spec.matmul_facts
-            or any(
-                node.target in (_reduce, _associative_scan)
-                for graph in strategy.fn.codegen.codegen_graphs
-                for node in graph.graph.nodes
-            )
+            or _kernel_calls(strategy.fn, (_reduce, _associative_scan))
         ):
             return None
         reduced = reduced_block_ids(strategy.fn.codegen)
@@ -2153,12 +2281,6 @@ class CuteLoopedReductionEmitter(
         strategy = self.strategy
         env = CompileEnvironment.current()
         if thread_count > 0 and block_size > thread_count:
-            strategy._cute_reduction_lane_extent = (
-                block_size + thread_count - 1
-            ) // thread_count
-            strategy._loop_block_size = (
-                thread_count * strategy._cute_reduction_lane_extent
-            )
             strategy._cute_reduction_lane_var = fn.new_var(
                 f"reduction_lane_{block_index}",
                 dce=False,
@@ -2175,15 +2297,14 @@ class CuteLoopedReductionEmitter(
                 block_index,
                 1,
             )
-            if (
-                isinstance(vec_width, int)
-                and vec_width > 1
-                and strategy._cute_reduction_lane_extent % vec_width == 0
-            ):
-                strategy._cute_reduction_vec_width = vec_width
-                strategy._cute_reduction_lane_extent = (
-                    strategy._cute_reduction_lane_extent // vec_width
-                )
+            lanes, width = looped_reduction_lanes(
+                block_size,
+                thread_count,
+                vec_width if isinstance(vec_width, int) else 1,
+            )
+            strategy._cute_reduction_lane_extent = lanes
+            strategy._cute_reduction_vec_width = width
+            strategy._loop_block_size = thread_count * lanes * width
 
     def plan_chunk_mask(self, block_index: int, mask_var: str | None) -> None:
         strategy = self.strategy
@@ -2786,6 +2907,7 @@ class CuteLoopedReductionEmitter(
                     ).body[0],
                 )
                 vec_for.body = inner_body  # type: ignore[assignment]
+                setattr(vec_for, HELION_REDUCTION_VLOOP_ATTR, True)
                 # The lane-loop body holds the per-lane base index, then any
                 # dispatcher-requested vec hoists, then the constexpr loop.
                 base_stmt = statement_from_string(
