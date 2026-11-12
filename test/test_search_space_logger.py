@@ -443,6 +443,23 @@ class TestTotalSearchSpaceSize(unittest.TestCase):
         self.assertEqual(report.to_dict()["total_search_space_size"], "unknown")
 
 
+class TestReductionLoopCardinality(unittest.TestCase):
+    def test_reduction_loop_reports_cardinality(self) -> None:
+        """A reduction loop must not make the whole report unavailable."""
+        from helion._compiler.triton.backend import TritonBackend
+        from helion.autotuner.config_spec import ConfigSpec
+        from helion.autotuner.config_spec import ReductionLoopSpec
+
+        spec = ConfigSpec(backend=TritonBackend())
+        spec.reduction_loops.append(ReductionLoopSpec(block_id=0, size_hint=4096))
+        # Regression: both of these raised NotImplementedError.
+        self.assertEqual(spec.reduction_loops.cardinality(spec), 10)
+        report = analyze_search_space(spec, kernel_name="k")
+        self.assertIsNotNone(report.total_search_space_size)
+        dim = next(d for d in report.dimensions if d.name == "reduction_loops")
+        self.assertEqual(dim.cardinality, 10)
+
+
 class TestRestrictionReasons(unittest.TestCase):
     def _spec(self) -> object:
         from helion._compiler.triton.backend import TritonBackend
