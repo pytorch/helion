@@ -2371,6 +2371,12 @@ def flex_bwd_wrapper_plan(
     plan = match.plan
     batch, kv_heads = plan.batch, plan.kv_heads
     family_flag: dict[str, object] = {} if family is None else {family: True}
+    # The Q rows the walk's tiles span when they reach past the sequence (a
+    # ragged or short q_seq, a 256-row Q block's padded tile): the launcher
+    # spans the Q-side TMA coordinate tensors over them.
+    walk_q: dict[str, object] = (
+        {"flex_walk_q_rows": plan.walk_q_rows} if plan.walk_past_q else {}
+    )
     return {
         "kind": "helion_flash_bwd",
         **family_flag,
@@ -2399,6 +2405,7 @@ def flex_bwd_wrapper_plan(
         "flex_bh_q": plan.num_bh,
         "flex_seq_k": plan.kv_seq,
         "flex_bh_k": batch * kv_heads,
+        **walk_q,
     }
 
 

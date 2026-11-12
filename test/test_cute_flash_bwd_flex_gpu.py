@@ -457,6 +457,74 @@ def test_ragged_lengths() -> None:
     _assert_close(got, ref)
 
 
+# 8 cases: q_seq 32 and 1, each in the four coordinate lists (the 1-CTA
+# kernel's rank-3 and rank-4 maps, the 2-CTA and pair kernels' own).
+_TWO_CTA = {"cute_flash_bwd_two_cta": 1}
+_KERNEL_MARKS = {
+    "bhsd": None,
+    "bshd": "'flex_strides': (",
+    "two_cta": "flash_bwd_flex_2cta_shared_storage",
+    "pair": "fbwd_is_dq",
+}
+
+
+@_gpu_test
+@pytest.mark.parametrize(
+    ("m", "d", "layout", "overrides", "kernel"),
+    [
+        (32, 64, "bhsd", {}, "bhsd"),
+        (32, 64, "bshd", {}, "bshd"),
+        (32, 128, "bhsd", _TWO_CTA, "two_cta"),
+        (32, 256, "bhsd", {}, "pair"),
+        (1, 64, "bhsd", {}, "bhsd"),
+        (1, 64, "bshd", {}, "bshd"),
+        (1, 128, "bhsd", _TWO_CTA, "two_cta"),
+        (1, 256, "bhsd", {}, "pair"),
+    ],
+    ids=[
+        "one_cta",
+        "rank4_maps",
+        "two_cta",
+        "pair",
+        "one_row",
+        "one_row_rank4",
+        "one_row_2cta",
+        "one_row_pair",
+    ],
+)
+def test_q_sequence_within_one_tile(
+    m: int, d: int, layout: str, overrides: dict[str, object], kernel: str
+) -> None:
+    """A 32-row Q sequence under 256-row BlockMask Q blocks: the walk's second
+    128-row Q tile lies wholly past the sequence and the dQ drain's 32-row
+    boxes past the first. With a single tile (box) in the sequence mode its
+    index used to wrap to the first one: the padded tile reloaded the real
+    Q / dO rows (dK / dV counted them twice) and the boxes reduce-added the
+    padded rows' dQ into the real ones. The 1-CTA kernel with the rank-3
+    and the rank-4 maps, the 2-CTA kernel and the pair kernel; and a
+    one-row sequence in each kernel, whose maps carried no stride for the
+    sequence mode at all. The one-row cases attend the first KV block
+    (``_prefix_only``) rather than use the causal mask, under which the row
+    sees one key and dQ / dK are exactly zero."""
+    got, ref, code = _run(
+        b=1,
+        hq=2,
+        hkv=2,
+        m=m,
+        n=256,
+        d=d,
+        mask_mod=_causal if m > 1 else _prefix_only,
+        block_size=(256, 128),
+        layout=layout,
+        config_overrides=overrides,
+    )
+    assert "'flex_walk_q_rows': 256" in code
+    mark = _KERNEL_MARKS[kernel]
+    if mark is not None:
+        assert mark in code, kernel
+    _assert_close(got, ref)
+
+
 @_gpu_test
 def test_empty_kv_tiles_store_zero() -> None:
     got, ref, _ = _run(b=1, hq=2, hkv=2, m=256, n=384, d=64, mask_mod=_prefix_only)

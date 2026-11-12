@@ -313,10 +313,24 @@ class FlexBwdPlan:
     def num_q_tiles_padded(self) -> int:
         """128-row Q tiles the list walk can visit: every listed Q block of
         ``q_block`` rows expands to ``q_block // 128`` tiles, so a ragged
-        last block reaches past ``ceil(q_seq / 128)`` (those tiles hold no
-        valid rows: the TMA unit zero-fills them and the stagings clamp)."""
+        last block reaches past ``ceil(q_seq / 128)``. Those tiles hold no
+        valid rows: the TMA unit zero-fills them and the stagings clamp,
+        given the launcher spans the Q-side coordinate tensors over
+        ``walk_q_rows`` (with a single tile in the mode their index would
+        wrap to the first tile)."""
         q_block = self.walk.q_block
         return -(-self.q_seq // q_block) * (q_block // 128)
+
+    @property
+    def walk_q_rows(self) -> int:
+        """The Q rows the list walk's tiles span."""
+        return self.num_q_tiles_padded * 128
+
+    @property
+    def walk_past_q(self) -> bool:
+        """The walk visits Q rows past ``q_seq``: a ragged or short Q
+        sequence, or a ``q_block`` whose last block reaches past it."""
+        return self.walk_q_rows > self.q_seq
 
     @property
     def max_steps(self) -> int:
@@ -1585,6 +1599,21 @@ def _assemble(
     if len({name for name, _, _ in tables}) != 4:
         ctx.decline("flex_bwd: the four tables must be distinct tensors")
         return None
+    # The walk sizes its step table and its Q coordinate maps from M; a
+    # BlockMask built for a longer Q sequence lists Q blocks past it, whose
+    # steps would overrun the table (PyTorch's flex_attention rejects such a
+    # mask unless ``BlockMask._adjust`` crops it).
+    q_blocks = -(-q_seq // q_block)
+    for name, value in (
+        (part_inner.idx_name, part_inner.idx_value),
+        (full_inner.idx_name, full_inner.idx_value),
+    ):
+        if int(value.shape[3]) > q_blocks:
+            ctx.decline(
+                f"flex_bwd: table {name} lists more Q blocks than M has "
+                "(a BlockMask built for a longer Q sequence)"
+            )
+            return None
     if not _accumulators_threaded(ctx, root, group_loop, dv_full, dk_full, nests):
         return None
     dk_name = dv_name = None
