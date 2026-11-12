@@ -42,6 +42,8 @@ TILE_K = 256  # e2m1x2 bytes per K step
 def _popcount(v: torch.Tensor) -> torch.Tensor:
     """Set bits per int32 lane (SWAR: Triton cannot scan inside a WS loop)."""
 
+    # An operand widened by int64 indexing keeps its low 32 bits.
+    v = v.to(torch.int32)
     v = v - ((v >> 1) & 0x55555555)
     v = (v & 0x33333333) + ((v >> 2) & 0x33333333)
     return (((v + (v >> 4)) & 0x0F0F0F0F) * 0x01010101) >> 24
