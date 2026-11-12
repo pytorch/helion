@@ -14,6 +14,11 @@ from helion._compiler.cute.fuse_two_pass_loads import _CuteFuseTwoPassLoads
 pytestmark = pytest.mark.cpu_only
 
 
+def _as_written(name: str) -> str:
+    """No rename groups: a name compares as it is spelled."""
+    return name
+
+
 def _definitions(values: dict[str, ast.expr]) -> dict[str, str]:
     return {name: ast.dump(value) for name, value in values.items()}
 
@@ -40,7 +45,7 @@ f = e
 @pytest.mark.parametrize("capacity", [2, 512])
 def test_prefix_cache_preserves_inherited_and_nonmonotone_queries(capacity: int):
     statements = _prefix_statements()
-    cache = _AnalysisCache()
+    cache = _AnalysisCache(_as_written)
     cache._CAPACITY = capacity
     inherited = {
         name: ast.Name(id=f"outer_{name}")
@@ -48,7 +53,7 @@ def test_prefix_cache_preserves_inherited_and_nonmonotone_queries(capacity: int)
     }
     for stop in [0, len(statements), 2, 5, 1, 7, 3, len(statements)]:
         for entry in ({}, inherited, {"a": ast.Constant(17)}):
-            expected = _CuteFuseTwoPassLoads._pure_definitions_before(
+            expected = _CuteFuseTwoPassLoads()._pure_definitions_before(
                 statements, stop, entry
             )
             actual = cache.pure_definitions_before(statements, stop, entry)
@@ -61,9 +66,25 @@ def test_prefix_cache_preserves_inherited_and_nonmonotone_queries(capacity: int)
     assert final["holder"] is inherited["holder"]
 
 
+def test_uncached_prefix_compares_names_through_rename_groups():
+    # The final rename merges ``idx_next`` into ``idx``: its write ends the
+    # definitions of ``idx`` and ``k``, and defines nothing itself.
+    statements = ast.parse("idx = 0\nk = idx + 1\nidx_next = idx + 2\nj = k").body
+    fuser = _CuteFuseTwoPassLoads(rename_groups={"idx_next": "idx"})
+    cache = _AnalysisCache(fuser._canonical)
+    inherited = {"m": ast.Name(id="idx"), "n": ast.Name(id="outer")}
+    for stop in range(len(statements) + 1):
+        for entry in ({}, inherited):
+            expected = fuser._pure_definitions_before(statements, stop, entry)
+            actual = cache.pure_definitions_before(statements, stop, entry)
+            assert _definitions(actual) == _definitions(expected)
+    final = fuser._pure_definitions_before(statements, len(statements), inherited)
+    assert set(final) == {"j", "n"}
+
+
 def test_statement_effects_are_analyzed_once_per_epoch():
     statements = _prefix_statements()
-    cache = _AnalysisCache()
+    cache = _AnalysisCache(_as_written)
     with patch.object(ReadWrites, "from_ast", wraps=ReadWrites.from_ast) as effects:
         for stop in range(len(statements) + 1):
             cache.pure_definitions_before(statements, stop, {})
@@ -74,7 +95,7 @@ def test_statement_effects_are_analyzed_once_per_epoch():
 
 def test_epoch_clear_observes_nested_write_and_pure_value_mutation():
     statements = ast.parse("a = 1\nfor lane in range(4):\n    temporary = lane").body
-    cache = _AnalysisCache()
+    cache = _AnalysisCache(_as_written)
     assert "a" in cache.pure_definitions_before(statements, 2, {})
     loop = statements[1]
     assert isinstance(loop, ast.For)
@@ -106,7 +127,7 @@ for offset in range(8):
 """
     ).body
     assert isinstance(first, ast.For) and isinstance(second, ast.For)
-    cache = _AnalysisCache()
+    cache = _AnalysisCache(_as_written)
     cache._CAPACITY = capacity
     fuser = _CuteFuseTwoPassLoads()
     expected = fuser._build_second_alias(first, second)

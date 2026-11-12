@@ -53,7 +53,7 @@ def test_static_padded_cluster_bounds_fit_int32(
     strategy._cute_rolled_cluster_checked = False
     state = SimpleNamespace(
         codegen=SimpleNamespace(
-            current_grid_state=SimpleNamespace(thread_axis_sizes={})
+            current_grid_state=SimpleNamespace(thread_axis_sizes={}, lane_loops=[])
         )
     )
     with (

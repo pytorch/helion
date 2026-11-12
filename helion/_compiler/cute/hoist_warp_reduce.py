@@ -53,6 +53,7 @@ from ._ast_pass_utils import names_read
 from ._ast_pass_utils import names_written
 from .reduce_call import CLUSTER_REDUCES
 from .reduce_call import LANE_FOLD_REDUCES
+from .unroll_lane_loads import _loop_trips
 
 # Warp-reduction call attribute names recognised by this pass.  Each maps
 # to the identity element used for the per-thread V-fold accumulator.
@@ -1176,31 +1177,13 @@ def _static_trip_count(
     loop: ast.For, constexpr_values: dict[str, int] | None
 ) -> int | None:
     """Static trip count of a ``range(...)`` / ``cutlass.range_constexpr``
-    for-loop, or None when unknown."""
-    from .fuse_two_pass_loads import _range_bounds
-    from .fuse_two_pass_loads import _trip_count_for
+    for-loop, or None when unknown (``unroll_lane_loads._loop_trips``).
 
-    it = loop.iter
-    if (
-        isinstance(it, ast.Call)
-        and isinstance(it.func, ast.Attribute)
-        and it.func.attr == "range_constexpr"
-    ):
-        # Unrolled at trace time, but a call statement inside still
-        # references the SAME preamble-allocated mbarrier on every
-        # unrolled iteration — so for once-per-kernel placement purposes
-        # the trip count is the unroll factor, not 1.
-        if (
-            it.args
-            and isinstance(it.args[0], ast.Constant)
-            and isinstance(it.args[0].value, int)
-        ):
-            return it.args[0].value
-        return None
-    bounds = _range_bounds(it)
-    if bounds is None:
-        return None
-    return _trip_count_for(*bounds, constexpr_values or {})
+    A ``range_constexpr`` loop is unrolled at trace time, but a call
+    statement inside still references the SAME preamble-allocated mbarrier
+    on every unrolled iteration — so for once-per-kernel placement purposes
+    the trip count is the unroll factor, not 1."""
+    return _loop_trips(loop, constexpr_values)
 
 
 def validate_cluster_reduce_placement(

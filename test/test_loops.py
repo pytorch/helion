@@ -1011,14 +1011,17 @@ class TestLoops(RefEagerTestBase, TestCase):
     @skipIfRefEager("checks the CuTe lowering of a block-sized slice reduction")
     @skipUnlessBackends(["cute"])
     def test_full_slice_of_block_sized_buffer_reduction(self):
-        """``buf[:, :].sum(-1)`` of a buffer sized by a registered block: the
-        slice's reduction dim reuses the block's symbol after its loop ended.
-        Where CuTe lowers it, the dim combines across its threads, so each
-        row's total is the tile loop's atomics once, not once per lane. Where
-        CuTe has no lowering (e.g. ``BackendUnsupported: reduction lane owner
-        is not proven``), the refusal is the expected safe outcome: it must
-        refuse rather than reduce with that dim's synthetic lane loop, which
-        would repeat the tile loop's atomics once per lane."""
+        """``buf[:, :].sum(-1)`` of a buffer sized by the block the inner loop
+        tiles: the slice's reduction dim reuses that tile's variable after its
+        loop ended, and meets the loop only through the buffer's memory, so
+        CuTe does not refuse it as a slice beside the tile
+        (``test_block_sized_buffer_slices.py``).  Where CuTe lowers it, the
+        dim combines across its threads, so each row's total is the tile
+        loop's atomics once, not once per lane.  Where CuTe has no lowering (e.g.
+        ``BackendUnsupported: reduction lane owner is not proven``), the
+        refusal is the expected safe outcome: it must refuse rather than
+        reduce with that dim's synthetic lane loop, which would repeat the
+        tile loop's atomics once per lane."""
 
         @helion.kernel(static_shapes=True)
         def row_sums(y: torch.Tensor) -> torch.Tensor:

@@ -36,6 +36,7 @@ from ..access_regions import access_address
 from ..access_regions import block_size_symbol
 from ..access_regions import tile_begin_symbol
 from ..cache_policy_loads import CachePolicy
+from ..iota_utils import cute_arange_index_source
 from ..state import cute_codegen_state
 from ..tile_ops import cute_masked_block_end
 
@@ -1154,41 +1155,6 @@ def _cute_tile_id_thread_extent_is_complete(
     return 0 <= axis < len(planned) and 0 < planned[axis] <= extent
 
 
-def _cute_arange_index_source(node: object) -> torch.fx.Node | None:
-    """The ``hl.arange`` iota that index ``node`` is computed lane-wise from.
-
-    Pointwise ops on a range (``cols * 2 + 1``) keep its lanes, as
-    ``_padded_iota_dims`` follows them for Triton.
-    """
-    if not isinstance(node, torch.fx.Node):
-        return None
-    if node.target is torch.ops.prims.iota.default:
-        return node
-    value = node.meta.get("val")
-    if (
-        not isinstance(value, torch.Tensor)
-        or value.ndim != 1
-        or not isinstance(node.target, torch._ops.OpOverload)
-        or torch.Tag.pointwise not in node.target.tags
-    ):
-        return None
-    sources = {
-        _cute_arange_index_source(arg)
-        for arg in node.all_input_nodes
-        if isinstance(arg_value := arg.meta.get("val"), torch.Tensor) and arg_value.ndim
-    }
-    if len(sources) != 1 or (source := sources.pop()) is None:
-        return None
-    source_value = source.meta.get("val")
-    if not isinstance(
-        source_value, torch.Tensor
-    ) or not CompileEnvironment.current().known_equal(
-        source_value.size(0), value.size(0)
-    ):
-        return None
-    return source
-
-
 def _cute_combined_mask(
     state: CodegenState,
     subscript: list[object] | tuple[object, ...],
@@ -1397,17 +1363,47 @@ def _cute_combined_mask(
             # tensor (lanes 5..7 read columns 6..8 into a reduction).
             fx_node = state.fx_node
             fx_index = fx_node.args[1] if fx_node is not None else None
-            if (
-                isinstance(fx_index, (list, tuple))
+            iota = (
+                cute_arange_index_source(fx_index[pos])
+                if isinstance(fx_index, (list, tuple))
                 and len(fx_index) == len(subscript)
-                and (iota := _cute_arange_index_source(fx_index[pos])) is not None
-                and (block_id := env.resolve_block_id(iota.meta["val"].size(0)))
-                is not None
+                else None
+            )
+            length = iota.meta["val"].size(0) if iota is not None else None
+            if (
+                iota is not None
+                and (block_id := env.resolve_block_id(length)) is not None
                 and env.block_sizes[block_id].reduction
                 and (mask_var := mask_var_for_block_id(block_id)) is not None
                 and mask_var not in terms
             ):
                 terms.append(mask_var)
+            # The same for a range on the reduction axis of its padded size
+            # (``cute_padded_range_reduction_block``), which has no mask.  It
+            # is spelled as the address bound below, which is the same term
+            # for ``hl.arange(n)`` over a row of ``n``.
+            bound_block = (
+                cute_codegen_state(state.codegen).padded_range_blocks.get(iota)
+                if iota is not None
+                else None
+            )
+            if bound_block is not None:
+                index_var = active_index_var(bound_block)
+                if index_var is None:
+                    # A sum of this load skips its own mask, since the zeros
+                    # the load fills in are its identity
+                    # (``_reads_padded_range_load``): without the term the
+                    # lanes past the range would add data.
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        "an access over a padded hl.arange outside the lanes "
+                        "of its reduction dim",
+                    )
+                term = (
+                    f"{env.backend.dtype_str(env.index_dtype)}({index_var}) < {length}"
+                )
+                if term not in terms:
+                    terms.append(term)
             # A free ``hl.arange`` mapped onto a synthetic thread axis carries no
             # block id, so the loops below add no bound for it. Emit its lane
             # bound explicitly to mask the out-of-bounds lanes a wider sibling

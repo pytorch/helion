@@ -225,7 +225,8 @@ def test_partial_cluster_keeps_legality_guards(reason: str) -> None:
     state = SimpleNamespace(
         codegen=SimpleNamespace(
             current_grid_state=SimpleNamespace(
-                thread_axis_sizes={0: 2} if reason == "multirow" else {}
+                thread_axis_sizes={0: 2} if reason == "multirow" else {},
+                lane_loops=[],
             )
         )
     )

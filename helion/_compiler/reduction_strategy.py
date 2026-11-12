@@ -179,7 +179,7 @@ class PersistentReductionEmitter(ReductionEmitter["PersistentReductionStrategy"]
     @abc.abstractmethod
     def plan_axis_partner(
         self, concurrent: list[TileStrategy], size_hint: int
-    ) -> PersistentReductionStrategy | None:
+    ) -> ReductionStrategy | None:
         """A concurrent sibling whose thread axis this block indexes instead."""
 
     @abc.abstractmethod
@@ -459,10 +459,7 @@ class ReductionStrategy(TileStrategy):
         dispatcher parks it on the lowest axis no threaded reduction holds
         (``TileStrategyDispatch.thread_axis_for_strategy``), which a tile may
         use.  Giving every such reduction a private axis ran past the three
-        hardware axes as soon as a kernel held four reduction dims (an
-        attention kernel whose value head dim differs from the q/k head dim,
-        plus the two tile-sized dims that ``tile.index[:, None]`` slices
-        allocate).
+        hardware axes as soon as a kernel held four reduction dims.
         """
         if (emitter := self.emitter) is not None:
             return emitter.claims_thread_axis()
@@ -844,9 +841,9 @@ class PersistentReductionStrategy(ReductionStrategy):
         # The ``num_threads`` entry the config spells for this block (0 when
         # it leaves the count to the backend).
         self._cute_requested_threads = 0
-        # A concurrent sibling persistent block whose thread axis this block
+        # A concurrent sibling reduction block whose thread axis this block
         # indexes instead of claiming one (``plan_axis_partner``).
-        self._cute_axis_partner: PersistentReductionStrategy | None = None
+        self._cute_axis_partner: ReductionStrategy | None = None
         # Compute thread count for warp-level reductions
         max_threads = env.backend.max_reduction_threads()
         if max_threads is not None:
@@ -873,16 +870,13 @@ class PersistentReductionStrategy(ReductionStrategy):
             # so they never co-execute and must not be multiplied into this
             # reduction's thread budget. Drop them before adjusting.
             concurrent = _strategies_concurrent_with_block(tile_dispatch, block_index)
+            partner = None
             if emitter is not None:
                 partner = emitter.plan_axis_partner(concurrent, size_hint)
-                if partner is not None:
-                    # The shared axis is already in the budget as the partner.
-                    self._cute_axis_partner = partner
-                    concurrent = [s for s in concurrent if s is not partner]
-            if self._cute_axis_partner is not None:
-                self._thread_count = env.backend.adjust_reduction_thread_count(
-                    self._thread_count, concurrent
-                )
+            if partner is not None:
+                # The shared axis is already in the budget as the partner, and
+                # its thread count is this block's.
+                self._cute_axis_partner = partner
             else:
                 self._thread_count = _fit_reduction_thread_count(
                     tile_dispatch,
@@ -948,7 +942,7 @@ class PersistentReductionStrategy(ReductionStrategy):
                 )
                 if emitter is not None:
                     emitter.plan_synthetic_lanes(
-                        lane_extent, size_hint, mask_var, merged_tiled_extent
+                        lane_extent, size_hint, self._mask_var, merged_tiled_extent
                     )
 
     @functools.cached_property
@@ -1064,7 +1058,9 @@ class PersistentReductionStrategy(ReductionStrategy):
             self.block_index: LoopDimInfo(end_var_name=end_var_name, end_expr=numel)
         }
         tracker = ThreadAxisTracker()
-        if self._claims_thread_axis():
+        if self._claims_thread_axis() or self._cute_axis_partner is not None:
+            # A block indexing its partner's axis spans that axis's threads
+            # all the same (``plan_axis_partner``).
             tracker.record(
                 self.block_index, self._get_thread_axis(), self._thread_count
             )

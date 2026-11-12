@@ -407,6 +407,7 @@ def generate_materialized_fission(
 ) -> ast.Module:
     from ..generate_ast import emit_main_def
     from ..generate_ast import generate_ast
+    from .execution_plans import VloopSinkLayoutRefused
     from .sink_vector_loops import VloopSinkNotApplied
     from .sink_vector_loops import vloop_sink_off_config
 
@@ -479,33 +480,44 @@ def generate_materialized_fission(
         stage = _stage_host(func, root, stage_index, graphs, graph_ids, plan)
         root_id = func.device_ir.root_ids[stage_index]
         releases_at_entry = pdl_roots is not None and root_id == pdl_roots[0]
+        stage_config = config
+        layout_disabled = env_state.vloop_sink_reduction_layout_disabled
         try:
-            module = generate_stage(
-                stage,
-                config,
-                stage_index,
-                releases_dependents_at_entry=releases_at_entry,
-            )
-        except VloopSinkNotApplied:
-            # ``cute_vloop_sink`` shaped this stage's thread layout but sank
-            # nothing.  The knob must not change the code by itself, so
-            # regenerate exactly the knob-off stage, from graphs the knob-on
-            # layout planning has not annotated.
-            off_config = vloop_sink_off_config(config)
-            stage = _stage_host(
-                func,
-                root,
-                stage_index,
-                func.device_ir.build_codegen_graphs(off_config),
-                graph_ids,
-                plan,
-            )
-            module = generate_stage(
-                stage,
-                off_config,
-                stage_index,
-                releases_dependents_at_entry=releases_at_entry,
-            )
+            while True:
+                try:
+                    module = generate_stage(
+                        stage,
+                        stage_config,
+                        stage_index,
+                        releases_dependents_at_entry=releases_at_entry,
+                    )
+                    break
+                except VloopSinkNotApplied:
+                    # ``cute_vloop_sink`` shaped this stage's code (its thread
+                    # layout, a flattened tile's index) but sank nothing.  The
+                    # knob must not change the code by itself, so regenerate
+                    # exactly the knob-off stage.
+                    if not stage_config.get("cute_vloop_sink", False):
+                        raise
+                    stage_config = vloop_sink_off_config(stage_config)
+                except VloopSinkLayoutRefused:
+                    # Codegen refused the tile-first layout the knob laid this
+                    # stage's reduction out in: regenerate the stage with the
+                    # default layout and the knob still on.
+                    if env_state.vloop_sink_reduction_layout_disabled:
+                        raise
+                    env_state.vloop_sink_reduction_layout_disabled = True
+                # From graphs the knob-on layout planning has not annotated.
+                stage = _stage_host(
+                    func,
+                    root,
+                    stage_index,
+                    func.device_ir.build_codegen_graphs(stage_config),
+                    graph_ids,
+                    plan,
+                )
+        finally:
+            env_state.vloop_sink_reduction_layout_disabled = layout_disabled
         if (
             stage_index == env.config_spec.cute_mma_dag_phase_index
             and config.get("cute_mma_dag", "off") != "off"

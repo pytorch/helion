@@ -211,8 +211,8 @@ def _outer_masked_running_max(x: torch.Tensor) -> torch.Tensor:
     for tile_s, tile_c in hl.tile([s, c]):
         acc = hl.full([tile_s, block_r, tile_c], float("-inf"), dtype=x.dtype)
         for tile_r in hl.tile(r, block_size=block_r):
-            # ``tile_s.index[:, None]`` allocates a reduction block aliasing
-            # tile_s.
+            # ``tile_s.index[:, None]`` keeps tile_s's block: no reduction
+            # block is allocated for it.
             flat = tile_s.index[:, None] * r + tile_r.index[None, :]
             valid = (flat < s * r)[:, :, None]
             acc = torch.where(valid, torch.maximum(acc, x[tile_s, tile_r, tile_c]), acc)
@@ -236,17 +236,16 @@ def _running_max_beside_dead_sum(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@pytest.mark.parametrize(
-    "fn", [_outer_masked_running_max, _running_max_beside_dead_sum]
-)
-def test_reduction_without_strategy_reserves_no_axis(
-    fn: Callable[[torch.Tensor], torch.Tensor],
-) -> None:
-    # Neither reduction block gets a strategy.  Reserving the leading thread
-    # axis for it left the row loop's block none: a lane loop folds the
-    # running max into one carried scalar per thread, so it was refused.
+def test_reduction_without_strategy_reserves_no_axis() -> None:
+    # The full-slice sum on the side of the branch this config never takes
+    # gets no strategy.  Reserving the leading thread axis for it left the row
+    # loop's block none: a lane loop folds the running max into one carried
+    # scalar per thread, so it was refused.
     kernel = helion.kernel(
-        fn, backend="cute", static_shapes=True, autotune_effort="none"
+        _running_max_beside_dead_sum,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
     )
     bound = kernel._bind_isolated((torch.empty((4, 200, 16), device=CPU_DEVICE),))
     # The amax after the loop combines across threads through shared memory.
@@ -254,6 +253,57 @@ def test_reduction_without_strategy_reserves_no_axis(
         source = bound.to_code(helion.Config(block_sizes=[16, 4, 16]))
     assert _launch_shape(source) == (4, 16, 16)
     assert "for lane_" not in source
+
+
+def test_tile_index_slice_beside_a_running_max_reserves_no_axis() -> None:
+    # ``tile_s.index[:, None]`` keeps tile_s's block, so it allocates no
+    # reduction block and no thread axis is reserved for one: the row loop's
+    # block keeps its 16 threads.  Left none, a lane loop would fold the
+    # running max into one carried scalar per thread, which is refused.
+    kernel = helion.kernel(
+        _outer_masked_running_max,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+    )
+    bound = kernel._bind_isolated((torch.empty((4, 200, 16), device=CPU_DEVICE),))
+    assert not any(block.reduction for block in bound.env.block_sizes)
+    with patch_target_facts(reduction_smem_budget_bytes=232448):
+        source = bound.to_code(helion.Config(block_sizes=[16, 4, 16]))
+    assert _launch_shape(source) == (4, 16, 16)
+    assert "for lane_" not in source
+
+
+def _four_full_slices(
+    a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, d: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    out_a, out_b = torch.empty_like(a), torch.empty_like(b)
+    out_c, out_d = torch.empty_like(c), torch.empty_like(d)
+    for tile_m in hl.tile(a.size(0)):
+        out_a[tile_m, :] = a[tile_m, :] * 2
+        out_b[tile_m, :] = b[tile_m, :] * 2
+        out_c[tile_m, :] = c[tile_m, :] * 2
+        out_d[tile_m, :] = d[tile_m, :] * 2
+    return out_a, out_b, out_c, out_d
+
+
+def test_single_thread_reductions_claim_no_thread_axis() -> None:
+    # Four full slices, 256, 128, 64 and 32 wide, are four reduction blocks.
+    # The widest takes 256 threads and the 4-row tile the rest of the CTA, so
+    # the other three are left one live thread each: they walk their extent
+    # in a lane loop from the constant 0 and claim no thread axis
+    # (``ReductionStrategy._claims_thread_axis``).  Had each claimed one, the
+    # launch would have planned the tile on a fifth axis.
+    kernel = helion.kernel(
+        _four_full_slices, backend="cute", static_shapes=True, autotune_effort="none"
+    )
+    inputs = tuple(
+        torch.empty((64, width), device=CPU_DEVICE) for width in (256, 128, 64, 32)
+    )
+    source = kernel._bind_isolated(inputs).to_code(helion.Config(block_sizes=[4]))
+    assert _launch_shape(source) == (256, 4, 1)
+    assert "thread_idx()[3]" not in source
+    assert source.count("= cutlass.Int32(0) + cutlass.Int32(synthetic_lane_") == 3
 
 
 def _outer_masked_row_sums(x: torch.Tensor) -> torch.Tensor:
@@ -298,9 +348,10 @@ def test_row_tile_wider_than_z_keeps_64_threads(
 ) -> None:
     # Beside the two grid axes the row loop's tile lands on z, which takes 64
     # threads.  Its 128 automatic threads launched an invalid
-    # block=(2, 2, 128) under either mask; the outer index mask's kernel
-    # compiled only while a reserved reduction axis left the tile no thread
-    # axis at all.  The tile keeps 64 threads, each walking two lanes.
+    # block=(2, 2, 128).  The tile keeps 64 threads, each walking two lanes,
+    # whether its mask reads the outer tile's index (``tile_s.index``, the
+    # same on every lane) or its own (``tile_r.index``, which each lane
+    # offsets).
     source = _wide_row_source(fn)
     assert _launch_shape(source) == (2, 2, 64)
     assert "for lane_0 in range(2)" in source

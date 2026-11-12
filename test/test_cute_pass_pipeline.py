@@ -20,8 +20,9 @@ pytestmark = pytest.mark.cpu_only
 # removing an entry is a deliberate, render-checked change that updates this
 # list.  The fact derivations of the inline sequence (float scalar names,
 # constexpr values, the raw launch shape, tensor dtypes, disjoint pairs, reload
-# modes, the block-grid dims) are the ``PassContext`` built ahead of the
-# prologue; ``freeze_pass_context`` seals the launch shape the prologue decided.
+# modes) are the ``PassContext`` built ahead of the prologue;
+# ``freeze_pass_context`` seals the launch shape and the block-grid dims the
+# prologue decided.
 DEVICE_BODY_PROLOGUE_NAMES = [
     "guard_atomics_on_later_thread_axes",
     "lower_uniform_comparisons",
@@ -62,6 +63,7 @@ DEVICE_BODY_PASS_NAMES = [
     "pack_fp32_constexpr_loops",
     "hoist_packed_factored_reductions",
     "pack_bf16_recurrences",
+    "divide_vector_bases",
     "simplify_proven_loop_bounds",
     "simplify_proven_bounds",
     "fuse_cluster_online_pair",

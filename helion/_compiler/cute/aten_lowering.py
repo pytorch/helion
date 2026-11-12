@@ -68,6 +68,7 @@ from .iota_utils import cute_free_arange_lanes
 from .iota_utils import cute_free_arange_memory_index_positions
 from .iota_utils import cute_iota_has_atomic_tensor_index_only_users
 from .iota_utils import cute_iota_is_free_memory_index
+from .iota_utils import cute_padded_range_reduction_block
 from .matmul_fallback import _emit_cute_matmul
 from .matmul_fallback import _emit_cute_matmul_n_collapse
 from .matmul_utils import cute_lower_rhs_for_matmul
@@ -1280,6 +1281,17 @@ def _cute_iota_expr(
                 ]
                 if len(grid_candidates) == 1:
                     block_id = grid_candidates[0]
+            if (
+                block_id is None
+                and (
+                    padded := cute_padded_range_reduction_block(
+                        cg, source_node, length_hint
+                    )
+                )
+                is not None
+            ):
+                block_id = padded
+                cute_codegen_state(cg).padded_range_blocks[source_node] = padded
     if block_id is None:
         if (active_expr := active_iota_expr()) is not None:
             return active_expr

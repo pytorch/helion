@@ -124,6 +124,7 @@ from .cute import CuteRolledClusterLadderHeuristic
 from .cute import CuteRolledRowLadderHeuristic
 from .cute import CuteScanTileHeuristic
 from .cute import CuteSiblingRowHeuristic
+from .cute import CuteStridedReductionHeuristic
 from .cute import CuteTcgen05ClusterM2FfiHeuristic
 from .cute import CuteTcgen05ClusterM2Heuristic
 from .cute import CuteTcgen05GroupedDynamicBk64Heuristic
@@ -168,6 +169,7 @@ from .cute_materialized_pdl import register_materialized_pdl_coverage
 from .cute_mma_dag import CuteMmaDagHeuristic
 from .cute_mxfp8_epilogue_coverage import register_mxfp8_epilogue_coverage
 from .cute_packed_operand import register_packed_operand_coverage
+from .cute_privatize_atomics import CutePrivatizeAtomicsHeuristic
 from .cute_radix_selection import CuteRadixSelectionHeuristic
 from .cute_radix_selection import register_radix_selection_coverage
 from .cute_register_chain import CuteRegisterChainHeuristic
@@ -291,6 +293,8 @@ _CUTE_HEURISTIC_CLASSES: tuple[AutotunerHeuristicType, ...] = (
     CuteFragmentPureProducerRegionsHeuristic,
     CuteRadixSelectionHeuristic,
     CuteFragmentHalfMmaHeuristic,
+    CuteStridedReductionHeuristic,
+    CutePrivatizeAtomicsHeuristic,
 )
 
 

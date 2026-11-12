@@ -30,6 +30,7 @@ from ..emitter_protocols import KernelTransforms
 from ..emitter_protocols import RetryPolicy
 from ..emitter_protocols import TransformPolicy
 from . import target_facts
+from .execution_plans import VloopSinkLayoutRefused
 from .fragment_mma_dot import FragmentMmaNotApplied
 from .fragment_mma_dot import fragment_mma_off_config
 from .register_tile_admission import RegisterTileUnsupported
@@ -355,12 +356,15 @@ class CuteRegeneration(RetryPolicy):
       register tiles existed.  Caller-built codegen graphs were rolled for
       ``config`` as given, so that retry keeps the config and only the lane
       nesting changes.
-    - ``cute_vloop_sink`` shapes the thread layout during layout planning;
-      when no vector loop is sunk after all (``VloopSinkNotApplied``), the
-      kernel is generated again with the knob off (``vloop_sink_off_config``)
-      so the knob alone never changes the code.  Layout planning annotated a
-      caller's graphs in place, so a caller that supplied them rebuilds them
-      for the knob-off run itself (the signal propagates).
+    - ``cute_vloop_sink`` shapes the code before anything is sunk: the
+      thread layout during layout planning, and a flattened tile's element
+      index and mask at codegen (``record_flattened_vloop_wrapper``); when no
+      vector loop is sunk after all (``VloopSinkNotApplied``), the kernel is
+      generated again with the knob off and the requested lane unroll
+      (``vloop_sink_off_config``) so the knob alone never changes the code.
+      Layout planning annotated a caller's graphs in place, so a caller that
+      supplied them rebuilds them for the knob-off run itself (the signal
+      propagates).
     - ``cute_lane_unroll`` without sinking asks the last kernel-body pass to
       unroll the grid lane loops loads-first; when no loop takes it
       (``LaneUnrollNotApplied``) the kernel is generated again with the
@@ -373,12 +377,19 @@ class CuteRegeneration(RetryPolicy):
       (``FragmentMmaNotApplied`` / ``RingMmaNotApplied``) the kernel is
       generated again with that knob off (``fragment_mma_off_config`` /
       ``ring_mma_off_config``), reusing the caller's graphs.
+    - ``cute_vloop_sink`` lays a threaded reduction out tile-first
+      (``_plan_vloop_sink_reduction_execution``); when codegen refuses that
+      layout (``VloopSinkLayoutRefused``: a lane combine the interleaved
+      threads defeat), the kernel is generated again with the
+      default layout (``CuteEnvState.vloop_sink_reduction_layout_disabled``)
+      and the knob still on, as before the layout existed.  A caller's graphs
+      carry the plan, so a caller that supplied them rebuilds them with the
+      layout disabled itself (the signal propagates).
 
     The retries compose: the register tile is admitted afresh on the knob-off
     pass, and the sink pass runs on the rolled body of a rejected register
     tile.  Each fires at most once per ``generate_ast`` call (its repair
-    switches off what raised it), so a call generates the kernel at most
-    three times.
+    switches off what raised it).
     """
 
     signals: tuple[type[BaseException], ...] = (
@@ -387,22 +398,28 @@ class CuteRegeneration(RetryPolicy):
         FragmentMmaNotApplied,
         RingMmaNotApplied,
         LaneUnrollNotApplied,
+        VloopSinkLayoutRefused,
     )
 
     @contextlib.contextmanager
     def scope(self) -> Iterator[None]:
         env_state = cute_env_state(CompileEnvironment.current())
         register_tiles_disabled = env_state.register_tile_disabled
+        layout_planned = env_state.vloop_sink_reduction_layout_planned
+        layout_disabled = env_state.vloop_sink_reduction_layout_disabled
         try:
             yield
         finally:
             env_state.register_tile_disabled = register_tiles_disabled
+            env_state.vloop_sink_reduction_layout_planned = layout_planned
+            env_state.vloop_sink_reduction_layout_disabled = layout_disabled
 
     def repair(
         self, signal: BaseException, config: Config, *, caller_graphs: bool
     ) -> Config | None:
         env = CompileEnvironment.current()
         env_state = cute_env_state(env)
+        env_state.vloop_sink_reduction_layout_planned = False
         if isinstance(signal, RegisterTileUnsupported):
             if env_state.register_tile_disabled:
                 return None
@@ -430,8 +447,14 @@ class CuteRegeneration(RetryPolicy):
         if isinstance(signal, RingMmaNotApplied):
             # The ring rewrite is a late AST pass like the fragment one.
             return ring_mma_off_config(config)
-        assert isinstance(signal, LaneUnrollNotApplied)
-        return lane_unroll_off_config(config)
+        if isinstance(signal, LaneUnrollNotApplied):
+            return lane_unroll_off_config(config)
+        assert isinstance(signal, VloopSinkLayoutRefused)
+        if caller_graphs or env_state.vloop_sink_reduction_layout_disabled:
+            return None
+        log.debug("regenerating with the default thread layout: %s", signal)
+        env_state.vloop_sink_reduction_layout_disabled = True
+        return config
 
 
 REGENERATION = CuteRegeneration()

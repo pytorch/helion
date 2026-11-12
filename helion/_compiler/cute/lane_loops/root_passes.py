@@ -160,6 +160,9 @@ def run_root_lane_passes(codegen: GenerateAST) -> None:
             running_sums=codegen.device_function.cute_state.lanes.matmul_running_sums,
             register_tile_options=RegisterTileOptions(
                 warp_fold=knobs.get("cute_register_tile_warp_fold") is True,
+                cooperative_fold=(
+                    knobs.get("cute_register_tile_cooperative_fold") is True
+                ),
                 store_first=knobs.get("cute_register_tile_store_first") is True,
             ),
         )
@@ -191,7 +194,7 @@ def run_root_lane_passes(codegen: GenerateAST) -> None:
 def sink_root_vector_loops(codegen: GenerateAST) -> None:
     """Interchange a grid constexpr vector loop into the serial reduction nest
     it wraps (``cute_vloop_sink``); raises ``VloopSinkNotApplied`` when the knob
-    shaped the thread layout but nothing was sunk."""
+    shaped the code (``vloop_sink_shaped_code``) but nothing was sunk."""
     from ...device_function import TensorArg
     from ..sink_vector_loops import VloopSinkNotApplied
 
@@ -226,8 +229,8 @@ def sink_root_vector_loops(codegen: GenerateAST) -> None:
             wide_packet_hints=codegen.device_function.config.cute_wide_packet_hints,
         )
         cute_state.lanes.vloop_sink_unrolled = unrolled
-    if not fired and cute_state.lanes.vloop_sink_layout_applied:
-        # The knob shaped the thread layout but nothing was sunk.  The
+    if not fired and cute_state.lanes.vloop_sink_shaped_code:
+        # The knob shaped the code but nothing was sunk.  The
         # knob must not change the code by itself, so start over with it
         # off (``generate_ast`` or the owner of the codegen graphs
         # regenerates the knob-off code).

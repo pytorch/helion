@@ -140,6 +140,16 @@ def constexpr_live_graph_ids(
     return frozenset(live)
 
 
+def graph_tile_loop_paths(
+    device_ir: DeviceIR,
+    graphs: Sequence[GraphInfo],
+) -> list[tuple[GraphInfo, TileLoopPath]]:
+    """:func:`_root_graph_tile_loop_paths` without the root indices."""
+    return [
+        (info, path) for _, info, path in _root_graph_tile_loop_paths(device_ir, graphs)
+    ]
+
+
 def _root_graph_tile_loop_paths(
     device_ir: DeviceIR,
     graphs: Sequence[GraphInfo],

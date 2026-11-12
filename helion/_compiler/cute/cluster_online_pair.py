@@ -346,7 +346,13 @@ def _find_vec_exp(
                     and isinstance(s.value, ast.Name)
                     and s.value.id in cache_names
                 ]
-                if len(cache_slots) != 1:
+                # The pair caches each lane's exponential at the slot its
+                # exponent reads: a slot every lane shares (a single-slot
+                # value of fuse_two_pass_loads) would keep the last lane's.
+                if len(cache_slots) != 1 or not any(
+                    isinstance(name, ast.Name) and name.id == vec_var
+                    for name in ast.walk(cache_slots[0].slice)
+                ):
                     continue
                 canonical = _canonical_src(
                     inlined, {vec_var: "_V_", scaled_name: "_S_"}

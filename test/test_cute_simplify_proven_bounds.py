@@ -1,12 +1,23 @@
 from __future__ import annotations
 
 import ast
+from typing import TYPE_CHECKING
 from typing import cast
+from unittest.mock import patch
 
 import pytest
+import torch
 
+import helion
 from helion._compiler.ast_extension import convert
+from helion._compiler.cute.passes import pipeline
 from helion._compiler.cute.simplify_proven_bounds import simplify_proven_bounds
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_index_math import flat_channel_code
+from helion._testing.cute_index_math import row_scale
+
+if TYPE_CHECKING:
+    from helion._compiler.device_function import DeviceFunction
 
 pytestmark = pytest.mark.cpu_only
 
@@ -64,11 +75,12 @@ def _transform(
     source: str = SOURCE,
     *,
     enabled: bool = True,
-    xyz_grid: bool = True,
+    exact_grid: bool = True,
     thread_block_dims: tuple[int, int, int] | None = (16, 8, 1),
     block_grid_dims: tuple[int | None, int | None, int | None] = (12, 256, 1),
     constexpr_values: dict[str, int] | None = None,
     proven_tensor_size_values: (dict[tuple[str, int], tuple[str, int]] | None) = None,
+    rename_groups: dict[str, str] | None = None,
     extended: bool = False,
 ) -> str:
     module = ast.parse(source)
@@ -77,7 +89,7 @@ def _transform(
     body = simplify_proven_bounds(
         module.body,
         enabled=enabled,
-        xyz_grid=xyz_grid,
+        exact_grid=exact_grid,
         thread_block_dims=thread_block_dims,
         block_grid_dims=block_grid_dims,
         constexpr_values=(
@@ -98,6 +110,7 @@ def _transform(
             if proven_tensor_size_values is None
             else proven_tensor_size_values
         ),
+        rename_groups=rename_groups,
     )
     return ast.unparse(ast.Module(body=body, type_ignores=[]))
 
@@ -146,7 +159,7 @@ def test_missing_size_proof_retains_only_that_tensor_guard() -> None:
     ("kwargs", "needle"),
     [
         ({"enabled": False}, "cute.arch.block_idx()[2]"),
-        ({"xyz_grid": False}, "cute.arch.block_idx()[2]"),
+        ({"exact_grid": False}, "cute.arch.block_idx()[2]"),
         ({"block_grid_dims": (12, None, 1)}, "cute.arch.block_idx()[2]"),
         ({"block_grid_dims": (12, 256, 2)}, "cute.arch.block_idx()[2]"),
         ({"thread_block_dims": (32, 33, 1)}, "< a_size_1"),
@@ -289,3 +302,204 @@ consumer = consume(_cute_proven_bounds_0_abi_version)
 
     assert "_cute_proven_bounds_1_abi_version = 1" in result
     assert "consumer = consume(_cute_proven_bounds_0_abi_version)" in result
+
+
+CHANNEL_GATHER = """
+pid_flat = cutlass.Int32(cute.arch.block_idx()[0])
+offsets_base_0 = pid_flat * _BLOCK_SIZE_0
+v_0 = 196
+v_2 = 384
+for lane_0 in cutlass.range_constexpr(4):
+    lane_base_0 = offsets_base_0 + (
+        cutlass.Int32(lane_0) * 256 + cutlass.Int32(cute.arch.thread_idx()[0])
+    ) * 8
+    for vec_lane_0 in cutlass.range_constexpr(8):
+        indices_0 = lane_base_0 + cutlass.Int32(vec_lane_0)
+        v_1 = indices_0 // v_0
+        v_3 = _cute_python_mod(cutlass.Int32(v_1), cutlass.Int32(v_2))
+        weight = w[v_3] if cutlass.Int32(v_3) < 384 else zero
+        half_lane = lane_0 // 2
+        unproven = loaded // 3
+"""
+
+
+@pytest.mark.parametrize("extended", [False, True])
+def test_proven_channel_index_drops_its_guard_and_signed_corrections(
+    extended: bool,
+) -> None:
+    """``(i // HW) % C`` of a flat NCHW index: the Python remainder bounds the
+    channel below ``C``, so the gather's guard goes, and the division and
+    remainder of the proven nonnegative index run unsigned (no sign
+    corrections).  Trace-time Python ints and unproven values keep their
+    operators."""
+    result = _transform(
+        CHANNEL_GATHER,
+        thread_block_dims=(256, 1, 1),
+        block_grid_dims=(1176, 1, 1),
+        constexpr_values={"_BLOCK_SIZE_0": 8192},
+        proven_tensor_size_values={},
+        extended=extended,
+    )
+
+    assert "v_1 = cutlass.Int32(cutlass.Uint32(indices_0) // cutlass.Uint32(v_0))" in (
+        result
+    )
+    assert (
+        "v_3 = cutlass.Int32(cutlass.Uint32(cutlass.Int32(v_1)) % "
+        "cutlass.Uint32(cutlass.Int32(v_2)))"
+    ) in result
+    assert "weight = w[v_3]\n" in result + "\n"
+    assert "half_lane = lane_0 // 2" in result
+    assert "unproven = loaded // 3" in result
+
+
+def test_unproven_launch_keeps_the_channel_guard() -> None:
+    result = _transform(
+        CHANNEL_GATHER,
+        thread_block_dims=(256, 1, 1),
+        block_grid_dims=(None, 1, 1),
+        constexpr_values={"_BLOCK_SIZE_0": 8192},
+        proven_tensor_size_values={},
+    )
+
+    assert "_cute_python_mod(cutlass.Int32(v_1), cutlass.Int32(v_2))" in result
+    assert "if cutlass.Int32(v_3) < 384" in result
+
+
+UNSIGNED_OPERANDS = """
+thread = cutlass.Int32(cute.arch.thread_idx()[0])
+wide = cutlass.Int64(thread)
+narrow = thread
+value = {expression}
+"""
+
+
+@pytest.mark.parametrize(
+    ("expression", "unsigned"),
+    [
+        ("narrow // 4", True),
+        ("cutlass.Int32(wide) % 4", True),
+        # A wider or unsigned operand: the division's result is no Int32, so
+        # the rewrite's Int32 would change its type.
+        ("wide // 4", False),
+        ("cutlass.Int64(thread) // 4", False),
+        ("cutlass.Uint32(thread) % 4", False),
+        ("thread // cutlass.Int64(4)", False),
+        # A trace-time Python int stays one.
+        ("12 // 4", False),
+    ],
+)
+def test_unsigned_division_keeps_the_type_of_the_signed_one(
+    expression: str, unsigned: bool
+) -> None:
+    result = _transform(UNSIGNED_OPERANDS.format(expression=expression))
+
+    if unsigned:
+        assert "value = cutlass.Int32(cutlass.Uint32(" in result, result
+    else:
+        assert f"value = {expression}" in result, result
+
+
+def test_each_branch_starts_from_the_integer_kinds_before_the_if() -> None:
+    """The ``else`` branch divides the Int64 bound before the ``if``, not the
+    Int32 the ``if`` branch binds."""
+    result = _transform(
+        """
+thread = cutlass.Int32(cute.arch.thread_idx()[0])
+value = cutlass.Int64(thread)
+if flag:
+    value = thread
+else:
+    quotient = value // 4
+"""
+    )
+
+    assert "quotient = value // 4" in result
+
+
+@pytest.mark.parametrize(
+    ("stop", "unsigned"), [("8", True), ("cutlass.Int64(8)", False)]
+)
+def test_a_staged_loop_counts_in_the_type_of_its_bounds(
+    stop: str, unsigned: bool
+) -> None:
+    result = _transform(f"stop = {stop}\nfor k in range(stop):\n    half = k // 2\n")
+
+    assert ("half = k // 2" not in result) is unsigned, result
+
+
+def test_a_python_bound_past_int32_widens_a_staged_counter() -> None:
+    """The counter's only value, 2**30, fits Int32, but the Python stop 2**32
+    makes the DSL count in Int64: an unsigned Int32 half would narrow it."""
+    result = _transform(
+        "for k in range(1073741824, 4294967296, 4294967296):\n    half = k // 2\n"
+    )
+
+    assert "half = k // 2" in result, result
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        # The loop carries ``d``: its second iteration divides by -1.
+        "for i in range(2):\n    q = col // d\n    d_1 = d - 9\n",
+        # Straight-line code reads the updated ``d`` once renamed.
+        "d_1 = d - 9\nq = col // d\n",
+    ],
+)
+@pytest.mark.parametrize("merged", [False, True])
+def test_a_value_updated_under_an_alias_counts_as_updated(
+    update: str, merged: bool
+) -> None:
+    """``d_1`` is ``d`` once ``ast_rename`` merges them, so writing it writes
+    ``d``: ``col // d`` keeps its signed division (column 7 over -1 is -7, not
+    the unsigned 0).  Unmerged, ``d`` stays 8 and the division runs
+    unsigned."""
+    result = _transform(
+        "col = cutlass.Int32(cute.arch.thread_idx()[0])\nd = cutlass.Int32(8)\n"
+        + update,
+        rename_groups={"d": "d", "d_1": "d"} if merged else {},
+    )
+
+    assert ("q = col // d" in result) is merged, result
+
+
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_unsigned_division_needs_int32_indices(index_dtype: torch.dtype) -> None:
+    """``(tile.index // 8) * 2**20`` with int64 indexing multiplies an Int64
+    quotient; an unsigned Int32 one would wrap from ``tile.index`` 2**14 on."""
+    bound = cpu_bind(row_scale[index_dtype], (torch.empty(65536),))
+    config = bound.config_spec.normalized_config(
+        helion.Config(block_sizes=[1024], num_threads=[128], cute_proven_bounds=True)
+    )
+    code = bound.to_code(config)
+    assert ("cutlass.Uint32(" in code) is (index_dtype == torch.int32), code
+
+
+@pytest.mark.parametrize("proven", [False, True])
+def test_flat_launch_proves_its_grid(proven: bool) -> None:
+    """A flat one-dimensional launch has an exact grid too: with the knob on,
+    the channel gather loses its guard and its index math runs unsigned."""
+    code = flat_channel_code(14, proven_bounds=proven)
+    assert ("< 24 else" in code) is not proven, code
+    assert ("cutlass.Uint32(" in code) is proven, code
+
+
+def test_a_host_wrapper_launch_proves_no_flat_grid() -> None:
+    """A host wrapper plan launches its own ``grid_x``, so the flat program
+    ids' static grid proves nothing about ``block_idx``.  The plan is
+    registered only while the grid is proved."""
+    exact_flat_grid = pipeline._exact_flat_grid
+
+    def with_wrapper_plan(fn: DeviceFunction) -> int | None:
+        plans = pipeline.cute_codegen_state(fn.codegen).wrapper_plans
+        plans.append({"kind": "own_grid"})
+        try:
+            return exact_flat_grid(fn)
+        finally:
+            plans.pop()
+
+    with patch.object(pipeline, "_exact_flat_grid", with_wrapper_plan):
+        code = flat_channel_code(14, proven_bounds=True)
+    assert "< 24 else" in code, code
+    assert "cutlass.Uint32(" not in code, code

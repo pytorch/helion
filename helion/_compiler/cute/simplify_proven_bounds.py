@@ -2,8 +2,10 @@
 
 The pass intentionally understands only nonnegative integer affine arithmetic
 over exact launch dimensions, constexprs, and cache-specialized tensor sizes.
-Unknown values, reassigned proof inputs, non-XYZ launches, and arithmetic that
-could overflow are left untouched.
+Unknown values, reassigned proof inputs, launches without an exact grid, and
+arithmetic that could overflow are left untouched; names ``ast_rename`` merges
+later count as one variable.  The same proofs let ``//`` and ``%`` of a
+nonnegative traced ``Int32`` run unsigned.
 """
 
 from __future__ import annotations
@@ -11,16 +13,32 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 import functools
+from typing import TYPE_CHECKING
 from typing import cast
 
+from ..ast_extension import expr_from_string
 from ._ast_pass_utils import call_path as _call_path
+from ._ast_pass_utils import call_path_str
 from ._ast_pass_utils import comparison_is_always_true
+from ._ast_pass_utils import is_staged_loop
+from ._ast_pass_utils import merged_names
 from ._ast_pass_utils import names_read
 from ._ast_pass_utils import names_stored_or_deleted as _assigned_names
+from ._ast_pass_utils import with_merged_names
+from .scalar_integer import _INTEGER_CASTS
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Iterable
+    from collections.abc import Mapping
 
 _INT32_MAX = (1 << 31) - 1
 _ABI_VERSION = 1
 _MARKER_PREFIX = "_cute_proven_bounds_"
+_PYTHON_MOD = "_cute_python_mod"
+# The kinds of integer the unsigned rewrite tells apart (``_integer_kind``).
+_INT32 = "int32"
+_PYTHON = "python"
 
 
 def _axis_index(node: ast.AST, function: str) -> int | None:
@@ -69,6 +87,18 @@ def _remove_true_and_operands(values: list[ast.expr]) -> list[ast.expr]:
     return remaining
 
 
+def _python_mod_operands(node: ast.AST) -> list[ast.expr] | None:
+    """The operands of a ``_cute_python_mod(a, b)`` call, else None."""
+    if (
+        isinstance(node, ast.Call)
+        and _call_path(node.func) == (_PYTHON_MOD,)
+        and len(node.args) == 2
+        and not node.keywords
+    ):
+        return node.args
+    return None
+
+
 def _literal_int(node: ast.expr, bounds: dict[str, tuple[int, int]]) -> int | None:
     if isinstance(node, ast.Constant) and type(node.value) is int:
         return node.value
@@ -108,15 +138,23 @@ def _integer_interval(
     if block_axis is not None:
         return 0, block_grid_dims[block_axis] - 1
     if isinstance(node, ast.Call):
-        path = _call_path(node.func)
+        operands = _python_mod_operands(node)
+        if operands is not None:
+            # Over the nonnegative domain Python's remainder is C's.
+            dividend, divisor = (
+                _integer_interval(
+                    argument,
+                    bounds=bounds,
+                    thread_block_dims=thread_block_dims,
+                    block_grid_dims=block_grid_dims,
+                )
+                for argument in operands
+            )
+            if dividend is None or divisor is None or not divisor[0] == divisor[1] > 0:
+                return None
+            return _checked_interval(0, min(dividend[1], divisor[0] - 1))
         if (
-            path
-            not in {
-                ("cutlass", "Int32"),
-                ("cutlass", "Int64"),
-                ("cutlass", "Uint32"),
-                ("cutlass", "Uint64"),
-            }
+            call_path_str(node.func) not in _INTEGER_CASTS
             or len(node.args) != 1
             or node.keywords
         ):
@@ -244,14 +282,117 @@ def _supported_body(statements: list[ast.stmt]) -> bool:
     )
 
 
+def _integer_kind(node: ast.expr, kinds: dict[str, str]) -> str | None:
+    """``_INT32`` for a traced ``cutlass.Int32`` value, ``_PYTHON`` for a
+    trace-time Python int (constants, constexprs, ``range_constexpr`` lanes),
+    None for anything else (wider or unsigned DSL integers, floats, unknown
+    values).  ``kinds`` maps names to the kinds of their values.
+
+    The DSL converts a Python int within Int32 beside an Int32 operand to
+    Int32, so arithmetic mixing the two stays Int32.  A Python int outside
+    Int32 would widen it, so a kind only holds where the interval proof also
+    bounds the expression.
+    """
+    if isinstance(node, ast.Constant):
+        return _PYTHON if type(node.value) is int else None
+    if isinstance(node, ast.Name):
+        return kinds.get(node.id)
+    if (
+        _axis_index(node, "thread_idx") is not None
+        or _axis_index(node, "block_idx") is not None
+    ):
+        return _INT32
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.UAdd):
+        return _integer_kind(node.operand, kinds)
+    if isinstance(node, ast.Call):
+        if (
+            call_path_str(node.func) == "cutlass.Int32"
+            and len(node.args) == 1
+            and not node.keywords
+        ):
+            return _INT32
+        operands = _python_mod_operands(node)
+        if operands is None:
+            return None
+    elif isinstance(node, ast.BinOp) and isinstance(
+        node.op, (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.Mod)
+    ):
+        operands = [node.left, node.right]
+    else:
+        return None
+    found = {_integer_kind(operand, kinds) for operand in operands}
+    if found == {_PYTHON}:
+        return _PYTHON
+    if found <= {_INT32, _PYTHON}:
+        return _INT32
+    return None
+
+
+def _loop_target_kind(
+    loop: ast.For,
+    kinds: dict[str, str],
+    interval: Callable[[ast.expr], tuple[int, int] | None],
+) -> str | None:
+    """The kind of a loop's counter: a staged loop counts in the integer its
+    bounds promote to (Int32 for Int32 bounds and Python ints the interval
+    proof keeps within Int32; a larger Python int widens it), an unrolled
+    ``range_constexpr`` loop in a Python int."""
+    iterator = loop.iter
+    if not isinstance(iterator, ast.Call):
+        return None
+    if is_staged_loop(loop):
+        if all(
+            (kind := _integer_kind(argument, kinds)) == _INT32
+            or (kind == _PYTHON and interval(argument) is not None)
+            for argument in iterator.args
+        ):
+            return _INT32
+        return None
+    if _call_path(iterator.func) == ("cutlass", "range_constexpr"):
+        return _PYTHON
+    return None
+
+
+def _bind_kind(kinds: dict[str, str], name: str, kind: str | None) -> None:
+    if kind is None:
+        kinds.pop(name, None)
+    else:
+        kinds[name] = kind
+
+
+def _unsigned(operation: str, dividend: ast.expr, divisor: ast.expr) -> ast.expr:
+    """``dividend // divisor`` or ``dividend % divisor`` in unsigned 32-bit
+    arithmetic, back as ``Int32``: signed floor division and remainder carry
+    sign corrections that a proven nonnegative dividend never needs.  The
+    dividend is a traced Int32 and the divisor an Int32 or a Python int, so
+    the result has the type the signed operation had."""
+    expression = expr_from_string(
+        f"cutlass.Int32(cutlass.Uint32({{a}}) {operation} cutlass.Uint32({{b}}))",
+        a=dividend,
+        b=divisor,
+    )
+    assert isinstance(expression, ast.expr)
+    return expression
+
+
 @dataclass
 class _Simplifier:
     thread_block_dims: tuple[int, int, int]
     block_grid_dims: tuple[int, int, int]
+    # Each name ``ast_rename`` merges with others (a loop-carried value and
+    # its aliases), with all of them: once renamed they are one variable, so
+    # a write to any is a write to all.
+    merged: Mapping[str, frozenset[str]]
     changed: int = 0
 
+    def with_merged(self, names: Iterable[str]) -> set[str]:
+        return with_merged_names(names, self.merged)
+
     def expression(
-        self, node: ast.expr, bounds: dict[str, tuple[int, int]]
+        self,
+        node: ast.expr,
+        bounds: dict[str, tuple[int, int]],
+        kinds: dict[str, str],
     ) -> ast.expr:
         parent = self
         interval = functools.partial(
@@ -295,6 +436,45 @@ class _Simplifier:
                 visited.values = values
                 return visited
 
+            def _unsigned_operands(self, dividend: ast.expr, divisor: ast.expr) -> bool:
+                # Trace-time Python ints are never rewritten, and wider or
+                # unsigned operands keep their type (see ``_unsigned``).
+                divisor_range = interval(divisor)
+                return (
+                    interval(dividend) is not None
+                    and divisor_range is not None
+                    and divisor_range[0] == divisor_range[1] > 0
+                    and _integer_kind(dividend, kinds) == _INT32
+                    and _integer_kind(divisor, kinds) in (_INT32, _PYTHON)
+                )
+
+            def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
+                visited = self.generic_visit(node)
+                assert isinstance(visited, ast.BinOp)
+                # isinstance: codegen's operator nodes are ExtendedAST
+                # subclasses of the ast classes.
+                if isinstance(visited.op, ast.FloorDiv):
+                    operation = "//"
+                elif isinstance(visited.op, ast.Mod):
+                    operation = "%"
+                else:
+                    return visited
+                if not self._unsigned_operands(visited.left, visited.right):
+                    return visited
+                parent.changed += 1
+                return ast.copy_location(
+                    _unsigned(operation, visited.left, visited.right), visited
+                )
+
+            def visit_Call(self, node: ast.Call) -> ast.AST:
+                visited = self.generic_visit(node)
+                assert isinstance(visited, ast.Call)
+                operands = _python_mod_operands(visited)
+                if operands is None or not self._unsigned_operands(*operands):
+                    return visited
+                parent.changed += 1
+                return ast.copy_location(_unsigned("%", *operands), visited)
+
             def visit_IfExp(self, node: ast.IfExp) -> ast.AST:
                 visited = self.generic_visit(node)
                 assert isinstance(visited, ast.IfExp)
@@ -314,24 +494,29 @@ class _Simplifier:
         self,
         statements: list[ast.stmt],
         bounds: dict[str, tuple[int, int]],
+        kinds: dict[str, str],
     ) -> list[ast.stmt]:
         result: list[ast.stmt] = []
         for statement in statements:
             if isinstance(statement, ast.Assign):
-                statement.value = self.expression(statement.value, bounds)
+                statement.value = self.expression(statement.value, bounds, kinds)
                 if len(statement.targets) == 1 and isinstance(
                     statement.targets[0], ast.Name
                 ):
-                    target = statement.targets[0].id
-                    if target in names_read(statement.value):
-                        bounds.pop(target, None)
-                    else:
-                        interval = _integer_interval(
+                    targets = self.with_merged((statement.targets[0].id,))
+                    kind = _integer_kind(statement.value, kinds)
+                    interval = (
+                        None
+                        if targets & names_read(statement.value)
+                        else _integer_interval(
                             statement.value,
                             bounds=bounds,
                             thread_block_dims=self.thread_block_dims,
                             block_grid_dims=self.block_grid_dims,
                         )
+                    )
+                    for target in targets:
+                        _bind_kind(kinds, target, kind)
                         if interval is None:
                             bounds.pop(target, None)
                         else:
@@ -339,51 +524,71 @@ class _Simplifier:
                 result.append(statement)
                 continue
             if isinstance(statement, ast.For):
-                statement.iter = self.expression(statement.iter, bounds)
+                statement.iter = self.expression(statement.iter, bounds, kinds)
                 loop_bounds = dict(bounds)
+                loop_kinds = dict(kinds)
                 # A value written in the loop is loop-carried unless a local
                 # assignment re-establishes its interval before use.  Do not
                 # let an incoming value justify a guard in a later iteration.
-                loop_assigned = _assigned_names(
-                    ast.Module(body=statement.body, type_ignores=[])
+                loop_assigned = self.with_merged(
+                    _assigned_names(ast.Module(body=statement.body, type_ignores=[]))
                 )
                 for name in loop_assigned:
                     loop_bounds.pop(name, None)
+                    loop_kinds.pop(name, None)
                 interval = _range_interval(statement.iter, bounds=bounds)
                 if isinstance(statement.target, ast.Name):
-                    loop_bounds.pop(statement.target.id, None)
-                    if interval is not None:
-                        loop_bounds[statement.target.id] = interval
-                statement.body = self.block(statement.body, loop_bounds)
+                    kind = _loop_target_kind(
+                        statement,
+                        kinds,
+                        functools.partial(
+                            _integer_interval,
+                            bounds=bounds,
+                            thread_block_dims=self.thread_block_dims,
+                            block_grid_dims=self.block_grid_dims,
+                        ),
+                    )
+                    for target in self.with_merged((statement.target.id,)):
+                        _bind_kind(loop_kinds, target, kind)
+                        loop_bounds.pop(target, None)
+                        if interval is not None:
+                            loop_bounds[target] = interval
+                statement.body = self.block(statement.body, loop_bounds, loop_kinds)
                 post_loop_bounds = dict(bounds)
-                for name in _assigned_names(statement):
+                for name in self.with_merged(_assigned_names(statement)):
                     post_loop_bounds.pop(name, None)
-                statement.orelse = self.block(statement.orelse, dict(post_loop_bounds))
+                    kinds.pop(name, None)
+                statement.orelse = self.block(
+                    statement.orelse, dict(post_loop_bounds), dict(kinds)
+                )
                 bounds.clear()
                 bounds.update(post_loop_bounds)
                 result.append(statement)
                 continue
             if isinstance(statement, ast.If):
-                statement.test = self.expression(statement.test, bounds)
+                statement.test = self.expression(statement.test, bounds, kinds)
                 if isinstance(statement.test, ast.Constant) and (
                     statement.test.value is True
                 ):
                     self.changed += 1
-                    result.extend(self.block(statement.body, bounds))
+                    result.extend(self.block(statement.body, bounds, kinds))
                     continue
-                statement.body = self.block(statement.body, dict(bounds))
-                statement.orelse = self.block(statement.orelse, dict(bounds))
-                for name in _assigned_names(statement):
+                statement.body = self.block(statement.body, dict(bounds), dict(kinds))
+                statement.orelse = self.block(
+                    statement.orelse, dict(bounds), dict(kinds)
+                )
+                for name in self.with_merged(_assigned_names(statement)):
                     bounds.pop(name, None)
+                    kinds.pop(name, None)
                 result.append(statement)
                 continue
             for field, value in ast.iter_fields(statement):
                 if isinstance(value, ast.expr):
-                    setattr(statement, field, self.expression(value, bounds))
+                    setattr(statement, field, self.expression(value, bounds, kinds))
                 elif isinstance(value, list):
                     for index, item in enumerate(value):
                         if isinstance(item, ast.expr):
-                            value[index] = self.expression(item, bounds)
+                            value[index] = self.expression(item, bounds, kinds)
             result.append(statement)
         return result
 
@@ -392,18 +597,23 @@ def simplify_proven_bounds(
     body: list[ast.stmt],
     *,
     enabled: bool,
-    xyz_grid: bool,
+    exact_grid: bool,
     thread_block_dims: tuple[int, int, int] | None,
     block_grid_dims: tuple[int | None, int | None, int | None],
     constexpr_values: dict[str, int],
     proven_tensor_size_values: dict[tuple[str, int], tuple[str, int]],
+    rename_groups: Mapping[str, str] | None = None,
 ) -> list[ast.stmt]:
     """Simplify only bounds proven by exact launch and input metadata.
 
     ``thread_block_dims`` is the proven static launch shape; ``None`` (an
-    argument-sized or otherwise unproven axis) proves nothing.
+    argument-sized or otherwise unproven axis) proves nothing.  ``exact_grid``
+    says ``block_grid_dims`` is the launch's block grid.  ``rename_groups``
+    maps the names ``ast_rename`` will merge to their shared name; the body
+    still spells them apart, so a loop-carried value updated under an alias
+    must count as updated.
     """
-    if not enabled or not xyz_grid or thread_block_dims is None:
+    if not enabled or not exact_grid or thread_block_dims is None:
         return body
     if len(thread_block_dims) != 3 or len(block_grid_dims) != 3:
         return body
@@ -435,7 +645,8 @@ def simplify_proven_bounds(
     module = ast.Module(body=body, type_ignores=[])
     if not _supported_body(body):
         return body
-    if _assigned_names(module) & protected_names:
+    simplifier = _Simplifier(thread_block_dims, grid, merged_names(rename_groups or {}))
+    if simplifier.with_merged(_assigned_names(module)) & protected_names:
         return body
     if any(
         not isinstance(name, str)
@@ -453,8 +664,9 @@ def simplify_proven_bounds(
         marker_suffix += 1
     initial_bounds = {name: (value, value) for name, value in constexpr_values.items()}
     initial_bounds.update({name: (value, value) for name, value in exact_sizes.items()})
-    simplifier = _Simplifier(thread_block_dims, grid)
-    rewritten = simplifier.block(body, initial_bounds)
+    rewritten = simplifier.block(
+        body, initial_bounds, dict.fromkeys(constexpr_values, _PYTHON)
+    )
     if not simplifier.changed:
         return body
     rewritten.insert(

@@ -451,11 +451,10 @@ def _live_lane_setup(
     Setup statements (per-lane index / mask definitions) whose results the
     body never reads are dropped, and a lane loop whose variable is then left
     unreferenced is dead (``_lane_loop_is_live``).  An unused rdim block
-    (e.g. one allocated for a ``tile.index`` that codegen serves from the
-    tile's own block) would otherwise wrap the whole body in a dead innermost
-    loop, and the lane-reduce split pass would then try to split reductions
-    on that loop's lane var instead of the loop that actually distributes
-    them.
+    (one whose index the body never reads) would otherwise wrap the whole
+    body in a dead innermost loop, and the lane-reduce split pass would then
+    try to split reductions on that loop's lane var instead of the loop that
+    actually distributes them.
     """
     from .ast_read_writes import ReadWrites
 
@@ -4429,6 +4428,11 @@ class PerThreadFlattenedTileStrategy(_LaneContextOwner, FlattenedTileStrategy):
             # A packet is V-aligned only when every lane base is: the tile
             # begin must be a multiple of V.
             vec_width = 1
+        # Set when the backend sinks the constexpr V-loop of a one-block tile
+        # into the serial reduction nest it wraps (column sums of a
+        # ``[rows, cols]`` tensor over ``hl.tile(cols)``: one packet per row,
+        # V accumulators; ``Backend.record_flattened_vloop_wrapper``).
+        sink_index_expr: str | None = None
         if vec_width > 1:
             # Same outer x constexpr-V lane partition as
             # ``PerThreadNDTileStrategy.codegen_grid`` so the memory_ops
@@ -4477,11 +4481,21 @@ class PerThreadFlattenedTileStrategy(_LaneContextOwner, FlattenedTileStrategy):
                 vec_lane_var=vec_lane_var,
                 base_index_var=base_index_var,
             )
+            chunk_index = f"{base_index_var} + cutlass.Int32({vec_lane_var})"
             lane_setup_statements.append(
-                statement_from_string(
-                    f"{offsets_var} = {base_index_var} + cutlass.Int32({vec_lane_var})"
-                )
+                statement_from_string(f"{offsets_var} = {chunk_index}")
             )
+            if len(block_ids) == 1 and env.backend.record_flattened_vloop_wrapper(
+                self.fn,
+                vec_wrappers[self._lane_var],
+                block_id=block_id,
+                lane_var=self._lane_var,
+                index_var=self.index_var(block_id),
+                mask_var=self.mask_var(-1),
+                begin=begins[0],
+                extent=env.block_sizes[block_id].numel,
+            ):
+                sink_index_expr = chunk_index
         elif lane_strided:
             # ``offsets = pid*BS + tid + lane * NT`` — consecutive threads
             # touch consecutive elements each lane iter (coalesced even
@@ -4504,6 +4518,11 @@ class PerThreadFlattenedTileStrategy(_LaneContextOwner, FlattenedTileStrategy):
             self.trip_counts[block_idx] = numel
             block_index_var = self.index_var(block_idx)
             expr = offsets_var
+            if sink_index_expr is not None:
+                # The element index is ``offsets`` itself, spelled as the
+                # chunk base plus the V-lane: the form the V-loop sink
+                # recognizes.
+                expr = sink_index_expr
             if total_numel != sympy.S.One:
                 expr = f"({expr}) // ({state.sympy_expr(total_numel)})"
             if i + 1 < len(block_ids):
@@ -4515,9 +4534,14 @@ class PerThreadFlattenedTileStrategy(_LaneContextOwner, FlattenedTileStrategy):
 
         mask_var = self.mask_var(-1)
         if mask_var is not None:
+            # On the element index when the backend sinks the V-loop: the sink
+            # evaluates a mask on that index at the chunk base.
+            bound_var = (
+                offsets_var if sink_index_expr is None else self.index_var(block_ids[0])
+            )
             lane_setup_statements.append(
                 statement_from_string(
-                    f"{mask_var} = {offsets_var} < "
+                    f"{mask_var} = {bound_var} < "
                     f"({state.sympy_expr(begin + total_numel)})"
                 )
             )

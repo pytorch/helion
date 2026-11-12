@@ -1,6 +1,6 @@
 """Thread-axis execution plans for CuTe root kernels.
 
-``plan_execution`` runs three planners over each root graph once per config.
+``plan_execution`` runs four planners over each root graph once per config.
 Each one recognizes a kernel shape from the graph and its tile strategies and
 records a :class:`CuTeGridExecutionPlan` on the graph, which
 ``TileStrategyDispatch`` and ``PerThreadNDTileStrategy`` read to order the
@@ -13,6 +13,9 @@ launch's thread axes and to skip the reduction-axis reservation:
 * ``_plan_warp_per_row_execution``: the softmax shape, one warp per row.
 * ``_plan_register_tile_execution``: a register-tile reduction lane whose
   vectorized tile blocks take the lowest thread axes.
+* ``_plan_vloop_sink_reduction_execution``: a reduction beside a vectorized
+  grid tile that ``cute_vloop_sink`` sinks into it; the tile takes the
+  lowest thread axes.
 """
 
 from __future__ import annotations
@@ -23,17 +26,23 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ... import exc
 from ...language import memory_ops
 from ...language import reduce_ops
 from ..compile_environment import CompileEnvironment
 from .matmul_utils import analyze_direct_grouped_n_loads
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Iterable
 
     from ..device_ir import GraphInfo
+    from ..device_ir import RootGraphInfo
     from ..reduction_strategy import PersistentReductionStrategy
     from ..tile_dispatch import TileStrategyDispatch
+    from ..tile_strategy import PerThreadFlattenedTileStrategy
+    from ..tile_strategy import PerThreadNDTileStrategy
+    from ..tile_strategy import TileStrategy
 
 MATMUL_PLAN_META_KEY = "cute_matmul_plan"
 
@@ -121,10 +130,16 @@ def plan_execution(
     tile_strategy: TileStrategyDispatch,
 ) -> None:
     """Record the execution plans of every root graph in *graphs* (in place)."""
+    from .state import cute_env_state
+
+    # Per pass: ``CuteRegeneration`` reads it after a refusal.
+    env_state = cute_env_state(CompileEnvironment.current())
+    env_state.vloop_sink_reduction_layout_planned = False
     for graph_info in graphs:
         _plan_matmul_execution(graph_info, tile_strategy)
         _plan_warp_per_row_execution(graph_info, tile_strategy)
         _plan_register_tile_execution(graph_info, tile_strategy)
+        _plan_vloop_sink_reduction_execution(graph_info, tile_strategy)
 
 
 def _plan_matmul_execution(
@@ -353,7 +368,7 @@ def _plan_warp_per_row_execution(
         # the inner reduced axis stays above it.  Record that the knob shaped
         # the layout: should no V-loop be sunk after all, codegen restarts
         # with the knob off so the knob alone never changes the code.
-        m_strategy.fn.cute_state.lanes.vloop_sink_layout_applied = True
+        m_strategy.fn.cute_state.lanes.vloop_sink_shaped_code = True
         return
     m_threads = tile_strategy.thread_extent_for_block_id(m_block_id)
     if not isinstance(m_threads, int) or m_threads < 2:
@@ -436,15 +451,12 @@ def _plan_register_tile_execution(
     finalize combines every tile element with the strided shared-memory
     column reduce (``_cute_grouped_reduce_shared_columns``).
 
-    Emits a ``CuTeGridExecutionPlan`` ranking vectorized tile blocks first,
-    other threaded tile blocks next and the reduction last, and disables the
-    reduction-axis reservation for the tile blocks.
+    Records the tile-first plan of ``_record_tile_first_plan``.
     """
     from ..device_ir import RootGraphInfo
     from ..reduction_strategy import PersistentReductionStrategy
     from ..reduction_strategy import ReductionStrategy
     from ..tile_strategy import PerThreadFlattenedTileStrategy
-    from ..tile_strategy import PerThreadNDTileStrategy
 
     if not isinstance(graph_info, RootGraphInfo):
         return
@@ -467,35 +479,233 @@ def _plan_register_tile_execution(
         or not reduction._cute_register_tile_predicted
     ):
         return
+
+    def vectorized(
+        strategy: PerThreadNDTileStrategy | PerThreadFlattenedTileStrategy,
+        block_id: int,
+    ) -> bool:
+        if isinstance(strategy, PerThreadFlattenedTileStrategy):
+            return strategy._lane_var is not None
+        return block_id in strategy._lane_var_by_block
+
+    _record_tile_first_plan(
+        graph_info,
+        _tile_thread_axis_blocks(tile_strategy, vectorized),
+        reduction.block_index,
+    )
+
+
+class VloopSinkLayoutRefused(exc.BackendUnsupported):
+    """Codegen refused the tile-first layout ``cute_vloop_sink`` laid a
+    reduction out in (``_plan_vloop_sink_reduction_execution``): a lane
+    combine the tile threads interleaved below the reduction's axis defeat.
+    An argreduce's finalize folds consecutive lanes; a sibling-axis combine
+    (``_cute_sibling_axis_reduction_expr``) refuses a cluster split, another
+    block on the reduce axis, thread axes that do not tile its group, a group
+    the launch does not prove, and a missing linear thread index.
+
+    The kernel is generated again with the default layout and the knob still
+    on (``CuteEnvState.vloop_sink_reduction_layout_disabled``): by
+    ``generate_ast`` for the codegen graphs it builds, and by a caller that
+    supplied its own graphs (materialized fission), whose execution plans
+    record the layout and which therefore have to be rebuilt.
+    """
+
+    @staticmethod
+    def refusal_type(planned: bool) -> type[exc.BackendUnsupported]:
+        """What a lane combine raises when it cannot combine its lanes: this
+        exception under the layout ``cute_vloop_sink`` planned (``planned``,
+        ``vloop_sink_reduction_layout_planned``), which regenerates the
+        kernel with the default layout, else ``BackendUnsupported``."""
+        return VloopSinkLayoutRefused if planned else exc.BackendUnsupported
+
+
+def _plan_vloop_sink_reduction_execution(
+    graph_info: GraphInfo,
+    tile_strategy: TileStrategyDispatch,
+) -> None:
+    """Lay a vectorized grid tile below a threaded rolled reduction it encloses.
+
+    ``cute_vloop_sink`` interchanges a vectorized grid axis's constexpr
+    V-loop into the loops of its body, so every lane of a reduction loads V
+    contiguous elements of a row at once (a channels-last spatial mean:
+    ``x[tile_n, :, tile_c]`` reduced over the middle dim).  With the
+    reduction threads on ``thread_idx[0]`` (the CuTe default, for warp
+    shuffles) the lanes of a warp sit on different rows, ``C`` elements
+    apart, and every V-wide load instruction touches as many cache lines as
+    the warp has reduction lanes.  As for the column sums of
+    ``_plan_warp_per_row_execution``, adjacent column chunks must sit in
+    adjacent threads: the tile-first plan of ``_record_tile_first_plan``
+    puts the vectorized grid blocks on the lowest thread axes, and the
+    reduction combines its lanes across the interleaved tile threads (the
+    grouped shared-memory reduce of the looped emitter).
+
+    Records that the knob shaped the layout, so codegen restarts with it off
+    when no V-loop is sunk after all.  Keeps the default layout when the
+    tile-first order would put an axis past its launch limit (128 reduction
+    threads on z); a lane combine the interleaved threads defeat (the
+    argreduce finalize, or a sibling-axis combine refusal) refuses the
+    layout in codegen (``VloopSinkLayoutRefused``), and the kernel is
+    generated again with the default layout.
+    """
+    from ..device_ir import RootGraphInfo
+    from ..host_function import HostFunction
+    from ..reduction_strategy import LoopedReductionStrategy
+    from ..reduction_strategy import ReductionStrategy
+    from ..tile_strategy import PerThreadNDTileStrategy
+    from .state import cute_env_state
+    from .thread_budget import MAX_THREAD_BLOCK_DIMS
+
+    if not isinstance(graph_info, RootGraphInfo):
+        return
+    # One grid, as for ``_plan_warp_per_row_execution``: the plan lays out the
+    # strategies of every root, and would rank another root's blocks.
+    if len(HostFunction.current().device_ir.grid_block_ids) != 1:
+        return
+    if graph_info.cute_grid_execution_plans:
+        return
+    env_state = cute_env_state(CompileEnvironment.current())
+    if env_state.vloop_sink_reduction_layout_disabled:
+        return
+    reductions = [
+        strategy
+        for strategy in tile_strategy.strategies
+        if isinstance(strategy, ReductionStrategy)
+        and strategy._reduction_thread_count() > 1
+    ]
+    # A rolled reduction combines its lanes across the interleaved tile
+    # threads in shared memory; a persistent one keeps its warp shuffles.
+    if len(reductions) != 1 or not isinstance(reductions[0], LoopedReductionStrategy):
+        return
+    (reduction,) = reductions
+    if reduction.fn.config.config.get("cute_vloop_sink") is not True:
+        return
+    tiles = [
+        strategy
+        for strategy in tile_strategy.strategies
+        if not isinstance(strategy, ReductionStrategy)
+    ]
+    if not tiles or not all(
+        isinstance(strategy, PerThreadNDTileStrategy) and not strategy.mma_mode
+        for strategy in tiles
+    ):
+        return
+    grid_strategy = tiles[0]
+    assert isinstance(grid_strategy, PerThreadNDTileStrategy)
+
+    def vectorized(
+        strategy: PerThreadNDTileStrategy | PerThreadFlattenedTileStrategy,
+        block_id: int,
+    ) -> bool:
+        return (
+            strategy is grid_strategy
+            and block_id in grid_strategy._lane_var_by_block
+            and grid_strategy.lane_context(block_id).vec_width > 1
+        )
+
+    blocks = _tile_thread_axis_blocks(tile_strategy, vectorized)
+    # Every strategy but the reduction is a per-thread tile (checked above).
+    assert blocks is not None
+    vector_blocks, other_blocks = blocks
+    # The dispatcher orders whole strategies by the plan, and the grid
+    # strategy numbers its own threaded blocks in loop order
+    # (``_thread_axis_map``): the vectors take the lowest axes only when its
+    # loop order reaches them before its other threaded blocks.  Otherwise
+    # keep the default layout rather than put rows below them (blocks
+    # [32, 64] on (32, 8) threads would launch (32, 8, 2), each warp on 32
+    # images).
+    threaded = [
+        block_id
+        for block_id in _axis_ordered_blocks(grid_strategy)
+        if block_id in vector_blocks or block_id in other_blocks
+    ]
+    if threaded[: len(vector_blocks)] != [b for b in threaded if b in vector_blocks]:
+        return
+    # The plan orders the axes as listed, the reduction last: the vectors,
+    # then the other threaded blocks, whose order only matters on z, where
+    # the reduction sits when three axes are threaded.
+    order = [*vector_blocks, *other_blocks, reduction.block_index]
+    extents = [tile_strategy.thread_extent_for_block_id(b) for b in order]
+    if len(order) > len(MAX_THREAD_BLOCK_DIMS) or any(
+        extent is None or extent > limit
+        for extent, limit in zip(extents, MAX_THREAD_BLOCK_DIMS, strict=False)
+    ):
+        return
+    if _record_tile_first_plan(graph_info, blocks, reduction.block_index):
+        grid_strategy.fn.cute_state.lanes.vloop_sink_shaped_code = True
+        env_state.vloop_sink_reduction_layout_planned = True
+
+
+def _tile_thread_axis_blocks(
+    tile_strategy: TileStrategyDispatch,
+    vectorized: Callable[
+        [PerThreadNDTileStrategy | PerThreadFlattenedTileStrategy, int], bool
+    ],
+) -> tuple[list[int], list[int]] | None:
+    """The tile blocks that take a thread axis, split into the vectorized
+    ones (``vectorized(strategy, block_id)``) and the others; None when a
+    strategy other than a reduction is not a per-thread tile.  A flattened
+    strategy's one axis carries all of its blocks, judged by its last."""
+    from ..reduction_strategy import ReductionStrategy
+    from ..tile_strategy import PerThreadFlattenedTileStrategy
+    from ..tile_strategy import PerThreadNDTileStrategy
+
     vector_blocks: list[int] = []
     other_blocks: list[int] = []
     for strategy in tile_strategy.strategies:
         if isinstance(strategy, ReductionStrategy):
             continue
         if isinstance(strategy, PerThreadFlattenedTileStrategy):
-            # One flattened axis for every block of the strategy.
             if strategy._uses_thread_axis():
-                target = vector_blocks if strategy._lane_var else other_blocks
+                target = (
+                    vector_blocks
+                    if vectorized(strategy, strategy.block_ids[-1])
+                    else other_blocks
+                )
                 target.extend(strategy.block_ids)
             continue
         if not isinstance(strategy, PerThreadNDTileStrategy):
-            return
+            return None
         assert isinstance(strategy.block_size, list)
         for block_id, block_size in zip(
             strategy.block_ids, strategy.block_size, strict=True
         ):
-            if not strategy._uses_thread_axis_for_block(block_id, block_size):
-                continue
-            if block_id in strategy._lane_var_by_block:
-                vector_blocks.append(block_id)
-            else:
-                other_blocks.append(block_id)
-    if not vector_blocks:
-        return
+            if strategy._uses_thread_axis_for_block(block_id, block_size):
+                target = (
+                    vector_blocks if vectorized(strategy, block_id) else other_blocks
+                )
+                target.append(block_id)
+    return vector_blocks, other_blocks
+
+
+def _axis_ordered_blocks(strategy: TileStrategy) -> list[int]:
+    """``strategy``'s blocks in the order it numbers their thread axes: loop
+    order (``_thread_axis_map``); a flattened strategy's one axis carries them
+    all."""
+    from ..tile_strategy import PerThreadNDTileStrategy
+
+    if isinstance(strategy, PerThreadNDTileStrategy):
+        return [strategy.block_ids[i] for i in strategy.loop_order]
+    return list(strategy.block_ids)
+
+
+def _record_tile_first_plan(
+    graph_info: RootGraphInfo,
+    blocks: tuple[list[int], list[int]] | None,
+    reduction_block_id: int,
+) -> bool:
+    """Record a ``CuTeGridExecutionPlan`` ranking the vectorized tile blocks
+    of ``blocks`` (``_tile_thread_axis_blocks``) first, the other threaded
+    tile blocks next and the reduction last, with the reduction-axis
+    reservation disabled for the tile blocks.  False, recording nothing,
+    without a vectorized block."""
+    if blocks is None or not blocks[0]:
+        return False
+    vector_blocks, other_blocks = blocks
     priority = {
         **dict.fromkeys(vector_blocks, 0),
         **dict.fromkeys(other_blocks, 1),
-        reduction.block_index: 2,
+        reduction_block_id: 2,
     }
     graph_info.cute_grid_execution_plans = (
         *graph_info.cute_grid_execution_plans,
@@ -507,3 +717,4 @@ def _plan_register_tile_execution(
             ),
         ),
     )
+    return True

@@ -267,6 +267,22 @@ def _center_rows_then_two_roots(
     return out, y_sums, z_sums
 
 
+def _center_rows_then_sum_and_max(
+    x: torch.Tensor, w: torch.Tensor, y: torch.Tensor, z: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    out = torch.empty_like(w)
+    sums = torch.empty([y.size(0)], dtype=torch.float32, device=y.device)
+    maxes = torch.empty([z.size(0)], dtype=torch.float32, device=z.device)
+    for tile_m in hl.tile(x.size(0)):
+        mean = torch.mean(x[tile_m, :].to(torch.float32), dim=-1)
+        for tile_n in hl.tile(w.size(1)):
+            out[tile_m, tile_n] = (w[tile_m, tile_n] - mean[:, None]).to(w.dtype)
+    for tile_r in hl.tile(y.size(0)):
+        sums[tile_r] = y[tile_r, :].to(torch.float32).sum(-1)
+        maxes[tile_r] = z[tile_r, :].to(torch.float32).amax(-1)
+    return out, sums, maxes
+
+
 @pytest.mark.parametrize(
     ("fn", "shapes", "values", "launch", "threads"),
     [
@@ -289,6 +305,15 @@ def _center_rows_then_two_roots(
             {"block_sizes": [1, 16, 1, 1]},
             "(8, 1, 16)",
             {1: 8, 4: 8, 6: 1},
+        ),
+        # The second root's max, threaded, would reserve a third axis and push
+        # the first root's 16-thread loop off the launch.
+        (
+            _center_rows_then_sum_and_max,
+            [(64, 8), (64, 16), (64, 128), (64, 256)],
+            {"block_sizes": [1, 16, 1]},
+            "(8, 1, 16)",
+            {1: 8, 4: 8, 5: 1},
         ),
         # Taking the first sum's 8 threads would move the 128-row tiles to the
         # z axis, past its 64 threads.

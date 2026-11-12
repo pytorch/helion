@@ -78,6 +78,18 @@ _RELAYOUT_TARGETS = frozenset({torch.ops.aten.permute.default})
 # shortened DMA can leave its VMEM tail stale.
 PALLAS_DEFERRED_MASK_CONSUMERS_META = "pallas_deferred_mask_consumers"
 
+# On a ``_for_loop`` node, for each carry with a dim on the loop's own blocks
+# (by its index), those of the blocks along which its update reads the tile's
+# lanes (``_LaneReads``), in all of it or in a branch of a runtime ``if``, as
+# ``mask_loop_carries`` records them.  Only the CuTe lane-merged carry check
+# reads it; the other backends ignore it.
+CARRIES_READING_TILE_LANES_META = "carries_reading_tile_lanes"
+# On a ``_for_loop`` node, the indices of the carries ``mask_loop_carries``
+# leaves unmasked because a select of a whole update would drop what a
+# branch adds to the padded lanes (``_LaneReads.select_drops_a_branch``).
+# Only the CuTe lane-merged carry check reads it.
+CARRIES_LEFT_UNMASKED_META = "carries_left_unmasked"
+
 
 def mask_node_inputs(
     node: torch.fx.Node,
@@ -609,7 +621,7 @@ def _dim_blocks(value: object, blocks: Collection[int]) -> dict[int, int]:
 
 
 # Reads of a value's metadata, not of its elements.
-_METADATA_TARGETS = (torch.ops.aten.sym_size.int, torch.ops.aten.sym_stride.int)
+METADATA_TARGETS = (torch.ops.aten.sym_size.int, torch.ops.aten.sym_stride.int)
 
 # A carry update ``op(carry, other)`` leaves the carry as it is wherever
 # ``other`` holds the op's identity.  A division has one for its divisor
@@ -671,7 +683,10 @@ def mask_loop_carries(graphs: Sequence[GraphInfo]) -> None:
     take the fill values (CuTe refuses such a carry); a dim of size ``bn =
     hl.register_block_size(n)`` is on it.  Backends that do not lower
     ``_mask_select`` keep their carries as they are
-    (``Backend.lowers_mask_select``).
+    (``Backend.lowers_mask_select``).  Each loop records the blocks along
+    which each such carry's update reads the tile's lanes
+    (``CARRIES_READING_TILE_LANES_META``), for checks that run on code
+    generation's copies of the graphs.
     """
     from .device_ir import ForLoopGraphInfo
 
@@ -686,9 +701,17 @@ def mask_loop_carries(graphs: Sequence[GraphInfo]) -> None:
         assert isinstance(body, ForLoopGraphInfo)
         blocks = {env.canonical_block_id(block_id) for block_id in body.block_ids}
         selected: set[tuple[torch.fx.Graph, int]] = set()
+        reading: dict[int, frozenset[int]] = {}
+        left: set[int] = set()
         for carry in loop_carries(loop, body.graph):
             if not block_dims(carry.placeholder.meta.get("val"), blocks):
                 continue
+            if isinstance(carry.update, torch.fx.Node):
+                reading[carry.index] = frozenset(
+                    block
+                    for block in blocks
+                    if lanes.reads_tile_lanes(carry.update, body.graph, (block,))
+                )
             for update in lanes.updates(body.graph, carry.index, carry.placeholder):
                 if (
                     (update.graph, update.index) not in selected
@@ -696,9 +719,12 @@ def mask_loop_carries(graphs: Sequence[GraphInfo]) -> None:
                     and not lanes.mask_tile_operands(update, body.graph, blocks)
                 ):
                     if lanes.select_drops_a_branch(update, body.graph, blocks):
+                        left.add(carry.index)
                         continue
                     selected.add((update.graph, update.index))
                     _select_carry_update(update, blocks)
+        loop.meta[CARRIES_READING_TILE_LANES_META] = reading
+        loop.meta[CARRIES_LEFT_UNMASKED_META] = frozenset(left)
 
 
 class _CarryUpdate(NamedTuple):
@@ -797,7 +823,7 @@ class _LaneReads:
             val = node.meta.get("val")
             if (
                 node in seen
-                or node.target in _METADATA_TARGETS
+                or node.target in METADATA_TARGETS
                 # The results of a multi-output op are its getitems.
                 or (not isinstance(val, (list, tuple)) and not block_dims(val, blocks))
             ):
@@ -1532,21 +1558,19 @@ def getitem_masked_value(
 
 
 def if_result_source(
-    if_node: torch.fx.Node, index: int
+    if_node: torch.fx.Node,
+    index: int,
+    graphs: Sequence[GraphInfo] | None = None,
 ) -> tuple[int, int] | torch.fx.Node | None:
-    """Where result ``index`` of the ``_if`` node ``if_node`` comes from: a
-    branch output, as ``(graph_id, output_index)``, or for a variable the
-    branch does not assign, the outer value it passes through (an input of
-    either branch), or None when that value is not a node.
-
-    The if branch's ``IfGraphInfo.result_source`` reads the results' layout.
-    """
+    """``IfGraphInfo.result_source`` of result ``index`` of the ``_if`` node
+    ``if_node``, whose branches ``graphs`` holds by graph id (by default, the
+    current ``DeviceIR``'s graphs)."""
     from .device_ir import DeviceIR
     from .device_ir import IfGraphInfo
 
-    if_graph_id, else_graph_id = if_node.args[1:3]
-    assert isinstance(if_graph_id, int) and isinstance(else_graph_id, int)
-    if_info = DeviceIR.current().graphs[if_graph_id]
+    if_graph_id = if_node.args[1]
+    assert isinstance(if_graph_id, int)
+    if_info = (DeviceIR.current().graphs if graphs is None else graphs)[if_graph_id]
     assert isinstance(if_info, IfGraphInfo)
     return if_info.result_source(if_node, index)
 

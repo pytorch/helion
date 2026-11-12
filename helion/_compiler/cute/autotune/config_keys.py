@@ -205,6 +205,7 @@ CUTE_MISC_SCHEDULE_KEYS: tuple[str, ...] = (
     "cute_scalar_epilogue_owner_fold",
     "cute_warp_fp32_redux",
     "cute_register_tile_warp_fold",
+    "cute_register_tile_cooperative_fold",
     "cute_register_tile_store_first",
     "cute_replicated_reduction",
     "cute_vector_packet_unroll",
@@ -219,6 +220,7 @@ CUTE_MISC_SCHEDULE_KEYS: tuple[str, ...] = (
     "cute_pdl_release",
     "cute_pdl_spread",
     "cute_warp_aggregated_atomics",
+    "cute_privatize_atomics",
     "cute_packet_prefetch",
     "cute_wide_packet_hints",
 )

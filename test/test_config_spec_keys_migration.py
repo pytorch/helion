@@ -133,7 +133,8 @@ _BASE_VALID_KEYS = """
     cute_register_row cute_register_row_tensor_copy cute_register_subblocks
     cute_register_subblocks_colside cute_register_subblocks_mask
     cute_register_subblocks_prefetch cute_register_subblocks_roll
-    cute_register_subblocks_warps cute_register_tile_store_first
+    cute_register_subblocks_warps cute_register_tile_cooperative_fold
+    cute_register_tile_store_first
     cute_register_tile_warp_fold cute_replicated_reduction cute_rng_packet
     cute_scalar_epilogue cute_scalar_epilogue_keep_inputs
     cute_scalar_epilogue_owner_fold cute_scaled_cluster_m cute_scaled_compact_m
@@ -194,7 +195,7 @@ _BASE_VALID_KEYS = """
     tcgen05_warp_spec_register_decrease tcgen05_warp_spec_register_increase
     tcgen05_warp_spec_scheduler_warps tcgen05_warp_spec_store_warps waves_per_eu
     xcd_remap
-    cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_flash_gated_row_warps cute_pdl_spread cute_split_k_atomic_epilogue tcgen05_epi_round_subtiles
+    cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_flash_gated_row_warps cute_pdl_spread cute_split_k_atomic_epilogue tcgen05_epi_round_subtiles cute_privatize_atomics
 """
 
 # ``BACKEND_SPECIFIC_KEYS``.
@@ -293,7 +294,8 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_register_row cute_register_row_tensor_copy cute_register_subblocks
     cute_register_subblocks_colside cute_register_subblocks_mask
     cute_register_subblocks_prefetch cute_register_subblocks_roll
-    cute_register_subblocks_warps cute_register_tile_store_first
+    cute_register_subblocks_warps cute_register_tile_cooperative_fold
+    cute_register_tile_store_first
     cute_register_tile_warp_fold cute_replicated_reduction cute_rng_packet
     cute_scalar_epilogue cute_scalar_epilogue_keep_inputs
     cute_scalar_epilogue_owner_fold cute_scaled_cluster_m cute_scaled_compact_m
@@ -349,7 +351,7 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     tcgen05_warp_spec_register_decrease tcgen05_warp_spec_register_increase
     tcgen05_warp_spec_scheduler_warps tcgen05_warp_spec_store_warps waves_per_eu
     xcd_remap
-    cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_flash_gated_row_warps cute_pdl_spread cute_split_k_atomic_epilogue tcgen05_epi_round_subtiles
+    cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_flash_gated_row_warps cute_pdl_spread cute_split_k_atomic_epilogue tcgen05_epi_round_subtiles cute_privatize_atomics
 """
 
 # ``_CUTE_IMPLICIT_DEFAULT_KEYS``.
@@ -387,7 +389,8 @@ _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     cute_reduction_group_rows cute_reduction_local_tree cute_reduction_pack_output
     cute_reduction_pipeline_depth cute_reduction_row_schedule
     cute_reduction_schedule cute_reduction_sequence cute_register_chain
-    cute_register_row cute_register_row_tensor_copy cute_register_tile_store_first
+    cute_register_row cute_register_row_tensor_copy
+    cute_register_tile_cooperative_fold cute_register_tile_store_first
     cute_register_tile_warp_fold cute_replicated_reduction cute_rng_packet
     cute_scalar_epilogue cute_scalar_epilogue_keep_inputs
     cute_scalar_epilogue_owner_fold cute_scaled_cluster_m cute_scaled_compact_m
@@ -404,7 +407,7 @@ _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     l2_groupings load_eviction_policies loop_orders maxnreg num_sm_multiplier
     num_stages num_warps pid_type range_flattens range_multi_buffers
     range_num_stages range_unroll_factors range_warp_specializes static_ranges
-    cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_pdl_spread cute_split_k_atomic_epilogue
+    cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_pdl_spread cute_split_k_atomic_epilogue cute_privatize_atomics
 """
 
 # ``{k in VALID_KEYS: CuteBackend().supports_config_key(k)}``.
@@ -504,7 +507,8 @@ _BASE_CUTE_ACCEPTED = """
     cute_register_row cute_register_row_tensor_copy cute_register_subblocks
     cute_register_subblocks_colside cute_register_subblocks_mask
     cute_register_subblocks_prefetch cute_register_subblocks_roll
-    cute_register_subblocks_warps cute_register_tile_store_first
+    cute_register_subblocks_warps cute_register_tile_cooperative_fold
+    cute_register_tile_store_first
     cute_register_tile_warp_fold cute_replicated_reduction cute_rng_packet
     cute_scalar_epilogue cute_scalar_epilogue_keep_inputs
     cute_scalar_epilogue_owner_fold cute_scaled_cluster_m cute_scaled_compact_m
@@ -559,7 +563,7 @@ _BASE_CUTE_ACCEPTED = """
     tcgen05_warp_spec_epi_load_warps tcgen05_warp_spec_mma_warps
     tcgen05_warp_spec_register_decrease tcgen05_warp_spec_register_increase
     tcgen05_warp_spec_scheduler_warps tcgen05_warp_spec_store_warps
-    cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_flash_gated_row_warps cute_pdl_spread cute_split_k_atomic_epilogue tcgen05_epi_round_subtiles
+    cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_flash_gated_row_warps cute_pdl_spread cute_split_k_atomic_epilogue tcgen05_epi_round_subtiles cute_privatize_atomics
 """
 
 # The same census for ``TritonBackend``.

@@ -183,6 +183,7 @@ class Config(Mapping[str, object]):
         cute_pdl_release: CutePdlReleaseLiteral | None = None,
         cute_pdl_spread: bool | None = None,
         cute_warp_aggregated_atomics: bool | None = None,
+        cute_privatize_atomics: bool | None = None,
         cute_packet_prefetch: int | None = None,
         cute_reduction_pipeline_depth: int | None = None,
         cute_host_paired_sum: CuteHostPairedSumLiteral | None = None,
@@ -251,7 +252,9 @@ class Config(Mapping[str, object]):
             cute_signed_bitfield_bf16: Convert proved signed byte fields to BF16
                 using the existing vector load/store packets. Disabled by default.
             cute_proven_bounds: Remove CuTe index guards only when exact launch
-                dimensions and cache-specialized tensor sizes prove them true.
+                dimensions and cache-specialized tensor sizes prove them true,
+                and divide the Int32 indices those facts prove nonnegative
+                (``//``, ``%``) in unsigned arithmetic.
             cute_affine_scan_schedule: Physical schedule for a compatible affine
                 scan. ``"ordinary"`` disables the direct lowering;
                 ``"direct_m16n8_v1"`` and ``"direct_m16n16_v1"`` select the
@@ -268,9 +271,12 @@ class Config(Mapping[str, object]):
                 per-lane register accumulators, one grouped cross-thread combine
                 per row tile. Disabled by default. Kernels where nothing can be
                 sunk generate exactly the knob-off code.
-            cute_lane_unroll: Unroll factor (1, 2, 4, 8, 16) for the row lane
-                loop of a sunk vector nest; every copy's vector loads issue
-                before any copy's accumulates. Only applies with cute_vloop_sink.
+            cute_lane_unroll: Unroll factor (1, 2, 4, 8, 16) for per-thread
+                lane loops: every unrolled lane's loads issue before the first
+                of them computes. It takes the row lane loop of a sunk vector
+                nest (with cute_vloop_sink), else the lane loops of tile axes
+                the config gives fewer threads than elements; kernels where no
+                loop takes it generate exactly the knob-off code.
             cute_wide_packet_hints: Carry the ``l2_last`` / ``l1_l2_first`` /
                 ``l1_l2_last`` load eviction policies onto 32-byte CuTe packets
                 (``cute_vector_widths`` 8 for fp32, 16 for bf16/fp16) through
@@ -356,6 +362,17 @@ class Config(Mapping[str, object]):
             cute_warp_aggregated_atomics: Combine relaxed Int32 zero/one ticket
                 reservations for equal addresses within each active warp. Each
                 lane retains its own valid fetch-add return value. Off by default.
+            cute_privatize_atomics: Accumulate the relaxed ``hl.atomic_add``
+                updates of a small fp32 or int32 tensor (16 KiB in all) that the
+                kernel touches only through such adds in a shared-memory copy
+                per CTA, and add each changed cell to the tensor once after the
+                CTA's last tile. This changes the fp32 summation order. Off by
+                default; offered only for tensors of static shape and rank at
+                least 1, proven not to alias the kernel's other tensors, whose
+                views share one dtype, in kernels without a matmul,
+                ``hl.barrier()``, an atomic that is not relaxed, asm not
+                declared pure, an access through a stack tensor
+                (``hl.stacktensor_like``) or a remote copy or barrier.
             cute_packet_prefetch: Prefetch 2, 4, or 8 independent vector packets
                 in a proved complete tile; 0 (the default) keeps the original order.
                 Requires cute_proven_bounds and storage-disjointness proof.
@@ -459,6 +476,7 @@ class Config(Mapping[str, object]):
             "cute_pdl_release": cute_pdl_release,
             "cute_pdl_spread": cute_pdl_spread,
             "cute_warp_aggregated_atomics": cute_warp_aggregated_atomics,
+            "cute_privatize_atomics": cute_privatize_atomics,
             "cute_packet_prefetch": cute_packet_prefetch,
             "cute_reduction_pipeline_depth": cute_reduction_pipeline_depth,
             "cute_host_paired_sum": cute_host_paired_sum,

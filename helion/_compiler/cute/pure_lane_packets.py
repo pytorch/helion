@@ -85,6 +85,38 @@ def _pure_packet_call(call: ast.Call) -> bool:
     ) and is_pure_inline_asm_call(call)
 
 
+def inline_asm_operands(call: ast.Call) -> tuple[object, object, object] | None:
+    """``(asm, constraints, is_pure)`` of a ``_cute_inline_asm_elementwise``
+    call over one operand tuple whose keywords are those constants, a
+    ``dtype`` and an optional integer ``pack``; None for any other call."""
+    if not (
+        isinstance(call.func, ast.Name)
+        and call.func.id == "_cute_inline_asm_elementwise"
+        and len(call.args) == 1
+    ):
+        return None
+    keywords = {keyword.arg: keyword.value for keyword in call.keywords}
+    pack = keywords.pop("pack", None)
+    if pack is not None and not (
+        isinstance(pack, ast.Constant) and type(pack.value) is int
+    ):
+        return None
+    if set(keywords) != {"asm", "constraints", "dtype", "is_pure"}:
+        return None
+    asm, constraints, pure = (
+        keywords["asm"],
+        keywords["constraints"],
+        keywords["is_pure"],
+    )
+    if not (
+        isinstance(asm, ast.Constant)
+        and isinstance(constraints, ast.Constant)
+        and isinstance(pure, ast.Constant)
+    ):
+        return None
+    return asm.value, constraints.value, pure.value
+
+
 def is_pure_inline_asm_call(call: ast.Call) -> bool:
     """Whether ``call`` is ``_cute_inline_asm_elementwise`` over pure scalar
     arithmetic (:func:`is_pure_scalar_assembly`), packed or not.
@@ -94,30 +126,13 @@ def is_pure_inline_asm_call(call: ast.Call) -> bool:
     the same effect-free asm once per element whatever the pack, so the pack
     width changes the register ABI, not the purity.
     """
-    if ast.unparse(call.func) != "_cute_inline_asm_elementwise" or len(call.args) != 1:
+    operands = inline_asm_operands(call)
+    if operands is None:
         return False
-    keywords = {keyword.arg: keyword.value for keyword in call.keywords}
-    pack = keywords.pop("pack", None)
-    if pack is not None and not (
-        isinstance(pack, ast.Constant) and type(pack.value) is int
-    ):
-        return False
-    if set(keywords) != {"asm", "constraints", "dtype", "is_pure"}:
-        return False
-    pure, asm, constraints = (
-        keywords["is_pure"],
-        keywords["asm"],
-        keywords["constraints"],
-    )
-    if not (
-        isinstance(pure, ast.Constant)
-        and isinstance(asm, ast.Constant)
-        and isinstance(constraints, ast.Constant)
-    ):
-        return False
+    asm, constraints, pure = operands
     from .philox_stream import SCALAR_ASM
 
-    if asm.value == SCALAR_ASM:
+    if asm == SCALAR_ASM:
         # The compiler's own uniform stream.  Its lane loop belongs to
         # ``lower_philox_packets``, which shares one Philox evaluation across
         # the lanes and then vectorizes the fast path's memory itself (through
@@ -125,7 +140,7 @@ def is_pure_inline_asm_call(call: ast.Call) -> bool:
         # per-lane RNG loop inside the vector path, where the packet guard's
         # branches disagree on the collected store list.
         return False
-    return is_pure_scalar_assembly(asm.value, constraints.value, pure.value)
+    return is_pure_scalar_assembly(asm, constraints, pure)
 
 
 def is_pure_scalar_assembly(asm: object, constraints: object, is_pure: object) -> bool:

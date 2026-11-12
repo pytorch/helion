@@ -36,6 +36,7 @@ from .variable_origin import GridOrigin
 from .variable_origin import TileBeginOrigin
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Sequence
 
     from ..runtime.config import Config
@@ -194,6 +195,21 @@ def exact_tile_block_ids(
     return tuple(block_ids)
 
 
+# Ops that keep a value's elements in their lanes when its shape stays: a
+# view of a range in its own shape (``hl.arange(1, 6).reshape(5)``) is the
+# range, and so are its copy and alias (``clone``, ``alias``), which are not
+# views but keep the lanes too.
+LANE_PRESERVING_OPS = frozenset(
+    {
+        torch.ops.aten.view.default,
+        torch.ops.aten.reshape.default,
+        torch.ops.aten._unsafe_view.default,
+        torch.ops.aten.alias.default,
+        torch.ops.aten.clone.default,
+    }
+)
+
+
 def _padded_iota_dims(
     node: object,
     *,
@@ -203,10 +219,11 @@ def _padded_iota_dims(
     """Per-dim lengths of the padded iotas ``node`` is computed lane-wise from.
 
     A static non-power-of-2 ``hl.arange`` is emitted as a power-of-2 range, and
-    ``[:, None]`` subscripts and pointwise ops (``rows[:, None] * 9 + cols``)
-    keep its padding lanes in place; with ``through_loads``, so does a load
-    indexed by such a range (``_padded_load_dims``).  Entry ``d`` is the iota
-    length behind dim ``d``, or None where no padded iota feeds that dim.
+    ``[:, None]`` subscripts, views in its own shape (``LANE_PRESERVING_OPS``)
+    and pointwise ops (``rows[:, None] * 9 + cols``) keep its padding lanes in
+    place; with ``through_loads``, so does a load indexed by such a range
+    (``_padded_load_dims``).  Entry ``d`` is the iota length behind dim ``d``,
+    or None where no padded iota feeds that dim.
     """
     from ..language import _tracing_ops
     from ..language import memory_ops
@@ -250,6 +267,22 @@ def _padded_iota_dims(
         return (length if padded else None,)
     if through_loads and node.target is memory_ops.load:
         return _padded_load_dims(node, memo)
+    if node.target in LANE_PRESERVING_OPS:
+        base_node = node.args[0]
+        val = node.meta.get("val")
+        base_val = (
+            base_node.meta.get("val") if isinstance(base_node, torch.fx.Node) else None
+        )
+        # ``known_equal``: comparing the symbolic sizes would add guards.
+        env = CompileEnvironment.current()
+        if (
+            not isinstance(val, torch.Tensor)
+            or not isinstance(base_val, torch.Tensor)
+            or val.ndim != base_val.ndim
+            or not all(map(env.known_equal, val.shape, base_val.shape))
+        ):
+            return None
+        return _padded_iota_dims_once(base_node, through_loads, memo)
     if node.target is view_ops.subscript:
         base = _padded_iota_dims_once(node.args[0], through_loads, memo)
         index = node.args[1]
@@ -329,15 +362,14 @@ def _padded_iota_dims_once(
     return memo[key]
 
 
-def _padded_load_dims(
-    node: torch.fx.Node,
-    memo: dict[tuple[torch.fx.Node, bool], tuple[int | None, ...] | None],
-) -> tuple[int | None, ...] | None:
-    """``_padded_iota_dims`` of a load: the padded iotas its tensor indices
-    carry into the dims ``SubscriptIndexing.compute_shape`` gives them.
+def load_index_axes(node: torch.fx.Node) -> dict[int, list[int | None]] | None:
+    """For each tensor index of the load ``node``, by its position in the
+    subscript, the load's dim each of the index's dims runs along (None: none),
+    as ``SubscriptIndexing.compute_shape`` lays them out (through the same
+    helpers); None when they do not add up to the load's rank.
 
-    ``hl.load(x, [i, hl.arange(200)])`` has one dim, of the range's padded
-    size 256, whose first 200 lanes it loads.
+    ``hl.load(x, [i, hl.arange(200)])`` has one dim, along which the range
+    runs; ``x[tile, rows, :]`` has three, the second ``rows``'.
     """
     index = node.args[1]
     val = node.meta.get("val")
@@ -351,36 +383,73 @@ def _padded_load_dims(
     tensors = [
         (position, k) for position, k in enumerate(fake) if isinstance(k, torch.Tensor)
     ]
-
-    def lanes(position: int) -> tuple[int | None, ...]:
-        k = fake[position]
-        assert isinstance(k, torch.Tensor)
-        found = _padded_iota_dims_once(index[position], True, memo)
-        return found if found is not None and len(found) == k.ndim else (None,) * k.ndim
-
+    axes: dict[int, list[int | None]] = {
+        position: [None] * k.ndim for position, k in tensors
+    }
     broadcast = env.should_broadcast_tensor_indexers(fake)
-    dims: list[int | None] = []
+    rank = 0
     for position, k in enumerate(fake):
         if isinstance(k, torch.Tensor):
-            # The dims the indexers give the load, and the indexer dims each
-            # runs along, are compute_shape's (through the same helpers).
             if not broadcast:
-                dims.extend(
-                    None if dim is None else lanes(position)[dim]
-                    for dim in env.tensor_indexer_dim_sources(k)
-                )
+                for dim in env.tensor_indexer_dim_sources(k):
+                    if dim is not None:
+                        axes[position][dim] = rank
+                    rank += 1
             elif position == tensors[0][0]:
                 for sources in env.tensor_indexer_broadcast_sources(
                     [t for _, t in tensors]
                 ):
-                    found = {lanes(tensors[i][0])[dim] for i, dim in sources}
-                    found.discard(None)
-                    if len(found) > 1:
-                        return None
-                    dims.append(found.pop() if found else None)
+                    for i, dim in sources:
+                        axes[tensors[i][0]][dim] = rank
+                    rank += 1
         elif k is None or isinstance(k, slice) or is_block_size_index(k):
-            dims.append(None)
-    return tuple(dims) if len(dims) == val.ndim else None
+            rank += 1
+    return axes if rank == val.ndim else None
+
+
+def _padded_load_dims(
+    node: torch.fx.Node,
+    memo: dict[tuple[torch.fx.Node, bool], tuple[int | None, ...] | None],
+) -> tuple[int | None, ...] | None:
+    """``_padded_iota_dims`` of a load: the padded iotas its tensor indices
+    carry into the dims ``load_index_axes`` gives them.
+
+    ``hl.load(x, [i, hl.arange(200)])`` has one dim, of the range's padded
+    size 256, whose first 200 lanes it loads.
+    """
+    index = node.args[1]
+    if (axes := load_index_axes(node)) is None:
+        return None
+    assert isinstance(index, (list, tuple))
+
+    def lanes(position: int) -> tuple[int | None, ...] | None:
+        found = _padded_iota_dims_once(index[position], True, memo)
+        return (
+            found if found is not None and len(found) == len(axes[position]) else None
+        )
+
+    return padded_index_dims(node, axes, lanes)
+
+
+def padded_index_dims(
+    node: torch.fx.Node,
+    axes: dict[int, list[int | None]],
+    lanes: Callable[[int], tuple[int | None, ...] | None],
+) -> tuple[int | None, ...] | None:
+    """The padded iotas the tensor indices of the load ``node`` carry into
+    its dims: each index's (``lanes``, by position) along the dims
+    ``load_index_axes`` gives it (``axes``); None where two of them meet in a
+    dim with different lengths."""
+    found: list[set[int]] = [set() for _ in range(node.meta["val"].ndim)]
+    for position, dims in axes.items():
+        if (lengths := lanes(position)) is None or len(lengths) != len(dims):
+            continue
+        for axis, length in zip(dims, lengths, strict=True):
+            if axis is not None and length is not None:
+                found[axis].add(length)
+    if any(len(lengths) > 1 for lengths in found):
+        return None
+    return tuple(next(iter(lengths), None) for lengths in found)
 
 
 def _kernel_has_padded_iota(node: torch.fx.Node) -> bool:
@@ -2311,7 +2380,7 @@ class SubscriptIndexing(NamedTuple):
             ):
                 # Tensor marked as tile.index + offset
                 # Always use block_size for consistency with type propagation
-                # (see _device_indexing_size in type_propagation.py)
+                # (see _device_indexing_size in type_info.py)
                 input_size.popleft()
                 output_size.append(tile_info.resolved_block_size_var(env))
             elif isinstance(k, torch.SymInt):
@@ -2327,12 +2396,24 @@ class SubscriptIndexing(NamedTuple):
                 slice_size = compute_slice_size(k, size)
 
                 if not env.is_singleton_size(slice_size):
+                    if is_block_size_index(slice_size) and (
+                        tensor not in HostFunction.current().tensor_to_origin
+                    ):
+                        # A device value (e.g. a grid tile's ``tile.index``,
+                        # whose load emits the tile's index) keeps the block
+                        # for a slice spanning it, as _device_indexing_size
+                        # does.  A reduction dim for it would be indexed by
+                        # nothing yet still get a strategy (on CuTe, a thread
+                        # axis whose threads all repeat the tile).  A host
+                        # buffer sized by a block still needs one to index its
+                        # slice.
+                        output_size.append(slice_size)
                     # On backends that don't pad factory ops to
                     # power-of-2, keep concrete dims concrete so shape
                     # inference can prove equality with concretely-sized
                     # buffers (matches _device_indexing_size).  A tunable
                     # extent still needs a reduction dim.
-                    if (
+                    elif (
                         not env.backend.pad_factory_tensors_to_power_of_2
                         and not env.is_tunable_extent(slice_size)
                     ):
