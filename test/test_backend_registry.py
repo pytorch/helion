@@ -18,6 +18,7 @@ from helion._compiler.backend_registry import all_reserved_launch_param_names
 from helion._compiler.backend_registry import get_backend_class
 from helion._compiler.backend_registry import list_backends
 from helion._compiler.backend_registry import register_compiler_backend
+from helion._compiler.backend_registry import registered_backends
 from helion._compiler.backend_registry import registry_generation
 from helion._compiler.backend_registry import repair_backend_codegen
 from helion._compiler.backend_registry import unregister_compiler_backend
@@ -38,7 +39,7 @@ class TestBackendRegistry(unittest.TestCase):
             self.assertIn(expected, names)
 
     def test_get_backend_class_and_instantiate_all(self) -> None:
-        for name in list_backends():
+        for name in registered_backends():
             cls = get_backend_class(name)
             instance = cls()
             self.assertIsInstance(instance, Backend)
@@ -179,6 +180,12 @@ class TestBackendRegistry(unittest.TestCase):
         self.assertNotIn("_test_late_debug_key", config_spec.debug_keys())
         self.assertEqual(get_heuristics("_test_late"), ())
         self.assertFalse(_tunable_name_conflicts("_test_late_key"))
+
+    def test_reregister_same_class_is_noop(self) -> None:
+        repaired = frozenset({"triton"})
+        with mock.patch.object(backend_registry, "_REPAIRED_CODEGEN_NAMES", repaired):
+            register_compiler_backend(get_backend_class("triton"))
+            self.assertIs(backend_registry._REPAIRED_CODEGEN_NAMES, repaired)
 
     def test_all_reserved_launch_param_names_is_union(self) -> None:
         result = all_reserved_launch_param_names()
