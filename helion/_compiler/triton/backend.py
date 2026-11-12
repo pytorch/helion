@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     from ..device_function import Argument
     from ..device_function import DeviceBodyContext
     from ..device_function import DeviceFunction
+    from ..device_ir import DeviceIR
     from ..emitter_protocols import RetryPolicy
     from ..inductor_lowering import GenerateASTFromInductor
     from ..inductor_lowering import GraphInterpreter
@@ -836,7 +837,14 @@ class GluonBackend(TritonBackend):
     _IGNORED_KEYS = frozenset(["maxnreg", "range_flattens", "range_multi_buffers"])
 
     def supports_config_key(self, key: str) -> bool:
+        if key == "cross_loop_tmem_prefetch":
+            return True
         return key not in self._IGNORED_KEYS and super().supports_config_key(key)
+
+    def tmem_prefetch_candidates(self, device_ir: DeviceIR) -> list[list[int]]:
+        from .gluon_ring import tmem_prefetch_candidates
+
+        return tmem_prefetch_candidates(device_ir)
 
     def supports_block_ptr_indexing(self) -> bool:
         return False

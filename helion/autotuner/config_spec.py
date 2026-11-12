@@ -793,6 +793,7 @@ BACKEND_TUNABLE_KEYS: frozenset[str] = _get_backend_tunable_keys()
 _BACKEND_GATED_GENERIC_KEYS: frozenset[str] = frozenset(
     {
         "cross_loop_pipeline",
+        "cross_loop_tmem_prefetch",
         "load_cache_modifiers",
         "store_cache_modifiers",
         "host_tensor_descriptors",
@@ -1112,6 +1113,11 @@ class ConfigSpec:
         )
         self.range_flattens: BlockIdSequence[RangeFlattenSpec] = BlockIdSequence()
         self.static_ranges: BlockIdSequence[StaticRangeSpec] = BlockIdSequence()
+        # The cross-loop K loops whose ungated weight stream may prefetch into
+        # tensor memory ahead of their task's dependency wait (``gluon_ring``).
+        self.cross_loop_tmem_prefetch: BlockIdSequence[CrossLoopTmemPrefetchSpec] = (
+            BlockIdSequence()
+        )
 
         self.allowed_pid_types: tuple[PidTypeLiteral, ...] = tuple(VALID_PID_TYPES)
         # Keep alternative pid types searchable when an ordered reference uses flat.
@@ -1728,6 +1734,7 @@ class ConfigSpec:
         self.range_multi_buffers._remove_duplicates()
         self.range_flattens._remove_duplicates()
         self.static_ranges._remove_duplicates()
+        self.cross_loop_tmem_prefetch._remove_duplicates()
 
     def pin_flatten_loop(self, block_id: int) -> None:
         """Pin the flatten_loops choice of ``block_id``'s loop to False.
@@ -2205,6 +2212,7 @@ class ConfigSpec:
             ("range_multi_buffers", self.range_multi_buffers, True),
             ("range_flattens", self.range_flattens, True),
             ("static_ranges", self.static_ranges, True),
+            ("cross_loop_tmem_prefetch", self.cross_loop_tmem_prefetch, True),
         ]:
             if not self.supports_config_key(name):
                 if name in config:
@@ -2302,6 +2310,7 @@ class ConfigSpec:
             "range_multi_buffers",
             "range_flattens",
             "static_ranges",
+            "cross_loop_tmem_prefetch",
             "load_eviction_policies",
             "load_cache_modifiers",
             "store_cache_modifiers",
@@ -3046,6 +3055,7 @@ class ConfigSpec:
                     ("range_multi_buffers", self.range_multi_buffers),
                     ("range_flattens", self.range_flattens),
                     ("static_ranges", self.static_ranges),
+                    ("cross_loop_tmem_prefetch", self.cross_loop_tmem_prefetch),
                 ]
                 if self.supports_config_key(name)
             }
@@ -3430,6 +3440,7 @@ class ConfigSpec:
             "range_multi_buffers",
             "range_flattens",
             "static_ranges",
+            "cross_loop_tmem_prefetch",
             "load_eviction_policies",
             "load_cache_modifiers",
             "store_cache_modifiers",
@@ -4142,7 +4153,7 @@ class RangeFlattenSpec(_OptionalBoolSpec):
     pass
 
 
-class StaticRangeSpec(_BlockIdItem):
+class _BoolSpec(_BlockIdItem):
     def _fragment(self, base: ConfigSpec) -> BooleanFragment:
         return BooleanFragment()
 
@@ -4154,6 +4165,15 @@ class StaticRangeSpec(_BlockIdItem):
     def _fill_missing(self) -> bool:
         """Provide a value when not provided by the user."""
         return False
+
+
+class StaticRangeSpec(_BoolSpec):
+    pass
+
+
+class CrossLoopTmemPrefetchSpec(_BoolSpec):
+    """A candidate K loop (``Backend.tmem_prefetch_candidates``): True streams
+    the last steps' weight tiles into the tensor memory its accumulators leave."""
 
 
 def _product(seq: Sequence[int]) -> int:

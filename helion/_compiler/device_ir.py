@@ -42,6 +42,7 @@ from ..autotuner.config_fragment import ConfigSpecFragment
 from ..autotuner.config_spec import FULL_EXTENT_CATEGORIES
 from ..autotuner.config_spec import SIZED_REDUCTION_CATEGORIES
 from ..autotuner.config_spec import VALID_CROSS_LOOP_PIPELINES
+from ..autotuner.config_spec import CrossLoopTmemPrefetchSpec
 from ..autotuner.config_spec import MatmulWithReductionEpilogueFact
 from ..autotuner.config_spec import ReductionCategory
 from ..autotuner.config_spec import ReductionDescriptor
@@ -4621,6 +4622,11 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         f"{allowed}",
                     )
                 config_spec.enable_cross_loop_pipeline(choices=choices)
+                if config_spec.supports_config_key("cross_loop_tmem_prefetch"):
+                    for block_ids in env.backend.tmem_prefetch_candidates(device_ir):
+                        config_spec.cross_loop_tmem_prefetch.append(
+                            CrossLoopTmemPrefetchSpec(block_ids)
+                        )
         config_spec.multi_phase = len(device_ir.phases) > 1
         if config_spec.supports_config_key("pallas_load_buffer_count"):
             config_spec.pallas_load_buffer_count.length = sum(
