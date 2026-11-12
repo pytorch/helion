@@ -116,15 +116,27 @@ def _warp_reduce_prod(value: cute.Numeric, *, threads_in_group: int) -> cute.Num
     )
 
 
+@cute.jit
+def _warp_reduce_any(value: cute.Numeric, *, threads_in_group: int) -> cute.Numeric:
+    return cute.arch.warp_reduction(
+        value,
+        operator.or_,
+        threads_in_group=threads_in_group,
+    )
+
+
 # Reduction type -> (warp_op, combine): the warp-level shuffle reduction and
 # the scalar combine every grouped body below is templated over.  The
 # ``@cute.jit`` bodies take the pair as plain Python arguments (resolved at
-# trace time), so one body per form serves every reduction type.
+# trace time), so one body per form serves every reduction type.  ``any``
+# folds its Int32 0/1 mask (``CuteBackend.widen_reduction_acc_dtype``) with
+# or; a Boolean max would be a signed i1 max, which folds as an and.
 _OP_TABLE: dict[str, tuple[object, object]] = {
     "sum": (_warp_reduce_sum, operator.add),
     "max": (_warp_reduce_max, _cute_nan_max),
     "min": (_warp_reduce_min, _cute_nan_min),
     "prod": (_warp_reduce_prod, operator.mul),
+    "any": (_warp_reduce_any, operator.or_),
 }
 
 

@@ -692,6 +692,61 @@ def test_block_without_a_static_size_keeps_the_fill() -> None:
     assert "torch.empty([" not in code.replace("torch.empty([x.size(0)]", "")
 
 
+def _tile_ids_under_a_begin_extent(x: torch.Tensor) -> torch.Tensor:
+    # The inner loop's extent ``tile_m.begin + 32`` takes a value per row tile
+    # (32, then 64), so only the second row tile writes column 1.
+    out = torch.zeros((64, 2), dtype=torch.float32, device=x.device)
+    for tile_m in hl.tile(64):
+        for tile_n in hl.tile(tile_m.begin + 32, block_size=32):
+            out[tile_m, tile_n.id] = 1.0
+    return out
+
+
+def _tile_ids_under_an_end_extent(x: torch.Tensor) -> torch.Tensor:
+    out = torch.zeros((64, 2), dtype=torch.float32, device=x.device)
+    for tile_m in hl.tile(64):
+        for tile_n in hl.tile(tile_m.end, block_size=32):
+            out[tile_m, tile_n.id] = 1.0
+    return out
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "fn", [_tile_ids_under_a_begin_extent, _tile_ids_under_an_end_extent]
+)
+def test_tile_ids_over_a_per_tile_extent_keep_the_fill(
+    fn: Callable[..., object],
+) -> None:
+    # ``tile_m.begin`` and ``tile_m.end`` name ``tile_m``'s block but are not
+    # its block size: they do not take the configured size.
+    code = _host_code(
+        fn, torch.empty((64,), dtype=torch.float32), overrides={"block_sizes": [32]}
+    )
+    assert "out = torch.zeros((64, 2)" in code
+
+
+def _tile_ids_of_a_derived_block(x: torch.Tensor) -> torch.Tensor:
+    # ``block_size=block * 2`` over a registered block size: the config fixes
+    # the tile count, here 128 // 64 = 2 tiles, one per slot of ``counts``.
+    block = hl.register_block_size(1, 64)
+    counts = torch.zeros([2], dtype=torch.float32, device=x.device)
+    for tile in hl.tile(x.size(0), block_size=block * 2):
+        counts[tile.id] = 1.0
+    return counts
+
+
+@pytest.mark.cpu_only
+def test_tile_ids_of_a_derived_block_size_drop_the_fill() -> None:
+    # The block size ``block * 2`` resolves through the configured ``block``.
+    code = _host_code(
+        _tile_ids_of_a_derived_block,
+        torch.empty((128,), dtype=torch.float32),
+        overrides={"block_sizes": [32]},
+    )
+    assert "counts = torch.empty([2]" in code
+    assert "counts = torch.zeros(" not in code
+
+
 def test_zeros_with_an_out_keyword_keeps_the_fill() -> None:
     code = _host_code(_zeros_into_out, torch.empty((64, 32), dtype=torch.bfloat16))
     assert "out = torch.zeros([x.size(0)]" in code or "out = torch.zeros([64]" in code

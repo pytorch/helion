@@ -3837,6 +3837,15 @@ class CuteBackend(Backend):
     def next_power_of_2_host_expr(self, expr: str) -> str:
         return f"_next_power_of_2({expr})"
 
+    def widen_reduction_acc_dtype(
+        self, reduction_type: str, dtype: torch.dtype
+    ) -> torch.dtype:
+        if reduction_type == "any":
+            # Cross-warp combines stage partials in shared memory, which
+            # alloc_smem cannot type as Boolean: fold the mask as Int32 0/1.
+            return torch.int32
+        return dtype
+
     def reduction_combine_expr(
         self,
         reduction_type: str,
@@ -3875,6 +3884,8 @@ class CuteBackend(Backend):
             )
         if reduction_type == "prod":
             return f"({acc} * {val})"
+        if reduction_type == "any":
+            return f"({acc} | {val})"
         raise exc.BackendUnsupported(self.name, f"reduction combine {reduction_type!r}")
 
     def _threads_for_block_size_var(self, block_size_var: str | None) -> int:
@@ -3953,6 +3964,8 @@ class CuteBackend(Backend):
             return f"cute.arch.warp_reduction({input_name}, _cute_nan_min{tg})"
         if reduction_type == "prod":
             return f"cute.arch.warp_reduction({input_name}, lambda a, b: (a * b){tg})"
+        if reduction_type == "any":
+            return f"cute.arch.warp_reduction({input_name}, lambda a, b: (a | b){tg})"
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
 
     def thread_linear_index_expr(self, axis_sizes: dict[int, int]) -> str | None:
@@ -5048,6 +5061,10 @@ class CuteBackend(Backend):
         return True
 
     def reflattens_pointwise_tiles(self) -> bool:
+        return True
+
+    def reduces_every_dim_one_at_a_time(self) -> bool:
+        # ``_reduce_along`` runs each dim's reduction strategy in turn.
         return True
 
     def tunes_lane_vector_widths(self) -> bool:

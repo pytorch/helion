@@ -128,6 +128,59 @@ def _reduce_multi_dim_tile(x: torch.Tensor, op: hl.constexpr) -> torch.Tensor:
     return out
 
 
+@helion.kernel(static_shapes=True)
+def _flattened_tile_row_reductions(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, ...]:
+    a, b, c = x.shape
+    sums = torch.empty([a, b], dtype=torch.float32, device=x.device)
+    argmaxes = torch.empty([a, b], dtype=torch.int64, device=x.device)
+    centered = torch.empty_like(x)
+    scaled = torch.empty_like(x)
+    chunked_sums = torch.empty([a, b], dtype=torch.float32, device=x.device)
+    for tile_a, tile_b in hl.tile([a, b]):
+        row = x[tile_a, tile_b, :]
+        sums[tile_a, tile_b] = row.sum(-1)
+        argmaxes[tile_a, tile_b] = row.argmax(-1)
+        centered[tile_a, tile_b, :] = row - row.amax(-1)[:, :, None]
+        scaled[tile_a, tile_b, :] = row * row.sum(-1).unsqueeze(-1)
+        acc = hl.zeros([tile_a, tile_b], dtype=torch.float32)
+        for tile_c in hl.tile(c):
+            acc = acc + x[tile_a, tile_b, tile_c].sum(-1)
+        chunked_sums[tile_a, tile_b] = acc
+    return sums, argmaxes, centered, scaled, chunked_sums
+
+
+def _add_combine(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """The combine function of a sum for ``hl.reduce``."""
+    return a + b
+
+
+@helion.kernel(static_shapes=True)
+def _flattened_tile_totals(x: torch.Tensor) -> torch.Tensor:
+    scaled = torch.empty_like(x)
+    for tile_a, tile_b in hl.tile(x.size()):
+        tile = x[tile_a, tile_b]
+        scaled[tile_a, tile_b] = tile * hl.reduce(_add_combine, tile)
+    return scaled
+
+
+@helion.kernel(static_shapes=True)
+def _flattened_tile_shares(
+    x: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    centered = torch.empty_like(x)
+    shares = torch.empty_like(y)
+    for tile_a, tile_b in hl.tile(x.size()):
+        tile = x[tile_a, tile_b]
+        # Keeping the reduced dims, the total has the tile's rank, which the
+        # subscript below depends on.
+        total = hl.reduce(_add_combine, tile, keep_dims=True)
+        centered[tile_a, tile_b] = tile - total
+        shares[tile_a, tile_b, :] = y[tile_a, tile_b, :] * total[:, :, None]
+    return centered, shares
+
+
 @onlyBackends(["triton", "cute", "pallas", "metal"])
 class TestReductions(RefEagerTestBase, TestCase):
     @skipUnlessBackends(["cute", "triton"])
@@ -267,6 +320,69 @@ class TestReductions(RefEagerTestBase, TestCase):
                         reduction_loops=[reduction_loop],
                     )
                     torch.testing.assert_close(output, expected)
+
+    @onlyBackends(["triton", "cute"])
+    def test_reductions_after_a_flattened_tile(self):
+        """A flattened ``[tile_a, tile_b]`` is one dim of the values, so the
+        reduced row dim after it moves down: a persistent and a rolled
+        reduction, an argmax, a reduction broadcast back by ``[:, :, None]``
+        and by ``unsqueeze`` and a reduction over an inner tile loop."""
+        x = torch.randn([4, 8, 32], device=DEVICE)
+        for reduction_loop in (None, 16):
+            with self.subTest(reduction_loop=reduction_loop):
+                _, (sums, argmaxes, centered, scaled, chunked_sums) = code_and_output(
+                    _flattened_tile_row_reductions,
+                    (x,),
+                    block_sizes=[2, 4, 16],
+                    flatten_loops=[True],
+                    reduction_loops=[reduction_loop],
+                )
+                torch.testing.assert_close(sums, x.sum(-1), rtol=1e-4, atol=1e-4)
+                torch.testing.assert_close(argmaxes, x.argmax(-1))
+                torch.testing.assert_close(centered, x - x.amax(-1, keepdim=True))
+                torch.testing.assert_close(
+                    scaled, x * x.sum(-1, keepdim=True), rtol=1e-4, atol=1e-4
+                )
+                torch.testing.assert_close(
+                    chunked_sums, x.sum(-1), rtol=1e-4, atol=1e-4
+                )
+
+    @onlyBackends(["triton", "cute"])
+    @skipIfRefEager(
+        "ref mode runs the loop as one tile, not the config's [2, 32] tiles"
+    )
+    def test_reduce_over_every_dim_of_a_flattened_tile(self):
+        """``hl.reduce`` without a dim: Triton reduces the flattened tile at
+        once (``tl.reduce(x, None, fn)``), and CuTe, which reduces one dim at
+        a time, pins the loop unflattened.  A total that keeps the reduced
+        dims pins it on both: its size-1 dims cannot stand for the tile's
+        single one.  Tiles of whole rows hold the same elements flattened or
+        not."""
+        x = torch.randn([8, 32], device=DEVICE)
+        y = torch.randn([8, 32, 4], device=DEVICE)
+        tiles = x.view(4, 2, 32)
+        totals = tiles.sum((1, 2), keepdim=True)
+        _, scaled = code_and_output(
+            _flattened_tile_totals, (x,), block_sizes=[2, 32], flatten_loops=[True]
+        )
+        torch.testing.assert_close(
+            scaled, (tiles * totals).view_as(x), rtol=1e-4, atol=1e-4
+        )
+        _, (centered, shares) = code_and_output(
+            _flattened_tile_shares,
+            (x, y),
+            block_sizes=[2, 32],
+            flatten_loops=[True],
+        )
+        torch.testing.assert_close(
+            centered, (tiles - totals).view_as(x), rtol=1e-4, atol=1e-4
+        )
+        torch.testing.assert_close(
+            shares,
+            (y.view(4, 2, 32, 4) * totals[..., None]).view_as(y),
+            rtol=1e-4,
+            atol=1e-4,
+        )
 
     @onlyBackends(["triton", "cute"])
     @skipIfRefEager("checks compiled reduction dimensions")
@@ -1012,6 +1128,84 @@ class TestReductions(RefEagerTestBase, TestCase):
                     tile_count, (x,), block_sizes=[rows_per_block]
                 )
                 torch.testing.assert_close(output, torch.full_like(output, 64))
+
+    @onlyBackends(["cute", "triton", "tileir"])
+    def test_any_all_reductions(self):
+        @helion.kernel(static_shapes=True)
+        def row_flags(
+            x: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            masked = torch.empty_like(x)
+            all_hot = torch.empty([x.size(0)], dtype=torch.bool, device=x.device)
+            max_hot = torch.empty_like(all_hot)
+            for row in hl.tile(x.size(0)):
+                values = x[row, :]
+                hot = values > 0.5
+                masked[row, :] = torch.where(
+                    torch.any(hot, dim=-1, keepdim=True), values, 0.0
+                )
+                # Traced as not any(not hot), and a bool amax as any.
+                all_hot[row] = torch.all(hot, dim=-1)
+                max_hot[row] = torch.amax(hot, dim=-1)
+            return masked, all_hot, max_hot
+
+        @helion.kernel(static_shapes=True)
+        def tile_any(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([x.size(0)], dtype=torch.bool, device=x.device)
+            for row in hl.tile(x.size(0)):
+                found = hl.full([row], False, dtype=torch.bool)
+                for col in hl.tile(x.size(1)):
+                    found = found | torch.any(x[row, col] > 0.5, dim=1)
+                out[row] = found
+            return out
+
+        @helion.kernel(static_shapes=True)
+        def carried_any(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([x.size(0)], dtype=torch.bool, device=x.device)
+            for row in hl.tile(x.size(0)):
+                values = x[row, :]
+                found = hl.full([row], False, dtype=torch.bool)
+                for _step in range(2):
+                    found = found | torch.any(values > 0.5, dim=-1)
+                    values = values + 0.25
+                out[row] = found
+            return out
+
+        # Rows with no hot element, one in a varying column, one in the last
+        # column (in the padded last chunk) and only hot elements; row 4 only
+        # gets hot on carried_any's second step.
+        x = torch.rand(16, 100, device=DEVICE) * 0.5
+        x[::4] *= 0.4
+        x[4, 10] = 0.3
+        rows = torch.arange(1, 16, 4, device=DEVICE)
+        x[rows, rows * 7] = 0.9
+        x[2::4, -1] = 0.9
+        x[3::4] += 0.6
+        hot = x > 0.5
+        cases = [
+            (x, {"reduction_loops": [None]}),
+            (x, {"reduction_loops": [32]}),
+            # At most a warp of columns: one warp reduction of the bool mask.
+            (x[:, -24:].contiguous(), {"reduction_loops": [None]}),
+        ]
+        if _get_backend() == "cute":
+            # Fewer threads than columns: a per-thread lane loop.
+            cases.append((x, {"reduction_loops": [None], "num_threads": [0, 32]}))
+        for row_x, config in cases:
+            with self.subTest(columns=row_x.size(1), **config):
+                _, (masked, all_hot, max_hot) = code_and_output(
+                    row_flags, (row_x,), block_sizes=[2], **config
+                )
+                row_hot = row_x > 0.5
+                torch.testing.assert_close(
+                    masked, torch.where(row_hot.any(-1, keepdim=True), row_x, 0.0)
+                )
+                torch.testing.assert_close(all_hot, row_hot.all(-1))
+                torch.testing.assert_close(max_hot, row_hot.any(-1))
+        _, found = code_and_output(tile_any, (x,), block_sizes=[2, 32])
+        torch.testing.assert_close(found, hot.any(-1))
+        _, found = code_and_output(carried_any, (x,), block_sizes=[2])
+        torch.testing.assert_close(found, hot.any(-1) | (x + 0.25 > 0.5).any(-1))
 
     @onlyBackends(["cute"])
     def test_carried_min_max_preserve_nan(self):
@@ -1798,6 +1992,77 @@ class TestReductions(RefEagerTestBase, TestCase):
         torch.testing.assert_close(
             out2, expected * 2.0 + x.amax(-1), rtol=1e-4, atol=1e-4
         )
+
+    @onlyBackends(["triton", "cute"])
+    def test_rolled_reduction_reads_a_row_scalar_before_its_store(self):
+        # The loop after the amax recomputes ``r``, and reloaded ``s`` there
+        # after the store had replaced it with ``top``.
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def shifted_exp(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for row in hl.tile(x.size(0)):
+                s = scale[row, :]
+                r = x[row, :] * s
+                top = r.amax(-1, keepdim=True)
+                scale[row, :] = top
+                out[row, :] = torch.exp(r - top)
+            return out
+
+        x = torch.randn([32, 256], device=DEVICE)
+        scale = torch.rand([32, 1], device=DEVICE) + 0.5
+        top = (x * scale).amax(-1, keepdim=True)
+        expected = torch.exp(x * scale - top)
+        _code, out = code_and_output(
+            shifted_exp, (x, scale), block_size=4, reduction_loop=32
+        )
+        torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(scale, top)
+
+    @onlyBackends(["triton", "cute"])
+    def test_saved_rolled_config_of_a_rerun_atomic_runs_persistent(self):
+        # Older versions rolled this row and ran the atomic in both loops.
+        # The roll is refused now; a config saved then still loads into the
+        # row's pinned slot and runs the persistent reduction.
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def counted(counts: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(y)
+            for row in hl.tile(counts.size(0)):
+                old = hl.atomic_add(counts, [row, slice(None)], 1.0)
+                total = y[row, :].sum(-1, keepdim=True)
+                out[row, :] = old * total
+            return out
+
+        counts = torch.randn([32, 256], device=DEVICE)
+        y = torch.randn([32, 256], device=DEVICE)
+        expected = counts * y.sum(-1, keepdim=True)
+        expected_counts = counts + 1
+        _code, out = code_and_output(
+            counted, (counts, y), block_size=4, reduction_loop=32
+        )
+        torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(counts, expected_counts)
+
+    @onlyBackends(["triton", "cute"])
+    @skipIfTileIR("TileIR has no barrier to keep the load behind the rolled store")
+    def test_rolled_row_store_read_back_outside_the_loops(self):
+        # ``y[row, 0]`` is loaded outside the loops, and was placed ahead of
+        # the loop storing the row, so ``out`` got the old ``y[row, 0]``.
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def read_back(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+            for row in hl.tile(x.size(0)):
+                r = x[row, :]
+                top = r.amax(-1)
+                y[row, :] = r - top[:, None]
+                out[row] = y[row, 0]
+            return out
+
+        x = torch.randn([32, 256], device=DEVICE)
+        y = torch.full_like(x, 7.0)
+        expected = x - x.amax(-1, keepdim=True)
+        _code, out = code_and_output(read_back, (x, y), block_size=4, reduction_loop=32)
+        torch.testing.assert_close(y, expected)
+        torch.testing.assert_close(out, expected[:, 0])
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_argmin_argmax_looped(self):

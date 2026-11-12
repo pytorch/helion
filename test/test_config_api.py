@@ -94,9 +94,16 @@ from helion._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_sme
 from helion._compiler.pallas.backend import PallasBackend
 from helion._compiler.triton.backend import TritonBackend
 from helion._testing import TestCase
+from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
+from helion._testing import skipIfNotTriton
+from helion._testing import skipIfRefEager
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.padded_range_kernels import grid_pick_column
+from helion._testing.padded_range_kernels import host_arange_mark
+from helion._testing.padded_range_kernels import host_arange_mark_then_row_sums
 from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import ListOf
@@ -104,6 +111,7 @@ from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import LoopOrderSpec
 from helion.autotuner.config_spec import MatmulFact
+from helion.autotuner.config_spec import ReductionLoopSpec
 import helion.language as hl
 
 pytestmark = pytest.mark.cpu_only
@@ -359,6 +367,216 @@ class TestPallasLoadBufferCountConfig(TestCase):
                     pallas_loop_type="fori_loop", pallas_load_buffer_count=[2]
                 )
             )
+
+
+def _count_columns_then_sum_rows(
+    x: torch.Tensor, pos: torch.Tensor, y: torch.Tensor, z: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    m, n = x.shape
+    counts = torch.empty([m], dtype=torch.int32, device=x.device)
+    y_sums = torch.empty([y.size(0)], dtype=y.dtype, device=y.device)
+    z_sums = torch.empty([z.size(0)], dtype=z.dtype, device=z.device)
+    for tile_m in hl.tile(m):
+        above = hl.arange(n)[None, :] >= pos[tile_m][:, None]
+        counts[tile_m] = above.to(torch.int32).sum(-1)
+    for tile_y in hl.tile(y.size(0)):
+        y_sums[tile_y] = y[tile_y, :].sum(-1)
+    for tile_z in hl.tile(z.size(0)):
+        z_sums[tile_z] = z[tile_z, :].sum(-1)
+    return counts, y_sums, z_sums
+
+
+def _zero_row_then_mark_columns(x: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        row = x[tile_m, :]
+        top = row.amax(-1, keepdim=True)
+        x[tile_m, :] = 0.0
+        out[tile_m, :] = torch.where(
+            hl.arange(n)[None, :] == pos[tile_m][:, None], -1.0, row - top
+        )
+    return out
+
+
+def _mark_columns_sum_rows_then_rerun_atomics(
+    x: torch.Tensor, pos: torch.Tensor, y: torch.Tensor, z: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    m, n = x.shape
+    out = torch.empty_like(x)
+    y_sums = torch.empty([y.size(0)], dtype=y.dtype, device=y.device)
+    z_out = torch.empty_like(z)
+    for tile_m in hl.tile(m):
+        row = x[tile_m, :]
+        cols = hl.arange(n)
+        out[tile_m, :] = torch.where(cols[None, :] == pos[tile_m][:, None], -1.0, row)
+    for tile_y in hl.tile(y.size(0)):
+        y_sums[tile_y] = y[tile_y, :].sum(-1)
+    for tile_z in hl.tile(z.size(0)):
+        old = hl.atomic_add(z, [tile_z, slice(None)], 1.0)
+        z_out[tile_z, :] = old * old.sum(-1, keepdim=True)
+    return out, y_sums, z_out
+
+
+def _mark_columns_beside_a_row_sum(
+    x: torch.Tensor, pos: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m, n = x.shape
+    out = torch.empty_like(x)
+    sums = torch.empty([y.size(0)], dtype=y.dtype, device=y.device)
+    for tile_m in hl.tile(m):
+        row = x[tile_m, :]
+        cols = hl.arange(n)
+        out[tile_m, :] = torch.where(cols[None, :] == pos[tile_m][:, None], -1.0, row)
+        sums[tile_m] = y[tile_m, :].sum(-1)
+    return out, sums
+
+
+def _mark_columns_beside_rerun_atomics(
+    x: torch.Tensor, pos: torch.Tensor, z: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m, n = x.shape
+    out = torch.empty_like(x)
+    z_out = torch.empty_like(z)
+    for tile_m in hl.tile(m):
+        row = x[tile_m, :]
+        cols = hl.arange(n)
+        out[tile_m, :] = torch.where(cols[None, :] == pos[tile_m][:, None], -1.0, row)
+    for tile_z in hl.tile(z.size(0)):
+        old = hl.atomic_add(z, [tile_z, slice(None)], 1.0)
+        z_out[tile_z, :] = old * old.sum(-1, keepdim=True)
+    return out, z_out
+
+
+def _count_columns_in_a_branch_beside_row_sums(
+    x: torch.Tensor, pos: torch.Tensor, r: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    m, n = x.shape
+    hits = torch.zeros([m], dtype=torch.float32, device=x.device)
+    r_sums = torch.empty([m], dtype=r.dtype, device=r.device)
+    y_sums = torch.empty([y.size(0)], dtype=y.dtype, device=y.device)
+    for tile_m in hl.tile(m):
+        if pos[tile_m.begin] >= 0:
+            hit = hl.arange(n)[None, :] == pos[tile_m][:, None]
+            hits[tile_m] = hit.to(torch.float32).sum(-1)
+        r_sums[tile_m] = r[tile_m, :].sum(-1)
+    for tile_y in hl.tile(y.size(0)):
+        y_sums[tile_y] = y[tile_y, :].sum(-1)
+    return hits, r_sums, y_sums
+
+
+def _count_columns_then_sum_rows_of_their_extent(
+    x: torch.Tensor, pos: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    m, n = x.shape
+    counts = torch.empty([m], dtype=torch.int32, device=x.device)
+    x_sums = torch.empty([m], dtype=x.dtype, device=x.device)
+    y_sums = torch.empty([y.size(0)], dtype=y.dtype, device=y.device)
+    scaled = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        above = hl.arange(n)[None, :] >= pos[tile_m][:, None]
+        counts[tile_m] = above.to(torch.int32).sum(-1)
+    for tile_m in hl.tile(m):
+        x_sums[tile_m] = x[tile_m, :].sum(-1)
+    for tile_y in hl.tile(y.size(0)):
+        y_sums[tile_y] = y[tile_y, :].sum(-1)
+    for tile_m in hl.tile(m):
+        ones = hl.full([tile_m, 64], 1.0, dtype=x.dtype)
+        scaled[tile_m] = (ones * pos[tile_m][:, None]).sum(-1)
+    return counts, x_sums, y_sums, scaled
+
+
+def _count_columns_then_sum_their_rows(
+    x: torch.Tensor, pos: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m, n = x.shape
+    counts = torch.empty([m], dtype=torch.int32, device=x.device)
+    sums = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        hit = hl.arange(n)[None, :] == pos[tile_m][:, None]
+        counts[tile_m] = hit.to(torch.int32).sum(-1)
+        sums[tile_m] = x[tile_m, :].sum(-1)
+    return counts, sums
+
+
+def _sum_rows_then_count_their_columns(
+    x: torch.Tensor, pos: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m, n = x.shape
+    counts = torch.empty([m], dtype=torch.int32, device=x.device)
+    sums = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        sums[tile_m] = x[tile_m, :].sum(-1)
+        hit = hl.arange(n)[None, :] == pos[tile_m][:, None]
+        counts[tile_m] = hit.to(torch.int32).sum(-1)
+    return counts, sums
+
+
+def _mark_columns_then_add_rows_in_a_branch(
+    x: torch.Tensor, pos: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    m, n = x.shape
+    sums = torch.empty([m], dtype=x.dtype, device=x.device)
+    out = torch.empty_like(x)
+    y_sums = torch.empty([y.size(0)], dtype=y.dtype, device=y.device)
+    for tile_m in hl.tile(m):
+        hit = torch.where(hl.arange(n)[None, :] == pos[tile_m][:, None], 1.0, 0.0)
+        sums[tile_m] = hit.sum(-1)
+        if pos[tile_m.begin] >= 0:
+            out[tile_m, :] = x[tile_m, :] + hit
+    for tile_y in hl.tile(y.size(0)):
+        y_sums[tile_y] = y[tile_y, :].sum(-1)
+    return sums, out, y_sums
+
+
+def _mark_columns_then_add_rows_in_a_loop(
+    x: torch.Tensor, pos: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    m, n = x.shape
+    sums = torch.empty([m], dtype=x.dtype, device=x.device)
+    out = torch.empty_like(x)
+    y_sums = torch.empty([y.size(0)], dtype=y.dtype, device=y.device)
+    for tile_m in hl.tile(m):
+        hit = torch.where(hl.arange(n)[None, :] == pos[tile_m][:, None], 1.0, 0.0)
+        sums[tile_m] = hit.sum(-1)
+        for _ in hl.grid(2):
+            out[tile_m, :] = x[tile_m, :] + hit
+    for tile_y in hl.tile(y.size(0)):
+        y_sums[tile_y] = y[tile_y, :].sum(-1)
+    return sums, out, y_sums
+
+
+def _mask_rows_causally_then_sum_them(x: torch.Tensor) -> torch.Tensor:
+    b, n, _ = x.shape
+    out = torch.empty([b, n], dtype=x.dtype, device=x.device)
+    for tile_b in hl.tile(b):
+        rows = hl.arange(n)
+        causal = rows[:, None] >= rows[None, :]
+        out[tile_b, :] = torch.where(causal[None, :, :], x[tile_b, :, :], 0.0).sum(-1)
+    return out
+
+
+def _sum_a_range_then_the_bare_range(x: torch.Tensor) -> torch.Tensor:
+    m = x.size(0)
+    out = torch.zeros([m, 2], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        out[tile_m, 0] = (x[tile_m, 0:1] * 0 + hl.arange(200)[None, :]).sum(-1)
+    for tile_m in hl.tile(m):
+        out[tile_m, 1] = x[tile_m, 0] * 0 + hl.arange(200).sum()
+    return out
+
+
+def _sum_two_ranges_then_a_wide_row(x: torch.Tensor) -> torch.Tensor:
+    m = x.size(0)
+    out = torch.zeros([m, 3], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        out[tile_m, 0] = (x[tile_m, 0:1] * 0 + hl.arange(600)[None, :]).sum(-1)
+    for tile_m in hl.tile(m):
+        out[tile_m, 1] = (x[tile_m, 0:1] * 0 + hl.arange(200)[None, :]).sum(-1)
+    for tile_m in hl.tile(m):
+        row = hl.full([1, 1024], 2.0, dtype=x.dtype)
+        out[tile_m, 2] = (x[tile_m, 0:1] * 0 + row).sum(-1)
+    return out
 
 
 @onlyBackends(["triton", "cute"])
@@ -651,6 +869,398 @@ class TestConfigAPI(TestCase):
                 spec.normalize(
                     helion.Config.from_dict({"cross_loop_schedule": "static_pipeline"})
                 )
+
+    def test_saved_reduction_loops_entries_of_retired_slots(self) -> None:
+        # A reduction dim an older version offered a loop and this version
+        # keeps persistent keeps its reduction_loops slot, pinned to None, so
+        # the configs that version saved line up with this version's by
+        # position, also with trailing entries left off.  Any chunk for a
+        # pinned slot keeps the reduction persistent: no smaller loop over
+        # such a dim compiled or computed the right results then.
+        def spec_with(sizes: list[int], retired: set[int]) -> ConfigSpec:
+            spec = ConfigSpec(backend=TritonBackend())
+            for block_id, size in enumerate(sizes):
+                spec.reduction_loops.append(
+                    ReductionLoopSpec(
+                        block_id=block_id,
+                        size_hint=size,
+                        persistent_reason="retired" if block_id in retired else None,
+                    )
+                )
+            return spec
+
+        wide = [200, 2097152, 1024]
+        two_retired = [200, 2097152, 300, 1024]
+        with patch("helion._compat.is_hip", return_value=False):
+            for sizes, retired, saved, expected in (
+                ([200], {0}, [None], [None]),
+                ([200], {0}, [256], [None]),
+                ([200], {0}, [512], [None]),
+                # Each entry keeps its dim: 64 chunks the 2097152-wide one.
+                (wide, {0}, [None, 64, None], [None, 64, None]),
+                (wide, {0}, [256, 64, 512], [None, 64, 512]),
+                ([2097152, 200, 1024], {1}, [64, None, 128], [64, None, 128]),
+                ([200], {0}, [64], [None]),
+                (wide, {0}, [64, 64, None], [None, 64, None]),
+                # Trailing entries left off take their defaults.
+                (wide, {0}, [None, 64], [None, 64, None]),
+                (two_retired, {0, 2}, [None, 64, None], [None, 64, None, None]),
+            ):
+                with self.subTest(saved=saved):
+                    config = spec_with(sizes, retired).normalized_config(
+                        {"reduction_loops": saved}
+                    )
+                    self.assertEqual(config.reduction_loops, expected)
+            # A config longer than the older versions' is rejected.
+            with self.assertRaisesRegex(exc.InvalidConfig, "Too many values"):
+                spec_with(wide, {0}).normalized_config(
+                    {"reduction_loops": [None, 64, None, None]}
+                )
+
+    @skipIfNotTriton("Triton configs are the saved configs that must keep loading")
+    @skipIfRefEager("ref mode has no config spec or reduction-loop slots")
+    def test_saved_reduction_loops_of_dims_now_kept_persistent_load(self) -> None:
+        # Older versions offered a reduction loop to the row's dim beside a
+        # free hl.arange of its size (no chunk size of it compiled) and to the
+        # power-of-two dim a reduction over the range's subscript got, after
+        # the full slices' dims.  This version keeps both reductions
+        # persistent in slots pinned to None, and the configs older versions
+        # saved, full or trimmed, load with each entry at its own dim.  The
+        # row of 2097152 is too wide for a persistent reduction, so it needs
+        # the saved chunk of 64 that follows the retired dim's entry.  Beside
+        # a row sum in the same loop, the row's dim took the loop's graph
+        # from the sum's: the configs then have one entry, which stays at the
+        # row's slot, and the sum's slot follows it.
+        mark, mark_then_sums = host_arange_mark, host_arange_mark_then_row_sums
+        mark_beside_sum = _mark_columns_beside_a_row_sum
+        x, pos = torch.empty(16, 200), torch.zeros(16, dtype=torch.int64)
+        wide, medium = torch.empty(2, 2097152), torch.empty(4, 1024)
+        with cpu_render_target():
+            bound = {
+                fn: cpu_bind(
+                    helion.kernel(fn, backend="triton", static_shapes=True), args
+                )
+                for fn, args in (
+                    (mark, (x, pos)),
+                    (mark_then_sums, (x, pos, wide, medium)),
+                    (_count_columns_then_sum_rows, (x, pos, wide, medium)),
+                    (mark_beside_sum, (x, pos, torch.empty(16, 1024))),
+                )
+            }
+            for fn, pinned in (
+                (mark, [True]),
+                (mark_then_sums, [True, False, False]),
+                (_count_columns_then_sum_rows, [False, False, True]),
+                (mark_beside_sum, [True, False]),
+            ):
+                slots = bound[fn].config_spec.reduction_loops
+                self.assertEqual([spec.pinned for spec in slots], pinned)
+            for fn, saved, expected in (
+                (mark, [None], [None]),
+                (mark, [256], [None]),
+                (mark, [512], [None]),
+                (mark_then_sums, [None, 64, None], [None, 64, None]),
+                (mark_then_sums, [None, 64], [None, 64, None]),
+                (_count_columns_then_sum_rows, [64, None, None], [64, None, None]),
+                (_count_columns_then_sum_rows, [64], [64, None, None]),
+                (mark_beside_sum, [None], [None, None]),
+                (mark_beside_sum, [None, 64], [None, 64]),
+                # A chunk for a retired slot, which never compiled, keeps the
+                # reduction persistent.
+                (mark, [64], [None]),
+                (mark_then_sums, [64, None, None], [None, None, None]),
+                (_count_columns_then_sum_rows, [None, None, 64], [None, None, None]),
+                (mark_beside_sum, [64], [None, None]),
+            ):
+                spec = bound[fn].config_spec
+                config = helion.Config(
+                    block_sizes=[2] * len(spec.block_sizes), reduction_loops=saved
+                )
+                with self.subTest(kernel=fn.__name__, saved=saved):
+                    normalized = spec.normalized_config(config)
+                    self.assertEqual(normalized.reduction_loops, expected)
+            # The saved chunk of 64 still loops the 2097152-wide row, from the
+            # full config and from the trimmed one.
+            codes = [
+                bound[mark_then_sums].to_triton_code(
+                    helion.Config(block_sizes=[2, 2, 2], reduction_loops=saved)
+                )
+                for saved in ([None, 64, None], [None, 64])
+            ]
+        for code in codes:
+            (block,) = re.findall(
+                r"tl\.range\(0, 2097152, (_REDUCTION_BLOCK_\d+)\)", code
+            )
+            self.assertIn(f"{block} = 64", code)
+
+    @skipIfNotTriton("Triton configs are the saved configs that must keep loading")
+    @skipIfRefEager("ref mode has no config spec or reduction-loop slots")
+    def test_saved_reduction_loops_of_dims_retired_by_either_rule_load(self) -> None:
+        # Older versions also offered a loop to a row the rerun check refuses
+        # (an atomic whose result a later loop reads, or a row reloaded after
+        # the store of zeros), also beside a free hl.arange of its size.  The
+        # configs they saved load with each entry at its own dim, also with
+        # the last entry left off.  Such a dim's chunk ran, with wrong results,
+        # and one for a dim beside a free range never compiled: both keep the
+        # reduction persistent.
+        x, pos = torch.empty(16, 200), torch.zeros(16, dtype=torch.int64)
+        wide, medium = torch.empty(2, 2097152), torch.empty(4, 1024)
+        zero_then_mark = _zero_row_then_mark_columns
+        mark_sums_atomics = _mark_columns_sum_rows_then_rerun_atomics
+        mark_atomics = _mark_columns_beside_rerun_atomics
+        with cpu_render_target():
+            bound = {
+                fn: cpu_bind(
+                    helion.kernel(fn, backend="triton", static_shapes=True), args
+                )
+                for fn, args in (
+                    (zero_then_mark, (x, pos)),
+                    (mark_sums_atomics, (x, pos, wide, medium)),
+                    (mark_atomics, (x, pos, medium)),
+                )
+            }
+            for fn, slots in (
+                (zero_then_mark, [(200, True)]),
+                (mark_sums_atomics, [(200, True), (2097152, False), (1024, True)]),
+                (mark_atomics, [(200, True), (1024, True)]),
+            ):
+                self.assertEqual(
+                    [
+                        (spec.size_hint, spec.pinned)
+                        for spec in bound[fn].config_spec.reduction_loops
+                    ],
+                    slots,
+                )
+            for fn, saved, expected in (
+                (zero_then_mark, [None], [None]),
+                (mark_sums_atomics, [None, 64, None], [None, 64, None]),
+                (mark_sums_atomics, [None, 64], [None, 64, None]),
+                (zero_then_mark, [64], [None]),
+                (mark_sums_atomics, [None, 64, 16], [None, 64, None]),
+                (mark_atomics, [None, 16], [None, None]),
+            ):
+                spec = bound[fn].config_spec
+                config = helion.Config(
+                    block_sizes=[2] * len(spec.block_sizes), reduction_loops=saved
+                )
+                with self.subTest(kernel=fn.__name__, saved=saved):
+                    normalized = spec.normalized_config(config)
+                    self.assertEqual(normalized.reduction_loops, expected)
+            # The trimmed config's 64 still loops the 2097152-wide row.
+            code = bound[mark_sums_atomics].to_triton_code(
+                helion.Config(block_sizes=[2, 2, 2], reduction_loops=[None, 64])
+            )
+        (block,) = re.findall(r"tl\.range\(0, 2097152, (_REDUCTION_BLOCK_\d+)\)", code)
+        self.assertIn(f"{block} = 64", code)
+
+    @skipIfNotTriton("Triton configs are the saved configs that must keep loading")
+    @skipIfRefEager("ref mode has no config spec or reduction-loop slots")
+    def test_saved_reduction_loops_where_older_versions_met_the_range(
+        self,
+    ) -> None:
+        # Older versions padded the range's subscript to 256, which joined the
+        # sum over r's 256 columns into one dim.  The range read in a branch
+        # kept that dim from rolling, so the configs they saved have one
+        # entry, for y's 2097152 columns; the r dim rolls now, after it.
+        # Beside a full slice of the range's extent in another loop, older
+        # versions read the range through the slice's dim, which the range
+        # kept persistent, and had no dim of 256: their entries are for the
+        # rows of 2097152 and 64 columns.
+        x, pos = torch.empty(16, 200), torch.zeros(16, dtype=torch.int64)
+        wide = torch.empty(2, 2097152)
+        branch = _count_columns_in_a_branch_beside_row_sums
+        extent = _count_columns_then_sum_rows_of_their_extent
+        with cpu_render_target():
+            bound = {
+                fn: cpu_bind(
+                    helion.kernel(fn, backend="triton", static_shapes=True), args
+                )
+                for fn, args in (
+                    (branch, (x, pos, torch.empty(16, 256), wide)),
+                    (extent, (x, pos, wide)),
+                )
+            }
+            for fn, slots in (
+                (branch, [(2097152, False), (256, False)]),
+                (extent, [(2097152, False), (64, False)]),
+            ):
+                self.assertEqual(
+                    [
+                        (spec.size_hint, spec.pinned)
+                        for spec in bound[fn].config_spec.reduction_loops
+                    ],
+                    slots,
+                )
+            for fn, saved, expected in (
+                (branch, [64], [64, None]),
+                (extent, [64, 32], [64, 32]),
+                (extent, [None, 32], [None, 32]),
+            ):
+                spec = bound[fn].config_spec
+                config = helion.Config(
+                    block_sizes=[2] * len(spec.block_sizes), reduction_loops=saved
+                )
+                with self.subTest(kernel=fn.__name__, saved=saved):
+                    normalized = spec.normalized_config(config)
+                    self.assertEqual(normalized.reduction_loops, expected)
+            # The saved 64 loops the 2097152-wide row, too wide to stay
+            # persistent.
+            spec = bound[branch].config_spec
+            code = bound[branch].to_triton_code(
+                helion.Config(
+                    block_sizes=[2] * len(spec.block_sizes), reduction_loops=[64]
+                )
+            )
+        (block,) = re.findall(r"tl\.range\(0, 2097152, (_REDUCTION_BLOCK_\d+)\)", code)
+        self.assertIn(f"{block} = 64", code)
+
+    @skipIfNotTriton("Triton configs are the saved configs that must keep loading")
+    @skipIfRefEager("ref mode has no config spec or reduction-loop slots")
+    def test_saved_reduction_loops_of_a_range_typed_before_a_full_slice(
+        self,
+    ) -> None:
+        # Typed before a full slice of its extent in the same loop, the
+        # range's subscript kept its padded 256 in older versions, and its sum
+        # had a dim of 256 with a slot of its own, also with the slice in a
+        # branch or an inner loop.  The range and the slice share one dim of
+        # 200 now, which keeps that slot, pinned.  So does a range subscripted
+        # on two axes, a causal mask: its dim takes both and the slice's two,
+        # where older versions had literal 256s.  Typed after the slice, the
+        # range read the slice's dim then too, which the free range keeps
+        # persistent: no slot.  A sum over the bare range joins the range's
+        # dim as well, but only a slice gave older versions' range the
+        # slice's dim, so the subscripted range's sum keeps its slot; and a
+        # padded 1024 that a later row of 1024 joined keeps the position
+        # older versions allocated it at, ahead of the 256 after it.
+        x, pos = torch.empty(16, 200), torch.zeros(16, dtype=torch.int64)
+        wide = torch.empty(2, 2097152)
+        with cpu_render_target():
+            for fn, args, slots in (
+                (_count_columns_then_sum_their_rows, (x, pos), [(200, True)]),
+                (_sum_rows_then_count_their_columns, (x, pos), []),
+                (
+                    _mark_columns_then_add_rows_in_a_branch,
+                    (x, pos, wide),
+                    [(2097152, False), (200, True)],
+                ),
+                (
+                    _mark_columns_then_add_rows_in_a_loop,
+                    (x, pos, wide),
+                    [(2097152, False), (200, True)],
+                ),
+                (
+                    _mask_rows_causally_then_sum_them,
+                    (torch.empty(4, 200, 200),),
+                    [(200, True)],
+                ),
+                (_sum_a_range_then_the_bare_range, (x,), [(200, True)]),
+                (_sum_two_ranges_then_a_wide_row, (x,), [(1024, False), (200, True)]),
+            ):
+                spec = cpu_bind(
+                    helion.kernel(fn, backend="triton", static_shapes=True), args
+                ).config_spec
+                with self.subTest(kernel=fn.__name__):
+                    self.assertEqual(
+                        [
+                            (slot.size_hint, slot.pinned)
+                            for slot in spec.reduction_loops
+                        ],
+                        slots,
+                    )
+                    # The entries older versions saved load by position; a
+                    # pinned slot's entry runs persistent.
+                    config = helion.Config(
+                        block_sizes=[2] * len(spec.block_sizes),
+                        reduction_loops=[64] * len(slots),
+                    )
+                    self.assertEqual(
+                        spec.normalized_config(config).reduction_loops,
+                        [None if pinned else 64 for _, pinned in slots],
+                    )
+
+    @skipIfRefEager("ref mode has no config spec or reduction-loop slots")
+    def test_reduction_loop_slots_line_up_with_origin_main(self) -> None:
+        # The sizes of the reduction_loops slots origin/main (415adfb59) gave
+        # these kernels, recorded by binding them there.  The configs it saved
+        # must keep loading with each entry at its dim: the same number of
+        # slots, and a slot this version does not pin naming a dim of the old
+        # size.  A pinned slot (a dim kept persistent) may name another size,
+        # the range's 200 for the padded 256.
+        x, pos = torch.empty(16, 200), torch.zeros(16, dtype=torch.int64)
+        wide, medium = torch.empty(2, 2097152), torch.empty(4, 1024)
+        cases = (
+            (
+                _count_columns_then_sum_rows,
+                (x, pos, wide, medium),
+                [2097152, 1024, 256],
+            ),
+            (_count_columns_then_sum_their_rows, (x, pos), [256]),
+            (_mark_columns_beside_rerun_atomics, (x, pos, medium), [200, 1024]),
+            (
+                _mark_columns_sum_rows_then_rerun_atomics,
+                (x, pos, wide, medium),
+                [200, 2097152, 1024],
+            ),
+            (_mark_columns_then_add_rows_in_a_branch, (x, pos, wide), [2097152, 256]),
+            (_mark_columns_then_add_rows_in_a_loop, (x, pos, wide), [2097152, 256]),
+            (_mask_rows_causally_then_sum_them, (torch.empty(4, 200, 200),), [256]),
+            (_sum_rows_then_count_their_columns, (x, pos), []),
+            (_zero_row_then_mark_columns, (x, pos), [200]),
+            (_sum_a_range_then_the_bare_range, (x,), [256]),
+            (_sum_two_ranges_then_a_wide_row, (x,), [1024, 256]),
+            (grid_pick_column, (x, pos), [256]),
+            (host_arange_mark, (x, pos), [200]),
+            (
+                host_arange_mark_then_row_sums,
+                (x, pos, wide, medium),
+                [200, 2097152, 1024],
+            ),
+        )
+        with cpu_render_target():
+            for fn, args, origin_main in cases:
+                spec = cpu_bind(
+                    helion.kernel(fn, backend="triton", static_shapes=True), args
+                ).config_spec
+                with self.subTest(kernel=fn.__name__):
+                    slots = list(spec.reduction_loops)
+                    self.assertEqual(len(slots), len(origin_main))
+                    for slot, size in zip(slots, origin_main, strict=True):
+                        if not slot.pinned:
+                            self.assertEqual(slot.size_hint, size)
+
+    @skipIfNotTriton("The code and slots asserted are Triton's")
+    @skipIfRefEager("ref mode has no config spec or reduction-loop slots")
+    def test_load_typed_before_the_range_subscript_shares_its_dim(self) -> None:
+        # The load over the range is typed before the subscript names the
+        # extent of 200, with the padded 256, and the op between them pinned
+        # the subscript's dim to 256 (CuTe then refused a sum over the two
+        # dims).  Device IR tracing gives the load and the subscript one dim
+        # of 200, as when the subscript comes first, with no reduction loop:
+        # the range stays outside it.  Older configs had one for the 256,
+        # whose slot stays, pinned to None.
+        x, pos = torch.empty(16, 200), torch.zeros(16, dtype=torch.int64)
+        with cpu_render_target():
+            bound = cpu_bind(
+                helion.kernel(grid_pick_column, backend="triton", static_shapes=True),
+                (x, pos),
+            )
+            code = bound.to_code(bound.config_spec.default_config())
+            spec = bound.config_spec
+            saved = spec.normalized_config(helion.Config(reduction_loops=[None]))
+        (rdim,) = [info for info in bound.env.block_sizes if info.reduction]
+        self.assertEqual(rdim.size, 200)
+        self.assertEqual(
+            [
+                (slot.block_id, slot.size_hint, slot.pinned)
+                for slot in spec.reduction_loops
+            ],
+            [(rdim.block_id, 200, True)],
+        )
+        self.assertEqual(saved.reduction_loops, [None])
+        self.assertRegex(code, r"mask_\d+ = indices_\d+ < 200")
+        # That mask covers the range's padding lanes, so neither the load
+        # through the range nor the sum over it masks them again.
+        self.assertNotIn("tl.arange(0, 256) < 200", code)
 
     def test_cross_loop_pipeline_is_not_supported_on_amd(self) -> None:
         with patch("helion._compat.is_hip", return_value=True):

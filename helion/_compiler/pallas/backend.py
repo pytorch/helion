@@ -498,6 +498,10 @@ class PallasBackend(Backend):
     def supports_config_key(self, key: str) -> bool:
         return key in self._PALLAS_SUPPORTED_KEYS
 
+    def flattened_tile_shares_one_index(self) -> bool:
+        # A flattened loop flattens the grid only; each tile keeps its block.
+        return False
+
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
         return f"pl.program_id({dim})"
 

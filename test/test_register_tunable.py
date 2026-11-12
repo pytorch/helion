@@ -355,6 +355,28 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
             # the config gives (the default foo is 16).
             self.assertRegex(code, r"_BLOCK_SIZE_0 = (tl\.constexpr\()?64\b")
 
+    def test_host_min_max_over_a_tunable(self):
+        """Python's min and max over a tunable on the host compute with the
+        config's value, not the tunable's hint (8192)."""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel_with_min_max(x: torch.Tensor) -> torch.Tensor:
+            (n,) = x.size()
+            out = torch.empty_like(x)
+            foo = hl.register_tunable("foo", PowerOfTwoFragment(16, 256))
+            low = min(foo, 100)
+            high = max(foo, 100)
+            for tile_n in hl.tile([n], block_size=[min(foo, 128)]):
+                out[tile_n] = x[tile_n] * low + high
+            return out
+
+        x = torch.randn(1000, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(kernel_with_min_max, (x,), foo=64)
+        torch.testing.assert_close(result, x * 64 + 100)
+        if not self._in_ref_eager_mode:
+            # The host computes the block under the config.
+            self.assertIn("_BLOCK_SIZE_0 = min(128, foo)", code)
+
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @patch.object(loops, "_supports_warp_specialize", lambda: False)
     def test_integer_fragment(self):
@@ -396,6 +418,30 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
         x = torch.randn(128, device=DEVICE, dtype=torch.float32)
         result = kernel_with_enum(x)
         expected = x * 2.0
+        torch.testing.assert_close(result, expected)
+
+    def test_host_and_device_helper_value(self):
+        """A helper over a tunable called on the host and again in device
+        code computes one value, which the device allocation takes as its
+        compile-time size."""
+
+        @helion.kernel(autotune_effort="none")
+        def fill_width(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.zeros_like(x)
+            foo = hl.register_tunable("foo", PowerOfTwoFragment(16, 256))
+            width = helion.next_power_of_2(foo)
+            for tile_m in hl.tile(m):
+                acc = hl.zeros(
+                    [tile_m, helion.next_power_of_2(foo)], dtype=torch.float32
+                )
+                out[tile_m, :width] = acc + 1
+            return out
+
+        x = torch.randn(64, 1000, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(fill_width, (x,), block_sizes=[16], foo=64)
+        expected = torch.zeros_like(x)
+        expected[:, :64] = 1
         torch.testing.assert_close(result, expected)
 
     @skipIfRefEager("to_triton_code is not supported in ref eager mode")

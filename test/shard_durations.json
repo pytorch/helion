@@ -401,6 +401,7 @@
  "test/test_rocm_benchmarking.py": 0.0,
  "test/test_rolled_control_flow_gpu.py": 6.5,
  "test/test_rolled_reduction_positions.py": 17.6,
+ "test/test_rolled_reduction_reruns.py": 0.9,
  "test/test_root_dispatch.py": 6.3,
  "test/test_rounded_division.py": 0.1,
  "test/test_runtime.py": 0.0,

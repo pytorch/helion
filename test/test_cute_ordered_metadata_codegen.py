@@ -510,6 +510,27 @@ def test_class_truth_is_refused_before_structural_proxy_evaluation():
     assert effects == _HOST_EFFECTS
 
 
+@pytest.mark.parametrize("rows", [3, 4])
+def test_a_computed_dot_operand_takes_the_fragment_owner_at_any_row_count(rows):
+    # ``hl.arange(rows)[:, None]`` keeps its extent, which repeats no other
+    # axis here (the 7 rows of the test below padded to the contraction's 8,
+    # and the repeat gave the dot its owner).  The dot's computed operand
+    # needs the fragment owner all the same: the scalar fallback has no K
+    # tile to walk.
+    x = torch.arange(2 * 128, dtype=torch.bfloat16).as_strided(
+        (2, rows, 8), (128, 8, 1)
+    )
+    y = torch.ones(2, 8, 9, dtype=torch.bfloat16)
+    with cpu_target():
+        bound = cpu_bind(computed_metadata_phases, (x, y, None))
+        config = dict(bound.config_spec.default_config()) | {
+            "pid_type": "flat",
+            "cute_fragment_half_mma": True,
+        }
+        code = bound.to_code(helion.Config.from_dict(config))
+    assert "_helion_fragment_mma.mma_bf16(" in stage_sources(code)[0]
+
+
 @pytest.mark.parametrize("shift", [None, 2.0])
 def test_ordered_metadata_and_exact_storage_capture(shift, tmp_path):
     x = torch.arange(2 * 128 + 3, dtype=torch.bfloat16)[3:].as_strided(

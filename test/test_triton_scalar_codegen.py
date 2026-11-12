@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 import ast
-from contextlib import ExitStack
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
-from unittest.mock import patch
 
 import pytest
 import sympy
@@ -16,37 +13,14 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
+from helion._testing.triton_codegen import cpu_codegen as cpu_codegen
 from helion._utils import triton_is_available
 import helion.language as hl
 from helion.runtime.settings import _get_backend
 
-if TYPE_CHECKING:
-    from collections.abc import Iterator
-
 pytestmark = pytest.mark.skipif(
     not triton_is_available(), reason="Triton is required for source generation"
 )
-
-
-@pytest.fixture
-def cpu_codegen() -> Iterator[None]:
-    with ExitStack() as stack:
-        for name, value in (
-            ("torch.cuda.is_available", False),
-            ("helion._compat._supports_maxnreg", False),
-            ("helion._compat._supports_tensor_descriptor", False),
-            ("helion._compat._is_hip", False),
-            ("helion.language.loops.use_tileir_tunables", False),
-            ("helion.autotuner.config_spec.num_compute_units", 128),
-            ("helion.runtime.kernel.target_device_capability", (9, 0)),
-            ("helion._compiler.compile_environment.target_device_capability", (9, 0)),
-            ("helion.runtime.get_num_sm", 132),
-        ):
-            stack.enter_context(patch(name, return_value=value))
-        stack.enter_context(
-            patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden"))
-        )
-        yield
 
 
 def _device_function(code: str) -> ast.FunctionDef:

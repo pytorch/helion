@@ -43,27 +43,17 @@ class _PadTensorFactoryMode(TorchDispatchMode):
             )
 
             def _pad_dim(dim_size: object) -> object:
-                if (
-                    isinstance(dim_size, int)
-                    and dim_size > 0
-                    and (fully_concrete or dim_size >= 16)
-                ):
-                    padded = next_power_of_2(dim_size)
-                    if padded != dim_size and not fully_concrete:
-                        # The padded dim of a tile is the full-slice reduction
-                        # dim of the same size (``hl.zeros([tile, 400])`` and
-                        # ``y[tile, :]`` over 400 columns): its var keeps the
-                        # padded tile and its mask hides the padding columns.
-                        # Without a guard: a dynamic slice that merely has the
-                        # literal's size at bind time keeps its own dim rather
-                        # than being specialized to the literal.
-                        return (
-                            CompileEnvironment.current()
-                            .allocate_reduction_dimension(dim_size, guard=False)
-                            .var
-                        )
-                    return padded
-                return dim_size
+                if not isinstance(dim_size, int) or dim_size <= 0:
+                    return dim_size
+                if fully_concrete:
+                    return next_power_of_2(dim_size)
+                if dim_size < 16:
+                    return dim_size
+                # The padded dim of a tile is the full-slice reduction dim of
+                # the same size (``hl.zeros([tile, 400])`` and ``y[tile, :]``
+                # over 400 columns): its var keeps the padded tile and its mask
+                # hides the padding columns.
+                return CompileEnvironment.current().padded_extent_dim(dim_size)
 
             return tree_map(_pad_dim, shape)
 
