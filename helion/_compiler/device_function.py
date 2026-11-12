@@ -821,12 +821,20 @@ class DeviceFunction:
         resolved = host.resolve_tunable_expr(expr, self.config)
         if isinstance(resolved, (int, float, bool)):
             return env.backend.scalar_literal_expr(resolved)
-        expr = resolved
-        if not expr.free_symbols:
-            return env.backend.sympy_printer_expr(expr)
+        constants = env.config_constants(resolved, self.config)
+        if not constants.free_symbols:
+            return env.backend.sympy_printer_expr(constants)
+        expr_to_origin = host.expr_to_origin
+        # A name for the whole expression passes its value in where the
+        # config's values leave a symbol nothing names alone
+        # (``HostFunction.sympy_expr``).
+        if expr is not constants and expr in self.expr_to_var_info:
+            return self.expr_to_var_info[expr].name
+        if expr is not constants and expr in expr_to_origin:
+            return self._lift_sympy_arg(expr)
+        expr = constants
         if expr in self.expr_to_var_info:
             return self.expr_to_var_info[expr].name
-        expr_to_origin = HostFunction.current().expr_to_origin
         if expr in expr_to_origin:
             return self._lift_sympy_arg(expr)
         if env.backend.lowers_integer_powers:
@@ -1100,7 +1108,9 @@ class DeviceFunction:
                 # literal avoids specializing a dynamic stride solely to build
                 # a launch-time descriptor.
                 strides[-1] = "1"
-                host_block_size = ", ".join(map(host_function.literal_expr, block_size))
+                host_block_size = ", ".join(
+                    host_function.literal_expr(size, self.config) for size in block_size
+                )
                 arg = TensorDescriptorArg(
                     desc_name,
                     fake_value,
@@ -1822,7 +1832,7 @@ class DeviceFunction:
         """Add all deferred RDIM definitions to host statements."""
         backend = CompileEnvironment.current().backend
         for var_name, expr in self.deferred_rdim_defs:
-            expr_str = HostFunction.current().sympy_expr(expr)
+            expr_str = HostFunction.current().sympy_expr(expr, self.config)
             stmt = statement_from_string(
                 f"{var_name} = {backend.dynamic_rdim_size_expr(expr_str)}"
             )

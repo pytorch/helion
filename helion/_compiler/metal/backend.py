@@ -346,6 +346,10 @@ class MetalBackend(Backend):
         return "metal"
 
     @property
+    def lowers_mask_select(self) -> bool:
+        return True
+
+    @property
     def state(self) -> BackendState:
         return BackendState.EXPERIMENTAL
 

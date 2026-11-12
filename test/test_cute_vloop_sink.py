@@ -750,6 +750,42 @@ def test_fission_stages_regenerate_the_knob_off_code_when_nothing_sinks(
         assert retried == off
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _scale_columns(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_r, tile_c in hl.tile(x.size()):
+        out[tile_r, tile_c] = (
+            x[tile_r, tile_c].to(torch.float32) * w[tile_c].to(torch.float32)
+        ).to(x.dtype)
+    return out
+
+
+def test_a_guarded_row_store_lets_the_row_loads_sink(cpu_only: None) -> None:
+    """500 rows end the 32-row tiles ragged, so each row's store is guarded
+    by its row mask.  A plain ``if mask: ptr.store(v)`` is a store into
+    ``out`` (``_segment_stored_tensors``), so the vector loop sinks: each
+    row's ``x`` loads as one predicated packet.  The guarded store used to be
+    a statement substituted for a template line, wrapped in a second
+    ``Expr``: an effect the pass could not name, which kept the knob-off code
+    (a 2-byte load per element of each row)."""
+    args = (
+        torch.empty(500, 384, dtype=torch.bfloat16),
+        torch.empty(384, dtype=torch.bfloat16),
+    )
+    code = _cpu_code(
+        _scale_columns,
+        args,
+        block_sizes=[32, 32],
+        num_threads=[8, 4],
+        loop_orders=[[1, 0]],
+        cute_vector_widths=[1, 8],
+        cute_lane_layouts=["blocked", "strided"],
+        cute_vloop_sink=True,
+    )
+    rows = _loop(code, "lane_0")
+    assert len(_vector_loads(rows.body)) == 1, code
+
+
 def test_knob_off_keeps_the_original_nest(cpu_only: None) -> None:
     x = torch.empty(4096, 4096, dtype=torch.bfloat16)
     code = _cpu_code(
@@ -1088,6 +1124,28 @@ class TestCuteVloopSink(TestCase):
             ),
         )
         self.assertIn("ir.VectorType.get([4], cutlass.Uint32.mlir_type)", code)
+
+    def test_a_guarded_row_store_sinks_bitwise(self) -> None:
+        """``test_a_guarded_row_store_lets_the_row_loads_sink``'s ragged row
+        tiles: the sunk kernel's output is bitwise the knob-off kernel's."""
+        x = torch.randn(500, 384, device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn(384, device=DEVICE, dtype=torch.bfloat16)
+        outputs = {}
+        for sink in (True, False):
+            code, outputs[sink] = code_and_output(
+                _scale_columns,
+                (x, w),
+                block_sizes=[32, 32],
+                num_threads=[8, 4],
+                loop_orders=[[1, 0]],
+                cute_vector_widths=[1, 8],
+                cute_lane_layouts=["blocked", "strided"],
+                cute_vloop_sink=sink,
+            )
+            self.assertEqual("_vsink" in code, sink)
+        torch.testing.assert_close(outputs[True], outputs[False], atol=0, rtol=0)
+        expected = (x.float() * w.float()).to(x.dtype)
+        torch.testing.assert_close(outputs[True], expected, atol=0, rtol=0)
 
     def test_nonzero_grid_origin_declines_and_stays_correct(self) -> None:
         """``hl.tile(8, n)`` keeps per-element column masks: the pass declines

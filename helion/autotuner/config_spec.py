@@ -537,8 +537,9 @@ class ReductionKernelFact(NamedTuple):
     non-reduction loop, parallel grid axes, the complete live-tile timeline, and axes whose
     contiguous memory access makes them coalescing-sensitive.
 
-    Built by ``build_reduction_kernel_fact``. ``reductions`` may be empty (a kernel with only
-    GRID_TILE / DECLINED reductions, or none) — the seed then declines.
+    Built by ``build_reduction_kernel_fact``. ``reductions`` holds every occurrence, GRID_TILE
+    and DECLINED ones included, so it is empty only for a kernel without reductions; the
+    reduction seed declines when no member is sized (``SIZED_REDUCTION_CATEGORIES``).
     """
 
     reductions: tuple[ReductionDescriptor, ...]
@@ -572,14 +573,18 @@ class MatmulWithReductionEpilogueFact(NamedTuple):
 
 class MemoryOpFact(NamedTuple):
     """Metadata linking one ``Config.indexing`` slot to its graph memory op, one entry per
-    load/store in graph-traversal order (so ``memory_op_facts[i]`` describes ``config.indexing[i]``).
+    lowering of a load/store in the order code generation lowers them (a ``while`` condition's
+    load gets two on a backend that slots each lowering): ``indexing_index`` is the slot for the
+    configs that roll no reduction (a load of a ``tile.index`` value or of a stack tensor, which
+    takes none, has one after the others), and ``DeviceIR.config_memory_op_facts`` gives the
+    facts of any config.
     Lets heuristics reason about *which* load/store a slot is, not a bare positional index.
 
     The reduction-fact builders consume the enrichment fields below (all reduction-AGNOSTIC — no
     notion of which axis is "the" reduction; the builders index them by the reduction's ``block_id``).
     """
 
-    indexing_index: int  # slot in Config.indexing (== position in this list)
+    indexing_index: int  # slot in Config.indexing of a config that rolls no reduction
     kind: str  # "load" | "store"
     eviction_index: int | None  # slot in Config.load_eviction_policies, else None
     tensor_name: str | None  # host buffer name being accessed, e.g. "x", "weight"

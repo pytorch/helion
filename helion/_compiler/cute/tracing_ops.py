@@ -17,6 +17,7 @@ from torch._inductor.codegen.simd import constant_repr
 
 from ...language import _decorators
 from ...language._tracing_ops import _if
+from ...language._tracing_ops import _mask_select
 from ...language._tracing_ops import _mask_to
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
@@ -27,6 +28,9 @@ from .block_uniform import block_uniform
 from .synthetic_axes import branch_scope
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Collection
+
     from ..inductor_lowering import CodegenState
 
 
@@ -192,26 +196,45 @@ def _(state: CodegenState) -> list[object]:
     )
 
 
-@_decorators.codegen(_mask_to, "cute")
-def _(state: CodegenState) -> ast.AST:
-    tensor = state.proxy_arg(0)
-    assert isinstance(tensor, torch.Tensor)
-    other = state.proxy_arg(1)
-    assert isinstance(other, (int, float, bool))
-
+def _tile_mask_expr(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    block_ids: Collection[int] | None = None,
+) -> str | None:
+    """The mask of the active tiles over ``tensor``'s dims (of the canonical
+    ``block_ids`` only, if given), or None when no such dim has a masked
+    tile."""
+    env = CompileEnvironment.current()
     mask_exprs: list[str] = []
     input_sizes = [*tensor.size()]
     for dim, size in enumerate(input_sizes):
         if (
-            index := CompileEnvironment.current().resolve_block_id(size)
-        ) is not None and (mask_var := state.codegen.mask_var(index)) is not None:
+            (index := env.resolve_block_id(size)) is not None
+            and (block_ids is None or env.canonical_block_id(index) in block_ids)
+            and (mask_var := state.codegen.mask_var(index)) is not None
+        ):
             expand = state.tile_strategy.expand_str(input_sizes, dim)
             expr = f"({mask_var}{expand})"
             if expr not in mask_exprs:
                 mask_exprs.append(expr)
     if not mask_exprs:
+        return None
+    return " and ".join(mask_exprs)
+
+
+def _masked_select(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    other: Callable[[torch.dtype], ast.AST],
+    block_ids: Collection[int] | None = None,
+) -> ast.AST:
+    """``(tensor if mask else other)`` for the active tiles' mask (of
+    ``block_ids`` only, if given), at ``tensor``'s dtype; ``other(dtype)``
+    renders the fallback at the dtype the select runs in.  ``tensor`` itself
+    where no such tile is masked."""
+    mask_expr = _tile_mask_expr(state, tensor, block_ids)
+    if mask_expr is None:
         return state.ast_arg(0)
-    mask_expr = " and ".join(mask_exprs)
     input_dtype = tensor.dtype
     # CuTe cannot select between float8 scalars; they convert to float32 and
     # back exactly.
@@ -220,17 +243,42 @@ def _(state: CodegenState) -> ast.AST:
         if input_dtype.itemsize == 1 and input_dtype.is_floating_point
         else input_dtype
     )
-    expr_typed = cast_ast(state.ast_arg(0), select_dtype)
-    other_typed = CompileEnvironment.current().backend.cast_ast(
-        expr_from_string(constant_repr(other)),
-        select_dtype,
-    )
     result = expr_from_string(
         "({expr} if {mask} else {other})",
-        expr=expr_typed,
+        expr=cast_ast(state.ast_arg(0), select_dtype),
         mask=expr_from_string(mask_expr),
-        other=other_typed,
+        other=other(select_dtype),
     )
     if select_dtype != input_dtype:
         result = cast_ast(result, input_dtype)
     return result
+
+
+def _constant_other(value: float | bool) -> Callable[[torch.dtype], ast.AST]:
+    """A masked select's constant ``value`` in the select's dtype."""
+    return lambda dtype: CompileEnvironment.current().backend.cast_ast(
+        expr_from_string(constant_repr(value)), dtype
+    )
+
+
+@_decorators.codegen(_mask_to, "cute")
+def _(state: CodegenState) -> ast.AST:
+    tensor = state.proxy_arg(0)
+    assert isinstance(tensor, torch.Tensor)
+    other = state.proxy_arg(1)
+    assert isinstance(other, (int, float, bool))
+    return _masked_select(state, tensor, _constant_other(other))
+
+
+@_decorators.codegen(_mask_select, "cute")
+def _(state: CodegenState) -> ast.AST:
+    tensor = state.proxy_arg(0)
+    assert isinstance(tensor, torch.Tensor)
+    block_ids = state.proxy_arg(2)
+    assert isinstance(block_ids, tuple)
+    other = state.proxy_arg(1)
+    if isinstance(other, (int, float, bool)):
+        return _masked_select(state, tensor, _constant_other(other), block_ids)
+    return _masked_select(
+        state, tensor, lambda dtype: cast_ast(state.ast_arg(1), dtype), block_ids
+    )

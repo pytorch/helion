@@ -430,6 +430,55 @@ def _(node: torch.fx.Node) -> float | bool:
     return value
 
 
+@_decorators.api()
+def _mask_select(
+    tensor: torch.Tensor,
+    other: torch.Tensor | float | bool,
+    block_ids: tuple[int, ...],
+    /,
+) -> torch.Tensor:
+    """
+    ``tensor`` with the values outside the tiles of ``block_ids`` taken from
+    ``other``, a tensor of the same shape or a scalar: ``_mask_to`` limited to
+    some blocks.  The compiler applies it to the operands of a loop carry's
+    update that read a partial tile of the loop, or to the whole update
+    (``mask_loop_carries``), so that the tile's padded lanes add nothing to
+    the carried value.
+
+    Args:
+        tensor: The tensor to apply the mask to.
+        other: The tensor whose values the masked out elements take, or the
+            value they all take.
+        block_ids: The canonical block ids whose tile masks apply.
+
+    Returns:
+        torch.Tensor: ``tensor`` where those tile masks are true, else ``other``.
+    """
+    raise NotInsideKernel
+
+
+@_decorators.register_fake(_mask_select)
+def _(
+    tensor: torch.Tensor,
+    other: torch.Tensor | float | bool,
+    block_ids: tuple[int, ...],
+) -> torch.Tensor:
+    return torch.empty_like(tensor)
+
+
+@_decorators.get_masked_value(_mask_select)
+def _(node: torch.fx.Node) -> float | bool | None:
+    from .._compiler.node_masking import cached_masked_value
+
+    # The masked lanes of other blocks keep the tensor's values.
+    tensor, other = node.args[:2]
+    assert isinstance(tensor, torch.fx.Node)
+    value = cached_masked_value(tensor)
+    if isinstance(other, torch.fx.Node):
+        other = cached_masked_value(other)
+    return value if value == other else None
+
+
 @_decorators.api(allow_host_tensor=True)
 def _new_var(value: _T, /) -> _T:
     """

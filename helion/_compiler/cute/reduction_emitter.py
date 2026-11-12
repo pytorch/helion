@@ -2309,7 +2309,9 @@ class CuteLoopedReductionEmitter(
         if block_mapping:
             return
         trips_var = f"_REDUCTION_TRIPS_{strategy.block_index}"
-        host_numel = HostFunction.current().sympy_expr(numel)
+        host_numel = HostFunction.current().sympy_expr(
+            numel, state.device_function.config
+        )
         state.device_function.constexpr_arg_with_host_def(
             trips_var,
             f"({host_numel} + {block_size_var} - 1) // {block_size_var}",

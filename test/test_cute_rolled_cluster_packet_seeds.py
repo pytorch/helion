@@ -193,7 +193,14 @@ def test_full_fused_population_contains_both_packet_profiles() -> None:
         retained.reduction_loops == [2048]
         and retained.config["cute_min_blocks_per_mp"] == 1
     )
-    assert retained.config["load_eviction_policies"] == ["first", *["l2_last"] * 7]
+    # The rolled code lowers five loads (x and the residual, then all three
+    # again in the second loop) into the first five slots and leaves the
+    # last three unused.
+    assert retained.config["load_eviction_policies"] == [
+        "first",
+        *["l2_last"] * 4,
+        *[""] * 3,
+    ]
     profile = get_effort_profile("full").pattern_search
     assert profile is not None and profile.initial_population_strategy == "from_random"
     with bound.env:
@@ -209,6 +216,18 @@ def test_full_fused_population_contains_both_packet_profiles() -> None:
         assert (
             "_consume_prefetch_" in source and "_cute_grouped_reduce_cluster(" in source
         )
+    # The retained profile's first source, x, evicts first; the other loads
+    # its rolled code lowers keep their lines.
+    loads = {
+        name: [line for line in source.splitlines() if f"({name}.iterator" in line]
+        for name in ("x", "residual", "weight")
+    }
+    assert all(loads.values()), loads
+    assert all("level1_eviction_priority='evict_first'" in line for line in loads["x"])
+    assert all(
+        "_cute_load_l2_evict_last(" in line
+        for line in loads["residual"] + loads["weight"]
+    )
 
 
 def test_legacy_seed_prefix_and_default_are_unchanged() -> None:

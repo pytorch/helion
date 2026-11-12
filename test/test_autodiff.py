@@ -708,6 +708,47 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         )
         self.assertIn("x.view([-1, 4, 8])", helion_code)
 
+    def test_loop_carry_on_its_loops_block(self):
+        # The carry's update takes a `_mask_select` (mask_loop_carries) that
+        # keeps a partial tile's padded lanes out of it: the scan re-applies
+        # it where the last tile is partial (500 columns) and passes the
+        # value through where every tile is full (512).
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            block_size_n = hl.register_block_size(n)
+            out = torch.empty([m], device=x.device)
+            for tile_m in hl.tile(m):
+                acc = hl.zeros([tile_m, block_size_n], dtype=torch.float32)
+                for tile_n in hl.tile(n, block_size=block_size_n):
+                    acc = acc + torch.exp(x[tile_m, tile_n])
+                out[tile_m] = acc.sum(dim=1)
+            return out
+
+        # The same carry with the loop's dim first: the scan lays its mask
+        # along that dim.
+        @helion.kernel(autotune_effort="none")
+        def transposed(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            block_size_n = hl.register_block_size(n)
+            out = torch.empty([m], device=x.device)
+            for tile_m in hl.tile(m):
+                acc = hl.zeros([block_size_n, tile_m], dtype=torch.float32)
+                for tile_n in hl.tile(n, block_size=block_size_n):
+                    acc = acc + torch.exp(x[tile_m, tile_n].T)
+                out[tile_m] = acc.sum(dim=0)
+            return out
+
+        for fn in (kernel, transposed):
+            for n in (512, 500):
+                self._check_backward(
+                    fn,
+                    lambda x: torch.exp(x).sum(dim=1),
+                    1,
+                    shape=(64, n),
+                    grad_shape=(64,),
+                )
+
     def test_multi_output_reordered_stores(self):
         @helion.kernel(autotune_effort="none")
         def kernel(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
