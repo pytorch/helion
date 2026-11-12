@@ -1,0 +1,763 @@
+{
+ "description": "Pick a time-weighted, family-stratified sample of better-benchmark kernels.",
+ "sweep": "artifacts/bb-sweep-2026-11-07/inductor_all_shapes.json",
+ "better_benchmark_commit": "824c970f25f052de6cf66a4c634df246af00bb1e",
+ "params": {
+  "count": 48,
+  "top_fraction": 0.6,
+  "min_us": 12.0,
+  "max_per_pattern": 1,
+  "max_kernels": 6,
+  "exclude": [],
+  "extra": [
+   "var_mean_42fad1ece813:652894ae",
+   "var_mean_004f9a9ea198:536b6e86",
+   "sum_sum_643db2887a01:2cd54028"
+  ]
+ },
+ "total_model_share": 164.0,
+ "selected_model_share": 21.518602456571905,
+ "extra_model_share": 0.047523606777044126,
+ "unpriced_occurrences": 311,
+ "kernels": [
+  {
+   "repro": "pointwise_826ea0b5f6e4",
+   "shape": "92efc45e",
+   "family": "pointwise",
+   "inductor_us": 59.167999774217606,
+   "memcopy_sol_us": 35.61599925160408,
+   "total_bytes": 201326592,
+   "n_kernels": 1,
+   "model_share": 1.4679239384148126,
+   "models": {
+    "hf/infer/BertForMaskedLM": 12,
+    "hf/infer/LayoutLMForMaskedLM": 12,
+    "hf/infer/PLBartForCausalLM": 6,
+    "hf/infer/RobertaForCausalLM": 12,
+    "hf/infer/YituTechConvBert": 12,
+    "hf/train/BertForMaskedLM": 12,
+    "hf/train/LayoutLMForMaskedLM": 12,
+    "hf/train/PLBartForCausalLM": 1,
+    "hf/train/RobertaForCausalLM": 12,
+    "hf/train/YituTechConvBert": 12
+   },
+   "reason": "top model share"
+  },
+  {
+   "repro": "sum_sum_sum_d2c97d17f3dc",
+   "shape": "3932aff4",
+   "family": "sum_sum_sum",
+   "inductor_us": 18574.3350982666,
+   "memcopy_sol_us": 344.86401081085205,
+   "total_bytes": 2366646276,
+   "n_kernels": 6,
+   "model_share": 1.188487909103168,
+   "models": {
+    "hf/train/T5ForConditionalGeneration": 1,
+    "hf/train/T5Small": 1
+   },
+   "reason": "top model share"
+  },
+  {
+   "repro": "sum_81b4fd73f8d1",
+   "shape": "5599a41a",
+   "family": "sum",
+   "inductor_us": 1298.7200021743774,
+   "memcopy_sol_us": 477.183997631073,
+   "total_bytes": 3294527496,
+   "n_kernels": 2,
+   "model_share": 1.0422709687744394,
+   "models": {
+    "hf/train/BartForCausalLM": 1,
+    "hf/train/MBartForCausalLM": 1
+   },
+   "reason": "top model share"
+  },
+  {
+   "repro": "amax_sum_3aad2361105e",
+   "shape": "b899b223",
+   "family": "amax_sum",
+   "inductor_us": 1069.216012954712,
+   "memcopy_sol_us": 625.5679726600647,
+   "total_bytes": 4295049216,
+   "n_kernels": 1,
+   "model_share": 1.0,
+   "models": {
+    "genai/static/CrossEntropyForward": 1
+   },
+   "reason": "top model share"
+  },
+  {
+   "repro": "var_mean_f7906a6c6957",
+   "shape": "e5ae55b5",
+   "family": "var_mean",
+   "inductor_us": 384.92798805236816,
+   "memcopy_sol_us": 344.0000116825104,
+   "total_bytes": 2359298048,
+   "n_kernels": 1,
+   "model_share": 1.0,
+   "models": {
+    "genai/static/LayerNormForward": 1
+   },
+   "reason": "top model share"
+  },
+  {
+   "repro": "mean_f667cd8901af",
+   "shape": "e5ae55b5",
+   "family": "mean",
+   "inductor_us": 356.0959994792938,
+   "memcopy_sol_us": 344.0319895744324,
+   "total_bytes": 2359298048,
+   "n_kernels": 1,
+   "model_share": 1.0,
+   "models": {
+    "genai/static/RMSNormForward": 1
+   },
+   "reason": "top model share"
+  },
+  {
+   "repro": "amax_sum_7079889cfc04",
+   "shape": "4ac62a08",
+   "family": "amax_sum",
+   "inductor_us": 2557.8880310058594,
+   "memcopy_sol_us": 1240.0959730148315,
+   "total_bytes": 8589934592,
+   "n_kernels": 1,
+   "model_share": 1.0,
+   "models": {
+    "genai/static/SoftmaxForward": 1
+   },
+   "reason": "top model share"
+  },
+  {
+   "repro": "pointwise_238e96847398",
+   "shape": "2149da1a",
+   "family": "pointwise",
+   "inductor_us": 22.272000089287758,
+   "memcopy_sol_us": 6.175999995321035,
+   "total_bytes": 6492148,
+   "n_kernels": 1,
+   "model_share": 1.0,
+   "models": {
+    "torchbench/infer/pyhpc_equation_of_state": 1
+   },
+   "reason": "top model share"
+  },
+  {
+   "repro": "amax_sum_979a0af8f7a7",
+   "shape": "679762f8",
+   "family": "amax_sum",
+   "inductor_us": 147.23199605941772,
+   "memcopy_sol_us": 63.45599889755249,
+   "total_bytes": 402653184,
+   "n_kernels": 1,
+   "model_share": 0.8049405425899213,
+   "models": {
+    "hf/infer/T5ForConditionalGeneration": 10,
+    "hf/infer/T5Small": 10
+   },
+   "reason": "top model share"
+  },
+  {
+   "repro": "pointwise_b6d762cd3d81",
+   "shape": "58f85f13",
+   "family": "pointwise",
+   "inductor_us": 61.24800071120262,
+   "memcopy_sol_us": 35.58399900794029,
+   "total_bytes": 202701824,
+   "n_kernels": 1,
+   "model_share": 0.7530902314587532,
+   "models": {
+    "torchbench/infer/nvidia_deeprecommender": 1,
+    "torchbench/train/nvidia_deeprecommender": 1
+   },
+   "reason": "top model share"
+  },
+  {
+   "repro": "sum_b2873b4c9052",
+   "shape": "ed4a60c9",
+   "family": "sum",
+   "inductor_us": 1884.1919898986816,
+   "memcopy_sol_us": 1247.3599910736084,
+   "total_bytes": 8590065666,
+   "n_kernels": 1,
+   "model_share": 0.6351505965029592,
+   "models": {
+    "genai/static/CrossEntropyBackward": 1
+   },
+   "reason": "top model share"
+  },
+  {
+   "repro": "any_amax_sum_e232f7a3d0d8",
+   "shape": "59a0e132",
+   "family": "any_amax_sum",
+   "inductor_us": 91.839998960495,
+   "memcopy_sol_us": 63.58399987220764,
+   "total_bytes": 402653184,
+   "n_kernels": 1,
+   "model_share": 0.6207723416347319,
+   "models": {
+    "hf/infer/BertForMaskedLM": 12,
+    "hf/infer/RobertaForCausalLM": 12
+   },
+   "reason": "top model share"
+  },
+  {
+   "repro": "sum_6119d597d188",
+   "shape": "b73ba80f",
+   "family": "sum",
+   "inductor_us": 2278.3360481262207,
+   "memcopy_sol_us": 949.1199851036072,
+   "total_bytes": 6554714120,
+   "n_kernels": 2,
+   "model_share": 0.6076522000333737,
+   "models": {
+    "hf/train/PLBartForCausalLM": 1
+   },
+   "reason": "top model share"
+  },
+  {
+   "repro": "sum_sum_2cd99e5eb23e",
+   "shape": "cbc6f48e",
+   "family": "sum_sum",
+   "inductor_us": 421.7279851436615,
+   "memcopy_sol_us": 344.06399726867676,
+   "total_bytes": 2363908098,
+   "n_kernels": 1,
+   "model_share": 0.5683297951054177,
+   "models": {
+    "genai/static/RMSNormBackward": 1
+   },
+   "reason": "top model share"
+  },
+  {
+   "repro": "sum_4fd6e4019857",
+   "shape": "74d25999",
+   "family": "sum",
+   "inductor_us": 2555.0079345703125,
+   "memcopy_sol_us": 1248.2880353927612,
+   "total_bytes": 8590000130,
+   "n_kernels": 1,
+   "model_share": 0.5326732907525279,
+   "models": {
+    "genai/static/SoftmaxBackward": 1
+   },
+   "reason": "top model share"
+  },
+  {
+   "repro": "sum_sum_sum_3cac3bbf4e8f",
+   "shape": "4e21884e",
+   "family": "sum_sum_sum",
+   "inductor_us": 411.48799657821655,
+   "memcopy_sol_us": 344.09600496292114,
+   "total_bytes": 2368516098,
+   "n_kernels": 2,
+   "model_share": 0.5274837962172365,
+   "models": {
+    "genai/static/LayerNormBackward": 1
+   },
+   "reason": "top model share"
+  },
+  {
+   "repro": "amax_sum_sum_822c7c06b882",
+   "shape": "4445581e",
+   "family": "amax_sum_sum",
+   "inductor_us": 310.04801392555237,
+   "memcopy_sol_us": 124.86399710178375,
+   "total_bytes": 823607298,
+   "n_kernels": 2,
+   "model_share": 0.5264382538605117,
+   "models": {
+    "hf/infer/AllenaiLongformerBase": 1,
+    "hf/infer/BartForCausalLM": 1,
+    "hf/infer/MBartForCausalLM": 1
+   },
+   "reason": "top model share"
+  },
+  {
+   "repro": "amax_sum_sum_42988b64e7f9",
+   "shape": "c1ee6cd0",
+   "family": "amax_sum_sum",
+   "inductor_us": 626.7840266227722,
+   "memcopy_sol_us": 242.5280064344406,
+   "total_bytes": 1646952452,
+   "n_kernels": 2,
+   "model_share": 0.5029142267373462,
+   "models": {
+    "hf/infer/DistillGPT2": 1
+   },
+   "reason": "top model share"
+  },
+  {
+   "repro": "pointwise_2d969ac9ad59",
+   "shape": "5cd82a46",
+   "family": "pointwise",
+   "inductor_us": 32.44800120592117,
+   "memcopy_sol_us": 26.43200010061264,
+   "total_bytes": 134217728,
+   "n_kernels": 1,
+   "model_share": 0.4892844767924686,
+   "models": {
+    "hf/infer/GPTNeoForCausalLM": 24,
+    "hf/infer/GPTNeoForSequenceClassification": 24
+   },
+   "reason": "top model share"
+  },
+  {
+   "repro": "var_mean_sum_53c829d32b0c",
+   "shape": "e5ae55b5",
+   "family": "var_mean_sum",
+   "inductor_us": 368.6079978942871,
+   "memcopy_sol_us": 176.15999281406403,
+   "total_bytes": 1188866050,
+   "n_kernels": 2,
+   "model_share": 0.47251620378276354,
+   "models": {
+    "genai/static/LayerNormBackward": 1
+   },
+   "reason": "top model share"
+  },
+  {
+   "repro": "pointwise_014bbb0703c3",
+   "shape": "e421f3e7",
+   "family": "pointwise",
+   "inductor_us": 46.84799909591675,
+   "memcopy_sol_us": 28.511999174952507,
+   "total_bytes": 154140672,
+   "n_kernels": 1,
+   "model_share": 0.4682943442856592,
+   "models": {
+    "timm/infer/visformer_small": 14,
+    "timm/train/visformer_small": 14
+   },
+   "reason": "top model share"
+  },
+  {
+   "repro": "amax_sum_sum_4325c394b077",
+   "shape": "4ac62a08",
+   "family": "amax_sum_sum",
+   "inductor_us": 2241.568088531494,
+   "memcopy_sol_us": 623.4880089759827,
+   "total_bytes": 4295032834,
+   "n_kernels": 2,
+   "model_share": 0.4673267092474721,
+   "models": {
+    "genai/static/SoftmaxBackward": 1
+   },
+   "reason": "top model share"
+  },
+  {
+   "repro": "var_mean_f4578c128d74",
+   "shape": "ad6d6241",
+   "family": "var_mean",
+   "inductor_us": 13.183999806642532,
+   "memcopy_sol_us": 11.359999887645245,
+   "total_bytes": 38732544,
+   "n_kernels": 1,
+   "model_share": 0.45680679215290054,
+   "models": {
+    "timm/infer/deit_tiny_patch16_224.fb_in1k": 23
+   },
+   "reason": "top model share"
+  },
+  {
+   "repro": "sum_49dda4f7b564",
+   "shape": "771c693d",
+   "family": "sum",
+   "inductor_us": 1449.8239755630493,
+   "memcopy_sol_us": 910.2399945259094,
+   "total_bytes": 6291718152,
+   "n_kernels": 1,
+   "model_share": 0.4560663492325547,
+   "models": {
+    "hf/train/XGLMForCausalLM": 1
+   },
+   "reason": "top model share"
+  },
+  {
+   "repro": "amax_sum_sum_a97be2219d64",
+   "shape": "353f43da",
+   "family": "amax_sum_sum",
+   "inductor_us": 534.4319939613342,
+   "memcopy_sol_us": 240.447998046875,
+   "total_bytes": 1638694914,
+   "n_kernels": 2,
+   "model_share": 0.44907232827320365,
+   "models": {
+    "hf/infer/PLBartForCausalLM": 1
+   },
+   "reason": "top model share"
+  },
+  {
+   "repro": "max_amax_sum_66e6dc6d2131",
+   "shape": "1bcb4709",
+   "family": "max_amax_sum",
+   "inductor_us": 149.31200444698334,
+   "memcopy_sol_us": 43.83999854326248,
+   "total_bytes": 258000128,
+   "n_kernels": 2,
+   "model_share": 0.44748624508575924,
+   "models": {
+    "hf/infer/openai/gpt-oss-20b": 22
+   },
+   "reason": "top model share"
+  },
+  {
+   "repro": "mean_sum_60b7c9e320b2",
+   "shape": "e5ae55b5",
+   "family": "mean_sum",
+   "inductor_us": 320.3200101852417,
+   "memcopy_sol_us": 176.06399953365326,
+   "total_bytes": 1184258050,
+   "n_kernels": 2,
+   "model_share": 0.4316702048945823,
+   "models": {
+    "genai/static/RMSNormBackward": 1
+   },
+   "reason": "top model share"
+  },
+  {
+   "repro": "pointwise_9128d8745e42",
+   "shape": "319d51bf",
+   "family": "pointwise",
+   "inductor_us": 25.312000885605812,
+   "memcopy_sol_us": 17.184000462293625,
+   "total_bytes": 77079552,
+   "n_kernels": 1,
+   "model_share": 0.430089093750658,
+   "models": {
+    "timm/infer/repvgg_a2": 13
+   },
+   "reason": "top model share"
+  },
+  {
+   "repro": "amax_sum_sum_93ab7097e9e5",
+   "shape": "4b47cbc0",
+   "family": "amax_sum_sum",
+   "inductor_us": 380.95998764038086,
+   "memcopy_sol_us": 149.50400590896606,
+   "total_bytes": 1000275970,
+   "n_kernels": 2,
+   "model_share": 0.4257173587248696,
+   "models": {
+    "hf/infer/BertForMaskedLM": 1,
+    "hf/infer/LayoutLMForMaskedLM": 1,
+    "hf/infer/YituTechConvBert": 1
+   },
+   "reason": "top model share"
+  },
+  {
+   "repro": "amax_sum_any_d7a4553f749f",
+   "shape": "b31e9601",
+   "family": "amax_sum_any",
+   "inductor_us": 141.24800264835358,
+   "memcopy_sol_us": 121.66400253772736,
+   "total_bytes": 805306368,
+   "n_kernels": 1,
+   "model_share": 0.13145868098802863,
+   "models": {
+    "hf/train/AlbertForMaskedLM": 11
+   },
+   "reason": "family amax_sum_any"
+  },
+  {
+   "repro": "sum_mean_6150664fe0bf",
+   "shape": "4a0c78a6",
+   "family": "sum_mean",
+   "inductor_us": 177.05599963665009,
+   "memcopy_sol_us": 36.83200106024742,
+   "total_bytes": 212341760,
+   "n_kernels": 3,
+   "model_share": 0.32552802932424146,
+   "models": {
+    "timm/infer/convnextv2_nano.fcmae_ft_in22k_in1k": 8
+   },
+   "reason": "family sum_mean"
+  },
+  {
+   "repro": "amax_amax_any_f8e425e72787",
+   "shape": "df5bbfd4",
+   "family": "amax_amax_any",
+   "inductor_us": 65.21599739789963,
+   "memcopy_sol_us": 32.607998698949814,
+   "total_bytes": 181410816,
+   "n_kernels": 2,
+   "model_share": 0.03623642439701433,
+   "models": {
+    "timm/train/visformer_small": 4
+   },
+   "reason": "family amax_amax_any"
+  },
+  {
+   "repro": "mean_mean_37961b6339c1",
+   "shape": "f8472361",
+   "family": "mean_mean",
+   "inductor_us": 12.06399966031313,
+   "memcopy_sol_us": 8.128000423312187,
+   "total_bytes": 16896512,
+   "n_kernels": 3,
+   "model_share": 0.27446274479105937,
+   "models": {
+    "hf/infer/Qwen/Qwen3-0.6B": 27
+   },
+   "reason": "family mean_mean"
+  },
+  {
+   "repro": "any_amax_amax_af50781fc699",
+   "shape": "99deda8b",
+   "family": "any_amax_amax",
+   "inductor_us": 93.21600198745728,
+   "memcopy_sol_us": 64.35199826955795,
+   "total_bytes": 402653184,
+   "n_kernels": 1,
+   "model_share": 0.29538492848376385,
+   "models": {
+    "hf/infer/XLNetLMHeadModel": 24
+   },
+   "reason": "family any_amax_amax"
+  },
+  {
+   "repro": "var_mean_mean_e790938418f4",
+   "shape": "46238279",
+   "family": "var_mean_mean",
+   "inductor_us": 151.32799744606018,
+   "memcopy_sol_us": 38.88000175356865,
+   "total_bytes": 231252480,
+   "n_kernels": 4,
+   "model_share": 0.016544914878666696,
+   "models": {
+    "timm/train/tf_efficientnet_b0": 1
+   },
+   "reason": "family var_mean_mean"
+  },
+  {
+   "repro": "var_mean_var_mean_5cc92f5d49c1",
+   "shape": "ec58f56f",
+   "family": "var_mean_var_mean",
+   "inductor_us": 91.90399944782257,
+   "memcopy_sol_us": 27.35999971628189,
+   "total_bytes": 154157056,
+   "n_kernels": 5,
+   "model_share": 0.025848490795609698,
+   "models": {
+    "torchbench/train/resnet50": 1
+   },
+   "reason": "family var_mean_var_mean"
+  },
+  {
+   "repro": "mean_var_236af0aff0ee",
+   "shape": "4205ff34",
+   "family": "mean_var",
+   "inductor_us": 25.34399926662445,
+   "memcopy_sol_us": 9.983999654650688,
+   "total_bytes": 28326376,
+   "n_kernels": 1,
+   "model_share": 0.00565847652442851,
+   "models": {
+    "torchbench/train/BERT_pytorch": 1
+   },
+   "reason": "family mean_var"
+  },
+  {
+   "repro": "mean_var_mean_f541715270de",
+   "shape": "e781f0b8",
+   "family": "mean_var_mean",
+   "inductor_us": 21.47199958562851,
+   "memcopy_sol_us": 17.184000462293625,
+   "total_bytes": 77664768,
+   "n_kernels": 2,
+   "model_share": 0.010914828143527011,
+   "models": {
+    "timm/infer/beit_base_patch16_224": 1
+   },
+   "reason": "family mean_var_mean"
+  },
+  {
+   "repro": "var_mean_var_mean_mean_0efb69a14422",
+   "shape": "e1dd88f2",
+   "family": "var_mean_var_mean_mean",
+   "inductor_us": 32.575998455286026,
+   "memcopy_sol_us": 11.008000001311302,
+   "total_bytes": 35774464,
+   "n_kernels": 5,
+   "model_share": 0.005809706144676693,
+   "models": {
+    "timm/train/repvgg_a2": 1
+   },
+   "reason": "family var_mean_var_mean_mean"
+  },
+  {
+   "repro": "sum_sum_85ee747617a6",
+   "shape": "7eef06a5",
+   "family": "sum_sum",
+   "inductor_us": 1161.1520051956177,
+   "memcopy_sol_us": 579.4240236282349,
+   "total_bytes": 4001160432,
+   "n_kernels": 3,
+   "model_share": 0.2128871553751295,
+   "models": {
+    "hf/train/BertForMaskedLM": 1,
+    "hf/train/LayoutLMForMaskedLM": 1,
+    "hf/train/YituTechConvBert": 1
+   },
+   "reason": "family sum_sum"
+  },
+  {
+   "repro": "mean_c9e1a8113328",
+   "shape": "4784273d",
+   "family": "mean",
+   "inductor_us": 28.31999957561493,
+   "memcopy_sol_us": 24.512000381946564,
+   "total_bytes": 127795200,
+   "n_kernels": 1,
+   "model_share": 0.05745758254938952,
+   "models": {
+    "timm/infer/nfnet_l0": 6
+   },
+   "reason": "family mean"
+  },
+  {
+   "repro": "amax_sum_any_30cded63a2f9",
+   "shape": "8ae0f618",
+   "family": "amax_sum_any",
+   "inductor_us": 407.3599874973297,
+   "memcopy_sol_us": 136.06399297714233,
+   "total_bytes": 905969960,
+   "n_kernels": 1,
+   "model_share": 0.04585365881886998,
+   "models": {
+    "hf/train/BertForMaskedLM": 1,
+    "hf/train/RobertaForCausalLM": 1
+   },
+   "reason": "family amax_sum_any"
+  },
+  {
+   "repro": "sum_mean_1db528935b36",
+   "shape": "09211248",
+   "family": "sum_mean",
+   "inductor_us": 99.39199686050415,
+   "memcopy_sol_us": 24.70399998128414,
+   "total_bytes": 129116672,
+   "n_kernels": 3,
+   "model_share": 0.07913350376584505,
+   "models": {
+    "timm/train/convnextv2_nano.fcmae_ft_in22k_in1k": 8
+   },
+   "reason": "family sum_mean"
+  },
+  {
+   "repro": "amax_amax_any_80cdfb3610b6",
+   "shape": "279c055a",
+   "family": "amax_amax_any",
+   "inductor_us": 360.1279854774475,
+   "memcopy_sol_us": 78.72000336647034,
+   "total_bytes": 505872680,
+   "n_kernels": 1,
+   "model_share": 0.02179128384342123,
+   "models": {
+    "hf/train/LayoutLMForMaskedLM": 1
+   },
+   "reason": "family amax_amax_any"
+  },
+  {
+   "repro": "max_amax_sum_bbcd2529e855",
+   "shape": "d9b19a63",
+   "family": "max_amax_sum",
+   "inductor_us": 151.16800367832184,
+   "memcopy_sol_us": 43.07200014591217,
+   "total_bytes": 258000128,
+   "n_kernels": 3,
+   "model_share": 0.02059312054575857,
+   "models": {
+    "hf/infer/openai/gpt-oss-20b": 1
+   },
+   "reason": "family max_amax_sum"
+  },
+  {
+   "repro": "mean_mean_7291b09200a4",
+   "shape": "2c02d9cc",
+   "family": "mean_mean",
+   "inductor_us": 12.128000147640705,
+   "memcopy_sol_us": 8.031999692320824,
+   "total_bytes": 17409024,
+   "n_kernels": 3,
+   "model_share": 0.15542797216972828,
+   "models": {
+    "hf/infer/google/gemma-3-4b-it": 28
+   },
+   "reason": "family mean_mean"
+  },
+  {
+   "repro": "var_mean_mean_5a1b8c788e4b",
+   "shape": "765e4345",
+   "family": "var_mean_mean",
+   "inductor_us": 79.6160027384758,
+   "memcopy_sol_us": 33.63199904561043,
+   "total_bytes": 192802560,
+   "n_kernels": 4,
+   "model_share": 0.01168055966808402,
+   "models": {
+    "timm/train/mobilenetv3_large_100": 2
+   },
+   "reason": "family var_mean_mean"
+  },
+  {
+   "repro": "var_mean_var_mean_0dd15b92dc70",
+   "shape": "7a83b18a",
+   "family": "var_mean_var_mean",
+   "inductor_us": 17.343999817967415,
+   "memcopy_sol_us": 12.703999876976013,
+   "total_bytes": 52502528,
+   "n_kernels": 1,
+   "model_share": 0.013472197956571234,
+   "models": {
+    "hf/infer/MBartForCausalLM": 1
+   },
+   "reason": "family var_mean_var_mean"
+  },
+  {
+   "repro": "var_mean_42fad1ece813",
+   "shape": "652894ae",
+   "family": "var_mean",
+   "inductor_us": 15.168000012636185,
+   "memcopy_sol_us": 6.943999789655209,
+   "total_bytes": 12595200,
+   "n_kernels": 3,
+   "model_share": 0.009709284811153204,
+   "models": {
+    "timm/train/adv_inception_v3": 4,
+    "timm/train/inception_v3": 4
+   },
+   "reason": "extra"
+  },
+  {
+   "repro": "var_mean_004f9a9ea198",
+   "shape": "536b6e86",
+   "family": "var_mean",
+   "inductor_us": 36.959998309612274,
+   "memcopy_sol_us": 35.58399900794029,
+   "total_bytes": 205521920,
+   "n_kernels": 1,
+   "model_share": 0.004405370167144815,
+   "models": {
+    "timm/infer/swin_base_patch4_window7_224": 1
+   },
+   "reason": "extra"
+  },
+  {
+   "repro": "sum_sum_643db2887a01",
+   "shape": "2cd54028",
+   "family": "sum_sum",
+   "inductor_us": 208.76799523830414,
+   "memcopy_sol_us": 110.49599945545197,
+   "total_bytes": 727483010,
+   "n_kernels": 4,
+   "model_share": 0.03340895179874611,
+   "models": {
+    "timm/train/adv_inception_v3": 1,
+    "timm/train/inception_v3": 1
+   },
+   "reason": "extra"
+  }
+ ]
+}
