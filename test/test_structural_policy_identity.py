@@ -160,7 +160,10 @@ def test_runtime_hooks_module_imports_first_and_is_not_a_codegen_module() -> Non
     # it must stay out of helion's own import chain: importable as the very
     # first helion import of a fresh interpreter ...
     root = Path(__file__).resolve().parents[1]
-    environment = dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONPATH=str(root))
+    pythonpath = os.pathsep.join(
+        filter(None, (str(root), os.environ.get("PYTHONPATH")))
+    )
+    environment = dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONPATH=pythonpath)
     result = subprocess.run(
         [
             sys.executable,
