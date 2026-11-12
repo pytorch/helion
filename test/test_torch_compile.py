@@ -130,6 +130,133 @@ def k_add_ref(x, y):  # noqa: FURB118
 
 
 @helion.kernel(autotune_effort="none")
+def k_add_sized_out(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """``k_add`` whose host code reads only ``x``'s size."""
+    m, n = x.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=y.device)
+    for tile in hl.tile(x.size()):
+        out[tile] = x[tile] + y[tile]
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def k_add_out_like_y(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """``k_add`` whose host code reads ``x`` only in the grid bounds."""
+    out = torch.empty_like(y)
+    for tile in hl.tile(x.size()):
+        out[tile] = x[tile] + y[tile]
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def k_clone_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """``k_add`` whose host code reads ``x``'s values."""
+    out = x.clone()
+    for tile in hl.tile(out.size()):
+        out[tile] = out[tile] + y[tile]
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def k_add_out_dtype_of_y(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """``k_add`` whose host code reads ``x``'s size and ``y``'s dtype."""
+    out = torch.empty(x.size(), dtype=y.dtype, device=x.device)
+    for tile in hl.tile(x.size()):
+        out[tile] = x[tile] + y[tile]
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def k_dead_load_of_x(y: torch.Tensor, x: torch.Tensor, /) -> torch.Tensor:
+    """Adds one to ``y``; its load of ``x`` is dead.  Positional-only, as
+    the generated host function keeps those parameters too."""
+    out = torch.empty_like(y)
+    for tile in hl.tile(y.size()):
+        unused = x[tile]  # noqa: F841
+        out[tile] = y[tile] + 1
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def k_add_masked_twice(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Adds ``x``, its even elements and ``y``: ``x`` is loaded twice, the
+    second time with a mask."""
+    out = torch.empty_like(y)
+    for tile in hl.tile(y.size(0)):
+        even = (tile.index % 2) == 0
+        out[tile] = x[tile] + hl.load(x, [tile], extra_mask=even) + y[tile]
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def k_center_rows(x: torch.Tensor) -> torch.Tensor:
+    """Subtracts each row's sum from it: ``x`` is loaded in two loops."""
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(x.size(0)):
+        acc = hl.zeros([tile_m], dtype=torch.float32)
+        for tile_n in hl.tile(x.size(1)):
+            acc = acc + x[tile_m, tile_n].sum(-1)
+        for tile_n in hl.tile(x.size(1)):
+            out[tile_m, tile_n] = x[tile_m, tile_n] - acc[:, None]
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def k_nested_reloads(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Reloads ``x[tile]`` in a branch and in an inner loop inside its first
+    load's block."""
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        a = x[tile]
+        if tile.begin == 0:
+            a = a + x[tile]
+        for _ in hl.tile(y.size(0)):
+            a = a + x[tile]
+        out[tile] = a
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def k_sum_merged_dims(x: torch.Tensor) -> torch.Tensor:
+    """Sums dims 1 and 2, which merge_reduction_dims loads through
+    ``x.flatten(1, 2)``."""
+    out = x.new_empty([x.size(0)])
+    for tile_m in hl.tile(x.size(0)):
+        out[tile_m] = x[tile_m, :, :].sum(dim=(1, 2))
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def k_sum_unrolled_cols(x: torch.Tensor) -> torch.Tensor:
+    """Sums columns 1 and 2: ``x[tile, i]`` is a load per unrolled iteration."""
+    out = x.new_zeros([x.size(0)])
+    for tile in hl.tile(x.size(0)):
+        acc = hl.zeros([tile], dtype=torch.float32)
+        for i in hl.static_range(1, 3):
+            acc = acc + x[tile, i]
+        out[tile] = acc
+    return out
+
+
+@helion.kernel(config=helion.Config(block_sizes=[1], reduction_loops=[16]))
+def k_softmax_looped(x: torch.Tensor) -> torch.Tensor:
+    """A row softmax whose one source-level load of ``x`` becomes one load
+    per reduction loop (the max, the sum and the output loops)."""
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(x.size(0)):
+        out[tile_m, :] = torch.nn.functional.softmax(x[tile_m, :], dim=1)
+    return out
+
+
+@helion.kernel(autotune_effort="none", static_shapes=False)
+def k_add_dynamic(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size()):
+        out[tile] = x[tile] + y[tile]
+    return out
+
+
+@helion.kernel(autotune_effort="none")
 def k_scale_two(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Scale two tensors of potentially different shapes."""
     out_x = torch.empty_like(x)
@@ -608,7 +735,7 @@ def lower_through_callable_kernel(kernel: object) -> Callable[[object], object]:
 # the flag nowhere else) only re-check the opaque lowering that the other
 # parametrized tests cover, so they run the fused leg alone; three such tests
 # keep both legs as representatives (test_transpose_then_view_to_3d_epilogue,
-# test_epilogue_broadcast_bias, test_prologue_flip_plus_bias_not_fused).
+# test_epilogue_broadcast_bias, test_prologue_flip_plus_bias_fused).
 _FUSED_ONLY = (True,)
 
 
@@ -5448,12 +5575,15 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    def test_prologue_flip_plus_bias_not_fused(self, allow_torch_compile_fusion):
-        """Prologue that chains flip+bias is not inlined.
+    def test_prologue_flip_plus_bias_fused(self, allow_torch_compile_fusion):
+        """A prologue reading two buffers (``flip(x) + b``) fuses.
 
-        ``flip(x) + b`` produces a node with two MemoryDep reads (x and b).
-        Multi-read prologue nodes must not be fused, since collapsing both
-        reads into a single placeholder would give wrong results.
+        The kernel call passes one source of the prologue for the kernel's
+        ``x`` and the other as an extra input.  The host code reads ``x``
+        (``torch.empty_like(x)``), so it must get ``x``, the source with the
+        same layout.  The choice used to follow the order of Inductor's
+        frozenset of sources, so under some string hash seeds ``b`` was passed
+        and the output came back with b's shape.
         """
         n = 64
         x = torch.randn(n, n, device=DEVICE, dtype=torch.float32)
@@ -5477,12 +5607,11 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
     @parametrize("allow_torch_compile_fusion", _FUSED_ONLY)
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
-    def test_prologue_bias_not_fused_when_multi_read(self, allow_torch_compile_fusion):
-        """Multi-read prologue (y + bias) is not inlined when one input is flipped.
+    def test_prologue_multi_read_fused(self, allow_torch_compile_fusion):
+        """Both prologues of ``k_add(flip(x), y + b)`` fuse.
 
-        In ``k_add(flip(x), y + b)``, ``y + b`` forms a two-read prologue
-        (reads y and b). Multi-read prologue nodes must not be fused, so
-        ``y + b`` should run as a separate kernel.
+        ``y + b`` reads two buffers: one is passed for ``y``, the other as an
+        extra input.
         """
         n = 64
         x = torch.randn(n, n, device=DEVICE, dtype=torch.float32)
@@ -5502,6 +5631,217 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels=1 if allow_torch_compile_fusion else None,
             kernels_ref=[k_add_ref],
             expected_num_kernels_ref=1,
+        )
+
+    # Cases on one axis: each is a distinct way the generated code reads a
+    # parameter, so each would catch a different wrong fusion decision.
+    @parametrize(
+        "case",
+        (
+            # Unfused: no source can stand in for what the host code reads.
+            "size_mismatch",
+            "dtype_mismatch",
+            "sourceless",
+            "values_read",
+            "two_params_one_producer",
+            # Fused: a source matches everything the generated code reads.
+            "loaded_only",
+            "size_read_only",
+            "grid_bounds_only",
+            "dynamic_loaded_only",
+            "sourceless_dead_load",
+        ),
+    )
+    @skipUnlessBackendFuses
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_prologue_needs_a_host_stand_in(self, case):
+        """A producer fuses into a parameter only when one of its sources can
+        stand in for the parameter wherever the generated code reads it.
+
+        A fused prologue's output is never allocated: the kernel call passes
+        a source of the prologue for the parameter, or drops the parameter
+        when the prologue reads none, and only the parameter's device loads
+        are replaced.  ``k_add``'s host code reads ``x``'s layout
+        (``torch.empty_like(x)``): a slice, an upcast and a sourceless
+        producer used to give an output of the source's shape or dtype, or a
+        NameError.  ``k_clone_add`` reads ``x``'s values, which no source
+        has.  One source is passed for every parameter a buffer feeds, so it
+        must match what is read of all of them.  The fused cases read
+        nothing the source lacks: ``y`` only loaded, only ``x``'s size,
+        ``x`` only in the grid bounds (constant under static shapes), and
+        under dynamic shapes a loaded ``y``'s size and strides but not its
+        dtype; a sourceless producer fuses into a parameter whose only load
+        is dead, as nothing else of it is read.
+        """
+        n = 64
+        x = torch.randn(n, n, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(n, n, device=DEVICE, dtype=torch.float32)
+        b = torch.randn(n, device=DEVICE, dtype=torch.float32)
+        h = torch.randn(n, n, device=DEVICE, dtype=HALF_DTYPE)
+
+        def one_producer_for_both(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            # h matches x's size and b y's dtype, but one source is passed
+            # for both parameters.
+            t = h.float() + b
+            return k_add_out_dtype_of_y(t, t)
+
+        cases = {
+            "size_mismatch": (
+                k_add,
+                lambda x, y: k_add(x[:, : n // 2] * 2, y[:, : n // 2]),
+                2,
+            ),
+            "dtype_mismatch": (k_add, lambda x, y: k_add(h.float(), y), 2),
+            "sourceless": (
+                k_add,
+                lambda x, y: k_add(torch.full((n, n), 2.0, device=x.device), y),
+                2,
+            ),
+            "values_read": (k_clone_add, lambda x, y: k_clone_add(x * 2, y), 2),
+            "two_params_one_producer": (k_add_out_dtype_of_y, one_producer_for_both, 2),
+            "loaded_only": (k_add, lambda x, y: k_add(y, b.expand(n, n) * 2), 1),
+            "size_read_only": (
+                k_add_sized_out,
+                lambda x, y: k_add_sized_out(h.float(), y),
+                1,
+            ),
+            "grid_bounds_only": (
+                k_add_out_like_y,
+                lambda x, y: k_add_out_like_y(b.expand(n, n) * 2, y),
+                1,
+            ),
+            "dynamic_loaded_only": (
+                k_add_dynamic,
+                lambda x, y: k_add_dynamic(x, h.float()),
+                1,
+            ),
+            # The dead load drops out before the prologue replaces it, so the
+            # host function keeps ``x``, which is passed None.
+            "sourceless_dead_load": (
+                k_dead_load_of_x,
+                lambda x, y: k_dead_load_of_x(
+                    y, torch.full((n, n), 2.0, device=y.device)
+                ),
+                1,
+            ),
+        }
+        kernel, f, expected_num_kernels = cases[case]
+        self._run_compile_test(
+            f,
+            (x, y),
+            kernels=[kernel],
+            allow_torch_compile_fusion=True,
+            expected_num_kernels=expected_num_kernels,
+        )
+
+    @parametrize(
+        "case",
+        (
+            "masked_second_load",
+            "load_in_two_loops",
+            "load_in_static_range",
+            "load_through_merged_dims",
+        ),
+    )
+    @skipUnlessBackendFuses
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_prologue_into_a_parameter_loaded_two_ways(self, case):
+        """A fused prologue replaces one form of load of its parameter, so a
+        parameter loaded in two (another mask, index, loop or branch, or an
+        index per hl.static_range iteration) stays unfused: the second load
+        used to get the first load's mask, a wrong result, or failed to
+        compile. So does one merge_reduction_dims loads through a flattened
+        view, whose loads the prologue did not replace (the producer was
+        dropped)."""
+        n = 64
+        x = torch.randn(n, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(n, device=DEVICE, dtype=torch.float32)
+        rows = torch.randn(n, 2 * n, device=DEVICE, dtype=torch.float32)
+        kernel, f, args = {
+            "masked_second_load": (
+                k_add_masked_twice,
+                lambda x, y: k_add_masked_twice(x * 2, y),
+                (x, y),
+            ),
+            "load_in_two_loops": (
+                k_center_rows,
+                lambda rows: k_center_rows(rows * 2),
+                (rows,),
+            ),
+            "load_in_static_range": (
+                k_sum_unrolled_cols,
+                lambda rows: k_sum_unrolled_cols(rows * 2),
+                (rows,),
+            ),
+            "load_through_merged_dims": (
+                k_sum_merged_dims,
+                lambda cube: k_sum_merged_dims(cube * 2),
+                (torch.randn(8, 4, 16, device=DEVICE, dtype=torch.float32),),
+            ),
+        }[case]
+        self._run_compile_test(
+            f,
+            args,
+            kernels=[kernel],
+            allow_torch_compile_fusion=True,
+            expected_num_kernels=2,
+        )
+
+    @skipUnlessBackendFuses
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_prologue_from_a_mutated_buffer(self):
+        """A producer reading a buffer an earlier kernel mutated in place
+        (index_put_ with accumulate) reads it under the MutationOutput's name,
+        which names no tensor: the kernel call passes the mutated buffer (a
+        NameError at run time before, a compile error once the stand-in check
+        ran)."""
+
+        def f(x, y):
+            t = x * 3
+            idx = torch.arange(0, 64, 2, device=x.device)
+            t.index_put_((idx,), torch.ones(64, device=x.device), accumulate=True)
+            return k_add(t * 2, y)
+
+        x = torch.randn(64, 64, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(64, 64, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x, y),
+            kernels=[k_add],
+            allow_torch_compile_fusion=True,
+            # t * 2 fused into k_add.
+            expected_num_kernels=3,
+        )
+
+    @skipUnlessBackendFuses
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_prologue_into_nested_reloads(self):
+        """Reloads of x[tile] in blocks inside its first load's are one form
+        of load: the producer fuses, and the inner loads reuse the prologue's
+        result."""
+        x = torch.randn(64, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(16, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            lambda x, y: k_nested_reloads(x * 2, y),
+            (x, y),
+            kernels=[k_nested_reloads],
+            allow_torch_compile_fusion=True,
+            expected_num_kernels=1,
+        )
+
+    @skipUnlessBackendFuses
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_prologue_into_reduction_loops(self):
+        """Reduction loops emit one load of x per loop: the fused prologue is
+        emitted in each (its result variable was read out of scope in the
+        second loop, a NameError at compile time)."""
+        x = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            lambda x: k_softmax_looped(x * 2),
+            (x,),
+            kernels=[k_softmax_looped],
+            allow_torch_compile_fusion=True,
+            expected_num_kernels=1,
         )
 
     # --- Shared helpers for autotune-with-fusion tests ---

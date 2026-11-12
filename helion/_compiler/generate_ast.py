@@ -266,6 +266,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         # lives on the pass rather than on the transform so the register-tile
         # retry in ``generate_ast`` emits every placeholder again.
         self.prologue_first_indexing: dict[str, str] = {}
+        # The statement blocks each fused input's placeholder was emitted in.
+        self.prologue_blocks: dict[str, list[list[ast.AST]]] = {}
         self._statement_owner_fx_node: Node | None = None
         self._codegen_results_by_owner_node_id: dict[int, object] = {}
         self.resident_prep_lowering_stack: list[
@@ -1331,12 +1333,10 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         return not any(kw.arg == "device" for kw in node.keywords)
 
     def _inject_device_kwarg(self, node: ast.Call) -> ast.Call:
-        for name, val in self.host_function.params.arguments.items():
-            if isinstance(val, torch.Tensor):
-                device_expr = expr_from_string(f"{name}.device")
-                new_kw = create(ast.keyword, arg="device", value=device_expr)
-                node.keywords = [*node.keywords, new_kw]
-                return node
+        if (name := self.host_function.first_tensor_param()) is not None:
+            device_expr = expr_from_string(f"{name}.device")
+            new_kw = create(ast.keyword, arg="device", value=device_expr)
+            node.keywords = [*node.keywords, new_kw]
         return node
 
     def host_dead_code_elimination(
