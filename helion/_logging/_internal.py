@@ -35,6 +35,8 @@ class LogRegistry:
 
 # ``megakernel``: a megakernel's schedule, its root barriers and why, the
 # transport of its cross-rank dependencies and why a ring falls back.
+# ``timeline``: the paths megakernel timelines are written to; the setting reads
+# the same value (Settings.megakernel_timeline) and records them.
 _LOG_REGISTRY = LogRegistry(
     {
         "all": ["helion"],
@@ -43,6 +45,7 @@ _LOG_REGISTRY = LogRegistry(
             "helion._compiler.tile_dependency",
             "helion._compiler.triton.gluon_ring",
         ],
+        "timeline": ["helion.runtime.timeline"],
     }
 )
 

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import itertools
+import os
+import tempfile
 import unittest
+from unittest import mock
 
 import torch
 
@@ -20,6 +23,7 @@ from helion._testing import code_and_output
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessGluon
 import helion.language as hl
+from helion.runtime import timeline
 
 RING = {
     "indexing": "tensor_descriptor",
@@ -812,6 +816,66 @@ class TestGluonRing(TestCase):
                 self.assertLess(at, prefetching.index("_launch("))
                 self.assertIn("return (tile_dependency_epoch,)", body)
                 self.assertNotIn("def _helion_scale_then_mm_claimer(", code)
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_megakernel_timeline(self) -> None:
+        """A ring megakernel's timeline: the compute partition stamps every task
+        (its producers and MMA partition none), the outputs unchanged."""
+        x = torch.randn([256, 1024], device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn([1024, 256], device=DEVICE, dtype=torch.bfloat16)
+        slots = len(scale_then_mm.bind((x, w)).config_spec.range_warp_specialize)
+        ring = {
+            "block_sizes": [128, 64, 128, 64, 64],
+            "pid_type": "persistent_blocked",
+            "num_sm_multiplier": 1,
+            "num_warps": 4,
+            "indexing": "tensor_descriptor",
+            "num_stages": 2,
+            "range_warp_specializes": [None] * (slots - 1) + [True],
+        }
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.dict(timeline._buffers, clear=True),
+        ):
+            for pipeline in ("static", "dynamic"):
+                kernel = helion.kernel(
+                    scale_then_mm.fn,
+                    static_shapes=True,
+                    backend="gluon",
+                    megakernel_timeline=os.path.join(directory, pipeline),
+                )
+                for launch in range(2):
+                    args = (x + launch, w)
+                    code, out = code_and_output(
+                        kernel, args, cross_loop_pipeline=pipeline, **ring
+                    )
+                    _, expected = code_and_output(
+                        scale_then_mm, args, cross_loop_pipeline=pipeline, **ring
+                    )
+                    for got, want in zip(out, expected, strict=True):
+                        torch.testing.assert_close(got, want, atol=0, rtol=0)
+                # (Every partition takes the buffer, a launch-state argument.)
+                functions = _functions(code)
+                self.assertIn("%globaltimer", functions["_helion_scale_then_mm_body"])
+                for name in ("producer0", "producer1", "mma"):
+                    self.assertNotIn(
+                        "%globaltimer", functions[f"_helion_scale_then_mm_{name}"]
+                    )
+            paths = sorted(timeline.write())
+            self.assertEqual(
+                [os.path.basename(path).split(".")[0] for path in paths],
+                ["dynamic", "static"],
+            )
+            for path in paths:
+                recorded = timeline.load(path)
+                self.assertEqual([launch.epoch for launch in recorded.launches], [1, 2])
+                tasks = sum(count for count, _name in recorded.roots.values())
+                for launch in recorded.launches:
+                    self.assertEqual(len(launch.tasks), tasks)
+                    for task in launch.tasks:
+                        _sm, entry, leave = launch.workers[task.worker]
+                        self.assertTrue(entry <= task.start <= task.end <= leave)
 
     @skipIfRefEager("checks generated code")
     @skipUnlessGluon()

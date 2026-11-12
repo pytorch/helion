@@ -174,6 +174,14 @@ def _env_get_str_or_none(var_name: str, default: str | None) -> str | None:
     return value
 
 
+def _get_megakernel_timeline() -> str | None:
+    """``HELION_LOGS=timeline``: megakernel timelines under ./helion_timeline/."""
+    entries = os.environ.get("HELION_LOGS", "").split(",")
+    if "timeline" not in {entry.strip().lstrip("+") for entry in entries}:
+        return None
+    return os.path.abspath(os.path.join("helion_timeline", "timeline"))
+
+
 def _get_index_dtype() -> torch.dtype | None:
     value = os.environ.get("HELION_INDEX_DTYPE")
     if value is None or (token := value.strip()) == "":
@@ -563,6 +571,9 @@ class _Settings:
     )
     print_repro: bool = dataclasses.field(
         default_factory=functools.partial(_env_get_bool, "HELION_PRINT_REPRO", False)
+    )
+    megakernel_timeline: str | None = dataclasses.field(
+        default_factory=_get_megakernel_timeline
     )
     output_origin_lines: bool = dataclasses.field(
         default_factory=functools.partial(
@@ -1046,6 +1057,20 @@ class Settings(_Settings):
         ),
         "print_output_code": "If True, print the output code of the kernel to stderr.",
         "print_repro": "If True, print Helion kernel code, config, and caller code to stderr as a standalone repro script.",
+        "megakernel_timeline": (
+            "Path prefix for megakernel timelines. When set, a megakernel "
+            "(a cross_loop_pipeline) stamps %globaltimer at each worker's entry and "
+            "exit and at each task's start, last scheduler wait and end, keeping its "
+            "last 16 launches, and at exit writes them to "
+            "<prefix>.<kernel>.<n>.rank<r>.txt (.cuda<i>.txt outside a process "
+            "group; python -m helion.runtime.timeline plot draws one). Stamping "
+            "adds work: compare times within a timeline. "
+            "A CUDA graph keeps only its last replay unless the kernel was launched "
+            "on the capturing stream before capture. Use it with a fixed config: "
+            "autotuning would measure stamped candidates and record each one. "
+            "HELION_LOGS=timeline sets it to ./helion_timeline/timeline and logs "
+            "the paths written."
+        ),
         "output_origin_lines": (
             "If True, annotate generated Triton code with source-origin comments. "
             "Set HELION_OUTPUT_ORIGIN_LINES=0 to disable."

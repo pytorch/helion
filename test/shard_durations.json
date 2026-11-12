@@ -414,6 +414,7 @@
  "test/test_lowering_input_slots.py": 1.2,
  "test/test_masking.py": 3.6,
  "test/test_matmul.py": 11.4,
+ "test/test_megakernel_timeline.py": 0.2,
  "test/test_memory_op_facts.py": 0.6,
  "test/test_memory_op_slot_order.py": 0.5,
  "test/test_metal.py": 0.5,

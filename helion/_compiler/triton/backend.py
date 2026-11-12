@@ -768,6 +768,9 @@ class TritonBackend(Backend):
                 )
             )
             out.append(f"_persistent_state_specs=({specs},)")
+            if device_fn.timeline is not None:
+                timeline = (device_fn.timeline.slot, device_fn.timeline.meta)
+                out.append(f"_timeline={timeline!r}")
             if any(spec[3] for spec in device_fn.triton_persistent_state_specs):
                 process_group_name = CompileEnvironment.current().process_group_name
                 if process_group_name is None:

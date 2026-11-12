@@ -18,6 +18,7 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import onlyBackends
 import helion.language as hl
+from helion.runtime import timeline
 
 
 @helion.kernel(autotune_effort="none")
@@ -83,7 +84,7 @@ class TestLogging(RefEagerTestDisabled, TestCase):
         levels = helion._logging._internal._LOG_REGISTRY.log_levels
         saved = dict(levels)
         self.addCleanup(lambda: (levels.clear(), levels.update(saved)))
-        helion._logging._internal.parse_log_value("megakernel")
+        helion._logging._internal.parse_log_value("megakernel,timeline")
         # (gluon_ring imports Triton's Gluon, which a CPU-only lane lacks.)
         for name in (
             cross_loop_report.log.name,
@@ -91,6 +92,7 @@ class TestLogging(RefEagerTestDisabled, TestCase):
             "helion._compiler.triton.gluon_ring",
         ):
             self.assertEqual(levels[name], logging.INFO)
+        self.assertEqual(levels[timeline.log.name], logging.INFO)
 
     def test_kernel_log(self):
         @helion.kernel(
