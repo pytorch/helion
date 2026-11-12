@@ -409,7 +409,8 @@ def _coop_view(
             )
             continue
         ov, ev = f"{var}_o{d}", f"{var}_e{d}"
-        if e == size or e.lstrip("-").isdigit():
+        # mpp_matmul clamps a literal extent beside a literal size.
+        if e == size or (e.lstrip("-").isdigit() and size.isdigit()):
             e = f"(long)({e})"
         else:
             e = f"metal::min((long)({e}), (long)({size}))"
