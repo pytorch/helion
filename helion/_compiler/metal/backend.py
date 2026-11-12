@@ -107,11 +107,21 @@ def indexed_reduction_blocks(device_ir: DeviceIR) -> set[int]:
     }
 
 
+def static_extent(size: object) -> int | None:
+    """*size* as an int if codegen knows it: a literal, or a SymInt with no
+    free symbols left (a dim ``hl.specialize`` pinned under dynamic shapes)."""
+    if isinstance(size, int):
+        return size
+    if isinstance(size, torch.SymInt) and not size.node.expr.free_symbols:
+        return int(size)
+    return None
+
+
 def _lane_floor(config: Config, device_ir: DeviceIR | None = None) -> int:
     """The fewest threads at which every persistent reduction dim fits its
     lane form beside the root tiles that walk no lanes: a fold walks at most
-    ``MAX_LANE_COPIES`` lanes, while an argmin/argmax and a symbolic
-    (non-int) extent walk none."""
+    ``MAX_LANE_COPIES`` lanes, while an argmin/argmax and an extent codegen
+    doesn't know (``static_extent``) walk none."""
     from torch._inductor.runtime.runtime_utils import next_power_of_2
 
     from ..compile_environment import CompileEnvironment
@@ -148,7 +158,7 @@ def _lane_floor(config: Config, device_ir: DeviceIR | None = None) -> int:
         ):
             continue  # a rolled chunk steps by its threads (create_reduction_strategy)
         extent = int(info.size_hint())
-        if not isinstance(info.size, int) or block_id in indexed:
+        if static_extent(info.size) is None or block_id in indexed:
             floor *= next_power_of_2(max(1, extent))
         elif _reduction_contracted(block_id) or block_id in scalar_dots:
             floor *= next_power_of_2(max(1, -(-extent // MAX_LANE_COPIES)))
@@ -522,12 +532,14 @@ class MetalBackend(Backend):
         from ..compile_environment import CompileEnvironment
         from .free_arange import check_free_lanes
         from .free_arange import plan_free_aranges
+        from .literal_dims import reject_literal_dims
         from .mpp_matmul import plan_mpp_matmuls
         from .positional_rebind import reject_positional_rebinds
         from .reduction import plan_reduced_tile_axes
         from .repeated_blocks import plan_repeated_blocks
 
         reject_positional_rebinds(graphs)
+        reject_literal_dims(graphs, config)
         plan_repeated_blocks(graphs, tile_strategy)
         plan_reduced_tile_axes(graphs, tile_strategy)
         self._tid_axes = set()
@@ -789,7 +801,7 @@ class MetalBackend(Backend):
             return MetalPaddedTwinStrategy(fn, block_id, owner)
         if reduction_loop is None:
             size = CompileEnvironment.current().block_sizes[block_id].size
-            if isinstance(size, torch.SymInt) and size.node.expr.free_symbols:
+            if isinstance(size, torch.SymInt) and static_extent(size) is None:
                 raise exc.BackendUnsupported(
                     self.name,
                     f"a ':' dimension of runtime extent {size}: Metal fixes the "
@@ -842,13 +854,14 @@ class MetalBackend(Backend):
 
         needed = self.static_rdim_size(covered)
         if needed > span:
-            size = env.block_sizes[block_id].size
-            if isinstance(strategy, MetalPersistentReductionStrategy) and isinstance(
-                size, int
+            extent = static_extent(env.block_sizes[block_id].size)
+            if (
+                isinstance(strategy, MetalPersistentReductionStrategy)
+                and extent is not None
             ):
                 # Lanes cover the real extent: covering its power-of-two
                 # padding would only add fully masked lanes.
-                strategy.serialize_lanes(size)
+                strategy.serialize_lanes(extent)
                 if _reduction_contracted(block_id):
                     strategy.fold_lanes()
                 return strategy
@@ -1173,7 +1186,7 @@ class MetalBackend(Backend):
             # persistent dim walks lanes only over a static extent, and an
             # argmin/argmax has no lane form.
             can_lane = (
-                rolled is not None or isinstance(block_size_info.size, int)
+                rolled is not None or static_extent(block_size_info.size) is not None
             ) and block_id not in indexed
             full = next_power_of_2(max(1, min(extent, budget)))
             if not combined or not can_lane:

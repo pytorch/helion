@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import dataclasses
 import math
 from typing import TYPE_CHECKING
+from typing import ClassVar
+from typing import Literal
 
+import numpy as np
 import torch
 from torch.utils._pytree import tree_flatten
-from torch.utils._pytree import tree_map_only
 
 from .kernel_args import PortableFunction
 
 if TYPE_CHECKING:
+    from typing import Callable
+
     from ..runtime.settings import Settings
 
 _FP8_DTYPES = {
@@ -26,6 +31,7 @@ def is_fp8_dtype(dtype: torch.dtype) -> bool:
 
 
 FP8_ACCURACY_MODES = ("ulp", "bitwise")
+AtolScale = Literal["rms", "peak"]
 
 # The byte every free caching-allocator block is filled with before a run the
 # accuracy check judges.  Repeated, it is a finite value of every dtype
@@ -155,8 +161,11 @@ def relative_l2_disagreement(
     code: 1e-3 or so) and names a lowering that lost or misread a term
     (near 1).  Integer and boolean leaves must be equal: an index output
     whose ties two correct lowerings break differently (an argmax over equal
-    values) counts as a disagreement, as it does in the accuracy check of
-    every candidate.  Leaves that are not tensors are not compared."""
+    values) counts as a disagreement.  This is stricter than the accuracy
+    check of every candidate, which applies its tolerances to integer leaves
+    too (``|a - b| <= atol + rtol * |b|``: the default ``rtol=1e-2`` admits
+    an index of 101 against 100).  Leaves that are not tensors are not
+    compared."""
     actual_leaves, actual_spec = tree_flatten(actual)
     expected_leaves, expected_spec = tree_flatten(expected)
     if actual_spec != expected_spec or len(actual_leaves) != len(expected_leaves):
@@ -183,11 +192,16 @@ def relative_l2_disagreement(
             if not torch.equal(a, b):
                 return f"leaf {index} ({a.dtype}) differs"
             continue
-        af = a.detach().to(torch.float32)
-        bf = b.detach().to(torch.float32)
+        # float64 leaves keep their range: in float32 two different large
+        # values would both overflow to inf and agree.
+        compute_dtype = torch.float64 if a.dtype == torch.float64 else torch.float32
+        af = a.detach().to(compute_dtype)
+        bf = b.detach().to(compute_dtype)
         finite = torch.isfinite(bf)
-        if not torch.equal(torch.isfinite(af), finite) or not torch.equal(
-            torch.isnan(af), torch.isnan(bf)
+        if (
+            not torch.equal(torch.isfinite(af), finite)
+            or not torch.equal(torch.isnan(af), torch.isnan(bf))
+            or not torch.equal(torch.isposinf(af), torch.isposinf(bf))
         ):
             return f"leaf {index}: the non-finite elements differ"
         af = torch.where(finite, af, torch.zeros((), dtype=af.dtype, device=af.device))
@@ -213,18 +227,25 @@ def assert_close(
     rtol: float,
     *,
     scale_atol_by_expected_rms: bool = False,
+    atol_scale: AtolScale | None = None,
     fp8_accuracy: str = "bitwise",
 ) -> None:
     """Like torch.testing.assert_close, with packed floats and large tensor handling.
 
-    With ``scale_atol_by_expected_rms`` (used when the caller did not specify
-    an explicit atol), the absolute-tolerance floor for each tensor leaf is
+    With ``atol_scale="rms"`` (``scale_atol_by_expected_rms`` for short; used
+    when the caller did not specify an explicit atol), the absolute-tolerance
+    floor for each tensor leaf is
     ``atol * max(1, rms(expected))``: a near-zero element of a large reduction
     legitimately differs across accumulation orders by an amount proportional
     to the global output scale, not to the element's own magnitude, so a fixed
     elementwise atol falsely rejects every config that restructures the
     reduction (e.g. all split_k > 1 matmul configs). The scaling never
     tightens the check.
+
+    With ``atol_scale="peak"`` the floor is instead
+    ``atol * max(|expected|)`` over the finite elements of each floating-point
+    leaf (see :class:`AccuracyCheck`); unlike the rms scaling it can tighten
+    the check, down to exact equality for an all-zero leaf.
 
     ``fp8_accuracy`` selects how fp8 leaves are compared: ``"bitwise"`` views
     them as bytes and applies ``atol``/``rtol`` to the byte values (exact when
@@ -235,18 +256,15 @@ def assert_close(
         raise ValueError(
             f"fp8_accuracy must be one of {FP8_ACCURACY_MODES}, got {fp8_accuracy!r}"
         )
+    if scale_atol_by_expected_rms:
+        if atol_scale not in (None, "rms"):
+            raise ValueError(
+                f"scale_atol_by_expected_rms contradicts atol_scale={atol_scale!r}"
+            )
+        atol_scale = "rms"
 
-    def convert(t: torch.Tensor) -> torch.Tensor:
-        if t.dtype in _FP8_DTYPES and fp8_accuracy == "bitwise":
-            return t.view(torch.uint8)
-        return t
-
-    actual_flat, actual_spec = tree_flatten(
-        tree_map_only(torch.Tensor, convert, actual)
-    )
-    expected_flat, expected_spec = tree_flatten(
-        tree_map_only(torch.Tensor, convert, expected)
-    )
+    actual_flat, actual_spec = tree_flatten(actual)
+    expected_flat, expected_spec = tree_flatten(expected)
 
     if actual_spec != expected_spec:
         raise AssertionError(
@@ -256,21 +274,45 @@ def assert_close(
         )
 
     for actual_leaf, expected_leaf in zip(actual_flat, expected_flat, strict=True):
-        if isinstance(actual_leaf, torch.Tensor):
-            if not isinstance(expected_leaf, torch.Tensor):
-                raise AssertionError(
-                    "Output leaf type mismatch during autotuner accuracy check: "
-                    f"actual is Tensor, expected is {type(expected_leaf).__name__}"
-                )
+        actual_kind = _leaf_kind(actual_leaf)
+        if actual_kind != _leaf_kind(expected_leaf):
+            # Two leaves of different kinds would reach a comparison that has
+            # no pair for them (a TypeError, which the autotuner does not
+            # catch): a mismatch.
+            raise AssertionError(
+                "Output leaf type mismatch during autotuner accuracy check: "
+                f"actual is {type(actual_leaf).__name__}, expected is "
+                f"{type(expected_leaf).__name__}"
+            )
+        if actual_kind == "tensor":
+            assert isinstance(actual_leaf, torch.Tensor)
+            assert isinstance(expected_leaf, torch.Tensor)
             if actual_leaf.dtype in _FP8_DTYPES or expected_leaf.dtype in _FP8_DTYPES:
-                # Only the "ulp" mode keeps fp8 leaves typed; "bitwise" viewed
-                # them as uint8 above.
+                if actual_leaf.dtype != expected_leaf.dtype:
+                    # Two fp8 formats (or fp8 against bytes) can share a bit
+                    # pattern for different values.
+                    raise AssertionError(
+                        "Tensor dtype mismatch during autotuner accuracy check: "
+                        f"{actual_leaf.dtype} != {expected_leaf.dtype}"
+                    )
+                if fp8_accuracy == "bitwise":
+                    if atol or rtol:
+                        # Byte tolerances would let a value one byte from inf
+                        # or NaN pass against it.
+                        _assert_non_finite_bytes_match(actual_leaf, expected_leaf)
+                    _chunked_assert_close(
+                        actual_leaf.view(torch.uint8),
+                        expected_leaf.view(torch.uint8),
+                        atol=atol,
+                        rtol=rtol,
+                    )
+                    continue
                 _assert_close_fp8_ulp(
                     actual_leaf,
                     expected_leaf,
                     atol=atol,
                     rtol=rtol,
-                    scale_atol_by_expected_rms=scale_atol_by_expected_rms,
+                    atol_scale=atol_scale,
                 )
                 continue
             _chunked_assert_close(
@@ -278,29 +320,74 @@ def assert_close(
                 expected_leaf,
                 atol=atol,
                 rtol=rtol,
-                scale_atol_by_expected_rms=scale_atol_by_expected_rms,
+                atol_scale=atol_scale,
             )
-        elif isinstance(actual_leaf, str):
-            if not isinstance(expected_leaf, str):
-                raise AssertionError(f"Type mismatch {actual_leaf} vs {expected_leaf}")
+        elif actual_kind == "str":
             if actual_leaf != expected_leaf:
                 raise AssertionError(
                     f"string mismatch {actual_leaf} vs {expected_leaf}"
                 )
-        elif _is_function_leaf(actual_leaf):
+        elif actual_kind == "function":
             # A callable argument (an epilogue, possibly serialized by code
             # for the benchmark subprocess) is not something a kernel can
             # write to; comparing the post-call arguments against the
             # baseline's only concerns the tensors around it, and
             # ``torch.testing.assert_close`` has no pair for functions.
-            if not _is_function_leaf(expected_leaf):
-                raise AssertionError(
-                    "Leaf type mismatch during autotuner accuracy check: "
-                    f"actual is {type(actual_leaf).__name__}, expected is "
-                    f"{type(expected_leaf).__name__}"
-                )
-        else:
+            pass
+        elif _is_number(actual_leaf) and _is_number(expected_leaf):
             torch.testing.assert_close(actual_leaf, expected_leaf, atol=atol, rtol=rtol)
+        elif actual_leaf != expected_leaf:
+            # Leaves torch.testing has no comparison for (a torch.dtype, None)
+            # must be equal.
+            raise AssertionError(
+                "Leaf mismatch during autotuner accuracy check: "
+                f"{actual_leaf!r} vs {expected_leaf!r}"
+            )
+
+
+def _is_number(leaf: object) -> bool:
+    # The scalars torch.testing.assert_close pairs.
+    return isinstance(leaf, (int, float, complex, np.number))
+
+
+def _assert_non_finite_bytes_match(
+    actual: torch.Tensor, expected: torch.Tensor, chunk_size: int = 2**22
+) -> None:
+    """Every position where either fp8 tensor is inf or NaN holds the same
+    byte in both."""
+    if actual.shape != expected.shape:
+        raise AssertionError(
+            f"Tensor shape mismatch during autotuner accuracy check: "
+            f"{tuple(actual.shape)} != {tuple(expected.shape)}"
+        )
+    if actual.device != expected.device:
+        actual = actual.to(expected.device)
+    actual_flat = actual.reshape(-1)
+    expected_flat = expected.reshape(-1)
+    chunk_size = _accuracy_chunk_size(expected, chunk_size)
+    for start in range(0, expected_flat.numel(), chunk_size):
+        a8 = actual_flat[start : start + chunk_size]
+        b8 = expected_flat[start : start + chunk_size]
+        non_finite = ~torch.isfinite(a8.to(torch.float32)) | ~torch.isfinite(
+            b8.to(torch.float32)
+        )
+        if not torch.equal(
+            a8.view(torch.uint8)[non_finite], b8.view(torch.uint8)[non_finite]
+        ):
+            raise AssertionError(
+                "fp8 tensors differ at an inf or NaN element during autotuner "
+                f"accuracy check (dtype={expected.dtype})"
+            )
+
+
+def _leaf_kind(leaf: object) -> str:
+    if isinstance(leaf, torch.Tensor):
+        return "tensor"
+    if isinstance(leaf, str):
+        return "str"
+    if _is_function_leaf(leaf):
+        return "function"
+    return "other"
 
 
 def _is_function_leaf(leaf: object) -> bool:
@@ -311,7 +398,117 @@ def _assert_close(actual: object, expected: object, atol: float, rtol: float) ->
     assert_close(actual, expected, atol=atol, rtol=rtol)
 
 
+@dataclasses.dataclass(frozen=True)
+class AccuracyCheck:
+    """An ``autotune_baseline_accuracy_check_fn`` built from plain tolerances.
+
+    It compares every output (and mutated argument) of a candidate with the
+    baseline's as the default check does (:func:`assert_close`), with the
+    tolerances given here instead of the ``autotune_baseline_*`` settings:
+
+    - ``atol_scale=None``: ``|actual - expected| <= atol + rtol * |expected|``
+      elementwise.
+    - ``atol_scale="rms"``: ``atol`` is scaled per tensor to
+      ``atol * max(1, rms(expected))``, the default check's scaling:
+      ``AccuracyCheck(atol=1e-2, rtol=1e-2, atol_scale="rms")`` is the default
+      check of outputs that are not fp8.
+    - ``atol_scale="peak"``: ``atol`` is scaled per tensor to
+      ``atol * max(|expected|)``.  Rounding error in low-precision outputs and
+      accumulation-order differences scale with a tensor's peak; with
+      ``rtol=0`` this accepts correct heavy-tailed outputs, such as bf16
+      attention gradients whose peak is tens of times their rms, that a fixed
+      elementwise tolerance rejects.  An all-zero tensor that is not fp8
+      must match exactly (an fp8 one under ``"ulp"`` still gets one ulp).
+
+    Scaling applies to floating-point tensors and ignores non-finite baseline
+    elements, which must match exactly.  Integer and bool tensors get the
+    unscaled tolerances, as in the default check (exact when ``rtol=0`` and
+    ``atol < 1``); packed fp4 tensors must match byte for byte.
+    ``fp8_accuracy`` selects how fp8 tensors are compared (see
+    :func:`assert_close`) in place of the ``autotune_fp8_accuracy`` setting
+    (``HELION_AUTOTUNE_FP8_ACCURACY``), which this check ignores like the
+    ``autotune_baseline_*`` tolerances, so that equal checks behave the same
+    in every process; as with the settings, ``atol=0`` with ``rtol=0``
+    compares them bitwise whatever it says.
+
+    Unlike an arbitrary callback, this check is Helion's own code, so the
+    autotune cache keys it by its fields (and ``VERSION``, bumped whenever its
+    behavior changes): a config tuned under one check is reused across
+    processes under an equal check and never under a different one.
+    """
+
+    atol: float
+    rtol: float
+    atol_scale: AtolScale | None = None
+    fp8_accuracy: Literal["ulp", "bitwise"] = "ulp"
+    # Bump whenever a behavior reachable from ``assert_close`` changes: cached
+    # autotune results are keyed by it, and the loose cache key holds no hash
+    # of Helion's source.
+    VERSION: ClassVar[int] = 1
+
+    def __post_init__(self) -> None:
+        for name in ("atol", "rtol"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                raise ValueError(
+                    f"AccuracyCheck {name} must be a non-negative finite number, "
+                    f"got {value!r}"
+                )
+        if self.atol_scale not in (None, "rms", "peak"):
+            raise ValueError(
+                "AccuracyCheck atol_scale must be None, 'rms' or 'peak', "
+                f"got {self.atol_scale!r}"
+            )
+        if self.fp8_accuracy not in FP8_ACCURACY_MODES:
+            raise ValueError(
+                f"AccuracyCheck fp8_accuracy must be one of {FP8_ACCURACY_MODES}, "
+                f"got {self.fp8_accuracy!r}"
+            )
+
+    @property
+    def effective_fp8_accuracy(self) -> str:
+        """The fp8 mode the check runs: ``"bitwise"`` under zero tolerances."""
+        if self.atol == 0 and self.rtol == 0:
+            return "bitwise"
+        return self.fp8_accuracy
+
+    def cache_policy(self) -> dict[str, object]:
+        """Plain data identifying this check for autotune cache keys."""
+        return {
+            "check": "accuracy_check",
+            "version": self.VERSION,
+            "atol": float(self.atol),
+            "rtol": float(self.rtol),
+            "atol_scale": self.atol_scale,
+            "fp8_accuracy": self.effective_fp8_accuracy,
+        }
+
+    def __call__(self, actual: object, expected: object) -> None:
+        assert_close(
+            actual,
+            expected,
+            atol=self.atol,
+            rtol=self.rtol,
+            atol_scale=self.atol_scale,
+            fp8_accuracy=self.effective_fp8_accuracy,
+        )
+
+
+def keyable_accuracy_check(settings: Settings) -> AccuracyCheck | None:
+    """The ``autotune_baseline_accuracy_check_fn`` of ``settings`` when the
+    autotune cache can key it: an :class:`AccuracyCheck` (not a subclass,
+    which may override ``__call__``)."""
+    check = settings.autotune_baseline_accuracy_check_fn
+    return check if type(check) is AccuracyCheck else None
+
+
 _RMS_CACHE_ATTR = "_helion_accuracy_rms"
+_PEAK_CACHE_ATTR = "_helion_accuracy_peak"
 _TPU_ACCURACY_CHUNK_ELEMENTS = 2**26
 
 
@@ -328,6 +525,21 @@ def _finite_sum_of_squares(chunk: torch.Tensor) -> tuple[float, int]:
     return float(squares.sum()), int(finite.sum())
 
 
+def _memoized(t: torch.Tensor, attr: str, compute: Callable[[], float]) -> float:
+    """``compute()`` memoized on ``t`` under ``attr``, keyed by its mutation
+    version: the autotuner compares hundreds of candidates against one fixed
+    baseline per run.  Inference tensors have no version counter, so they are
+    not memoized."""
+    if t.is_inference():
+        return compute()
+    cached = getattr(t, attr, None)
+    if cached is not None and cached[0] == t._version:
+        return cached[1]
+    value = compute()
+    setattr(t, attr, (t._version, value))
+    return value
+
+
 def _chunked_rms(t: torch.Tensor, chunk_size: int) -> float:
     """RMS of the finite elements of ``t`` (0.0 when there are none).
 
@@ -339,12 +551,10 @@ def _chunked_rms(t: torch.Tensor, chunk_size: int) -> float:
     match exactly (``torch.testing.assert_close`` never tolerates ``inf``
     against a finite element).
     """
-    # The autotuner compares hundreds of candidates against one fixed
-    # baseline per run; memoize the RMS on the tensor (keyed by its mutation
-    # version) instead of re-reading the whole output for every candidate.
-    cached = getattr(t, _RMS_CACHE_ATTR, None)
-    if cached is not None and cached[0] == t._version:
-        return cached[1]
+    return _memoized(t, _RMS_CACHE_ATTR, lambda: _compute_rms(t, chunk_size))
+
+
+def _compute_rms(t: torch.Tensor, chunk_size: int) -> float:
     flat = t.reshape(-1)
     if flat.numel() == 0:
         return 0.0
@@ -352,9 +562,7 @@ def _chunked_rms(t: torch.Tensor, chunk_size: int) -> float:
         # XLA fuses the conversion, mask, square, and reduction. Keeping the
         # whole reduction on device avoids one host synchronization per chunk.
         total, count = _finite_sum_of_squares(flat.to(torch.float32))
-        rms = math.sqrt(total / count) if count else 0.0
-        setattr(t, _RMS_CACHE_ATTR, (t._version, rms))
-        return rms
+        return math.sqrt(total / count) if count else 0.0
     chunk_size = _accuracy_chunk_size(t, chunk_size)
     # Accumulate in float64 so large-magnitude outputs cannot overflow the
     # sum of squares. MPS has no float64; use float32 there — an overflow to
@@ -369,9 +577,47 @@ def _chunked_rms(t: torch.Tensor, chunk_size: int) -> float:
         )
         total += chunk_total
         count += chunk_count
-    rms = math.sqrt(total / count) if count else 0.0
-    setattr(t, _RMS_CACHE_ATTR, (t._version, rms))
-    return rms
+    return math.sqrt(total / count) if count else 0.0
+
+
+def _chunked_peak(t: torch.Tensor, chunk_size: int) -> float:
+    """Largest magnitude of the finite elements of ``t`` (0.0 when there are
+    none), memoized on the tensor like ``_chunked_rms``."""
+    return _memoized(t, _PEAK_CACHE_ATTR, lambda: _compute_peak(t, chunk_size))
+
+
+def _compute_peak(t: torch.Tensor, chunk_size: int) -> float:
+    flat = t.reshape(-1)
+    chunk_size = _accuracy_chunk_size(t, chunk_size)
+    peak = 0.0
+    for start in range(0, flat.numel(), chunk_size):
+        chunk = flat[start : start + chunk_size]
+        if chunk.dtype != torch.float64:
+            chunk = chunk.to(torch.float32)
+        magnitude = torch.where(
+            torch.isfinite(chunk), chunk.abs(), torch.zeros_like(chunk)
+        )
+        peak = max(peak, float(magnitude.max()))
+    return peak
+
+
+def _scaled_atol(
+    expected: torch.Tensor,
+    atol: float,
+    chunk_size: int,
+    atol_scale: AtolScale | None,
+) -> float:
+    """``atol`` scaled by the expected tensor's scale (see ``assert_close``)."""
+    if atol_scale == "rms":
+        rms = _chunked_rms(expected, chunk_size)
+        # The RMS skips non-finite baseline elements; it can still overflow
+        # on MPS (float32 accumulation), and that must not disable the gate:
+        # keep the unscaled floor in that case.
+        if math.isfinite(rms):
+            return atol * max(1.0, rms)
+    elif atol_scale == "peak":
+        return atol * _chunked_peak(expected, chunk_size)
+    return atol
 
 
 def _fp8_ulp(magnitude: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -401,7 +647,7 @@ def _assert_close_fp8_ulp(
     atol: float,
     rtol: float,
     chunk_size: int = 2**22,
-    scale_atol_by_expected_rms: bool = False,
+    atol_scale: AtolScale | None = None,
 ) -> None:
     """Compare two fp8 tensors on their dequantized values.
 
@@ -413,7 +659,7 @@ def _assert_close_fp8_ulp(
     tolerance (a sign flip of a near-zero value reads as a distance >= 128).
 
     Every element must satisfy ``|a - b| <= ulp(max(|a|, |b|)) + atol + rtol * |b|``
-    with ``atol`` scaled by ``max(1, rms(b))`` when requested: one ulp admits
+    with ``atol`` scaled by ``max(1, rms(b))`` or ``max(|b|)`` when requested: one ulp admits
     the single-bucket flips, the tolerances cover near-zero elements of a
     large reduction whose few-ulp distance is small against the output scale.
     NaNs must match NaNs.  ``float8_e8m0fnu`` has no mantissa, so its one ulp
@@ -438,10 +684,7 @@ def _assert_close_fp8_ulp(
     if actual.device != expected.device:
         actual = actual.to(expected.device)
     dtype = expected.dtype
-    if scale_atol_by_expected_rms:
-        rms = _chunked_rms(expected, chunk_size)
-        if math.isfinite(rms):
-            atol = atol * max(1.0, rms)
+    atol = _scaled_atol(expected, atol, chunk_size, atol_scale)
     chunk_size = _accuracy_chunk_size(expected, chunk_size)
     actual_flat = actual.reshape(-1)
     expected_flat = expected.reshape(-1)
@@ -464,12 +707,15 @@ def _assert_close_fp8_ulp(
                 a8.view(torch.uint8).to(torch.int16)
                 - b8.view(torch.uint8).to(torch.int16)
             ).abs()
-            within = distance <= 1
+            # NaN (byte 0xFF) is one byte from the largest finite value.
+            within = (distance <= 1) & ~torch.isnan(a) & ~torch.isnan(b)
         else:
             tolerance = _fp8_ulp(torch.maximum(a.abs(), b.abs()), dtype) + atol
             if rtol:
                 tolerance = tolerance + rtol * b.abs()
-            within = diff <= tolerance
+            # An infinite element (whose tolerance is infinite too) must match
+            # exactly: ``equal`` covers that.
+            within = (diff <= tolerance) & torch.isfinite(a) & torch.isfinite(b)
         bad = ~(equal | both_nan | within)
         n_bad = int(bad.sum())
         if n_bad:
@@ -513,7 +759,7 @@ def _chunked_assert_close(
     atol: float,
     rtol: float,
     chunk_size: int = 2**22,
-    scale_atol_by_expected_rms: bool = False,
+    atol_scale: AtolScale | None = None,
 ) -> None:
     """Memory-efficient assert_close for large tensors."""
     if actual.shape != expected.shape:
@@ -533,13 +779,8 @@ def _chunked_assert_close(
         actual = actual.view(torch.uint8)
         expected = expected.view(torch.uint8)
         atol = rtol = 0.0
-    if scale_atol_by_expected_rms and expected.dtype.is_floating_point:
-        rms = _chunked_rms(expected, chunk_size)
-        # The RMS skips non-finite baseline elements; it can still overflow
-        # on MPS (float32 accumulation), and that must not disable the gate:
-        # keep the unscaled floor in that case.
-        if math.isfinite(rms):
-            atol = atol * max(1.0, rms)
+    if expected.dtype.is_floating_point:
+        atol = _scaled_atol(expected, atol, chunk_size, atol_scale)
     if (
         actual.device.type == "tpu"
         and actual.dtype == expected.dtype

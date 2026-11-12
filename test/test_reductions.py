@@ -17,6 +17,7 @@ from helion._testing import TestCase
 from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import output_only
 from helion._testing import skipIfCute
 from helion._testing import skipIfMetal
 from helion._testing import skipIfNotCUDA
@@ -28,6 +29,7 @@ from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessCuteAvailable
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallasTpu
+from helion.autotuner import IntegerFragment
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -1251,6 +1253,32 @@ class TestReductions(RefEagerTestBase, TestCase):
         x = torch.randn([32, 2], device=DEVICE)
         code, out = code_and_output(sum_const_inner, (x,), block_size=16)
         torch.testing.assert_close(out, x.sum(-1), rtol=1e-4, atol=1e-4)
+
+    def test_sum_tunable_extent(self):
+        """Reduce a full slice over a host dim sized by hl.register_tunable.
+
+        The extent is fixed per config but is not a block size, so the slice
+        needs a reduction dim, also on backends that do not pad factory
+        tensors (Pallas).  Width 37 covers the tail mask.
+        """
+
+        @helion.kernel(static_shapes=True)
+        def host_factory(x: torch.Tensor) -> torch.Tensor:
+            extent = hl.register_tunable("width", IntegerFragment(1, 64, 16))
+            tmp = torch.ones((x.size(0), 2 * extent), dtype=x.dtype, device=x.device)
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = tmp[tile, :].sum(-1) + x[tile]
+            return out
+
+        x = torch.randn(17, device=DEVICE)
+        configs = [{"width": 16}, {"width": 37}]
+        if _get_backend() == "triton":
+            configs.append({"width": 37, "reduction_loops": [16]})
+        for config in configs:
+            with self.subTest(**config):
+                out = output_only(host_factory, (x,), block_size=16, **config)
+                torch.testing.assert_close(out, x + 2 * config["width"])
 
     @skipIfPallas("complex layernorm with fp16, not relevant to Pallas")
     @skipIfRefEager("Does not call assert_close")

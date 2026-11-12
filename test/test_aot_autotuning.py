@@ -134,7 +134,7 @@ class TestShapeKey:
         )
 
         with patch(
-            "helion.autotuner.local_cache._cute_flash_search_policy_hash",
+            "helion.autotuner.local_cache._search_policy_hash",
             return_value="full-v1",
         ) as policy_hash:
             key = cache._create_shape_key()
@@ -167,13 +167,13 @@ class TestShapeKey:
             return next(nonces)
 
         with patch(
-            "helion.autotuner.local_cache._cute_flash_search_policy_hash",
+            "helion.autotuner.local_cache._search_policy_hash",
             side_effect=uncacheable_policy,
         ):
             first = cache._create_shape_key()
         cache.autotuner = SimpleNamespace(_search_policy_cacheable=True)
         with patch(
-            "helion.autotuner.local_cache._cute_flash_search_policy_hash",
+            "helion.autotuner.local_cache._search_policy_hash",
             side_effect=uncacheable_policy,
         ):
             second = cache._create_shape_key()
@@ -846,7 +846,11 @@ def test_aot_cache_canonicalizes_defaults_for_compile_get(
         config_spec=SimpleNamespace(cute_flash_search_enabled=False),
         is_cacheable=lambda: True,
     )
-    autotuner = SimpleNamespace(kernel=bound_kernel, args=(tensor,))
+    autotuner = SimpleNamespace(
+        kernel=bound_kernel,
+        args=(tensor,),
+        settings=SimpleNamespace(autotune_baseline_accuracy_check_fn=None),
+    )
     monkeypatch.setenv("HELION_AOT_MODE", "compile")
     monkeypatch.setattr(aot_cache_module, "get_aot_data_dir", lambda: tmp_path)
     monkeypatch.setattr(

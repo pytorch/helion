@@ -25,6 +25,7 @@ from ..runtime.config import Config
 from ..runtime.cute.structural_config import decode_structural_policy
 from ..runtime.structural_policy import bound_structural_policy
 from ..runtime.structural_policy import require_same_structural_policy
+from .accuracy import keyable_accuracy_check
 from .base_cache import AutotuneCacheBase
 from .base_cache import LooseAutotuneCacheKey
 from .base_cache import StrictAutotuneCacheKey
@@ -105,17 +106,37 @@ def _search_policy_json_value(
         active.remove(value_id)
 
 
-def _cute_flash_search_policy_hash(
+def _hash_policy(policy: object) -> str:
+    encoded = json.dumps(
+        policy, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _search_policy_hash(
     autotuner: BaseSearch, *, cute_flash_search_enabled: bool
 ) -> str:
-    """Hash the effective built-in search policy for CuTe flash caches.
+    """Hash the search settings a cache key must cover beyond the kernel and
+    its inputs.
 
-    A cached quick or explicitly truncated search must not satisfy a later full
-    request. Unknown/custom policies get a unique one-shot key; other kernels
-    retain their historical cache keys.
+    For CuTe flash kernels this is the whole effective built-in search policy:
+    a cached quick or explicitly truncated search must not satisfy a later
+    full request, and unknown/custom policies get a unique one-shot key.
+    Other kernels key only an :class:`AccuracyCheck` that validates the
+    search, so a config accepted under one check is not reused under a
+    different one; without one they retain their historical cache keys (which
+    also leave out their search settings and ``autotune_baseline_fn``).
     """
     if not cute_flash_search_enabled:
-        return ""
+        accuracy_check = keyable_accuracy_check(autotuner.settings)
+        if accuracy_check is None or not autotuner.settings.autotune_accuracy_check:
+            return ""
+        return _hash_policy(
+            {
+                "schema": "accuracy_check_policy_v1",
+                "autotune_baseline_accuracy_check_fn": accuracy_check.cache_policy(),
+            }
+        )
 
     policy = autotuner.cache_policy()
     if policy is None:
@@ -126,21 +147,10 @@ def _cute_flash_search_policy_hash(
         )
         policy = _uncacheable_search_policy(autotuner)
     try:
-        canonical_policy = _search_policy_json_value(policy)
-        encoded = json.dumps(
-            canonical_policy,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
+        return _hash_policy(_search_policy_json_value(policy))
     except (TypeError, ValueError) as error:
         log.warning("CuTe-flash autotune cache reuse is disabled: %s", error)
-        encoded = json.dumps(
-            _uncacheable_search_policy(autotuner),
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+        return _hash_policy(_uncacheable_search_policy(autotuner))
 
 
 def get_helion_cache_dir() -> Path:
@@ -316,7 +326,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
         config_spec_hash = self.kernel.config_spec.cache_fingerprint_hash(
             advanced_controls_files=self.autotuner.settings.autotune_search_acf or None
         )
-        search_policy_hash = _cute_flash_search_policy_hash(
+        search_policy_hash = _search_policy_hash(
             self.autotuner,
             cute_flash_search_enabled=bool(
                 getattr(self.kernel.config_spec, "cute_flash_search_enabled", False)

@@ -38,9 +38,13 @@ import torch
 
 from ... import exc
 from ._constants import MAX_THREADGROUP_MEMORY_BYTES
+from .fma_fusion import fuse_multiply_adds
 from .lane_fold import unroll_lane_folds
+from .msl_ast_walker import MASKED_LOAD
+from .msl_ast_walker import MASKED_LOAD_PREAMBLE
 from .msl_ast_walker import EmitState
 from .msl_ast_walker import _emit_stmts
+from .msl_ast_walker import select_masked_loads
 from .msl_reduction import GROUP_PATHS
 from .msl_reduction import REDUCTION_INCLUDES
 from .msl_reduction import REDUCTION_NAMESPACE
@@ -109,20 +113,22 @@ class _MetalKernel:
         by_value: tuple[int, ...],
     ) -> tuple[object, ...]:
         """Everything the compiled shader depends on besides the body: block
-        dims, tensor dtypes and ranks, and baked non-tensor values.  Runtime
-        scalars contribute only their type: they bind by value
-        (:data:`_RUNTIME_SCALAR_TYPES`) instead of being baked into the
-        shader, so a new value reuses the compiled kernel."""
+        dims, tensor dtypes, ranks, emptiness and which tensors share storage,
+        and baked non-tensor values.  Runtime scalars contribute only their
+        type: they bind by value (:data:`_RUNTIME_SCALAR_TYPES`) instead of
+        being baked into the shader, so a new value reuses the compiled
+        kernel."""
         return (
             block_dims,
             *[
-                (arg.dtype, arg.ndim)
+                (arg.dtype, arg.ndim, arg.numel() > 0)
                 if isinstance(arg, torch.Tensor)
                 else type(arg)
                 if i in by_value
                 else (type(arg), arg)
                 for i, arg in enumerate(args)
             ],
+            _shared_storage(args),
         )
 
     def _plan(
@@ -178,6 +184,16 @@ class _MetalKernel:
             },
         )
         return torch.mps.compile_shader(self.msl_source)  # type: ignore[attr-defined]
+
+
+def _shared_storage(args: tuple[object, ...]) -> frozenset[int]:
+    """The positions of the tensor arguments that share storage with another
+    (an in-place call passing one tensor twice, or views of one tensor)."""
+    seen: dict[int, list[int]] = {}
+    for i, arg in enumerate(args):
+        if isinstance(arg, torch.Tensor) and arg.numel() > 0:
+            seen.setdefault(arg.untyped_storage().data_ptr(), []).append(i)
+    return frozenset(i for group in seen.values() if len(group) > 1 for i in group)
 
 
 def _generate_msl(
@@ -245,6 +261,28 @@ def _generate_msl(
         reduction_sites,
         required_threads_per_threadgroup,
     )
+    body_stmts = fuse_multiply_adds(
+        body_stmts,
+        {
+            **{n: DTYPE_TO_METAL[d] for n, d in tensor_dtypes.items()},
+            **{n: dtype for n, dtype, _ in threadgroup_buffers},
+            **by_value,
+            **{
+                n: "float" if type(a) is float else "int"
+                for n, a in zip(param_names, args, strict=True)
+                if n not in by_value and type(a) in (int, float)
+            },
+        },
+    )
+    shared = _shared_storage(args)
+    body_stmts = select_masked_loads(
+        body_stmts,
+        frozenset(
+            name
+            for i, (name, arg) in enumerate(zip(param_names, args, strict=True))
+            if isinstance(arg, torch.Tensor) and arg.numel() > 0 and i not in shared
+        ),
+    )
     uses_reductions = _uses_reductions(body_stmts)
     if uses_reductions:
         msl_parts.extend(REDUCTION_INCLUDES)
@@ -274,6 +312,12 @@ def _generate_msl(
         msl_parts.append(ROUND_PREAMBLE)
     if BF16_CAST in referenced:
         msl_parts.append(BF16_CAST_PREAMBLE)
+    if any(
+        isinstance(node, ast.Name) and node.id == MASKED_LOAD
+        for stmt in body_stmts
+        for node in ast.walk(stmt)
+    ):
+        msl_parts.append(MASKED_LOAD_PREAMBLE)
     msl_parts.append("")
 
     params: list[str] = []
