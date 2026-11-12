@@ -1698,6 +1698,8 @@ class DeviceFunction:
         # accidentally turn a module constexpr into a host-wrapper local.
         dead_assignment_elimination(cast("list[ast.AST]", cloned_body), self.dce_vars)
         dead_expression_elimination(cast("list[ast.AST]", cloned_body))
+        if not cloned_body:
+            cloned_body.append(ast.Pass())
         reads = set(ReadWrites.from_list(cloned_body).reads)
         local_names = {
             node.id
@@ -1707,7 +1709,9 @@ class DeviceFunction:
         }
         helper_names = {name for name, _, _, _ in self.triton_outlined_helpers}
         environment = CompileEnvironment.current()
-        for name in reads:
+        # Sorted: the module declares these constexprs in insertion order, and
+        # a set's order follows the string hash seed.
+        for name in sorted(reads):
             if not name.startswith("_BLOCK_SIZE_"):
                 continue
             suffix = name.removeprefix("_BLOCK_SIZE_")

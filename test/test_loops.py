@@ -282,9 +282,6 @@ def _thread_barrier() -> str:
 
 @onlyBackends(["triton", "cute", "pallas"])
 class TestLoops(RefEagerTestBase, TestCase):
-    @skipIfRefEager(
-        "a ref-eager load is a view of the input, so in-place ops mutate it"
-    )
     def test_inplace_ops_on_loop_values(self) -> None:
         """In-place ops on device-loop values (``acc.mul_(y)``) mutate SSA values
         and lower as their functional twins on every backend."""
@@ -304,6 +301,136 @@ class TestLoops(RefEagerTestBase, TestCase):
         y = torch.randn([1024], device=DEVICE)
         code, result = code_and_output(fn, (x, y), block_size=128)
         torch.testing.assert_close(result, x * y + 1.0 - x)
+
+    def test_a_constant_beside_an_outer_loops_flag_in_a_branch_test(self) -> None:
+        """``if True and flag:`` in an inner loop reads ``flag`` from the outer
+        loop: the traced ``and`` hands back its operand, which rebinds no
+        value (a check that took any new node of an input for an in-place
+        update refused this kernel)."""
+
+        @helion.kernel(autotune_effort="none")
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(x.size(0)):
+                flag = x[tile_m, 0].sum() > 0
+                for tile_n in hl.tile(x.size(1)):
+                    if True and flag:
+                        out[tile_m, tile_n] = x[tile_m, tile_n] * 2.0
+                    else:
+                        out[tile_m, tile_n] = x[tile_m, tile_n]
+            return out
+
+        x = torch.rand([64, 32], device=DEVICE) + 0.5
+        for sign, scale in ((1.0, 2.0), (-1.0, 1.0)):
+            _code, result = code_and_output(fn, (sign * x,), block_sizes=[16, 16])
+            torch.testing.assert_close(result, sign * x * scale)
+
+    def test_inplace_ops_on_loop_carries(self) -> None:
+        """An in-place op on a value a device loop or a branch carries out
+        (``acc.add_(x)``) updates the carried value, as ``acc = acc + x`` does,
+        instead of leaving the value it had before."""
+
+        @helion.kernel(autotune_effort="none")
+        def fn(x: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            block_n = hl.register_block_size(n)
+            out = torch.empty([m], dtype=torch.float32, device=x.device)
+            for tile_m in hl.tile(m):
+                acc = hl.zeros([tile_m, block_n], dtype=torch.float32)
+                for tile_n in hl.tile(n, block_size=block_n):
+                    acc.add_(x[tile_m, tile_n])
+                total = acc.sum(-1)
+                if flags[0] > 0:
+                    total.mul_(2.0)
+                out[tile_m] = total
+            return out
+
+        x = torch.randn([64, 256], device=DEVICE)
+        for flag in (0, 3):
+            flags = torch.tensor([flag], dtype=torch.int32, device=DEVICE)
+            code, result = code_and_output(fn, (x, flags), block_sizes=[32, 16])
+            expected = x.sum(-1) * (2.0 if flag else 1.0)
+            torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+    def test_inplace_op_result_bound_to_a_second_name(self) -> None:
+        """An in-place op returns its receiver, so ``seen = acc.add_(x)`` binds
+        two names to one tensor; after the device loop or the branch each name
+        keeps its own value, on the branch's path that skips the op too."""
+
+        @helion.kernel(autotune_effort="none")
+        def fn(
+            x: torch.Tensor, flags: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            m, n = x.shape
+            block_n = hl.register_block_size(n)
+            totals = torch.empty([m], dtype=torch.float32, device=x.device)
+            doubled = torch.empty([m], dtype=torch.float32, device=x.device)
+            seen_sums = torch.empty([m], dtype=torch.float32, device=x.device)
+            for tile_m in hl.tile(m):
+                acc = hl.zeros([tile_m, block_n], dtype=torch.float32)
+                seen = hl.full([tile_m, block_n], 1.0, dtype=torch.float32)
+                for tile_n in hl.tile(n, block_size=block_n):
+                    seen = acc.add_(x[tile_m, tile_n])
+                total = acc.sum(-1)
+                twice = hl.zeros([tile_m], dtype=torch.float32)
+                if flags[0] > 0:
+                    twice = total.mul_(2.0)
+                totals[tile_m] = total
+                doubled[tile_m] = twice
+                seen_sums[tile_m] = seen.sum(-1)
+            return totals, doubled, seen_sums
+
+        x = torch.randn([64, 256], device=DEVICE)
+        row_sums = x.sum(-1)
+        for flag in (0, 3):
+            flags = torch.tensor([flag], dtype=torch.int32, device=DEVICE)
+            code, (totals, doubled, seen_sums) = code_and_output(
+                fn, (x, flags), block_sizes=[32, 16]
+            )
+            torch.testing.assert_close(
+                totals, row_sums * (2.0 if flag else 1.0), rtol=1e-4, atol=1e-4
+            )
+            torch.testing.assert_close(
+                doubled,
+                row_sums * 2.0 if flag else torch.zeros_like(row_sums),
+                rtol=1e-4,
+                atol=1e-4,
+            )
+            torch.testing.assert_close(seen_sums, row_sums, rtol=1e-4, atol=1e-4)
+
+    @xfailIfPallas(
+        "Pallas lowers only statically counted while loops (StaticLoopUnroller)"
+    )
+    def test_inplace_ops_on_while_loop_carries(self) -> None:
+        """An in-place op in a ``while`` body updates the value the loop carries
+        out, and its result bound to a second name (``result = total.add_(1.0)``)
+        keeps its own value, also when the loop never runs."""
+
+        @helion.kernel(autotune_effort="none")
+        def fn(
+            x: torch.Tensor, flags: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            totals = torch.empty_like(x)
+            results = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                total = x[tile]
+                result = hl.zeros([tile], dtype=torch.float32)
+                count = flags[0]
+                while count > 0:
+                    result = total.add_(1.0)
+                    count = count - 1
+                totals[tile] = total
+                results[tile] = result
+            return totals, results
+
+        x = torch.randn([64], device=DEVICE)
+        for count in (0, 3):
+            flags = torch.tensor([count], dtype=torch.int32, device=DEVICE)
+            code, (totals, results) = code_and_output(fn, (x, flags), block_size=32)
+            torch.testing.assert_close(totals, x + count)
+            torch.testing.assert_close(
+                results, x + count if count else torch.zeros_like(x)
+            )
 
     @skipIfRefEager("StaticLoopUnroller unit test does not execute a kernel")
     def test_static_unroller_rejects_multiple_counter_updates(self) -> None:
@@ -421,6 +548,38 @@ class TestLoops(RefEagerTestBase, TestCase):
         x = torch.zeros(16, device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(kernel, (x,))
         torch.testing.assert_close(result, torch.full_like(x, 4.0))
+
+    @xfailIfPallas(
+        "Pallas lowers only statically counted while loops (StaticLoopUnroller)"
+    )
+    def test_while_updates_carried_values_from_their_old_values(self) -> None:
+        # Both updates read the values before the iteration: the body must not
+        # read ``left`` after it holds the new value.
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor, limits: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for row in hl.grid(x.size(0)):
+                lane = hl.arange(x.size(1))
+                left = x[row, lane]
+                right = left + 1
+                steps = hl.full([], 0, dtype=torch.int32)
+                limit = limits[row]
+                while steps < limit:
+                    left, right = left + right, left - right
+                    steps = steps + 1
+                out[row, lane] = left + 10 * right
+            return out
+
+        x = torch.arange(48, device=DEVICE, dtype=torch.float32).reshape(3, 16)
+        limits = torch.tensor([0, 1, 3], device=DEVICE, dtype=torch.int32)
+        expected = torch.empty_like(x)
+        for row, limit in enumerate(limits.tolist()):
+            left, right = x[row], x[row] + 1
+            for _ in range(limit):
+                left, right = left + right, left - right
+            expected[row] = left + 10 * right
+        code, result = code_and_output(kernel, (x, limits))
+        torch.testing.assert_close(result, expected)
 
     @skipIfRefEager(
         "Ref eager mode does not raise StatementNotSupported for while/else"

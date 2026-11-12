@@ -56,14 +56,25 @@ def _get_symnode(debug_name: str) -> int:
     raise AssertionError("this should never be called")
 
 
+# The value a ``_get_symnode`` capture prints when its traced value stays for
+# a shape (``resolve_reduction_sizes``): the one computed from the extents.
+EXTENT_VALUE = "helion_extent_value"
+
+
+def symnode_value(node: torch.fx.Node) -> object:
+    """The value a ``_get_symnode`` capture's code prints (``EXTENT_VALUE``)."""
+    return node.meta.get(EXTENT_VALUE, node.meta["val"])
+
+
 @_decorators.codegen(_get_symnode, "common")
 def _(state: CodegenState) -> ast.AST:
-    # pyrefly: ignore [missing-attribute]
-    val = state.fx_node.meta["val"]
+    # pyrefly: ignore [bad-argument-type]
+    val = symnode_value(state.fx_node)
 
-    # Handle the case where val is a regular integer (e.g., from reduction_loops config)
-    if isinstance(val, int):
-        return expr_from_string(str(val))
+    # A constant: an integer from the config (reduction_loops), or a value
+    # computed from a reduction dim's extent (``resolve_reduction_sizes``).
+    if isinstance(val, (int, float, bool)):
+        return expr_from_string(state.device_function.literal_expr(val))
 
     assert isinstance(val, (torch.SymInt, torch.SymFloat, torch.SymBool)), val
     sym_expr = _val_to_sympy(val)

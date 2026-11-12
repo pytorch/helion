@@ -455,6 +455,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             mark_in_divergent_control_flow=backend.supports_intra_loop_barriers(
                 in_divergent_control_flow=True
             ),
+            atomics=backend.intra_loop_barriers_order_atomics,
         )
 
     def ensure_module_statements(self, source: str) -> None:
@@ -1314,20 +1315,28 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         allow_compiler_shape_helpers = (
             self.device_function.config.cross_loop_pipeline != "barrier"
         )
+
+        def pure(stmt: ast.Assign) -> bool:
+            return definitely_does_not_have_side_effects(
+                stmt.value, allow_compiler_shape_helpers=allow_compiler_shape_helpers
+            )
+
         for stmt in self.host_statements:
             if (
                 isinstance(stmt, ast.Assign)
-                and definitely_does_not_have_side_effects(
-                    stmt.value,
-                    allow_compiler_shape_helpers=allow_compiler_shape_helpers,
-                )
+                and pure(stmt)
                 and all(isinstance(name, ast.Name) for name in stmt.targets)
             ):
                 for name in stmt.targets:
                     assert isinstance(name, ast.Name)
                     dce_vars.add(name.id)
 
-        dead_assignment_elimination(self.host_statements, list(dce_vars))
+        # A host variable is a user's: beside its pure assignment it may have
+        # others with effects (``flag = 0`` and ``flag = x.add_(1)``, flag
+        # never read), which must run.
+        dead_assignment_elimination(
+            self.host_statements, list(dce_vars), removable=pure
+        )
         dead_expression_elimination(self.host_statements)
 
 

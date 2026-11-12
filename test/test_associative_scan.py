@@ -13,6 +13,8 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import output_only
+from helion._testing import skipIfCute
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
@@ -98,6 +100,13 @@ def argmax_combine_tuple_fn(left_tuple, right_tuple):
     return combined_values, combined_indices
 
 
+def max_combine_tuple_fn(left_tuple, right_tuple):
+    """Running maximum of a 1-tuple, in tuple format."""
+    (left,) = left_tuple
+    (right,) = right_tuple
+    return (torch.maximum(left, right),)
+
+
 def cumsum_helper(x: torch.Tensor) -> torch.Tensor:
     """Helper function that performs cumulative sum using hl.associative_scan."""
     return hl.associative_scan(add_combine_fn, x, dim=0)
@@ -144,7 +153,6 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
                         expected = expected.flip([-1])
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
-    @onlyBackends(["cute"])
     def test_computed_cumsum_unmasked_tail(self) -> None:
         @helion.kernel(static_shapes=True)
         def kernel(x: torch.Tensor, reverse: hl.constexpr) -> torch.Tensor:
@@ -868,6 +876,40 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
             self.assertIn("def argmax_combine_fn_", code)
             self.assertIn("tl.associative_scan", code)
 
+    def test_tuple_scan_combines_each_operand_in_its_dtype(self):
+        """A tuple scan traces its combine function with the left elements,
+        then the right ones, so each takes its operand's dtype: an int64
+        running maximum beside an fp32 payload compares in int64 rather than
+        fp32, where values above 2**24 that differ by less than fp32's
+        spacing would round together."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def running_argmax(
+            values: torch.Tensor, positions: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            maxes = torch.empty_like(values)
+            argmaxes = torch.empty_like(positions)
+            for tile_m in hl.tile(values.size(0)):
+                row_maxes, row_argmaxes = hl.associative_scan(
+                    argmax_combine_fn,
+                    (values[tile_m, :], positions[tile_m, :]),
+                    dim=1,
+                )
+                maxes[tile_m, :] = row_maxes
+                argmaxes[tile_m, :] = row_argmaxes
+            return maxes, argmaxes
+
+        # Distinct values within 2**10 of 2**30, where fp32 spacing is 128.
+        values = 2**30 + torch.randperm(16 * 64, device=DEVICE).reshape(16, 64)
+        positions = torch.arange(64, device=DEVICE, dtype=torch.float32)
+        positions = positions.expand(16, 64).contiguous()
+        maxes, argmaxes = output_only(
+            running_argmax, (values, positions), block_sizes=[4]
+        )
+        expected = torch.cummax(values, dim=1)
+        torch.testing.assert_close(maxes, expected.values)
+        torch.testing.assert_close(argmaxes, expected.indices.to(torch.float32))
+
     def test_associative_scan_in_helper_function(self):
         """Test calling a function that internally uses hl.associative_scan."""
 
@@ -1028,6 +1070,212 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
 
         # Verify reverse parameter is used
         self.assertIn("reverse=True", code)
+
+    @skipIfRefEager(
+        "the tiles kernel scans each 32-wide tile, so the result depends on"
+        " block_sizes, which ref mode does not apply"
+    )
+    @skipIfTileIR("TileIR does not legalize this kernel's tt.scan")
+    def test_reverse_scans_skip_lanes_without_elements(self):
+        """A reverse scan folds the lanes after each element. Lanes that hold
+        no element (a 17-wide row padded to 32, the 16-element last tile of a
+        48-wide row) load as zeros, which no product or maximum of negative
+        elements may fold in, for one value, a 1-tuple or a pair."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def rows(
+            x: torch.Tensor, positions: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            prods, maxes = torch.empty_like(x), torch.empty_like(x)
+            tuple_maxes = torch.empty_like(x)
+            argmaxes = torch.empty_like(positions)
+            for tile_m in hl.tile(x.size(0)):
+                values = x[tile_m, :]
+                prods[tile_m, :] = hl.cumprod(values, dim=1, reverse=True)
+                maxes[tile_m, :] = hl.associative_scan(
+                    max_combine_fn, values, dim=1, reverse=True
+                )
+                (tuple_max,) = hl.associative_scan(
+                    max_combine_tuple_fn, (values,), dim=1, reverse=True
+                )
+                tuple_maxes[tile_m, :] = tuple_max
+                _, argmax = hl.associative_scan(
+                    argmax_combine_fn,
+                    (values, positions[tile_m, :]),
+                    dim=1,
+                    reverse=True,
+                )
+                argmaxes[tile_m, :] = argmax
+            return prods, maxes, tuple_maxes, argmaxes
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def tiles(
+            x: torch.Tensor, positions: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            prods, maxes = torch.empty_like(x), torch.empty_like(x)
+            tuple_maxes = torch.empty_like(x)
+            argmaxes = torch.empty_like(positions)
+            for tile_m, tile_n in hl.tile(x.size()):
+                values = x[tile_m, tile_n]
+                prods[tile_m, tile_n] = hl.cumprod(values, dim=1, reverse=True)
+                maxes[tile_m, tile_n] = hl.associative_scan(
+                    max_combine_fn, values, dim=1, reverse=True
+                )
+                (tuple_max,) = hl.associative_scan(
+                    max_combine_tuple_fn, (values,), dim=1, reverse=True
+                )
+                tuple_maxes[tile_m, tile_n] = tuple_max
+                _, argmax = hl.associative_scan(
+                    argmax_combine_fn,
+                    (values, positions[tile_m, tile_n]),
+                    dim=1,
+                    reverse=True,
+                )
+                argmaxes[tile_m, tile_n] = argmax
+            return prods, maxes, tuple_maxes, argmaxes
+
+        def reverse(scan, segments):
+            return torch.cat(
+                [torch.flip(scan(torch.flip(s, [1])), [1]) for s in segments], 1
+            )
+
+        for kernel, shape, block_sizes in (
+            (rows, [5, 17], [8]),
+            (tiles, [37, 48], [8, 32]),
+        ):
+            x = -(torch.rand(shape, device=DEVICE) * 0.5 + 0.75)
+            positions = torch.arange(shape[1], device=DEVICE, dtype=torch.int32)
+            positions = positions.expand(shape).contiguous()
+            code, (prods, maxes, tuple_maxes, argmaxes) = code_and_output(
+                kernel, (x, positions), block_sizes=block_sizes
+            )
+            if _get_backend() == "triton":
+                # The product skips a lane holding its identity, one operand;
+                # the maxima carry a flag beside each value.
+                self.assertRegex(code, r"associative_scan\(tl\.where\(.*, mul_")
+                self.assertEqual(code.count("_valid_lanes, reverse=True"), 3)
+            # Each 32-wide tile scans on its own.
+            segments = x.split(32, dim=1)
+            torch.testing.assert_close(
+                prods, reverse(lambda s: torch.cumprod(s, 1), segments)
+            )
+            expected_maxes = reverse(lambda s: torch.cummax(s, 1).values, segments)
+            torch.testing.assert_close(maxes, expected_maxes)
+            torch.testing.assert_close(tuple_maxes, expected_maxes)
+            torch.testing.assert_close(x.gather(1, argmaxes.long()), expected_maxes)
+
+    @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
+    @skipIfTileIR("TileIR does not legalize this kernel's tt.scan")
+    def test_reverse_scans_skip_jagged_lanes(self):
+        """The lanes of a jagged tile past each row's length hold no element:
+        a reverse running maximum or product of negative values may not fold
+        the zeros they load."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def kernel(
+            x: torch.Tensor, lengths: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            maxes, prods = torch.zeros_like(x), torch.zeros_like(x)
+            for tile_b in hl.tile(x.size(0)):
+                row_lengths = lengths[tile_b]
+                for tile_k in hl.jagged_tile(row_lengths):
+                    values = x[tile_b, tile_k]
+                    maxes[tile_b, tile_k] = hl.associative_scan(
+                        max_combine_fn, values, dim=1, reverse=True
+                    )
+                    prods[tile_b, tile_k] = hl.cumprod(values, dim=1, reverse=True)
+            return maxes, prods
+
+        x = -(torch.rand([6, 17], device=DEVICE) * 0.5 + 0.75)
+        lengths = torch.tensor([17, 1, 9, 16, 4, 12], device=DEVICE, dtype=torch.int32)
+        # One 32-wide jagged tile covers every row.
+        _code, (maxes, prods) = code_and_output(
+            kernel, (x, lengths), block_sizes=[8, 32]
+        )
+        expected_maxes, expected_prods = torch.zeros_like(x), torch.zeros_like(x)
+        for row, length in enumerate(lengths.tolist()):
+            values = x[row, :length].flip(0)
+            expected_maxes[row, :length] = values.cummax(0).values.flip(0)
+            expected_prods[row, :length] = values.cumprod(0).flip(0)
+        torch.testing.assert_close(maxes, expected_maxes)
+        torch.testing.assert_close(prods, expected_prods)
+
+    @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
+    @skipIfCute(
+        "CuTe's reverse scans fold the lanes between a jagged column's elements "
+        "(pre-existing, left for a follow-up)"
+    )
+    @skipIfTileIR("TileIR does not legalize this kernel's tt.scan")
+    def test_scans_across_jagged_rows_skip_lanes_without_elements(self):
+        """Across the rows of a jagged tile, the lanes past each row's length
+        sit between the elements of a column, so a scan along the rows skips
+        them in either direction: running maxima and a reverse cumprod of
+        negative values."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def columns(
+            x: torch.Tensor, lengths: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            maxes, reverse_maxes = torch.zeros_like(x), torch.zeros_like(x)
+            reverse_prods = torch.zeros_like(x)
+            for tile_b in hl.tile(x.size(0)):
+                row_lengths = lengths[tile_b]
+                for tile_k in hl.jagged_tile(row_lengths):
+                    values = x[tile_b, tile_k]
+                    maxes[tile_b, tile_k] = hl.associative_scan(
+                        max_combine_fn, values, dim=0
+                    )
+                    reverse_maxes[tile_b, tile_k] = hl.associative_scan(
+                        max_combine_fn, values, dim=0, reverse=True
+                    )
+                    reverse_prods[tile_b, tile_k] = hl.cumprod(
+                        values, dim=0, reverse=True
+                    )
+            return maxes, reverse_maxes, reverse_prods
+
+        # Rows of 5, 1, 3 and 2 elements in one 4-row tile: column 2 holds
+        # elements in rows 0 and 2 only.
+        x = -(torch.rand([4, 5], device=DEVICE) * 0.5 + 0.75)
+        lengths = torch.tensor([5, 1, 3, 2], device=DEVICE, dtype=torch.int32)
+        _code, results = code_and_output(columns, (x, lengths), block_sizes=[4, 8])
+        expected = [torch.zeros_like(x) for _ in range(3)]
+        for column in range(x.size(1)):
+            rows = (lengths > column).nonzero().flatten()
+            values = x[rows, column]
+            expected[0][rows, column] = values.cummax(0).values
+            expected[1][rows, column] = values.flip(0).cummax(0).values.flip(0)
+            expected[2][rows, column] = values.flip(0).cumprod(0).flip(0)
+        for result, reference in zip(results, expected, strict=True):
+            torch.testing.assert_close(result, reference)
+
+    @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
+    @skipIfCute("CuTe refuses a scan along a jagged dim (its bound is not known)")
+    def test_forward_scan_along_a_jagged_dim_named_from_the_end(self):
+        """``dim=-1`` names the jagged dim itself, whose own padded lanes a
+        forward scan never folds in, so it renders as ``dim=1`` does: with no
+        flag beside each value."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def rows(x: torch.Tensor, lengths: torch.Tensor, dim: hl.constexpr):
+            maxes = torch.zeros_like(x)
+            for tile_b in hl.tile(x.size(0)):
+                row_lengths = lengths[tile_b]
+                for tile_k in hl.jagged_tile(row_lengths):
+                    maxes[tile_b, tile_k] = hl.associative_scan(
+                        max_combine_fn, x[tile_b, tile_k], dim=dim
+                    )
+            return maxes
+
+        x = -(torch.rand([4, 5], device=DEVICE) * 0.5 + 0.75)
+        lengths = torch.tensor([5, 1, 3, 2], device=DEVICE, dtype=torch.int32)
+        expected = torch.zeros_like(x)
+        for row, length in enumerate(lengths.tolist()):
+            expected[row, :length] = x[row, :length].cummax(0).values
+        for dim in (1, -1):
+            code, maxes = code_and_output(rows, (x, lengths, dim), block_sizes=[4, 8])
+            torch.testing.assert_close(maxes, expected)
+            if _get_backend() == "triton":
+                self.assertNotIn("_valid_lanes", code)
 
     def test_cumprod_different_dtypes(self):
         """Test cumprod with different data types."""

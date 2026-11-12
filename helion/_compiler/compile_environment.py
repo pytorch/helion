@@ -40,6 +40,7 @@ from .. import exc
 from .._compat import is_hip
 from .._compat import shape_env_size_hint
 from .._compat import target_device_capability
+from .._compat import tensor_descriptor_supports_dtype
 from .._utils import triton_is_available
 from ..language.constexpr import ConstExpr
 from .backend import BackendState
@@ -526,6 +527,47 @@ def _constrain_unify(shape_env: ShapeEnv, a: SymInt, b: SymInt) -> None:
             shape_env.replacements[b.node.expr] = new_var
 
 
+class _GuardAxioms(dict):
+    """The axioms of a ``_GuardedShapeEnv``: an update that adds axioms (a
+    new guard's, in ``ShapeEnv._evaluate_expr``) advances the ShapeEnv's
+    version counter."""
+
+    def __init__(self, shape_env: ShapeEnv) -> None:
+        super().__init__()
+        self._shape_env = shape_env
+
+    def update(self, *args: typing.Any, **kwargs: typing.Any) -> None:  # noqa: ANN401
+        axioms = len(self)
+        super().update(*args, **kwargs)
+        if len(self) != axioms:
+            # TODO(jansel): drop this once PyTorch's ShapeEnv advances the
+            # counter itself: ``_get_key`` leaves out the guards and their
+            # axioms, and ``evaluate_expr`` appends a guard without calling
+            # ``_update_version_counter``.
+            self._shape_env._version_counter += 1
+
+
+class _GuardedShapeEnv(ShapeEnv):
+    """A ShapeEnv whose cached evaluations are decided by every guard added
+    before them.
+
+    ``ShapeEnv`` caches ``_maybe_evaluate_static``, the ``simplify`` it starts
+    from (which decides ``Max(0, a - b)`` from the guards), ``get_axioms`` and
+    its other evaluations keyed on a version counter that a new guard does not
+    advance, although the guard's axioms can decide them: ``Eq(u1, u2)``,
+    cached as undecided, stays undecided after the guards that imply it, and
+    ``get_axioms`` leaves the guard out.  So adding axioms advances the
+    counter (``_GuardAxioms``), which drops every such cache.  It happens in
+    the axioms' update, after torch records the guard: a guard records as its
+    location the first frame outside torch, which is the code that compared,
+    not a frame of this class.
+    """
+
+    def __init__(self, *args: typing.Any, **kwargs: typing.Any) -> None:  # noqa: ANN401
+        super().__init__(*args, **kwargs)
+        self.axioms = _GuardAxioms(self)
+
+
 class CompileEnvironment:
     """
     Global state for the duration of a compilation.
@@ -582,7 +624,7 @@ class CompileEnvironment:
             )
         # For dynamic kernels, keep 0/1 tensor dimensions symbolic so a kernel
         # first seen with size 0 or 1 can be reused for larger sizes.
-        self.shape_env = ShapeEnv(
+        self.shape_env = _GuardedShapeEnv(
             specialize_zero_one=settings.static_shapes,
             duck_shape=False,
             assume_static_by_default=settings.static_shapes,
@@ -949,6 +991,10 @@ class CompileEnvironment:
         has_derived_block_extent: bool = False,
     ) -> None:
         """Specialize kernels on replayable tensor-descriptor predicates."""
+        if not tensor_descriptor_supports_dtype(fake_tensor.dtype):
+            # No descriptor takes this tensor (``TensorDescriptorIndexingStrategy``
+            # declines it), so its layout cannot change the code.
+            return
         source = self.tensor_input_source(fake_tensor)
         has_direct_source = source is not None and _is_supported_tensor_input_source(
             source

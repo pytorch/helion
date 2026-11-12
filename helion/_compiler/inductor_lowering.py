@@ -196,14 +196,17 @@ def lowering_input_nodes(node: Node) -> list[Node]:
 def opmath_scalar_dtype(node: Node) -> torch.dtype | None:
     """The fp16/bf16 dtype of ``node`` when it combines a SymFloat or SymInt
     (a Python host scalar) with 16-bit tensors and torch computes it at
-    float32 opmath, otherwise None.
+    float32 opmath, otherwise None.  So does a float or an int a scalar node
+    holds: a value computed from a reduction dim's extent
+    (``resolve_reduction_sizes``).
 
     Such a node keeps the scalar at float32 and rounds its result to this
     dtype, as a static-shape literal scalar does.
     """
     if node.target not in _OPMATH_SCALAR_TARGETS or not any(
         isinstance(arg, Node)
-        and isinstance(arg.meta["val"], (torch.SymFloat, torch.SymInt))
+        and isinstance(arg.meta["val"], (torch.SymFloat, torch.SymInt, float, int))
+        and not isinstance(arg.meta["val"], bool)
         for arg in node.args
     ):
         return None
@@ -276,11 +279,15 @@ def prepare_node_lowering(
             return
 
     if isinstance(
-        val := node.meta["val"], (torch.SymInt, torch.SymFloat, torch.SymBool)
+        val := node.meta["val"],
+        (torch.SymInt, torch.SymFloat, torch.SymBool, int, float, bool),
     ):
-        # SymBool's `_sympy_()` is a boolean rather than the Expr the field holds.
+        # A constant is a value computed from a reduction dim's extent
+        # (``resolve_reduction_sizes``).  ``sympify`` takes a Sym value's
+        # `_sympy_()`, for a SymBool a boolean rather than the Expr the field
+        # holds.
         # pyrefly: ignore [bad-argument-type]
-        node.meta["lowering"] = SympyExprLowering(val._sympy_())
+        node.meta["lowering"] = SympyExprLowering(sympy.sympify(val))
         return
 
     # Track arguments to reuse names for duplicates
@@ -593,11 +600,17 @@ class InductorLowering(Lowering):
                             "{tensor}[" + ", ".join(expand) + "]",
                             tensor=ast_val,
                         )
-            elif isinstance(fake_val, torch.SymFloat):
+            elif isinstance(fake_val, (torch.SymFloat, float)):
+                # Or a float a scalar node holds: a value computed from a
+                # reduction dim's extent (``resolve_reduction_sizes``).
                 ast_val = backend.scalar_float_operand_ast(
                     ast_val, fake_val, computes_in_float64=computes_in_float64
                 )
-            elif isinstance(fake_val, torch.SymInt) and opmath_dtype is not None:
+            elif (
+                isinstance(fake_val, (torch.SymInt, int))
+                and not isinstance(fake_val, bool)
+                and opmath_dtype is not None
+            ):
                 # An integer would take the 16-bit operand's type.
                 ast_val = backend.cast_ast(ast_val, torch.float32)
             if (
@@ -1939,20 +1952,36 @@ class GraphInterpreter(LoweringContext, Interpreter):
                         ):
                             expr = val._sympy_()
                         if isinstance(expr, sympy.Expr) and len(expr.free_symbols) > 0:
+                            env = CompileEnvironment.current()
                             # Keep track of what variable symints are stored in to support DeviceFunction.sympy_expr()
                             with contextlib.suppress(Exception):
-                                expr = CompileEnvironment.current().shape_env.simplify(
-                                    expr
-                                )
-                            if isinstance(result, ast.Name):
-                                self.cg.device_function.expr_to_var_info[expr] = (
-                                    VarInfo(result.id, n)
-                                )
-                            else:
-                                assert isinstance(result, ast.Constant)
-                                self.cg.device_function.expr_to_var_info[expr] = (
-                                    VarInfo(repr(result.value), n)
-                                )
+                                expr = env.shape_env.simplify(expr)
+                            # A value that is exactly a reduction dim's block
+                            # size symbol may lower to the dim's extent: the reduction
+                            # lowering inlines the extent where the dim's size
+                            # is read (``resolve_reduction_sizes``), but the
+                            # read's users (an iota's sub and floordiv) keep
+                            # the symbol in their fake values and lower to the
+                            # extent, a constant or with dynamic shapes the
+                            # size's name.  Recorded, that would print wherever
+                            # the symbol means the block size (a tensor
+                            # descriptor's block shape).  A value computed from
+                            # the symbol is recorded under its own expression,
+                            # which a nested graph's capture of it prints.
+                            block_id = env.get_block_id(expr)
+                            if (
+                                block_id is None
+                                or not env.block_sizes[block_id].reduction
+                            ):
+                                if isinstance(result, ast.Name):
+                                    self.cg.device_function.expr_to_var_info[expr] = (
+                                        VarInfo(result.id, n)
+                                    )
+                                else:
+                                    assert isinstance(result, ast.Constant)
+                                    self.cg.device_function.expr_to_var_info[expr] = (
+                                        VarInfo(repr(result.value), n)
+                                    )
                         self._record_final_codegen_result(n, result)
                         return result
                     if not isinstance(result, (ast.Name, ast.Constant)):

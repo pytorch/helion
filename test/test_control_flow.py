@@ -910,6 +910,30 @@ class TestControlFlowJoins(RefEagerTestBase, TestCase):
             _, result = code_and_output(carried, (y, flag), block_sizes=[8, 64])
             torch.testing.assert_close(result, y[:, 0] * (0.25 if flag else 0.5))
 
+    def test_if_branch_unpacks_one_value_into_two_names(self):
+        # ``v, w = t, t`` binds both names to one value: the branch carries
+        # each out in a variable of its own (``_collect_outputs``), or the
+        # merges after the if share one name and the other branch's two
+        # values overwrite each other.
+        @helion.kernel(static_shapes=False)
+        def fn(x: torch.Tensor, flag: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                if flag[0] > 0:
+                    t = x[tile] + 1
+                    v, w = t, t
+                else:
+                    v = x[tile] + 2
+                    w = x[tile] + 3
+                out[tile] = v + w
+            return out
+
+        x = torch.randn(1000, device=DEVICE)
+        for flag, expected in ((1, 2 * (x + 1)), (0, 2 * x + 5)):
+            flags = torch.tensor([flag], device=DEVICE, dtype=torch.int32)
+            _, result = code_and_output(fn, (x, flags))
+            torch.testing.assert_close(result, expected)
+
 
 if __name__ == "__main__":
     unittest.main()
