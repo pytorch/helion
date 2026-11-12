@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
+from typing import Any
 from unittest.mock import Mock
 from unittest.mock import patch
 
@@ -22,6 +23,16 @@ from helion.exc import ReductionOnNonTile
 import helion.language as hl
 
 pytestmark = pytest.mark.cpu_only
+
+# Settings for kernels these tests only bind, on CPU under any HELION_BACKEND,
+# to see which block sizes become reductions. Pallas refuses
+# debug_dtype_asserts (it emits Triton checks), which the dtype-asserts CI job
+# turns on through HELION_DEBUG_DTYPE_ASSERTS, so it is pinned off.
+_BIND_ONLY: dict[str, Any] = {
+    "static_shapes": True,
+    "ref_mode": helion.RefMode.OFF,
+    "debug_dtype_asserts": False,
+}
 
 if TYPE_CHECKING:
     from helion._compiler.backend import Backend
@@ -75,8 +86,7 @@ def test_split_k_barrier_binds_on_pallas() -> None:
     kernel = helion.kernel(
         import_example("split_k_barrier").split_k_matmul.fn,
         backend="pallas",
-        static_shapes=True,
-        ref_mode=helion.RefMode.OFF,
+        **_BIND_ONLY,
     )
     bound = kernel.bind((torch.randn(150, 200), torch.randn(200, 6)))
     assert any(info.reduction for info in bound.env.block_sizes)
@@ -84,7 +94,7 @@ def test_split_k_barrier_binds_on_pallas() -> None:
 
 @pytest.mark.parametrize("backend", ["pallas", "triton"])
 def test_reduction_over_runtime_extent_is_rejected(backend: str) -> None:
-    @helion.kernel(backend=backend, static_shapes=True, ref_mode=helion.RefMode.OFF)
+    @helion.kernel(backend=backend, **_BIND_ONLY)
     def kernel(x: torch.Tensor, extent: int) -> torch.Tensor:
         out = torch.empty_like(x)
         for tile in hl.tile(x.size(0)):
@@ -100,7 +110,7 @@ def test_pallas_block_size_slice_keeps_its_extent() -> None:
     # Guards the scope of the tunable-extent fix: only tunable extents take
     # a reduction dim on Pallas; a full slice of a block-size-sized buffer
     # keeps its extent as before.
-    @helion.kernel(backend="pallas", static_shapes=True, ref_mode=helion.RefMode.OFF)
+    @helion.kernel(backend="pallas", **_BIND_ONLY)
     def kernel(x: torch.Tensor) -> torch.Tensor:
         m, n = x.size()
         bm = hl.register_block_size(m)
