@@ -27,6 +27,7 @@ from helion._compiler.metal.backend import MetalBackend
 from helion._compiler.metal.fma_fusion import fuse_multiply_adds
 from helion._compiler.metal.lane_fold import LaneJam
 from helion._compiler.metal.lane_fold import balanced_combine
+from helion._compiler.metal.lane_fold import jam_lanes_into_loops
 from helion._compiler.metal.lane_fold import unroll_lane_folds
 from helion._compiler.metal.metal_overrides import MetalOverrides
 from helion._compiler.metal.mpp_matmul import names_read
@@ -10113,6 +10114,306 @@ class TestMetalLaneFoldRewrite(unittest.TestCase):
                 self.assertRaisesRegex(AssertionError, message),
             ):
                 unroll_lane_folds(ast.parse(source).body, names_read)
+
+    def test_lane_loop_jams_into_loop(self) -> None:
+        """A lane loop around a loop with a lane-independent load moves
+        inside it: the load, and what is computed from it, runs once per
+        iteration, and each lane keeps its own carry."""
+        body = ast.parse(
+            textwrap.dedent(
+                """
+                for lane_0 in range(2):
+                    indices_0 = offset_0 + lane_0
+                    acc = 0.0
+                    for offset_1 in range(0, 64, 8):
+                        w = tl.load(wq, indices_0, offset_1)
+                        x = tl.load(xs, offset_1)
+                        xe = exp(x)
+                        acc = acc + w * xe
+                    store(out, indices_0, acc)
+                """
+            )
+        ).body
+        expected = """
+            indices_0__lane0 = offset_0 + 0
+            indices_0__lane1 = offset_0 + 1
+            acc__lane0 = 0.0
+            acc__lane1 = 0.0
+            for offset_1 in range(0, 64, 8):
+                w__lane0 = tl.load(wq, indices_0__lane0, offset_1)
+                w__lane1 = tl.load(wq, indices_0__lane1, offset_1)
+                x = tl.load(xs, offset_1)
+                xe = exp(x)
+                acc__lane0 = acc__lane0 + w__lane0 * xe
+                acc__lane1 = acc__lane1 + w__lane1 * xe
+            store(out, indices_0__lane0, acc__lane0)
+            store(out, indices_0__lane1, acc__lane1)
+            """
+        self.assertEqual(
+            ast.unparse(ast.Module(body=jam_lanes_into_loops(body), type_ignores=[])),
+            ast.unparse(ast.parse(textwrap.dedent(expected))),
+        )
+
+    def test_lane_loop_jams_inside_a_loop(self) -> None:
+        """A lane loop inside another loop jams too: what the outer loop's
+        next iteration reads is assigned before each lane reads it."""
+        body = ast.parse(
+            textwrap.dedent(
+                """
+                for offset_0 in range(0, 8, 2):
+                    for lane_0 in range(2):
+                        indices_0 = offset_0 + lane_0
+                        acc = 0.0
+                        for o in range(4):
+                            v = tl.load(xs, o)
+                            acc = acc + tl.load(wq, indices_0, o) * v
+                        store(out, indices_0, acc)
+                """
+            )
+        ).body
+        expected = """
+            for offset_0 in range(0, 8, 2):
+                indices_0__lane0 = offset_0 + 0
+                indices_0__lane1 = offset_0 + 1
+                acc__lane0 = 0.0
+                acc__lane1 = 0.0
+                for o in range(4):
+                    v = tl.load(xs, o)
+                    acc__lane0 = acc__lane0 + tl.load(wq, indices_0__lane0, o) * v
+                    acc__lane1 = acc__lane1 + tl.load(wq, indices_0__lane1, o) * v
+                store(out, indices_0__lane0, acc__lane0)
+                store(out, indices_0__lane1, acc__lane1)
+            """
+        self.assertEqual(
+            ast.unparse(ast.Module(body=jam_lanes_into_loops(body), type_ignores=[])),
+            ast.unparse(ast.parse(textwrap.dedent(expected))),
+        )
+
+    def test_lane_loop_jams_before_a_sibling(self) -> None:
+        """A later lane loop that assigns the lane names again before reading
+        them doesn't keep an earlier one from jamming."""
+        body = ast.parse(
+            textwrap.dedent(
+                """
+                for lane_0 in range(2):
+                    acc = 0.0
+                    for k in range(8):
+                        v = tl.load(y, k)
+                        acc = acc + tl.load(x, lane_0, k) * v
+                    tl.store(out, lane_0, acc)
+                for lane_0 in range(2):
+                    tl.store(out2, lane_0, 1.0)
+                """
+            )
+        ).body
+        jammed = jam_lanes_into_loops(body)
+        self.assertNotIsInstance(jammed[0], ast.For)
+        self.assertEqual(ast.unparse(jammed[-1]), ast.unparse(body[1]))
+
+    def test_lane_loop_kept(self) -> None:
+        """A lane loop stays whole when the jam saves no load, would copy a
+        statement more than ``MAX_JAMMED_COPIES`` times, or can't keep the
+        lanes apart."""
+        for name, source in (
+            (
+                "no lane-independent load",
+                """
+                for lane_0 in range(2):
+                    acc = 0.0
+                    for o in range(4):
+                        idx = tid[0] * 4 + o
+                        acc = acc + tl.load(x, lane_0, idx)
+                    store(out, lane_0, acc)
+                """,
+            ),
+            (
+                "too many lanes",
+                """
+                for lane_0 in range(33):
+                    acc = 0.0
+                    for o in range(4):
+                        v = tl.load(y, o)
+                        acc = acc + tl.load(x, lane_0, o) * v
+                    store(out, lane_0, acc)
+                """,
+            ),
+            (
+                "too many copies with an earlier jam's",
+                """
+                for lane_0 in range(16):
+                    acc = 0.0
+                    for o in range(4):
+                        v = tl.load(y, o)
+                        acc = acc + tl.load(x, lane_0, o) * v * s__lane7
+                    store(out, lane_0, acc)
+                """,
+            ),
+            (
+                "lane-dependent value read after the loop",
+                """
+                r = 0.0
+                for lane_0 in range(2):
+                    acc = 0.0
+                    for o in range(4):
+                        v = tl.load(y, o)
+                        acc = acc + tl.load(x, lane_0, o) * v
+                    r = acc
+                store(out, 0, r)
+                """,
+            ),
+            (
+                "lane-independent value carried across lanes",
+                """
+                for lane_0 in range(8):
+                    acc_copy = acc
+                    t = 0.0
+                    for o in range(4):
+                        v = tl.load(z, o)
+                        t = t + v
+                    acc = acc_copy + t
+                """,
+            ),
+            (
+                "lane value read by the enclosing loop's next iteration",
+                """
+                for o in range(4):
+                    use(acc)
+                    for lane_0 in range(2):
+                        acc = 0.0
+                        for k in range(4):
+                            v = tl.load(y, k)
+                            acc = acc + tl.load(x, lane_0, k) * v
+                """,
+            ),
+            (
+                "a loop with no shared load beside one with it",
+                """
+                for lane_0 in range(2):
+                    acc = 0.0
+                    for o in range(4):
+                        acc = acc + tl.load(x, lane_0, o)
+                    for o in range(4):
+                        v = tl.load(y, o)
+                        store(out, lane_0, o, acc * v)
+                """,
+            ),
+            (
+                "shared load only in an inner lane loop",
+                """
+                for lane_0 in range(2):
+                    for lane_1 in range(4):
+                        v = tl.load(y, lane_1)
+                        store(out, lane_0, lane_1, tl.load(x, lane_0, lane_1) + v)
+                """,
+            ),
+            (
+                "lane arrays past the budget once copied per lane",
+                """
+                for lane_0 in range(8):
+                    arr = _metal_lane_array('half', 8)
+                    for o in range(4):
+                        v = tl.load(y, o)
+                        _metal_lane_put(arr, o, tl.load(x, lane_0, o) * v)
+                    store(out, lane_0, _metal_lane_get(arr, 0))
+                """,
+            ),
+            (
+                "lane-dependent control flow",
+                """
+                for lane_0 in range(2):
+                    acc = 0.0
+                    for o in range(4):
+                        v = tl.load(y, o)
+                        if lane_0:
+                            acc = acc + v
+                    store(out, lane_0, acc)
+                """,
+            ),
+            (
+                "value carried across lanes",
+                """
+                for lane_0 in range(2):
+                    for o in range(4):
+                        v = tl.load(y, o)
+                        acc = acc + v * lane_0
+                    store(out, lane_0, acc)
+                """,
+            ),
+        ):
+            with self.subTest(name):
+                body = ast.parse(textwrap.dedent(source)).body
+                self.assertEqual(
+                    ast.unparse(
+                        ast.Module(body=jam_lanes_into_loops(body), type_ignores=[])
+                    ),
+                    ast.unparse(ast.Module(body=body, type_ignores=[])),
+                )
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def rows_gemv(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """x @ w.T with x's few rows walked as lanes of each thread."""
+    m, k = x.size()
+    n = w.size(0)
+    bk = hl.register_block_size(8, 64)
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n, bk], dtype=torch.float32)
+        for tile_k in hl.tile(k, block_size=bk):
+            xk = x[tile_m, tile_k].to(torch.float32)[:, None, :]
+            acc = acc + xk * w[tile_n, tile_k].to(torch.float32)[None, :, :]
+        out[tile_m, tile_n] = acc.sum(2)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def lane_sum_of_row_sums(z: torch.Tensor, n: int) -> torch.Tensor:
+    """Each row's sum, added once per element of an n-wide tile: a value
+    every lane adds to one carry, which depends on no lane."""
+    m, j = z.size()
+    out = torch.empty([m], dtype=torch.float32, device=z.device)
+    bn = hl.register_block_size(8, 8)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m, bn], dtype=torch.float32)
+        for _tile_n in hl.tile(n, block_size=bn):
+            t = hl.zeros([tile_m], dtype=torch.float32)
+            for tile_j in hl.tile(j):
+                t = t + z[tile_m, tile_j].sum(-1)
+            acc = acc + t[:, None]
+        out[tile_m] = acc.sum(-1)
+    return out
+
+
+@_requires_darwin
+class TestMetalLaneJam(unittest.TestCase):
+    """``jam_lanes_into_loops`` in a compiled kernel."""
+
+    def test_rows_share_weight_loads(self) -> None:
+        """Four rows on lanes load each weight element once per K step."""
+        x = torch.randn(4, 64, device=DEVICE, dtype=torch.float16)
+        w = torch.randn(48, 64, device=DEVICE, dtype=torch.float16)
+        config = helion.Config(block_sizes=[8, 4, 16], num_threads=[8, 1, 16])
+        out, code, msl = _run_with_msl(rows_gemv, (x, w), config)
+        torch.testing.assert_close(
+            out.cpu().double(),
+            x.cpu().double() @ w.cpu().double().T,
+            rtol=1e-4,
+            atol=1e-4,
+        )
+        self.assertRegex(code, r"for lane_\d+ in range\(4\)")
+        self.assertNotIn("for (int lane_", msl)
+        self.assertEqual(msl.count("_helion_masked(w["), 1)
+        self.assertEqual(msl.count("_helion_masked(x["), 4)
+
+    def test_lane_independent_carry(self) -> None:
+        """A carry every lane adds a lane-independent value to keeps its
+        lane loop: jammed, the value would be added once."""
+        z = torch.randn(8, 32, device=DEVICE)
+        config = helion.Config(block_sizes=[8, 4, 8], num_threads=[1, 4, 8])
+        out, _, _ = _run_with_msl(lane_sum_of_row_sums, (z, 16), config)
+        torch.testing.assert_close(
+            out.cpu(), 16 * z.cpu().sum(-1), rtol=1e-4, atol=1e-4
+        )
 
 
 @helion.kernel(backend="metal", static_shapes=True)
