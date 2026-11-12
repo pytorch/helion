@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import operator
@@ -10,6 +11,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock
 import uuid
@@ -20,6 +22,7 @@ from helion import Settings
 from helion.autotuner import HandoffBundle
 from helion.autotuner import HandoffCaseResult
 from helion.autotuner import HandoffEvaluation
+from helion.autotuner import handoff_cli
 from helion.autotuner.handoff_cli import CLISourceAgent
 from helion.autotuner.handoff_submit import _atomic_json
 from helion.autotuner.logger import AutotuningLogger
@@ -75,6 +78,8 @@ def sessions(tmp_path, monkeypatch):
         "HELION_HANDOFF_AGENT",
         "HELION_HANDOFF_MODEL",
         "HELION_HANDOFF_EFFORT",
+        "HELION_HANDOFF_AGENT_ARGS",
+        "HELION_HANDOFF_GPU_WRAPPER",
     ):
         monkeypatch.delenv(name, raising=False)
     return directory
@@ -353,7 +358,10 @@ def test_one_workspace_and_process_across_explicit_submissions(
             ("--tools", "Read,Edit,Write,Glob,Grep,Bash"),
             (
                 "--allowedTools",
-                f"Read,Edit,Write,Glob,Grep,Bash({sys.executable} submit_candidate.py)",
+                (
+                    f"Read,Edit,Write,Glob,Grep,Bash({sys.executable} submit_candidate.py),"
+                    f"Bash({sys.executable} gpu_run.py *)"
+                ),
             ),
             ("--model", "opus"),
             ("--effort", "max"),
@@ -652,6 +660,498 @@ def test_model_and_effort_defaults_overrides_and_missing_cli(
         CLISourceAgent(tmp_path / "calls")
 
 
+@pytest.mark.parametrize("runtime", ["codex", "claude"], indirect=True)
+def test_gpu_commands_and_agent_args(bundle, tmp_path, runtime, monkeypatch):
+    """The agent's own shell has no GPU; it is told to run GPU code through
+    gpu_run.py, which Claude may run, and extra CLI arguments reach the CLI."""
+    monkeypatch.setenv("HELION_HANDOFF_AGENT_ARGS", "-c 'limit=500 000'")
+    agent = CLISourceAgent(tmp_path / "calls")
+    agent(bundle)
+    process = runtime.processes[-1]
+    assert (process.workspace / "gpu_run.py").read_bytes() == (
+        Path(handoff_cli.__file__).with_name("handoff_gpu_run.py").read_bytes()
+    )
+    agent.close(reason="interrupted")
+    assert process.command[0] == f"/mock/{runtime.agent}"
+    # After Helion's own arguments, before Codex's `-` prompt.
+    expected = ["-c", "limit=500 000"]
+    if runtime.agent == "codex":
+        assert process.command[-3:] == [*expected, "-"]
+    else:
+        assert process.command[-2:] == expected
+    assert f"`{sys.executable} gpu_run.py [--timeout SECONDS]" in process.request
+    assert "Do not run GPU code" not in process.request
+    # The bundle names no device, so commands see the caller's GPUs.
+    assert "cuda:0" not in process.request
+    env = process.kwargs["env"]
+    assert env["CUDA_VISIBLE_DEVICES"] == ""
+    if runtime.agent == "claude":
+        # Claude's Bash tool can wait out the longest GPU command.
+        assert int(env["BASH_MAX_TIMEOUT_MS"]) > 3600 * 1000
+
+    explicit = CLISourceAgent(tmp_path / "calls", gpu_wrapper=[], agent_args=[])
+    assert (explicit.gpu_wrapper, explicit.agent_args) == ([], [])
+
+
+def test_gpu_mailbox_failure_is_recorded_when_closing(bundle, tmp_path, runtime):
+    """The agent controls the GPU mailbox; closing records its failure."""
+    agent = CLISourceAgent(tmp_path / "calls")
+    agent(bundle)
+    shutil.rmtree(runtime.processes[-1].workspace / ".gpu")
+    agent.close(reason="interrupted")
+    (session,) = (tmp_path / "calls").iterdir()
+    outcome = json.loads((session / "outcome.json").read_text())
+    assert outcome["stop_reason"] == "interrupted"
+    assert any(
+        error.startswith("GPU commands: FileNotFoundError")
+        for error in outcome["archive_errors"]
+    )
+
+
+def test_agent_is_told_the_measured_gpu_is_device_0(
+    bundle, tmp_path, runtime, monkeypatch
+):
+    monkeypatch.setattr(handoff_cli, "_measured_gpu", lambda manifest: "5")
+    agent = CLISourceAgent(tmp_path / "calls")
+    agent(bundle)
+    agent.close(reason="interrupted")
+    assert "the only one visible, cuda:0" in runtime.processes[-1].request
+
+
+def test_gpu_commands_get_the_device_the_cases_run_on(monkeypatch):
+    def manifest(*devices):
+        tensors = [{"type": "Tensor", "device": device} for device in devices]
+        return {"cases": [{"input_metadata": [tensors, {"type": "int", "value": 1}]}]}
+
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.delenv("HIP_VISIBLE_DEVICES", raising=False)
+    monkeypatch.delenv("ROCR_VISIBLE_DEVICES", raising=False)
+    assert handoff_cli._measured_gpu(manifest("cuda:3", "cpu", "cuda:3")) == "3"
+    # Indices count the caller's visible devices.
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4, 6")
+    assert handoff_cli._measured_gpu(manifest("cuda:1")) == "6"
+    assert handoff_cli._measured_gpu(manifest("cuda:2")) is None
+    # Otherwise the caller's environment stands.
+    assert handoff_cli._measured_gpu(manifest("cuda:0", "cuda:1")) is None
+    assert handoff_cli._measured_gpu(manifest("cpu")) is None
+    assert handoff_cli._measured_gpu(manifest("xpu:0")) is None
+    assert handoff_cli._measured_gpu({"cases": [{"backend": "triton"}]}) is None
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "1")
+    assert handoff_cli._measured_gpu(manifest("cuda:0")) is None
+
+
+def test_preflight_checks_gpu_wrapper_and_agent_args(tmp_path, runtime, monkeypatch):
+    """A GPU wrapper or extra arguments that cannot launch fail before the
+    search, not after it; explicit values override the environment."""
+    monkeypatch.setenv("HELION_HANDOFF_AGENT_ARGS", "-c 'unterminated")
+    with pytest.raises(ValueError, match="HELION_HANDOFF_AGENT_ARGS"):
+        CLISourceAgent.validate_available()
+    CLISourceAgent(tmp_path / "calls", agent_args=[]).close(reason="interrupted")
+    monkeypatch.delenv("HELION_HANDOFF_AGENT_ARGS")
+    monkeypatch.setenv("HELION_HANDOFF_GPU_WRAPPER", "/missing/sandbox --")
+    monkeypatch.setattr(
+        "helion.autotuner.handoff_cli.shutil.which",
+        lambda name: None if name.startswith("/missing/") else f"/mock/{name}",
+    )
+    with pytest.raises(FileNotFoundError, match="/missing/sandbox"):
+        CLISourceAgent.validate_available()
+    with pytest.raises(FileNotFoundError, match="/missing/sandbox"):
+        CLISourceAgent(tmp_path / "calls")
+    CLISourceAgent(tmp_path / "calls", gpu_wrapper=[]).close(reason="interrupted")
+
+
+@pytest.fixture
+def gpu_workspace(tmp_path):
+    # The session resolves its workspace; so do these tests.
+    tmp_path = tmp_path.resolve()
+    workspace = tmp_path / "workspace"
+    (workspace / "sub").mkdir(parents=True)
+    shutil.copyfile(
+        Path(handoff_cli.__file__).with_name("handoff_gpu_run.py"),
+        workspace / "gpu_run.py",
+    )
+    record = tmp_path / "record"
+    record.mkdir()
+    return workspace, record
+
+
+def gpu_run(workspace, *command, cwd=None, timeout=60):
+    """Start the agent's client for ``command``; it waits for the runner."""
+    return subprocess.Popen(
+        [
+            sys.executable,
+            str(workspace / "gpu_run.py"),
+            "--timeout",
+            str(timeout),
+            "--",
+            *command,
+        ],
+        cwd=cwd or workspace,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def wait_for_requests(workspace, count=1):
+    deadline = time.monotonic() + 30
+    while len(list((workspace / ".gpu").glob("request_*.json"))) < count:
+        assert time.monotonic() < deadline, "a client sent no request"
+        time.sleep(0.02)
+
+
+def serve_until_requested(runner, workspace):
+    """Serve once a request has arrived, starting its command."""
+    wait_for_requests(workspace)
+    runner.serve()
+
+
+def gone(pid):
+    """Whether ``pid`` has exited; a zombie has (a container's init may never
+    reap it)."""
+    if Path("/proc").is_dir():
+        return not handoff_cli._alive(pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+def serve_until_answered(runner, workspace, request_id):
+    response = workspace / ".gpu" / f"response_{request_id}.json"
+    deadline = time.monotonic() + 30
+    while not response.exists():
+        assert time.monotonic() < deadline, "the runner did not answer"
+        runner.serve()
+        time.sleep(0.02)
+    return json.loads(response.read_text())
+
+
+def test_gpu_commands_run_in_order_and_truncate_long_output(gpu_workspace, monkeypatch):
+    """The runner without the client: no interpreter starts, so this stays in
+    the pull-request tier."""
+    workspace, record = gpu_workspace
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3,7")
+    monkeypatch.setenv("HELION_AUTOTUNE_HANDOFF", "1")
+    monkeypatch.setenv("HELION_AUTOTUNE_LOG", str(workspace.parent / "run"))
+    runner = handoff_cli._GPUCommands(workspace, record, [], gpu="7")
+    requests = []
+    for argv in (["env"], ["head", "-c", "300000", "/dev/zero"]):
+        requests.append(uuid.uuid4().hex)
+        _atomic_json(
+            workspace / ".gpu" / f"request_{requests[-1]}.json",
+            {"argv": argv, "cwd": "sub", "timeout": 30},
+        )
+    first, second = (serve_until_answered(runner, workspace, r) for r in requests)
+    assert (first["status"], first["returncode"]) == ("completed", 0)
+    # The measured GPU, no nested hand-off, and not the caller's autotune log.
+    environment = dict(
+        line.split("=", 1) for line in first["output"].splitlines() if "=" in line
+    )
+    assert environment["CUDA_VISIBLE_DEVICES"] == "7"
+    assert environment["HELION_AUTOTUNE_HANDOFF"] == "0"
+    assert "HELION_AUTOTUNE_LOG" not in environment
+    marker = "[gpu_run: output truncated to its last 200000 bytes]\n"
+    assert second["output"] == marker + "\0" * 200_000
+    # The runner leaves only its answers in the mailbox.
+    assert sorted(path.name for path in (workspace / ".gpu").iterdir()) == sorted(
+        f"response_{r}.json" for r in requests
+    )
+
+
+def test_a_stop_lets_the_command_clean_up_and_fifos_are_refused(gpu_workspace):
+    """A stop sends SIGTERM first, so a profiler can write its report; a
+    request that is not a regular file cannot block the session."""
+    workspace, record = gpu_workspace
+    runner = handoff_cli._GPUCommands(workspace, record, [])
+    script = (
+        "trap 'echo report > report.txt; exit 0' TERM; echo > ready.txt; "
+        "while :; do sleep 0.1; done"
+    )
+    request_id = uuid.uuid4().hex
+    _atomic_json(
+        workspace / ".gpu" / f"request_{request_id}.json",
+        {"argv": ["sh", "-c", script], "cwd": ".", "timeout": 30},
+    )
+    runner.serve()
+    deadline = time.monotonic() + 30
+    while not (workspace / "ready.txt").exists():
+        assert time.monotonic() < deadline, "the command did not start"
+        time.sleep(0.02)
+    runner.stop("stopped: a submission started")
+    assert (workspace / "report.txt").read_text() == "report\n"
+    fifo = uuid.uuid4().hex
+    os.mkfifo(workspace / ".gpu" / f"request_{fifo}.json")
+    response = serve_until_answered(runner, workspace, fifo)
+    assert response["status"] == (
+        "could not start: ValueError: the request is not a regular file"
+    )
+
+
+def test_a_stop_survives_macos_refusing_a_zombie_group(gpu_workspace, monkeypatch):
+    """macOS answers EPERM to signalling a process group left with only
+    zombies, which SIGTERM leaves behind before the SIGKILL."""
+    workspace, record = gpu_workspace
+    runner = handoff_cli._GPUCommands(workspace, record, [])
+    request_id = uuid.uuid4().hex
+    _atomic_json(
+        workspace / ".gpu" / f"request_{request_id}.json",
+        {"argv": ["sleep", "60"], "cwd": ".", "timeout": 30},
+    )
+    runner.serve()
+    killpg = os.killpg
+
+    def macos_killpg(group, signum):
+        if signum != signal.SIGKILL:
+            return killpg(group, signum)
+        with contextlib.suppress(ProcessLookupError):
+            killpg(group, signum)
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(handoff_cli.os, "killpg", macos_killpg)
+    runner.stop("stopped: a submission started")
+    response = json.loads(
+        (workspace / ".gpu" / f"response_{request_id}.json").read_text()
+    )
+    assert response["status"] == "stopped: a submission started"
+
+
+def test_an_interrupted_stop_still_kills_the_command(gpu_workspace, monkeypatch):
+    """Ctrl-C during the SIGTERM grace still kills a command that ignores
+    SIGTERM, and ``close`` then answers its client."""
+    workspace, record = gpu_workspace
+    runner = handoff_cli._GPUCommands(workspace, record, [])
+    request_id = uuid.uuid4().hex
+    script = "trap '' TERM; echo > ready.txt; while :; do sleep 0.1; done"
+    _atomic_json(
+        workspace / ".gpu" / f"request_{request_id}.json",
+        {"argv": ["sh", "-c", script], "cwd": ".", "timeout": 30},
+    )
+    runner.serve()
+    deadline = time.monotonic() + 30
+    while not (workspace / "ready.txt").exists():
+        assert time.monotonic() < deadline, "the command did not start"
+        time.sleep(0.02)
+    process = runner._running.process
+    sleep = time.sleep
+
+    def interrupt(seconds):
+        monkeypatch.setattr(handoff_cli.time, "sleep", sleep)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(handoff_cli.time, "sleep", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        runner.stop("stopped: a submission started")
+    assert process.wait(timeout=30) == -signal.SIGKILL
+    runner.close("stopped: the session ended")
+    assert (workspace / ".gpu" / f"response_{request_id}.json").exists()
+
+
+def test_processes_that_survive_a_stop_end_the_session(gpu_workspace, monkeypatch):
+    workspace, record = gpu_workspace
+    runner = handoff_cli._GPUCommands(workspace, record, [])
+    request_id = uuid.uuid4().hex
+    _atomic_json(
+        workspace / ".gpu" / f"request_{request_id}.json",
+        {"argv": ["sleep", "60"], "cwd": ".", "timeout": 30},
+    )
+    runner.serve()
+    # A descendant stuck in the driver would ignore SIGKILL; this one is a
+    # PID above Linux's limit, which nothing has.
+    stuck = 2**22 + 1
+    monkeypatch.setattr(handoff_cli, "_command_processes", lambda pid: [stuck])
+    monkeypatch.setattr(handoff_cli, "_alive", lambda pid: pid == stuck)
+    # Enough for the killed command itself to exit.
+    monkeypatch.setattr(handoff_cli, "_GPU_TERM_GRACE", 0)
+    monkeypatch.setattr(handoff_cli, "_GPU_STOP_GRACE", 0.5)
+    with pytest.raises(RuntimeError, match=rf"processes \[{stuck}\] did not exit"):
+        runner.stop("stopped: a submission started")
+    response = json.loads(
+        (workspace / ".gpu" / f"response_{request_id}.json").read_text()
+    )
+    assert response["status"] == (
+        f"stopped: a submission started; processes [{stuck}] did not exit"
+    )
+
+
+def serve_until_exit(runner, client):
+    deadline = time.monotonic() + 30
+    while client.poll() is None:
+        assert time.monotonic() < deadline, "the client did not finish"
+        runner.serve()
+        time.sleep(0.02)
+    return client.communicate()
+
+
+# The GPU command tests start interpreters (the client and its commands).
+@pytest.mark.slow
+def test_gpu_command_runs_with_the_callers_environment_after_the_wrapper(
+    gpu_workspace, monkeypatch
+):
+    workspace, record = gpu_workspace
+    wrapper = workspace.parent / "bin" / "sandbox"
+    wrapper.parent.mkdir()
+    wrapper.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "print(json.dumps({'wrapper_cwd': os.getcwd(), "
+        "'workspace': os.environ['HELION_HANDOFF_WORKSPACE'], "
+        "'record': os.environ['HELION_HANDOFF_RECORD']}), flush=True)\n"
+        "os.execv(sys.argv[2], sys.argv[2:])\n"
+    )
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3")
+    # GPU commands run in the workspace, so the wrapper is resolved before.
+    monkeypatch.chdir(workspace.parent)
+    runner = handoff_cli._GPUCommands(
+        workspace, record, handoff_cli._gpu_wrapper(["bin/sandbox", "--"])
+    )
+    command = "import os, sys; print(os.environ['CUDA_VISIBLE_DEVICES']); sys.exit(3)"
+    client = gpu_run(workspace, sys.executable, "-c", command, cwd=workspace / "sub")
+    stdout, stderr = serve_until_exit(runner, client)
+    assert client.returncode == 3, stderr
+    seen, output = stdout.splitlines()
+    assert json.loads(seen) == {
+        "wrapper_cwd": str(workspace / "sub"),
+        "workspace": str(workspace),
+        "record": str(record),
+    }
+    assert output == "3"
+    (entry,) = map(json.loads, (record / "gpu_commands.jsonl").read_text().splitlines())
+    assert entry["argv"] == [sys.executable, "-c", command]
+    assert (entry["cwd"], entry["status"], entry["returncode"]) == (
+        "sub",
+        "completed",
+        3,
+    )
+    assert entry["seconds"] >= 0 and entry["waited_seconds"] >= 0
+    # Answered requests leave the mailbox.
+    assert list((workspace / ".gpu").iterdir()) == []
+
+
+@pytest.mark.slow
+def test_submission_stops_the_gpu_command_and_its_children(gpu_workspace):
+    """``stop`` ends the command with its descendants, on Linux even a
+    grandchild in its own session under a child in the command's group, and a
+    command requested while a submission is measured (no ``serve``) waits."""
+    workspace, record = gpu_workspace
+    runner = handoff_cli._GPUCommands(workspace, record, [])
+    child = workspace / "child.pid"
+    # Without /proc a stop reaches only the command's process group.
+    own_session = Path("/proc/self/stat").exists()
+    grandchild = (
+        "import subprocess, sys, time; "
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], "
+        f"start_new_session={own_session}); "
+        f"open({str(child)!r}, 'w').write(str(p.pid)); time.sleep(60)"
+    )
+    command = (
+        "import subprocess, sys, time; "
+        f"subprocess.Popen([sys.executable, '-c', {grandchild!r}]); "
+        "print('started', flush=True); time.sleep(60)"
+    )
+    client = gpu_run(workspace, sys.executable, "-c", command)
+    serve_until_requested(runner, workspace)
+    deadline = time.monotonic() + 30
+    while not child.exists() or not child.read_text():
+        assert time.monotonic() < deadline, "the command did not start its child"
+        time.sleep(0.02)
+    waiting = gpu_run(workspace, sys.executable, "-c", "print('after')")
+    runner.stop("stopped: a submission started")
+    stdout, stderr = client.communicate(timeout=30)
+    assert client.returncode == 124
+    assert stdout == "started\n"
+    assert "[gpu_run: stopped: a submission started]" in stderr
+    assert gone(int(child.read_text()))
+    time.sleep(0.5)
+    assert waiting.poll() is None
+    assert serve_until_exit(runner, waiting)[0] == "after\n"
+    # A command that finished just before a submission completed.
+    done = gpu_run(workspace, sys.executable, "-c", "print('done')")
+    serve_until_requested(runner, workspace)
+    runner._running.process.wait(timeout=30)
+    runner.stop("stopped: a submission started")
+    assert done.communicate(timeout=30)[0] == "done\n" and done.returncode == 0
+    statuses = [
+        json.loads(line)["status"]
+        for line in (record / "gpu_commands.jsonl").read_text().splitlines()
+    ]
+    assert statuses == ["stopped: a submission started", "completed", "completed"]
+
+
+@pytest.mark.slow
+def test_gpu_command_timeout_and_requests_that_cannot_start(gpu_workspace):
+    workspace, record = gpu_workspace
+    runner = handoff_cli._GPUCommands(workspace, record, [])
+    client = gpu_run(
+        workspace, sys.executable, "-c", "import time; time.sleep(60)", timeout=1
+    )
+    stdout, stderr = serve_until_exit(runner, client)
+    assert client.returncode == 124
+    assert "[gpu_run: timed out after 1 s]" in stderr
+    command = "import os, signal; os.kill(os.getpid(), signal.SIGKILL)"
+    client = gpu_run(workspace, sys.executable, "-c", command)
+    stdout, stderr = serve_until_exit(runner, client)
+    assert client.returncode == 128 + signal.SIGKILL
+    assert f"[gpu_run: killed by signal {int(signal.SIGKILL)}]" in stderr
+    client = gpu_run(workspace, str(workspace / "missing"))
+    stdout, stderr = serve_until_exit(runner, client)
+    assert client.returncode == 124
+    assert "could not start: FileNotFoundError" in stderr
+    request_id = uuid.uuid4().hex
+    _atomic_json(
+        workspace / ".gpu" / f"request_{request_id}.json",
+        {"argv": ["true"], "cwd": "..", "timeout": 1},
+    )
+    runner.serve()
+    response = json.loads(
+        (workspace / ".gpu" / f"response_{request_id}.json").read_text()
+    )
+    assert response["status"].startswith("could not start: ValueError")
+    assert response["returncode"] is None
+
+
+@pytest.mark.slow
+def test_ending_the_client_cancels_its_gpu_command(gpu_workspace):
+    """An agent tool that kills the client, even with SIGKILL (e.g. at its own
+    timeout), frees the runner: the running command stops, and a queued one
+    never starts."""
+    workspace, record = gpu_workspace
+    runner = handoff_cli._GPUCommands(workspace, record, [])
+    client = gpu_run(workspace, sys.executable, "-c", "import time; time.sleep(60)")
+    serve_until_requested(runner, workspace)
+    queued = gpu_run(workspace, sys.executable, "-c", "print('never')")
+    wait_for_requests(workspace, 2)
+    for process in (client, queued):
+        process.kill()
+        process.wait(timeout=30)
+    runner.serve()
+    runner.serve()
+    statuses = [
+        json.loads(line)["status"]
+        for line in (record / "gpu_commands.jsonl").read_text().splitlines()
+    ]
+    assert statuses == ["cancelled: the client ended"] * 2
+
+
+@pytest.mark.slow
+def test_closing_answers_every_gpu_request(gpu_workspace):
+    workspace, record = gpu_workspace
+    runner = handoff_cli._GPUCommands(workspace, record, [])
+    running = gpu_run(workspace, sys.executable, "-c", "import time; time.sleep(60)")
+    serve_until_requested(runner, workspace)
+    queued = gpu_run(workspace, sys.executable, "-c", "print('never')")
+    wait_for_requests(workspace, 2)
+    runner.close("stopped: the session ended")
+    late = gpu_run(workspace, sys.executable, "-c", "print('never')")
+    for client in (running, queued, late):
+        stdout, stderr = client.communicate(timeout=30)
+        assert client.returncode == 124
+        assert "[gpu_run: stopped: the session ended]" in stderr
+        assert "never" not in stdout
+
+
 def test_agent_selection_defaults_environment_and_explicit_override(
     tmp_path, runtime, monkeypatch
 ):
@@ -680,6 +1180,7 @@ def test_unknown_agent_fails_before_start(tmp_path, runtime, monkeypatch, explic
     assert not (tmp_path / "calls").exists()
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("provider", ["codex", "claude"])
 def test_default_controller_with_one_real_fake_cli_session(
     bundle, tmp_path, monkeypatch, sessions, provider
@@ -717,6 +1218,8 @@ def test_default_controller_with_one_real_fake_cli_session(
         "chat({'type': 'session_meta', 'payload': {'id': session_id, 'base_instructions': {'text': 'Initial system instructions.'}}})\n"
         "chat({'type': 'response_item', 'payload': {'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': request}]}})\n"
         "record({'event': 'request', 'request': request})\n"
+        "gpu = subprocess.run([sys.executable, 'gpu_run.py', '--', sys.executable, '-c', 'import os; print(os.environ[\"CUDA_VISIBLE_DEVICES\"])'], capture_output=True, text=True)\n"
+        "record({'event': 'gpu', 'returncode': gpu.returncode, 'stdout': gpu.stdout})\n"
         "source = pathlib.Path('case_0/kernel.py')\n"
         "for candidate in ('slower', 'faster'):\n"
         "    before = source.read_text()\n"
@@ -734,6 +1237,7 @@ def test_default_controller_with_one_real_fake_cli_session(
     )
     executable.chmod(0o755)
     monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "5")
     evaluated = []
 
     def evaluate(workspace, **kwargs):
@@ -776,6 +1280,10 @@ def test_default_controller_with_one_real_fake_cli_session(
     records = [json.loads(line) for line in trace.read_text().splitlines()]
     starts = [record for record in records if record["event"] == "start"]
     assert len(starts) == 1 and starts[0]["gpu"] == ""
+    # The agent's GPU command sees the caller's GPU.
+    assert [record for record in records if record["event"] == "gpu"] == [
+        {"event": "gpu", "returncode": 0, "stdout": "5\n"}
+    ]
     session_id = starts[0]["session_id"]
     rollout = Path(starts[0]["rollout"])
     assert not Path(starts[0]["workspace"]).exists()
@@ -801,6 +1309,10 @@ def test_default_controller_with_one_real_fake_cli_session(
         assert (
             Path(result.directory) / f"round_{number:04d}" / "notes.md"
         ).read_text() == f"Notes for {candidate}"
+    (gpu_command,) = map(
+        json.loads, (sessions[0] / "gpu_commands.jsonl").read_text().splitlines()
+    )
+    assert gpu_command["status"] == "completed"
     outcome = json.loads((sessions[0] / "outcome.json").read_text())
     assert outcome["agent"] == provider
     assert outcome["submissions"] == 2
