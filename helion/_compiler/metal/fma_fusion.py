@@ -170,7 +170,7 @@ def _type(node: ast.expr, env: Mapping[str, str]) -> str | None:
         if isinstance(func, ast.Name):
             name = func.id
         first = node.args[0]
-        if name == "static_cast" and isinstance(first, ast.Name):
+        if name in ("static_cast", "as_type") and isinstance(first, ast.Name):
             return first.id
         if isinstance(func, ast.Name) and name in _SCALAR_TYPES:  # float(0.0)
             return name
