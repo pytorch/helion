@@ -604,12 +604,16 @@ def _accepted(backend: object) -> frozenset[str]:
     )
 
 
+# The MTIA tunables, which only builds with ``helion.fb`` (fbcode) define.
+_MTIA_KEYS = frozenset(get_mtia_tunable_fragments())
+
+
 def test_valid_keys_match_the_literal_table() -> None:
-    assert _keys(_BASE_VALID_KEYS) == VALID_KEYS
+    assert _keys(_BASE_VALID_KEYS) | _MTIA_KEYS == VALID_KEYS
 
 
 def test_backend_specific_keys_match_the_literal_table() -> None:
-    assert _keys(_BASE_BACKEND_SPECIFIC_KEYS) == BACKEND_SPECIFIC_KEYS
+    assert _keys(_BASE_BACKEND_SPECIFIC_KEYS) | _MTIA_KEYS == BACKEND_SPECIFIC_KEYS
     assert BACKEND_SPECIFIC_KEYS <= VALID_KEYS
 
 
