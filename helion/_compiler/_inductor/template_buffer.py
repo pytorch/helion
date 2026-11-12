@@ -16,8 +16,10 @@ from torch._dynamo.testing import rand_strided
 from torch._dynamo.utils import ExactWeakKeyDictionary
 from torch._inductor.codecache import PyCodeCache
 from torch._inductor.dependencies import MemoryDep
+from torch._inductor.ir import BaseView
 from torch._inductor.ir import Buffer
 from torch._inductor.ir import ComputedBuffer
+from torch._inductor.ir import DtypeView
 from torch._inductor.ir import FinalizeCodegenResult
 from torch._inductor.ir import FixedLayout
 from torch._inductor.ir import FlexibleLayout
@@ -105,6 +107,26 @@ class _CodeExpr(str):
 
     def __repr__(self) -> str:
         return str(self)
+
+
+def _input_expr(node: IRNode, base: str | None = None) -> str:
+    """Wrapper-code expression of a kernel input: its buffer name, or for a
+    ``ReinterpretView`` (a slice, an offset or bitcast view) the view, whose
+    buffer name alone would drop its offset, strides and dtype. ``base`` (a
+    prologue's source buffer) stands in for the view's buffer; bitcast views
+    are never fused (see ``create``), so it keeps its own dtype. For a node
+    that is not a view, ``base`` (when given) is the expression."""
+    if not isinstance(node, ReinterpretView):
+        return base if base is not None else node.get_name()
+    if base is None:
+        return node.codegen_reference()
+    wrapper = V.graph.wrapper_code
+    return (
+        f"reinterpret_tensor({base}, "
+        f"{wrapper.codegen_python_shape_tuple(node.get_size())}, "
+        f"{wrapper.codegen_python_shape_tuple(node.get_stride())}, "
+        f"{wrapper.codegen_sizevar(node.layout.offset)})"
+    )
 
 
 @dataclasses.dataclass
@@ -735,17 +757,10 @@ class HelionTemplateBuffer(TemplateBuffer):
             source_buf = prologue_source_buffers.get(param_name)
 
             if isinstance(node, ReinterpretView):
-                base = source_buf if source_buf is not None else node.data.get_name()
                 name = f"reinterp_{len(preamble)}"
-                preamble.append(
-                    f"{name} = reinterpret_tensor("
-                    f"{base}, {tuple(node.get_size())}, {tuple(node.get_stride())}, {node.layout.offset})"
-                )
+                preamble.append(f"{name} = {_input_expr(node, source_buf)}")
                 return name
-
-            if source_buf is not None:
-                return source_buf
-            return node.get_name()  # type: ignore[union-attr]
+            return _input_expr(node, source_buf)
 
         call_args: list[str] = [
             resolved
@@ -767,9 +782,13 @@ class HelionTemplateBuffer(TemplateBuffer):
         on_tensor_leaf: Callable[[str, Any, list[tuple[type, int]], int], None]
         | None = None,
         fusion_enabled: bool = False,
+        pre_realize_bitcast_names: frozenset[str] = frozenset(),
         **buffer_kwargs: Any,  # noqa: ANN401
     ) -> tuple[HelionTemplateBuffer, tuple[TensorBox, ...]]:
-        """Build a HelionTemplateBuffer and return ``(buf, outputs)``."""
+        """Build a HelionTemplateBuffer and return ``(buf, outputs)``.
+        ``pre_realize_bitcast_names`` names inputs whose view chain held a
+        bitcast before realization (see ``lower_helion_kernel``); they are
+        kept unfused like a dtype-changing ReinterpretView."""
         inputs = list(realized_inputs.values())
         dev = inputs[0].get_device() if inputs else torch.device("cuda")
 
@@ -789,6 +808,15 @@ class HelionTemplateBuffer(TemplateBuffer):
             for inp in inputs  # type: ignore[union-attr]
             if inp.get_read_names() & mutated_inp_names
         }
+        # A fused producer would run on its source buffer, which the kernel
+        # would then read through the bitcast view's dtype: keep bitcast views
+        # unfused.
+        bitcast_inp_names = {
+            inp.get_name()
+            for inp in inputs
+            if isinstance(inp, ReinterpretView)
+            and inp.layout.dtype != inp.data.get_dtype()
+        } | pre_realize_bitcast_names
         size_indexed_inp_names = {
             inp.get_name()
             for inp in inputs
@@ -815,6 +843,7 @@ class HelionTemplateBuffer(TemplateBuffer):
         unfused_inp_names = (
             mutated_inp_names
             | container_inp_names
+            | bitcast_inp_names
             | mutation_dependent_inp_names
             | size_indexed_inp_names
         )
@@ -880,8 +909,7 @@ class HelionTemplateBuffer(TemplateBuffer):
         # _rebuild_container_args so it can pop 'param.0', 'param.1' etc.
         named_inputs = self._named_inputs  # pyrefly: ignore[missing-attribute]
         all_args: dict[str, object] = {
-            n: _CodeExpr(inp.get_name())  # type: ignore[union-attr]
-            for n, inp in named_inputs.items()
+            n: _CodeExpr(_input_expr(inp)) for n, inp in named_inputs.items()
         }
         for n, v in self._constant_args_dict.items():
             if n in all_args:
@@ -1764,10 +1792,41 @@ def lower_helion_kernel(
     _realize = (
         TemplateBuffer.realize_template_input  # pyrefly: ignore[missing-attribute]
     )
+
+    def realize(tb: TensorBox) -> IRNode:
+        # A bitcast becomes a view of its source's buffer, as Inductor makes it
+        # where DtypeView can reindex (newer PyTorch; see
+        # pre_realize_bitcast_names below for PyTorch 2.13).
+        if isinstance(tb.data, DtypeView):
+            inner = tb.data.data
+            source = _realize(
+                inner if isinstance(inner, TensorBox) else TensorBox(inner)
+            )
+            return DtypeView.create(source, tb.data.get_dtype())
+        return _realize(tb)
+
+    def through_bitcast(node: IRNode) -> bool:
+        """Whether ``node``'s view chain holds a bitcast (DtypeView)."""
+        while isinstance(node, (TensorBox, BaseView)):
+            if isinstance(node, DtypeView):
+                return True
+            node = node.data
+        return False
+
     realized: dict[str, IRNode] = {}
+    # Inputs whose view chain holds a bitcast. Newer PyTorch realizes them as
+    # dtype-changing ReinterpretViews, which create() keeps unfused anyway; on
+    # PyTorch 2.13, whose DtypeView cannot reindex, a view of a bitcast (a
+    # top-level one goes through realize() above) is copied into a buffer of
+    # its own, which create() cannot tell from a bitcast-free producer. Fused
+    # as one prologue with its source's producer, such a copy left the
+    # producer's input out of the kernel (NameError), so name them all.
+    pre_realize_bitcast_names: set[str] = set()
     for n, tb in tensor_args.items():
         if isinstance(tb, TensorBox):
-            realized[n] = _realize(tb)
+            realized[n] = realize(tb)
+            if through_bitcast(tb):
+                pre_realize_bitcast_names.add(realized[n].get_name())
 
     # Build fake tensors for kernel binding (sympy exprs to concrete ints)
     def as_int(x: object, default: int) -> int:
@@ -1981,6 +2040,7 @@ def lower_helion_kernel(
         on_tensor_leaf=on_tensor_leaf,
         fusion_enabled=kernel.settings.torch_compile_fusion
         and bound.env.backend.supports_inductor_fusion,
+        pre_realize_bitcast_names=frozenset(pre_realize_bitcast_names),
         kernel=kernel,
         bound_kernel=bound,
         constant_args=constant_args,

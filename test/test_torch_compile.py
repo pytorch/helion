@@ -682,6 +682,15 @@ def k_host_applies_callable(fn: Callable, x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(autotune_effort="none")
+def k_bits_to_float(bits: torch.Tensor) -> torch.Tensor:
+    """Converts integer bits to float32 values (for bitcast view inputs)."""
+    out = torch.empty(bits.size(), dtype=torch.float32, device=bits.device)
+    for tile in hl.tile(bits.size()):
+        out[tile] = bits[tile].to(torch.float32)
+    return out
+
+
 def sin_plus_one(x: torch.Tensor) -> torch.Tensor:
     return torch.sin(x) + 1.0
 
@@ -735,7 +744,9 @@ def lower_through_callable_kernel(kernel: object) -> Callable[[object], object]:
 # the flag nowhere else) only re-check the opaque lowering that the other
 # parametrized tests cover, so they run the fused leg alone; three such tests
 # keep both legs as representatives (test_transpose_then_view_to_3d_epilogue,
-# test_epilogue_broadcast_bias, test_prologue_flip_plus_bias_fused).
+# test_epilogue_broadcast_bias, test_prologue_flip_plus_bias_fused). Tests of
+# container and bitcast inputs use it too: those inputs are never fused, so
+# the unfused leg renders the same call.
 _FUSED_ONLY = (True,)
 
 
@@ -5071,6 +5082,99 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels=2 if allow_torch_compile_fusion else None,
             kernels_ref=[k_sum_tuple_ref],
             expected_num_kernels_ref=1,
+        )
+
+    @parametrize("allow_torch_compile_fusion", _FUSED_ONLY)
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_kernel_with_tuple_input_views(self, allow_torch_compile_fusion):
+        """Test: a tuple of tensors holding two slices of one buffer, the
+        second at a storage offset, passes each slice (not the buffer)."""
+
+        @helion.kernel(autotune_effort="none")
+        def k_sum_tuple(tensors: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+            out = torch.empty_like(tensors[0])
+            for tile in hl.tile(tensors[0].size()):
+                out[tile] = tensors[0][tile] + tensors[1][tile]
+            return out
+
+        def f(x: torch.Tensor, *, _kernels=(k_sum_tuple,)) -> torch.Tensor:
+            x = x * 2.0
+            result = _kernels[0]((x[:, :8], x[:, 8:]))
+            return torch.relu(result) + 1.0
+
+        x = torch.randn(4, 16, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x,),
+            kernels=[k_sum_tuple],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @parametrize("allow_torch_compile_fusion", _FUSED_ONLY)
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_kernel_with_tuple_input_bitcast_view(self, allow_torch_compile_fusion):
+        """Test: a bitcast view inside a tuple of tensors keeps its dtype."""
+
+        @helion.kernel(autotune_effort="none")
+        def k_add_bits(tensors: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+            out = torch.empty_like(tensors[0])
+            for tile in hl.tile(tensors[0].size()):
+                out[tile] = tensors[0][tile] + tensors[1][tile].to(torch.float32)
+            return out
+
+        def f(x: torch.Tensor, *, _kernels=(k_add_bits,)) -> torch.Tensor:
+            x = x * 2.0
+            return _kernels[0]((x, (x + 1).view(torch.int32)))
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x,),
+            kernels=[k_add_bits],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @parametrize("allow_torch_compile_fusion", _FUSED_ONLY)
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_kernel_with_bitcast_view_input(self, allow_torch_compile_fusion):
+        """Test: a bitcast view argument keeps its dtype, and the producer of
+        its buffer is not fused into the kernel (which would read the
+        producer's source through the view's dtype)."""
+
+        def f(x: torch.Tensor, *, _kernels=(k_bits_to_float,)) -> torch.Tensor:
+            return _kernels[0]((x + 1).view(torch.int32))
+
+        x = torch.randn(4, 16, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x,),
+            kernels=[k_bits_to_float],
+            rtol=0,
+            atol=0,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+            # x + 1 runs as its own kernel rather than fused into the Helion one.
+            expected_num_kernels=2,
+        )
+
+    @parametrize("allow_torch_compile_fusion", _FUSED_ONLY)
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_kernel_with_view_of_bitcast_input(self, allow_torch_compile_fusion):
+        """Test: a slice of a bitcast view gives the right values. On PyTorch
+        builds whose DtypeView cannot reindex (2.13), Inductor copies such a
+        view into a buffer of its own (one more kernel), which create() keeps
+        out of prologue fusion like any input read through a bitcast."""
+
+        def f(x: torch.Tensor, *, _kernels=(k_bits_to_float,)) -> torch.Tensor:
+            return _kernels[0]((x + 1).view(torch.int32)[:, 8:])
+
+        x = torch.randn(4, 16, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x,),
+            kernels=[k_bits_to_float],
+            rtol=0,
+            atol=0,
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
         )
 
     @parametrize("allow_torch_compile_fusion", (True, False))
