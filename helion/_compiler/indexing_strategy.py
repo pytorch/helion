@@ -634,12 +634,36 @@ def _padded_iota_mask(state: CodegenState, index_position: int) -> str | None:
     dims = _padded_iota_dims(index_node, through_loads=True, memo=_IndexWalkMemo())
     if dims is None:
         return None
+    val = index_node.meta.get("val")
     terms = [
         padded_lanes_mask(length, dim, len(dims))
         for dim, length in enumerate(dims)
-        if length is not None
+        if length is not None and not _dim_masks_its_padding(state, val, dim, length)
     ]
     return f"({' & '.join(terms)})" if terms else None
+
+
+def _dim_masks_its_padding(
+    state: CodegenState, val: object, dim: int, length: int
+) -> bool:
+    """Whether dim ``dim`` of the index ``val`` takes the access onto a
+    reduction dim of the range's ``length`` whose own mask the access applies
+    already (``SubscriptIndexing.compute_shape`` resolves the index's dims as
+    here): a subscript names a range's static extent by such a dim, and its
+    block of 256 masks the lanes past 200 where its strategy is active."""
+    if not isinstance(val, torch.Tensor):
+        return False
+    env = CompileEnvironment.current()
+    block_id = env.resolve_block_id(val.size(dim))
+    if block_id is None:
+        return False
+    info = env.block_sizes[block_id]
+    return (
+        info.reduction
+        and isinstance(info.size, (int, torch.SymInt))
+        and env.known_equal(info.size, length)
+        and state.codegen.mask_var(block_id) is not None
+    )
 
 
 def padded_lanes_mask(length: int, dim: int, ndim: int) -> str:

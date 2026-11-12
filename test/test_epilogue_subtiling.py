@@ -15,6 +15,7 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessTensorDescriptor
 from helion.autotuner.config_fragment import EnumFragment
+from helion.autotuner.config_fragment import PowerOfTwoFragment
 import helion.language as hl
 from helion.runtime.settings import _get_backend
 
@@ -309,6 +310,42 @@ def store_with_tile_indexer(
     return out
 
 
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def scale_into(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    for tile_m, tile_n in hl.tile(x.size()):
+        out[tile_m, tile_n] = x[tile_m, tile_n] * 2.0
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def scale_into_tunable_tile(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    (n,) = x.size()
+    block_size = hl.register_tunable("foo", PowerOfTwoFragment(1, 64))
+    for tile_n in hl.tile([n], block_size=[block_size * 2]):
+        out[tile_n] = x[tile_n] * 2.0
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def scale_into_tunable_block(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    (n,) = x.size()
+    block_size = hl.register_tunable("bar", PowerOfTwoFragment(1, 64))
+    for tile_n in hl.tile([n], block_size=[block_size]):
+        out[tile_n] = x[tile_n] * 2.0
+    return out
+
+
+@helion.kernel(static_shapes=False, autotune_effort="none")
+def scale_into_dynamic_tile(
+    x: torch.Tensor, out: torch.Tensor, width: torch.Tensor, multiple: hl.constexpr
+) -> torch.Tensor:
+    """The tile is ``multiple`` times ``width``'s dynamic size wide."""
+    (n,) = x.size()
+    for tile_n in hl.tile([n], block_size=[width.size(0) * multiple]):
+        out[tile_n] = x[tile_n] * 2.0
+    return out
+
+
 @onlyBackends(["triton", "cute"])
 class TestEpilogueSubtiling(TestCase):
     @skipIfRefEager("test checks generated backend code")
@@ -419,6 +456,61 @@ class TestEpilogueSubtiling(TestCase):
         expected = out.clone()
         expected[:, :90] = a[:, :90] + 1.0
         torch.testing.assert_close(add_one(a, n, out), expected)
+
+    @skipIfRefEager("test checks generated backend code")
+    def test_no_split_for_tile_narrower_than_factor(self):
+        """A store is not split along a tile whose configured block size the
+        factor does not divide: the pieces of a 1-wide tile were zero lanes
+        wide, so CuTe dropped every store and Triton failed to compile.  The
+        store stays whole rather than splitting the next tile dim, which
+        would slice every value of its chain along that dim."""
+        x = torch.randn([16, 8], device=DEVICE)
+        # Counted stores, not ``_assert_split_codegen``: CuTe splits this
+        # direct store by reloading each half, without ``split_smem``.
+        store_call = ".store(" if _get_backend() == "cute" else "tl.store("
+        for block_sizes, store_count in (([1, 1], 1), ([8, 1], 1), ([8, 2], 2)):
+            with self.subTest(block_sizes=block_sizes):
+                out = torch.full_like(x, -1.0)
+                code, output = code_and_output(
+                    scale_into, (x, out), block_sizes=block_sizes, epilogue_subtile=2
+                )
+                torch.testing.assert_close(output, x * 2.0, atol=0, rtol=0)
+                self.assertEqual(code.count(store_call), store_count)
+
+    @skipIfRefEager("test checks generated backend code")
+    def test_no_split_for_symbolic_tile_the_factor_may_not_divide(self):
+        """A symbolic block size splits only where the factor divides the
+        extent the config gives it.  A tunable at its configured value
+        (``block_size=bar`` at ``bar=1``, ``block_size=foo * 2`` at ``foo=1``
+        under ``epilogue_subtile=4``) would split into zero-width pieces, and
+        a dynamic size never splits, doubled or not: its pieces would index
+        with a runtime size.  Each store stays whole."""
+        x = torch.randn([128], device=DEVICE)
+        store_call = ".store(" if _get_backend() == "cute" else "tl.store("
+        width = torch.empty([8], device=DEVICE)
+        for kernel, args, config in (
+            (scale_into_tunable_block, (), {"bar": 1, "epilogue_subtile": 2}),
+            (scale_into_tunable_tile, (), {"foo": 1, "epilogue_subtile": 4}),
+            (scale_into_dynamic_tile, (width, 1), {"epilogue_subtile": 2}),
+            (scale_into_dynamic_tile, (width, 2), {"epilogue_subtile": 2}),
+        ):
+            with self.subTest(kernel=kernel.fn.__name__, args=args[1:], **config):
+                out = torch.full_like(x, -1.0)
+                code, output = code_and_output(kernel, (x, out, *args), **config)
+                torch.testing.assert_close(output, x * 2.0, atol=0, rtol=0)
+                self.assertEqual(code.count(store_call), 1)
+
+    @skipIfRefEager("test checks generated backend code")
+    @skipIfCute("CuTe raises BackendUnsupported for a store split over a symbolic tile")
+    def test_tunable_backed_tile_still_splits(self):
+        """``block_size=foo * 2`` at ``foo=16`` splits its 32-wide tile."""
+        x = torch.randn([128], device=DEVICE)
+        out = torch.full_like(x, -1.0)
+        code, output = code_and_output(
+            scale_into_tunable_tile, (x, out), foo=16, epilogue_subtile=2
+        )
+        torch.testing.assert_close(output, x * 2.0, atol=0, rtol=0)
+        self.assertEqual(code.count("tl.store("), 2)
 
     @skipIfRefEager("test checks generated backend code")
     def test_codegen_s4(self):

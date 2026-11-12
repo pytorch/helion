@@ -432,6 +432,7 @@
  "test/test_triton_launch_options.py": 0.0,
  "test/test_triton_overrides.py": 0.0,
  "test/test_triton_scalar_codegen.py": 1.1,
+ "test/test_triton_selection.py": 0.1,
  "test/test_triton_topk_correctness.py": 62.6,
  "test/test_type_propagation.py": 0.8,
  "test/test_unroll_tuples.py": 18.0,

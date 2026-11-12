@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import builtins
 import contextlib
 import copy
 import dataclasses
@@ -58,6 +59,7 @@ from .compile_environment import RuntimeInputSpecialization
 from .compile_environment import _ContainerIdentity
 from .compile_environment import _symint_expr
 from .compile_environment import _symint_free_symbols
+from .compile_environment import compute_symbolic_min_max
 from .compile_environment import warning
 from .container_identity import record_opaque_container_result
 from .device_function import contains_only_block_size_symbols
@@ -1003,6 +1005,7 @@ class TensorType(TypeInfo):
                     rdim = CompileEnvironment.current().allocate_reduction_dimension(
                         output_size
                     )
+                    env.record_full_slice_dim(rdim.block_id)
                     output_sizes.append(rdim.var)
                 else:
                     output_sizes.append(1)
@@ -1129,7 +1132,9 @@ class TensorType(TypeInfo):
                 ) from None
         new_sizes = self._device_indexing_size(key)
         env = CompileEnvironment.current()
-        new_fake = env.new_index_result(self.fake_value, new_sizes)
+        new_fake = env.new_index_result(
+            self.fake_value, new_sizes, keep_static_extents=self.origin.is_device()
+        )
 
         return TensorType(origin, new_fake)
 
@@ -1697,27 +1702,6 @@ class _PeerViewCapture(TorchDispatchMode):
         return result
 
 
-def _config_value_names(value: object) -> list[str]:
-    """The tunables the config values ``value`` reads derive from
-    (``config_value_expressions``), sorted."""
-    if not isinstance(value, torch.SymInt):
-        return []
-    expressions = CompileEnvironment.current().config_value_expressions
-    pending = [
-        expressions[symbol]
-        for symbol in value._sympy_().free_symbols
-        if symbol in expressions
-    ]
-    names: set[str] = set()
-    while pending:
-        for argument in pending.pop().arguments:
-            if isinstance(argument, ConfigValueExpression):
-                pending.append(argument)
-            elif isinstance(argument, str):
-                names.add(argument)
-    return sorted(names)
-
-
 class CallableType(LiteralType):
     # pyrefly: ignore [bad-override]
     value: Callable[..., object]
@@ -1758,19 +1742,6 @@ class CallableType(LiteralType):
             and origin.is_device()
         ):
             raise exc.UnsupportedSplitOperation(op="torch.tensor_split")
-        if origin.is_device() and self._config_value_operation() == "next_power_of_2":
-            # Device code would run the helper on the hints of the tunables it
-            # reads (8192), not on each config's values; the host records it
-            # per config.
-            for arg in [*args, *kwargs.values()]:
-                if isinstance(arg, SymIntType) and (
-                    names := _config_value_names(arg.value)
-                ):
-                    raise exc.NotAllowedOnDevice(
-                        f"next_power_of_2 over the tunable {names[0]!r}, which "
-                        "device code would compute at the tunable's hint whatever "
-                        "the config (compute it before the loop),"
-                    )
         if is_api_func(fn := self.value):
             if fn._is_device_only and origin.is_host():
                 raise exc.DeviceAPIOnHost(fn.__qualname__)
@@ -1882,6 +1853,28 @@ class CallableType(LiteralType):
         env: CompileEnvironment = CompileEnvironment.current()
         proxy_args = [x.tree_map(to_proxy) for x in args]
         proxy_kwargs = {k: v.tree_map(to_proxy) for k, v in kwargs.items()}
+        if self.value in (builtins.min, builtins.max) and not proxy_kwargs:
+            values = proxy_args
+            if len(values) == 1 and isinstance(values[0], (list, tuple)):
+                # ``min([a, b])`` compares like ``min(a, b)``.
+                values = [*values[0]]
+            if (
+                len(values) > 1
+                and all(isinstance(value, (int, torch.SymInt)) for value in values)
+                and _config_value_symbol(env, values) is not None
+            ):
+                # Python's min and max would compare a config value at its
+                # hint.  Take what device code computes instead: the argument
+                # every config picks, else the symbolic min or max
+                # (``Min(128, foo)``, beside config values or a dynamic size),
+                # which code generation evaluates under each config.
+                return TypeInfo.from_example(
+                    compute_symbolic_min_max(
+                        cast("tuple[int | torch.SymInt, ...]", tuple(values)),
+                        op=self.value,
+                    ),
+                    origin,
+                )
 
         if (
             origin.is_host()
@@ -1906,8 +1899,7 @@ class CallableType(LiteralType):
         if any(
             isinstance(x, torch.SymInt) and _is_symbolic_numeric(x) for x in proxy_args
         ):
-            if self.value in self._new_symint_on_host_fns() and origin.is_host():
-                result = SymIntType.new_unbacked(origin)
+            if self.value in self._new_symint_on_host_fns():
                 operation = self._config_value_operation()
                 derived_args: list[int | str | ConfigValueExpression] = []
                 for arg in proxy_args:
@@ -1917,23 +1909,42 @@ class CallableType(LiteralType):
                         expr = _symint_expr(arg)
                         if expr is None:
                             break
-                        expression = env.config_value_expressions.get(expr)
+                        # A recorded config value, or arithmetic over them
+                        # (``next_power_of_2(foo * 2)``).
+                        expression = env.config_value_expression(expr)
                         if expression is None:
                             break
                         derived_args.append(expression)
                     else:
                         break
                 else:
-                    result_expr = _symint_expr(result.value)
                     if (
                         operation is not None
                         and not proxy_kwargs
-                        and result_expr is not None
+                        # ``cdiv`` in device code stays arithmetic (``(foo +
+                        # 1) // 2``), which code generation evaluates under each
+                        # config and a shape compares equal to.
+                        and not (operation == "cdiv" and origin.is_device())
                     ):
-                        env.config_value_expressions[result_expr] = (
-                            ConfigValueExpression(operation, tuple(derived_args))
+                        # The config fixes the value, in device code as on the
+                        # host: tracing the helper there would specialize the
+                        # tunables to their hints instead, whatever the config.
+                        return SymIntType(
+                            origin,
+                            env.config_value_symint(
+                                ConfigValueExpression(operation, tuple(derived_args))
+                            ),
                         )
-                return result
+                if origin.is_host():
+                    return SymIntType.new_unbacked(origin)
+                # In device code ``next_power_of_2`` would run on the tunables'
+                # hints (``next_power_of_2(foo + n)`` beside a dynamic ``n``),
+                # or on the hint of a value a helper computes from them;
+                # ``cdiv`` stays symbolic arithmetic.
+                if operation == "next_power_of_2" and (
+                    symbol := _config_value_symbol(env, proxy_args)
+                ):
+                    raise env.tunable_specialized(symbol)
         try:
             with (
                 patch.object(torch.SymInt, "__index__", _raise_shape_specializing),
@@ -2067,7 +2078,11 @@ class CallableType(LiteralType):
     @staticmethod
     @functools.cache
     def _new_symint_on_host_fns() -> dict[object, None]:
-        """Functions that should return a new unbacked symint when called on host with a symint argument."""
+        """The helpers the type pass handles over a symint argument: over
+        config values it records them (``config_value_symint``; ``cdiv`` in
+        device code stays arithmetic), and ``WalkDeviceAST.visit_Call`` reads
+        that symbol instead of calling them again; a host call over another
+        value takes a new unbacked symint."""
         from .._utils import cdiv
         from .._utils import next_power_of_2
 
@@ -2102,6 +2117,23 @@ class CallableType(LiteralType):
 
 def _raise_shape_specializing(*args: object) -> None:
     raise exc.ShapeSpecializingCall
+
+
+def _config_value_symbol(
+    env: CompileEnvironment, values: Sequence[object]
+) -> sympy.Symbol | None:
+    """The first symbol of ``config_value_expressions`` (by name) in the
+    SymInts among ``values``."""
+    for value in values:
+        if not isinstance(value, torch.SymInt):
+            continue
+        for symbol in sorted(value._sympy_().free_symbols, key=str):
+            if (
+                isinstance(symbol, sympy.Symbol)
+                and symbol in env.config_value_expressions
+            ):
+                return symbol
+    return None
 
 
 class PythonModuleType(LiteralType):

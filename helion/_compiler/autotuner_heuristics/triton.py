@@ -25,7 +25,6 @@ from ...autotuner.config_spec import LoopAxisFact
 from ...autotuner.config_spec import ReductionCategory
 from ...exc import InvalidConfig
 from ...runtime.config import Config
-from ..compile_environment import _symint_sympy_expr
 from .common import clamp_block_size_targets
 from .common import dedupe_configs
 from .common import matches_hardware
@@ -927,9 +926,9 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             info = env.block_sizes[bid]
             value = info.block_size_source.from_config(candidate, info)
             if isinstance(value, torch.SymInt):
-                expression = env.config_value_expressions.get(_symint_sympy_expr(value))
-                if expression is not None:
-                    value = expression.evaluate(candidate)
+                configured = env.config_value(value, candidate)
+                if configured is not None:
+                    value = configured
             assert isinstance(value, (int, torch.SymInt))
             out[bid] = max(1, env.size_hint(value))
         return out
@@ -4519,9 +4518,9 @@ class TritonReductionHeuristic(AutotunerHeuristic):
             info = env.block_sizes[block_id]
             value = info.block_size_source.from_config(default, info)
             if isinstance(value, torch.SymInt):
-                expression = env.config_value_expressions.get(_symint_sympy_expr(value))
-                if expression is not None:
-                    value = expression.evaluate(default)
+                configured = env.config_value(value, default)
+                if configured is not None:
+                    value = configured
             if isinstance(value, (int, torch.SymInt)) and env.size_hint(value) > 1:
                 return True
         return False

@@ -364,8 +364,17 @@ class ConfigGeneration:
             else:
                 assert len(indices) == 1
                 field = self.flat_spec[indices[0]]
-                if isinstance(field, ListOf) and not isinstance(value, list):
-                    value = [_copy_config_structure(value) for _ in range(field.length)]
+                if isinstance(field, ListOf):
+                    if not isinstance(value, list):
+                        value = [
+                            _copy_config_structure(value) for _ in range(field.length)
+                        ]
+                    elif len(value) != field.length:
+                        # A per-op list saved for a kernel with more or fewer
+                        # slots of it (the loads of a loop graph this version
+                        # drops came last): keep the slots the kernel has,
+                        # and fill a missing one with its default.
+                        value = [*value[: field.length], *field.default()[len(value) :]]
                 result[indices[0]] = _copy_config_structure(value)
         self.extension.repair_flat_config(result)
         return result

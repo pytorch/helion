@@ -26,6 +26,7 @@ from .tile_strategy import CompactedShape
 from .tile_strategy import DeviceLoopState
 from .tile_strategy import PerThreadNDTileStrategy
 from .tile_strategy import TileStrategy
+from .tile_strategy import compacted_dim_groups
 
 if TYPE_CHECKING:
     from collections.abc import ItemsView
@@ -434,9 +435,23 @@ class TileStrategyDispatch:
                 if block_size is None:
                     block_size = "1"
                 compacted_shapes.append(CompactedShape(block_size, [idx], [block_idx]))
-        for strategy in self.strategies:
-            compacted_shapes = strategy.compact_shape(compacted_shapes)
-        return compacted_shapes
+        # Unlike ``physical_dims``, this groups a flattened tile on every
+        # backend.
+        # TODO(jansel): we should combine size==1 dimensions of N-D tiles here
+        output = []
+        for group in self._dim_groups([shape.block_ids for shape in compacted_shapes]):
+            shape = compacted_shapes[group[0]]
+            for index in group[1:]:
+                shape = shape.combine(compacted_shapes[index])
+            output.append(shape)
+        return output
+
+    def _dim_groups(self, dim_block_ids: Sequence[Sequence[int]]) -> list[list[int]]:
+        """``compacted_dim_groups`` over the runs of every strategy."""
+        return compacted_dim_groups(
+            dim_block_ids,
+            [strategy.compacted_block_ids() for strategy in self.strategies],
+        )
 
     def _get_shape_string(self, shape: SymIntLike) -> str:
         """Get string representation of a shape"""
@@ -493,6 +508,56 @@ class TileStrategyDispatch:
     def shape_dims(self, shape: ShapeLike) -> list[str]:
         compacted_shapes = self.compact_shape(shape)
         return [s.size_str for s in compacted_shapes]
+
+    def physical_dims(self, shape: ShapeLike) -> list[list[int]]:
+        """The logical dims of ``shape`` that each physical dimension holds.
+
+        Where a flattened tile's dims share one index
+        (``Backend.flattened_tile_shares_one_index``) they are one dimension,
+        grouped by their blocks as in ``compact_shape``; elsewhere every dim is
+        its own.
+        """
+        env = CompileEnvironment.current()
+        if not env.backend.flattened_tile_shares_one_index():
+            return [[index] for index in range(len(shape))]
+        block_ids = [env.resolve_block_id(size) for size in shape]
+        return self._dim_groups(
+            [[] if block_id is None else [block_id] for block_id in block_ids]
+        )
+
+    def physical_keys(self, shape: ShapeLike, keys: Sequence[str]) -> list[str]:
+        """``keys``, one per logical dim of ``shape``, for its physical dims:
+        a flattened tile's dims share one dimension and its key.
+
+        Where no dims share one (``Backend.flattened_tile_shares_one_index``)
+        the keys are the physical ones as they are, whatever the shape:
+        Pallas's pre-broadcast rewrites ``m[:, :, None]`` to ``m[:, :]`` on a
+        value that keeps its trailing dim, so it has fewer keys than dims.
+        """
+        if not CompileEnvironment.current().backend.flattened_tile_shares_one_index():
+            return [*keys]
+        return [keys[dims[0]] for dims in self.physical_dims(shape)]
+
+    def physical_dim(self, shape: ShapeLike, dim: int) -> int:
+        """The physical dimension holding logical dim ``dim`` of ``shape``.
+
+        The dims after a flattened tile move down; a negative ``dim`` gives a
+        negative index.  A dim of a flattened tile has no physical dimension
+        of its own: an op along it (a reduction or scan over one dim of the
+        tile) is refused.
+        """
+        physical_dims = self.physical_dims(shape)
+        user_index = dim + len(shape) if dim < 0 else dim
+        for index, user_indices in enumerate(physical_dims):
+            if user_index in user_indices:
+                if len(user_indices) > 1:
+                    raise exc.InvalidConfig(
+                        f"An operation along dim {dim} of a flattened tile "
+                        "needs that dim on its own physical dimension. Disable "
+                        "flatten_loops for the affected tile axes."
+                    )
+                return index - len(physical_dims) if dim < 0 else index
+        raise AssertionError(f"dim {dim} out of range for shape {[*shape]}")
 
     def supports_index_rank_expansion(self) -> bool:
         return all(

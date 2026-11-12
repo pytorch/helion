@@ -269,6 +269,12 @@ These exceptions occur when Helion language functions are used incorrectly with 
 .. autoclass:: TunableNameConflict
 
    Raised for duplicate tunable parameter names.
+
+.. autoclass:: TunableSpecialized
+
+   Raised when a tunable, or a value a helper computes from it, would be
+   evaluated at its hint while the kernel is traced, so every config would
+   compute with the hint.
 ```
 
 ## Language and Syntax Errors

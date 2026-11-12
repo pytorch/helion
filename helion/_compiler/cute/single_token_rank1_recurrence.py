@@ -537,25 +537,6 @@ def _contiguous_tail(tensor: torch.Tensor, rank: int) -> bool:
     return True
 
 
-def _reduction_signature(info: GraphInfo) -> tuple[tuple[int, ...] | None, ...] | None:
-    calls = [node for node in info.graph.nodes if node.op == "call_function"]
-    result: list[tuple[int, ...] | None] = []
-    for node in calls:
-        if node.kwargs:
-            return None
-        if node.target is torch.ops.aten.sum.default and len(node.args) == 1:
-            result.append(None)
-        elif (
-            node.target is torch.ops.aten.sum.dim_IntList
-            and len(node.args) == 2
-            and isinstance(node.args[1], (list, tuple))
-        ):
-            result.append(tuple(node.args[1]))
-        else:
-            return None
-    return tuple(result)
-
-
 def _match_rank1_else(
     info: GraphInfo,
 ) -> (
@@ -1044,7 +1025,6 @@ def _plan_single_token_rank1_recurrence(
     from ..device_function import DeviceFunction
     from ..device_ir import ElseGraphInfo
     from ..device_ir import IfGraphInfo
-    from ..device_ir import ReductionLoopGraphInfo
     from ..device_ir import RootGraphInfo
     from ..host_function import HostFunction
 
@@ -1060,20 +1040,14 @@ def _plan_single_token_rank1_recurrence(
     roots = [info for info in graphs if isinstance(info, RootGraphInfo)]
     if_graphs = [info for info in graphs if isinstance(info, IfGraphInfo)]
     else_graphs = [info for info in graphs if isinstance(info, ElseGraphInfo)]
-    reductions = [info for info in graphs if isinstance(info, ReductionLoopGraphInfo)]
+    # No reduction loop graphs: the root's branch cannot roll the several
+    # loops the else branch's sums need, so the reduction dim stays persistent
+    # and the device IR drops the loops (``register_rollable_reductions``).
     if (
-        len(graphs) != 7
+        len(graphs) != 3
         or len(roots) != 1
         or len(if_graphs) != 1
         or len(else_graphs) != 1
-        or len(reductions) != 4
-    ):
-        return None
-    reduction_signatures = sorted(
-        (_reduction_signature(info) for info in reductions), key=repr
-    )
-    if reduction_signatures != sorted(
-        ((None,), (None,), ((-1,),), ((1,), (1,))), key=repr
     ):
         return None
     root = roots[0]

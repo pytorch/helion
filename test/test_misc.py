@@ -1422,6 +1422,12 @@ class TestMisc(RefEagerTestBase, TestCase):
         if _get_backend() == "triton":
             self.assertIn("tl.sort", code)
 
+    @skipIfXPU(
+        "Intel's Triton compiler fails an assertion in its "
+        "TritonIntelGPURemoveLayoutConversions pass for a scan of a sort's output "
+        "when one constant is used before and after the sort, as the sort keys' "
+        "encoding and decoding do"
+    )
     def test_torch_sort_then_cumsum(self):
         """Test that torch.sort result can be used as input to torch.cumsum.
 
@@ -1459,7 +1465,9 @@ class TestMisc(RefEagerTestBase, TestCase):
         When only values from torch.sort() are used, the compiler should
         skip generating the rank-based argsort code (which creates
         O(N^2) intermediate tensors and would exceed Triton's 1M element limit
-        for large N).
+        for large N). On Triton, 32-bit values never rank: their indices come
+        from sorting packed value/index keys. 64-bit values rank only for used
+        indices (test_triton_selection.py).
         """
 
         @helion.kernel()
@@ -1481,7 +1489,7 @@ class TestMisc(RefEagerTestBase, TestCase):
             # Argsort rank computation should NOT be present
             self.assertNotIn("tl.sum(tl.where(", code)
 
-        # Contrast: when indices ARE used, argsort code must be generated
+        # Contrast: the indices are used
         @helion.kernel()
         def sort_with_indices_kernel(
             x: torch.Tensor,
@@ -1500,8 +1508,9 @@ class TestMisc(RefEagerTestBase, TestCase):
         torch.testing.assert_close(vals2, ref_vals2)
         torch.testing.assert_close(idx2, ref_idx2)
         if _get_backend() == "triton":
-            # Argsort rank computation SHOULD be present when indices are used
-            self.assertIn("tl.sum(tl.where(", code2)
+            # Sorted value/index keys give the indices, without ranks
+            self.assertIn("tl.sort", code2)
+            self.assertNotIn("tl.sum(tl.where(", code2)
 
     def test_cumsum_does_not_alias_input(self):
         """Regression test: torch.cumsum output must not alias its input.

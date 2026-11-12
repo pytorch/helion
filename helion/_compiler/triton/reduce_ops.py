@@ -27,6 +27,10 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     dim = state.proxy_arg(2)
     keep_dims = state.proxy_arg(3)
     is_tuple_input = state.proxy_arg(4)
+    if dim is not None:
+        dim = state.tile_strategy.physical_dim(
+            [*state.proxy_tensor_arg(1).size()], cast("int", dim)
+        )
 
     # Input tensor is already masked, so we can use it directly
     if is_tuple_input:

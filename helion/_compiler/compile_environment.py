@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import builtins
 import collections
 import contextlib
 import contextvars
@@ -8,8 +9,10 @@ import dataclasses
 import itertools
 import logging
 import math
+import os
 import sys
 import threading
+import traceback
 import types
 import typing
 from typing import TYPE_CHECKING
@@ -35,6 +38,10 @@ from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.fx.experimental.symbolic_shapes import StatelessSymbolicContext
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 from torch.utils import _pytree as pytree
+from torch.utils._sympy.functions import FloorDiv
+from torch.utils._sympy.numbers import int_oo
+from torch.utils._sympy.value_ranges import ValueRanges
+from torch.utils._sympy.value_ranges import bound_sympy
 
 from .. import exc
 from .._compat import is_hip
@@ -114,7 +121,40 @@ class ConfigValueExpression:
         if self.operation == "next_power_of_2":
             assert len(args) == 1
             return next_power_of_2(args[0])
+        if self.operation == "min":
+            return min(args)
+        if self.operation == "max":
+            return max(args)
+        if self.operation == "add":
+            return sum(args)
+        if self.operation == "mul":
+            return math.prod(args)
+        if self.operation == "floordiv":
+            assert len(args) == 2
+            return args[0] // args[1]
         raise ValueError(f"unknown config expression operation {self.operation!r}")
+
+    def __str__(self) -> str:
+        """The expression as kernel code spells it (``next_power_of_2(foo)``,
+        ``(foo + 1)``)."""
+        args = [str(arg) for arg in self.arguments]
+        if self.operation == "config":
+            return args[0]
+        infix = {"add": " + ", "mul": " * ", "floordiv": " // "}.get(self.operation)
+        if infix is not None:
+            return f"({infix.join(args)})"
+        return f"{self.operation}({', '.join(args)})"
+
+    def config_keys(self) -> list[str]:
+        """The config keys the expression reads, in order: the tunables
+        under a value a helper computes from them."""
+        keys = []
+        for arg in self.arguments:
+            if isinstance(arg, ConfigValueExpression):
+                keys.extend(arg.config_keys())
+            elif isinstance(arg, str):
+                keys.append(arg)
+        return keys
 
 
 @dataclasses.dataclass
@@ -432,10 +472,12 @@ def _make_numel_check(
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from collections.abc import Set as AbstractSet
     from types import TracebackType
     from typing_extensions import Self
 
     from torch._guards import Source
+    from torch.fx.experimental.symbolic_shapes import ShapeGuard
 
     from .. import Config
     from ..autotuner.config_fragment import ConfigSpecFragment
@@ -490,6 +532,83 @@ def shape_env_var_hints(shape_env: ShapeEnv) -> dict[sympy.Symbol, sympy.Integer
     if (backed_var_to_val := getattr(shape_env, "backed_var_to_val", None)) is not None:
         return typing.cast("dict[sympy.Symbol, sympy.Integer]", backed_var_to_val)
     return shape_env.var_to_val  # pyrefly: ignore [deprecated]
+
+
+# The configs a test of config values is tried under, one by one, where the
+# ranges of the values do not decide it; past them it counts as failing.
+_CONFIGS_TRIED = 4096
+
+
+def _holds_for_sizes(
+    expr: sympy.Basic, ranges: dict[sympy.Expr, ValueRanges] | None = None
+) -> bool:
+    """Whether ``expr`` holds whenever each of its symbols in ``ranges`` lies
+    in its range and each other one is an integer of at least 2, as Helion
+    takes a symbolic size to be (its hint keeps ``x == 1`` checks false)."""
+    ranges = ranges or {}
+    shifted = expr.xreplace(
+        {
+            symbol: sympy.Add(
+                sympy.Dummy(integer=True, nonnegative=True), sympy.Integer(2)
+            )
+            for symbol in expr.free_symbols
+            if symbol not in ranges
+        }
+    )
+    if shifted is sympy.true:
+        return True
+    try:
+        bound = bound_sympy(
+            typing.cast("sympy.Expr", shifted),
+            {
+                typing.cast("sympy.Symbol", symbol): ranges.get(
+                    typing.cast("sympy.Expr", symbol), ValueRanges(0, int_oo)
+                )
+                for symbol in shifted.free_symbols
+            },
+        )
+    except (KeyError, AttributeError, NotImplementedError):
+        # A function bound_sympy has no rule for proves nothing.
+        return False
+    return bound.is_singleton() and bound.lower is sympy.true
+
+
+# Where torch and Helion live: the guards their code records take a symbolic
+# size to be at least 2, as Helion does throughout.
+_COMPILER_DIRS = tuple(
+    os.path.join(path, "")
+    for path in (
+        *torch.__path__,
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    )
+)
+
+
+def _in_builtin_call(location: object) -> bool:
+    """Whether ``location``, a guard's frame, is where Helion calls a
+    function the kernel's code calls (``_CheckForIndexCalls.retry_call``): a
+    builtin such as ``max`` compares there, in no frame of its own."""
+    return (
+        isinstance(location, traceback.FrameSummary)
+        and location.name == "retry_call"
+        and location.filename.endswith(os.path.join("language", "tile_proxy.py"))
+    )
+
+
+def _recorded_by_compiler(guard: ShapeGuard) -> bool:
+    """Whether torch's shape machinery or Helion's compiler recorded
+    ``guard`` (``Ne(u0, 1)`` when broadcasting a dim, a contiguity test, a
+    tile packing's ``extent != 1``), as opposed to a comparison the kernel's
+    own code makes: that records its frame (a helper defined outside the
+    kernel, say), or Helion's call of a builtin the kernel calls
+    (``max(foo, 2)``)."""
+    location = guard.sloc.framework_loc
+    return (
+        location is not None
+        and not isinstance(location, str)
+        and location.filename.startswith(_COMPILER_DIRS)
+        and not _in_builtin_call(location)
+    )
 
 
 # Legacy ShapeEnv unifier retained for Helion.
@@ -683,6 +802,30 @@ class CompileEnvironment:
         # be resolved for each candidate configuration.
         self.config_value_expressions: dict[sympy.Expr, ConfigValueExpression] = {}
         self.block_sizes: list[BlockSizeInfo] = []
+        # The reduction dims a subscript's static extent allocated
+        # (``new_index_result``) and, for each one a reduction was lowered
+        # over, the number of block sizes when the first such reduction was
+        # (``record_reduction_over``).  Older versions padded such a subscript
+        # to the power of two its extent rounds up to, unless a full slice of
+        # the extent had a dim of its own, so that reduction allocated a
+        # reduction dim of the power of two then, and the configs they saved
+        # have reduction_loops entries for those dims
+        # (``DeviceIR._record_legacy_reduction_loops``).
+        self.subscript_extent_block_ids: set[int] = set()
+        self.subscript_extent_reductions: dict[int, int] = {}
+        # The root device loop type propagation is typing
+        # (``TypePropagation.visit_For``); for each subscript extent's dim, the
+        # root loops whose subscripts typed it while its size was literal; the
+        # dims a full slice of their extent joined; and those a full slice
+        # joined in one of those loops.  Typed before a full slice of its
+        # extent in the same loop, such a subscript kept its padded size in
+        # older versions, and so did the reductions over it, also where the
+        # slice is inside a branch or an inner loop
+        # (``DeviceIR._padded_range_dims``).
+        self.typing_root_id: int | None = None
+        self.literal_subscript_roots: dict[int, set[int]] = {}
+        self.subscript_extents_joined_by_slice: set[int] = set()
+        self.subscript_extents_joined_in_loop: set[int] = set()
         self.debug_shape_renames: dict[sympy.Basic, sympy.Basic] = {}
         self._debug_shape_rename_override: contextvars.ContextVar[
             dict[sympy.Basic, sympy.Basic] | None
@@ -2010,7 +2153,10 @@ class CompileEnvironment:
         for symbol in expr.free_symbols:
             if not isinstance(symbol, sympy.Symbol):
                 return False
-            if symbol in self.specialized_vars:
+            if (
+                symbol in self.specialized_vars
+                or symbol in self.config_value_expressions
+            ):
                 continue
             origin_info = HostFunction.current().expr_to_origin.get(symbol)
             if origin_info is None:
@@ -2412,6 +2558,20 @@ class CompileEnvironment:
         info.literal_size = not guard
         return info
 
+    def padded_extent_dim(self, size: int) -> int | torch.SymInt:
+        """The dim of a static extent ``size`` whose lanes are padded to a
+        power of two (a tensor factory's, an ``hl.arange``'s).
+
+        A power of two is its own dim.  Any other extent is named by the
+        reduction dim of its size, allocated without a guard
+        (``BlockSizeInfo.literal_size``): a full slice of that size shares
+        it, so a reduction over it masks the padding lanes, while a dynamic
+        full slice that merely has the size at bind time keeps its own dim.
+        """
+        if size <= 0 or size == next_power_of_2(size):
+            return size
+        return self.allocate_reduction_dimension(size, guard=False).var
+
     def create_block_var(self, debug_name: str, hint: int = 64) -> torch.SymInt:
         source = _current_symbol_source()
         with self.shape_env.ignore_fresh_unbacked_symbols():
@@ -2605,12 +2765,20 @@ class CompileEnvironment:
         return [(size, dim) for dim, size in non_trivial] or [(1, None)]
 
     def new_index_result(
-        self, tensor: torch.Tensor, output_shape: typing.Sequence[int | torch.SymInt]
+        self,
+        tensor: torch.Tensor,
+        output_shape: typing.Sequence[int | torch.SymInt],
+        *,
+        keep_static_extents: bool = False,
     ) -> torch.Tensor:
         """Create tensor for indexing ops with normalized shapes.
 
         Uses size-based approach to normalize all dimensions that correspond
-        to block sizes to their canonical variables.
+        to block sizes to their canonical variables.  ``keep_static_extents``
+        keeps each static extent of a shape of only static dims, as a
+        subscript or view of a device tensor (``t[None, :]``, a gather of
+        one) has its tensor's extents, rather than padding it to a power of
+        two.
         """
         specialized_shape: list[int | torch.SymInt] = []
         for dim in output_shape:
@@ -2623,6 +2791,33 @@ class CompileEnvironment:
             specialized_shape.append(dim)
         # Normalize all dimensions to canonical block size variables
         shape = self._normalize_shape_to_block_vars(specialized_shape)
+        static = [dim for dim in shape if isinstance(dim, int)]
+        if (
+            keep_static_extents
+            and self.backend.pad_factory_tensors_to_power_of_2
+            and len(static) == len(shape)
+        ):
+            # ``new_empty`` pads every dim of a shape of only static dims to a
+            # power of two, but a view keeps its tensor's extents.  Name each
+            # static non-power-of-2 dim (a padded ``hl.arange``'s) as
+            # ``tensor_utils`` names the padded dim of a factory beside a tile,
+            # by the reduction dim of its size.  Small dims too, unlike there:
+            # ``hl.arange(5)`` is emitted over 8 lanes just as ``hl.arange(200)``
+            # is over 256, and a reduction over it must mask them.
+            count = len(self.block_sizes)
+            shape = [self.padded_extent_dim(dim) for dim in static]
+            self.subscript_extent_block_ids.update(range(count, len(self.block_sizes)))
+            if self.typing_root_id is not None:
+                for dim in shape:
+                    block_id = self.get_block_id(dim)
+                    if (
+                        block_id is not None
+                        and block_id in self.subscript_extent_block_ids
+                        and self.block_sizes[block_id].literal_size
+                    ):
+                        self.literal_subscript_roots.setdefault(block_id, set()).add(
+                            self.typing_root_id
+                        )
         return tensor.new_empty(shape)
 
     def resolve_fragment_global(
@@ -2731,6 +2926,63 @@ class CompileEnvironment:
         for _, witness in self._container_identities.values():
             witness.value = None
         self._container_identities.clear()
+
+    def renew_pinned_subscript_extents(self) -> None:
+        """Replace each subscript extent's dim that a guard pinned to its
+        padded size with a fresh dim of the same extent.
+
+        Type propagation types a load over a range, ``hl.load(x, [i, cols])``
+        in a grid kernel, with the padded power of two when no dim of the
+        range's extent exists yet.  A subscript of the range typed after it,
+        ``cols[None, :]``, then allocates that dim, and an op between the two
+        pins the dim's var to the power of two.  Device IR tracing types the
+        load again after the dim exists, so the load shares it, as when the
+        subscript comes first; a fresh dim lets it do so instead of reading
+        the pinned power of two.  No join record moves to the fresh dim
+        (``subscript_extents_joined_in_loop``): a full slice joining the dim
+        during type propagation clears its literal size, which renewal needs.
+        """
+        for block_id in sorted(self.subscript_extent_block_ids):
+            info = self.block_sizes[block_id]
+            size = info.size
+            if (
+                info.reduction
+                and info.literal_size
+                and isinstance(size, int)
+                and info.var._sympy_() == next_power_of_2(size)
+            ):
+                info.retire_reduction()
+                count = len(self.block_sizes)
+                self.padded_extent_dim(size)
+                self.subscript_extent_block_ids.update(
+                    range(count, len(self.block_sizes))
+                )
+
+    def record_full_slice_dim(self, block_id: int) -> None:
+        """Note that a full slice's dim is the reduction dim ``block_id``.
+
+        Only a subscript extent's dim (``subscript_extent_block_ids``) is
+        recorded, in ``subscript_extents_joined_by_slice``, and in
+        ``subscript_extents_joined_in_loop`` when the slice is in a root loop
+        whose subscripts typed the dim while its size was literal.  A
+        reduction over the extent joins the dim too, but older versions gave
+        the range's reads the slice's dim only.
+        """
+        if block_id not in self.subscript_extent_block_ids:
+            return
+        self.subscript_extents_joined_by_slice.add(block_id)
+        if self.typing_root_id in self.literal_subscript_roots.get(block_id, ()):
+            self.subscript_extents_joined_in_loop.add(block_id)
+
+    def record_reduction_over(self, block_id: int) -> None:
+        """Note a reduction over the reduction dim ``block_id``.
+
+        Only a subscript extent's dim (``subscript_extent_block_ids``) is
+        recorded: older versions could reduce over a dim of its next power
+        of two instead, allocated here unless one of that size existed.
+        """
+        if block_id in self.subscript_extent_block_ids:
+            self.subscript_extent_reductions.setdefault(block_id, len(self.block_sizes))
 
     def to_fake(self, obj: object, origin: Origin) -> object:
         # Importing autotuner at module scope cycles back to CompileEnvironment.
@@ -3055,6 +3307,369 @@ class CompileEnvironment:
             return None
         return max(int(hinted), 2)
 
+    def config_value_symint(self, expression: ConfigValueExpression) -> torch.SymInt:
+        """The unbacked symbol of the value ``expression`` computes from the
+        config, recorded in ``config_value_expressions``: one per distinct
+        expression, so a helper the type pass visits again (a loop body is
+        visited until its types settle) or calls twice keeps one symbol."""
+        symint = self.cached_create_unbacked_symint(("config_value", expression))
+        expr = _symint_expr(symint)
+        assert expr is not None
+        self.config_value_expressions[expr] = expression
+        return symint
+
+    def check_config_values_unspecialized(self) -> None:
+        """Raise TunableSpecialized when tracing has evaluated a value the
+        config sets (a tunable, or a helper over tunables) at its hint, which
+        every config would then compute with: when it replaced the value's
+        symbol by an integer, or guarded on it with a test some configs fail,
+        as a comparison in a function defined outside the kernel or in a
+        builtin the kernel calls does (``min(foo, 128)``).  This catches what
+        the type pass does not
+        record, such as a helper called with keyword arguments or through a
+        wrapper.  A replacement by another symbol (``assert n == foo`` on the
+        host) still computes with the config's value."""
+        for symbol, value in self.shape_env.replacements.items():
+            if symbol in self.config_value_expressions and isinstance(
+                value, sympy.Integer
+            ):
+                raise self.tunable_specialized(
+                    symbol, f", where tracing set {self._spelled(symbol)} to {value}"
+                )
+        for guard in self.shape_env.guards:
+            symbols = {
+                symbol
+                for symbol in self.config_value_expressions
+                if symbol in guard.expr.free_symbols
+            }
+            if symbols and not self._holds_for_every_config(guard, symbols):
+                where = (
+                    "(in a builtin the kernel calls)"
+                    if _in_builtin_call(guard.sloc.framework_loc)
+                    else guard.sloc
+                )
+                raise self.tunable_specialized(
+                    min(symbols, key=str),
+                    f", by the test {self._spelled(guard.expr)} {where}",
+                )
+
+    def _holds_for_every_config(
+        self, guard: ShapeGuard, symbols: AbstractSet[sympy.Expr]
+    ) -> bool:
+        """Whether ``guard`` holds under every config, its config value
+        ``symbols`` taking the values the configs give them and its other
+        symbols sizes.  A guard torch or Helion records about a size holds
+        where the size is at least 2, as Helion takes every symbolic size to
+        be, a size a tunable sets included (``Ne(u0, 1)`` beside a dim of
+        ``foo``); a comparison the kernel's code makes must hold for every
+        value the tunables take (``foo == 1`` with ``foo`` from 1 to 8 does
+        not)."""
+        if _recorded_by_compiler(guard) and _holds_for_sizes(guard.expr):
+            return True
+        return self._holds_for_config_values(guard.expr, symbols)
+
+    def _holds_for_config_values(
+        self, expr: sympy.Basic, symbols: AbstractSet[sympy.Expr]
+    ) -> bool:
+        """Whether ``expr`` holds for every value its config value ``symbols``
+        take, its other symbols sizes: by the tunables' ranges where they
+        decide it, else config by config."""
+        ranges = {}
+        for symbol in symbols:
+            bounds = self._config_value_bounds(self.config_value_expressions[symbol])
+            if bounds is None:
+                break
+            ranges[symbol] = ValueRanges(*bounds)
+        else:
+            if _holds_for_sizes(expr, ranges):
+                return True
+        return self._holds_for_each_config(expr, symbols)
+
+    def picked_by_every_config(
+        self, values: Sequence[int | torch.SymInt], op: object
+    ) -> int | None:
+        """The position of the argument of ``min(*values)`` (``max`` for
+        ``op``) that every config picks, when each is a config value:
+        ``min(foo, 8)`` is 8 where ``foo`` takes 16 to 256.  None when the
+        configs pick different ones, or another symbol occurs."""
+        exprs = [_to_sympy(value) for value in values]
+        if any(self.config_value_expression(expr) is None for expr in exprs):
+            return None
+        compare = sympy.Le if op is builtins.min else sympy.Ge
+        for position, candidate in enumerate(exprs):
+            relations = [compare(candidate, other) for other in exprs]
+            if sympy.false not in relations and all(
+                self._holds_for_config_values(
+                    relation,
+                    {
+                        symbol
+                        for symbol in relation.free_symbols
+                        if symbol in self.config_value_expressions
+                    },
+                )
+                for relation in relations
+            ):
+                return position
+        return None
+
+    def _config_value_bounds(
+        self, expression: int | str | ConfigValueExpression
+    ) -> tuple[int, int] | None:
+        """The least and greatest values ``expression`` takes over the
+        configs (its tunables' ranges), or None where they are not known."""
+        from ..autotuner.config_fragment import BaseIntegerFragment
+
+        if isinstance(expression, int):
+            return expression, expression
+        if isinstance(expression, str):
+            fragment = self.config_spec.user_defined_tunables.get(expression)
+            if isinstance(fragment, BaseIntegerFragment):
+                return fragment.low, fragment.high
+            return None
+        bounds = [self._config_value_bounds(arg) for arg in expression.arguments]
+        if any(bound is None for bound in bounds):
+            return None
+        lows = [typing.cast("tuple[int, int]", bound)[0] for bound in bounds]
+        highs = [typing.cast("tuple[int, int]", bound)[1] for bound in bounds]
+        operation = expression.operation
+        if operation == "config":
+            return lows[0], highs[0]
+        if operation in ("min", "max"):
+            pick = min if operation == "min" else max
+            return pick(lows), pick(highs)
+        if operation == "add":
+            return sum(lows), sum(highs)
+        if min(lows) < 0:
+            # The rules below are monotone over nonnegative operands only.
+            return None
+        if operation == "mul":
+            return math.prod(lows), math.prod(highs)
+        if operation == "next_power_of_2" and lows[0] >= 1:
+            return next_power_of_2(lows[0]), next_power_of_2(highs[0])
+        if operation == "cdiv" and lows[1] >= 1:
+            return -(-lows[0] // highs[1]), -(-highs[0] // lows[1])
+        if operation == "floordiv" and lows[1] >= 1:
+            return lows[0] // highs[1], highs[0] // lows[1]
+        return None
+
+    def _holds_for_each_config(
+        self, expr: sympy.Basic, symbols: AbstractSet[sympy.Expr]
+    ) -> bool:
+        """Whether ``expr`` holds under each config of the tunables its
+        config value ``symbols`` read, tried one by one, with its other
+        symbols sizes.  Past ``_CONFIGS_TRIED`` configs, or over a tunable
+        whose values are not listed, it does not hold."""
+        from ..autotuner.config_fragment import EnumFragment
+        from ..runtime.config import Config
+
+        expressions = {
+            symbol: self.config_value_expressions[symbol] for symbol in symbols
+        }
+        names = sorted({key for e in expressions.values() for key in e.config_keys()})
+        # Every value a config may hold: an enum's choices include those its
+        # search leaves out (``search_choices``), which a config can still name.
+        choices = [
+            (
+                list(fragment.choices)
+                if len(fragment.choices) <= _CONFIGS_TRIED
+                else None
+            )
+            if isinstance(fragment, EnumFragment)
+            else fragment.search_values(limit=_CONFIGS_TRIED)
+            for fragment in (
+                self.config_spec.user_defined_tunables[name] for name in names
+            )
+        ]
+        if (
+            any(values is None for values in choices)
+            or math.prod(len(typing.cast("list[object]", values)) for values in choices)
+            > _CONFIGS_TRIED
+        ):
+            return False
+        for values in itertools.product(*typing.cast("list[list[object]]", choices)):
+            config = Config.from_dict(dict(zip(names, values, strict=True)))
+            try:
+                substitutions = {
+                    symbol: sympy.Integer(expression.evaluate(config))
+                    for symbol, expression in expressions.items()
+                }
+            except (TypeError, ValueError, ZeroDivisionError):
+                return False
+            if not _holds_for_sizes(expr.xreplace(substitutions)):
+                return False
+        return True
+
+    def _spelled(self, expr: sympy.Basic) -> str:
+        """``expr`` with each config value spelled as the kernel computes it
+        (``Ne(foo, 1)``, ``next_power_of_2(foo)``)."""
+        return str(
+            expr.xreplace(
+                {
+                    symbol: sympy.Symbol(str(expression))
+                    for symbol, expression in self.config_value_expressions.items()
+                }
+            )
+        )
+
+    def tunable_specialized(
+        self, symbol: sympy.Expr, cause: str = ""
+    ) -> exc.TunableSpecialized:
+        """The refusal of the config value ``symbol`` evaluated at its hint,
+        naming the first tunable it reads, that tunable's hint and ``cause``,
+        what evaluated it (``", by the test Ne(foo, 1) (helpers.py:3 in f)"``)."""
+        name = self.config_value_expressions[symbol].config_keys()[0]
+        tunable = next(
+            leaf
+            for leaf, expression in self.config_value_expressions.items()
+            if expression == ConfigValueExpression("config", (name,))
+        )
+        return exc.TunableSpecialized(
+            name, shape_env_size_hint(self.shape_env, tunable), cause
+        )
+
+    def config_value_expression(
+        self, expr: sympy.Basic
+    ) -> int | ConfigValueExpression | None:
+        """``expr`` as an expression over config values: an integer, a symbol
+        with a recorded ``config_value_expressions`` entry, or sums, products,
+        floor divisions, minima and maxima of those (the argument ``foo * 2``
+        of a host helper over a tunable ``foo``, or ``min(foo, 100)`` written
+        in device code).  None when another symbol occurs."""
+        if not isinstance(expr, sympy.Expr):
+            return None
+        if (expression := self.config_value_expressions.get(expr)) is not None:
+            return expression
+        if isinstance(expr, sympy.Integer):
+            return int(expr)
+        if isinstance(expr, sympy.Add):
+            operation = "add"
+        elif isinstance(expr, sympy.Mul):
+            operation = "mul"
+        elif isinstance(expr, FloorDiv):
+            operation = "floordiv"
+        elif isinstance(expr, sympy.Min):
+            operation = "min"
+        elif isinstance(expr, sympy.Max):
+            operation = "max"
+        else:
+            return None
+        operands: list[int | ConfigValueExpression] = []
+        for arg in expr.args:
+            operand = self.config_value_expression(arg)
+            if operand is None:
+                return None
+            operands.append(operand)
+        return ConfigValueExpression(operation, tuple(operands))
+
+    def config_value(self, value: object, config: Config) -> int | None:
+        """``value`` as the integer ``config`` gives it, or None when it stays
+        dynamic.  Every ``hl.register_tunable`` symbol and host helper over
+        them takes its value from ``config`` (``config_value_expressions``),
+        and every block-size symbol its block's configured size, itself
+        resolved the same way (``block_size=[bs * 2]`` over
+        ``bs = hl.register_block_size(...)``); any other symbol leaves the
+        value dynamic: a dynamic input size, and a grid index or a tile's
+        ``begin``, ``end``, ``count`` or ``id``, which name a block too
+        (``get_block_id``) but take a value per tile at run time."""
+        return self._config_value(value, config, frozenset())
+
+    def config_may_fix(self, value: object) -> bool:
+        """Whether some config gives ``value`` an integer (``config_value``):
+        every symbol in it is a tunable or a host helper over them, or a
+        block-size symbol whose block's size a config may fix in turn."""
+        return self._config_may_fix(value, frozenset())
+
+    def _config_may_fix(self, value: object, resolving: frozenset[int]) -> bool:
+        expr = self._config_expr(value)
+        if expr is None or isinstance(expr, int):
+            return expr is not None
+        sources = self._config_sources(expr, resolving)
+        if sources is None:
+            return False
+        for source in sources.values():
+            if isinstance(source, ConfigValueExpression):
+                continue
+            block_size_source = self.block_sizes[source].block_size_source
+            if isinstance(
+                block_size_source, FixedBlockSizeSource
+            ) and not self._config_may_fix(
+                block_size_source.value, resolving | {source}
+            ):
+                return False
+        return True
+
+    @staticmethod
+    def _config_expr(value: object) -> int | sympy.Basic | None:
+        """``value`` as an int or a sympy expression; None for a bool or a
+        value of another type."""
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, torch.SymInt):
+            return value._sympy_()
+        if isinstance(value, sympy.Basic):
+            return value
+        return None
+
+    def _config_sources(
+        self, expr: sympy.Basic, resolving: frozenset[int]
+    ) -> dict[sympy.Symbol, ConfigValueExpression | int] | None:
+        """Each symbol in ``expr`` with what gives it a value under a config:
+        the expression of a tunable or a host helper over them
+        (``config_value_expressions``), or the id of a block-size symbol's
+        block not in ``resolving``.  None when another symbol is in it."""
+        sources: dict[sympy.Symbol, ConfigValueExpression | int] = {}
+        for symbol in expr.free_symbols:
+            if not isinstance(symbol, sympy.Symbol):
+                return None
+            if (expression := self.config_value_expressions.get(symbol)) is not None:
+                sources[symbol] = expression
+                continue
+            block_id = self._block_size_block_id(symbol)
+            if block_id is None or block_id in resolving:
+                return None
+            sources[symbol] = block_id
+        return sources
+
+    @staticmethod
+    def _block_size_block_id(symbol: sympy.Symbol) -> int | None:
+        """The block whose block-size symbol ``symbol`` is (``BlockSizeOrigin``,
+        not a grid index or a tile's ``begin`` / ``end`` / ``id``)."""
+        from .host_function import HostFunction
+
+        origin_info = HostFunction.current().expr_to_origin.get(symbol)
+        if origin_info is not None and isinstance(origin_info.origin, BlockSizeOrigin):
+            return origin_info.origin.block_id
+        return None
+
+    def _config_value(
+        self, value: object, config: Config, resolving: frozenset[int]
+    ) -> int | None:
+        expr = self._config_expr(value)
+        if expr is None or isinstance(expr, int):
+            return expr
+        sources = self._config_sources(expr, resolving)
+        if sources is None:
+            return None
+        substitutions: dict[sympy.Basic, sympy.Integer] = {}
+        for symbol, source in sources.items():
+            if isinstance(source, ConfigValueExpression):
+                size = source.evaluate(config)
+            else:
+                size = self._config_value(
+                    self.block_sizes[source].from_config(config),
+                    config,
+                    resolving | {source},
+                )
+                if size is None:
+                    return None
+            substitutions[symbol] = sympy.Integer(size)
+        resolved = sympy.sympify(expr.xreplace(substitutions))
+        if not isinstance(resolved, sympy.Integer):
+            resolved = sympy.simplify(resolved)
+        return int(resolved) if isinstance(resolved, sympy.Integer) else None
+
     def size_hint(self, n: int | torch.SymInt) -> int:
         if isinstance(n, torch.SymInt):
             expr = n._sympy_()
@@ -3065,6 +3680,21 @@ class CompileEnvironment:
                 # This preserves the original value passed to the kernel.
                 if expr in var_hints:
                     return int(var_hints[expr])
+                # A min or max over config values and sizes (``min(foo,
+                # 32)``) takes the value their hints give it, as Python's min
+                # would.
+                if isinstance(expr, (sympy.Min, sympy.Max)) and (
+                    free_unbacked_symbols(expr) <= self.config_value_expressions.keys()
+                ):
+                    hinted = expr.xreplace(
+                        {
+                            symbol: var_hints[symbol]
+                            for symbol in expr.free_symbols
+                            if symbol in var_hints
+                        }
+                    )
+                    if isinstance(hinted, sympy.Integer):
+                        return int(hinted)
                 # Fall back to default hint if not found
                 return 8192
 
@@ -3302,6 +3932,12 @@ class CompileEnvironment:
             ),
             None,
         )
+
+    def pin_unflattened_along(self, size: int | torch.SymInt) -> None:
+        """For an op along a dim of extent ``size``: pin the loop of the tile
+        it measures unflattened (``BlockSizeInfo.pin_unflattened``)."""
+        if (block_id := self.resolve_block_id(size)) is not None:
+            self.block_sizes[block_id].pin_unflattened()
 
     def resolve_block_id(self, size: object) -> int | None:
         """Resolve the block id carried by ``size``'s symbolic provenance."""
@@ -3597,6 +4233,15 @@ class BlockSizeInfo:
         spec = CompileEnvironment.current().config_spec
         return spec.flatten_loops.config_get(config.flatten_loops, self.block_id, False)
 
+    def pin_unflattened(self) -> None:
+        """Pin this tile's loop unflattened for an op along its dim
+        (``pin_unflattened_loops``): where a flattened tile's dims share one
+        index (``Backend.flattened_tile_shares_one_index``), none of them is a
+        dim of its own."""
+        env = CompileEnvironment.current()
+        if self.is_tile and env.backend.flattened_tile_shares_one_index():
+            env.config_spec.pin_flatten_loop(self.block_id)
+
     def update_min_block(self, value: int, *, allow_flattened: bool = True) -> None:
         spec = CompileEnvironment.current().config_spec
         if not allow_flattened:
@@ -3742,6 +4387,29 @@ def _to_sympy(x: int | torch.SymInt | sympy.Expr) -> sympy.Expr:
         return x
     # type: ignore [missing-attribute]
     return sympy.sympify(x)
+
+
+def compute_symbolic_min_max(
+    args: tuple[int | torch.SymInt, ...], op: object
+) -> torch.SymInt | int:
+    env = CompileEnvironment.current()
+    # Over config values, the argument every config picks is the value.
+    if (position := env.picked_by_every_config(args, op)) is not None:
+        return args[position]
+    shape_env = env.shape_env
+    sympy_op = sympy.Min if op is builtins.min else sympy.Max
+    hint_fn = min if op is builtins.min else max
+
+    expr = _to_sympy(args[0])
+    hint = env.size_hint(args[0])
+
+    for arg in args[1:]:
+        rhs_expr = _to_sympy(arg)
+        rhs_hint = env.size_hint(arg)
+        expr = sympy_op(expr, rhs_expr)  # type: ignore[call-arg]
+        hint = hint_fn(hint, rhs_hint)  # type: ignore[arg-type]
+
+    return shape_env.create_symintnode(expr, hint=hint)  # type: ignore[return-value]
 
 
 def _symint_expr(x: torch.SymInt) -> sympy.Expr | None:

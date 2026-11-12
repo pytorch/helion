@@ -230,6 +230,13 @@ def memory_write_target(node: Node) -> Argument | None:
     return None
 
 
+def reaches_through_pointers(target: object) -> bool:
+    """Whether a memory op's ``target`` (its first argument) is a stack
+    tensor, ``(tensor_like, dev_ptrs)``: the op reaches whatever memory its
+    device pointers name, which no storage of the kernel bounds."""
+    return isinstance(target, (list, tuple))
+
+
 def opaque_access_target(node: Node) -> Argument | None:
     """What an op with side effects that is no load, store, atomic or control
     flow may read and write: every input it gets that may name the kernel's
