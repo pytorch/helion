@@ -6516,6 +6516,33 @@ def lane_center_scale(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="metal", static_shapes=True)
+def grid_online_attention(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float
+) -> torch.Tensor:
+    """One query row per program attending over every key with an online
+    softmax: each key tile's scores are a reduction over the head dim, and
+    the narrow key tile is read again after the max."""
+    rows, d = q.size()
+    keys = k.size(0)
+    out = torch.empty_like(q)
+    for row in hl.grid(rows):
+        qv = q[row, :].to(torch.float32) * scale
+        m = hl.full([1], float("-inf"), dtype=torch.float32)
+        denom = hl.zeros([1], dtype=torch.float32)
+        acc = hl.zeros([d], dtype=torch.float32)
+        for tile_s in hl.tile(keys):
+            scores = (k[tile_s, :].to(torch.float32) * qv[None, :]).sum(-1)
+            m_new = torch.maximum(m, scores.amax(-1, keepdim=True))
+            p = torch.exp(scores - m_new)
+            alpha = torch.exp(m - m_new)
+            denom = denom * alpha + p.sum(-1, keepdim=True)
+            acc = acc * alpha + (p[:, None] * v[tile_s, :].to(torch.float32)).sum(0)
+            m = m_new
+        out[row, :] = (acc / denom).to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
 def lane_counts(x: torch.Tensor) -> torch.Tensor:
     m, n = x.size()
     out = torch.empty([3, m], dtype=torch.int64, device=x.device)
@@ -6687,6 +6714,33 @@ class TestMetalLaneArrays(unittest.TestCase):
             atol=1e-2,
             rtol=1e-2,
         )
+
+    def test_arrays_one_per_slice_lane(self) -> None:
+        """At the default config the 128-wide head dim is 16 threads by 8
+        slice lanes, and each key tile's bfloat keys go in an array indexed
+        by the key lane.  The jam over the slice lanes gives each its own
+        array: one shared array kept the last slice's keys for every slice.
+        With 512 threads the head dim needs no slice lanes."""
+        q = torch.randn(4, 128, device=DEVICE, dtype=torch.bfloat16)
+        k, v = (torch.randn(64, 128, device=DEVICE, dtype=torch.bfloat16) for _ in "kv")
+        scale = 128**-0.5
+        qd, kd, vd = (t.cpu().double() for t in (q, k, v))
+        expected = torch.softmax(qd @ kd.T * scale, -1) @ vd
+        for config, slices in (
+            (helion.Config(block_sizes=[32], num_warps=4), True),
+            (helion.Config(block_sizes=[4], num_warps=16), False),
+        ):
+            with self.subTest(config=config):
+                out, code, msl = _run_with_msl(
+                    grid_online_attention, (q, k, v, scale), config
+                )
+                torch.testing.assert_close(
+                    out.cpu().double(), expected, atol=1e-2, rtol=1e-2
+                )
+                self.assertEqual("slice_lane_" in code, slices)
+                if slices:
+                    self.assertIn("_metal_lane_put(", code)
+                    self.assertRegex(msl, r"bfloat \w+_lanes__lane7\[")
 
 
 @_requires_darwin
@@ -9328,6 +9382,45 @@ class TestMetalLaneFoldRewrite(unittest.TestCase):
                 static_cast(half, carry__lane2),
             )
             store(best, lane_fold_1)
+            """
+        self.assertEqual(got, ast.unparse(ast.parse(textwrap.dedent(expected))))
+
+    def test_lane_arrays_one_per_lane(self) -> None:
+        """An array stored at an index other than the lane, from a
+        lane-dependent value, is one array per lane; one indexed by the lane
+        itself stays shared."""
+        got = self._unroll(
+            """
+            for slice_lane_1 in range(2):
+                indices_1 = tid[0] + slice_lane_1 * 16
+                keys = _metal_lane_array('bfloat', 4)
+                by_lane = _metal_lane_array('bfloat', 2)
+                for lane_2 in range(4):
+                    k = load(x, indices_1, lane_2)
+                    _metal_lane_put(keys, lane_2, k)
+                    _metal_lane_put(by_lane, slice_lane_1, k)
+                    lane_fold = _metal_lane_fold('sum', k, slice_lane_1, 'float')
+                for lane_2 in range(4):
+                    store(out, indices_1, _metal_lane_get(keys, lane_2))
+            """
+        )
+        expected = """
+            indices_1__lane0 = tid[0] + 0 * 16
+            indices_1__lane1 = tid[0] + 1 * 16
+            keys__lane0 = _metal_lane_array('bfloat', 4)
+            keys__lane1 = _metal_lane_array('bfloat', 4)
+            by_lane = _metal_lane_array('bfloat', 2)
+            for lane_2 in range(4):
+                k__lane0 = load(x, indices_1__lane0, lane_2)
+                k__lane1 = load(x, indices_1__lane1, lane_2)
+                _metal_lane_put(keys__lane0, lane_2, k__lane0)
+                _metal_lane_put(keys__lane1, lane_2, k__lane1)
+                _metal_lane_put(by_lane, 0, k__lane0)
+                _metal_lane_put(by_lane, 1, k__lane1)
+                lane_fold = static_cast(float, k__lane0) + static_cast(float, k__lane1)
+            for lane_2 in range(4):
+                store(out, indices_1__lane0, _metal_lane_get(keys__lane0, lane_2))
+                store(out, indices_1__lane1, _metal_lane_get(keys__lane1, lane_2))
             """
         self.assertEqual(got, ast.unparse(ast.parse(textwrap.dedent(expected))))
 

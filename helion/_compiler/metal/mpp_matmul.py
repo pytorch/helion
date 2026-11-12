@@ -105,6 +105,7 @@ from .factored_dims import widened_iota
 from .free_arange import live_graphs
 from .lane_fold import BF16_CAST
 from .lane_fold import LANE_FOLD
+from .lane_fold import LANE_PUT
 from .lane_fold import MAX_LANE_COPIES
 from .lane_fold import LaneArrayBudget
 from .lane_fold import LaneJam
@@ -4436,7 +4437,7 @@ def _loads_first(
         load = cast("ast.Call", _tl_load(value))
         first += [
             s,
-            statement_from_string(f"_metal_lane_put({array}, {lane}, {name})"),
+            statement_from_string(f"{LANE_PUT}({array}, {lane}, {name})"),
         ]
         read = f"_metal_lane_get({array}, {lane})"
         masked = _load_mask_other(load)
