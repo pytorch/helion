@@ -46,6 +46,7 @@ from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
 from helion._testing.cute_flash import compiled_source
+import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -693,12 +694,44 @@ def test_empty_kv_tiles_store_zero() -> None:
 
 
 @_gpu_test
+@pytest.mark.parametrize(
+    ("index", "d"), [("q", 64), ("kv", 256)], ids=["one_cta", "pair"]
+)
+def test_table_starting_inside_its_storage(index: str, d: int) -> None:
+    """An fp16 bias table viewed one element into its storage (a 2-byte
+    aligned base) read along the lanes -- by ``q_idx`` in the 1-CTA kernel's
+    transposed frame, by ``kv_idx`` in the pair kernel's dQ clusters -- is
+    loaded in single elements: the 16-byte vector load faulted with a
+    misaligned address."""
+    full = torch.randn(257, device=DEVICE, dtype=torch.float16)
+    bias = full[1:]
+
+    def score_mod(score, b, h, q_idx, kv_idx):
+        return score + hl.load(bias, [q_idx if index == "q" else kv_idx])
+
+    def ref_score_mod(score, b, h, q_idx, kv_idx):
+        return score + bias[q_idx if index == "q" else kv_idx]
+
+    got, ref, code = _run(
+        b=1,
+        hq=2,
+        hkv=2,
+        m=256,
+        n=256,
+        d=d,
+        score_mod=score_mod,
+        mask_mod=_causal,
+        ref_score_mod=ref_score_mod,
+    )
+    assert "_cute_flex_load_vec(_flash_aux0.iterator" in code
+    _assert_close(got, ref)
+
+
+@_gpu_test
 def test_score_mod_table_gather() -> None:
     bias = torch.randn((2, 1023), device=DEVICE, dtype=torch.float32)
 
     def score_mod(score, b, h, q_idx, kv_idx):
-        import helion.language as hl
-
         return score + hl.load(bias, [h, q_idx - kv_idx + 511])
 
     def ref_score_mod(score, b, h, q_idx, kv_idx):
@@ -772,8 +805,6 @@ def test_gathered_table_score_mod(aux_smem: int) -> None:
     bias = torch.randn((2, 7), device=DEVICE, dtype=torch.float32)
 
     def score_mod(score, b, h, q_idx, kv_idx):
-        import helion.language as hl
-
         dist = hl.load(index, [b, q_idx, kv_idx])
         return score + hl.load(bias, [h, dist])
 
@@ -1175,8 +1206,6 @@ def test_head_dim_256_pair_table_bias(bias_fold: int) -> None:
     bias = torch.randn((4, 1279), device=DEVICE, dtype=torch.float32)
 
     def score_mod(score, b, h, q_idx, kv_idx):
-        import helion.language as hl
-
         return score + hl.load(bias, [h, q_idx - kv_idx + 639])
 
     def ref_score_mod(score, b, h, q_idx, kv_idx):
