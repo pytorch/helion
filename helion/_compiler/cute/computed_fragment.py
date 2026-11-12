@@ -63,6 +63,8 @@ from .fragment_shared_arena import SharedArenaRequest
 from .fragment_shared_arena import plan_shared_arena
 from .full_reduction_owner import fragment_store_destinations
 from .full_reduction_owner import requires_full_reduction_owner
+from .handler_ops import integer_to_float_expr
+from .handler_ops import scalar_value_dtype
 from .local_atomic import local_atomic_allocations
 from .local_atomic import prove_local_atomics
 from .matmul_utils import cute_static_k_invariant_extent
@@ -205,7 +207,15 @@ class FragmentOps(GenerateASTFromInductor):
         # Fragment loads and shared buffers contain logical typed scalars.
         # The parent handler's FP8 byte decoder belongs to ordinary raw-byte
         # global loads; applying it to a typed Float8 register corrupts its bits.
-        return self._lift(self._create_cast_expr(x, dtype))
+        # An integer or a bool still becomes a float as in the pointwise
+        # lowering, where MLIR could fold an 8-bit float conversion into it.
+        x_ast = self._to_ast(x)
+        converted = integer_to_float_expr(
+            x_ast, dtype, src_dtype, self.cg.device_function
+        )
+        if converted is not None:
+            return self._lift(converted)
+        return self._lift(self._create_cast_expr(x_ast, dtype))
 
     def index_expr(self, expr: sympy.Expr, dtype: torch.dtype) -> str:
         return self._lift(
@@ -223,6 +233,20 @@ class FragmentCompiler(
     """The computed-fragment root owner: the graph walk and node dispatch over
     the general-purpose fragment emitters, plus the inductor-backed pointwise
     lowering of a fragment node."""
+
+    def convert(
+        self, expression: str, source: torch.dtype | None, dtype: torch.dtype
+    ) -> str:
+        """``expression``, of dtype ``source``, cast to ``dtype``: an integer
+        or a bool becomes a float as in the pointwise lowering
+        (``integer_to_float_expr``), where MLIR could fold an 8-bit float
+        conversion into it."""
+        converted = integer_to_float_expr(
+            expr_from_string(expression), dtype, source, self.cg.device_function
+        )
+        if converted is None:
+            return self.cast(expression, dtype)
+        return ast.unparse(converted)
 
     def pointwise_read(
         self,
@@ -916,7 +940,9 @@ class FragmentCompiler(
             return Fragment(
                 self.shape(fake.shape),
                 fake.dtype,
-                lambda coords: self.cast(f"({offset}) + ({coords[0]})", fake.dtype),
+                lambda coords: self.convert(
+                    f"({offset}) + ({coords[0]})", self.env.index_dtype, fake.dtype
+                ),
                 logical_domain=lambda coords: (
                     f"({offset}) + ({coords[0]}) < ({bound})",
                 ),
@@ -979,7 +1005,13 @@ class FragmentCompiler(
             result = Fragment(
                 shape,
                 fake.dtype,
-                lambda _: self.cast(self.scalar(value), fake.dtype),
+                lambda _: self.convert(
+                    self.scalar(value),
+                    value.dtype
+                    if isinstance(value, Fragment)
+                    else scalar_value_dtype(value),
+                    fake.dtype,
+                ),
                 dependencies=(value,) if isinstance(value, Fragment) else (),
                 logical_domain=(
                     lambda coords: tuple(

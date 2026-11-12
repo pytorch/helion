@@ -539,9 +539,15 @@ def test_packed_atomic_epilogue_respects_the_target_capability(
         (64, 1024), dtype=torch.float16 if dtype is torch.float32 else dtype
     )
     y = torch.empty((1024, 128), dtype=x.dtype)
+    config = _vector_epilogue_config()
+    if capability is not None and capability < (9, 0):
+        # Below sm_90 libNVVM compiles 48 KiB of static shared memory, so the
+        # four-stage ring (57344 bytes) is refused at codegen there; three
+        # stages (45056 bytes) compile.
+        config = helion.Config(**{**config.config, "cute_collective_stages": 3})
     with mock_cuda_unavailable():
         bound = cpu_bind(kernel, (x, y), capability=capability)
-        code = bound.to_code(_vector_epilogue_config())
+        code = bound.to_code(config)
     assert ("_cute_red_add_" in code) == packed
     assert "cute.arch.atomic_add(" in code
 

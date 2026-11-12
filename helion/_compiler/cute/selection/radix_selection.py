@@ -90,8 +90,11 @@ def radix_packet_base_is_aligned(env: CompileEnvironment, tensor: torch.Tensor) 
         residue = env.bound_runtime_input_specialization_results.get(
             _PACKET_ALIGNMENT_KEY
         )
+        # An Inductor render's inputs hold the residue only modulo its
+        # alignment (``CompileEnvironment.input_alignment_limit``).
         return (
-            specialization is not None
+            env.input_residues_hold_modulo(32)
+            and specialization is not None
             and specialization.sources == (source,)
             and type(residue) is int
             and (residue + offset_bytes) % 32 == 0
@@ -179,6 +182,9 @@ def _host_tensor(node: object) -> torch.Tensor | None:
 
 
 def _static_layout(tensor: torch.Tensor) -> bool:
+    """Whether ``tensor``'s sizes and strides are literals the generated code
+    can bake in: also in every call it serves, which a dynamic graph's
+    placeholder strides are not (``CompileEnvironment.traced_strides_hold``)."""
     return (
         tensor.dtype in SCALAR_DTYPES
         and all(type(size) is int and size > 0 for size in tensor.shape)
@@ -188,6 +194,7 @@ def _static_layout(tensor: torch.Tensor) -> bool:
             for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
         )
         <= ((1 << 63) - 1) // tensor.element_size()
+        and CompileEnvironment.current().traced_strides_hold(tensor)
     )
 
 

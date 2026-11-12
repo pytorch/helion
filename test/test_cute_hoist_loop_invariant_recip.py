@@ -186,8 +186,8 @@ class TestCuteHoistRecip(TestCase):
         self.assertIn("/ di\n", code)
 
     def test_recip_hoist_does_not_fire_on_loop_dependent_divisor(self) -> None:
-        """When the divisor changes per-iteration (e.g. ``local_sum``
-        computed inside the loop), the pass must NOT hoist it.
+        """When the divisor changes per iteration (here per element), the
+        pass must NOT hoist it.
         """
 
         @helion.kernel(backend="cute", fast_math=True)
@@ -197,9 +197,8 @@ class TestCuteHoistRecip(TestCase):
             for tile_m in hl.tile(m):
                 for tile_n in hl.tile(n):
                     values = x[tile_m, tile_n]
-                    # The divisor changes per tile_n iteration.
-                    local_sum = torch.sum(values, dim=1, keepdim=True)
-                    out[tile_m, tile_n] = values / local_sum
+                    # The divisor changes per element and tile_n iteration.
+                    out[tile_m, tile_n] = values / (values + 1)
             return out
 
         x = torch.randn(4096, 1024, device=DEVICE, dtype=HALF_DTYPE)
@@ -210,7 +209,7 @@ class TestCuteHoistRecip(TestCase):
             num_threads=[0, 32],
             cute_vector_widths=[1, 4],
         )
-        # No reciprocal hoist — local_sum is recomputed every iter.
+        # No reciprocal hoist: the divisor is recomputed for every element.
         self.assertNotIn("_helion_inv_div_", code)
 
     def test_recip_hoist_disable_env(self) -> None:
@@ -285,10 +284,15 @@ class TestCuteFMAScaleHoist(TestCase):
     def test_lane_loop_config_exponentiates_like_one_element_per_thread(
         self,
     ) -> None:
-        """``exp(x - shift[0])`` lowers to ``exp2((x - shift) * log2(e))``.
-        In a lane loop ``shift`` is loop-invariant; without ``fast_math``
-        that config must still match the one-element-per-thread config bit
-        for bit."""
+        """``exp(x - shift[0])`` in a lane loop, where ``shift`` is
+        loop-invariant: without ``fast_math`` that config must still match
+        the one-element-per-thread config bit for bit.  (The exact exp has no
+        ``(x - shift) * log2(e)`` product to distribute, and ``torch.exp2((x
+        - m) * C)`` binds ``C`` to its own name, which the hoist does not
+        match.  The hoist's ``fast_math`` gate is checked end to end on the
+        gdn recurrence's ``exp2((g_last - g) * log2(e))`` gate in
+        ``test_cute_gdn_recurrence.py``, and on the pass in
+        ``test_cute_scaled_sub_fusion.py``.)"""
         torch.manual_seed(0)
         x = torch.randn(1 << 16, device=DEVICE) * 4
         shift = torch.tensor([1.37], device=DEVICE)
@@ -301,25 +305,6 @@ class TestCuteFMAScaleHoist(TestCase):
             self.assertNotIn("_helion_scaled_", code)
             outputs.append(out)
         torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
-
-    @skipIfRefEager("checks the generated code")
-    def test_fma_scale_hoist_needs_fast_math(self) -> None:
-        """Without ``fast_math`` both softmax sweeps keep the exact
-        ``(x - max) * log2(e)`` exponent."""
-        x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
-        code, out = code_and_output(
-            _reduction_kernel,
-            (x,),
-            block_sizes=[1, 128],
-            num_threads=[0, 32],
-            cute_vector_widths=[1, 4],
-        )
-        torch.testing.assert_close(
-            out, torch.nn.functional.softmax(x, dim=1), atol=1e-2, rtol=1e-2
-        )
-        self.assertNotIn("_helion_scaled_", code)
-        self.assertIn("v_10 = v_9 - mi\n", code)
-        self.assertIn("v_6 = v_5 - v_1\n", code)
 
     def test_fma_scale_hoist_above_consume(self) -> None:
         """The consume loop's ``exp2((v_9 - mi) * 1.4427)`` pattern with

@@ -8,7 +8,6 @@ from typing import cast
 
 import sympy
 import torch
-from torch.fx import Node
 
 from ...language import _tracing_ops
 from ...language import atomic_ops
@@ -22,6 +21,8 @@ from .local_atomic import atomic_target_origins
 from .local_atomic import local_buffer_conditional_inputs
 
 if TYPE_CHECKING:
+    from torch.fx import Node
+
     from ..compile_environment import CompileEnvironment
     from ..device_ir import GraphInfo
 
@@ -100,13 +101,7 @@ def local_atomic_register_chain(
             host = cast("Node", user.args[0])
             if host.target is not _tracing_ops._host_tensor or user.users:
                 return frozenset()
-            indices = [
-                index.meta["val"] if isinstance(index, Node) else index
-                for index in cast("list[object]", user.args[1])
-            ]
-            if not same_shape(
-                SubscriptIndexing.compute_shape(host.meta["val"], indices)
-            ):
+            if not same_shape(SubscriptIndexing.node_shape(user)):
                 return frozenset()
             continue
         if user.target is atomic_ops.atomic_add:

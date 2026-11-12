@@ -577,7 +577,7 @@ def _memory_case(
     )
     codegen = SimpleNamespace(device_function=device_function)
     env = SimpleNamespace(
-        compiler_fact_specialization_facts=frozenset(("input_tensor_metadata",)),
+        exact_input_metadata_holds=lambda: True,
         runtime_value_for_tensor=lambda tensor: tensor,
         tensor_input_source=lambda tensor: object(),
         config_spec=SimpleNamespace(target_device_capability=(9, 0)),

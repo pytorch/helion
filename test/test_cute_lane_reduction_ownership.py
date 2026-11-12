@@ -31,6 +31,8 @@ from helion._compiler.cute.lane_loops.markers import (
 )
 from helion._compiler.cute.lane_loops.markers import set_marker_owner
 from helion._compiler.cute.lane_loops.markers import validate_lane_reduce_owners
+from helion._compiler.cute.lane_loops.owner_guards import _ATOMIC_HELPERS
+from helion._compiler.cute.lane_loops.owner_guards import _VECTOR_ATOMIC_HELPERS
 from helion._compiler.cute.lane_loops.owner_guards import _atomic_pointer_and_value
 from helion._compiler.cute.lane_loops.owner_guards import _clone_stmt
 from helion._compiler.cute.lane_loops.owner_guards import _lane_reduce_owner_expr
@@ -38,6 +40,7 @@ from helion._compiler.cute.lane_loops.owner_guards import _loop_body_scalar_defi
 from helion._compiler.cute.lane_loops.owner_guards import (
     _loop_invariant_scalar_definitions,
 )
+from helion._compiler.cute.lane_loops.owner_guards import _memory_write_calls
 from helion._compiler.cute.lane_loops.owner_guards import (
     _predicate_accepts_zero_thread_axis,
 )
@@ -47,6 +50,7 @@ from helion._compiler.cute.lane_loops.owner_guards import _StoreThreadAxes
 from helion._compiler.cute.lane_loops.owner_guards import _update_scalar_definitions
 from helion._compiler.cute.lane_loops.split import _has_extra_cross_lane_carry
 from helion._compiler.cute.lane_loops.split import _is_serial_for
+from helion._compiler.cute.lane_loops.split import _live_phase2_indices
 from helion._compiler.cute.lane_loops.split import _restore_per_lane_markers
 from helion._compiler.cute.lane_loops.split import _split_stmt_lane_reductions
 from helion._compiler.cute.lane_loops.split import (
@@ -1478,44 +1482,83 @@ def test_an_if_join_that_is_not_the_same_carry_in_every_lane_is_declined(
         )
 
 
-def test_an_atomic_add_of_a_strided_reduction_runs_once_on_the_lanes_total() -> None:
-    """The emitted atomic spells its operand by keyword (``val=``); it is a lane-invariant consumer of the total, so the shares are totalled and the one guarded atomic runs after the loop."""
-    code = _split(
-        _restored_rows_body(_GUARDED_ATOMIC_ADD), _ROW_SUMS_RENAMES, _RESTORED_DISJOINT
-    )
+@pytest.mark.parametrize(
+    "callee",
+    ["cute.arch.atomic_add", "_cute_atomic_max_float32"],
+    ids=["cute_arch", "helper"],
+)
+def test_an_atomic_add_of_a_strided_reduction_runs_once_on_the_lanes_total(
+    callee: str,
+) -> None:
+    """The emitted atomic spells its operand by keyword (``val=``); it is a lane-invariant consumer of the total, so the shares are totalled and the one guarded atomic runs after the loop.  An atomic helper called by bare name (the float max emulated with integer atomics) is such a consumer too."""
+    tail = _GUARDED_ATOMIC_ADD.replace("cute.arch.atomic_add(", f"{callee}(")
+    code = _split(_restored_rows_body(tail), _ROW_SUMS_RENAMES, _RESTORED_DISJOINT)
     (body,) = _lane_passes(code)
     assert (
         "sum_2_lane_total = sum_2_lane_total + cutlass.Float32(sum_2_lane_share)"
         in body
     )
-    assert "atomic_add" not in body
+    assert f"{callee}(" not in body
     after = code[code.index("sum_2 = cutlass.Float32(sum_2_lane_total)") :]
-    assert after.count("cute.arch.atomic_add(") == 1
-    assert after.index("if cute.arch.thread_idx()[0] == 0:") < after.index(
-        "cute.arch.atomic_add("
-    )
+    assert after.count(f"{callee}(") == 1
+    assert after.index("if cute.arch.thread_idx()[0] == 0:") < after.index(f"{callee}(")
 
 
-@pytest.mark.parametrize(
-    ("call", "expected"),
-    [
-        ("cute.arch.atomic_add(p, val=v, sem='relaxed')", ("p", "v")),
-        ("cute.arch.atomic_add(p, v)", ("p", "v")),
-        ("cute.arch.atomic_cas(p, cmp=a, val=b, sem='relaxed')", None),
-    ],
-    ids=["keyword", "positional", "compare_and_swap"],
-)
-def test_the_atomic_operand_parser_reads_the_keyword_form(
-    call: str, expected: tuple[str, str] | None
-) -> None:
-    node = ast.parse(call, mode="eval").body
+def test_the_atomic_operand_parser_declines_a_compare_and_swap() -> None:
+    """A compare-and-swap writes no single operand the owner guards could
+    total; the other atomics' keyword and positional forms are read in
+    ``test_every_atomic_spelling_writes_through_its_pointer``."""
+    node = ast.parse(
+        "cute.arch.atomic_cas(p, cmp=a, val=b, sem='relaxed')", mode="eval"
+    ).body
     assert isinstance(node, ast.Call)
-    parts = _atomic_pointer_and_value(node)
-    if expected is None:
-        assert parts is None
-    else:
-        assert parts is not None
-        assert tuple(ast.unparse(part) for part in parts) == expected
+    assert _atomic_pointer_and_value(node) is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "callee",
+    [*sorted(_ATOMIC_HELPERS | _VECTOR_ATOMIC_HELPERS), "cute.arch.atomic_add"],
+)
+def test_every_atomic_spelling_writes_through_its_pointer(callee: str) -> None:
+    """Each atomic helper is read like ``cute.arch.atomic_add``: one memory
+    write whose pointer and operand the owner guards find, positional or with
+    the emitted ``val=`` (the vector flushes are emitted positionally only),
+    and a side effect the phase-2 liveness keeps even when the old value it
+    binds to a name is never read."""
+    sources = [f"{callee}(p, v)"]
+    if callee not in _VECTOR_ATOMIC_HELPERS:
+        sources += [
+            f"{callee}(p, val=v, sem='relaxed')",
+            f"old = {callee}(p, val=v, sem='relaxed')",
+        ]
+    for source in sources:
+        statement = ast.parse(source).body[0]
+        (call,) = _memory_write_calls(statement)
+        parts = _atomic_pointer_and_value(call)
+        assert parts is not None, source
+        assert tuple(ast.unparse(part) for part in parts) == ("p", "v"), source
+        assert _live_phase2_indices([statement]) == {0}, source
+
+
+@pytest.mark.cpu_only
+def test_the_interchange_drops_the_first_pass_copy_of_a_ticket_fetch_add() -> None:
+    """A warp-aggregated fetch-add of the reduction is an atomic consumer the
+    final pass applies to each row's total; the first pass, whose copy would
+    count the lanes' partials as well, has nothing else to do and goes."""
+    loop = _create_lane_loop(
+        "lane",
+        4,
+        _body(
+            "for row in range(rows):\n"
+            "    value = (source.iterator + row * 4 + lane).load()\n"
+            "    reduced = _helion_lane_reduce(value, 'sum', 0.0, threads_in_group=1)\n"
+            "    _cute_atomic_warp_fetch_add_int32((counts.iterator + row).llvm_ptr, "
+            "val=cutlass.Int32(reduced > 0.0), sem='relaxed')\n"
+        ),
+    )
+    (final,) = interchange_lane_outside_serial_reductions([loop])
+    assert ast.unparse(final).count("_cute_atomic_warp_fetch_add_int32(") == 1
 
 
 def test_a_second_marker_input_produced_between_the_markers_joins_the_prefix() -> None:

@@ -13,6 +13,7 @@ GPU-free codegen checks for three lowerings and their seed, plus GPU numerics:
 
 from __future__ import annotations
 
+import ast
 import re
 from typing import TYPE_CHECKING
 from typing import Any
@@ -22,6 +23,7 @@ import pytest
 import torch
 
 import helion
+from helion._compiler.cute.unroll_lane_loads import _LevelPlan
 from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import import_example
@@ -630,6 +632,54 @@ def test_partial_lane_unroll_rolls_the_remaining_trips() -> None:
     outer = code.index("for lane_0_blk in range(4):")
     assert code.index("_lane_unroll_loads_0 = []") > outer
     assert re.search(r"= _lane_unroll_loads_\d+\[lane_0_u\]", code)
+
+
+@pytest.mark.parametrize(
+    ("columns", "unroll", "unrolled"),
+    [
+        # Four column packets per row: 8 rows would hold 32 packets live,
+        # twice ``_MAX_LIVE_PACKETS``, so the knob unrolls 4 rows.
+        (512, 8, 4),
+        # Sixteen per row: two rows already hold 32, so the knob declines
+        # and the knob-off kernel is regenerated.
+        (2048, 4, 1),
+    ],
+)
+def test_lane_unroll_counts_every_packet_of_a_nested_lane_loop(
+    columns: int, unroll: int, unrolled: int
+) -> None:
+    # The load phase appends a packet on every trip of the nested column lane
+    # loop; the budget counted one trip of it, so these unrolled 8 and 4 rows
+    # holding 32 and 64 packets.
+    x = torch.zeros(64, columns, dtype=torch.bfloat16, device=CPU)
+    config = {
+        "block_sizes": [8, columns],
+        "num_threads": [1, 32],
+        "cute_vector_widths": [1, 4],
+    }
+    code = _codegen(_pointwise_2d, (x,), **config, cute_lane_unroll=unroll)
+    if unrolled == 1:
+        assert code == _codegen(_pointwise_2d, (x,), **config)
+        assert LOAD_LIST not in code
+    else:
+        assert "for lane_0_blk in range(2):" in code
+        assert code.count(f"for lane_0_u in cutlass.range_constexpr({unrolled}):") == 2
+
+
+def test_lane_unroll_copy_budget_adds_sibling_nested_levels() -> None:
+    # Nested levels that run one after another in a lane body add their
+    # trace-time copies, as packet_count adds their packets; a level nested in
+    # another multiplies.  (The planner stops hoisting at a lane body's first
+    # nested loop, so no kernel builds sibling levels yet.)
+    def level(extent: int, *nested: _LevelPlan) -> _LevelPlan:
+        loop = ast.parse("for lane in range(1):\n    pass").body[0]
+        assert isinstance(loop, ast.For)
+        return _LevelPlan(loop, extent, list(nested))
+
+    assert level(8).nested_product() == 1
+    assert level(8, level(4)).nested_product() == 4
+    assert level(8, level(4), level(4)).nested_product() == 8
+    assert level(8, level(4, level(2)), level(4)).nested_product() == 12
 
 
 def test_lane_unroll_without_a_lane_loop_or_a_movable_load_changes_nothing() -> None:

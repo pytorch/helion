@@ -35,8 +35,9 @@ pattern:
 The cached and rescaled exponentials round each output differently, so
 that form needs the ``fast_math`` setting.  Without it the rewrite keeps
 every exponential exact: only sweep B moves into the frame of the CTA's own
-maximum (``_try_rewrite_pair_exact``), and sweep C recomputes its ``exp2``
-from the global maximum.
+maximum (``_try_rewrite_pair_exact``, which also takes the natural ``exp``
+that ``torch.exp`` lowers to without ``fast_math``), and sweep C recomputes
+its exponentials from the global maximum.
 
 Every rewrite condition fails closed: if any structural check does not
 match, the kernel keeps the two-exchange form.
@@ -55,6 +56,7 @@ from ._ast_pass_utils import reparse_expr
 from .analysis.online_pair import _BLOCK_REDUCE
 from .analysis.online_pair import _PAIR_REDUCE
 from .analysis.online_pair import OnlinePairMatcher
+from .analysis.online_pair import _exponent
 from .analysis.online_pair import _Inliner
 from .analysis.online_pair import _is_exp2
 from .analysis.online_pair import _loads
@@ -448,11 +450,12 @@ def _try_rewrite_pair_exact(
 
     ``_try_rewrite_pair`` caches sweep B's exponentials and rescales them in
     sweep C, which rounds each output differently; it needs fast_math.  This one
-    only moves sweep B's ``exp2((x - mi) * C)`` into the frame of the CTA's
-    own maximum: the packed exchange folds the CTA sums with ``sum +=
-    s_r * exp2((m_r - m) * C)``, the reassociation the kernel's online
-    recurrence already applies between tiles, and sweep C still computes
-    ``exp2((x - mi) * C)`` from the global maximum.
+    only moves sweep B's ``exp2((x - mi) * C)`` (or natural ``exp(x - mi)``,
+    see ``_exponent``) into the frame of the CTA's own maximum: the packed
+    exchange folds the CTA sums with ``sum += s_r * exp2((m_r - m) * C)``
+    (``exp(m_r - m)``), the reassociation the kernel's online recurrence
+    already applies between tiles, and sweep C still computes its
+    exponentials from the global maximum.
 
     Every read of ``mi`` (or a copy of it) between the sweeps must be the
     subtrahend of such an exponent, and site B must reduce exactly their
@@ -532,27 +535,21 @@ def _try_rewrite_pair_exact(
     ):
         return False
 
-    # ``exp2(Float32(shift) * C)`` with ``shift`` a frame subtraction.
-    exponents: dict[int, float] = {}
+    # ``exp2(Float32(shift) * C)`` or ``exp(Float32(shift))`` with ``shift``
+    # a frame subtraction.
+    exponents: dict[int, float | None] = {}
     allowed: set[int] = set()
     subtractions: list[ast.BinOp] = [
         value for value in shifted.values() if isinstance(value, ast.BinOp)
     ]
     for statement in region:
         for node in ast.walk(statement):
-            if not (_is_exp2(node) and not node.keywords):  # type: ignore[union-attr]
+            if not isinstance(node, ast.Call) or node.keywords:
                 continue
-            argument = node.args[0]  # type: ignore[union-attr]
-            if not (
-                isinstance(argument, ast.BinOp)
-                and isinstance(argument.op, ast.Mult)
-                and isinstance(argument.right, ast.Constant)
-                and type(argument.right.value) is float
-                and math.isfinite(argument.right.value)
-                and argument.right.value > 0
-            ):
+            exponent = _exponent(node)
+            if exponent is None:
                 continue
-            shift = argument.left
+            shift, scale = exponent
             if (
                 isinstance(shift, ast.Call)
                 and ast.unparse(shift.func) == "cutlass.Float32"
@@ -567,7 +564,7 @@ def _try_rewrite_pair_exact(
                 subtractions.append(subtraction)
             else:
                 continue
-            exponents[id(node)] = argument.right.value
+            exponents[id(node)] = scale
     scales = set(exponents.values())
     if len(scales) != 1:
         return False
@@ -682,9 +679,9 @@ def _try_rewrite_pair_exact(
     negative_inf = _unique_name(body, canon, f"_pair_negative_inf_{k}")
     frame = _unique_name(body, canon, f"_pair_frame_{k}")
     _localize_site_a(site_a)
-    # An all--inf CTA slice has the zero frame, so exp2((-inf - -inf) * C)
-    # does not poison its sum; the packed exchange keeps the true local
-    # maximum, so a globally all--inf row still produces NaN.
+    # An all--inf CTA slice has the zero frame, so its exponentials of
+    # -inf - -inf do not poison its sum; the packed exchange keeps the true
+    # local maximum, so a globally all--inf row still produces NaN.
     after_a = body.index(site_a.for_node) + 1
     body[after_a:after_a] = [
         _stmt(f"{negative_inf} = {mi_name} == cutlass.Float32(float('-inf'))"),
@@ -786,7 +783,7 @@ def _localize_site_a(site_a: _Site) -> None:
 
 
 def _pair_site_b(
-    site_b: _Site, mi_name: str, scale: float, fast_math: bool, k: int
+    site_b: _Site, mi_name: str, scale: float | None, fast_math: bool, k: int
 ) -> None:
     """Site B exchanges the ``(local_max, local_sum)`` pair once and every
     later read of ``mi`` sees the global maximum."""

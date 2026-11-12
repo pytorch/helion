@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+from typing import TYPE_CHECKING
 import unittest
 
 import torch
@@ -14,6 +15,10 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 import helion.language as hl
+from helion.runtime.settings import _get_backend
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 def _normalize_rows(x: torch.Tensor) -> torch.Tensor:
@@ -40,6 +45,13 @@ def _stderr_of(kernel: object, x: torch.Tensor) -> str:
     return buffer.getvalue()
 
 
+def _sigmoid(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size()):
+        out[tile] = torch.sigmoid(x[tile])
+    return out
+
+
 def _row_max(x: torch.Tensor) -> torch.Tensor:
     n, d = x.size()
     out = x.new_empty([n])
@@ -53,24 +65,48 @@ def _row_max(x: torch.Tensor) -> torch.Tensor:
     "TileIR keeps the exact forms under fast_math; the warning is not emitted"
 )
 class TestFastMathWarning(TestCase):
+    def _assert_counts_on_triton_only(
+        self,
+        fn: Callable[[torch.Tensor], torch.Tensor],
+        reference: Callable[[torch.Tensor], torch.Tensor],
+        *expected: str,
+    ) -> None:
+        """``fn`` without fast_math matches ``reference`` and warns with
+        every ``expected`` text on the Triton backend, and not on CuTe."""
+        x = torch.randn([64, 128], device=DEVICE)
+        buffer = io.StringIO()
+        with contextlib.redirect_stderr(buffer):
+            _, out = code_and_output(helion.kernel(fn, static_shapes=True), (x,))
+        torch.testing.assert_close(out, reference(x))
+        text = buffer.getvalue()
+        if _get_backend() == "triton":
+            for part in expected:
+                self.assertIn(part, text)
+        else:
+            self.assertNotIn("FastMathUnused", text)
+
     @skipIfRefEager("Warning emitted in compile mode only")
     def test_max_reduction_counts_on_triton_only(self) -> None:
         # Under fast_math Triton lowers amax/amin and maximum/minimum without
         # NaN propagation; the CuTe backend keeps the propagating forms, so
         # only Triton kernels are told about them.
-        from helion.runtime.settings import _get_backend
+        self._assert_counts_on_triton_only(
+            _row_max,
+            lambda x: x.amax(-1),
+            "WARNING[FastMathUnused]",
+            "max/min reductions",
+        )
 
-        x = torch.randn([64, 128], device=DEVICE)
-        buffer = io.StringIO()
-        with contextlib.redirect_stderr(buffer):
-            _, out = code_and_output(helion.kernel(_row_max, static_shapes=True), (x,))
-        torch.testing.assert_close(out, x.amax(-1))
-        text = buffer.getvalue()
-        if _get_backend() == "triton":
-            self.assertIn("WARNING[FastMathUnused]", text)
-            self.assertIn("max/min reductions", text)
-        else:
-            self.assertNotIn("FastMathUnused", text)
+    @skipIfRefEager("Warning emitted in compile mode only")
+    def test_sigmoid_counts_on_triton_only(self) -> None:
+        # Under fast_math Triton lowers torch.sigmoid with libdevice's fast exp
+        # and divide; the CuTe backend lowers it to one contract with or
+        # without the setting, so only Triton kernels are told about it.
+        self._assert_counts_on_triton_only(
+            _sigmoid,
+            torch.sigmoid,
+            "WARNING[FastMathUnused]: This kernel computes sigmoid,",
+        )
 
     @skipIfRefEager("Warning emitted in compile mode only")
     def test_division_and_exp_without_fast_math_warn(self) -> None:

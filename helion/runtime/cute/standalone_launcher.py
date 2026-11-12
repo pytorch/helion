@@ -9,6 +9,9 @@ from typing import Any
 from typing import cast
 
 # pyrefly: ignore [missing-import]
+import cuda.bindings.driver as _standalone_cuda_driver
+
+# pyrefly: ignore [missing-import]
 from cuda.bindings.driver import CUstream  # noqa: F401  # Emitted wrapper annotation.
 import cutlass
 import cutlass.cute as cute
@@ -173,6 +176,29 @@ def _standalone_validate_mma_dag_aliases(
                 )
 
 
+# Looked up once: every launch checks the context, the fast relaunch included.
+_STANDALONE_CUDA_SUCCESS = _standalone_cuda_driver.CUresult.CUDA_SUCCESS
+_standalone_cu_ctx_get_current = _standalone_cuda_driver.cuCtxGetCurrent
+
+
+def _standalone_ensure_cuda_context() -> None:
+    """Make the current device's primary CUDA context current on this thread,
+    before every launch: the compiled host code of a launch that sets function
+    attributes aborts without one, and a thread can lack one at any launch."""
+    # Helion's own launcher runs this check too, and its
+    # helion.runtime.cute.launcher._ensure_cuda_context says why.
+    success = _STANDALONE_CUDA_SUCCESS
+    error, context = _standalone_cu_ctx_get_current()
+    if error == success and int(context) == 0:
+        error, device = _standalone_cuda_driver.cuDeviceGet(torch.cuda.current_device())
+        if error == success:
+            error, context = _standalone_cuda_driver.cuDevicePrimaryCtxRetain(device)
+        if error == success:
+            (error,) = _standalone_cuda_driver.cuCtxSetCurrent(context)
+    if error != success:
+        raise RuntimeError(f"No CUDA context for a CuTe launch: {error}")
+
+
 def _default_cute_launcher(
     kernel: object, grid: tuple[int, ...], *args: object, **kwargs: object
 ) -> None:
@@ -211,6 +237,7 @@ def _default_cute_launcher(
     device = devices.pop()
     launch_args.extend(grid)
     with torch.cuda.device(device):
+        _standalone_ensure_cuda_context()
         launch_args.append(cutlass_torch.current_stream())
         key = (kernel_name, torch.cuda.current_device())
         compiled = _STANDALONE_COMPILED.get(key)

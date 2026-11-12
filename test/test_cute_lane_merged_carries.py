@@ -87,6 +87,21 @@ def carry_ones_init(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(static_shapes=True)
+def carry_widened_sum(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    bn = hl.register_block_size(n)
+    # acc.sum(-1) of an int32 carry is int64.
+    dtype = torch.int64 if x.dtype == torch.int32 else x.dtype
+    out = torch.zeros([m], dtype=dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m, bn], dtype=x.dtype)
+        for tile_n in hl.tile(n, block_size=bn):
+            acc = acc + x[tile_m, tile_n]
+        out[tile_m] = acc.sum(-1)
+    return out
+
+
+@helion.kernel(static_shapes=True)
 def carry_read_in_loop(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     m, n = x.shape
     bn = hl.register_block_size(n)
@@ -130,6 +145,23 @@ def carry_branch_max(x: torch.Tensor, beta: float) -> torch.Tensor:
             else:
                 acc = torch.maximum(acc, x[tile_m, tile_n])
         out[tile_m] = acc.sum(-1)
+    return out
+
+
+@helion.kernel(static_shapes=True)
+def carry_outer_masked_max(x: torch.Tensor) -> torch.Tensor:
+    s, r, c = x.shape
+    br = hl.register_block_size(r)
+    out = torch.zeros([s, c], dtype=x.dtype, device=x.device)
+    for tile_s, tile_c in hl.tile([s, c]):
+        acc = hl.full([tile_s, br, tile_c], float("-inf"), dtype=x.dtype)
+        for tile_r in hl.tile(r, block_size=br):
+            flat = tile_s.index[:, None] * r + tile_r.index[None, :]
+            valid = (flat % 3 != 0) & (tile_r.index[None, :] < r)
+            acc = torch.where(
+                valid[:, :, None], torch.maximum(acc, x[tile_s, tile_r, tile_c]), acc
+            )
+        out[tile_s, tile_c] = acc.amax(1)
     return out
 
 
@@ -185,6 +217,26 @@ class TestCuteLaneMergedCarries(TestCase):
                     ):
                         bound.compile_config(config)
 
+    def test_sums_wider_than_the_carry_are_refused(self) -> None:
+        """An int32 carry summed as int64, or a float16 or bfloat16 carry
+        whose sum accumulates in float32, would have each thread add its
+        columns in the carry's dtype first: 32 tiles of 2**25 fit a column's
+        int32, but four columns wrap to 0 in one Int32.  With a thread per
+        column nothing folds and the int64 sum is exact."""
+        x = torch.full((64, 512), 2**25, device=DEVICE, dtype=torch.int32)
+        for dtype in (torch.int32, torch.float16, torch.bfloat16):
+            bound = carry_widened_sum.bind((x.to(dtype),))
+            for config in (_config(16, 4), _config(16, 4, 4)):
+                with (
+                    self.subTest(dtype=dtype, config=config),
+                    self.assertRaisesRegex(
+                        helion.exc.BackendUnsupported, "own loop's block"
+                    ),
+                ):
+                    bound.compile_config(config)
+        out = carry_widened_sum.bind((x,)).compile_config(_config(16, 16))(x)
+        torch.testing.assert_close(out, x.sum(-1), atol=0, rtol=0)
+
     def test_one_element_per_thread_is_exact(self) -> None:
         """With a thread per column the carry holds one element, so the
         consumers the lane loop refuses stay exact."""
@@ -197,3 +249,22 @@ class TestCuteLaneMergedCarries(TestCase):
             with self.subTest(kernel=kernel.name):
                 out = kernel.bind((x,)).compile_config(_config(16, 16))(x)
                 torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+    def test_outer_index_mask_keeps_a_thread_per_element(self) -> None:
+        """``tile_s.index[:, None]`` allocates a reduction block aliasing
+        ``tile_s`` that gets no strategy; it must not take the third thread
+        axis from ``br``, whose masked running max then holds one element per
+        thread."""
+        flat = torch.arange(4, device=DEVICE)[:, None] * 200 + torch.arange(
+            200, device=DEVICE
+        )
+        masked = (flat % 3 == 0)[:, :, None]
+        # Distinct negative values, larger than any of them where the mask
+        # drops them: the mask, the tail lanes' masked loads of 0 and every
+        # lane's own maximum decide the result.
+        x = -1.0 - torch.rand(4, 200, 16, device=DEVICE)
+        x = torch.where(masked, x + 10.0, x)
+        expected = x.masked_fill(masked, float("-inf")).amax(1)
+        bound = carry_outer_masked_max.bind((x,))
+        out = bound.compile_config(helion.Config(block_sizes=[16, 4, 16]))(x)
+        torch.testing.assert_close(out, expected, atol=0, rtol=0)

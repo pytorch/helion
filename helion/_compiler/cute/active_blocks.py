@@ -12,13 +12,10 @@ from ..device_ir import RootGraphInfo
 from ..host_function import HostFunction
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
     from torch.fx.node import Node
 
     from ..device_function import DeviceFunction
     from ..inductor_lowering import CodegenState
-    from ..tile_strategy import TileStrategy
 
 
 def match_active_reduction_block_id(
@@ -87,16 +84,20 @@ def match_active_reduction_block_id(
     return None
 
 
-def inactive_broadcast_alias_block_ids(
-    fn: DeviceFunction, strategies: Sequence[TileStrategy]
-) -> set[int]:
+def inactive_broadcast_alias_block_ids(fn: DeviceFunction) -> set[int]:
     """Drop duplicate output-range reservations before physical allocation.
 
     Register broadcasting can allocate a reduction block whose variable is
-    exactly an existing tile variable. The canonical tile already owns
-    those coordinates. Nested tile loops may reuse an outer root's tile,
-    but cannot establish ownership for sibling or child-only tile axes.
-    Never elide executable reductions, free-iota or matrix dimensions.
+    exactly an existing tile variable (``tile.index[:, None]`` does). The
+    canonical tile already owns those coordinates. Nested tile loops may
+    reuse an outer root's tile, but cannot establish ownership for sibling
+    or child-only tile axes. Never elide executable reductions, free-iota or
+    matrix dimensions.
+
+    Only root grid tiles own such coordinates, so the answer does not wait
+    for the tile strategies: the per-thread planner asks while planning them
+    (``reduction_strategy_block_ids``) and reserves no reduction thread axis
+    for these blocks.
     """
     env = CompileEnvironment.current()
     spec = env.config_spec
@@ -108,9 +109,7 @@ def inactive_broadcast_alias_block_ids(
         for node in graph.graph.nodes
     ):
         return set()
-    tile_blocks = {
-        block_id for strategy in strategies for block_id in strategy.block_ids
-    }
+    grid_blocks = HostFunction.current().device_ir.grid_block_ids
     if not (
         spec.pointwise_facts
         and all(isinstance(graph, RootGraphInfo) for graph in graphs)
@@ -118,7 +117,6 @@ def inactive_broadcast_alias_block_ids(
         # One root's grid tiles dominate its tiled child graphs. Restrict
         # the extension to those outer coordinates: a child loop's tile
         # may be inactive in a sibling, even with an identical extent.
-        grid_blocks = HostFunction.current().device_ir.grid_block_ids
         if (
             len(grid_blocks) != 1
             or sum(isinstance(graph, RootGraphInfo) for graph in graphs) != 1
@@ -130,7 +128,7 @@ def inactive_broadcast_alias_block_ids(
             )
         ):
             return set()
-        tile_blocks &= set(grid_blocks[0])
+    tile_blocks = {block_id for block_ids in grid_blocks for block_id in block_ids}
     executable = set(spec.reduction_loops.valid_block_ids())
     if spec.reduction_kernel_fact is not None:
         executable.update(

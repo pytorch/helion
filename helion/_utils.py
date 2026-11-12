@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections
 import functools
 from typing import TYPE_CHECKING
+from typing import Iterable
 from typing import Sequence
 from typing import TypeVar
 
@@ -35,6 +36,18 @@ def prev_power_of_2(n: int, max_value: int | None = None) -> int:
     if n <= 1:
         return 1
     return 1 << (n.bit_length() - 1)
+
+
+def widest_halvable(sizes: Iterable[tuple[T, int, int | None]]) -> T | None:
+    """The key of the widest of ``(key, size, minimum)`` whose half stays at
+    or above ``minimum`` (the first of equally wide ones); ``None`` when none
+    can halve.  A ``None`` minimum never halves."""
+    widest: T | None = None
+    widest_size = -1
+    for key, size, minimum in sizes:
+        if minimum is not None and size // 2 >= minimum and size > widest_size:
+            widest, widest_size = key, size
+    return widest
 
 
 def indexing_uses_tensor_descriptor(indexing: object) -> bool:

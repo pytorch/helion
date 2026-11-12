@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING
 from typing import cast
 
 from ....autotuner.config_fragment import EnumFragment
+from ....autotuner.config_spec import fit_thread_count
 from ....autotuner.search_surface import ConfigGenerationExtension
 from ....exc import AutotuneError
 from ....exc import InvalidConfig
@@ -87,7 +88,7 @@ class _ThreadSlots:
     num_thread_block_pairs: list[tuple[int, int]]
     block_index_by_id: dict[int, int]
     num_thread_index_by_id: dict[int, int]
-    loop_order_index_by_id: dict[int, int]
+    loop_order_index_by_blocks: dict[tuple[int, ...], int]
     flatten_loop_groups: list[tuple[int, list[int]]]
     collective_mma_index: int | None
     register_chain_index: int | None
@@ -197,10 +198,20 @@ class CuteConfigGenerationExtension(ConfigGenerationExtension):
             if i < len(num_thread_indices) and spec.block_id in block_index_by_id
         ]
         loop_order_indices, _ = layout.get("loop_orders", ([], True))
-        loop_order_index_by_id = {
-            spec.block_ids[0]: loop_order_indices[i]
-            for i, spec in enumerate(config_spec.loop_orders)
-            if i < len(loop_order_indices)
+        # By the tile's block ids, as a tile loop path names its level: the
+        # slot of the order codegen gives the tile (``config_get_for_tile``;
+        # [row, col] in one root and [k, row] in another both take [k, row]'s,
+        # a 1-D tile none).
+        loop_order_index_by_blocks = {
+            level: index
+            for path in config_spec.cute_tile_loop_paths
+            for level in path
+            if (
+                index := config_spec.loop_orders.config_get_for_tile(
+                    loop_order_indices, level
+                )
+            )
+            is not None
         }
         flatten_loop_groups: list[tuple[int, list[int]]] = []
         if "flatten_loops" in layout:
@@ -268,7 +279,7 @@ class CuteConfigGenerationExtension(ConfigGenerationExtension):
             num_thread_block_pairs=num_thread_block_pairs,
             block_index_by_id=block_index_by_id,
             num_thread_index_by_id=num_thread_index_by_id,
-            loop_order_index_by_id=loop_order_index_by_id,
+            loop_order_index_by_blocks=loop_order_index_by_blocks,
             flatten_loop_groups=flatten_loop_groups,
             collective_mma_index=collective_mma_index,
             register_chain_index=register_chain_index,
@@ -356,7 +367,6 @@ class CuteConfigGenerationExtension(ConfigGenerationExtension):
         slots = self._threads
         if not slots.num_thread_block_pairs:
             return
-        largest_power_of_two_at_most = self.generation._largest_power_of_two_at_most
 
         for num_threads_idx, block_size_idx in slots.num_thread_block_pairs:
             num_threads = flat_config[num_threads_idx]
@@ -368,11 +378,7 @@ class CuteConfigGenerationExtension(ConfigGenerationExtension):
                 or block_size <= 0
             ):
                 continue
-            if num_threads > block_size:
-                num_threads = largest_power_of_two_at_most(block_size)
-            while num_threads > 1 and block_size % num_threads != 0:
-                num_threads //= 2
-            flat_config[num_threads_idx] = max(num_threads, 1)
+            flat_config[num_threads_idx] = fit_thread_count(num_threads, block_size)
         self._repair_collective_thread_layouts(flat_config)
 
         for flatten_idx, block_ids in slots.flatten_loop_groups:
@@ -488,7 +494,7 @@ class CuteConfigGenerationExtension(ConfigGenerationExtension):
                 position = 0
                 seen: set[int] = set()
                 for block_ids in path:
-                    order_index = slots.loop_order_index_by_id.get(block_ids[0])
+                    order_index = slots.loop_order_index_by_blocks.get(tuple(block_ids))
                     order = (
                         cast("list[int]", flat_config[order_index])
                         if order_index is not None
@@ -520,6 +526,7 @@ class CuteConfigGenerationExtension(ConfigGenerationExtension):
             axes = launch_axes()
             extents = [max(axis.values()) for axis in axes]
             if functools.reduce(operator.mul, extents, 1) <= 1024:
+                self._fit_tiles_per_block(flat_config)
                 return
             # The physical launch uses the maximum of each axis across paths,
             # not the largest path product. Only shrink a current maximum;
@@ -536,6 +543,172 @@ class CuteConfigGenerationExtension(ConfigGenerationExtension):
             flat_config[index] = self.generation._largest_power_of_two_at_most(
                 threads // 2
             )
+
+    def _fit_tiles_per_block(self, flat_config: FlatConfig) -> None:
+        """Pack only as many grid tiles into a CTA (``cute_tiles_per_block``)
+        as fit in one block beside the threads each tile launches.
+
+        Every packed tile runs on threads of its own, so the pack halves
+        until the tiles' threads times the pack (``_packed_tile_threads``)
+        fit in one block; the tiles keep the layout they were drawn with,
+        since packing serves tiles too small to fill a CTA.  A pack
+        normalization would drop is left to it.  Kernels with matmul facts
+        get no ``cute_tiles_per_block`` (``search_surface``), so their thread
+        repair has no pack to fit."""
+        from .search_surface import _normalize_cute_tiles_per_block
+
+        layout = self.generation._key_to_flat_indices
+        if "cute_tiles_per_block" not in layout:
+            return
+        values: dict[str, object] = {}
+        for key in (
+            "cute_tiles_per_block",
+            "pid_type",
+            "cute_cluster_n",
+            "l2_groupings",
+        ):
+            if key in layout:
+                indices, is_sequence = layout[key]
+                values[key] = (
+                    [flat_config[index] for index in indices]
+                    if is_sequence
+                    else flat_config[indices[0]]
+                )
+        _normalize_cute_tiles_per_block(
+            self.generation.config_spec, values, fix_invalid=True
+        )
+        pack = cast("int", values["cute_tiles_per_block"])
+        fitted = pack
+        while (
+            fitted > 1
+            and fitted * self._packed_tile_threads(flat_config, fitted) > 1024
+        ):
+            fitted //= 2
+        if fitted != pack:
+            ((index,), _) = layout["cute_tiles_per_block"]
+            flat_config[index] = fitted
+
+    def _packed_tile_threads(self, flat_config: FlatConfig, pack: int) -> int:
+        """The threads each of ``pack`` packed grid tiles launches, as the
+        per-thread planner and ``PerThreadNDTileStrategy`` lay out the tiles
+        of each loop path (its levels, outermost first).
+
+        The packed grid axis takes a launch axis, and a reduction the leading
+        one while the tiles leave it several threads.  Each tile plans its own
+        axes beside the reduction's axis and, below the root grid tile, the
+        root's: while more of them ask for a launch axis than remain, its
+        automatic ones latest in block order run on one thread, and then its
+        automatic counts shrink, the widest first, until the tile takes at
+        most what the pack leaves of a block.  The axes asking for threads
+        then take the launch's axes in loop order, tile after tile, and those
+        past the last run as lane loops.  Sibling paths share the launch's
+        axes, at the widest of each."""
+        spec = self.generation.config_spec
+        slots = self._threads
+        packed_id = min(
+            block_id
+            for block_id, count in spec.cute_tile_pack_counts.items()
+            if count % pack == 0
+        )
+        inactive = spec.cute_inactive_tile_block_ids | spec.reduction_block_ids
+        order_indices, _ = self.generation._key_to_flat_indices.get(
+            "loop_orders", ([], True)
+        )
+        loop_orders = [flat_config[index] for index in order_indices]
+        axis_limit = cast("int", spec.backend.thread_axis_limit())
+        reserve = int(bool(spec.reduction_block_ids))
+
+        def plan(
+            level: Sequence[int], seen: set[int], root_axes: int
+        ) -> tuple[int, list[int]]:
+            # The launch axes the tile of ``level`` asks for by its drawn
+            # counts, and the threads of each axis it takes, in loop order,
+            # below a root tile taking ``root_axes`` (the packed axis takes
+            # one of a thread).
+            sizes: dict[int, int] = {}
+            counts: dict[int, int] = {}
+            for block_id in level:
+                if block_id in seen:
+                    continue
+                seen.add(block_id)
+                size_index = slots.block_index_by_id.get(block_id)
+                count_index = slots.num_thread_index_by_id.get(block_id)
+                if block_id == packed_id:
+                    sizes[block_id] = counts[block_id] = 1
+                elif not (
+                    block_id in inactive or size_index is None or count_index is None
+                ):
+                    sizes[block_id] = cast("int", flat_config[size_index])
+                    counts[block_id] = cast("int", flat_config[count_index])
+
+            def takes_axis(block_id: int) -> bool:
+                return (
+                    block_id == packed_id or (counts[block_id] or sizes[block_id]) > 1
+                )
+
+            asking = sum(map(takes_axis, counts))
+            taking = asking
+            while taking > axis_limit - reserve - root_axes:
+                auto = [b for b in counts if counts[b] == 0 and takes_axis(b)]
+                if not auto:
+                    break
+                counts[auto[-1]] = 1
+                taking -= 1
+            auto = [b for b in counts if counts[b] == 0]
+            threads = {b: counts[b] or sizes[b] for b in counts}
+            while math.prod(threads.values()) > 1024 // pack:
+                widest = max(
+                    (b for b in auto if threads[b] > 1),
+                    key=threads.__getitem__,
+                    default=None,
+                )
+                if widest is None:
+                    break
+                fewer = threads[widest] - 1
+                while sizes[widest] % fewer:
+                    fewer -= 1
+                threads[widest] = fewer
+            order = cast(
+                "list[int] | None",
+                spec.loop_orders.config_get_for_tile(loop_orders, level),
+            ) or range(len(level))
+            return asking, [
+                threads[block_id]
+                for block_id in (level[dimension] for dimension in order)
+                if block_id in threads
+                and (block_id == packed_id or threads[block_id] > 1)
+            ]
+
+        paths: list[list[int]] = []
+        for path in spec.cute_tile_loop_paths:
+            seen: set[int] = set()
+            launched: list[int] = []
+            root_axes = 0
+            for depth, level in enumerate(path):
+                asking, threads = plan(level, seen, root_axes)
+                if depth == 0:
+                    root_axes = asking
+                launched += threads
+            paths.append(launched)
+        # A reduction takes the leading launch axis only while it keeps several
+        # threads: code generation fits it into what the packed tiles leave of
+        # a block, counting their threads on all their axes (those past the
+        # launch's too), and one drawn on a single thread keeps none.
+        tile_threads = max((math.prod(launched) for launched in paths), default=1)
+        reduction_keeps_threads = 2 * tile_threads * pack <= 1024 and any(
+            (index := slots.num_thread_index_by_id.get(block_id)) is None
+            or flat_config[index] != 1
+            for block_id in spec.reduction_block_ids
+        )
+        tile_axes = axis_limit - 1 if reduction_keeps_threads else axis_limit
+        extents: list[int] = []
+        for launched in paths:
+            for axis, threads in enumerate(launched[:tile_axes]):
+                if axis == len(extents):
+                    extents.append(threads)
+                else:
+                    extents[axis] = max(extents[axis], threads)
+        return math.prod(extents)
 
     # -- flash structural coverage ---------------------------------------------
 

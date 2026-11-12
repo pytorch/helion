@@ -14,6 +14,7 @@ from .....language.memory_ops import load as language_load
 from .....runtime.config import Config
 from ....autotuner_heuristics.common import is_canonical_row_reduction
 from ....autotuner_heuristics.registry import AutotunerHeuristic
+from .cute import _cute_static_block_extent
 from .cute import _seq_config_list
 
 if TYPE_CHECKING:
@@ -32,6 +33,12 @@ class CuteRolledClusterPacketHeuristic(AutotunerHeuristic):
     consumer-prefetch reserve at one 32-bit slot per
     retained element. The 128-slot cap is a conservative seed estimate; actual
     cache, mask, alias, collective, and launch legality remain compiler checks.
+
+    The cross-CTA race check (``lane_cluster_split.cluster_split_races``) is
+    one of those compiler checks and needs code generation's tile
+    strategies, so a kernel whose split it declines, such as a
+    running-statistic update beside the reduction, still gets these seeds;
+    they compile as if ``cute_cluster_n`` were 1.
 
     Neutral PDL and replicated/independent L2-retention profiles use existing
     public knobs. These are search candidates, never promoted defaults.
@@ -58,25 +65,24 @@ class CuteRolledClusterPacketHeuristic(AutotunerHeuristic):
         ):
             return False
         reduction = spec.reduction_loops[0]
-        row = spec.block_sizes[0].block_id
-        # Fixed outer tiles can leave a jagged tile as the sole tunable block.
-        # A jagged domain has no scalar row extent for these cluster seeds.
-        if env.is_jagged_tile(row):
-            return False
+        # Fixed outer tiles can leave a row block without a static size as the
+        # sole tunable block (a jagged tile, a loop over data-dependent bounds,
+        # a block used with two extents): it has no scalar row extent for these
+        # cluster seeds.
+        row_extent = _cute_static_block_extent(env, spec.block_sizes[0].block_id)
         extent = env.specialize_expr(env.block_sizes[reduction.block_id].numel)
-        row_extent = env.specialize_expr(env.block_sizes[row].numel)
         if (
-            not isinstance(extent, (int, sympy.Integer))
-            or not isinstance(row_extent, (int, sympy.Integer))
+            row_extent is None
+            or row_extent <= 0
+            or not isinstance(extent, (int, sympy.Integer))
             or int(extent) <= 32
-            or int(row_extent) <= 0
         ):
             return False
         # Runtime registers this heuristic, so keep the metadata import lazy.
         from .....runtime import get_num_sm
 
         num_sm = get_num_sm(env.device)
-        return num_sm > 0 and int(row_extent) <= num_sm
+        return num_sm > 0 and row_extent <= num_sm
 
     @classmethod
     def get_seed_config(

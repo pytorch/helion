@@ -278,6 +278,32 @@ def test_dynamic_or_high_grid_rows_decline() -> None:
     assert not _seeds(bind(149, 7168, torch.bfloat16))
 
 
+def _rows_beside_a_data_dependent_loop(
+    x: torch.Tensor, offsets: torch.Tensor
+) -> torch.Tensor:
+    m, n = x.size()
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m, block_size=1):
+        mean = x[tile_m, :].mean(dim=-1, keepdim=True)
+        start = offsets[tile_m.begin]
+        end = offsets[tile_m.begin + 1]
+        for tile_k in hl.tile(start, end):
+            out[tile_m, tile_k] = x[tile_m, tile_k] - mean
+    return out
+
+
+def test_a_loop_over_data_dependent_bounds_declines() -> None:
+    # The fixed row tile leaves the loop over ``offsets``' bounds the sole
+    # tunable block, which has no extent to seed a cluster by.
+    bound = helion.kernel(
+        _rows_beside_a_data_dependent_loop, backend="cute", static_shapes=True
+    )._bind_isolated((torch.empty((8, 512)), torch.arange(0, 513, 64)))
+    row = bound.config_spec.block_sizes[0].block_id
+    assert bound.env.block_sizes[row].size is None
+    assert not bound.env.is_jagged_tile(row)
+    assert not _seeds(bound)
+
+
 @pytest.mark.parametrize("reason", ["atomic", "indexed", "warp", "thread_domain"])
 def test_side_effect_and_unreachable_thread_guards(reason: str) -> None:
     bound = bind(4, 7168, torch.bfloat16)

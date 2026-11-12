@@ -6694,12 +6694,13 @@ class CuteGdnRecurrenceHeuristic(AutotunerHeuristic):
     ) -> GdnRecurrenceGeometry | None:
         from ...gdn_recurrence import detect_gdn_recurrence_search_geometry
 
-        capability = env.config_spec.target_device_capability
         host_function = device_ir.host_function
-        if capability is None or capability[0] != 10 or host_function is None:
+        if host_function is None:
             return None
         with host_function:
-            return detect_gdn_recurrence_search_geometry(device_ir.graphs)
+            return detect_gdn_recurrence_search_geometry(
+                device_ir.graphs, env.config_spec.target_device_capability
+            )
 
     @classmethod
     def register_facts(
@@ -8110,8 +8111,13 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
         inner = spec.block_sizes.block_id_lookup(vec_block).size_hint
         if vec not in choices or inner % vec:
             return []
-        lanes = min(cls.WIDE_PACKET_LANES, inner // vec)
-        inner_tile = min(inner, lanes * vec * cls.WIDE_PACKET_LOADS)
+        # Block sizes and thread counts must be powers of two. Rounding down
+        # keeps the caps (no more lanes than the row has packets, no tile wider
+        # than the row), so only a row's last tile is ragged; the search times
+        # this seed beside the others, and the doubled tile is one neighbor
+        # step from it.
+        lanes = prev_power_of_2(inner // vec, cls.WIDE_PACKET_LANES)
+        inner_tile = prev_power_of_2(inner, lanes * vec * cls.WIDE_PACKET_LOADS)
         rows = cls.WIDE_PACKET_THREADS // lanes
         fragments = {
             bid: spec.block_sizes.block_id_lookup(bid)._fragment(spec)

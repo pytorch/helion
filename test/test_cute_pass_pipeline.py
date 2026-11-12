@@ -23,6 +23,7 @@ pytestmark = pytest.mark.cpu_only
 # modes, the block-grid dims) are the ``PassContext`` built ahead of the
 # prologue; ``freeze_pass_context`` seals the launch shape the prologue decided.
 DEVICE_BODY_PROLOGUE_NAMES = [
+    "guard_atomics_on_later_thread_axes",
     "lower_uniform_comparisons",
     "lower_collective_matmul",
     "lower_simt_gemm",

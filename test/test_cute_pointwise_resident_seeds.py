@@ -192,3 +192,39 @@ def test_two_axis_pointwise_seeds_carry_wide_row_packets() -> None:
         for s in flat.config_spec.compiler_seed_configs
         if s.config.get("cute_min_blocks_per_mp") == 1
     ]
+
+
+@pytest.mark.parametrize(
+    ("width", "block_sizes", "num_threads"),
+    [
+        # 24 packets take eight lanes either way; the tile rounds from 384.
+        pytest.param(384, [32, 256], [32, 8], id="384"),
+        # 6 packets: the lanes round from six (42 rows) to four (64 rows)
+        # and the tile from 96.
+        pytest.param(96, [64, 64], [64, 4], id="96"),
+    ],
+)
+def test_wide_row_packets_round_a_row_down_to_a_power_of_two_tile(
+    width: int, block_sizes: list[int], num_threads: list[int]
+) -> None:
+    """A bf16 row of 16-element packets that is not a power of two wide
+    rounds the tile and the lanes down to powers of two: the config spec
+    rejects other block sizes and thread counts, which would drop the seed
+    before the search sees it."""
+    bound = _bind(
+        _gather_rows,
+        torch.randint(32768, (8192,), dtype=torch.int32),
+        torch.empty((32768, width), dtype=torch.bfloat16),
+    )
+    spec = bound.config_spec
+    wide = [
+        s
+        for s in spec.compiler_seed_configs
+        if s.config.get("cute_min_blocks_per_mp") == 1
+    ]
+    assert wide
+    for seed in wide:
+        assert seed.config["block_sizes"] == block_sizes
+        assert seed.config["num_threads"] == num_threads
+        assert cast("list[int]", seed.config["cute_vector_widths"])[-1] == 16
+        spec.normalized_config(seed)

@@ -58,6 +58,7 @@ from helion._testing import code_and_output
 from helion._testing import import_example
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
+from helion._testing.binding_state import with_binding_state
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_native_compile
 import helion.language as hl
@@ -386,14 +387,16 @@ def test_cluster_proof_refuses_unguarded_or_unbacked_extents(unbacked: bool) -> 
     # Even an exact-looking hint must not retire the mask without a replayable
     # proof. The real specialization helper rejects both cases before using it.
     extent = sympy.Symbol("u0" if unbacked else "s0", integer=True)
-    env = SimpleNamespace(
-        backend=SimpleNamespace(name="cute"),
-        block_sizes=[SimpleNamespace(numel=extent)],
-        config_spec=SimpleNamespace(cute_indexed_reduction_block_ids=set()),
-        compiler_fact_specialization_facts={"input_tensor_metadata"}
-        if unbacked
-        else set(),
-        specialize_expr=lambda expr: expr,
+    env = with_binding_state(
+        SimpleNamespace(
+            backend=SimpleNamespace(name="cute"),
+            block_sizes=[SimpleNamespace(numel=extent)],
+            config_spec=SimpleNamespace(cute_indexed_reduction_block_ids=set()),
+            compiler_fact_specialization_facts={"input_tensor_metadata"}
+            if unbacked
+            else set(),
+            specialize_expr=lambda expr: expr,
+        )
     )
     env.specialized_multiple = MethodType(CompileEnvironment.specialized_multiple, env)
     fn = SimpleNamespace(

@@ -5774,6 +5774,17 @@ def permuted_slice_sum(y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="metal", autotune_effort="none")
+def permuted_unit_dim_sum(x: torch.Tensor) -> torch.Tensor:
+    """A sum over an extent-1 dim lowers element-wise: its ``[tm, tn, 1]``
+    input meets the ``[tm, tn]`` result without the unit dim."""
+    m, n = x.shape
+    out = torch.empty([n, m], dtype=x.dtype, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        out[tn, tm] = (x[tm, tn][:, :, None] * 2.0).sum(-1).T
+    return out
+
+
+@helion.kernel(backend="metal", autotune_effort="none")
 def dot_permuted_lhs(x: torch.Tensor, s: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """A computed, transposed lhs over a tile K (mamba2_chunk_state's form)."""
     k, m = x.shape
@@ -6163,6 +6174,13 @@ class TestMetalPermute(unittest.TestCase):
         torch.testing.assert_close(
             self._run(permuted_slice_sum, (y,))[0], y.sum(1).T, rtol=1e-4, atol=1e-4
         )
+
+    def test_permute_beside_a_unit_dim_reduction(self) -> None:
+        """The input of a reduction over an extent-1 dim meets its result
+        without the unit dim (``size1_reduction_positions``), so the kernel
+        that permutes is accepted and each thread reads its own element."""
+        x = torch.randn(48, 80, device=DEVICE)
+        torch.testing.assert_close(self._run(permuted_unit_dim_sum, (x,))[0], (x * 2).T)
 
     def test_permute_into_dot(self) -> None:
         tiled = helion.Config(block_sizes=[16, 16, 16], num_threads=[4, 4, 16])

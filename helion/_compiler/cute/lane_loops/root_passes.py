@@ -134,6 +134,11 @@ def run_root_lane_passes(codegen: GenerateAST) -> None:
             if any(alias != name for alias in aliases)
             for alias in (name, *aliases)
         },
+        proven_tensor_stride_values=(
+            codegen.device_function.proven_tensor_stride_values()
+        ),
+        constexpr_value=codegen.device_function.resolved_int_constexpr,
+        rename_groups=lane_rename_groups,
     )
     # The interchange only moves markers that already exist
     # (``_interchange_one_lane_loop`` keeps a nest without

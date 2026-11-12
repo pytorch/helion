@@ -216,15 +216,15 @@ def mark_rolled_graph_nodes_pass(
 ) -> None:
     """Pre-roll node marks the roller's ``node_copy`` carries into the
     rolled sweeps."""
-    # Mark provably-FTZ-safe exp sites and explicitly rounded FP32
+    # Mark provably-FTZ-safe exp2 sites and explicitly rounded FP32
     # products on the pre-roll graphs so the roller's node_copy
     # carries the marks into the rolled sweeps (consumed by the cute
     # op overrides; inert for other backends).
-    from .exp2_fastmath import mark_ftz_safe_exp_nodes
+    from .exp2_fastmath import mark_ftz_safe_exp2_nodes
     from .scalar_recipe_rounding import mark_narrowed_fp32_multiplies
 
     for graph_info in device_ir.graphs:
-        mark_ftz_safe_exp_nodes(graph_info.graph)
+        mark_ftz_safe_exp2_nodes(graph_info.graph)
         mark_narrowed_fp32_multiplies(graph_info.graph)
 
 
