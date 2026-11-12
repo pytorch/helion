@@ -37,6 +37,7 @@ from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfSharedMemoryLessThan
 from helion._testing import slowIfBackends
+import helion.language as hl
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -490,6 +491,37 @@ def test_muse_spark_tp4_megakernels_compile() -> None:
             kernel.bind(args).to_triton_code(kernel.configs[0])
     finally:
         dist.destroy_process_group()
+
+
+def muse_experts_of(ids, out, distinct_table, expert_of) -> torch.Tensor:
+    for j in hl.tile(out.size(0), block_size=1):
+        words, counts, before, _ = distinct_table(ids[:])
+        out[j] = expert_of(words, counts, before, j.begin)
+    return out
+
+
+@skipIfRefEager("expert_of runs inside a compiled kernel")
+@skipIfNotTriton("expert_of runs only in the Triton-pinned Muse Spark MoE kernels")
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_muse_spark_expert_of(index_dtype: torch.dtype) -> None:
+    from pretuned_kernels.megakernels.muse_spark import _moe
+
+    kernel = helion.kernel(
+        muse_experts_of,
+        config=helion.Config(block_sizes=[]),
+        index_dtype=index_dtype,
+        static_shapes=True,
+    )
+    # Experts in every bitmap word, the top bit of the last one included. The
+    # 128 ids (a power of two) load unmasked: a masked slot would read expert 0.
+    ids = torch.tensor(
+        [3, 31, 32, 40, 63, 64, 100, 128, 160, 200, 224, 250, 255] * 9 + [5] * 11,
+        device=DEVICE,
+        dtype=torch.int32,
+    )
+    expected = torch.unique(ids)
+    out = kernel(ids, torch.zeros_like(expected), _moe.distinct_table, _moe.expert_of)
+    torch.testing.assert_close(out, expected)
 
 
 @skipIfRefEager("tile dependencies are built only in compiled mode")
