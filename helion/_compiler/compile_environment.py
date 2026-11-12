@@ -2008,6 +2008,22 @@ class CompileEnvironment:
             return size
         return self.size_hint(size)
 
+    def is_tunable_expr(self, expr: sympy.Basic) -> bool:
+        """Whether ``expr`` has free symbols and all of them are tunables."""
+        return bool(expr.free_symbols) and expr.free_symbols <= self.tunable_symbols
+
+    def is_tunable_extent(self, size: int | torch.SymInt) -> bool:
+        """Whether a tensor dim is sized by ``hl.register_tunable`` values alone.
+
+        Such an extent is fixed per config but is not a block size, so a full
+        slice over it needs a reduction dim for reductions, masks and loops.
+        """
+        return (
+            isinstance(size, torch.SymInt)
+            and self.is_tunable_expr(size._sympy_())
+            and self.resolve_block_id(size) is None
+        )
+
     def tunable_default_hint(self, expr: sympy.Basic) -> int | None:
         """``expr`` evaluated with every ``hl.register_tunable`` symbol at its default.
 
@@ -2018,11 +2034,11 @@ class CompileEnvironment:
         expressions whose free symbols are all integer tunables qualify; the
         result stays above one, clear of singleton special cases.
         """
+        if not self.is_tunable_expr(expr):
+            return None
         symbols = {
             symbol for symbol in expr.free_symbols if isinstance(symbol, sympy.Symbol)
         }
-        if not symbols or not symbols <= self.tunable_symbols:
-            return None
         substitutions: dict[sympy.Symbol, sympy.Integer] = {}
         for symbol in symbols:
             value = self.config_value_expressions.get(symbol)

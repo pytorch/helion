@@ -1106,12 +1106,11 @@ class DeviceFunction:
 
     def expr_arg(self, sym: sympy.Expr, origin: Origin) -> NumericArgument:
         if sym not in self._expr_args:
-            tunable_symbols = CompileEnvironment.current().tunable_symbols
             # A tunable-only expression is constant for each compiled config.
             arg_type = (
                 ConstExprArg
                 if sym in self._constexpr_exprs
-                or (sym.free_symbols and sym.free_symbols.issubset(tunable_symbols))
+                or CompileEnvironment.current().is_tunable_expr(sym)
                 else SymbolArgument
             )
             arg = arg_type(

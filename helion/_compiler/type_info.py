@@ -471,8 +471,12 @@ class TensorType(TypeInfo):
                     # buffers (e.g. host-allocated accumulators via hl.zeros).
                     # Allocating a reduction-dim block here would introduce a
                     # fresh unbacked symbol that does not unify with the int
-                    # even when the hint matches.
-                    if not env.backend.pad_factory_tensors_to_power_of_2:
+                    # even when the hint matches.  A tunable extent has no
+                    # int to unify with and needs a reduction dim like below.
+                    if (
+                        not env.backend.pad_factory_tensors_to_power_of_2
+                        and not env.is_tunable_extent(output_size)
+                    ):
                         output_sizes.append(env.try_concretize_symint(output_size))
                         continue
                     rdim = CompileEnvironment.current().allocate_reduction_dimension(

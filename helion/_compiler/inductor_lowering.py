@@ -1007,7 +1007,10 @@ class ReductionLowering(InductorLowering):
 
         env = CompileEnvironment.current()
         if isinstance(reduction_size, sympy.Symbol):
-            block_index: int | None = env.get_block_id(reduction_size)
+            block_index = env.get_block_id(reduction_size)
+            if block_index is None:
+                # A bare symbol that is not a block size (e.g. a runtime int).
+                raise exc.ReductionOnNonTile(reduction_size)
         elif isinstance(reduction_size, (int, sympy.Integer)):
             # Allocate or find a reduction dimension matching this size.
             # Convert to a SymInt when needed.
@@ -1022,7 +1025,6 @@ class ReductionLowering(InductorLowering):
                 raise exc.ReductionOnNonTile(reduction_size)
         else:
             raise exc.ReductionOnNonTile(reduction_size)
-        assert block_index is not None
         self.block_index: int = block_index
 
     @property
