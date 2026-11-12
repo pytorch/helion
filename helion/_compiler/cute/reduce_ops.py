@@ -260,6 +260,8 @@ def _reduce_along(
     dims: list[int],
     fake_input: torch.Tensor,
     prefix: str,
+    *,
+    filled: bool,
 ) -> ast.AST:
     """Reduce ``value`` over ``dims`` with the strategies that own them.
 
@@ -267,8 +269,13 @@ def _reduce_along(
     (``ReductionLowering.codegen``): a block wider than a warp combines its
     warps' partials through shared memory, which a bare warp reduction does
     not.  Several dims (``dim=None``) reduce one at a time, innermost first.
+    With ``filled``, the input's lanes past each padded ``hl.arange`` it reads
+    hold hl.reduce's ``other`` already (``_fill_padded_range_lanes``) and are
+    reduced as elements; otherwise each reduction gives the lanes past the
+    padded ranges the reduction reads its identity.
     """
     from ..compile_environment import CompileEnvironment
+    from .reduction_emitter import CutePersistentReductionEmitter
 
     env = CompileEnvironment.current()
     for dim in sorted(dims, reverse=True):
@@ -278,14 +285,123 @@ def _reduce_along(
         with env.fake_mode:
             fake_output = _fake_reduce_tensor(fake_input, dim, keep_dims=False)
         input_name = state.codegen.lift(value, dce=True, prefix=prefix).id
-        value = env.backend.cast_ast(
-            strategy.codegen_reduction(
-                state, input_name, reduction_type, dim, fake_input, fake_output
-            ),
-            fake_output.dtype,
-        )
+        persistent = isinstance(emitter, CutePersistentReductionEmitter)
+        if persistent:
+            emitter.padded_range_filled = filled
+        try:
+            value = env.backend.cast_ast(
+                strategy.codegen_reduction(
+                    state, input_name, reduction_type, dim, fake_input, fake_output
+                ),
+                fake_output.dtype,
+            )
+        finally:
+            if persistent:
+                emitter.padded_range_filled = False
         fake_input = fake_output
     return value
+
+
+def _fill_padded_range_lanes(
+    state: CodegenState,
+    value: ast.AST,
+    input_node: object,
+    dims: list[int],
+    fake_input: torch.Tensor,
+    other: float | bool | None,
+    dtype: torch.dtype,
+    prefix: str,
+) -> ast.AST | None:
+    """``value``, the hl.reduce input ``input_node``, with hl.reduce's
+    ``other`` in the lanes past the padded ranges it reads on the reduced
+    ``dims``' lanes, in ``dtype``, for ``_reduce_along(..., filled=True)``:
+    hl.reduce's value for masked and padded elements, as Triton masks each
+    input before ``tl.reduce``.  Another input of a tuple, a full row beside
+    the range, keeps its lanes.
+
+    The lanes are filled on every reduced dim before the first reduction: a
+    lane past a range on one dim is a padding element whatever its other
+    indices, so a padded row of an outer dim counts ``other`` once per lane,
+    not once.  None where the input reads no padded range on the reduced
+    dims' lanes, or the value of its masked lanes is unknown (``other``
+    None): then each reduction gives those lanes its identity.
+    """
+    from ..ast_extension import expr_from_string
+    from .iota_utils import cute_padded_range_length
+    from .reduction_emitter import CutePersistentReductionEmitter
+    from .reduction_emitter import select_past_padded_ranges
+
+    if other is None or not isinstance(input_node, torch.fx.Node):
+        return None
+    assert state.fx_node is not None
+    ranges: list[tuple[str, int]] = []
+    for dim in dims:
+        strategy = _dim_reduction_strategy(state, fake_input, dim)
+        if not isinstance(strategy.emitter, CutePersistentReductionEmitter):
+            continue
+        length = cute_padded_range_length(
+            state.codegen, state.fx_node, strategy.block_index, [input_node]
+        )
+        if length is not None:
+            ranges.append((strategy.index_var(strategy.block_index), length))
+    if not ranges:
+        return None
+    input_name = state.codegen.lift(value, dce=True, prefix=prefix).id
+    return expr_from_string(
+        select_past_padded_ranges(state, input_name, ranges, other, dtype)
+    )
+
+
+def _reduce_input(
+    state: CodegenState,
+    value: ast.AST,
+    input_node: object,
+    reduction_type: str,
+    dims: list[int],
+    fake_input: torch.Tensor,
+    prefix: str,
+) -> ast.AST:
+    """``_reduce_along`` of the hl.reduce input ``input_node``, rendered as
+    ``value``, whose masked and padded elements take its ``other``."""
+    from ..reduction_strategy import reduction_acc_dtype
+
+    other = _reduce_other(input_node)
+    filled = _fill_padded_range_lanes(
+        state,
+        value,
+        input_node,
+        dims,
+        fake_input,
+        other,
+        reduction_acc_dtype(reduction_type, fake_input, fake_input),
+        prefix,
+    )
+    # With ``other`` known, this input's padding is decided here, also when
+    # it reads no padded range while another input of the tuple does.
+    return _reduce_along(
+        state,
+        value if filled is None else filled,
+        reduction_type,
+        dims,
+        fake_input,
+        prefix,
+        filled=other is not None and isinstance(input_node, torch.fx.Node),
+    )
+
+
+def _reduce_other(node: object) -> float | bool | None:
+    """hl.reduce's ``other`` for the input ``node``: its ``_mask_to``'s, or,
+    where ``remove_unnecessary_masking`` dropped that mask, the value its
+    masked lanes hold already (None when unknown)."""
+    from ...language._tracing_ops import _mask_to
+    from ..node_masking import cached_masked_value
+
+    assert isinstance(node, torch.fx.Node)
+    if node.target is _mask_to:
+        other = node.args[1]
+        assert isinstance(other, (int, float, bool))
+        return other
+    return cached_masked_value(node)
 
 
 @_decorators.codegen(_reduce, "cute")
@@ -307,9 +423,11 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
                 "cute",
                 "hl.reduce custom combine function",
             )
-        return _reduce_along(
+        assert state.fx_node is not None
+        return _reduce_input(
             state,
             state.ast_arg(1),
+            state.fx_node.args[1],
             reduction_type,
             dims,
             first_input,
@@ -328,14 +446,18 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     if reduction_types := _infer_tuple_builtin_reduction_types_for_cute(
         state, combine_graph_id, tuple_arity
     ):
+        assert state.fx_node is not None
+        input_nodes = state.fx_node.args[1]
+        assert isinstance(input_nodes, (tuple, list))
         result_exprs: list[ast.AST] = []
         for i, reduction_type in enumerate(reduction_types):
             input_node = ast_input[i]
             assert isinstance(input_node, ast.AST), input_node
             result_exprs.append(
-                _reduce_along(
+                _reduce_input(
                     state,
                     input_node,
+                    input_nodes[i],
                     reduction_type,
                     dims,
                     proxy_input[i],
@@ -366,10 +488,49 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
 
     env = CompileEnvironment.current()
     backend = env.backend
-    value_name = state.codegen.lift(ast_input[0], dce=True, prefix="reduce_value").id
-    index_name = state.codegen.lift(ast_input[1], dce=True, prefix="reduce_index").id
     value_dtype = proxy_input[0].dtype
     index_dtype = proxy_input[1].dtype
+    # Each input's lanes past a padded range take its half of the ``other``
+    # pair and fold as elements, as on Triton, where both halves are known.
+    assert state.fx_node is not None
+    input_nodes = state.fx_node.args[1]
+    assert isinstance(input_nodes, (tuple, list))
+    other_value = _reduce_other(input_nodes[0])
+    other_index = _reduce_other(input_nodes[1])
+    value_ast = None
+    index_ast = None
+    if other_value is not None and other_index is not None:
+        value_ast = _fill_padded_range_lanes(
+            state,
+            ast_input[0],
+            input_nodes[0],
+            dims,
+            proxy_input[0],
+            other_value,
+            value_dtype,
+            "reduce_value",
+        )
+        index_ast = _fill_padded_range_lanes(
+            state,
+            ast_input[1],
+            input_nodes[1],
+            dims,
+            proxy_input[1],
+            other_index,
+            index_dtype,
+            "reduce_index",
+        )
+    filled = other_value is not None and other_index is not None
+    value_name = state.codegen.lift(
+        ast_input[0] if value_ast is None else value_ast,
+        dce=True,
+        prefix="reduce_value",
+    ).id
+    index_name = state.codegen.lift(
+        ast_input[1] if index_ast is None else index_ast,
+        dce=True,
+        prefix="reduce_index",
+    ).id
     value_reduction = "max" if argreduce.reduction_type == "argmax" else "min"
     strategy = _dim_reduction_strategy(state, proxy_input[0], dim_int)
     mask = strategy.mask_var(strategy.block_index)
@@ -394,7 +555,13 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
 
     def reduce(expr: str, reduction_type: str, fake: torch.Tensor, prefix: str) -> str:
         reduced = _reduce_along(
-            state, expr_from_string(expr), reduction_type, dims, fake, f"{prefix}_input"
+            state,
+            expr_from_string(expr),
+            reduction_type,
+            dims,
+            fake,
+            f"{prefix}_input",
+            filled=filled,
         )
         return state.codegen.lift(reduced, dce=True, prefix=prefix).id
 
@@ -480,5 +647,6 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
         dims,
         proxy_input[1],
         "reduce_index_candidate",
+        filled=filled,
     )
     return [expr_from_string(result_value), reduced_index]

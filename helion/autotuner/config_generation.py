@@ -724,16 +724,17 @@ class ConfigGeneration:
             1,
         )
 
+    def block_size_minimum(self, index: int) -> int:
+        """The smallest value shrinking gives the block size at flat ``index``."""
+        return max(self.flat_spec[index].get_minimum(), self.min_block_size)
+
     def _shrink_for_numel_constraints(self, flat_config: FlatConfig) -> None:
         """Shrink block sizes in flat_config to satisfy numel constraints."""
         constraints = self.config_spec.tensor_numel_constraints
         if not constraints:
             return
         block_sizes = [cast("int", flat_config[i]) for i in self.block_size_indices]
-        min_sizes = [
-            max(self.flat_spec[i].get_minimum(), self.min_block_size)
-            for i in self.block_size_indices
-        ]
+        min_sizes = [self.block_size_minimum(i) for i in self.block_size_indices]
         shrink_block_sizes_for_numel_constraints(constraints, block_sizes, min_sizes)
         for idx, fi in enumerate(self.block_size_indices):
             flat_config[fi] = block_sizes[idx]
@@ -749,8 +750,24 @@ class ConfigGeneration:
             flat_config: config to mutate in place
             max_elements_per_thread: maximum number of elements per thread
         """
-        if self.num_warps_index < 0 or not self.block_size_indices:
+        if not self.block_size_indices:
             return
+        if self.num_warps_index >= 0:
+            self._shrink_for_num_warps(flat_config, max_elements_per_thread)
+            self._shrink_for_numel_constraints(flat_config)
+        else:
+            # A backend without num_warps bounds its own thread knobs (CuTe
+            # tunes num_threads per axis), after the cheap numel bound so
+            # that its halvings start from a tile of at most that size.
+            self._shrink_for_numel_constraints(flat_config)
+            self.extension.shrink_for_threads(flat_config, max_elements_per_thread)
+        self.extension.repair_flat_config(flat_config)
+
+    def _shrink_for_num_warps(
+        self, flat_config: FlatConfig, max_elements_per_thread: int
+    ) -> None:
+        """Halve the block sizes until their product fits ``num_warps`` warps
+        of ``max_elements_per_thread`` elements each."""
         num_threads = warps_to_threads(cast("int", flat_config[self.num_warps_index]))
         # Respect the backend's per-tile element ceiling (Triton: 2**20;
         # Pallas: None, since the real bound is VMEM bytes). Unit-test
@@ -772,14 +789,11 @@ class ConfigGeneration:
             for i in self.block_size_indices:
                 val = flat_config[i]
                 assert isinstance(val, int)
-                threshold = max(self.flat_spec[i].get_minimum(), self.min_block_size)
-                if val // 2 >= threshold:
+                if val // 2 >= self.block_size_minimum(i):
                     flat_config[i] = val // 2
                     changes += 1
             if changes == 0:
                 break
-        self._shrink_for_numel_constraints(flat_config)
-        self.extension.repair_flat_config(flat_config)
 
     def _fragment_default_flat(self) -> FlatConfig:
         """

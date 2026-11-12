@@ -71,6 +71,7 @@ from helion._compiler.cute.autotune.heuristics.cute import CuteResidentRowHeuris
 from helion._compiler.cute.autotune.heuristics.cute import (
     CuteResidentRowWideClusterHeuristic,
 )
+from helion._compiler.cute.autotune.heuristics.cute import CuteStridedReductionHeuristic
 from helion._compiler.cute.autotune.heuristics.cute import CuteTcgen05ClusterM2Heuristic
 from helion._compiler.cute.autotune.heuristics.cute import (
     CuteTcgen05GroupedWorklistHeuristic,
@@ -1399,6 +1400,7 @@ class TestAutotunerHeuristic(TestCase):
             frozenset({"config_num_sm", "input_tensor_metadata"}),
         )
         for heuristic in (
+            CuteStridedReductionHeuristic,
             CuteTcgen05ClusterM2Heuristic,
             TritonH100FormulaMatmulHeuristic,
             TritonH100MultiMatmulHeuristic,
@@ -4340,6 +4342,8 @@ _CUTE_HEURISTIC_ORDER = (
     "cute_fragment_pure_producer_regions",
     "cute_radix_selection",
     "cute_fragment_half_mma",
+    "cute_strided_reduction",
+    "cute_privatize_atomics",
 )
 
 

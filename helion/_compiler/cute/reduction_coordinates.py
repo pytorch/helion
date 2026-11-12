@@ -41,6 +41,16 @@ if TYPE_CHECKING:
     from ..generate_ast import GenerateAST
 
 
+def reduced_block_ids(codegen: GenerateAST) -> set[int]:
+    """The block ids some lowered reduction of the kernel reduces over."""
+    return {
+        lowering.block_index
+        for graph in codegen.codegen_graphs
+        for node in graph.graph.nodes
+        if isinstance(lowering := node.meta.get("lowering"), ReductionLowering)
+    }
+
+
 def _full_reductions(
     env: CompileEnvironment, graphs: list[GraphInfo]
 ) -> Iterator[tuple[GraphInfo, Node, ReductionLowering]]:

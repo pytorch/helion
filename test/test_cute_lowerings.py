@@ -13900,10 +13900,6 @@ class TestCuteLowerings(unittest.TestCase):
                 "helion._compiler.cute.backend._detect_specialized_mma_loop",
                 return_value=True,
             ),
-            # The fake config spec models no tile aliases.
-            patch.object(
-                backend, "inactive_broadcast_alias_block_ids", return_value=set()
-            ),
         ):
             strategy = backend.create_loop_strategy(fn, [0, 1], config)
 

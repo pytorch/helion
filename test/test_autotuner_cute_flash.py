@@ -8172,6 +8172,7 @@ class TestCuteAutotuner(TestCase):
                 "cute_scalar_epilogue_owner_fold",
                 "cute_warp_fp32_redux",
                 "cute_register_tile_warp_fold",
+                "cute_register_tile_cooperative_fold",
                 "cute_register_tile_store_first",
                 "cute_replicated_reduction",
                 "cute_vector_packet_unroll",

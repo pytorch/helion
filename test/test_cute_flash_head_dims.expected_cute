@@ -780,7 +780,6 @@ import torch
 import cutlass
 import cutlass.cute as cute
 from helion.runtime import default_cute_launcher as _default_cute_launcher
-from helion._utils import next_power_of_2 as _next_power_of_2
 import cutlass.utils as cutlass_utils_flash
 import cutlass.pipeline as cutlass_pipeline_flash
 from cutlass.cute.nvgpu import cpasync as cute_cpasync_flash
@@ -1053,12 +1052,9 @@ def _dense_causal_attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.
     # src[test_cute_flash_head_dims.py:N]: qk_scale = (1.0 / math.sqrt(head_dim)) * math.log2(math.e)
     qk_scale = 1.0 / math.sqrt(head_dim) * math.log2(math.e)
     # src[test_cute_flash_head_dims.py:N]: for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
-    _BLOCK_SIZE_1 = 128
-    # src[test_cute_flash_head_dims.py:N]: for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
     # src[test_cute_flash_head_dims.py:N]:     m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
     # src[test_cute_flash_head_dims.py:N]:     l_i = torch.full_like(m_i, 1.0)
     # src[test_cute_flash_head_dims.py:N-N]: ...
-    _RDIM_SIZE_4 = _next_power_of_2(_BLOCK_SIZE_1)
     _launcher(_helion__dense_causal_attention, (128,), q_view, k_view, v_view, out, block=(256, 1, 1))
     # src[test_cute_flash_head_dims.py:N]: return out.view(q_in.size())
     return out.view(q_in.size())
@@ -1071,7 +1067,6 @@ import torch
 import cutlass
 import cutlass.cute as cute
 from helion.runtime import default_cute_launcher as _default_cute_launcher
-from helion._utils import next_power_of_2 as _next_power_of_2
 import cutlass.utils as cutlass_utils_flash
 import cutlass.pipeline as cutlass_pipeline_flash
 from cutlass.cute.nvgpu import cpasync as cute_cpasync_flash
@@ -1401,12 +1396,9 @@ def _dense_causal_attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.
     # src[test_cute_flash_head_dims.py:N]: qk_scale = (1.0 / math.sqrt(head_dim)) * math.log2(math.e)
     qk_scale = 1.0 / math.sqrt(head_dim) * math.log2(math.e)
     # src[test_cute_flash_head_dims.py:N]: for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
-    _BLOCK_SIZE_1 = 128
-    # src[test_cute_flash_head_dims.py:N]: for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
     # src[test_cute_flash_head_dims.py:N]:     m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
     # src[test_cute_flash_head_dims.py:N]:     l_i = torch.full_like(m_i, 1.0)
     # src[test_cute_flash_head_dims.py:N-N]: ...
-    _RDIM_SIZE_4 = _next_power_of_2(_BLOCK_SIZE_1)
     _launcher(_helion__dense_causal_attention, (128,), q_view, k_view, v_view, out, block=(256, 1, 1))
     # src[test_cute_flash_head_dims.py:N]: return out.view(q_in.size())
     return out.view(q_in.size())
@@ -1826,7 +1818,6 @@ import torch
 import cutlass
 import cutlass.cute as cute
 from helion.runtime import default_cute_launcher as _default_cute_launcher
-from helion._utils import next_power_of_2 as _next_power_of_2
 import cutlass.utils as cutlass_utils_flash
 import cutlass.pipeline as cutlass_pipeline_flash
 from cutlass.cute.nvgpu import cpasync as cute_cpasync_flash
@@ -2178,12 +2169,9 @@ def _dense_causal_attention(q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.
     # src[test_cute_flash_head_dims.py:N]: qk_scale = (1.0 / math.sqrt(head_dim)) * math.log2(math.e)
     qk_scale = 1.0 / math.sqrt(head_dim) * math.log2(math.e)
     # src[test_cute_flash_head_dims.py:N]: for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
-    _BLOCK_SIZE_1 = 128
-    # src[test_cute_flash_head_dims.py:N]: for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
     # src[test_cute_flash_head_dims.py:N]:     m_i = hl.full([tile_b, tile_m], float("-inf"), dtype=torch.float32)
     # src[test_cute_flash_head_dims.py:N]:     l_i = torch.full_like(m_i, 1.0)
     # src[test_cute_flash_head_dims.py:N-N]: ...
-    _RDIM_SIZE_4 = _next_power_of_2(_BLOCK_SIZE_1)
     _launcher(_helion__dense_causal_attention, (128,), q_view, k_view, v_view, out, block=(256, 1, 1))
     # src[test_cute_flash_head_dims.py:N]: return out.view(q_in.size())
     return out.view(q_in.size())

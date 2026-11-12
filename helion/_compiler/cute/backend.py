@@ -359,19 +359,6 @@ def _reject_dropped_root_threads(
         )
 
 
-def _reduced_block_ids(codegen: GenerateAST) -> set[int]:
-    """The block ids some lowered reduction of the kernel reduces over."""
-    # Local import: see ``_multi_phase_block_dims``.
-    from ..inductor_lowering import ReductionLowering
-
-    return {
-        lowering.block_index
-        for graph in codegen.codegen_graphs
-        for node in graph.graph.nodes
-        if isinstance(lowering := node.meta.get("lowering"), ReductionLowering)
-    }
-
-
 def _reject_multi_root_reduction_surplus(
     device_function: DeviceFunction, dims: Sequence[int]
 ) -> None:
@@ -386,13 +373,14 @@ def _reject_multi_root_reduction_surplus(
     rejected rather than folded with the surplus lanes.
     """
     from ..reduction_strategy import ReductionStrategy
+    from .reduction_coordinates import reduced_block_ids
 
     tile_strategy = device_function.tile_strategy
-    reduced_block_ids = _reduced_block_ids(device_function.codegen)
+    reduced = reduced_block_ids(device_function.codegen)
     for strategy in tile_strategy.strategies:
         if (
             not isinstance(strategy, ReductionStrategy)
-            or strategy.block_index not in reduced_block_ids
+            or strategy.block_index not in reduced
         ):
             continue
         count = strategy._reduction_thread_count()
@@ -427,6 +415,7 @@ def _multi_phase_block_dims(
     # before ``CompileEnvironment`` exists.
     from ..reduction_strategy import ReductionStrategy
     from ..tile_strategy import PerThreadNDTileStrategy
+    from .reduction_coordinates import reduced_block_ids
 
     codegen = device_function.codegen
     tile_strategy = device_function.tile_strategy
@@ -465,7 +454,7 @@ def _multi_phase_block_dims(
             "lanes of another phase would corrupt the cross-lane reduction",
         )
 
-    reduced_block_ids = _reduced_block_ids(codegen)
+    reduced = reduced_block_ids(codegen)
     for strategy in tile_strategy.strategies:
         base_axis = tile_strategy.thread_axis_for_strategy(strategy)
         if base_axis is None:
@@ -481,7 +470,7 @@ def _multi_phase_block_dims(
             size,
             _expr,
         ) in tile_strategy._iter_strategy_thread_axes(strategy):
-            if block_id not in reduced_block_ids or size is None:
+            if block_id not in reduced or size is None:
                 continue
             if isinstance(strategy, PerThreadNDTileStrategy):
                 size = strategy.thread_extent_for_masking(block_id, size)
@@ -2098,8 +2087,6 @@ class CuteBackend(Backend):
             for node in graph.graph.nodes
             for block_id in full_slice_block_ids(node)
         }
-        if sliced:
-            self._refuse_full_slices_beside_their_tiles(fn, sliced, live_graph_ids)
         return active_block_ids(
             graphs,
             (
@@ -2114,117 +2101,18 @@ class CuteBackend(Backend):
             if block.reduction and env.canonical_block_id(block.block_id) in sliced
         }
 
-    def _refuse_full_slices_beside_their_tiles(
-        self, fn: DeviceFunction, sliced: set[int], live_graph_ids: frozenset[int]
-    ) -> None:
-        """Refuse a live full slice (``full_slice_block_ids``) that may meet a
-        live loop over the block whose variable its reduction block reuses.
-
-        Shape propagation pairs the slice's elements with that tile's by
-        position, but CuTe gives the two blocks coordinates of their own:
-        inside the loop each lane would store a different buffer column into
-        one element.  A store outside every such loop that reads nothing
-        carrying the block's dim (zeroing the buffer) meets nothing.  An
-        access inside one is refused, and so are a load or an atomic, whose
-        value may flow into one, and a store whose value, ``extra_mask`` or
-        tensor index carries the dim, or that a tensor ``if`` whose test
-        carries it decides, which may come from one.  A stack tensor's
-        ``(tensor_like, pointers)`` counts as a store's input, so storing
-        into one is refused too.
-        """
-        from ...language import _tracing_ops
-        from ...language import memory_ops
-        from ..active_blocks import full_slice_block_ids
-        from ..compile_environment import CompileEnvironment
-        from ..device_ir import ForLoopGraphInfo
-        from ..device_ir import ReductionLoopGraphInfo
-        from ..device_ir import control_flow_child_graph_ids
-        from ..host_function import HostFunction
-
-        env = CompileEnvironment.current()
-        device_ir = HostFunction.current().device_ir
-        graphs = fn.codegen.codegen_graphs
-        # The canonical blocks the tile loops around each live graph iterate:
-        # its root's grid, then every enclosing tile loop.
-        around: dict[int, set[int]] = {}
-        # The canonical blocks the tests of the tensor ``if``s around each
-        # live graph carry: they decide element by element whether it runs.
-        decided: dict[int, set[int]] = {}
-
-        def blocks(value: object) -> set[int]:
-            val = value.meta.get("val") if isinstance(value, torch.fx.Node) else None
-            if not isinstance(val, torch.Tensor):
-                return set()
-            return {
-                env.canonical_block_id(block_id)
-                for size in val.shape
-                if (block_id := env.get_block_id(size)) is not None
-            }
-
-        def visit(graph_id: int, tiles: frozenset[int], tests: frozenset[int]) -> None:
-            if graph_id not in live_graph_ids:
-                return
-            info = graphs[graph_id]
-            if isinstance(info, ForLoopGraphInfo) and not isinstance(
-                info, ReductionLoopGraphInfo
-            ):
-                tiles = tiles | {env.canonical_block_id(b) for b in info.block_ids}
-            around.setdefault(graph_id, set()).update(tiles)
-            decided.setdefault(graph_id, set()).update(tests)
-            for node in info.graph.nodes:
-                inner = tests
-                if node.op == "call_function" and node.target is _tracing_ops._if:
-                    inner = tests | blocks(node.args[0])
-                for child in control_flow_child_graph_ids(node):
-                    visit(child, tiles, inner)
-
-        for root_id, block_ids in zip(
-            device_ir.root_ids, device_ir.grid_block_ids, strict=True
-        ):
-            visit(
-                root_id,
-                frozenset(env.canonical_block_id(b) for b in block_ids),
-                frozenset(),
-            )
-        tiled = sliced & set().union(*around.values())
-
-        for graph_id, tiles in around.items():
-            for node in graphs[graph_id].graph.nodes:
-                for block in full_slice_block_ids(node) & tiled:
-                    if block in tiles:
-                        meeting = "is accessed inside that loop"
-                        hint = "index the dim with tile.index - tile.begin"
-                    elif (
-                        node.target is not memory_ops.store
-                        or block in decided[graph_id]
-                        or any(
-                            block in blocks(operand)
-                            for operand in node.all_input_nodes
-                            if operand is not node.args[0]
-                        )
-                    ):
-                        meeting = "may meet that loop through a value"
-                        hint = (
-                            "access the buffer inside the loop and index the "
-                            "dim with tile.index - tile.begin"
-                        )
-                    else:
-                        continue
-                    raise exc.BackendUnsupported(
-                        "cute",
-                        "a full slice of a host tensor dim sized by a tile loop's "
-                        f"block size {meeting} (its reduction block reuses tile "
-                        f"block {block}'s variable, and CuTe has no lanes that "
-                        f"pair its elements with the tile's); {hint} instead",
-                    )
-
     def shares_sibling_thread_axes(self) -> bool:
         return True
 
-    def inactive_broadcast_alias_block_ids(self, fn: DeviceFunction) -> set[int]:
-        from .active_blocks import inactive_broadcast_alias_block_ids
+    def check_reduction_blocks(
+        self,
+        fn: DeviceFunction,
+        block_ids: Sequence[int],
+        live_graph_ids: frozenset[int] | None,
+    ) -> None:
+        from .active_blocks import reject_tile_alias_reductions
 
-        return inactive_broadcast_alias_block_ids(fn)
+        reject_tile_alias_reductions(fn, block_ids, live_graph_ids)
 
     def roots_may_reserve_distinct_thread_axes(self) -> bool:
         return True
@@ -2307,7 +2195,7 @@ class CuteBackend(Backend):
         from ..compile_environment import CompileEnvironment
         from .tile_packing import packed_grid_block
 
-        return packed_grid_block(CompileEnvironment.current(), config)
+        return packed_grid_block(CompileEnvironment.current().config_spec, config)
 
     # Tensor-core policy of the shared per-thread planner
     # (``per_thread_planning.plan_per_thread_loop_strategy``).  The detectors
@@ -3250,6 +3138,9 @@ class CuteBackend(Backend):
             "_cute_bfloat16_x16_to_float16": "from helion._compiler.cute.quantized_helpers import bfloat16_x16_to_float16 as _cute_bfloat16_x16_to_float16",
             "_cute_signed_bitfield_to_bf16_packed": "from helion._compiler.cute.vec_utils import signed_bitfield_to_bf16_packed as _cute_signed_bitfield_to_bf16_packed",
             "_cute_store_u16_vec": "from helion._compiler.cute.vec_utils import store_u16_vec as _cute_store_u16_vec",
+            "_cute_store_u8_vec": "from helion._compiler.cute.vec_utils import store_u8_vec as _cute_store_u8_vec",
+            "_cute_store_u8_vec_l2_evict_last": "from helion._compiler.cute.packet_store_helpers import store_u8_vec_l2_evict_last as _cute_store_u8_vec_l2_evict_last",
+            "_cute_store_u8_vec_streaming": "from helion._compiler.cute.packet_store_helpers import store_u8_vec_streaming as _cute_store_u8_vec_streaming",
             "_cute_store_fp8e4m3fn_vec": "from helion._compiler.cute.vec_utils import store_fp8e4m3fn_vec as _cute_store_fp8e4m3fn_vec",
             "_cute_store_fp8e5m2_vec": "from helion._compiler.cute.vec_utils import store_fp8e5m2_vec as _cute_store_fp8e5m2_vec",
             "_cute_store_fp8e4m3fn_vec_l2_evict_last": "from helion._compiler.cute.packet_store_helpers import store_fp8e4m3fn_vec_l2_evict_last as _cute_store_fp8e4m3fn_vec_l2_evict_last",
@@ -3971,7 +3862,9 @@ class CuteBackend(Backend):
         for strategy in existing_strategies:
             if isinstance(strategy, ReductionStrategy):
                 count = strategy._reduction_thread_count()
-                if count > 0:
+                # A block indexing a sibling's axis adds no threads
+                # (``CutePersistentReductionEmitter.plan_axis_partner``).
+                if count > 0 and strategy._claims_thread_axis():
                     other_threads *= count
             else:
                 for size in strategy.thread_block_sizes():
@@ -5082,13 +4975,15 @@ class CuteBackend(Backend):
         kernel, failed: the overflow is the actionable message. Callers wrap the
         statement visit and the device function finalization.
 
-        ``RegisterTileUnsupported`` is not a refusal but the register tile's
-        regeneration signal (``generate_ast`` retries with the rolled lane) and
-        passes through unchanged, decline or not.
+        A regeneration signal (``CuteRegeneration.signals``: the register
+        tile's ``RegisterTileUnsupported``, the planned layout's
+        ``VloopSinkLayoutRefused``, ...) is not a refusal: ``generate_ast``
+        generates the kernel again without what raised it, so it passes
+        through unchanged, decline or not.
         """
-        from .register_tile_admission import RegisterTileUnsupported
+        from .kernel_generators import CuteRegeneration
 
-        if isinstance(error, RegisterTileUnsupported):
+        if isinstance(error, CuteRegeneration.signals):
             return error
         declined = (
             codegen.device_function.cute_state.root_plans.fragment_capacity_decline
@@ -5126,6 +5021,7 @@ class CuteBackend(Backend):
     def after_device_codegen(
         self, codegen: GenerateAST, host: HostFunction, config: Config
     ) -> None:
+        from .atomic_privatization import privatize_atomic_targets
         from .cute_reshape import run_deferred_rebound_checks
         from .host_remainder_fills import append_device_remainder_fills
         from .lane_loops.root_passes import reject_lane_reads_without_lane_loops
@@ -5145,6 +5041,7 @@ class CuteBackend(Backend):
         cute_codegen_state(codegen).remainder_fills = append_device_remainder_fills(
             codegen, host, config
         )
+        privatize_atomic_targets(codegen, host)
 
     def finalize_host_statements(
         self, codegen: GenerateAST, host: HostFunction, statements: list[ast.AST]
@@ -5347,6 +5244,38 @@ class CuteBackend(Backend):
                 chunk_base_aligned=aligned,
             )
         )
+
+    def record_flattened_vloop_wrapper(
+        self,
+        fn: DeviceFunction,
+        wrapper: VecLaneWrapper,
+        *,
+        block_id: int,
+        lane_var: str,
+        index_var: str,
+        mask_var: str | None,
+        begin: object,
+        extent: object,
+    ) -> bool:
+        # Only ``cute_vloop_sink`` sinks a flattened tile's V-loop.  The
+        # respelled index and mask it asks for change the code, so like a
+        # thread layout the knob shapes they are regenerated with the knob
+        # off when nothing sinks (``VloopSinkNotApplied``).
+        if fn.config.config.get("cute_vloop_sink") is not True:
+            return False
+        self.record_vloop_wrapper(
+            fn,
+            wrapper,
+            block_id=block_id,
+            lane_var=lane_var,
+            index_var=index_var,
+            mask_var=mask_var,
+            begin=begin,
+            extent=extent,
+            step=None,
+        )
+        fn.cute_state.lanes.vloop_sink_shaped_code = True
+        return True
 
     def apply_lane_cluster_split(
         self, strategy: PerThreadNDTileStrategy, state: CodegenState

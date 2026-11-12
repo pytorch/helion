@@ -142,8 +142,11 @@ _CUTE_ALIGNMENT_MAX_BYTES = 32
 # same cache-key-backed base alignment the packet lowerings read.
 _CUTE_BYTE_PACKED_DTYPES = frozenset({torch.uint8, torch.int8, torch.float4_e2m1fn_x2})
 # Persistent-reduction stores of these dtypes become one packet per lane loop;
-# the flush helper converts every lane at once (``persistent_branch_vec``).
-_CUTE_PACKET_STORE_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2})
+# the flush helper converts (FP8) or packs (bool) every lane at once
+# (``persistent_branch_vec``).
+_CUTE_PACKET_STORE_DTYPES = frozenset(
+    {torch.float8_e4m3fn, torch.float8_e5m2, torch.bool}
+)
 
 
 def _specialized_int(
@@ -3593,6 +3596,11 @@ def _(state: CodegenState) -> ast.AST:
             if _cute_defer_grid_vector_op(
                 state, context, scalar_store, emit_tile_store
             ):
+                # Should the grid keep the scalar store (one nested in a lane
+                # loop of another axis), the sinking pass may still pack it.
+                _cute_record_sinkable_scalar_store(
+                    state, tensor, subscript, site.index_exprs, site.tensor_name
+                )
                 state.add_statement(scalar_store)
                 return ast.Constant(value=None)
             append_stmt = emit_tile_store()
@@ -3721,6 +3729,12 @@ def _(state: CodegenState) -> ast.AST:
                 vec_width=wrapper.vec_width,
                 dtype=tensor.dtype,
             )
+        )
+    elif store_uses_pointer and topk is None and not value_readdressed:
+        # A tile store nested in the loops a sunk V-loop encloses: the
+        # sinking pass may flush its V lanes as one packet.
+        _cute_record_sinkable_scalar_store(
+            state, tensor, subscript, site.index_exprs, site.tensor_name
         )
     assign_expr = expr_from_string(store_expr, value=value)
     _cute_tag_access_regions(assign_expr, site.tensor_name, site.regions)
@@ -5640,30 +5654,28 @@ def _cute_scalar_load_through_pointer(
     return f"({pointer}).load()"
 
 
-def _cute_record_sinkable_scalar_load(
+def _cute_sinkable_tile_wrapper(
     state: CodegenState,
     tensor: torch.Tensor,
     subscript: Sequence[object],
     index_exprs: Sequence[str],
-    tensor_name: str,
-    eviction_suffix: str,
-) -> None:
-    """Record a scalar tile load the vector-loop sinking pass may widen.
+) -> CuteVloopWrapperFact | None:
+    """The vectorized grid axis a scalar tile access may join as a packet once
+    ``cute/sink_vector_loops.py`` interchanges its V-loop into the loops
+    around the access, or None.
 
-    The ordinary tile hoist needs the load directly in the grid body so the
-    packet can move above the constexpr V-loop.  A load nested in a serial or
-    lane loop inside that V-loop keeps its scalar form here; when it still
-    addresses the vectorized grid axis at the tensor's stride-1 dim with the
-    plain per-element index, that axis is a zero-origin tile whose extent is
-    a multiple of V (every V-wide chunk is V-aligned and lies entirely inside
-    or outside the extent), the tensor's base and every other stride are
-    proven aligned for the packet and the packet fits one 16-byte
-    transaction, ``cute/sink_vector_loops.py`` can load the whole chunk once
-    per row after interchanging the V-loop into those loops.  The base and
-    stride proof is the tile hoist's (``cute_reduction_vector_layout_aligned``),
-    so a misaligned input view the hoist left on scalar loads is not widened
-    here either.  The fact is keyed by the scalar pointer expression the
-    pass will find in the AST.
+    The access must address that axis at the tensor's stride-1 dim with the
+    plain per-element index, and no other dim with it (``out[c, r, c]``), so
+    consecutive V lanes touch consecutive bytes.
+    The axis is a zero-origin tile whose extent is a multiple of V (every
+    V-wide chunk is V-aligned and lies entirely inside or outside the
+    extent), the tensor's base and every other stride are proven aligned for
+    the packet (the tile hoist's ``cute_reduction_vector_layout_aligned``, so
+    a misaligned input view the hoist left on scalar accesses is not widened
+    here either; its base proof reaches 32 bytes) and the packet spans at
+    most ``_FLAT_GATHER_SINK_MAX_BYTES``.  A packet load or store wider than
+    the target's widest access (16 bytes before SM100, 32 from it) lowers to
+    consecutive aligned accesses.
     """
     from ..tile_strategy import DeviceGridState
 
@@ -5676,10 +5688,8 @@ def _cute_record_sinkable_scalar_load(
         or tensor.dtype not in _CUTE_VECTOR_UNROLL_DTYPES
         or "None" in index_exprs
     ):
-        return
-    # Consecutive V lanes must fetch consecutive bytes, so the vectorized
-    # axis has to index the tensor's stride-1 dim (a plain ``int`` stride of
-    # 1: a symbolic stride is not specialized here).
+        return None
+    # A plain ``int`` stride of 1: a symbolic stride is not specialized here.
     stride1_dim = next(
         (
             dim
@@ -5689,7 +5699,7 @@ def _cute_record_sinkable_scalar_load(
         None,
     )
     if stride1_dim is None:
-        return
+        return None
     tensor_dim = 0
     lane_axis_pos: int | None = None
     block_id: int | None = None
@@ -5700,12 +5710,12 @@ def _cute_record_sinkable_scalar_load(
         expr_pos += 1
         if tensor_dim == stride1_dim:
             if not isinstance(idx, torch.SymInt):
-                return
+                return None
             block_id = env.get_block_id(idx)
             lane_axis_pos = expr_pos
         tensor_dim += 1
     if block_id is None or lane_axis_pos is None:
-        return
+        return None
     wrapper = next(
         (fact for fact in wrappers.values() if fact.block_id == block_id), None
     )
@@ -5714,20 +5724,80 @@ def _cute_record_sinkable_scalar_load(
         or not wrapper.uniform_vector_mask
         or wrapper.vec_width * tensor.dtype.itemsize > _FLAT_GATHER_SINK_MAX_BYTES
         or index_exprs[lane_axis_pos] != wrapper.index_var
+        or any(
+            {wrapper.index_var, wrapper.vec_lane_var}
+            & names_read(ast.parse(expr, mode="eval"))
+            for pos, expr in enumerate(index_exprs)
+            if pos != lane_axis_pos
+        )
         or not cute_reduction_vector_layout_aligned(
             env, tensor, stride1_dim, wrapper.vec_width
         )
     ):
-        return
-    from .device_state import CuteVloopLoadFact
+        return None
+    return wrapper
 
-    # Key by the normalized source text the pass sees after ``ast.unparse``.
-    key = ast.unparse(
+
+def _cute_sink_pointer_key(tensor_name: str, index_exprs: Sequence[str]) -> str:
+    """The scalar pointer of an access as the sinking pass sees it after
+    ``ast.unparse``."""
+    return ast.unparse(
         ast.parse(
             _cute_scalar_pointer_expr(tensor_name, list(index_exprs)), mode="eval"
         )
     )
-    state.device_function.cute_state.lanes.vloop_sink_loads[key] = CuteVloopLoadFact(
+
+
+def _cute_record_sinkable_scalar_store(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: Sequence[object],
+    index_exprs: Sequence[str],
+    tensor_name: str,
+) -> None:
+    """Record a scalar tile store the vector-loop sinking pass may flush as
+    one packet: the store-side twin of :func:`_cute_record_sinkable_scalar_load`."""
+    wrapper = _cute_sinkable_tile_wrapper(state, tensor, subscript, index_exprs)
+    if wrapper is None:
+        return
+    from .device_state import CuteVloopStoreFact
+
+    state.device_function.cute_state.lanes.vloop_sink_stores[
+        _cute_sink_pointer_key(tensor_name, index_exprs)
+    ] = CuteVloopStoreFact(
+        vec_lane_var=wrapper.vec_lane_var,
+        tensor_name=tensor_name,
+        vec_width=wrapper.vec_width,
+        dtype=tensor.dtype,
+    )
+
+
+def _cute_record_sinkable_scalar_load(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: Sequence[object],
+    index_exprs: Sequence[str],
+    tensor_name: str,
+    eviction_suffix: str,
+) -> None:
+    """Record a scalar tile load the vector-loop sinking pass may widen.
+
+    The ordinary tile hoist needs the load directly in the grid body so the
+    packet can move above the constexpr V-loop.  A load nested in a serial or
+    lane loop inside that V-loop keeps its scalar form here; when it
+    addresses the vectorized grid axis as ``_cute_sinkable_tile_wrapper``
+    requires, ``cute/sink_vector_loops.py`` can load the whole chunk once per
+    row after interchanging the V-loop into those loops.  The fact is keyed
+    by the scalar pointer expression the pass will find in the AST.
+    """
+    wrapper = _cute_sinkable_tile_wrapper(state, tensor, subscript, index_exprs)
+    if wrapper is None:
+        return
+    from .device_state import CuteVloopLoadFact
+
+    state.device_function.cute_state.lanes.vloop_sink_loads[
+        _cute_sink_pointer_key(tensor_name, index_exprs)
+    ] = CuteVloopLoadFact(
         vec_lane_var=wrapper.vec_lane_var,
         tensor_name=tensor_name,
         vec_width=wrapper.vec_width,
@@ -6592,6 +6662,16 @@ def _(state: CodegenState) -> object:
             if _cute_defer_grid_vector_op(state, context, scalar_load, emit_tile_load):
                 load_placeholders["tile_vector_load"] = scalar_load
                 load_expr = "{tile_vector_load}"
+                # Should the grid keep the scalar load (one nested in a lane
+                # loop of another axis), the sinking pass may still widen it.
+                _cute_record_sinkable_scalar_load(
+                    state,
+                    tensor,
+                    subscript,
+                    site.index_exprs,
+                    site.tensor_name,
+                    eviction_suffix,
+                )
             else:
                 vector_load = emit_tile_load()
                 if vector_load is not None:

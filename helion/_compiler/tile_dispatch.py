@@ -24,6 +24,7 @@ from .host_function import HostFunction
 from .inductor_lowering import ReductionLowering
 from .per_thread_planning import MAX_THREADS_PER_BLOCK
 from .per_thread_planning import extent_size_hint
+from .per_thread_planning import fit_reduction_threads
 from .reduction_strategy import LoopedReductionStrategy
 from .reduction_strategy import PersistentReductionStrategy
 from .reduction_strategy import ReductionStrategy
@@ -92,10 +93,8 @@ def reduction_strategy_block_ids(
 
     Every reduction block codegen still uses, except one used only on the
     untaken side of a branch that is constant for this config (outside
-    ``live_graph_ids``, the result of ``Backend.constexpr_live_graph_ids``)
-    and the broadcast aliases of a grid tile
-    (``Backend.inactive_broadcast_alias_block_ids``).  The per-thread planner
-    reserves a thread axis for them before they exist
+    ``live_graph_ids``, the result of ``Backend.constexpr_live_graph_ids``).
+    The per-thread planner reserves a thread axis for them before they exist
     (``plan_per_thread_loop_strategy``).
     """
     env = CompileEnvironment.current()
@@ -106,12 +105,10 @@ def reduction_strategy_block_ids(
         # branch is never emitted; its strategy would only claim an axis.
         live = backend.constexpr_live_block_ids(fn, live_graph_ids)
         active_block_ids = live if active_block_ids is None else active_block_ids & live
-    inactive_aliases = backend.inactive_broadcast_alias_block_ids(fn)
     return [
         bs.block_id
         for bs in env.block_sizes
         if bs.reduction
-        and bs.block_id not in inactive_aliases
         and (active_block_ids is None or bs.block_id in active_block_ids)
     ]
 
@@ -131,6 +128,12 @@ class TileStrategyDispatch:
         backend = CompileEnvironment.current().backend
         self._tile_loop_paths = backend.tile_loop_paths(fn)
         self._constexpr_live_graph_ids = backend.constexpr_live_graph_ids(fn)
+        self._reduction_block_ids = reduction_strategy_block_ids(
+            fn, self._constexpr_live_graph_ids
+        )
+        backend.check_reduction_blocks(
+            fn, self._reduction_block_ids, self._constexpr_live_graph_ids
+        )
         self._add_loop_strategies(fn, config)
         if backend.shares_sibling_thread_axes():
             if CompileEnvironment.current().config_spec.matmul_facts:
@@ -362,7 +365,7 @@ class TileStrategyDispatch:
         fn.tile_strategy = self
         env = CompileEnvironment.current()
         max_threads = env.backend.max_reduction_threads()
-        rdims = reduction_strategy_block_ids(fn, self._constexpr_live_graph_ids)
+        rdims = self._reduction_block_ids
         reduction_loop_block_ids = env.config_spec.rollable_reduction_block_ids()
         for block_id in rdims:
             reduction_loop = env.config_spec.reduction_loops.config_get(
@@ -861,9 +864,7 @@ class TileStrategyDispatch:
             ):
                 return None
         else:
-            threads = requested
-            while threads > 1 and threads * math.prod(dims) > MAX_THREADS_PER_BLOCK:
-                threads //= 2
+            threads = fit_reduction_threads(requested, math.prod(dims))
         if threads > 1:
             # The tiles sit above the reserved axes; one more reserved axis
             # moves each up by one, and the one on the last axis off the launch.

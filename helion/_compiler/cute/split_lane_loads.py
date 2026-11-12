@@ -35,22 +35,31 @@ protocol.
 Both phases are trace-time copies of the lane body, so the trace (and
 ptxas's time on it) grows with ``U`` copies of ``V`` elements, as do the
 registers holding the U loads until their lanes compute.  The split takes at
-most ``_MAX_UNROLLED_LANES`` copies, the bound of the knob's unroll
-(``cute/unroll_lane_loads.py``), and ``_MAX_SPLIT_ELEMENTS`` elements per
-thread.  A longer loop stays rolled (a huge block over few threads gave
-``range_constexpr(131072)``, which never finished compiling);
-``cute_lane_unroll`` unrolls it in bounded blocks.
+most ``_MAX_UNROLLED_LANES`` copies and ``_MAX_UNROLLED_STATEMENTS`` traced
+statements, the bounds of the knob's unroll (``cute/unroll_lane_loads.py``),
+and ``_MAX_SPLIT_ELEMENTS`` elements per thread, and copies no rolled loop
+other than a lane loop and a loop of one trip (``_trace_size``).  A lane loop
+past these bounds stays rolled (a huge block over few threads gave
+``range_constexpr(131072)``, which never finished compiling), and
+``cute_lane_unroll`` unrolls it in bounded blocks unless its body holds such
+a rolled loop.
 """
 
 from __future__ import annotations
 
 import ast
+from typing import TYPE_CHECKING
 
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ._ast_pass_utils import assigned_name
 from ._ast_pass_utils import loop_extent
 from .unroll_lane_loads import _MAX_UNROLLED_LANES
+from .unroll_lane_loads import _MAX_UNROLLED_STATEMENTS
+from .unroll_lane_loads import _trace_size
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 _LOAD_PREFIX = "_tile_unroll_vec_"
 # Elements per thread (``U * V``) the two phases unroll.  Compile time grows
@@ -92,7 +101,9 @@ def _lane_width(stmts: list[ast.stmt]) -> int:
     return width
 
 
-def _try_split(loop: ast.For, counter: int) -> list[ast.stmt] | None:
+def _try_split(
+    loop: ast.For, counter: int, constexpr_values: Mapping[str, int] | None
+) -> list[ast.stmt] | None:
     match = _is_const_range_loop(loop)
     if match is None:
         return None
@@ -117,7 +128,13 @@ def _try_split(loop: ast.For, counter: int) -> list[ast.stmt] | None:
     if not rest:
         return None
     reps = match[1]
-    if reps > _MAX_UNROLLED_LANES or reps * _lane_width(rest) > _MAX_SPLIT_ELEMENTS:
+    statements = _trace_size(rest, constexpr_values)
+    if (
+        statements is None
+        or reps > _MAX_UNROLLED_LANES
+        or reps * _lane_width(rest) > _MAX_SPLIT_ELEMENTS
+        or reps * statements > _MAX_UNROLLED_STATEMENTS
+    ):
         return None
     # Phase 1 writes only the lane base and the hoisted loads; both are
     # re-derived (base) or forwarded (loads) into phase 2, so no other
@@ -160,12 +177,16 @@ def _try_split(loop: ast.For, counter: int) -> list[ast.stmt] | None:
     return out
 
 
-def split_lane_loads(body: list[ast.stmt]) -> list[ast.stmt]:
+def split_lane_loads(
+    body: list[ast.stmt], constexpr_values: Mapping[str, int] | None = None
+) -> list[ast.stmt]:
+    """Split each top-level grid lane loop of ``body`` that fits the bounds;
+    ``constexpr_values`` resolves the bounds of rolled loops (``_trace_size``)."""
     counter = 0
     new_body: list[ast.stmt] = []
     for stmt in body:
         if isinstance(stmt, ast.For):
-            split = _try_split(stmt, counter)
+            split = _try_split(stmt, counter, constexpr_values)
             if split is not None:
                 counter += 1
                 new_body.extend(split)

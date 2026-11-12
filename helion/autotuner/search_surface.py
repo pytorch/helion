@@ -283,8 +283,10 @@ class ConfigGenerationExtension:
     pipeline: ``narrow_search_choices`` before the flat field table is
     collected, ``repair_flat_config`` on every flat config it produces
     (defaults, random draws, mutations, ``flatten``),
-    ``conditional_neighbor_updates`` when constructing search neighbors, and
-    ``initial_population_flats`` first thing in ``random_population_flat``.
+    ``conditional_neighbor_updates`` when constructing search neighbors,
+    ``shrink_for_threads`` when ``shrink_config`` bounds a random or mutated
+    config without ``num_warps``, and ``initial_population_flats`` first
+    thing in ``random_population_flat``.
     The structural-coverage hooks size and seed the population-based searches
     (``PatternSearch``, ``PopulationBasedSearch``); the defaults describe a
     surface without a structural design.  The CuTe implementation (SIMT
@@ -313,6 +315,15 @@ class ConfigGenerationExtension:
         prerequisites are searchable and no frozen coordinate would change.
         """
         return {}
+
+    def shrink_for_threads(
+        self, flat_config: FlatConfig, max_elements_per_thread: int
+    ) -> None:
+        """Shrink a random or mutated config without ``num_warps`` in place
+        so that each thread walks at most ``max_elements_per_thread``
+        elements: its block sizes, and any thread count it sets that the
+        launch could not take; the default leaves the config as drawn."""
+        return
 
     def initial_population_flats(
         self,

@@ -697,6 +697,45 @@ def test_nested_constexpr_vector_chain_is_cached_once() -> None:
     assert code.count("(out.iterator + row_lane).store") == 1
 
 
+# ``fuse_two_pass_loads`` caches a value every lane shares (the bias at one
+# address) in a single slot, which the first sweep writes and the later ones
+# read at index 0.
+_SINGLE_SLOT_CACHE = (
+    _VECTOR_CACHE.replace(
+        "_fuse_cache_11 = cute.make_rmem_tensor(4, cutlass.Float32)",
+        "_fuse_cache_11 = cute.make_rmem_tensor(1, cutlass.Float32)",
+    )
+    .replace("(bias.iterator + index).load()", "(bias.iterator + base).load()")
+    .replace("_fuse_cache_11[(element - 0) // 1]", "_fuse_cache_11[0]")
+)
+
+
+def test_vector_chain_reads_a_single_slot_cache_as_every_lanes_value() -> None:
+    # The chain reads the single slot as the value its producer stored, the
+    # same in every lane: it still moves above the row loop, into a fragment
+    # of its own, and the single slot goes.
+    code = _source(_rewrite_body(_SINGLE_SLOT_CACHE))
+    row_loop = code.index("for row_lane in range(16)")
+
+    assert code.count("cute.math.exp2(") == 2, code
+    assert "_fuse_cache_11" not in code, code
+    assert "cute.make_rmem_tensor(4, cutlass.BFloat16)" not in code, code
+    declaration = code.index("= cute.make_rmem_tensor(4, cutlass.Float32)")
+    precompute = code.index("in cutlass.range_constexpr(4)")
+    assert declaration < precompute < row_loop, code
+    assert code.count("(out.iterator + row_lane).store") == 1
+
+
+def test_vector_chain_rejects_a_single_slot_written_per_lane() -> None:
+    # A single slot written with each lane's value holds the last lane's,
+    # not every lane's: the chain stays in the sweeps.
+    source = _SINGLE_SLOT_CACHE.replace(
+        "(bias.iterator + base).load()", "(bias.iterator + index).load()"
+    )
+    code = _source(_rewrite_body(source))
+    assert "_lane_invariant_" not in code, code
+
+
 def test_extended_ast_vector_chain_runs_after_uniform_unswitch() -> None:
     parsed = ast.parse(_VECTOR_CACHE)
     row_loop = cast("ast.For", parsed.body[-1])

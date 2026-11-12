@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
@@ -7,11 +8,15 @@ import torch
 
 import helion
 from helion._compiler import indexing_strategy
+from helion._compiler.cute import iota_utils
 from helion._testing import cpu_render_target
 from helion._testing.cute_codegen import cpu_bind
 import helion.language as hl
 
 pytestmark = pytest.mark.cpu_only
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 def _reconverging_chain_mean(x: torch.Tensor) -> torch.Tensor:
@@ -30,21 +35,33 @@ def _reconverging_chain_mean(x: torch.Tensor) -> torch.Tensor:
     "counts the compiler's walks; ref mode does not compile"
 )
 def test_a_mean_walks_each_value_of_a_reconverging_chain_once() -> None:
-    # The mean's divisor walks back from its input to the padded ranges it
-    # reads (``_padded_iota_dims``).  Each round of ``row + row * 0.5`` reads
+    # The mean's divisor, the roller and CuTe's reduction masks walk back from
+    # a value to the padded ranges it reads (``_padded_iota_dims``,
+    # ``cute_arange_index_source``).  Each round of ``row + row * 0.5`` reads
     # the previous value twice, so a walk that visits a value once per path
     # reached the load 2**16 times, and a deeper chain never finished binding.
     walks = 0
-    walk = indexing_strategy._padded_iota_dims
 
-    def counted(*args: object, **kwargs: object) -> object:
-        nonlocal walks
-        walks += 1
-        assert walks <= 1000, "the padded-range walk revisits values"
-        return walk(*args, **kwargs)
+    def counted(walk: Callable[..., object]) -> Callable[..., object]:
+        def count(*args: object, **kwargs: object) -> object:
+            nonlocal walks
+            walks += 1
+            assert walks <= 1000, "a padded-range walk revisits values"
+            return walk(*args, **kwargs)
+
+        return count
 
     with (
-        patch.object(indexing_strategy, "_padded_iota_dims", counted),
+        patch.object(
+            indexing_strategy,
+            "_padded_iota_dims",
+            counted(indexing_strategy._padded_iota_dims),
+        ),
+        patch.object(
+            iota_utils,
+            "cute_arange_index_source",
+            counted(iota_utils.cute_arange_index_source),
+        ),
         cpu_render_target(),
     ):
         bound = cpu_bind(
@@ -183,7 +200,7 @@ def test_triton_reductions_take_their_identity_past_a_padded_range() -> None:
 
 @pytest.mark.cuda
 @helion._testing.skipIfNotCUDA()
-@helion._testing.onlyBackends(["triton"])
+@helion._testing.onlyBackends(["triton", "cute"])
 def test_padded_range_reductions_count_only_the_range() -> None:
     # Rows of zeros gave a mean of 1.28 (256 / 200) for ``(row + 1.0)``, and
     # negative rows an amax of 0, from the lanes past the range.
@@ -248,7 +265,7 @@ def test_an_index_loaded_through_a_padded_range_masks_its_lanes() -> None:
 
 @pytest.mark.cuda
 @helion._testing.skipIfNotCUDA()
-@helion._testing.onlyBackends(["triton"])
+@helion._testing.onlyBackends(["triton", "cute"])
 def test_a_scatter_through_loaded_columns_leaves_the_other_columns() -> None:
     device = helion._testing.DEVICE
     x = torch.randn(4, 200, device=device)

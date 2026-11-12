@@ -130,6 +130,13 @@ class CuteEnvState:
     # (``cute/register_tile_admission.py``); the persistent reduction
     # strategy then keeps its rolled lane nesting.
     register_tile_disabled: bool = False
+    # Whether the current pass laid a reduction out for ``cute_vloop_sink``
+    # (``_plan_vloop_sink_reduction_execution``): codegen's refusal of that
+    # layout (``VloopSinkLayoutRefused``) regenerates the kernel without it,
+    # ``generate_ast`` (materialized fission, for a stage) setting
+    # ``vloop_sink_reduction_layout_disabled`` meanwhile.
+    vloop_sink_reduction_layout_planned: bool = False
+    vloop_sink_reduction_layout_disabled: bool = False
     # ``resident_while_plan``'s memo for the traced graphs, which live as
     # long as the environment (``cute/resident_while.py``).
     resident_while_plans: ResidentWhileMemo = dataclasses.field(default_factory=dict)
@@ -164,6 +171,10 @@ class CuteCodegenState:
     synthetic_arange_access_positions: dict[tuple[Node, object], int] = (
         dataclasses.field(default_factory=dict)
     )
+    # ``iota node -> reduction block`` for a range on the lanes of the
+    # reduction dim of its padded size (``cute_padded_range_reduction_block``);
+    # a load or store over it masks the lanes past its length.
+    padded_range_blocks: dict[Node, int] = dataclasses.field(default_factory=dict)
     # Stack of ``(if_node_id, branch_side)`` entries describing the
     # mutually-exclusive control-flow branch the current codegen is inside.
     # ``branch_side`` is 0 for the ``if`` body and 1 for the ``else`` body of
@@ -472,9 +483,11 @@ class CuteLaneState:
     vloop_sink_stores: dict[str, CuteVloopStoreFact] = dataclasses.field(
         default_factory=dict
     )
-    # ``cute_vloop_sink`` kept the vectorized grid axis on thread x; when
-    # no V-loop is sunk after all, codegen restarts with the knob off.
-    vloop_sink_layout_applied: bool = False
+    # ``cute_vloop_sink`` shaped the code ahead of the sink (it kept the
+    # vectorized grid axis on thread x, or respelled a flattened tile's index
+    # for it); when no V-loop is sunk after all, codegen restarts with the
+    # knob off.
+    vloop_sink_shaped_code: bool = False
     # The sinking pass unrolled a lane loop itself (``cute_lane_unroll``);
     # otherwise the loads-first unroll of ``cute/unroll_lane_loads.py``
     # applies to the sunk lane loops once their packets are placed.

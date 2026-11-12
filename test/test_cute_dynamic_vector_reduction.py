@@ -413,7 +413,7 @@ def test_cluster_proof_refuses_unguarded_or_unbacked_extents(unbacked: bool) -> 
     strategy._cute_rolled_cluster_checked = False
     state = SimpleNamespace(
         codegen=SimpleNamespace(
-            current_grid_state=SimpleNamespace(thread_axis_sizes={})
+            current_grid_state=SimpleNamespace(thread_axis_sizes={}, lane_loops=[])
         )
     )
     host = SimpleNamespace(device_ir=SimpleNamespace(has_atomic_ops=lambda: False))
@@ -1420,3 +1420,69 @@ class TestCuteDynamicVectorReduction(TestCase):
             self.assertIn("ir.VectorType.get([8], cutlass.Uint16.mlir_type)", code)
             self.assertIn(predicate, code)
             torch.testing.assert_close(bound(x), x.float().amax(dim=-1))
+
+
+def _single_slot_group(loads: list[str], *uses: str) -> list[ast.stmt]:
+    """Rolled sweeps over a symbolic extent, fused under the register policy:
+    each runs ``loads`` in its lanes, then its entry of ``uses``."""
+    header = (
+        "for roffset_1 in range(cutlass.Int32(0), cutlass.Int32(n), "
+        "cutlass.Int32(1024)):\n    for reduction_lane_1 in range(8):\n"
+    )
+    source = "".join(
+        header + "".join(f"        {line}\n" for line in [*loads, use]) for use in uses
+    )
+    return fuse_two_pass_loads(
+        ast.parse(source).body,
+        tensor_dtypes={"x": "cutlass.Float32", "out": "cutlass.Float32"},
+        reload_modes={1: "register"},
+        proven_disjoint_tensor_pairs={frozenset(("x", "out"))},
+        dynamic_trip_counts={"roffset_1": (2, "_REDUCTION_TRIPS_1")},
+    )
+
+
+def test_a_single_slot_needs_no_trip_budget() -> None:
+    # A load of one element takes a single slot, which the exact trip count
+    # does not size: a group whose caches are all single slots fuses without
+    # the trace-time budget check and the pre-fusion fallback.  Beside a
+    # fragment of a slot per lane and trip, the single slot is declared
+    # outside the check, and the fallback leaves it unused.
+    store = "(out.iterator + roffset_1 + reduction_lane_1).store({})"
+    single = ast.Module(
+        body=_single_slot_group(
+            ["s = (x.iterator + 3).load()"], "acc = acc + s", store.format("s * 2.0")
+        ),
+        type_ignores=[],
+    )
+    code = ast.unparse(single)
+    assert "cutlass.const_expr(" not in code, code
+    assert ast.unparse(single.body[0]) == (
+        "_fuse_cache_0 = cute.make_rmem_tensor(1, cutlass.Float32)"
+    )
+    assert code.count("(x.iterator + 3).load()") == 1, code
+    assert "s = _fuse_cache_0[0]" in code, code
+
+    mixed = _single_slot_group(
+        [
+            "s = (x.iterator + 3).load()",
+            "v = (x.iterator + roffset_1 + reduction_lane_1).load()",
+        ],
+        "acc = acc + s * v",
+        store.format("s * v"),
+    )
+    assert ast.unparse(mixed[0]) == (
+        "_fuse_cache_0 = cute.make_rmem_tensor(1, cutlass.Float32)"
+    )
+    cap = "cutlass.const_expr(_REDUCTION_TRIPS_1 * 8 <= 16)"
+    declaration, group = [
+        node
+        for node in mixed
+        if isinstance(node, ast.If) and ast.unparse(node.test) == cap
+    ]
+    assert [ast.unparse(stmt) for stmt in declaration.body] == [
+        "_fuse_cache_1 = cute.make_rmem_tensor(_REDUCTION_TRIPS_1 * 8, cutlass.Float32)"
+    ]
+    fast = "\n".join(ast.unparse(stmt) for stmt in group.body)
+    fallback = "\n".join(ast.unparse(stmt) for stmt in group.orelse)
+    assert "s = _fuse_cache_0[0]" in fast, fast
+    assert "_fuse_cache_" not in fallback, fallback

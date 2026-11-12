@@ -777,10 +777,11 @@ def record_tile_loop_facts(
 ) -> None:
     """After the structural analysis: tile loop paths, the reduction blocks
     on each and the path of each tile strategy, boundary-only grid blocks,
-    the sizes of the paths' fixed blocks and whether an fp32 dot is exact on
-    this target."""
+    the sizes of the paths' fixed blocks, the loops the planner never
+    flattens and whether an fp32 dot is exact on this target."""
     env = CompileEnvironment.current()
     config_spec = env.config_spec
+    from ..per_thread_planning import tile_loop_keeps_nd_layout
     from .loop_nesting import boundary_only_grid_blocks
     from .loop_nesting import tile_loop_facts
 
@@ -807,6 +808,17 @@ def record_tile_loop_facts(
     )
     config_spec.cute_inactive_tile_block_ids = boundary_only_grid_blocks(
         env, device_ir, device_ir.graphs
+    )
+    config_spec.cute_nd_tile_loops = frozenset(
+        level
+        for path in config_spec.cute_tile_loop_paths
+        for level in path
+        if tile_loop_keeps_nd_layout(
+            device_ir,
+            device_ir.graphs,
+            level,
+            config_spec.cute_inactive_tile_block_ids,
+        )
     )
     from .mma_support import cute_fp32_dot_uses_tf32
 

@@ -1697,6 +1697,22 @@ def test_live_in_pins_resident_sequence(case: str) -> None:
         assert sorted(got) == expected[f"rs|{sorted(live_out)}"]
 
 
+def test_live_in_runs_a_for_loops_else_after_its_body() -> None:
+    # The ``else`` rebinds ``a`` only after the iterations, the first of which
+    # reads the ``a`` from before the loop.
+    statements = ast.parse("for i in range(n):\n    b = a\nelse:\n    a = 1").body
+    assert "a" in live_in(statements, {"a"})
+
+
+def test_live_in_keeps_what_a_break_past_the_else_reads() -> None:
+    # A ``break`` skips the ``else``, so the ``x`` from before the loop is
+    # what the code after it reads on that path.
+    statements = ast.parse(
+        "for i in range(n):\n    if c:\n        break\nelse:\n    x = 1"
+    ).body
+    assert "x" in live_in(statements, {"x"})
+
+
 def test_same_expr_and_parse_helpers() -> None:
     left = parse_expr("a.b(c + 1)")
     right = ast.parse("a.b(c + 1)", mode="eval").body

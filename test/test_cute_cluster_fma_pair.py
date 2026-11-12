@@ -175,6 +175,24 @@ def test_scaled_max_hidden_by_a_local_index_alias_keeps_original_exchanges() -> 
     assert _source(fuse_cluster_online_pair(body, {}, fast_math=True)) == before
 
 
+def test_a_cache_slot_every_lane_shares_keeps_two_exchanges() -> None:
+    # The exponent reads a single slot (a scale every lane loads alike,
+    # fuse_two_pass_loads' lane-invariant cache) beside an uncached value:
+    # the pair would cache each lane's exponential at that one slot and give
+    # every output the last lane's.
+    body = ast.parse(
+        _source(_body("cute.math.exp2(value * cache[0] - SCALED)"))
+        .replace(
+            "cache = cute.make_rmem_tensor(8, cutlass.Float32)",
+            "cache = cute.make_rmem_tensor(1, cutlass.Float32)",
+        )
+        .replace("cutlass.Float32(cache[lane])", "cutlass.Float32(x[lane])")
+    ).body
+    before = _source(body)
+    assert "cache[0]" in before
+    assert _source(fuse_cluster_online_pair(body, {}, fast_math=True)) == before
+
+
 # Runtime composition of scaled FP32 FMA and the packed cluster exchange.
 
 

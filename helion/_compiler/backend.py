@@ -1873,11 +1873,18 @@ class Backend(abc.ABC):
         roots must agree on its axis)."""
         return False
 
-    def inactive_broadcast_alias_block_ids(self, fn: DeviceFunction) -> set[int]:
-        """Reduction blocks that merely alias a grid tile's coordinates
-        (register broadcasting) and get no reduction strategy of their own,
-        so the per-thread planner reserves no thread axis for them either."""
-        return set()
+    def check_reduction_blocks(
+        self,
+        fn: DeviceFunction,
+        block_ids: Sequence[int],
+        live_graph_ids: frozenset[int] | None,
+    ) -> None:
+        """Refuse a kernel whose live reduction blocks (``block_ids``, the ones
+        ``reduction_strategy_block_ids`` gives a strategy) this backend cannot
+        lay out beside its tile loops in the graphs this config emits
+        (``live_graph_ids``, the result of :meth:`constexpr_live_graph_ids`);
+        the dispatcher asks before it plans any strategy."""
+        return None
 
     def roots_may_reserve_distinct_thread_axes(self) -> bool:
         """Whether separate root loops may reserve different synthetic or
@@ -2186,6 +2193,25 @@ class Backend(abc.ABC):
         tile's range (whether every V-wide chunk starts aligned and stays
         inside the extent follows from them)."""
         return None
+
+    def record_flattened_vloop_wrapper(
+        self,
+        fn: DeviceFunction,
+        wrapper: VecLaneWrapper,
+        *,
+        block_id: int,
+        lane_var: str,
+        index_var: str,
+        mask_var: str | None,
+        begin: object,
+        extent: object,
+    ) -> bool:
+        """Whether a one-block flattened tile prepares its constexpr V-loop
+        ``wrapper`` for sinking under ``fn``'s config, noting it as
+        ``record_vloop_wrapper`` does.  The tile then spells its element
+        index from the chunk base and the V-lane, and its bounds mask from
+        that index (the same values).  ``False`` leaves the tile as it is."""
+        return False
 
     def apply_lane_cluster_split(
         self, strategy: PerThreadNDTileStrategy, state: CodegenState

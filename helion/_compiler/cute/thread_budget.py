@@ -16,6 +16,7 @@ from __future__ import annotations
 import ast
 import math
 from typing import TYPE_CHECKING
+from typing import NamedTuple
 
 import torch
 
@@ -27,6 +28,7 @@ from .state import cute_codegen_state
 from .state import cute_env_state
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Iterable
     from collections.abc import Sequence
 
@@ -43,6 +45,7 @@ __all__ = [
     "CUTE_REGISTER_TILE_MAX_LIVE_VALUES",
     "MAX_THREADS_PER_BLOCK",
     "MAX_THREAD_BLOCK_DIMS",
+    "TileAxis",
     "check_thread_block_dims",
     "check_thread_limit",
     "checked_thread_block_dims",
@@ -50,6 +53,7 @@ __all__ = [
     "register_tile_shape",
     "shared_memory_budget_bytes",
     "thread_idx_axis",
+    "tile_level_axes",
     "tile_loop_thread_count",
 ]
 
@@ -92,6 +96,51 @@ def referenced_thread_axes(statements: Iterable[ast.AST]) -> list[int]:
     ]
 
 
+class TileAxis(NamedTuple):
+    """One axis of a tile loop level, as :func:`tile_level_axes` reads it."""
+
+    block_id: int
+    size: int
+    # The configured thread count; ``0`` (auto) gives each element a thread.
+    threads: int
+
+    @property
+    def extent(self) -> int:
+        """The threads the axis asks for: its count or, auto, its size."""
+        return self.threads if self.threads > 0 else self.size
+
+
+def tile_level_axes(
+    level: Sequence[int],
+    order: Iterable[int],
+    size_and_threads: Callable[[int], tuple[int, int] | None],
+    seen: set[int],
+) -> list[TileAxis]:
+    """The axes of ``level``, the block ids of one ``hl.tile`` on a tile loop
+    path (``loop_nesting.tile_loop_paths``), in its loop ``order`` (positions
+    in ``level``), the order in which they take the launch's thread axes.
+
+    ``size_and_threads(block_id)`` gives a block's size and configured thread
+    count, or ``None`` for a block that takes neither threads nor lanes (a
+    reduction, a boundary-only grid block, a size not known statically).  A
+    block in ``seen`` (an enclosing level of the path walked it) is skipped
+    and every other one added.  :func:`tile_loop_thread_count` and the
+    autotuner's thread repair and elements-per-thread shrink
+    (``CuteConfigGenerationExtension``) walk the levels through here and each
+    place the axes on the launch by their own rule.
+    """
+    axes: list[TileAxis] = []
+    for position in order:
+        block_id = level[position]
+        if block_id in seen:
+            continue
+        seen.add(block_id)
+        value = size_and_threads(block_id)
+        if value is not None:
+            axes.append(TileAxis(block_id, *value))
+    return axes
+
+
 def tile_loop_thread_count(
     env: CompileEnvironment,
     device_ir: DeviceIR,
@@ -108,35 +157,31 @@ def tile_loop_thread_count(
     """
     from .loop_nesting import tile_loop_paths
 
+    def size_and_threads(block_id: int) -> tuple[int, int] | None:
+        info = env.block_sizes[block_id]
+        if block_id in inactive_block_ids or info.reduction:
+            return None
+        size = info.from_config(config)
+        if not isinstance(size, int):
+            return None
+        threads = env.config_spec.num_threads.config_get(
+            config.num_threads, block_id, 0
+        )
+        return size, int(threads)
+
     launch_extents: list[int] = []
     for path in tile_loop_paths(device_ir, graphs):
         extents: list[int] = []
         seen: set[int] = set()
         for block_ids in path:
-            order = (
-                env.config_spec.loop_orders.config_get(config.loop_orders, block_ids[0])
-                if len(block_ids) > 1
-                else None
+            order = env.config_spec.loop_orders.config_get_for_tile(
+                config.loop_orders, block_ids
             ) or range(len(block_ids))
-            for position in order:
-                block_id = block_ids[position]
-                if block_id in seen or block_id in inactive_block_ids:
-                    continue
-                seen.add(block_id)
-                info = env.block_sizes[block_id]
-                if info.reduction:
-                    continue
-                size = info.from_config(config)
-                if not isinstance(size, int):
-                    continue
-                threads = int(
-                    env.config_spec.num_threads.config_get(
-                        config.num_threads, block_id, 0
-                    )
-                )
-                extent = threads if threads > 0 else size
-                if extent > 1:
-                    extents.append(extent)
+            extents.extend(
+                axis.extent
+                for axis in tile_level_axes(block_ids, order, size_and_threads, seen)
+                if axis.extent > 1
+            )
         # A launch has three thread axes; tiles beyond them run as single
         # thread lane loops (``PerThreadNDTileStrategy`` demotes them) and
         # add no threads.

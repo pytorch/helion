@@ -540,6 +540,7 @@ def prefetch_reduction_packets(
         tensor_dtypes,
         reload_modes,
         proven_disjoint_tensor_pairs,
+        rename_groups=groups,
     )
     loops = [(i, s) for i, s in enumerate(body) if isinstance(s, ast.For)]
     for (first_index, first), (last_index, last) in pairwise(loops):

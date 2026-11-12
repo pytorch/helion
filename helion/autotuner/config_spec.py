@@ -961,6 +961,10 @@ class ConfigSpec:
         # when loops share their blocks.
         self.cute_tile_strategy_paths: tuple[TileLoopPath, ...] = ()
         self.cute_inactive_tile_block_ids: set[int] = set()
+        # The loops of the ``cute_tile_loop_paths`` (block-id tuples) the
+        # per-thread planner lays out N-D whatever their ``flatten_loops`` entry
+        # (``per_thread_planning.tile_loop_keeps_nd_layout``).
+        self.cute_nd_tile_loops: frozenset[tuple[int, ...]] = frozenset()
         # Whether fp32 matmuls stay exact (dot_precision ieee / tf32x3): the
         # SIMT GEMM knob's precondition, recorded by DeviceIR.
         self.cute_fp32_dot_exact: bool = False
@@ -1030,6 +1034,7 @@ class ConfigSpec:
         self.cute_proven_bounds_enabled = False
         self.cute_rng_packet_enabled = False
         self.cute_warp_aggregated_atomics_enabled = False
+        self.cute_privatize_atomics_enabled = False
         self.cute_packet_prefetch_enabled = False
         self.range_unroll_factors: BlockIdSequence[RangeUnrollFactorSpec] = (
             BlockIdSequence()
@@ -2741,9 +2746,12 @@ class ConfigSpec:
                     if min_block >= 2:
                         min_block = 1 << (min_block.bit_length() - 1)
                         min_block = min(min_block, spec.max_size)
-                        spec.autotuner_min = assert_integer_power_of_two(
+                        raised = assert_integer_power_of_two(
                             max(min_block, spec.autotuner_min)
                         )
+                        if raised != spec.autotuner_min:
+                            spec.occupancy_floor = (spec.autotuner_min, raised)
+                        spec.autotuner_min = raised
 
     def _grid_floor_groups(self) -> list[tuple[int, ...]]:
         """Root grids for the occupancy floor, each owning a full budget."""
@@ -3437,6 +3445,10 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         self.structural_pin: int | None = None
         self.structural_pin_reason: str = ""
         self._structural_pin_warned: set[int] = set()
+        # The search floors before and after ``ConfigSpec.raise_grid_block_minimums``
+        # raised this block's, ``None`` where it did not
+        # (``drop_occupancy_floor``).
+        self.occupancy_floor: tuple[int, int] | None = None
         if self.max_size < self.min_size:
             self.max_size = self.min_size
         assert self.min_size <= self.max_size
@@ -3479,6 +3491,15 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         if result < self.min_size:
             result = self.min_size
         return result
+
+    def drop_occupancy_floor(self) -> None:
+        """Restore the search floor ``ConfigSpec.raise_grid_block_minimums``
+        raised, unless another surface has raised it since."""
+        if (
+            self.occupancy_floor is not None
+            and self.autotuner_min == self.occupancy_floor[1]
+        ):
+            self.autotuner_min = self.occupancy_floor[0]
 
     def pin_structurally(self, value: int, *, reason: str) -> None:
         """Pin this block size to the one value a fused lowering admits.
@@ -3838,12 +3859,18 @@ class CuteReductionReloadSpec(_BlockIdItem):
     Rolled or persistent LayerNorm/RMSNorm-style kernels sweep the same input
     several times (reduce, then consume).  ``"register"`` caches the earliest
     sweep's loads in a per-thread register fragment (fastest when the
-    per-thread slice is small; spills to local memory when it is not).
-    ``"gmem"`` re-loads from global memory on later sweeps (the row is usually
-    still resident in L2, and no registers are burned).  ``"auto"`` (default)
-    keeps the legacy size heuristic in ``fuse_two_pass_loads``. The optional
-    ``"register_prefetch"`` mode retains register reloads and also prefetches
-    one proven read-only consumer packet across a one-trip reduction.
+    per-thread slice is small; spills to local memory when it is not), and
+    the values that sweep computes from them with pure inline asm (the
+    Philox chain of a word0 ``hl.rand`` draw) or a transcendental (``exp``,
+    ``exp2``, ``log``, ``log2``, ``tanh``, ``erf``), which the later sweeps
+    then read instead of recomputing.  ``"gmem"`` re-loads from global memory
+    on later sweeps (the row is usually still resident in L2, and no
+    registers are burned) and recomputes those values.  ``"auto"`` (default)
+    keeps the legacy size heuristic in ``fuse_two_pass_loads`` and carries
+    the inline asm values, not the transcendentals.  The optional
+    ``"register_prefetch"`` mode carries what ``"register"`` does and also
+    prefetches one proven read-only consumer packet across a one-trip
+    reduction.
     """
 
     def __init__(self, *, block_id: int) -> None:

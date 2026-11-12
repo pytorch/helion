@@ -32,7 +32,12 @@ see whole (a barrier, a helper call of unknown purity, an atomic through a
 pointer alias) is pinned inside every lane loop and orders every statement
 that touches memory against itself; a pure register computation sharing no
 local name with it (a constant, an index expression) crosses it, so
-lane-invariant neighbours may still leave the loops around it.
+lane-invariant neighbours may still leave the loops around it.  A statement
+binding a CTA or cluster reduce (an RMSNorm row's shared-memory or warp sum
+beside the lane loop of a half-row slice) whose operands the pass sees whole
+(register computations and plain loads) is placed by those operands instead
+(``statements._assigns_a_collective_reduce``): every thread still reaches
+it equally often, once outside a loop its operands ignore.
 
 A vectorized lane loop also emits statements of its own around the body
 (``LaneScope.attached``: the per-thread lane base, the packet loads hoisted
@@ -700,8 +705,9 @@ def _place(
             if statement.index in before:
                 # Needed before the loop by a statement inside and after it
                 # by the loop's ordering: a mask computed from a load that a
-                # pinned statement inside (a shared-memory reduction helper)
-                # orders after itself, feeding a store inside.  When the
+                # pinned statement inside (a call the pass cannot see
+                # through, such as an is_pure=False inline asm) orders after
+                # itself, feeding a store inside.  When the
                 # statement and the trail it depends on only compute registers
                 # and load tensors nothing in the body writes, running them
                 # inside the loop once per lane is the tile program by
