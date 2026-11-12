@@ -12,6 +12,19 @@ if TYPE_CHECKING:
 _INTEGER_CASTS = frozenset(
     f"cutlass.{name}" for name in ("Int32", "Int64", "Uint32", "Uint64")
 )
+# Binary operators that keep integer operands integral.
+_INTEGER_OPERATORS = (
+    ast.Add,
+    ast.Sub,
+    ast.Mult,
+    ast.FloorDiv,
+    ast.Mod,
+    ast.LShift,
+    ast.RShift,
+    ast.BitAnd,
+    ast.BitOr,
+    ast.BitXor,
+)
 
 
 def _integer_expression(
@@ -91,21 +104,7 @@ def _integer_expression(
         return _integer_expression(
             node.operand, lane, known, integer_tensors=integer_tensors
         )
-    if isinstance(node, ast.BinOp) and isinstance(
-        node.op,
-        (
-            ast.Add,
-            ast.Sub,
-            ast.Mult,
-            ast.FloorDiv,
-            ast.Mod,
-            ast.LShift,
-            ast.RShift,
-            ast.BitAnd,
-            ast.BitOr,
-            ast.BitXor,
-        ),
-    ):
+    if isinstance(node, ast.BinOp) and isinstance(node.op, _INTEGER_OPERATORS):
         return _integer_expression(
             node.left, lane, known, integer_tensors=integer_tensors
         ) and _integer_expression(

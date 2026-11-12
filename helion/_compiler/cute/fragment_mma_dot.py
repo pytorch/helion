@@ -15,10 +15,12 @@ element, then the K threads of a row combine through warp shuffles::
     dot = _cute_grouped_reduce_warp(_helion_vfold_acc_0, 'sum', cutlass.Float32(0), <lane>, pre=8, group_span=32)
 
 That is two converts, a select and an FMA per element (64 instructions per
-32-byte packet) plus 40 shuffles per chunk.  A 128 MB-per-call GEMV is
-bandwidth-bound at boost clocks and issue-bound once the sustained power cap
-pulls the SM clock down (B200: 1965 -> ~900 MHz under a 256 MB stream;
-gather_gemv (8, 8192, 2): memory-only body 46 us, the fallback 53).
+32-byte packet) plus the K threads' shuffles (two butterfly stages, offsets
+16 and 8, for the eight interleaved rows: ``use_strided_warp_reduce``).  A
+128 MB-per-call GEMV is bandwidth-bound at boost clocks and issue-bound once
+the sustained power cap pulls the SM clock down (B200: 1965 -> ~900 MHz under
+a 256 MB stream; gather_gemv (8, 8192, 2): memory-only body 46 us, the
+fallback 53, measured when it still ran one masked pass per row).
 
 With ``cute_dot_fragment_mma`` on a ``(8, 4, 1)`` thread block (eight row
 threads on x, four K threads on y) the pass remaps the lanes so that the

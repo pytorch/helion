@@ -286,33 +286,80 @@ class DeviceLoopState(DeviceLoopOrGridState):
     def lane_loop_headers(self) -> list[ast.For]:
         return _lane_loop_headers(self.lane_loops, self.vec_lane_wrappers)
 
+    def _loops_to_body(
+        self,
+    ) -> list[tuple[ast.For, list[ast.stmt], list[ast.stmt]]]:
+        """The ``for`` statements on the way from ``for_node`` down to
+        ``inner_statements``, outermost first, each with the statements its
+        body runs before the next of them and after it (none for the last)."""
+        loops: list[tuple[ast.For, list[ast.stmt], list[ast.stmt]]] = []
+        loop = self.for_node
+        while loop.body is not self.inner_statements:
+            position, child = next(
+                (
+                    (position, child)
+                    for position, child in enumerate(loop.body)
+                    if isinstance(child, ast.For)
+                    and _encloses(child, self.inner_statements)
+                ),
+                (0, None),
+            )
+            if child is None:
+                break
+            loops.append((loop, loop.body[:position], loop.body[position + 1 :]))
+            loop = child
+        loops.append((loop, [], []))
+        return loops
+
     def loop_headers(self) -> list[ast.For]:
         """The device loops around ``inner_statements``, outermost first.
 
         The ``for`` statements on the way from ``for_node`` down to the body
         (a multi-dimensional tile nests one loop per block); the synthetic
         lane loops and constexpr vector loops among them are per-thread
-        structure, not iteration.
+        structure, not iteration (``per_thread_loops``).
         """
+        return [
+            loop
+            for loop, _before, _after in self._loops_to_body()
+            if not _is_per_thread_loop(loop)
+        ]
+
+    def per_thread_loops(
+        self,
+    ) -> tuple[list[ast.For], frozenset[str], list[ast.AST], list[ast.AST]]:
+        """The per-thread loops around ``inner_statements`` the lane nest does not hold.
+
+        The synthetic lane loops and constexpr vector loops on the way from
+        ``for_node`` down to the body, other than ``lane_loops`` and the vec
+        wrappers' V-loops: a looped reduction walks a thread's share of each
+        chunk with a reduction lane loop and a constexpr V-loop
+        (``reduction_emitter.emit_lane_loop_body``).  Returns them outermost
+        first, the names they redefine per iteration, the statements their
+        bodies run before the body (a lane's base index, its chunk predicate,
+        the hoisted packets) and those they run after it (the packets'
+        store flushes).
+        """
+        registered = {lane_var for lane_var, _extent in self.lane_loops}
+        registered.update(
+            wrapper.vec_lane_var for wrapper in self.vec_lane_wrappers.values()
+        )
         loops: list[ast.For] = []
-        loop: ast.For | None = self.for_node
-        while loop is not None:
-            if getattr(
-                loop, HELION_LANE_LOOP_VAR_ATTR, None
-            ) is None and not _is_constexpr_lane_iter(loop):
+        targets: set[str] = set()
+        definitions: list[ast.AST] = []
+        tails: list[ast.AST] = []
+        for loop, before, after in self._loops_to_body():
+            target = loop.target
+            if (
+                _is_per_thread_loop(loop)
+                and isinstance(target, ast.Name)
+                and target.id not in registered
+            ):
                 loops.append(loop)
-            if loop.body is self.inner_statements:
-                break
-            loop = next(
-                (
-                    child
-                    for child in loop.body
-                    if isinstance(child, ast.For)
-                    and _encloses(child, self.inner_statements)
-                ),
-                None,
-            )
-        return loops
+                targets.add(target.id)
+                definitions.extend(before)
+                tails[:0] = after
+        return loops, frozenset(targets), definitions, tails
 
     def loop_variables(self) -> frozenset[str]:
         """The names the device loops around ``inner_statements`` redefine per iteration."""
@@ -741,6 +788,14 @@ def _lane_loop_headers(
         headers.append(header)
     headers.extend(wrapper.vloop for wrapper in wrappers.values())
     return headers
+
+
+def _is_per_thread_loop(loop: ast.For) -> bool:
+    """Whether ``loop`` is per-thread structure rather than iteration: a
+    synthetic lane loop or a constexpr vector loop."""
+    return getattr(
+        loop, HELION_LANE_LOOP_VAR_ATTR, None
+    ) is not None or _is_constexpr_lane_iter(loop)
 
 
 @dataclasses.dataclass

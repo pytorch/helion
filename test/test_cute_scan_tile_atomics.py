@@ -29,14 +29,15 @@ from helion._testing import code_and_output
 from helion._testing import import_example
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfNotCUDA
+from helion._testing.cute_codegen import kernel_body
 import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
 
-# The CPU lane runs the codegen checks; the GPU lane runs the numerics
-# (``_GPU_TESTS``, marked ``cuda``).
+# The CPU lane runs the codegen checks; the GPU lane runs the numerics,
+# marked ``cuda``.
 pytestmark = pytest.mark.cpu_only
 
 CPU = torch.device("cpu")
@@ -294,16 +295,11 @@ def _pointwise_2d(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-# GPU numerics tests; everything else runs with CUDA forbidden.
-_GPU_TESTS = {
-    "test_segmented_reduction_matches_index_add",
-    "test_elided_scatter_matches_the_unelided_sum",
-}
-
-
 @pytest.fixture(autouse=True)
 def _cpu_only(request: pytest.FixtureRequest) -> Iterator[None]:
-    if request.node.originalname in _GPU_TESTS:
+    """Every test but the ``cuda``-marked GPU numerics runs with CUDA
+    forbidden."""
+    if request.node.get_closest_marker("cuda") is not None:
         yield
         return
     with (
@@ -337,18 +333,7 @@ def _codegen(
     config = bound.config_spec.default_config()
     if overrides:
         config = helion.Config(**{**config.config, **overrides})
-    return _kernel_body(bound.to_code(config))
-
-
-def _kernel_body(code: str) -> str:
-    start = code.index("@cute.kernel")
-    kernel_def = code.index("\ndef ", start)
-    end = code.find("\ndef ", kernel_def + 1)
-    if end < 0:
-        end = len(code)
-    return "\n".join(
-        line for line in code[start:end].splitlines() if "# src[" not in line
-    )
+    return kernel_body(bound.to_code(config))
 
 
 def _segment_args(
@@ -709,25 +694,33 @@ def test_lane_unroll_without_a_lane_loop_or_a_movable_load_changes_nothing() -> 
     assert "for lane_0 in range(16):" in unrolled
 
 
-def test_lane_unroll_declines_bodies_with_scalar_cache_policy_loads() -> None:
-    # The scalar streaming helper is not eligible for lane-load unrolling.
-    # Keep the policy and regenerate the ordinary loop unchanged.
+# The next-row index read with a streaming hint (an 8-byte scalar, which
+# ``lower_scalar_policy_loads`` spells as exact-policy PTX).
+_STREAMING_NEXT_INDEX = ["", "", "streaming"]
+
+
+def test_lane_unroll_moves_lowered_scalar_cache_policy_loads() -> None:
+    # The hinted 8-byte scalar load lowers to the exact-policy PTX helper, so
+    # the unroll takes its body: the load moves to the load phase with its
+    # hint.
     args = _segment_args()
-    policies = ["", "", "streaming"]
     plain = _codegen(
-        _segmented_reduction, args, **STRIP, load_eviction_policies=policies
+        _segmented_reduction,
+        args,
+        **STRIP,
+        load_eviction_policies=_STREAMING_NEXT_INDEX,
     )
     unrolled = _codegen(
         _segmented_reduction,
         args,
         **STRIP,
-        load_eviction_policies=policies,
+        load_eviction_policies=_STREAMING_NEXT_INDEX,
         cute_lane_unroll=16,
     )
     assert "_cute_scalar_policy_load(" in plain
-    assert "cutlass.Int64, 'streaming'" in plain
-    assert plain == unrolled
-    assert LOAD_LIST not in unrolled
+    assert LOAD_LIST not in plain
+    assert LOAD_LIST in unrolled
+    assert "cutlass.Int64, 'streaming'" in unrolled
 
 
 def test_lane_unroll_normalizes_to_one_without_a_grid_lane_loop() -> None:
@@ -947,6 +940,29 @@ def test_segmented_reduction_matches_index_add(
             atol=1e-3,
             msg=lambda m, pattern=pattern: f"{pattern}: {m}",
         )
+
+
+@pytest.mark.cuda
+@skipIfNotCUDA()
+def test_lane_unroll_over_a_streaming_scalar_load_matches_index_add() -> None:
+    """The unrolled body holding the hinted next-row index load compiles and
+    computes the segment sums (the CuTe DSL aborts on this form when the
+    hint reaches NVVM as an extended load, which
+    ``lower_scalar_policy_loads`` rules out)."""
+    kernel = helion.kernel(_segmented_reduction, backend="cute", static_shapes=True)
+    x = torch.randn(4096, 128, device=DEVICE)
+    indices = _index_patterns(4096, 64)["sorted_random"].to(DEVICE)
+    code, out = code_and_output(
+        kernel,
+        (indices, x, 64),
+        **STRIP,
+        load_eviction_policies=_STREAMING_NEXT_INDEX,
+        cute_lane_unroll=16,
+    )
+    # The unrolled form, with the hinted load lowered to exact-policy PTX.
+    assert LOAD_LIST in code
+    assert "cutlass.Int64, 'streaming'" in code
+    torch.testing.assert_close(out, _reference(indices, x, 64), rtol=1e-4, atol=1e-3)
 
 
 @pytest.mark.cuda

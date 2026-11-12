@@ -1741,6 +1741,43 @@ def test_repair_refuses_a_tile_whose_bounded_minimum_keeps_it_wide() -> None:
         _normalized(spec, block_sizes=[32, 32], reduction_loops=[None])
 
 
+@pytest.mark.parametrize(
+    "block_sizes",
+    [
+        # The bounded-tile clamp fits block 1 to block 0's 4.
+        [4, 128, 2],
+        # The tile leaves the reduction no threads: the repair halves block 0
+        # to 4, and the clamp follows.
+        [256, 128, 2],
+    ],
+)
+def test_lane_unroll_follows_the_clamped_and_repaired_tile(
+    block_sizes: list[int],
+) -> None:
+    """Block 1's four threads walk its 128 elements in a lane loop, which
+    keeps ``cute_lane_unroll``, until the clamp or the repair shrinks block 1
+    to four elements: the knob resets in the same pass, so the normalized
+    config normalizes to itself."""
+    spec = _cute_spec()
+    spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=256))
+    spec.block_sizes.append(
+        BlockSizeSpec(block_id=1, size_hint=128, bounded_by_block_id=0)
+    )
+    spec.block_sizes.append(BlockSizeSpec(block_id=2, size_hint=2))
+    for block_id, size in ((0, 256), (1, 128), (2, 2), (3, 128)):
+        spec.num_threads.append(NumThreadsSpec(block_id=block_id, size_hint=size))
+    spec.reduction_loops.append(ReductionLoopSpec(block_id=3, size_hint=128))
+    spec.reduction_block_ids.add(3)
+    normalized = _normalized(
+        spec, block_sizes=block_sizes, num_threads=[0, 4, 0, 0], cute_lane_unroll=2
+    )
+    assert normalized.config["block_sizes"] == [4, 4, 2]
+    assert normalized.config["cute_lane_unroll"] == 1
+    again = helion.Config(**normalized.config)
+    spec.normalize(again)
+    assert again.config == normalized.config
+
+
 def _sum_rows_then_double(
     x: torch.Tensor, y: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:

@@ -88,6 +88,14 @@ from .sweep_values import plan_cut
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+# Elements of a thread's register cache under ``"auto"`` reloads: a sweep
+# group whose cache would hold more reloads from memory instead.
+AUTO_REGISTER_CACHE_ELEMENTS = 64
+# The prefix of the register (or shared-memory) caches this pass declares:
+# each sweep of a tile iteration reads only the slots an earlier sweep of the
+# same iteration wrote (``jam_grid_lanes`` gives each lane a copy).
+FUSE_CACHE_PREFIX = "_fuse_cache_"
+
 _PERSISTENT_BRANCH_VEC_LOAD = "_helion_persistent_branch_vec_load"
 
 
@@ -372,41 +380,22 @@ def _looks_like_unmasked_load(node: ast.AST) -> ast.Call | None:
     return None
 
 
-def _looks_like_vec_load(node: ast.AST) -> ast.Call | None:
-    """Return the Call if ``node`` is a ``cute.arch.load(...)`` -- the hoisted
-    U16 vec load emitted by the LoopedReductionStrategy ``unroll`` mode, or a
-    cache-hinted scalar load -- or a cache-hinted vector load helper of the
-    same call shape (``_cute_load_l2_evict_last_8b(ptr, vec_type)``, see
-    ``cache_policy_loads``).  ``_vec_width`` tells the packets apart.
+def _arch_scalar_dtype(node: ast.AST) -> str | None:
+    """The explicit DTYPE of a scalar ``cute.arch.load(ptr, DTYPE, ...)``.
+
+    fp8/fp4 raw-byte loads (``cutlass.Uint8``) and byte-packed hoists
+    (``cutlass.Uint16``/``Uint32``/``Uint64`` of bool, int8 or fp8 bytes)
+    load REINTERPRETED integers; caching them in the base tensor's dtype
+    would numerically convert the value, so they cache in this dtype, as
+    the cache-hinted scalar loads do (``cutlass.Float32`` of an fp32
+    tensor).  None for a plain ``(ptr).load()``, whose implicit dtype is the
+    tensor's, and for a vector load.
     """
     access = match_packet_access(node)
-    if access is not None and access.kind in ("arch_load", "packet", "hinted_packet"):
-        return access.call
-    return None
+    return access.carrier if access is not None and access.kind == "arch_load" else None
 
 
-def _arch_scalar_dtype_mismatch(node: ast.AST, tensor_dtypes: dict[str, str]) -> bool:
-    """True for a scalar ``cute.arch.load(ptr, DTYPE, ...)`` whose explicit
-    DTYPE differs from the base tensor's element dtype.
-
-    fp8/fp4 raw-byte loads (``cutlass.Uint8``) and byte-packed fp8 hoists
-    (``cutlass.Uint32``/``Uint64``) load REINTERPRETED integers; caching
-    them in the base tensor's dtype (what the unmasked path does) would
-    numerically convert the value.  Cache-hinted fp32 loads pass
-    (``cutlass.Float32`` == the tensor's dtype string).
-    """
-    if _looks_like_vec_load(node) is None or _vec_width(node) is not None:
-        return False  # plain ``(ptr).load()``: implicit dtype == tensor dtype
-    assert isinstance(node, ast.Call)
-    if len(node.args) < 2:
-        return True
-    base = _unmasked_load_tensor_dtype(node, tensor_dtypes)
-    return base is None or ast.unparse(node.args[1]) != base
-
-
-def _load_kind(
-    node: ast.AST, tensor_dtypes: dict[str, str] | None = None
-) -> str | None:
+def _load_kind(node: ast.AST) -> str | None:
     """Classify the load shape into ``"masked"`` / ``"unmasked"`` / ``"vec"``.
 
     Returns None when ``node`` doesn't look like a gmem load we can fuse.
@@ -417,13 +406,16 @@ def _load_kind(
     # A cache-hinted SCALAR load also routes through ``cute.arch.load``
     # (``(ptr).load()`` has no hint kwargs), so "vec" additionally requires
     # a VectorType dtype argument; scalar arch loads fall through to
-    # "unmasked" — but only when their explicit dtype matches the base
-    # tensor's (see _arch_scalar_dtype_mismatch).
-    if _looks_like_vec_load(node) is not None and _vec_width(node) is not None:
+    # "unmasked" and cache in the dtype they name (``_arch_scalar_dtype``).
+    if _vec_width(node) is not None:
         return "vec"
-    if _looks_like_unmasked_load(node) is not None:
-        if tensor_dtypes is not None and _arch_scalar_dtype_mismatch(
-            node, tensor_dtypes
+    if (call := _looks_like_unmasked_load(node)) is not None:
+        # A ``cute.arch.load`` caches as a scalar only in a scalar dtype it
+        # names: one whose vector type ``_vec_width`` cannot read is not
+        # fused.
+        if (
+            call_path_str(call.func) == "cute.arch.load"
+            and _arch_scalar_dtype(call) is None
         ):
             return None
         return "unmasked"
@@ -588,25 +580,19 @@ def _trip_count_for(
 
 def _scalar_load_ptr_text(node: ast.AST) -> str | None:
     """Pointer text of a SCALAR gmem load in either emitted form:
-    ``(PTR).load(...)`` or ``cute.arch.load(PTR, <scalar dtype>, ...)``.
+    ``(PTR).load()`` or ``cute.arch.load(PTR, <scalar dtype>, ...)``
+    (``match_packet_access``' ``load`` and ``arch_load``).
 
     A cache-hinted scalar site routes through ``cute.arch.load`` while its
     unhinted twin in the other sweep stays ``(PTR).load()``; the two must
     compare equal for cross-sweep fusion, so both normalize to the pointer
-    expression.  Returns None for vec loads and non-load expressions.
+    expression.  Returns None for vector loads (of a literal width or not)
+    and non-load expressions.
     """
-    if not isinstance(node, ast.Call):
+    access = match_packet_access(node)
+    if access is None or access.kind not in ("load", "arch_load"):
         return None
-    func = node.func
-    if not isinstance(func, ast.Attribute) or func.attr != "load":
-        return None
-    if _looks_like_vec_load(node) is not None:
-        if _vec_width(node) is not None:
-            return None
-        if node.args:
-            return ast.unparse(node.args[0])
-        return None
-    return ast.unparse(func.value)
+    return ast.unparse(access.pointer)
 
 
 def _plain_vec_load_spelling(node: ast.AST) -> ast.AST:
@@ -624,36 +610,49 @@ def _plain_vec_load_spelling(node: ast.AST) -> ast.AST:
     return node
 
 
-def _normalized_load_text(node: ast.AST) -> str:
-    """Unparse with cache hints stripped and the two scalar load forms
-    collapsed onto one spelling (see ``_scalar_load_ptr_text``); a hinted
-    vector load helper collapses onto ``cute.arch.load``."""
-    node = _plain_vec_load_spelling(_unwrap_persistent_branch_vec_load(node))
+def _scalar_load_key(node: ast.AST, tensor_dtypes: dict[str, str]) -> str | None:
+    """``__scalar_load__(PTR, DTYPE)`` for a scalar load in either form (see
+    ``_scalar_load_ptr_text``), or None, DTYPE being the dtype its cache
+    holds (``_scalar_load_dtype``).  A hinted load and its plain twin share a
+    key; a load reinterpreting the bytes in another dtype never reads that
+    cache (a ``Uint64`` load of a ``Float32`` cache would keep 4 of its 8
+    bytes)."""
     ptr = _scalar_load_ptr_text(node)
-    if ptr is not None:
-        return f"__scalar_load__({ptr})"
+    if ptr is None:
+        return None
+    return f"__scalar_load__({ptr}, {_scalar_load_dtype(node, tensor_dtypes)})"
+
+
+def _scalar_load_dtype(node: ast.AST, tensor_dtypes: dict[str, str]) -> str | None:
+    """The dtype a scalar load's cache holds: the one a ``cute.arch.load``
+    names, else its tensor's (``_unmasked_load_tensor_dtype``).  A bare
+    ``(PTR).load()`` of an unsigned tensor reads the signed integer of its
+    width; the emitter wraps such a load in an unsigned conversion, which
+    ``_load_kind`` does not take."""
+    return _arch_scalar_dtype(node) or _unmasked_load_tensor_dtype(node, tensor_dtypes)
+
+
+def _normalized_load_text(node: ast.AST, tensor_dtypes: dict[str, str]) -> str:
+    """A stable text key for matching loads and loop ranges across sweeps;
+    not code.  Per-load-site cache hints are stripped (the same logical load
+    in different sweeps carries a different, independently tunable hint),
+    the two scalar load forms collapse onto one spelling
+    (``_scalar_load_key``), and a hinted vector load helper collapses onto
+    ``cute.arch.load``."""
+    node = _plain_vec_load_spelling(_unwrap_persistent_branch_vec_load(node))
+    key = _scalar_load_key(node, tensor_dtypes)
+    if key is not None:
+        return key
     if isinstance(node, ast.IfExp):
-        body_ptr = _scalar_load_ptr_text(node.body)
-        if body_ptr is not None:
+        body_key = _scalar_load_key(node.body, tensor_dtypes)
+        if body_key is not None:
             return (
-                f"(__scalar_load__({body_ptr}) if {ast.unparse(node.test)} "
+                f"({body_key} if {ast.unparse(node.test)} "
                 f"else {ast.unparse(node.orelse)})"
             )
     return re.sub(
         r",\s*(?:level1_eviction_priority|cop)='[a-z_]+'", "", ast.unparse(node)
     )
-
-
-def _node_text(node: ast.AST) -> str:
-    """Stable text key for matching AST nodes.
-
-    Per-load-site cache hints are stripped from the key (and the hinted /
-    unhinted scalar load spellings collapse): the same logical load in
-    different sweeps carries a different (independently tunable) hint, and
-    the hint must not defeat cross-sweep fusion — the surviving first-sweep
-    load keeps its own hint.
-    """
-    return _normalized_load_text(node)
 
 
 def _unmasked_load_tensor_dtype(
@@ -840,6 +839,8 @@ def _canonical_load_text(
     node: ast.AST,
     lane_var_alias: dict[str, str],
     definitions: dict[str, ast.expr] | None = None,
+    *,
+    tensor_dtypes: dict[str, str],
 ) -> str:
     """Stringify a load node with ``definitions`` inlined and the later
     sweep's lane variable spelled as the first sweep's (``lane_var_alias``).
@@ -874,8 +875,8 @@ def _canonical_load_text(
         )
 
     # Per-load-site eviction hints differ between sweeps and must not
-    # defeat matching (see _node_text).
-    text = _normalized_load_text(node)
+    # defeat matching (see _normalized_load_text).
+    text = _normalized_load_text(node, tensor_dtypes)
     for old, new in lane_var_alias.items():
         # Word-boundary replacement so suffixed vars don't pick up matches
         # for shorter prefixes.
@@ -1169,7 +1170,7 @@ class _CuteFuseTwoPassLoads:
         return int(match.group(1)) if match is not None else None
 
     def _new_cache_name(self) -> str:
-        name = f"_fuse_cache_{self._counter}"
+        name = f"{FUSE_CACHE_PREFIX}{self._counter}"
         self._counter += 1
         return name
 
@@ -1198,7 +1199,7 @@ class _CuteFuseTwoPassLoads:
             return False
         if is_pure_expression(statement.value):
             return True
-        return _load_kind(statement.value, self._tensor_dtypes) is not None and all(
+        return _load_kind(statement.value) is not None and all(
             _is_proven_relocatable_call(node, allow_load=True)
             or call_path_str(node.func) == _PERSISTENT_BRANCH_VEC_LOAD
             for node in ast.walk(statement.value)
@@ -1528,8 +1529,8 @@ class _CuteFuseTwoPassLoads:
             cache_index_outer = "0"
         else:
             cache_index_outer = (
-                f"({outer_loop.target.id} - ({_node_text(start)})) "
-                f"// ({_node_text(step)})"
+                f"({outer_loop.target.id} - ({ast.unparse(start)})) "
+                f"// ({ast.unparse(step)})"
             )
         for_children = [s for s in body if isinstance(s, ast.For)]
         if not for_children:
@@ -1624,34 +1625,12 @@ class _CuteFuseTwoPassLoads:
             assert isinstance(node, ast.IfExp)
             return _dtype_from_default(node.orelse)
         if kind == "unmasked":
-            # ``(ptr_expr).load()`` — the load expression itself doesn't
-            # carry a dtype, but we can look it up later via the assignment
-            # target's downstream usage.  For now, fall back to a Float32
-            # cache which the cute compiler will coerce.  (RMS-norm consume
-            # sweeps in fp16/bf16 take the masked path; this fallback is
-            # rarely exercised.)
-            return None
+            return _scalar_load_dtype(node, self._tensor_dtypes)
         if kind == "vec":
-            # ``cute.arch.load(ptr, ir.VectorType.get([V], <elem>.mlir_type))``
-            # Pull the element type expression out so the fragment is the
-            # right dtype.  The third arg to VectorType.get is the elem.
-            assert isinstance(node, ast.Call)
-            if len(node.args) >= 2:
-                vec_arg = node.args[1]
-                # ir.VectorType.get([V], <elem>.mlir_type)
-                if (
-                    isinstance(vec_arg, ast.Call)
-                    and isinstance(vec_arg.func, ast.Attribute)
-                    and vec_arg.func.attr == "get"
-                    and len(vec_arg.args) >= 2
-                ):
-                    elem_arg = vec_arg.args[1]
-                    if (
-                        isinstance(elem_arg, ast.Attribute)
-                        and elem_arg.attr == "mlir_type"
-                    ):
-                        return ast.unparse(elem_arg.value)
-            return None
+            # The element type of ``cute.arch.load(ptr, ir.VectorType.get([V],
+            # <elem>.mlir_type))`` or its hinted helper form.
+            access = match_packet_access(node)
+            return access.carrier if access is not None else None
         return None
 
     def _try_fuse(
@@ -1674,7 +1653,10 @@ class _CuteFuseTwoPassLoads:
         for loop in loops:
             if not isinstance(loop.target, ast.Name):
                 continue
-            key = (loop.target.id, _node_text(loop.iter))
+            key = (
+                loop.target.id,
+                _normalized_load_text(loop.iter, self._tensor_dtypes),
+            )
             groups_by_key.setdefault(key, []).append(loop)
         # Also process every later suffix.  A value may first be loaded in
         # sweep two and reused in sweep three; after the full group caches
@@ -1905,7 +1887,7 @@ class _CuteFuseTwoPassLoads:
                 # vec path multiplies slots by V); tile-loop sweeps keep
                 # the historical slot-count cap their tunings were
                 # calibrated against.
-                fragment_cap = 64
+                fragment_cap = AUTO_REGISTER_CACHE_ELEMENTS
                 if (cache_elems if is_reduction_sweep else cache_size) > fragment_cap:
                     continue
                 use_smem = False
@@ -1928,18 +1910,10 @@ class _CuteFuseTwoPassLoads:
                     and len(s.targets) == 1
                     and isinstance(s.targets[0], ast.Name)
                 ):
-                    kind = _load_kind(s.value, self._tensor_dtypes)
+                    kind = _load_kind(s.value)
                     if kind is None:
                         continue
                     dtype = self._dtype_for_load_kind(s.value, kind)
-                    if dtype is None and kind == "unmasked":
-                        # An unmasked scalar load (mask elided because the
-                        # extent divides the block) carries no dtype in its
-                        # text; cache in the base tensor's OWN dtype so the
-                        # roundtrip is exact for every consumer.
-                        dtype = _unmasked_load_tensor_dtype(
-                            s.value, self._tensor_dtypes
-                        )
                     if dtype is None:
                         continue
                     v_width = _vec_width(s.value) if kind == "vec" else 1
@@ -1948,7 +1922,12 @@ class _CuteFuseTwoPassLoads:
                     first_definitions = self._pure_definitions_before(
                         first_container, j, first_scope_definitions, analysis=analysis
                     )
-                    key = _canonical_load_text(s.value, {}, first_definitions)
+                    key = _canonical_load_text(
+                        s.value,
+                        {},
+                        first_definitions,
+                        tensor_dtypes=self._tensor_dtypes,
+                    )
                     tracked[key] = (
                         j,
                         s.targets[0].id,
@@ -2030,7 +2009,7 @@ class _CuteFuseTwoPassLoads:
                         and len(s.targets) == 1
                         and isinstance(s.targets[0], ast.Name)
                     ):
-                        kind = _load_kind(s.value, self._tensor_dtypes)
+                        kind = _load_kind(s.value)
                         if kind is None:
                             continue
                         # A fused vector load is deleted, and the reads of its
@@ -2049,7 +2028,10 @@ class _CuteFuseTwoPassLoads:
                             container_k, j, scope_definitions, analysis=analysis
                         )
                         key = _canonical_load_text(
-                            s.value, alias_k, definitions_at_load
+                            s.value,
+                            alias_k,
+                            definitions_at_load,
+                            tensor_dtypes=self._tensor_dtypes,
                         )
                         if self._key_reads(key) & unstable:
                             continue
@@ -2122,10 +2104,7 @@ class _CuteFuseTwoPassLoads:
                 scope_loads: dict[int, str] = {}
                 for index in range(first_loop_index + 1, sweeps[-1][0]):
                     statement = new_body[index]
-                    if not (
-                        is_name_assign(statement)
-                        and _load_kind(statement.value, self._tensor_dtypes)
-                    ):
+                    if not (is_name_assign(statement) and _load_kind(statement.value)):
                         continue
                     key = _canonical_load_text(
                         statement.value,
@@ -2133,6 +2112,7 @@ class _CuteFuseTwoPassLoads:
                         self._pure_definitions_before(
                             new_body, index, analysis=analysis
                         ),
+                        tensor_dtypes=self._tensor_dtypes,
                     )
                     if key not in invariant_keys:
                         continue
@@ -2341,7 +2321,7 @@ class _CuteFuseTwoPassLoads:
                             )
                         )
                         continue
-                    if _load_kind(s.value, self._tensor_dtypes) is None:
+                    if _load_kind(s.value) is None:
                         continue
                     key = first_keys.get(id(s))
                     if key is None:
@@ -2409,7 +2389,7 @@ class _CuteFuseTwoPassLoads:
                         and len(s.targets) == 1
                         and isinstance(s.targets[0], ast.Name)
                     ):
-                        kind = _load_kind(s.value, self._tensor_dtypes)
+                        kind = _load_kind(s.value)
                         if kind is not None:
                             key = matched_by_index.get(statement_index)
                             if key is None:

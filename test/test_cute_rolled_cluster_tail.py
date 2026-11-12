@@ -379,6 +379,16 @@ _RELOADED_CLUSTER = helion.Config(
     cute_reduction_reloads=["gmem"],
     cute_cluster_n=4,
 )
+# One element per thread per chunk, of 128 elements: a gather of what another
+# chunk stores is rejected all the same (with several lanes, also what another
+# lane of the thread stores).
+_ONE_LANE_CLUSTER = helion.Config(
+    block_sizes=[1],
+    num_threads=[1, 128],
+    reduction_loops=[128],
+    cute_vector_widths=[1, 1],
+    cute_cluster_n=4,
+)
 _BF16_ROWS = (
     torch.empty(8, 4096, dtype=torch.bfloat16),
     torch.empty(4096, dtype=torch.bfloat16),
@@ -406,17 +416,6 @@ _BF16_ROWS = (
             _ROLLED_CLUSTER,
             False,
             id="read-back",
-        ),
-        # A gather inside the sweep reads elements of the peers' slices.
-        pytest.param(
-            _normalize_rows_gathered,
-            (
-                torch.empty(8, 4096, dtype=torch.bfloat16),
-                torch.empty(4096, dtype=torch.int64),
-            ),
-            _ROLLED_CLUSTER,
-            False,
-            id="gather",
         ),
         # A scatter fills the CTA's slice after every CTA stored the row's
         # first element: a peer's late copy can land over the scattered one.
@@ -496,6 +495,28 @@ def test_rolled_cluster_declines_cross_cta_races(
     nowhere else; its sliced accesses must agree on the element each CTA's
     slice reaches."""
     _assert_cluster_split(kernel, args, config, clustered)
+
+
+@pytest.mark.parametrize(
+    ("config", "where"),
+    [(_ONE_LANE_CLUSTER, "two chunks"), (_ROLLED_CLUSTER, "two lanes")],
+    ids=["one-lane", "lanes"],
+)
+def test_a_gather_of_the_rows_the_sweep_stores_is_rejected(
+    config: helion.Config, where: str
+) -> None:
+    """A gather inside the consume sweep may read an element an earlier
+    chunk of the sweep stored, or with several lanes per thread an earlier
+    lane, where the program loads the whole row before storing any of it,
+    and no barrier orders the chunks or a thread's lanes: the config is
+    rejected before the cluster split, whose CTAs it would race across too,
+    comes into it."""
+    args = (
+        torch.empty(8, 4096, dtype=torch.bfloat16),
+        torch.empty(4096, dtype=torch.int64),
+    )
+    with pytest.raises(helion.exc.BackendUnsupported, match=where):
+        _assert_cluster_split(_normalize_rows_gathered, args, config, False)
 
 
 def _tile_loop_running_update(x: torch.Tensor, running: torch.Tensor) -> torch.Tensor:

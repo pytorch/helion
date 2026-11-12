@@ -10,9 +10,10 @@ passes consume; :class:`ReduceCall` records one call of the scalar family
 (``(input, 'op', identity, lane, ...)``) and renders it back to the exact
 text the emitters write.  ``test/test_cute_reduce_call.py`` asserts the
 table against the dispatchers and ``CuteBackend.library_imports``.  The
-routing of the shared two-stage dispatcher (``use_serial_block_reduce``,
+routing of the warp dispatcher (``use_strided_warp_reduce``) and of the
+shared two-stage dispatcher (``use_serial_block_reduce``,
 ``use_interleaved_shared_reduce``) lives here too: ``reduce_helpers``
-dispatches on it and ``smem_footprint`` sizes each form's buffer by it.
+dispatches on it and ``smem_footprint`` sizes each shared form's buffer by it.
 """
 
 from __future__ import annotations
@@ -42,6 +43,22 @@ class ReduceScope(enum.Enum):
     @property
     def helper(self) -> str:
         return self.value
+
+    @staticmethod
+    def fragment_fits(pre: int, group_span: int, count: int) -> bool:
+        """Whether ``SHARED_TWO_STAGE_FRAGMENT`` reduces ``count`` values per
+        thread of ``pre`` interleaved siblings in groups of ``group_span``
+        threads as ``count`` calls of ``SHARED_TWO_STAGE`` would, bit for
+        bit: its warp butterfly keeps a power-of-two ``pre`` of at most 32
+        apart, the groups are whole warps, and its second stage gives each of
+        a group's ``pre * count`` slots a thread
+        (``reduce_helpers._cute_grouped_reduce_shared_two_stage_fragment_body``)."""
+        return (
+            0 < pre <= 32
+            and pre & (pre - 1) == 0
+            and group_span % 32 == 0
+            and pre * count <= group_span
+        )
 
 
 def _names(*scopes: ReduceScope) -> frozenset[str]:
@@ -123,6 +140,21 @@ def use_interleaved_shared_reduce(pre: int, group_span: int) -> bool:
         and group_span % 32 == 0
         and group_span % pre == 0
         and (pre < 32 or pre % 32 == 0)
+    )
+
+
+def use_strided_warp_reduce(pre: int, group_span: int) -> bool:
+    """Whether ``_cute_grouped_reduce_warp`` reduces its ``pre`` interleaved
+    siblings with one partial butterfly: power-of-two ``pre`` and span, the
+    span within a warp and above ``pre``.  With one lane per sibling the
+    butterfly has no shuffle, only combines with constant identities, which
+    the compiler may fold away: a NaN would keep its payload where the
+    masked passes, combining with shuffled identities, canonicalize it."""
+    return (
+        pre > 1
+        and pre & (pre - 1) == 0
+        and group_span & (group_span - 1) == 0
+        and pre < group_span <= 32
     )
 
 

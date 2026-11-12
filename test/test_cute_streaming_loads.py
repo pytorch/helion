@@ -22,6 +22,8 @@ import torch
 
 import helion
 from helion._compiler.cute.backend import CuteBackend
+from helion._compiler.cute.scalar_policy_loads import is_extended_scalar_load
+from helion._compiler.cute.scalar_policy_loads import lower_scalar_policy_loads
 from helion._compiler.triton.backend import TritonBackend
 from helion._testing import DEVICE
 from helion._testing import TestCase
@@ -114,8 +116,6 @@ class TestCuteStreamingLoads(TestCase):
     ),
 )
 def test_scalar_policy_final_lowering(dtype, keyword, value, policy):
-    from helion._compiler.cute.scalar_policy_loads import lower_scalar_policy_loads
-
     body = ast.parse(
         f"x = cute.arch.load(p, cutlass.{dtype}, {keyword}={value!r})"
     ).body
@@ -144,14 +144,46 @@ def test_scalar_policy_final_lowering(dtype, keyword, value, policy):
     ),
 )
 def test_scalar_policy_preserves_other_load_forms(expr):
-    from helion._compiler.cute.scalar_policy_loads import lower_scalar_policy_loads
-
     body = ast.parse(f"x = {expr}").body
     before = ast.dump(ast.Module(body=body, type_ignores=[]))
     assert (
         ast.dump(ast.Module(body=lower_scalar_policy_loads(body), type_ignores=[]))
         == before
     )
+
+
+@pytest.mark.parametrize(
+    ("expr", "extended"),
+    (
+        # Lowered to exact-policy PTX at final emission.
+        ("cute.arch.load(p, cutlass.Float32, cop='cs')", False),
+        (
+            "cute.arch.load(p, cutlass.Int64, level1_eviction_priority='evict_last')",
+            False,
+        ),
+        # Not hinted, or a vector packet: no extended scalar load.
+        ("p.load()", False),
+        ("cute.arch.load(p, cutlass.Float32)", False),
+        (
+            "cute.arch.load(p, ir.VectorType.get([4], cutlass.Float32.mlir_type), cop='cs')",
+            False,
+        ),
+        # Hinted scalars the lowering keeps reach NVVM as extended loads.
+        ("cute.arch.load(p, cutlass.BFloat16, cop='cs')", True),
+        (
+            "cute.arch.load(p, cutlass.Uint8, level1_eviction_priority='evict_first')",
+            True,
+        ),
+        ("cute.arch.load(p, cutlass.Float32, cop='cg')", True),
+    ),
+)
+def test_extended_scalar_loads_are_the_hinted_ones_left_unlowered(expr, extended):
+    """``cute_lane_unroll`` declines a lane body holding an extended scalar
+    load (``unroll_lane_loads._has_extended_scalar_load``); the hints the
+    final lowering spells as PTX do not count."""
+    call = ast.parse(expr, mode="eval").body
+    assert isinstance(call, ast.Call)
+    assert is_extended_scalar_load(call) is extended
 
 
 def test_scalar_policy_helper_bits_and_memory_effects():
@@ -209,8 +241,6 @@ def test_scalar_policy_helper_bits_and_memory_effects():
 @pytest.mark.parametrize("length", (0, 1, 3, 4, 7))
 @pytest.mark.parametrize("width", (32, 64))
 def test_scalar_policy_mask_tail_alias_and_bit_model(length, width):
-    from helion._compiler.cute.scalar_policy_loads import lower_scalar_policy_loads
-
     # No arithmetic in the transfer: includes signed zero, NaN payloads,
     # infinities, subnormals and signed/unsigned integer high bits.
     words = [0, 1, 1 << (width - 1), (1 << width) - 1]
