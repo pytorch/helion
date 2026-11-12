@@ -69,13 +69,26 @@ def _helper_namespace(module_name: str) -> str:
     return "_standalone_" + module_name.rsplit(".", 1)[-1].lstrip("_")
 
 
+def _decorator_name(decorator: ast.expr) -> str:
+    """``cute.jit`` for both ``@cute.jit`` and ``@cute.jit(...)``."""
+    return ast.unparse(decorator.func if isinstance(decorator, ast.Call) else decorator)
+
+
 class _StructAnnotations(ast.NodeTransformer):
-    """Keep CuTe struct field types concrete under generated future annotations."""
+    """Keep CuTe struct and dataclass field types concrete under generated future
+    annotations.
+
+    CuTe DSL reads field types as objects: a dataclass field annotated
+    ``cutlass.Constexpr[float]`` is a compile-time constant only if its type is
+    not the string the future import makes of it.
+    """
 
     def visit_ClassDef(self, node: ast.ClassDef) -> ast.ClassDef:
         self.generic_visit(node)
         if not any(
-            ast.unparse(decorator) == "cute.struct" for decorator in node.decorator_list
+            _decorator_name(decorator)
+            in ("cute.struct", "dataclass", "dataclasses.dataclass")
+            for decorator in node.decorator_list
         ):
             return node
         fields = [
@@ -85,13 +98,22 @@ class _StructAnnotations(ast.NodeTransformer):
             and isinstance(statement.target, ast.Name)
         ]
         if fields:
-            node.body = [
-                statement
-                for statement in node.body
-                if not isinstance(statement, ast.AnnAssign)
-            ]
+            body: list[ast.stmt] = []
+            for statement in node.body:
+                if not isinstance(statement, ast.AnnAssign):
+                    body.append(statement)
+                elif statement.value is not None:
+                    # A field default stays a class attribute, where dataclasses
+                    # find it.
+                    body.append(
+                        ast.Assign(targets=[statement.target], value=statement.value)
+                    )
+            node.body = body
+            # After the docstring, which stays the class's ``__doc__``.
+            first = body[0].value if body and isinstance(body[0], ast.Expr) else None
+            docstring = isinstance(first, ast.Constant) and isinstance(first.value, str)
             node.body.insert(
-                0,
+                int(docstring),
                 ast.Assign(
                     targets=[ast.Name(id="__annotations__", ctx=ast.Store())],
                     value=ast.Dict(
