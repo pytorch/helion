@@ -4893,6 +4893,453 @@ class TestMetalReductionAfterTileLoop(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Literal dims beside tiles
+# ---------------------------------------------------------------------------
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def literal_carry_row_sum(x: torch.Tensor) -> torch.Tensor:
+    """Column partials of 64-wide tiles in a literal carry, summed after."""
+    m, n = x.shape
+    out = torch.empty([m], dtype=torch.float32, device=x.device)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m, 64], dtype=torch.float32)
+        for tile_n in hl.tile(n, block_size=64):
+            acc = acc + x[tile_m, tile_n]
+        out[tile_m] = acc.sum(1)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def literal_carry_tile_first(x: torch.Tensor) -> torch.Tensor:
+    """``literal_carry_row_sum`` with the tile first, stored through ``:``."""
+    m, n = x.shape
+    out = torch.empty([m, 64], dtype=torch.float32, device=x.device)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m, 64], dtype=torch.float32)
+        for tile_n in hl.tile(n, block_size=64):
+            acc = x[tile_m, tile_n] + acc
+        out[tile_m, :] = acc
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def tile_plus_slice(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile([m, n], block_size=[None, 64]):
+        out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, :]
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def literal_store_into_tile(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile([m, n], block_size=[None, 64]):
+        out[tile_m, tile_n] = y[tile_m, :] + hl.zeros([tile_m, 64], dtype=x.dtype)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def load_masked_by_slice(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile([m, n], block_size=[None, 64]):
+        out[tile_m, tile_n] = hl.load(x, [tile_m, tile_n], extra_mask=y[tile_m, :] > 0)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def store_masked_by_slice(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    out = torch.zeros_like(x)
+    for tile_m, tile_n in hl.tile([m, n], block_size=[None, 64]):
+        hl.store(out, [tile_m, tile_n], x[tile_m, tile_n], extra_mask=y[tile_m, :] > 0)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def load_masked_by_tile(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile([m, n], block_size=[None, 64]):
+        out[tile_m, tile_n] = hl.load(
+            x, [tile_m, tile_n], extra_mask=y[tile_m, tile_n] > 0
+        )
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def store_masked_by_tile(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    out = torch.zeros_like(x)
+    for tile_m, tile_n in hl.tile([m, n], block_size=[None, 64]):
+        hl.store(
+            out, [tile_m, tile_n], x[tile_m, tile_n], extra_mask=y[tile_m, tile_n] > 0
+        )
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def literal_holding_other_tile(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A literal dim that holds ``tile_k`` times ``tile_n`` at its position."""
+    m, n = x.shape
+    k = y.shape[1]
+    out = torch.empty([m, n // 32, k // 32], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n, tile_k in hl.tile([m, n, k], block_size=[None, 32, 32]):
+        t = hl.zeros([tile_m, 32], dtype=torch.float32) + y[tile_m, tile_k]
+        out[tile_m, tile_n.id, tile_k.id] = (t * x[tile_m, tile_n]).sum(1)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def literal_carry_of_slices(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A literal carry updated with ``:`` slices of its width."""
+    m, k = x.shape
+    out = torch.empty([m, 64], dtype=torch.float32, device=x.device)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m, 64], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = acc + y[tile_m, :] * x[tile_m, tile_k].sum(1, keepdim=True)
+        out[tile_m, :] = acc
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def literal_carry_beside_grid_tile(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """A literal carry holding a 64-wide grid tile through an inner loop."""
+    m, n = x.shape
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile([m, n], block_size=[None, 64]):
+        acc = hl.zeros([tile_m, 64], dtype=torch.float32)
+        for tile_k in hl.tile(w.size(0)):
+            acc = acc + x[tile_m, tile_n] * w[tile_k].sum()
+        out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def grid_index_store(x: torch.Tensor) -> torch.Tensor:
+    """``:`` and a tile stored beside an ``hl.grid`` index, which keeps no dim."""
+    _, n, b = x.shape
+    out = torch.empty_like(x)
+    for row in hl.grid(b):
+        for tile_n in hl.tile(n):
+            out[:, tile_n, row] = x[:, tile_n, row] * 2
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def grid_index_store_inner(x: torch.Tensor) -> torch.Tensor:
+    """``grid_index_store`` with the grid inside the tile loop."""
+    _, n, b = x.shape
+    out = torch.empty_like(x)
+    for tile_n in hl.tile(n):
+        for row in hl.grid(b):
+            out[:, tile_n, row] = x[:, tile_n, row] * 2
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def tile_into_slice(x: torch.Tensor) -> torch.Tensor:
+    """A 64-wide tile stored through ``:``."""
+    m, n = x.shape
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile([m, n], block_size=[None, 64]):
+        out[tile_m, :] = x[tile_m, tile_n] * 2
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def tile_into_slice_inner(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        for tile_n in hl.tile(n, block_size=64):
+            out[tile_m, :] = x[tile_m, tile_n] * 2
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def tile_into_slice_beside_id(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    out = torch.empty([m, n // 64, 64], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n], block_size=[None, 64]):
+        out[tile_m, tile_n.id, :] = x[tile_m, tile_n] * 2
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def literal_row_sum(x: torch.Tensor) -> torch.Tensor:
+    """A literal dim holding a tile, reduced (by the reduction block of 64)."""
+    m, n = x.shape
+    out = torch.empty([m, n // 64], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n], block_size=[None, 64]):
+        v = hl.zeros([tile_m, 64], dtype=x.dtype) + x[tile_m, tile_n]
+        out[tile_m, tile_n.id] = v.sum(1)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def carry_slice_then_tile(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A carry entering as a ``:`` slice and leaving as a 64-wide tile."""
+    m, n = x.shape
+    out = torch.empty([m, 64], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        acc = y[tile_m, :]
+        for tile_n in hl.tile(n, block_size=64):
+            acc = x[tile_m, tile_n] * 2
+        out[tile_m, :] = acc
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def two_unrelated_tiles(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """``tile_k`` times ``tile_n`` at one position, no literal involved."""
+    m, n = x.shape
+    k = y.shape[1]
+    out = torch.empty([m, n // 32, k // 32], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n, tile_k in hl.tile([m, n, k], block_size=[None, 32, 32]):
+        prod = y[tile_m, tile_k] * x[tile_m, tile_n]
+        out[tile_m, tile_n.id, tile_k.id] = prod.sum(1)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def tile_plus_transpose(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Two tiles meeting swapped: Helion pairs them by position, as loaded,
+    where Metal paired them by block (``x + y.T``)."""
+    m, n = x.shape
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile([m, n], block_size=[16, 16]):
+        out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_n, tile_m]
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def torch_zeros_carry(x: torch.Tensor) -> torch.Tensor:
+    """``torch.zeros`` is the same along its literal dim, as ``hl.zeros``."""
+    m, n = x.shape
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile([m, n], block_size=[None, 64]):
+        acc = torch.zeros([tile_m, 64], dtype=x.dtype, device=x.device)
+        acc = acc + x[tile_m, tile_n]
+        out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def literal_like_beside_tile(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile([m, n], block_size=[None, 64]):
+        t = hl.zeros([tile_m, 64], dtype=x.dtype) + x[tile_m, tile_n]
+        out[tile_m, tile_n] = t + (torch.zeros_like(t) + 1)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def literal_subscript_store(x: torch.Tensor) -> torch.Tensor:
+    """``hl.subscript`` keeps the holder of the literal dim it indexes."""
+    m, n = x.shape
+    out = torch.empty([m, n, 1], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n], block_size=[None, 64]):
+        t = hl.zeros([tile_m, 64], dtype=x.dtype) + x[tile_m, tile_n]
+        out[tile_m, tile_n, :] = t[:, :, None]
+    return out
+
+
+# metal/literal_dims.py's refusal of two unrelated tiles meeting by position.
+_PAIRS_TILES = r"pairs, at its dim \d+, dims held by block \d+'s tile, block \d+'s tile"
+
+
+def _ints(*shape: int) -> torch.Tensor:
+    # Integer values keep the sums exact in any order.
+    return torch.randint(-4, 5, shape, device=DEVICE).to(torch.float32)
+
+
+class TestMetalLiteralDims(unittest.TestCase):
+    """Literal dims (``hl.zeros([tile_m, 64])``, a ``:`` slice) beside tiles,
+    as test_literal_dims.py checks them for Triton and CuTe.
+
+    A Metal thread finds the block of a literal dim by its size, never a
+    tile, so where a literal dim holds a tile's elements, or a ``:`` slice
+    meets a tile, it read other elements than the positional program: every
+    refused kernel here returned wrong values before it was refused.
+    """
+
+    def _run(
+        self, kernel: helion.Kernel, config: helion.Config, *args: torch.Tensor
+    ) -> object:
+        return kernel.bind(args).compile_config(config)(*args)
+
+    def test_literal_carry_beside_device_loop_tile(self) -> None:
+        x = _ints(96, 640)
+        message = r"loop carry .* holds block \d+'s tile .* hl\.register_block_size"
+        for block_sizes, num_warps in (([1], 1), ([4], 4), ([16], 4)):
+            config = helion.Config(block_sizes=block_sizes, num_warps=num_warps)
+            for kernel in (literal_carry_row_sum, literal_carry_tile_first):
+                with (
+                    self.subTest(kernel=kernel.name, block_sizes=block_sizes),
+                    self.assertRaisesRegex(exc.BackendUnsupported, message),
+                ):
+                    self._run(kernel, config, x)
+
+    def test_slice_beside_tile(self) -> None:
+        x, y = _ints(96, 64), _ints(96, 64)
+        config = helion.Config(block_sizes=[4], num_warps=4)
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported,
+            # y[tile_m, :] traces as the literal 64 here.
+            r"aten.add.Tensor pairs, at its dim 1, dims held by block \d+'s tile, a "
+            r"literal dim .* index the ':' dim it comes from with the tile",
+        ):
+            self._run(tile_plus_slice, config, x, y)
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported,
+            r"a store writes dim 1 .* held by a literal dim .* through block \d+'s "
+            r"tile .* index the ':' dim it comes from with the tile",
+        ):
+            self._run(literal_store_into_tile, config, x, y)
+
+    def test_tile_into_slice(self) -> None:
+        # Each row stored one repeated value.
+        x = _ints(96, 64)
+        for kernel in (
+            tile_into_slice,
+            tile_into_slice_inner,
+            tile_into_slice_beside_id,
+        ):
+            for block_sizes in ([1], [4], [32]):
+                with (
+                    self.subTest(kernel=kernel.name, block_sizes=block_sizes),
+                    self.assertRaisesRegex(
+                        exc.BackendUnsupported,
+                        r"a store writes dim 1 .* held by block \d+'s tile, through "
+                        r"a ':' slice .* index the ':' dim with the tile",
+                    ),
+                ):
+                    self._run(
+                        kernel, helion.Config(block_sizes=block_sizes, num_warps=4), x
+                    )
+
+    def test_literal_holding_a_tile_reduced(self) -> None:
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported,
+            r"aten.sum.dim_IntList reads v .* holds block \d+'s tile.* "
+            r"hl\.register_block_size",
+        ):
+            self._run(literal_row_sum, helion.Config(block_sizes=[4]), _ints(96, 128))
+
+    def test_carry_entering_and_leaving_on_different_blocks(self) -> None:
+        x, y = _ints(96, 128), _ints(96, 64)
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported,
+            r"control-flow carry .* held by a ':' slice and block \d+'s tile.* "
+            r"index the ':' dim with the tile",
+        ):
+            self._run(carry_slice_then_tile, helion.Config(block_sizes=[4]), x, y)
+
+    def test_unrelated_tiles(self) -> None:
+        # Compiled and summed the wrong products at any config.
+        x, y = _ints(16, 64), _ints(16, 64)
+        for block_sizes in ([1], [4]):
+            with (
+                self.subTest(block_sizes=block_sizes),
+                self.assertRaisesRegex(exc.BackendUnsupported, _PAIRS_TILES),
+            ):
+                self._run(
+                    two_unrelated_tiles,
+                    helion.Config(block_sizes=block_sizes, num_warps=4),
+                    x,
+                    y,
+                )
+        # Swapped tiles pair by position, as loaded (what ref mode computes),
+        # where Metal's pairing by block computed x + y.T.
+        x, y = _ints(32, 32), _ints(32, 32)
+        with self.assertRaisesRegex(exc.BackendUnsupported, _PAIRS_TILES):
+            self._run(tile_plus_transpose, helion.Config(), x, y)
+
+    def test_factory_and_subscript_dims_agree(self) -> None:
+        x = _ints(96, 128)
+        config = helion.Config(block_sizes=[4], num_warps=4)
+        torch.testing.assert_close(self._run(torch_zeros_carry, config, x), x)
+        torch.testing.assert_close(
+            self._run(literal_like_beside_tile, config, x), x + 1
+        )
+        torch.testing.assert_close(
+            self._run(literal_subscript_store, config, x), x[:, :, None]
+        )
+
+    def test_literal_holding_another_tile(self) -> None:
+        # Refused at any block size of tile_m: block 1 at [4] compiled and
+        # summed the wrong products.
+        x, y = _ints(16, 64), _ints(16, 64)
+        for block_sizes in ([1], [4]):
+            with (
+                self.subTest(block_sizes=block_sizes),
+                self.assertRaisesRegex(
+                    exc.BackendUnsupported,
+                    r"aten.mul.Tensor pairs, at its dim 1, dims held by block \d+'s "
+                    r"tile, block \d+'s tile",
+                ),
+            ):
+                self._run(
+                    literal_holding_other_tile,
+                    helion.Config(block_sizes=block_sizes, num_warps=4),
+                    x,
+                    y,
+                )
+
+    def test_agreeing_literal_dims(self) -> None:
+        config = helion.Config(block_sizes=[4, 32], num_warps=4)
+        x, y = _ints(96, 640), _ints(96, 64)
+        torch.testing.assert_close(
+            self._run(literal_carry_of_slices, config, x, y),
+            y * x.sum(1, keepdim=True),
+        )
+        w = _ints(48)
+        torch.testing.assert_close(
+            self._run(literal_carry_beside_grid_tile, config, x, w), x * w.sum()
+        )
+
+    def test_grid_index_store(self) -> None:
+        x = _ints(4, 64, 6)
+        for kernel in (grid_index_store, grid_index_store_inner):
+            for block_sizes in ([16], [64]):
+                with self.subTest(kernel=kernel.name, block_sizes=block_sizes):
+                    config = helion.Config(block_sizes=block_sizes, num_warps=4)
+                    torch.testing.assert_close(self._run(kernel, config, x), x * 2)
+
+    def test_masks_beside_tiles(self) -> None:
+        # A mask is read at the element its load or store addresses: a ':'
+        # mask beside a tile read other rows' columns.
+        x, y = _ints(16, 64), _ints(16, 64)
+        expected = torch.where(y > 0, x, 0)
+        for block_sizes in ([1], [4]):
+            config = helion.Config(block_sizes=block_sizes, num_warps=4)
+            for kernel, what in (
+                (load_masked_by_slice, "a load's mask reads"),
+                (store_masked_by_slice, "a store's mask reads"),
+            ):
+                with (
+                    self.subTest(kernel=kernel.name, block_sizes=block_sizes),
+                    self.assertRaisesRegex(
+                        exc.BackendUnsupported,
+                        rf"{what} dim 1 .* held by a ':' slice, through block "
+                        r"\d+'s tile .* index the ':' dim with the tile",
+                    ),
+                ):
+                    self._run(kernel, config, x, y)
+            for kernel in (load_masked_by_tile, store_masked_by_tile):
+                with self.subTest(kernel=kernel.name, block_sizes=block_sizes):
+                    torch.testing.assert_close(
+                        self._run(kernel, config, x, y), expected
+                    )
+
+
+# ---------------------------------------------------------------------------
 # Squeeze
 # ---------------------------------------------------------------------------
 
@@ -10110,6 +10557,34 @@ def where_lower_rank(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="metal", static_shapes=True)
+def add_transposed_free(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Operands over two free blocks, the second transposed."""
+    out = torch.zeros_like(x)
+    bm = hl.register_block_size(8, 8)
+    bn = hl.register_block_size(8, 8)
+    for _ in hl.grid(1):
+        rows = hl.arange(bm)
+        cols = hl.arange(bn)
+        v = hl.load(x, [rows, cols]) + hl.load(y, [cols, rows])
+        hl.store(out, [rows, cols], v)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def where_transposed_free(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """``where`` over two free blocks, its value transposed."""
+    out = torch.zeros_like(x)
+    bm = hl.register_block_size(8, 8)
+    bn = hl.register_block_size(8, 8)
+    for _ in hl.grid(1):
+        rows = hl.arange(bm)
+        cols = hl.arange(bn)
+        v = torch.where(hl.load(x, [rows, cols]) > 0, hl.load(y, [cols, rows]), 0.0)
+        hl.store(out, [rows, cols], v)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
 def lowrank_onto_other_free_dim(x: torch.Tensor) -> torch.Tensor:
     """``[bp]`` onto ``[tm, bn]``: Triton places it on bn's dim."""
     m, n = x.shape
@@ -10717,13 +11192,11 @@ class TestMetalFreeArange(unittest.TestCase):
 
     def test_store_and_mask_rebinds_reject(self) -> None:
         x = torch.randn(64, device=DEVICE)
+        # A free block's value stored through a tile: metal/literal_dims.py.
+        store = r"a store writes dim 0 of .* held by block \d+'s tile, through block"
+        self._assert_rejected(free_store_into_tile, (x,), store)
         self._assert_rejected(
-            free_store_into_tile, (x,), r"a store binds a dim of block \d+ to"
-        )
-        self._assert_rejected(
-            free_store_into_tile_in_branch,
-            (x, torch.ones(1, device=DEVICE)),
-            r"a store binds a dim of block \d+ to",
+            free_store_into_tile_in_branch, (x, torch.ones(1, device=DEVICE)), store
         )
         self._assert_rejected(
             free_mask_rebind, (x,), r"a load mask binds a dim of block \d+ to"
@@ -10755,25 +11228,32 @@ class TestMetalFreeArange(unittest.TestCase):
         self._assert_rejected(
             where_other_free_block,
             (torch.randn(64, device=DEVICE),),
-            "operand binds a dim",
+            _PAIRS_TILES,
         )
         self._assert_rejected(
-            where_lower_rank, (torch.randn(16, 16, device=DEVICE),), "operand binds"
+            where_lower_rank, (torch.randn(16, 16, device=DEVICE),), _PAIRS_TILES
         )
+
+    def test_transposed_operands_reject(self) -> None:
+        # Operands over the same free blocks, one swapped: paired by position.
+        args = (torch.randn(8, 8, device=DEVICE), torch.randn(8, 8, device=DEVICE))
+        for kernel in (add_transposed_free, where_transposed_free):
+            with self.subTest(kernel=kernel.name):
+                self._assert_rejected(kernel, args, _PAIRS_TILES)
 
     def test_lower_rank_rebinds_reject(self) -> None:
         x = torch.randn(8, 8, 8, device=DEVICE)
         y = torch.randn(8, 8, device=DEVICE)
-        message = r"lower-rank operand binds a dim of block \d+ to"
+        # Each meets another free block's dim at a position.
         self._assert_rejected(
             lowrank_onto_other_free_dim,
             (torch.randn(8, 8, device=DEVICE),),
-            message,
+            _PAIRS_TILES,
             helion.Config(block_sizes=[8, 8, 4]),
         )
         config = helion.Config(block_sizes=[8, 8, 8])
-        self._assert_rejected(lowrank_swapped_dims, (x, y), message, config)
-        self._assert_rejected(lowrank_permuted_free, (x, y), message, config)
+        self._assert_rejected(lowrank_swapped_dims, (x, y), _PAIRS_TILES, config)
+        self._assert_rejected(lowrank_permuted_free, (x, y), _PAIRS_TILES, config)
 
     def test_carry_rebinds_reject(self) -> None:
         x = torch.randn(16, 16, device=DEVICE)
@@ -12424,6 +12904,20 @@ def stack_lit_two_tiles(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="metal", static_shapes=True)
+def stack_transposed(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A tile stacked beside its transpose: two tiles at each position."""
+    m, n = x.shape
+    out = torch.zeros([m, 2 * n], dtype=x.dtype, device=x.device)
+    bm = hl.register_block_size(8, 8)
+    bn = hl.register_block_size(8, 8)
+    for tm, tn in hl.tile([m, n], block_size=[bm, bn]):
+        st = torch.stack([x[tm, tn], y[tn, tm]], dim=2)
+        s = 2 * tn.begin
+        out[tm, s : s + 2 * bn] = st.reshape(bm, 2 * bn)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
 def misaligned_cols(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
     kh = out.size(1) // 2
     bk = hl.register_block_size(kh)
@@ -13071,18 +13565,23 @@ class TestMetalFactoredDims(unittest.TestCase):
         )
 
     def test_stack_inputs_over_other_blocks_reject(self) -> None:
-        message = r"aten.stack \w+ of inputs of shapes .* over different blocks"
+        # x[tj, tk] beside y[tm, tk]: metal/literal_dims.py refuses tj meeting
+        # tm before the stack's lowering sees it (in stack_lit_two_tiles, tj's
+        # block size became the literal 8 in x[tj, tk]).
         args = (torch.randn(8, 8), torch.randn(8, 8))
         for config in (
             helion.Config(block_sizes=[8, 8, 8]),
             helion.Config(block_sizes=[8, 4, 4]),
         ):
-            self._assert_rejected(stack_rows_two_tiles, args, message, config)
+            self._assert_rejected(stack_rows_two_tiles, args, _PAIRS_TILES, config)
         config = helion.Config(block_sizes=[8, 8, 8])
-        self._assert_rejected(stack_rows_two_tiles_swapped, args, message, config)
-        self._assert_rejected(stack_three_mixed, args, message, config)
+        self._assert_rejected(stack_rows_two_tiles_swapped, args, _PAIRS_TILES, config)
+        self._assert_rejected(stack_three_mixed, args, _PAIRS_TILES, config)
         self._assert_rejected(
-            stack_lit_two_tiles, args, message, helion.Config(block_sizes=[4])
+            stack_lit_two_tiles, args, _PAIRS_TILES, helion.Config(block_sizes=[4])
+        )
+        self._assert_rejected(
+            stack_transposed, args, _PAIRS_TILES, helion.Config(block_sizes=[8, 8])
         )
 
     def test_store_dims_over_other_blocks_reject(self) -> None:

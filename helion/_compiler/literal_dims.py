@@ -14,7 +14,8 @@ of either, a loop carry updated by one of those.
 to a fixpoint: held by a tile block, by size (``SIZE``: the reduction block of
 its extent), or the same everywhere along it (``FREE``: a factory, an iota, a
 broadcast).  It refuses nothing; a backend subclasses it with the programs
-its lowering cannot address (CuTe's ``cute/literal_dims.py``).
+its lowering cannot address (CuTe's ``cute/literal_dims.py``, Metal's
+``metal/literal_dims.py``).
 """
 
 from __future__ import annotations
