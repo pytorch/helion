@@ -436,16 +436,23 @@ def test_a_row_stored_in_place_is_read_back_from_memory() -> None:
 
 @contextlib.contextmanager
 def _head_rows_bound(
-    bias: torch.Tensor, rows: int = 16, keys: int = 512, *, static_shapes: bool = True
+    bias: torch.Tensor,
+    rows: int = 16,
+    keys: int = 512,
+    *,
+    static_shapes: bool = True,
+    capability: tuple[int, int] = (10, 0),
 ) -> Iterator[BoundKernel]:
     """``head_bias_softmax_bwd`` bound on CPU for ``rows`` rows of four
-    queries over ``keys`` keys and the ``[heads, q, k]`` ``bias``."""
+    queries over ``keys`` keys and the ``[heads, q, k]`` ``bias``, for a
+    target of ``capability``."""
     kernel = helion.kernel(
         head_bias_softmax_bwd, backend="cute", static_shapes=static_shapes
     )
     with cpu_render_target(reduction_smem_budget_bytes=232448):
         scores = torch.empty(rows, 4, keys, dtype=torch.bfloat16)
-        yield cpu_bind(kernel, (scores, scores, bias, *[torch.empty(rows, 4)] * 2))
+        args = (scores, scores, bias, *[torch.empty(rows, 4)] * 2)
+        yield cpu_bind(kernel, args, capability=capability)
 
 
 def _head_rows_code(**knobs: object) -> str:
@@ -535,6 +542,30 @@ def test_each_head_lane_reloads_from_its_own_register_cache() -> None:
         assert f"_fuse_cache_0_lane{lane}[" in code
 
 
+def test_jammed_head_rows_load_their_keys_in_packets() -> None:
+    # The seed's alternate at four keys per thread: each head lane loads its
+    # row's four bf16 scores and gradients as one packet and keeps its own
+    # register cache, and the heads' bias elements of a key stay one packet.
+    code = _head_rows_code(
+        cute_reduction_reloads=["register"],
+        cute_vector_widths=[4, 1, 1],
+        cute_grid_lane_jam=True,
+    )
+    assert "for lane_0 in range(4)" not in code
+    packet = "ir.VectorType.get([4], cutlass.Uint16.mlir_type)"
+    for tensor in ("scores", "grad"):
+        loads = [
+            line
+            for line in code.splitlines()
+            if f"cute.arch.load({tensor}.iterator" in line
+        ]
+        assert len(loads) == 4
+        assert all(packet in line for line in loads)
+    assert _bias_packets(code, 4) == 1
+    for lane in range(4):
+        assert f"_fuse_cache_0_lane{lane} = cute.make_rmem_tensor(" in code
+
+
 def test_heads_innermost_bias_seeds_the_jammed_head_lanes() -> None:
     jammed = [
         seed.config
@@ -555,15 +586,17 @@ def test_heads_innermost_bias_seeds_the_jammed_head_lanes() -> None:
     )
 
 
-def _head_rows_seeds(bias: torch.Tensor) -> list[helion.Config]:
-    kernel = helion.kernel(head_bias_softmax_bwd, backend="cute", static_shapes=True)
-    with cpu_render_target(reduction_smem_budget_bytes=232448):
-        rows = torch.empty(16, 4, 512, dtype=torch.bfloat16)
-        bound = cpu_bind(kernel, (rows, rows, bias, *[torch.empty(16, 4)] * 2))
+def _head_rows_seeds(
+    bias: torch.Tensor, keys: int = 512, capability: tuple[int, int] = (10, 0)
+) -> list[helion.Config]:
+    with _head_rows_bound(bias, keys=keys, capability=capability) as bound:
+        # The workspace's forwarding twin (``cute_scratch_forwarding``) is
+        # ``test_cute_scratch_forwarding.py``'s.
         return [
             seed.config
             for seed in bound.config_spec.compiler_seed_configs
             if seed.config.get("cute_grid_lane_jam")
+            and not seed.config.get("cute_scratch_forwarding")
         ]
 
 
@@ -572,14 +605,57 @@ def test_a_heads_innermost_bias_row_seeds_jammed_rows_around_the_reduction() -> 
     # a 16-byte packet), each row's 512 keys on 128 threads in one chunk of a
     # looped reduction that reloads from registers.
     seeds = _head_rows_seeds(head_bias(8, 4, 512, "cpu"))
-    assert len(seeds) == 1
     seed = seeds[0]
     assert seed["block_sizes"] == [4, 1]
     assert seed["num_threads"] == [1, 1, 128]
     assert seed["reduction_loops"] == [512]
     assert seed["cute_reduction_reloads"] == ["register"]
+    # The same seed at four keys per thread (eight would leave threads
+    # without keys in a 512-key chunk); the primary keeps one.
+    assert "cute_vector_widths" not in seed
+    assert [alternate["cute_vector_widths"] for alternate in seeds[1:]] == [[4, 1, 1]]
+    assert {**seeds[1], "cute_vector_widths": None} == {
+        **seed,
+        "cute_vector_widths": None,
+    }
+    # 300 keys fill 300 slots of their 512-key chunk: at four keys per thread
+    # 53 of the 128 threads would get none.
+    assert len(_head_rows_seeds(head_bias(8, 4, 300, "cpu"), keys=300)) == 1
+    # T5's 1024-key rows take both alternates; eight-key packets would not
+    # tile rows of 1500 keys.
+    for keys, widths in ((1024, [[4, 1, 1], [8, 1, 1]]), (1500, [[4, 1, 1]])):
+        alternates = _head_rows_seeds(head_bias(8, 4, keys, "cpu"), keys=keys)[1:]
+        assert [alternate["cute_vector_widths"] for alternate in alternates] == widths
+    # Before sm_100 a lane loads at most 16 bytes whole: eight keys of the
+    # fp32 workspace the second sweep reads back would be 32.
+    alternates = _head_rows_seeds(
+        head_bias(8, 4, 1024, "cpu"), keys=1024, capability=(9, 0)
+    )[1:]
+    assert [alternate["cute_vector_widths"] for alternate in alternates] == [[4, 1, 1]]
     # A keys-innermost bias row is no gather: no seed.
     assert _head_rows_seeds(torch.empty(8, 4, 512)) == []
+
+
+@pytest.mark.parametrize(("keys", "chunk"), [(768, 256), (1536, 512)])
+def test_the_head_rows_chunk_divides_the_row(keys: int, chunk: int) -> None:
+    # A 1024-key chunk leaves the last chunk of these rows masked, and each
+    # lane's bias element of a key a masked scalar load: no packet forms.
+    with _head_rows_bound(head_bias(8, 4, keys, "cpu"), keys=keys) as bound:
+        seed = _jam_seed(bound)
+        assert seed is not None
+        assert seed.config["reduction_loops"] == [chunk]
+        code = bound.to_code(bound.config_spec.normalized_config(seed))
+    assert "for lane_0 in range(4)" not in code
+    assert _bias_packets(code, 4) == 1
+
+
+def test_a_row_divided_only_by_one_key_per_thread_keeps_its_chunk() -> None:
+    # 2176 keys are 17 chunks of 128, one key per thread each: the seed
+    # keeps the 1024-key chunk, its last one masked.
+    with _head_rows_bound(head_bias(8, 4, 2176, "cpu"), keys=2176) as bound:
+        seed = _jam_seed(bound)
+    assert seed is not None
+    assert seed.config["reduction_loops"] == [1024]
 
 
 def _jam_seed(bound: BoundKernel) -> helion.Config | None:
@@ -612,6 +688,22 @@ def test_the_head_rows_seed_reaches_the_search_jammed() -> None:
     # one 16-byte packet.
     assert "for lane_0 in range(4)" not in code
     assert _bias_packets(code, 4) == 1
+
+
+def test_the_head_rows_alternates_reach_the_search() -> None:
+    # The search's transfer keeps each alternate's vector width (T5's
+    # 1024-key rows plant both).
+    with _head_rows_bound(head_bias(8, 4, 1024, "cpu"), keys=1024) as bound:
+        alternates = [
+            seed
+            for seed in bound.config_spec.compiler_seed_configs
+            if seed.config.get("cute_grid_lane_jam")
+            and seed.config.get("cute_vector_widths")
+            and not seed.config.get("cute_scratch_forwarding")
+        ]
+        assert len(alternates) == 2
+        for seed in alternates:
+            _assert_reaches_the_search(bound, seed)
 
 
 def test_twelve_bf16_heads_take_four_lanes() -> None:

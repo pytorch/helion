@@ -342,6 +342,16 @@ def loop_extent(
     return extent.value
 
 
+def is_constexpr_range(loop: ast.AST) -> bool:
+    """Whether ``loop`` is a ``for`` over ``cutlass.range_constexpr``, which
+    the trace unrolls whatever the spelling of its bounds."""
+    return (
+        isinstance(loop, ast.For)
+        and isinstance(loop.iter, ast.Call)
+        and call_path(loop.iter.func) == _LOOP_CALLEES["constexpr"]
+    )
+
+
 def is_vloop(node: ast.AST) -> bool:
     """``for v in cutlass.range_constexpr(<int>)`` with a literal extent."""
     return loop_extent(node, kinds=("constexpr",), minimum=None) is not None
@@ -883,6 +893,8 @@ _PURE_RELOCATABLE_NAMES = frozenset(
         "_cute_python_mod",
         "abs",
         "bool",
+        "cutlass.max",
+        "cutlass.min",
         "float",
         "int",
         "len",
@@ -972,6 +984,7 @@ def _is_proven_relocatable_call(
         return True
     if name.startswith("cutlass."):
         member = name.rsplit(".", 1)[-1]
+        # Type conversions.
         return bool(member) and member[0].isupper()
     if name.startswith(("math.", "cute.math.")):
         return True

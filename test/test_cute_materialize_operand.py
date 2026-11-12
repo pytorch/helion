@@ -758,6 +758,23 @@ def test_int16_cast_producer_loads_vector_packets(lhs: bool) -> None:
     assert "CtaGroup.TWO" in consumer
 
 
+def test_a_materialized_buffer_is_not_a_scratch_tensor() -> None:
+    # Each fission stage compiles a partial host body (``partial_program``):
+    # the producer's materialized buffer is read only by the next stage, so
+    # with ``cute_scratch_forwarding`` its stores, parameter and allocation
+    # must stay (an unread scratch tensor's go).
+    bound = _bind(_int16_bare_cast_rhs, _int16_args((128, 256, 128)))
+    with bound.env:
+        config = _producer_seed(
+            bound, tcgen05_cta_group="two", tcgen05_materialized_pdl=True
+        )
+    forwarding = helion.Config.from_dict(
+        config.config | {"cute_scratch_forwarding": True}
+    )
+    producer, _consumer = _stage_sources(bound.to_code(forwarding))
+    assert "_cute_store_u16_vec(" in producer
+
+
 def test_producer_seed_geometry_is_one_packet_per_thread_in_a_warp_quartet() -> None:
     bound = _bind(_int16_bare_cast_rhs, _int16_args((128, 256, 128)))
     spec = bound.config_spec

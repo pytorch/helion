@@ -81,7 +81,9 @@ reduction's sweep, a serial scan's fallback loop, an inner ``hl.tile`` loop
 of several tiles), which every copy would repeat; the copies the knob asks
 for trace at most ``_MAX_UNROLLED_STATEMENTS`` statements (``_trace_size``).
 A lane loop that a vectorized reduction's cross-lane fold must fully unroll
-skips both checks: it is unrolled in place otherwise (``_force_constexpr``).
+skips the rolled-loop check: a body holding a rolled loop has no statement
+bound then, only the lane bound (loads first when that form applies, in
+place otherwise, ``_force_constexpr``).
 The pass reports whether it fired so the caller can regenerate with the knob
 off when it did not (``LaneUnrollNotApplied`` in ``generate_ast``): the knob
 alone never changes the code.
@@ -102,7 +104,7 @@ from ..ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from ..ast_read_writes import HELION_VEC_LANE_OF_ATTR
 from ..ast_read_writes import ReadWrites
 from ._ast_pass_utils import _is_proven_relocatable_call
-from ._ast_pass_utils import call_path
+from ._ast_pass_utils import is_constexpr_range
 from ._ast_pass_utils import loop_extent
 from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
 from .fuse_two_pass_loads import _range_bounds
@@ -153,7 +155,8 @@ _MAX_UNROLLED_LANES = 64
 # gathered row index) do not count.
 _MAX_LIVE_PACKETS = 16
 # Statements the trace-time copies of a lane body emit (the copies times the
-# ``_trace_size`` of one); the loads-first split shares the bound.  What an
+# ``_trace_size`` of one); the loads-first split and the forced full unroll
+# of a cross-lane fold (``_force_constexpr``) share the bound.  What an
 # element costs varies far more than the element count: the split of a
 # 15-input BatchNorm-inference body (12 gathered per-channel loads and 3 rsqrt
 # per element, 429 statements per 8-element lane) compiled for 7 s at 16
@@ -198,9 +201,7 @@ def _trace_size(
             return None
         if isinstance(statement, ast.For):
             loop_trips = _loop_trips(statement, constexpr_values)
-            if isinstance(statement.iter, ast.Call) and call_path(
-                statement.iter.func
-            ) == ("cutlass", "range_constexpr"):
+            if is_constexpr_range(statement):
                 # A bound read at trace time (``cute.size(...)``) counts once.
                 trips = 1 if loop_trips is None else loop_trips
             elif _is_lane_loop(statement) and loop_trips is not None:
@@ -709,10 +710,14 @@ def _unroll_one(
         or (require_full and _has_lowered_scalar_load(loop))
     ):
         return None
-    # A forced unroll copies the body in place otherwise (``_force_constexpr``).
-    statements = 0 if require_full else _trace_size(loop.body, constexpr_values)
+    statements = _trace_size(loop.body, constexpr_values)
     if statements is None:
-        return None
+        if not require_full:
+            return None
+        # A forced unroll of a body holding a rolled loop has no statements
+        # to bound: only the lane bound applies (loads first when that form
+        # applies, in place otherwise, ``_force_constexpr``).
+        statements = 0
     # V-loops are nested levels unless their copies break the bounds; the
     # plan without them, which keeps a V-loop in place, stands then.  A
     # forced unroll (the cross-lane fold's) runs whatever the knob says, so
@@ -769,7 +774,9 @@ def _drop_lane_attr(loop: ast.For) -> None:
             delattr(node, HELION_LANE_LOOP_VAR_ATTR)
 
 
-def _force_constexpr(loop: ast.For) -> list[ast.stmt]:
+def _force_constexpr(
+    loop: ast.For, constexpr_values: Mapping[str, int] | None
+) -> list[ast.stmt]:
     """Unroll a lane loop at trace time in place, loads where they are.
 
     The fallback of a forced unroll (``forced_full``) when the loads-first
@@ -777,9 +784,15 @@ def _force_constexpr(loop: ast.For) -> list[ast.stmt]:
     ``_MAX_LIVE_PACKETS`` (each fold then re-reads the packets its slice
     needs rather than holding the whole slice live across the folds).  A
     body holding compiler markers is rejected: the passes expanding them
-    match the rolled nest.  So is an extent beyond ``_MAX_UNROLLED_LANES``:
-    the trace-time copies of the lane body (and ptxas's time on them) grow
-    with the lane count, and the loads-first form is bounded the same way.
+    match the rolled nest.  So is an extent beyond ``_MAX_UNROLLED_LANES``
+    or copies tracing more than ``_MAX_UNROLLED_STATEMENTS`` statements: the
+    statements track the trace's (and ptxas's) time, which the elements a
+    body computes do not (the bound's comment has the measurements), and the
+    loads-first forms are bounded the same way.  A body holding a rolled
+    loop has no statement count (``_trace_size``); only the lane bound
+    applies to it.  The count is the body's before ``fold_lane_reductions``
+    splits it into each reduction's slice, which repeats the statements the
+    slices share, so a folded body can trace somewhat past the bound.
     """
     extent = _ascending_range_extent(loop)
     if extent is None or contains_compiler_marker(list(loop.body)):
@@ -793,6 +806,14 @@ def _force_constexpr(loop: ast.For) -> list[ast.stmt]:
             "cute",
             f"lane loop {loop.target.id} walks {extent} packets per thread; "  # type: ignore[union-attr]
             f"the cross-lane fold unrolls at most {_MAX_UNROLLED_LANES}",
+        )
+    size = _trace_size(loop.body, constexpr_values)
+    if size is not None and extent * size > _MAX_UNROLLED_STATEMENTS:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"lane loop {loop.target.id} traces {extent * size} statements "  # type: ignore[union-attr]
+            "unrolled; the cross-lane fold unrolls at most "
+            f"{_MAX_UNROLLED_STATEMENTS}",
         )
     iterator = expr_from_string(f"cutlass.range_constexpr({extent})")
     assert isinstance(iterator, ast.expr)
@@ -835,9 +856,13 @@ def unroll_lane_loads(
                         extent,
                         new_var,
                         require_full=True,
+                        constexpr_values=constexpr_values,
                     )
                     if replacement is None:
-                        replacement = _force_constexpr(stmt)  # type: ignore[arg-type]
+                        replacement = _force_constexpr(
+                            stmt,  # type: ignore[arg-type]
+                            constexpr_values,
+                        )
                     result.extend(replacement)
                     continue
                 if knob > 1:

@@ -1664,28 +1664,32 @@ class DeviceFunction:
         # pointers referenced only by placeholder strings, not the AST body).
         # sourceless_prologue_params are intentionally NOT exempted — they are
         # fully inlined by the prologue hook and should be removed by DCE.
-        args_to_remove = {
-            arg.name
-            for arg in self.arguments
-            # pyrefly: ignore [unbound-name]
-            if arg.name not in rw.reads and arg.name not in self.placeholder_args
-        }
-        if args_to_remove:
-            self.arguments = [
-                arg for arg in self.arguments if arg.name not in args_to_remove
-            ]
-            for cache in cast(
-                "list[dict[object, Argument]]",
-                [
-                    self._tensor_args,
-                    self._tensor_descriptor_args,
-                    self._expr_args,
-                    self._tensor_properties,
-                ],
-            ):
-                for k, v in [*cache.items()]:
-                    if v.name in args_to_remove:
-                        del cache[k]
+        self.drop_arguments(
+            {
+                arg.name
+                for arg in self.arguments
+                # pyrefly: ignore [unbound-name]
+                if arg.name not in rw.reads and arg.name not in self.placeholder_args
+            }
+        )
+
+    def drop_arguments(self, names: set[str]) -> None:
+        """Remove the arguments named ``names`` and their cache entries."""
+        if not names:
+            return
+        self.arguments = [arg for arg in self.arguments if arg.name not in names]
+        for cache in cast(
+            "list[dict[object, Argument]]",
+            [
+                self._tensor_args,
+                self._tensor_descriptor_args,
+                self._expr_args,
+                self._tensor_properties,
+            ],
+        ):
+            for k, v in [*cache.items()]:
+                if v.name in names:
+                    del cache[k]
 
     def register_helper_function(
         self, helper_graph_info: HelperFunctionGraphInfo

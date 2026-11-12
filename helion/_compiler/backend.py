@@ -568,6 +568,20 @@ class Backend(abc.ABC):
         return False
 
     @property
+    def drops_unread_scratch_arguments(self) -> bool:
+        """Whether a kernel-local scratch tensor the finished kernel no longer
+        reads loses its parameter and launcher argument
+        (``scratch_tensors.drop_unused_scratch_arguments``).
+
+        Only a backend whose late passes drop such a tensor's stores needs
+        it.  The removal deletes one positional argument of the launch, so a
+        backend whose launcher keywords hold positions into those arguments
+        (Pallas's output and in-place indices, Metal's by-value list) keeps
+        it off.
+        """
+        return False
+
+    @property
     def dynamo_captures_kernel_launch(self) -> bool:
         """Whether Dynamo may trace a kernel call inline down to its launch.
 

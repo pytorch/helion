@@ -211,6 +211,7 @@ CUTE_MISC_SCHEDULE_KEYS: tuple[str, ...] = (
     "cute_vector_packet_unroll",
     "cute_vloop_sink",
     "cute_grid_lane_jam",
+    "cute_scratch_forwarding",
     "cute_lane_unroll",
     "cute_unpadded_rows",
     "cute_bool_byte_packets",
