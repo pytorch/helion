@@ -36,6 +36,7 @@ from helion._testing import skipIfCute
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfSharedMemoryLessThan
+from helion._testing import skipUnlessGluon
 from helion._testing import slowIfBackends
 import helion.language as hl
 
@@ -385,6 +386,21 @@ def test_deepseek_v3_tp_megakernels_compile() -> None:
             kernel.bind(args).to_triton_code(kernel.configs[0])
     finally:
         dist.destroy_process_group()
+
+
+@skipIfRefEager("tile dependencies are built only in compiled mode")
+@skipIfNotTriton("the gluon tests run in the triton lane")
+@skipUnlessGluon()
+@pytest.mark.parametrize(
+    "name", ["llama32_1b_verify_layer_bf16", "qwen3_verify_layer_bf16"]
+)
+def test_verify_layer_megakernels_generate_code(name: str) -> None:
+    # Their correctness tests are slow-tier; this keeps code generation covered.
+    module = _import_pretuned_kernel_module(name)
+    kernel = getattr(module, name)
+    # Uninitialized inputs: binding and code generation need only shapes.
+    args = module._kernel_args(module._make_inputs(tokens=8, init=False))
+    kernel.bind(args).to_triton_code(kernel.configs[0])
 
 
 @skipIfRefEager("tile dependencies are built only in compiled mode")
@@ -1052,6 +1068,11 @@ _GEOMEAN_NOISE_BAND = 0.10
 # The SM100 megakernels pass backend="triton" to their decorator, so a cute run
 # would repeat the Triton run.
 _PINNED_TO_TRITON = "megakernel is pinned to backend='triton'"
+# The spec-decode verify megakernels pass backend="gluon"; the gluon tests run in
+# the triton lane.
+_PINNED_TO_GLUON = "megakernel is pinned to backend='gluon'"
+# The speculative-decoding windows the verify megakernels are pretuned for.
+_VERIFY_TOKENS = (8, 16)
 
 
 @onlyBackends(["triton", "cute"])
@@ -1255,6 +1276,25 @@ class TestPretunedKernelsCorrectness(TestCase):
         if not module.has_vllm():
             self.skipTest("deepseek_v3_moe_nvfp4 correctness requires vLLM.")
         module.correctness_check()
+
+    @pytest.mark.slow
+    @pytest.mark.timeout(900)
+    @skipIfCute(_PINNED_TO_GLUON)
+    @skipUnlessGluon()
+    def test_llama32_1b_verify_layer_bf16(self):
+        # The FP32 PyTorch reference needs no vLLM.
+        module = _import_pretuned_kernel_module("llama32_1b_verify_layer_bf16")
+        for tokens in _VERIFY_TOKENS:
+            module.correctness_check(tokens)
+
+    @pytest.mark.slow
+    @pytest.mark.timeout(900)
+    @skipIfCute(_PINNED_TO_GLUON)
+    @skipUnlessGluon()
+    def test_qwen3_verify_layer_bf16(self):
+        module = _import_pretuned_kernel_module("qwen3_verify_layer_bf16")
+        for tokens in _VERIFY_TOKENS:
+            module.correctness_check(tokens)
 
 
 @onlyBackends(["cute"])
