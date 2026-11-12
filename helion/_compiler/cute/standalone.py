@@ -125,6 +125,59 @@ class _StructAnnotations(ast.NodeTransformer):
         return node
 
 
+class _JitDefaults(ast.NodeTransformer):
+    """Bind each non-constant default of a ``@cute.jit`` / ``@cute.kernel``
+    helper to a name of its own, defined just before the function.
+
+    Export makes a helper module's globals (``cutlass``, ...) locals of its
+    ``_make_standalone_*`` factory. CuTe DSL re-executes a jit function's
+    definition in a wrapper that sets the function's free variables to
+    ``None``, so a default such as ``io_dtype=cutlass.Float16`` evaluates to
+    ``None.Float16`` there. The DSL supplies the value of a default that is a
+    name it cannot otherwise resolve.
+    """
+
+    def visit_FunctionDef(
+        self, node: ast.FunctionDef
+    ) -> ast.FunctionDef | list[ast.stmt]:
+        self.generic_visit(node)
+        if not any(
+            _decorator_name(decorator) in ("cute.jit", "cute.kernel")
+            for decorator in node.decorator_list
+        ):
+            return node
+        bindings: list[ast.stmt] = []
+
+        def bind(arg: ast.arg, default: ast.expr) -> ast.expr:
+            if isinstance(default, ast.Constant):
+                return default
+            name = f"_{node.name}_default_{arg.arg}"
+            bindings.append(
+                ast.Assign(targets=[ast.Name(id=name, ctx=ast.Store())], value=default)
+            )
+            return ast.Name(id=name, ctx=ast.Load())
+
+        arguments = node.args
+        positional = [*arguments.posonlyargs, *arguments.args]
+        arguments.defaults = list(
+            starmap(
+                bind,
+                zip(
+                    positional[len(positional) - len(arguments.defaults) :],
+                    arguments.defaults,
+                    strict=True,
+                ),
+            )
+        )
+        arguments.kw_defaults = [
+            None if default is None else bind(arg, default)
+            for arg, default in zip(
+                arguments.kwonlyargs, arguments.kw_defaults, strict=True
+            )
+        ]
+        return [*bindings, node]
+
+
 class _Helpers:
     """Copy only the native helper definitions referenced by generated code."""
 
@@ -306,7 +359,7 @@ class _Helpers:
                 body=body,
                 decorator_list=[],
             )
-            result.append(_StructAnnotations().visit(function))
+            result.append(_JitDefaults().visit(_StructAnnotations().visit(function)))
             result.extend(ast.parse(f"{namespace} = _make{namespace}()").body)
         return result
 
