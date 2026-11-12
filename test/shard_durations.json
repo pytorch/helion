@@ -22,6 +22,7 @@
  "test/test_benchmark_worker.py": 0.4,
  "test/test_benchmarking_batched_replay.py": 0.3,
  "test/test_best_available.py": 0.2,
+ "test/test_better_benchmark.py": 0.0,
  "test/test_block_ptr_support.py": 0.0,
  "test/test_bound_kernel.py": 0.1,
  "test/test_breakpoint.py": 0.1,

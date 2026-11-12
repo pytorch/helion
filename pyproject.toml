@@ -237,6 +237,10 @@ project-excludes = [
   "helion/_compiler/cute/_flash_gemm_ptx.py",
   "helion/_compiler/pallas/topk_impl.py",
   "benchmarks/cute/tilegym_attention.py",
+  # Hand ports of better-benchmark repros: Pyrefly cannot type arithmetic on
+  # hl.constexpr kernel arguments (Tensor + ConstExpr, int // ConstExpr) in
+  # the device code; check_port.py checks every port on both backends.
+  "benchmarks/cute/better_benchmark/kernels",
 ]
 python-version = "3.10"
 search-path = ["../pytorch"]
