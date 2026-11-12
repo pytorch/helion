@@ -188,6 +188,7 @@ _BASE_VALID_KEYS = """
     tcgen05_warp_spec_scheduler_warps tcgen05_warp_spec_store_warps waves_per_eu
     xcd_remap
     cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_flash_gated_row_warps cute_pdl_spread cute_split_k_atomic_epilogue tcgen05_epi_round_subtiles
+    cross_loop_tmem_prefetch
 """
 
 # ``BACKEND_SPECIFIC_KEYS``.
@@ -338,6 +339,7 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     tcgen05_warp_spec_scheduler_warps tcgen05_warp_spec_store_warps waves_per_eu
     xcd_remap
     cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_flash_gated_row_warps cute_pdl_spread cute_split_k_atomic_epilogue tcgen05_epi_round_subtiles
+    cross_loop_tmem_prefetch
 """
 
 # ``_CUTE_IMPLICIT_DEFAULT_KEYS``.

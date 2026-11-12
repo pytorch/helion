@@ -881,6 +881,16 @@ class Backend(abc.ABC):
 
         return VALID_CROSS_LOOP_PIPELINES
 
+    def tmem_prefetch_candidates(self, device_ir: DeviceIR) -> list[list[int]]:
+        """The block ids of each K loop ``cross_loop_tmem_prefetch`` may stream
+        into tensor memory (one config entry each), from the device IR and its
+        tile dependency graph.
+
+        Consulted only when the backend supports the
+        ``cross_loop_tmem_prefetch`` config key.
+        """
+        return []
+
     # -- indexing, fake tensors and block-size constraints ---------------------
 
     def supports_block_ptr_indexing(self) -> bool:

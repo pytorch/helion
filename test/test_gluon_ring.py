@@ -350,6 +350,23 @@ def mm_after_flag(x: torch.Tensor, y: torch.Tensor, flag: torch.Tensor) -> torch
 
 
 @helion.kernel(static_shapes=True, backend="gluon")
+def scale_then_wx(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """Weight rows as the MMA's M (swap-AB) over the first root's output."""
+    m, k = x.size()
+    n = w.size(0)
+    y = torch.empty_like(x)
+    out = torch.empty([n, m], dtype=torch.float32, device=x.device)
+    for tile_r, tile_c in hl.tile([m, k]):
+        y[tile_r, tile_c] = x[tile_r, tile_c] * 2
+    for tile_n, tile_m in hl.tile([n, m]):
+        acc = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(w[tile_n, tile_k], y[tile_m, tile_k].T, acc=acc)
+        out[tile_n, tile_m] = acc
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
 def scale_then_w13x(
     x: torch.Tensor, w1: torch.Tensor, w3: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -370,6 +387,64 @@ def scale_then_w13x(
         out1[tile_n, tile_m] = acc1
         out3[tile_n, tile_m] = acc3
     return out1, out3
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def scale_then_ewx(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """``scale_then_wx`` with the second weight of a stack ([e, n, k])."""
+    m, k = x.size()
+    n = w.size(1)
+    y = torch.empty_like(x)
+    out = torch.empty([n, m], dtype=torch.float32, device=x.device)
+    for tile_r, tile_c in hl.tile([m, k]):
+        y[tile_r, tile_c] = x[tile_r, tile_c] * 2
+    for tile_n, tile_m in hl.tile([n, m]):
+        acc = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(w[1, tile_n, tile_k], y[tile_m, tile_k].T, acc=acc)
+        out[tile_n, tile_m] = acc
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def scale_then_wtx(x: torch.Tensor, wt: torch.Tensor) -> torch.Tensor:
+    """``scale_then_wx`` with the weight stored transposed ([k, n])."""
+    m, k = x.size()
+    n = wt.size(1)
+    y = torch.empty_like(x)
+    out = torch.empty([n, m], dtype=torch.float32, device=x.device)
+    for tile_r, tile_c in hl.tile([m, k]):
+        y[tile_r, tile_c] = x[tile_r, tile_c] * 2
+    for tile_n, tile_m in hl.tile([n, m]):
+        acc = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(wt[tile_k, tile_n].T, y[tile_m, tile_k].T, acc=acc)
+        out[tile_n, tile_m] = acc
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def scale_then_nested_wx(
+    x: torch.Tensor, w: torch.Tensor, v: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``scale_then_wx`` with a second K loop, over ``v``, in the first's body."""
+    m, k = x.size()
+    n = w.size(0)
+    y = torch.empty_like(x)
+    out = torch.empty([n, m], dtype=torch.float32, device=x.device)
+    inner_out = torch.empty([n, m], dtype=torch.float32, device=x.device)
+    for tile_r, tile_c in hl.tile([m, k]):
+        y[tile_r, tile_c] = x[tile_r, tile_c] * 2
+    for tile_n, tile_m in hl.tile([n, m]):
+        acc = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(w[tile_n, tile_k], y[tile_m, tile_k].T, acc=acc)
+            inner = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+            for tile_j in hl.tile(k):
+                inner = hl.dot(v[tile_n, tile_j], y[tile_m, tile_j].T, acc=inner)
+            inner_out[tile_n, tile_m] = inner
+        out[tile_n, tile_m] = acc
+    return out, inner_out
 
 
 @helion.kernel(static_shapes=True, backend="gluon")
@@ -1014,6 +1089,118 @@ class TestGluonRing(TestCase):
         reference = bound.compile_config(helion.Config(**{**base, "num_stages": 1}))
         for launch, out in zip(inputs, results, strict=True):
             torch.testing.assert_close(out, reference(*launch), atol=0, rtol=0)
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_cross_loop_tmem_prefetch(self) -> None:
+        """A K loop behind its task's gate whose weight (operand A) streams
+        ungated takes a tail (``cross_loop_tmem_prefetch``, an entry per such
+        loop): fill steps ahead of the loop copy its last steps' tiles into the
+        tensor memory the accumulators leave, and those steps read A there."""
+        x = torch.randn([32, 1024], device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn([256, 1024], device=DEVICE, dtype=torch.bfloat16)
+        bound = scale_then_wx.bind((x, w))
+        self.assertEqual(len(bound.config_spec.cross_loop_tmem_prefetch), 1)
+        slots = len(bound.config_spec.range_warp_specialize)
+        ring = {
+            **RING,
+            "block_sizes": [32, 64, 128, 32, 64],
+            "range_warp_specializes": [None] * (slots - 1) + [True],
+            "cross_loop_pipeline": "static",
+            "num_warps": 4,
+            "num_stages": 4,
+        }
+        code, out = code_and_output(
+            scale_then_wx, (x, w), **ring, cross_loop_tmem_prefetch=[True]
+        )
+        plain, reference = code_and_output(scale_then_wx, (x, w), **ring)
+        self.assertNotIn("tail_fill(", plain)
+        torch.testing.assert_close(out, reference, atol=0, rtol=0)
+        functions = _functions(code)
+        mma = functions["_helion_scale_then_wx_mma"]
+        self.assertEqual(mma.count("tail_fill("), 1)
+        self.assertIn("TAIL=_helion_ring_tail0", mma)
+        # 14 of the 16 steps: 448 columns beside the 64 of the accumulator ring.
+        self.assertIn("tail_buffers(w_ring_desc, 14, 128, 64)", code)
+        # Three CTAs an SM allocate 128 columns each (a power of two): 2 steps.
+        self.assertIn(
+            "tail_buffers(w_ring_desc, 2, 128, 64)",
+            bound.to_triton_code(
+                helion.Config(
+                    **{**ring, "num_sm_multiplier": 3}, cross_loop_tmem_prefetch=[True]
+                )
+            ),
+        )
+        # The gated producer skips the fill steps ahead of its dependency wait.
+        gated = functions["_helion_scale_then_wx_producer1"]
+        self.assertLess(gated.index("ring_skip("), gated.index("ld.acquire"))
+        # More tasks than workers: a worker refills the tiles its last task
+        # read, behind ring steps (14 of 16 steps) and with no ring step at all,
+        # the tail shallower than the ring (2 of 2).
+        sms = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+        many = torch.randn([(sms + 4) * 128, 1024], device=DEVICE, dtype=torch.bfloat16)
+        for k, tiles in ((1024, 14), (128, 2)):
+            args = (x[:, :k], many[:, :k])
+            code, out_many = code_and_output(
+                scale_then_wx, args, **ring, cross_loop_tmem_prefetch=[True]
+            )
+            _, ref_many = code_and_output(scale_then_wx, args, **ring)
+            self.assertIn(f"tail_buffers(w_ring_desc, {tiles}, 128, 64)", code)
+            torch.testing.assert_close(out_many, ref_many, atol=0, rtol=0)
+        # One weight of a stack ([e, n, k]): boxes with a unit leading dim.
+        stacked = torch.stack([torch.randn_like(w), w])
+        code, out = code_and_output(
+            scale_then_ewx, (x, stacked), **ring, cross_loop_tmem_prefetch=[True]
+        )
+        self.assertIn("tail_buffers(w_ring_desc, 14, 128, 64)", code)
+        torch.testing.assert_close(out, reference, atol=0, rtol=0)
+        # A 64-row weight tile takes no tail, and says why.
+        with self.assertLogs("helion._compiler.triton.gluon_ring", "INFO") as logs:
+            bound.to_triton_code(
+                helion.Config(
+                    **{**ring, "block_sizes": [32, 64, 64, 32, 64]},
+                    cross_loop_tmem_prefetch=[True],
+                )
+            )
+        self.assertIn("tensor memory takes 128 rows", "\n".join(logs.output))
+        # Two weights of one shape in one loop: the first dot takes the tail.
+        w3 = torch.randn_like(w)
+        code, outs = code_and_output(
+            scale_then_w13x, (x, w, w3), **ring, cross_loop_tmem_prefetch=[True]
+        )
+        _, references = code_and_output(scale_then_w13x, (x, w, w3), **ring)
+        self.assertEqual(code.count("tail_fill("), 1)
+        for got, expected in zip(outs, references, strict=True):
+            torch.testing.assert_close(got, expected, atol=0, rtol=0)
+        # A view of a load (the weight stored transposed) is no candidate.
+        with self.assertLogs("helion._compiler.triton.gluon_ring", "INFO") as logs:
+            transposed = scale_then_wtx.bind((x, w.T.contiguous()))
+        self.assertEqual(len(transposed.config_spec.cross_loop_tmem_prefetch), 0)
+        self.assertIn("operand A is no load", "\n".join(logs.output))
+        # A K loop inside another's body: both take a tail of one buffer only if
+        # the inner loop's refill cannot overwrite the outer loop's tiles, so
+        # the inner one takes none.
+        v = torch.randn_like(w)
+        nested = scale_then_nested_wx.bind((x, w, v))
+        task_loop = [None] * len(nested.config_spec.range_warp_specialize)
+        task_loop[1] = True
+        nested_ring = {
+            **ring,
+            "block_sizes": [32, 64, 128, 32, 64, 64],
+            "range_warp_specializes": task_loop,
+        }
+        with self.assertLogs("helion._compiler.triton.gluon_ring", "INFO") as logs:
+            code, outs = code_and_output(
+                scale_then_nested_wx,
+                (x, w, v),
+                **nested_ring,
+                cross_loop_tmem_prefetch=[True, True],
+            )
+        self.assertIn("loop 5: nested with loop 4", "\n".join(logs.output))
+        self.assertEqual(code.count("tail_fill("), 1)
+        _, references = code_and_output(scale_then_nested_wx, (x, w, v), **nested_ring)
+        for got, expected in zip(outs, references, strict=True):
+            torch.testing.assert_close(got, expected, atol=0, rtol=0)
 
     @skipIfRefEager("checks generated code")
     @skipUnlessGluon()

@@ -22,6 +22,10 @@ from typing import cast
 import torch
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+from triton.experimental.gluon.language.nvidia.blackwell import TensorMemoryLayout
+from triton.experimental.gluon.language.nvidia.blackwell import allocate_tensor_memory
+from triton.experimental.gluon.language.nvidia.blackwell import tcgen05_commit
+from triton.experimental.gluon.language.nvidia.blackwell import tcgen05_copy
 from triton.experimental.gluon.language.nvidia.hopper import fence_async_shared
 from triton.experimental.gluon.language.nvidia.hopper import mbarrier
 from triton.experimental.gluon.language.nvidia.hopper import tma
@@ -30,6 +34,8 @@ from triton.runtime.jit import JITFunction
 
 from ..._compat import torch_dtype_to_tl
 from ...autotuner.config_spec import ring_depth
+from ...language import memory_ops
+from ...language._tracing_ops import _for_loop
 from ...language.matmul_ops import dot_scaled
 from ..ast_extension import clone_ast
 from ..ast_extension import create
@@ -56,7 +62,10 @@ from ..cross_loop_codegen import _written_allocations
 from ..cross_loop_codegen import peer_state
 from ..device_function import RingFallback
 from ..device_ir import ForLoopGraphInfo
+from ..device_ir import ReductionLoopGraphInfo
+from ..device_ir import control_flow_parent_entries
 from ..device_ir import control_flow_parent_ids
+from ..device_ir_analysis import matmul_operand_positions
 from ..emitter_protocols import RetryPolicy
 from ..host_function import HostFunction
 from ..indexing_strategy import BlockedSubscriptIndexing
@@ -79,10 +88,12 @@ if TYPE_CHECKING:
     from ..device_function import DeviceFunction
     from ..device_function import SyncRole
     from ..device_function import TensorDescriptorArg
+    from ..device_ir import DeviceIR
     from ..generate_ast import GenerateAST
     from ..indexing_strategy import IndexingStrategy
     from ..inductor_lowering import CodegenState
     from ..inductor_lowering import GraphInterpreter
+    from ..tile_dependency import TileDependencyGraph
 
 log = logging.getLogger(__name__)
 
@@ -163,9 +174,13 @@ def ring_acquire(
     BOX: gl.constexpr,
     TAGGED=None,
     WAIT: gl.constexpr = True,  # pyrefly: ignore [bad-function-definition]
+    HEAD=True,
 ):
     """Consumer side of a ring load (the producer's ``ring_put`` arguments): the
-    step's filled slot; only a partition's first acquire of a step waits."""
+    step's filled slot; only a partition's first acquire of a step waits.
+    ``HEAD`` is the put's alone: the body's acquire carries it for the producer
+    sliced from the body (``_Slice``), and a tail step's slot is waited on all
+    the same (its producer arrives on it)."""
     s = step % S
     if WAIT:
         mbarrier.wait(full.index(s), (step // S) & 1)
@@ -184,15 +199,22 @@ def ring_put(
     FIRST: gl.constexpr,
     NBYTES: gl.constexpr,
     BOX: gl.constexpr,
+    HEAD=True,
 ):
     """Producer side: ``FIRST`` (the group's first operand of the step) waits for
-    the slot and arrives on the full barrier expecting the group's ``NBYTES``."""
+    the slot and arrives on the full barrier expecting the group's ``NBYTES``.
+    Past ``HEAD`` (a tail step, its tile in tensor memory) it loads nothing and
+    only arrives."""
     s = step % S
     if FIRST:
         mbarrier.wait(empty.index(s), ((step // S) & 1) ^ 1)
-        mbarrier.expect(full.index(s), NBYTES)
-    slot = ring_index(ring, s, S, BOX)  # pyrefly: ignore [bad-argument-count]
-    tma.async_load(desc, coords, full.index(s), slot)  # pyrefly: ignore [missing-attribute]
+        if HEAD:
+            mbarrier.expect(full.index(s), NBYTES)
+        else:
+            mbarrier.arrive(full.index(s))
+    if HEAD:
+        slot = ring_index(ring, s, S, BOX)  # pyrefly: ignore [bad-argument-count]
+        tma.async_load(desc, coords, full.index(s), slot)  # pyrefly: ignore [missing-attribute]
 
 
 @gluon.constexpr_function
@@ -395,13 +417,14 @@ def ring_put_paced(
     run,
     fill,
     K: gl.constexpr,
+    HEAD=True,
 ):
     """``ring_put`` of the weight producer's paced first fill beside gated producers
     (``fill``): a step of the run lands on a pace barrier and issues once the step K
-    back landed, forwarding that arrival to its full barrier.  Returns
-    ``(paced, run)``."""
+    back landed, forwarding that arrival to its full barrier.  A tail step (not
+    ``HEAD``) ends the run.  Returns ``(paced, run)``."""
     s = step % S
-    lead = (step < S - 1) & fill
+    lead = (step < S - 1) & fill & HEAD
     if FIRST:
         if lead:
             _pace_forward(full, pace, step, S, paced, run, K, False)  # pyrefly: ignore [bad-argument-count, bad-argument-type]
@@ -416,8 +439,12 @@ def ring_put_paced(
         tma.async_load(desc, coords, pace.index(n % K), slot)  # pyrefly: ignore [missing-attribute]
     else:
         if FIRST:
-            mbarrier.expect(full.index(s), NBYTES)
-        tma.async_load(desc, coords, full.index(s), slot)  # pyrefly: ignore [missing-attribute]
+            if HEAD:
+                mbarrier.expect(full.index(s), NBYTES)
+            else:
+                mbarrier.arrive(full.index(s))
+        if HEAD:
+            tma.async_load(desc, coords, full.index(s), slot)  # pyrefly: ignore [missing-attribute]
     if FIRST:
         if lead:
             paced = paced + 1
@@ -441,6 +468,34 @@ def ring_skip(full, empty, step, S: gl.constexpr, NBYTES: gl.constexpr):
     s = step % S
     mbarrier.wait(empty.index(s), ((step // S) & 1) ^ 1)
     mbarrier.arrive(full.index(s))
+
+
+# A tail (``cross_loop_tmem_prefetch``): a K loop's last steps read operand A from
+# tensor memory, filled through the ring's slots by steps of their own.
+
+
+@gluon.jit
+def tail_buffers(desc, B: gl.constexpr, ROWS: gl.constexpr, COLS: gl.constexpr):
+    """``B`` tensor-memory tiles of ``desc``'s 16-bit [``ROWS``, ``COLS``] boxes
+    (any leading unit dims dropped), two to a column."""
+    layout: gl.constexpr = TensorMemoryLayout([ROWS, COLS], col_stride=1)  # pyrefly: ignore [bad-argument-type, bad-assignment]
+    return allocate_tensor_memory(desc.dtype, [B, ROWS, COLS], layout)
+
+
+@gluon.jit
+def tail_fill(slot, empty, step, S: gl.constexpr, tiles, index):
+    """MMA side of a fill step: its slot into tile ``index`` (``tcgen05.cp``),
+    freeing the slot.  The MMAs reading the tile before and after need no wait:
+    an MMA's A read and a copy's write issued by one warp access tensor memory in
+    issue order, both ways (PTX ISA 9.7.18.6.2, "Pipelined tcgen05 Instructions":
+    mma A reads -> cp writes, and cp writes -> mma A reads)."""
+    ROWS: gl.constexpr = tiles.shape[1]
+    WORDS: gl.constexpr = tiles.shape[2] // 2
+    words = reinterpret(slot, gl.uint32, [ROWS, WORDS], _word_slots(slot.layout))  # pyrefly: ignore [bad-argument-count]
+    layout: gl.constexpr = TensorMemoryLayout([ROWS, WORDS], col_stride=1)  # pyrefly: ignore [bad-argument-type, bad-assignment]
+    tile = reinterpret(tiles.index(index), gl.uint32, [ROWS, WORDS], layout)  # pyrefly: ignore [bad-argument-count]
+    tcgen05_copy(words, tile)
+    tcgen05_commit(empty.index(step % S))
 
 
 @gluon.jit
@@ -485,6 +540,7 @@ def task_put(tasks, full, empty, step, S: gl.constexpr, ticket):
 # ---- the lowering ------------------------------------------------------------
 
 _DEPTH = "_helion_ring_S"
+_TAIL_KEY = "cross_loop_tmem_prefetch"
 # Gating groups, one producer each: weights stream ungated; activations earlier
 # roots write stream after the body's waits.
 _UNGATED, _GATED = 0, 1
@@ -507,7 +563,9 @@ def _tmem_columns(tiles: list[tuple[int, int]]) -> int:
 
 # Calls of a dot's MMA side: on its channels, and on its accumulator ring.
 _ACC_CALLS = frozenset(["acc_claim", "acc_commit"])
-_MMA_CALLS = frozenset(["ring_acquire", "tmem_dot", "tmem_dot_scaled"]) | _ACC_CALLS
+_MMA_CALLS = (
+    frozenset(["ring_acquire", "tmem_dot", "tmem_dot_scaled", "tail_fill"]) | _ACC_CALLS
+)
 
 
 # Worker register budgets: default, floors (producers, MMA side); one warp's: the minimum.
@@ -657,6 +715,21 @@ class _Site:
         return (self.slot_type[0], *self.slot_type[1][-2:])
 
 
+@dataclasses.dataclass(eq=False)
+class _Tail:
+    """A K loop whose last steps read operand A (an ungated slot) from tensor
+    memory (``cross_loop_tmem_prefetch``): A's load (its site's key), the slot
+    its acquire names (the body is rewritten after codegen: names identify), and
+    the loop's offsets (``start`` + i * ``stride``, ``trip`` steps)."""
+
+    load: torch.fx.Node
+    slot: str
+    start: int
+    stride: int
+    trip: int
+    block_id: int
+
+
 class RingLowering:
     """Per-kernel ring state: the sites found while lowering the body, and the ring
     kernel built around the body."""
@@ -665,13 +738,14 @@ class RingLowering:
         self.device_function = device_function
         self.depth = ring_depth(device_function.config.config, "gluon")
         # By load node, or (load, dot) for a deferred operand's slot of a dot.
+        # A tail's fill step is a dot of its own, keyed by its _Tail.
         self.sites: dict[object, _Site] = {}
-        self.dots: dict[torch.fx.Node, int] = {}
+        self.dots: dict[torch.fx.Node | _Tail, int] = {}
         # Dots with a slot acquired that have not issued yet (their step is
         # open), in acquire order.
         self.open: dict[torch.fx.Node, None] = {}
         # Per ring dot: whether it issues from the MMA partition.
-        self.mma: dict[torch.fx.Node, bool] = {}
+        self.mma: dict[torch.fx.Node | _Tail, bool] = {}
         # (shape, ordinal in its task) -> accumulator ring; each dot's root.
         self.acc_rings: dict[tuple[tuple[int, ...], int], int] = {}
         self.dot_roots: dict[torch.fx.Node, int | None] = {}
@@ -679,12 +753,19 @@ class RingLowering:
         self.acc_keys: dict[torch.fx.Node, tuple[tuple[int, ...], int]] = {}
         # The MMA partition stores scales from registers (4-warp layouts).
         self.mma_tensors = False
-        # Tensor memory of the dots outside the ring, (rows, columns) each.
+        # Tensor memory of the dots outside the ring, (rows, columns) each, and
+        # at most what the block scales take (only tails count it).
         self.tmem: list[tuple[int, int]] = []
+        self.scale_tmem: list[tuple[int, int]] = []
         # An operand of several dots (each acquires its own slot), by name.
         self.deferred: dict[
             str, tuple[torch.fx.Node, torch.Tensor, BlockedSubscriptIndexing, int, bool]
         ] = {}
+        # Each site's last acquired slot; the tails, and the emitted tails'
+        # loops (their block ids).
+        self.acquires: dict[object, str] = {}
+        self.tails: list[_Tail] = []
+        self.tail_loops: dict[ast.For, int] = {}
 
     # -- the body: ring sites and their consumers
 
@@ -926,6 +1007,7 @@ class RingLowering:
                 f"{'' if tagged is None else f', {tagged[0]}'})"
             )
         )
+        self.acquires[node] = slot
         return slot, descriptor
 
     def codegen_node(self, interp: GraphInterpreter, node: torch.fx.Node) -> object:
@@ -970,7 +1052,9 @@ class RingLowering:
             peers = [
                 n
                 for n, m in self.mma.items()
-                if m and self.dot_roots.get(n) == self.dot_roots[node]
+                if m
+                and isinstance(n, torch.fx.Node)
+                and self.dot_roots.get(n) == self.dot_roots[node]
             ]
             shapes = [gluon_ops.concrete(n.meta["val"].shape)[-2:] for n in peers]
             key = (tuple(shape), shapes.count(shape))
@@ -992,6 +1076,8 @@ class RingLowering:
             )
         # The step's groups share its channel's slot: one commit frees it.
         empty, step = (_link(dot_index, groups[0], name) for name in ("empty", "step"))
+        if (tail := self._tail(interp, node, dot_index)) is not None:
+            self.tails.append(tail)
         return gluon_ops.codegen_tmem_dot(interp, node, (empty, step, _DEPTH), ring)
 
     def _live_together(self, a: torch.fx.Node, b: torch.fx.Node) -> bool:
@@ -1016,6 +1102,72 @@ class RingLowering:
 
         chain_a, chain_b = graphs(a), graphs(b)
         return carrier(chain_a) in chain_b or carrier(chain_b) in chain_a
+
+    def _tail(
+        self, interp: GraphInterpreter, node: torch.fx.Node, dot_index: int
+    ) -> _Tail | None:
+        """The tail of a dot whose loop ``cross_loop_tmem_prefetch`` enables, else
+        None; logs why an enabled loop takes none."""
+        df = self.device_function
+        env = CompileEnvironment.current()
+        info = gluon_ops._graph_info(df, node.graph)
+        spec = env.config_spec.cross_loop_tmem_prefetch
+        block_ids = info.block_ids if isinstance(info, ForLoopGraphInfo) else []
+        if len(block_ids) != 1 or block_ids[0] not in spec.valid_block_ids():
+            return None
+        (block_id,) = block_ids
+        enabled = cast("list[bool]", df.config.config.get(_TAIL_KEY, []))
+        if not spec.config_get(enabled, block_id, False):
+            return None
+        graph = HostFunction.current().device_ir.tile_dependency_graph
+        assert graph is not None
+        if _tail_dot(cast("ForLoopGraphInfo", info), graph, False) is not node:
+            return None
+        load = cast(
+            "torch.fx.Node", node.args[matmul_operand_positions()[node.target][0]]
+        )
+        site = self.sites.get(load)
+        reason = None
+        box = site.slot_type[1] if site is not None else ()
+        if not self.mma[node]:
+            reason = "its dot issues from the body"
+        elif site is None or site.dot != dot_index:
+            reason = "operand A is no slot of its dot's step"
+        elif site.tagged or not site.slot_type[2] or site.descriptor.permutation:
+            reason = "operand A's slot is tagged, unswizzled or permuted"
+        elif [
+            s for s in self.sites.values() if (s.dot, s.group) == (site.dot, site.group)
+        ] != [site]:
+            reason = "another operand streams beside A in its producer's step"
+        elif (
+            any(d != 1 for d in box[:-2])
+            or box[-2] != _B200.TMEM_LANES
+            or (box[-1] * site.slot_type[0].itemsize < 128)
+        ):
+            reason = (
+                f"operand A's {list(box)} tiles: tensor memory takes 128 rows of "
+                "128 bytes or more"
+            )
+        if reason is not None:
+            log.info("%s: loop %d: %s", _TAIL_KEY, block_id, reason)
+            return None
+        parent, _ = control_flow_parent_entries(df.graph_infos())[info.graph_id]
+        if parent.target is not _for_loop:
+            log.info("%s: loop %d: a stepped loop", _TAIL_KEY, block_id)
+            return None
+        (start,), (end,) = cast("tuple[list[object], list[object]]", parent.args[1:3])
+        if not isinstance(start, int) or not isinstance(end, int):
+            log.info("%s: loop %d: bounds unknown at compile time", _TAIL_KEY, block_id)
+            return None
+        stride = cast("int", env.block_sizes[block_id].from_config_assert(df.config))
+        return _Tail(
+            load,
+            self.acquires[load],
+            start,
+            stride,
+            -(-(end - start) // stride),
+            block_id,
+        )
 
     def _tmem_left(self, *rings: tuple[int, ...]) -> int:
         """Tensor-memory columns the accumulator rings (and ``rings`` more) and the
@@ -1066,14 +1218,218 @@ class RingLowering:
         own = {graph.accesses[i].root for i in node.meta[TILE_ACCESS_META]}  # pyrefly: ignore [missing-attribute]
         return _UNGATED if not writers else None if writers & own else _GATED
 
+    # -- tails: a K loop's last steps' operand A in tensor memory
+
+    def _emit_tails(
+        self, body: ast.FunctionDef
+    ) -> list[tuple[str, str, int, int, int]]:
+        """Give the tails the tensor memory the accumulators leave a CTA, a buffer
+        of tiles per tile shape, in program order (a fill follows the loop that
+        last read its buffer: ``_emit_tail``); returns the buffers (name,
+        descriptor, tiles, a tile's rows and columns)."""
+        # A CTA's allocation is a power of two columns.
+        ctas = self.device_function.config.num_sm_multiplier
+        share = 1 << ((_TMEM_COLUMNS // ctas).bit_length() - 1)
+        left = self._tmem_left() - _tmem_columns(self.scale_tmem)
+        left -= _TMEM_COLUMNS - share
+        shapes: dict[tuple[object, ...], list[_Tail]] = {}
+        for tail in self.tails:
+            shapes.setdefault(self.sites[tail.load].tile, []).append(tail)
+        buffers: list[tuple[str, str, int, int, int]] = []
+        for tails in shapes.values():
+            site = self.sites[tails[0].load]
+            dtype, rows, cols = cast("tuple[torch.dtype, int, int]", site.tile)
+            tile = _tmem_columns([(rows, cols * dtype.itemsize // 4)])
+            tiles = min(max(t.trip for t in tails), left // tile)
+            if tiles < 1:
+                for tail in tails:
+                    log.info(
+                        "%s: loop %d: %d tensor-memory columns left, a tile takes %d",
+                        _TAIL_KEY,
+                        tail.block_id,
+                        left,
+                        tile,
+                    )
+                continue
+            buffer = f"_helion_ring_tail{len(buffers)}"
+            emitted = [
+                min(tiles, tail.trip)
+                for tail in tails
+                if self._emit_tail(body, tail, min(tiles, tail.trip), buffer)
+            ]
+            if emitted:
+                left -= max(emitted) * tile
+                buffers.append((buffer, site.descriptor.name, max(emitted), rows, cols))
+        return buffers
+
+    def _emit_tail(
+        self, body: ast.FunctionDef, tail: _Tail, tiles: int, buffer: str
+    ) -> bool:
+        """The loop's last ``tiles`` steps read A from ``buffer``: ring steps of
+        their own fill it (A's producer loads the tiles through the slots, the
+        other producers skip, the MMA partition copies each into tensor memory),
+        and in the loop A's producer only arrives on those steps.  The fill goes
+        ahead of the task's dependency waits, so the gated producers skip its
+        steps and the tiles stream while the task waits."""
+        site = self.sites[tail.load]
+        # The loop and statement acquiring the slot, and the MMA reading it.
+        loop, at = next(
+            (s, i)
+            for b in _blocks(body)
+            for s in b
+            if isinstance(s, ast.For)
+            for i, st in enumerate(s.body)
+            if isinstance(st, ast.Assign) and tail.slot in _stored_names([st])
+        )
+        # A loop nested with another tail's (either inside the other) would refill
+        # tiles the outer loop's tail steps still read, or its buffer's.
+        nested = [
+            block_id
+            for other, block_id in self.tail_loops.items()
+            if other in ast.walk(loop) or loop in ast.walk(other)
+        ]
+        if nested:
+            log.info(
+                "%s: loop %d: nested with loop %d, which has a tail",
+                _TAIL_KEY,
+                tail.block_id,
+                nested[0],
+            )
+            return False
+        var = cast("ast.Name", loop.target).id
+        acquire = _ring_call(loop.body[at], "ring_acquire")
+        assert acquire is not None
+        (mma,) = [
+            c for c in _ring_calls(loop, "tmem_dot") if tail.slot in _names(c.args[0])
+        ]
+        coordinates = _slice(loop.body[:at], _names(_arg(acquire, "coords")))
+        if any(
+            _is_load(c) or _may_write(c) or _is_tl_call(c, None, _MODULES)
+            for c in (n for st in coordinates for n in ast.walk(st))
+            if isinstance(c, ast.Call)
+        ):
+            log.info("%s: loop %d: A's coordinates load", _TAIL_KEY, tail.block_id)
+            return False
+        # What the fill steps read, the acquire's coordinates included: from
+        # before the loop, as the fill runs ahead of it, so nothing the loop
+        # updates (a carried value would be its initial one) but the channel
+        # state the fill steps take their own of.
+        steps = [*coordinates, loop.body[at]]
+        reads = _free_names(steps) - {var}
+        fill = len(self.dots)
+        links = {
+            _link(site.dot, site.group, n): _link(fill, site.group, n)
+            for n in ("full", "empty", "step", "bytes")
+        }
+        if carried := (reads - links.keys()) & _stored_names(loop.body):
+            log.info(
+                "%s: loop %d: A's coordinates read %s, which the loop updates",
+                _TAIL_KEY,
+                tail.block_id,
+                ", ".join(sorted(carried)),
+            )
+            return False
+        if (where := self._fill_point(body, loop, reads, buffer)) is None:
+            return False
+        block, point = where
+        log.info(
+            "%s: loop %d: %d of %d steps", _TAIL_KEY, tail.block_id, tiles, tail.trip
+        )
+        split = tail.start + (tail.trip - tiles) * tail.stride
+        stop = tail.start + tail.trip * tail.stride
+        index = f"({var} - {split}) // {tail.stride}"
+        self.dots[tail] = fill
+        self.mma[tail] = True
+        self.sites[tail] = filled = dataclasses.replace(
+            site, dot=fill, name=f"_helion_ring_site{len(self.sites)}"
+        )
+        slot = self.device_function.new_var("ring_tail_slot")
+        step = cast(
+            "ast.Assign",
+            ast_rename(
+                cast("ast.stmt", clone_ast(loop.body[at])),
+                {
+                    tail.slot: slot,
+                    site.name: filled.name,
+                    f"{site.name}_box": f"{filled.name}_box",
+                    **links,
+                },
+            ),
+        )
+        empty, counter = (_link(fill, site.group, n) for n in ("empty", "step"))
+        filling = create(
+            ast.For,
+            target=create(ast.Name, id=var, ctx=ast.Store()),
+            iter=expr_from_string(f"tl.range({split}, {stop}, {tail.stride})"),
+            body=[
+                *(cast("ast.stmt", clone_ast(st)) for st in coordinates),
+                step,
+                statement_from_string(
+                    f"{ALIAS}.tail_fill({slot}, {empty}, {counter}, {_DEPTH}, "
+                    f"{buffer}, {index})"
+                ),
+                statement_from_string(f"{counter} = {counter} + 1"),
+            ],
+            orelse=[],
+            type_comment=None,
+        )
+        block.insert(point, filling)
+        self.tail_loops[loop] = tail.block_id
+        acquire.keywords.append(
+            create(ast.keyword, arg="HEAD", value=expr_from_string(f"{var} < {split}"))
+        )
+        mma.keywords += [
+            create(ast.keyword, arg="TAIL", value=_name(buffer)),
+            create(ast.keyword, arg="TAIL_INDEX", value=expr_from_string(index)),
+        ]
+        return True
+
+    def _fill_point(
+        self,
+        body: ast.FunctionDef,
+        loop: ast.For,
+        reads: set[str],
+        buffer: str,
+    ) -> tuple[list[ast.stmt], int] | None:
+        """Where a tail's fill goes: in the loop's block, past the last statement
+        reading ``buffer`` (an earlier tail's loop) and those defining the names
+        the fill ``reads``, ahead of the first dependency wait; None (logged) if
+        a wait comes first."""
+        waits = self.device_function.sync_names("wait")
+
+        def waiting(statements: list[ast.stmt]) -> bool:
+            return bool(_stored_names(statements) & waits)
+
+        path = _path(body.body, loop)
+        # No wait may precede the loop's block within the task (the innermost
+        # loop around it).
+        for block, index in reversed(path[:-1]):
+            if isinstance(block[index], (ast.For, ast.While)):
+                break
+            if waiting(block[:index]):
+                log.info("%s: a dependency wait precedes the loop's block", _TAIL_KEY)
+                return None
+        block, at = path[-1]
+        low = max((i + 1 for i in range(at) if buffer in _names(block[i])), default=0)
+        defined = max(
+            (i + 1 for i in range(at) if _stored_names([block[i]]) & reads),
+            default=0,
+        )
+        point = next((i for i in range(low, at) if waiting([block[i]])), at)
+        if defined > point:
+            log.info("%s: A's coordinates follow a dependency wait", _TAIL_KEY)
+            return None
+        return block, point
+
     # -- the ring kernel
 
     def emit(self, body: ast.FunctionDef) -> list[ast.stmt]:
         """The partitions and the ring kernel launching them."""
         name, arguments = body.name, [a.arg for a in body.args.args]
+        df = self.device_function
+        tails = self._emit_tails(body)
         # A channel carries the steps of one issuing partition; a group without
         # operands in a step arrives from its skip.
-        df = self.device_function
         issuer = {index: self.mma[node] for node, index in self.dots.items()}
         channels: dict[bool, int] = {}
         group_puts: dict[int, set[str]] = {}
@@ -1249,6 +1605,7 @@ class RingLowering:
             *(buffer for buffer, _, _ in buffers),
             *(view for view, *_ in views),
             *(n for acc in accs for n in acc[:3]),
+            *(tail[0] for tail in tails),
             *([_TASKS, _TASK_FULL, _TASK_EMPTY] if claims else []),
         ]
         shell_arguments = cast("ast.arguments", clone_ast(body.args))
@@ -1325,6 +1682,10 @@ class RingLowering:
             dims = ", ".join(map(str, [*shape, _ACC_DEPTH]))
             setup.append(f"{acc} = {gluon_ops.ALIAS}.acc_buffers({dims})")
             setup += [f"{b} = {ALIAS}.ring_barriers({_ACC_DEPTH})" for b in barriers]
+        setup += [
+            f"{b} = {ALIAS}.tail_buffers({d}, {n}, {rows}, {cols})"
+            for b, d, n, rows, cols in tails
+        ]
         warps = ", ".join(str(w) for w, _ in workers)
         specialize = (
             f"gl.warp_specialize([{tasks}], [{warps}], [{', '.join(map(str, regs))}])"
@@ -1417,6 +1778,58 @@ class RingLowering:
         return buffers, views, box
 
 
+def _tail_dot(
+    info: ForLoopGraphInfo, graph: TileDependencyGraph, explain: bool
+) -> torch.fx.Node | None:
+    """The dot of a K loop a tail may take (``cross_loop_tmem_prefetch``): its
+    first dot carrying the loop's accumulator in a root that waits for another,
+    whose operand A (the one tcgen05 reads from tensor memory) is a 16-bit load,
+    not a view of one, of what no root writes; with ``explain``, logs why the
+    loop's other such dots are not."""
+    if isinstance(info, ReductionLoopGraphInfo):
+        return None
+    gated = {e.consumer_root for e in graph.edges if e.producer_root != e.consumer_root}
+    written = {a.allocation_id for a in graph.accesses if a.kind == "store"}
+    for node in info.graph.nodes:
+        if not gluon_ops.is_dot(node) or gluon_ops._carried(node) is None:
+            continue
+        load = cast(
+            "torch.fx.Node", node.args[matmul_operand_positions()[node.target][0]]
+        )
+        accesses = [graph.accesses[i] for i in load.meta.get(TILE_ACCESS_META, ())]
+        reason = None
+        if node.target is dot_scaled:
+            reason = "a block-scaled dot"
+        elif len(info.block_ids) != 1:
+            reason = "a loop over several block ids"
+        elif load.target is not memory_ops.load or not accesses:
+            reason = "operand A is no load (or a view of one)"
+        elif load.meta["val"].element_size() != 2:
+            reason = "operand A is not 16-bit"
+        elif any(access.root not in gated for access in accesses):
+            reason = "its root waits for no other root"
+        elif any(access.allocation_id in written for access in accesses):
+            reason = "a root writes operand A"
+        if reason is None:
+            return node
+        if explain:
+            log.info("%s: no candidate loop %s: %s", _TAIL_KEY, info.block_ids, reason)
+    return None
+
+
+def tmem_prefetch_candidates(device_ir: DeviceIR) -> list[list[int]]:
+    """The K loops a tail may take (``cross_loop_tmem_prefetch``, one entry
+    each): those with a ``_tail_dot``; logs each and why the others are not."""
+    graph = device_ir.tile_dependency_graph
+    assert graph is not None
+    loops: list[list[int]] = []
+    for info in device_ir.graphs:
+        if isinstance(info, ForLoopGraphInfo) and _tail_dot(info, graph, True):
+            log.info("%s: candidate loop %s", _TAIL_KEY, info.block_ids)
+            loops.append(list(info.block_ids))
+    return loops
+
+
 def _dot_between(load: torch.fx.Node, dot: torch.fx.Node) -> bool:
     """Whether another dot comes between ``load`` and ``dot`` (its graph's order)."""
     node = load.next
@@ -1444,6 +1857,35 @@ def _slice(
                 cast("ast.Assign", statement).value if simple else statement
             )
     return kept
+
+
+def _keywords(call: ast.Call, *names: str) -> list[ast.keyword]:
+    """``call``'s keyword arguments named ``names``."""
+    return [k for k in call.keywords if k.arg in names]
+
+
+def _free_names(statements: list[ast.stmt]) -> set[str]:
+    """The names ``statements`` read before (or without) storing them."""
+    free: set[str] = set()
+    stored: set[str] = set()
+    for statement in statements:
+        simple = isinstance(statement, ast.Assign | ast.Expr)
+        value = cast("ast.Assign", statement).value if simple else statement
+        free |= _names(value) - stored
+        stored |= _stored_names([statement])
+    return free
+
+
+def _path(block: list[ast.stmt], target: ast.stmt) -> list[tuple[list[ast.stmt], int]]:
+    """The (block, index) of each statement from ``block``'s down to ``target``."""
+    for index, statement in enumerate(block):
+        if statement is target:
+            return [(block, index)]
+        for field in ("body", "orelse"):
+            inner = getattr(statement, field, None)
+            if isinstance(inner, list) and (found := _path(inner, target)):
+                return [(block, index), *found]
+    return []
 
 
 def _blocks(tree: ast.AST) -> list[list[ast.stmt]]:
@@ -1934,7 +2376,10 @@ class _Slice:
                         )
                     )
                 return result
-            return create(ast.Expr, value=_call("ring_put", acquire.args))
+            ring_put_call = _call("ring_put", acquire.args)
+            # A tail's (``RingLowering._emit_tail``).
+            ring_put_call.keywords = _keywords(acquire, "HEAD")
+            return create(ast.Expr, value=ring_put_call)
         if not targets & live:
             return None
         value = cast("ast.expr", statement.value)
@@ -2096,7 +2541,7 @@ def _paced_fill(
                 full = _arg(put, "full")
                 state = [_beside(full, "paced"), _beside(full, "run")]
                 st = statement_from_string(f"{state[0].id}, {state[1].id} = 0")
-                cast("ast.Assign", st).value = _call(
+                paced_put = _call(
                     "ring_put_paced",
                     [  # pyrefly: ignore [bad-argument-type]
                         *put.args[:2],
@@ -2107,6 +2552,8 @@ def _paced_fill(
                         ast.Constant(K),
                     ],
                 )
+                paced_put.keywords = _keywords(put, "HEAD")
+                cast("ast.Assign", st).value = paced_put
             elif skip := _ring_call(st, "ring_skip"):
                 out.append(flush(_arg(skip, "full")))
             out.append(st)
