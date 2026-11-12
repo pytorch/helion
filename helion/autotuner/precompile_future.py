@@ -27,6 +27,7 @@ import uuid
 
 from .. import exc
 from ..runtime.precompile_shim import already_compiled
+from ..runtime.precompile_shim import already_compiled_fail
 from ..runtime.precompile_shim import make_precompiler
 from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import synchronize_device
@@ -66,6 +67,15 @@ class PrecompileContext:
         kernel: The kernel being autotuned (used for error reporting).
         args: The kernel arguments (used for repro logging on failure).
         jobs: Maximum number of concurrent precompile processes.
+        report_failures: Whether a failed precompile is reported: logged,
+            dumped, a repro printed, an unexpected error raised. Off for a
+            caller that compiles the config in-process next and reports its
+            failure there (the accuracy baseline): whether the compile
+            finished, outran the timeout or crashed its child
+            (``PrecompileFuture.exit_signal``) and the child's error
+            (``failure_error()``, which the baseline checks for an
+            unrecoverable one) are left, and an unrecoverable runtime error
+            from the fork precompile's host code is still raised.
     """
 
     settings: Settings
@@ -73,6 +83,7 @@ class PrecompileContext:
     kernel: _AutotunableKernel
     args: Sequence[object]
     jobs: int
+    report_failures: bool = True
 
 
 def _write_result_file(result_path: str, message: dict[str, object]) -> None:
@@ -121,7 +132,11 @@ class SerializedCompiledFunction:
 class RemoteError:
     exc_type: str
     exc_module: str | None
-    exc_args: tuple[object, ...]
+    # The exception's str(), which to_exception() rebuilds it from. Its args
+    # would read as their tuple when its class formats its own message
+    # (Triton's CompilationError: source, AST node and error), and a child's
+    # args that pickle cannot serialize would lose its whole result.
+    message: str
     traceback: str | None
     classification: str | None
     captured_output: str | None = None
@@ -129,8 +144,11 @@ class RemoteError:
     def to_exception(self) -> Exception:
         exc_cls = types.new_class(self.exc_type, (Exception,))
         exc_cls.__module__ = self.exc_module or __name__
-        exc_obj = exc_cls(*self.exc_args)
+        exc_obj = exc_cls(self.message)
         exc_obj.remote_traceback = self.traceback
+        # The child's classification of the real error, which no type rule
+        # can match on this stand-in of its class.
+        exc_obj.remote_classification = self.classification
         return exc_obj
 
 
@@ -332,6 +350,61 @@ def _unload_compiled_fn(fn: CompiledConfig) -> None:
         sys.modules.pop(module_name, None)
 
 
+def _detach_error(error: BaseException) -> None:
+    """Drop what ``error`` keeps alive of the code that raised it: the
+    tracebacks along its chain, whose frames hold the host code's tensors,
+    and an ``_ExtractedLaunchArgs`` in it, which holds the launch's
+    arguments (a bind error raised while handling one)."""
+    seen: set[int] = set()
+    pending: list[BaseException] = [error]
+    while pending:
+        node = pending.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        node.__traceback__ = None
+        if isinstance(node.__cause__, _ExtractedLaunchArgs):
+            node.__cause__ = None
+        if isinstance(node.__context__, _ExtractedLaunchArgs):
+            node.__context__ = None
+        pending += [link for link in (node.__cause__, node.__context__) if link]
+
+
+def cached_compile_failure_error() -> RuntimeError:
+    """Why a kernel an earlier compile in this process cached but could not
+    load (``already_compiled_fail``) fails again: the precompile phase and the
+    in-process compile report the same error."""
+    return RuntimeError(
+        "an earlier compile of this kernel in this process could not load it"
+    )
+
+
+def _write_error_result(
+    result_path: str, exc: Exception, decorator: str, captured_output: str
+) -> None:
+    """Report a precompile child's error to the parent: its type, its str()
+    (its arguments may not pickle; an exception that formats its own message
+    reads as a tuple of them) and its classification."""
+    with contextlib.suppress(Exception):
+        try:
+            classification = classify_triton_exception(exc)
+        except Exception:
+            classification = None
+        _write_result_file(
+            result_path,
+            {
+                "status": "error",
+                "traceback": "".join(traceback.format_exception(exc)),
+                "decorator": decorator,
+                "exc_type": type(exc).__name__,
+                "exc_module": type(exc).__module__,
+                "message": str(exc),
+                "classification": classification,
+                "captured_output": captured_output or None,
+            },
+        )
+
+
 def _run_kernel_in_subprocess_spawn(
     fn_spec: SerializedCompiledFunction,
     args_path: str,
@@ -339,7 +412,8 @@ def _run_kernel_in_subprocess_spawn(
     decorator: str,
 ) -> None:
     start_isolated_process_group()
-    status = 0
+    # Exit status 0 only after the "ok" result (see the fork child below).
+    status = 1
     _cap: list[str] = [""]
     try:
         fn = _load_compiled_fn(fn_spec)
@@ -351,30 +425,9 @@ def _run_kernel_in_subprocess_spawn(
             _output = fn(*args)
         synchronize_device()
         _write_result_file(result_path, {"status": "ok"})
+        status = 0
     except Exception as exc:
-        status = 1
-        with contextlib.suppress(Exception):
-            try:
-                exc_args = tuple(exc.args)
-            except Exception:
-                exc_args = (str(exc),)
-            try:
-                classification = classify_triton_exception(exc)
-            except Exception:
-                classification = None
-            _write_result_file(
-                result_path,
-                {
-                    "status": "error",
-                    "traceback": traceback.format_exc(),
-                    "decorator": decorator,
-                    "exc_type": type(exc).__name__,
-                    "exc_module": type(exc).__module__,
-                    "exc_args": exc_args,
-                    "classification": classification,
-                    "captured_output": _cap[0] or None,
-                },
-            )
+        _write_error_result(result_path, exc, decorator, _cap[0])
     finally:
         os._exit(status)
 
@@ -384,7 +437,7 @@ def _prepare_precompiler_for_fork(
     args: Sequence[object],
     config: Config,
     kernel: _AutotunableKernel,
-) -> Callable[[], bool] | None:
+) -> Callable[[], bool]:
     def extract_launcher(
         triton_kernel: object,
         grid: tuple[int, ...],
@@ -397,18 +450,15 @@ def _prepare_precompiler_for_fork(
         fn(*args, _launcher=extract_launcher)
         raise RuntimeError("Expected _ExtractedLaunchArgs to be raised")
     except _ExtractedLaunchArgs as extracted:
-        precompiler = make_precompiler(
+        return make_precompiler(
             cast("Any", extracted.kernel),
             config,
             cast("BoundKernel", kernel),
         )(*extracted.args, **extracted.kwargs)
-        if precompiler is already_compiled:
-            return None
-        return precompiler
 
 
 def _run_kernel_in_subprocess_fork(
-    precompiler: Callable[[], None],
+    precompiler: Callable[[], bool],
     config: Config,
     kernel: _AutotunableKernel,
     result_path: str,
@@ -416,36 +466,18 @@ def _run_kernel_in_subprocess_fork(
 ) -> None:
     start_isolated_process_group()
     isolate_forked_worker()
-    status = 0
+    # Exit status 0 tells the parent the config compiled, so it is set only
+    # once the "ok" result is written: an exception the handler below does
+    # not catch (SystemExit, KeyboardInterrupt) still exits nonzero.
+    status = 1
     _cap: list[str] = [""]
     try:
         with capture_output() as _cap:
             precompiler()
         _write_result_file(result_path, {"status": "ok"})
+        status = 0
     except Exception as exc:
-        status = 1
-        with contextlib.suppress(Exception):
-            try:
-                exc_args = tuple(exc.args)
-            except Exception:
-                exc_args = (str(exc),)
-            try:
-                classification = classify_triton_exception(exc)
-            except Exception:
-                classification = None
-            _write_result_file(
-                result_path,
-                {
-                    "status": "error",
-                    "traceback": traceback.format_exc(),
-                    "decorator": decorator,
-                    "exc_type": type(exc).__name__,
-                    "exc_module": type(exc).__module__,
-                    "exc_args": exc_args,
-                    "classification": classification,
-                    "captured_output": _cap[0] or None,
-                },
-            )
+        _write_error_result(result_path, exc, decorator, _cap[0])
     finally:
         os._exit(status)
 
@@ -477,7 +509,17 @@ class PrecompileFuture:
     _result_received: bool = False
     remote_error: RemoteError | None = None
     _remote_error_handled: bool = False
+    # The error that rejected the config before a child started: preparing
+    # the fork precompile (running the host code to find the kernel's launch,
+    # binding its arguments) raised it, detached (``_detach_error``), or a
+    # kernel an earlier compile in this process failed to load
+    # (``cached_compile_failure_error``).
+    prepare_error: Exception | None = None
     failure_reason: Literal["ok", "error", "timeout"] | None = None
+    # The signal that ended the child when it died before writing a result:
+    # a crash in the backend compiler (an LLVM or MLIR abort, a segfault)
+    # rather than an error it reported or the deadline.
+    exit_signal: int | None = None
 
     @property
     def elapsed(self) -> float:
@@ -515,8 +557,14 @@ class PrecompileFuture:
         start_without_collection(self.process)
 
     @staticmethod
-    def skip(ctx: PrecompileContext, config: Config, ok: bool) -> PrecompileFuture:
-        """Dummy precompile future that is already done."""
+    def skip(
+        ctx: PrecompileContext,
+        config: Config,
+        ok: bool,
+        prepare_error: Exception | None = None,
+    ) -> PrecompileFuture:
+        """Dummy precompile future that is already done; ``prepare_error`` is
+        the error that rejected the config, when known."""
         ts = time.time()
         return PrecompileFuture(
             ctx=ctx,
@@ -530,6 +578,7 @@ class PrecompileFuture:
             _result_received=True,
             remote_error=None,
             _remote_error_handled=True,
+            prepare_error=prepare_error,
             failure_reason="ok" if ok else "error",
         )
 
@@ -545,8 +594,13 @@ class PrecompileFuture:
         """Create a PrecompileFuture by spawning or forking a subprocess.
 
         Handles fork-vs-spawn mode selection, serialization, and process
-        construction.  Returns a ``skip`` future when the kernel is already
-        compiled (fork mode only).
+        construction.  Returns a done ``skip`` future when no child runs: in
+        fork mode when the outcome is known without one -- a kernel an earlier
+        compile in this process cached, compiled or not
+        (``cached_compile_failure_error``), or an error that keeps the child
+        from starting (``prepare_error``) -- and in spawn mode, without
+        ``report_failures``, for a kernel that cannot be serialized, which the
+        caller compiles in-process.
         """
         mode = ctx.settings.autotune_precompile
         decorator = ctx.kernel.format_kernel_decorator(config, ctx.settings)
@@ -557,6 +611,9 @@ class PrecompileFuture:
             try:
                 fn_spec = _serialize_compiled_fn(fn)
             except RuntimeError as err:
+                if not ctx.report_failures:
+                    # The caller compiles the config in-process next.
+                    return PrecompileFuture.skip(ctx, config, False)
                 raise exc.AutotuneError(
                     "Failed to serialize compiled kernel for spawn precompile."
                     ' Set HELION_AUTOTUNE_PRECOMPILE="fork" to fall back to fork mode.'
@@ -575,29 +632,47 @@ class PrecompileFuture:
                     fn, args, config, ctx.kernel
                 )
             except Exception as e:
-                maybe_dump_triton_failure(ctx.kernel, config, e)
                 action = classify_triton_exception(e)
-                if not ctx.settings.autotune_ignore_errors:
-                    log_generated_triton_code_debug(
-                        ctx.log,
-                        ctx.kernel,
-                        config,
-                        prefix=f"Generated Triton code for {decorator}:",
-                    )
-                    log = ctx.log.debug if action == "debug" else ctx.log.warning
-                    log(
-                        f"Helion autotuner precompile error for {decorator}.",
-                        SUPPRESSED_TRITON_CODE_MSG,
-                        exc_info=True,
-                    )
-                e.__traceback__ = None
+                if ctx.report_failures:
+                    maybe_dump_triton_failure(ctx.kernel, config, e)
+                    if not ctx.settings.autotune_ignore_errors:
+                        log_generated_triton_code_debug(
+                            ctx.log,
+                            ctx.kernel,
+                            config,
+                            prefix=f"Generated Triton code for {decorator}:",
+                        )
+                        log = ctx.log.debug if action == "debug" else ctx.log.warning
+                        log(
+                            f"Helion autotuner precompile error for {decorator}.",
+                            SUPPRESSED_TRITON_CODE_MSG,
+                            exc_info=True,
+                        )
+                _detach_error(e)
                 if match_unrecoverable_runtime_error(e):
                     raise
-                if action == "raise" and not ctx.settings.autotune_ignore_errors:
+                if (
+                    action == "raise"
+                    and ctx.report_failures
+                    and not ctx.settings.autotune_ignore_errors
+                ):
                     raise
-                return PrecompileFuture.skip(ctx, config, False)
-            if precompiler is None:
-                return PrecompileFuture.skip(ctx, config, True)
+                return PrecompileFuture.skip(ctx, config, False, prepare_error=e)
+            if precompiler is already_compiled or precompiler is already_compiled_fail:
+                # Compiled earlier in this process, so the outcome is known
+                # (failed: a kernel ``_triton_compile`` compiled but could not
+                # load). A child would ignore the sentinel's result and report
+                # success.
+                return PrecompileFuture.skip(
+                    ctx,
+                    config,
+                    precompiler is already_compiled,
+                    prepare_error=(
+                        cached_compile_failure_error()
+                        if precompiler is already_compiled_fail
+                        else None
+                    ),
+                )
             mp_ctx = mp.get_context("fork")
             process = cast(
                 "mp.Process",
@@ -631,6 +706,28 @@ class PrecompileFuture:
         self._consume_result(raise_on_raise=True)
         assert self.ok is not None
         return self.ok
+
+    def failure_error(self) -> Exception | None:
+        """Why the precompile rejected the config, for the compile-failure
+        summaries: the deadline it outran, the signal its child died from, the
+        child's error, or the error that kept a child from starting or that a
+        kernel compiled earlier in this process failed with
+        (``prepare_error``); None when none is known (a spawn-mode kernel
+        that cannot be serialized, without ``report_failures``)."""
+        if self.failure_reason == "timeout":
+            return TimeoutError(
+                f"compile exceeded autotune_compile_timeout={self.timeout}s "
+                "(HELION_AUTOTUNE_COMPILE_TIMEOUT) in the precompile subprocess"
+            )
+        if self.exit_signal is not None:
+            return ChildProcessError(
+                f"the precompile subprocess died from signal {self.exit_signal} "
+                f"({signal.strsignal(self.exit_signal) or 'unknown'}) before "
+                "reporting a result"
+            )
+        if self.remote_error is not None:
+            return self.remote_error.to_exception()
+        return self.prepare_error
 
     @staticmethod
     def wait_for_all(
@@ -757,24 +854,32 @@ class PrecompileFuture:
             self.ok = process.exitcode == 0
             if not self.ok:
                 signal_process_tree(process, signal.SIGKILL)
+            reported = self._result_received or (
+                self.result_path is not None and os.path.exists(self.result_path)
+            )
             self._consume_result(raise_on_raise=False)
             if self.ok:
                 self.failure_reason = "ok"
             elif self.failure_reason is None:
                 self.failure_reason = "error"
+            exitcode = process.exitcode
+            if not reported and exitcode is not None and exitcode < 0:
+                self.exit_signal = -exitcode
             return self.ok
         signal_process_tree(process, signal.SIGTERM)
         process.join(10)
         msg = f"Timeout after {self.elapsed:.0f}s compiling {self.config}"
+        report = (
+            self.ctx.report_failures and not self.ctx.settings.autotune_ignore_errors
+        )
         if process.is_alive():
-            if not self.ctx.settings.autotune_ignore_errors:
+            if report:
                 self.ctx.log.warning(
                     msg,
                     "(SIGKILL required)",
                 )
-        else:
-            if not self.ctx.settings.autotune_ignore_errors:
-                self.ctx.log.warning(msg)
+        elif report:
+            self.ctx.log.warning(msg)
         # The worker can exit on SIGTERM before a compiler grandchild does.
         # Always hard-kill the process group after the grace period.
         signal_process_tree(process, signal.SIGKILL)
@@ -798,7 +903,7 @@ class PrecompileFuture:
                     self.remote_error = RemoteError(
                         exc_type=type(err).__name__,
                         exc_module=type(err).__module__,
-                        exc_args=(str(err),),
+                        message=str(err),
                         traceback=None,
                         classification="warn",
                     )
@@ -814,7 +919,7 @@ class PrecompileFuture:
                     self.remote_error = RemoteError(
                         exc_type="EOFError",
                         exc_module=__name__,
-                        exc_args=("No result received from subprocess.",),
+                        message="No result received from subprocess.",
                         traceback=None,
                         classification="debug",
                     )
@@ -823,15 +928,10 @@ class PrecompileFuture:
                     self.ok = True
                 assert self.remote_error is None
             else:
-                exc_args_obj = message_data["exc_args"]
-                if isinstance(exc_args_obj, tuple):
-                    exc_args_tuple: tuple[object, ...] = exc_args_obj
-                else:
-                    exc_args_tuple = tuple(cast("Iterable[object]", exc_args_obj))
                 self.remote_error = RemoteError(
                     exc_type=cast("str", message_data["exc_type"]),
                     exc_module=cast("str | None", message_data["exc_module"]),
-                    exc_args=exc_args_tuple,
+                    message=cast("str", message_data["message"]),
                     traceback=cast("str | None", message_data["traceback"]),
                     classification=cast("str | None", message_data["classification"]),
                     captured_output=cast(
@@ -845,6 +945,10 @@ class PrecompileFuture:
         error = self.remote_error
         if error is None or self._remote_error_handled:
             return
+        if not self.ctx.report_failures:
+            # The caller compiles the config in-process next and reports it.
+            self._remote_error_handled = True
+            return
         exc_obj = error.to_exception()
         maybe_dump_triton_failure(
             self.ctx.kernel,
@@ -857,7 +961,16 @@ class PrecompileFuture:
         ignore_errors = self.ctx.settings.autotune_ignore_errors
         if ignore_errors:
             classification = "debug"
-        if classification == "raise":
+        # A fork child only compiles the kernel, so an error there, even one
+        # the classifier does not expect ("raise", such as Triton's frontend
+        # CompilationError), fails only this config: it is logged as a warning
+        # and the config skipped, as the benchmark worker skips a config it
+        # cannot compile. A spawned child also runs the generated host code
+        # and the kernel; an unexpected error there still raises.
+        if (
+            classification == "raise"
+            and self.ctx.settings.autotune_precompile == "spawn"
+        ):
             if raise_on_raise:
                 self._remote_error_handled = True
                 decorator = self.ctx.kernel.format_kernel_decorator(
@@ -888,14 +1001,25 @@ class PrecompileFuture:
             self.config,
             prefix=f"Generated Triton code for {decorator}:",
         )
-        formatted = format_triton_compile_failure(self.config, exc_obj, self.ctx.kernel)
-        if error.traceback:
-            formatted = (
-                f"{formatted}\nRemote traceback (spawned process):\n{error.traceback}"
-            )
         if not ignore_errors:
-            self.ctx.log.debug(formatted)
+            # A fork child's unexpected error (above) is shown by default; the
+            # traceback, through Triton's frames, stays at debug level.
+            log = (
+                self.ctx.log.warning
+                if classification == "raise"
+                else self.ctx.log.debug
+            )
+            log(format_triton_compile_failure(self.config, exc_obj, self.ctx.kernel))
+            if error.traceback:
+                self.ctx.log.debug(f"Remote traceback (subprocess):\n{error.traceback}")
+            # The repro of a compile error ("warn": ptxas, PassManager) is a
+            # warning too, as on the in-process path, so HELION_PRINT_REPRO=1
+            # shows it although the error itself is logged at debug level.
             self.ctx.kernel.maybe_log_repro(
-                self.ctx.log.debug, self.ctx.args, self.config
+                self.ctx.log.warning
+                if classification in ("raise", "warn")
+                else self.ctx.log.debug,
+                self.ctx.args,
+                self.config,
             )
         self._remote_error_handled = True

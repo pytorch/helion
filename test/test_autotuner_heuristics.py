@@ -1146,7 +1146,10 @@ class TestAutotunerHeuristic(TestCase):
             with self.subTest(default=default):
                 provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
                 provider.args = ()
-                provider.settings = MagicMock(autotune_baseline_fn=None)
+                # No precompile pool: the baseline compiles in-process only.
+                provider.settings = MagicMock(
+                    autotune_baseline_fn=None, autotune_precompile=None
+                )
                 provider.config_spec = MagicMock()
                 provider.config_spec.autotune_reference_config.return_value = reference
                 provider.config_spec.default_config.return_value = default

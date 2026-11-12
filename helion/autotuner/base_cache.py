@@ -534,10 +534,11 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
             )
 
         base_seed = settings.autotune_random_seed
-        # Snapshot any settings the autotuner mutates inside ``_prepare`` /
-        # ``set_adaptive_compile_timeout`` so trial N+1 starts with the same
-        # values trial 1 saw. Without this, trial 1's adaptive-timeout
-        # narrowing leaks into later trials and they are not independent.
+        # Each trial starts from the compile timeout trial 1 saw.
+        # BaseSearch.autotune puts back the timeout set_adaptive_compile_timeout
+        # narrowed; this reset remains for custom ``autotuner_fn`` searches
+        # that are not BaseSearch subclasses, whose narrowing would otherwise
+        # leak into later trials.
         base_compile_timeout = settings.autotune_compile_timeout
         original_autotuner = self.autotuner
 

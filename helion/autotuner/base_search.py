@@ -994,10 +994,9 @@ class BaseSearch(BaseAutotuner):
             and self.config_spec.backend.supports_precompile()
         ):
             # The adapted timeout kills precompile subprocesses. Render
-            # workers (CuTe) keep the configured timeout and only fall back
-            # to an in-process render past it, and the kernel's settings
-            # are shared by every bound shape of the kernel: a timeout fitted
-            # on one shape's render times would time out a larger shape's.
+            # workers (CuTe) keep the configured timeout: past a narrower one
+            # fitted on the population's render times they would only fall
+            # back to rendering the slower configs in this process.
             self.log.debug("No precompile pool; the compile timeout is not adapted")
             return
 
@@ -1199,6 +1198,16 @@ class BaseSearch(BaseAutotuner):
         best: Config | None = None
         try:
             with exit_stack:
+                # set_adaptive_compile_timeout narrows the compile deadline
+                # for this search. The kernel's settings are shared by every
+                # shape the kernel is bound to, whose searches (and accuracy
+                # baselines) would otherwise inherit the narrowed deadline.
+                exit_stack.callback(
+                    setattr,
+                    self.settings,
+                    "autotune_compile_timeout",
+                    self.settings.autotune_compile_timeout,
+                )
                 exit_stack.enter_context(_searching_candidates())
                 if self.settings.autotune_log:
                     # .csv/.log follow the log path; the dataset (.meta.jsonl) also

@@ -16,6 +16,7 @@ from . import DEVICE
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from contextlib import AbstractContextManager
 
     from ..autotuner.base_search import _AutotunableKernel
     from ..runtime.settings import Settings
@@ -58,12 +59,18 @@ def mock_kernel(settings: Settings, **attrs: object) -> SimpleNamespace:
     return kernel
 
 
-def prepare_search(search: BaseSearch) -> None:
-    """``search._prepare()`` without the accuracy baseline, which would
-    compile and run the kernel's default config."""
-    with patch.object(
+def skip_accuracy_baseline() -> AbstractContextManager[object]:
+    """Within it, a search prepares without the accuracy baseline, which
+    would compile and run the kernel's default config."""
+    return patch.object(
         LocalBenchmarkProvider, "_compute_baseline", return_value=(None, [], None)
-    ):
+    )
+
+
+def prepare_search(search: BaseSearch) -> None:
+    """``search._prepare()`` without the accuracy baseline
+    (:func:`skip_accuracy_baseline`)."""
+    with skip_accuracy_baseline():
         search._prepare()
 
 
