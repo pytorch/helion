@@ -108,7 +108,7 @@ def test_native_graph_evaluation_checks_replayed_mutation(
         "cuda_graph",
         0.0,
         0.0,
-        False,
+        None,
         2,
         _alias_signature((output, expected)),
         str(tmp_path / "progress.jsonl"),

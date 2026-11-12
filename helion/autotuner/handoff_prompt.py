@@ -69,11 +69,23 @@ def build_handoff_prompt(manifest: Mapping[str, Any]) -> str:
                     "rtol",
                     "scale_atol",
                 )
+                # scale_atol is for older evaluators; atol_scale replaces it.
+                if not (key == "scale_atol" and case.get("atol_scale") == "peak")
             },
             "backend": _BACKEND_LABELS.get(case["backend"], case["backend"]),
             **(
                 {"alias_signature": case["alias_signature"]}
                 if case.get("alias_signature") is not None
+                else {}
+            ),
+            # Only the peak scaling is shown: older and default prompts are
+            # unchanged.
+            **(
+                {
+                    "atol_scale": "peak",
+                    "fp8_accuracy": case.get("fp8_accuracy", "bitwise"),
+                }
+                if case.get("atol_scale") == "peak"
                 else {}
             ),
         }
@@ -83,6 +95,21 @@ def build_handoff_prompt(manifest: Mapping[str, Any]) -> str:
         "Preserve entrypoints, output structure, input mutations, aliases, and "
         "numerical tolerances."
     )
+    if any("atol_scale" in case for case in cases):
+        contract += (
+            ' With atol_scale "peak", each floating-point tensor of the output '
+            "(and each input the reference mutates) must satisfy "
+            "|output - reference| <= atol * max|reference| + rtol * |reference| "
+            "elementwise, max|reference| taken over that tensor's finite "
+            "elements; infinite reference elements must be matched exactly, a "
+            "NaN output fails, and integer and bool tensors use the unscaled "
+            'atol. fp8 tensors: with fp8_accuracy "ulp", one fp8 ulp of '
+            "max(|output|, |reference|) is allowed on top of this bound, as long "
+            "as those one-ulp differences are not mostly in one direction "
+            "(float8_e8m0fnu instead allows one byte step and no atol or rtol); "
+            'with "bitwise", their bytes are compared with the unscaled atol and '
+            "rtol."
+        )
     if any("alias_signature" in case for case in cases):
         contract += (
             " alias_signature lists storage groups of flattened output tensors "

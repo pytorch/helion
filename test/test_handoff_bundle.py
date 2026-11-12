@@ -9,6 +9,7 @@ import stat
 import subprocess
 import sys
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import NamedTuple
 from typing import cast
 
@@ -21,12 +22,14 @@ from helion._testing import _has_cute_dsl
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessCuteAvailable
+from helion.autotuner import AccuracyCheck
 from helion.autotuner import FiniteSearch
 from helion.autotuner import HandoffBundle
 from helion.autotuner import HandoffPolicy
 from helion.autotuner import build_handoff
 from helion.autotuner import find_handoff
 from helion.autotuner.benchmark_provider import _MultiShapeAutotuneArgs
+from helion.autotuner.handoff_bundle import _accuracy
 from helion.autotuner.handoff_bundle import _input_metadata
 from helion.autotuner.handoff_bundle import _tolerances
 from helion.autotuner.handoff_inputs import _clone_inputs
@@ -113,6 +116,97 @@ def test_fp8_reference_tolerances() -> None:
         helion.Settings(autotune_baseline_atol=0.02), output, inputs, inputs
     ) == (0.02, 0.01)
     assert _tolerances(bitwise, output, inputs, (inputs[0] + 1,)) == (0.01, 0.01)
+
+
+def test_accuracy_rule_records_an_accuracy_check() -> None:
+    """A bundle records the rule autotuning applied: an AccuracyCheck's own
+    tolerances and atol scaling, else the autotune_baseline_* settings."""
+    inputs = (torch.ones(8),)
+    output = torch.ones(8)
+    check = AccuracyCheck(atol=0.03, rtol=0.0, atol_scale="peak")
+    assert _accuracy(
+        helion.Settings(autotune_baseline_accuracy_check_fn=check),
+        output,
+        inputs,
+        inputs,
+    ) == {
+        "atol": 0.03,
+        "rtol": 0.0,
+        "atol_scale": "peak",
+        "scale_atol": False,
+        "fp8_accuracy": "ulp",
+    }
+    default = _accuracy(helion.Settings(), output, inputs, inputs)
+    assert default["atol_scale"] == "rms" and default["scale_atol"]
+    explicit = _accuracy(
+        helion.Settings(autotune_baseline_atol=0.02), output, inputs, inputs
+    )
+    assert (explicit["atol"], explicit["atol_scale"], explicit["scale_atol"]) == (
+        0.02,
+        None,
+        False,
+    )
+
+
+@pytest.mark.slow
+@pytest.mark.timeout(300)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@skipIfRefEager("Native handoff requires compilation")
+@skipUnlessBackends(["triton"])
+def test_handoff_applies_an_accuracy_check(tmp_path: Path) -> None:
+    """build_handoff accepts an AccuracyCheck, whose peak-scaled bound then
+    decides the agent's rounds, and still refuses arbitrary callbacks."""
+
+    def offset_kernel(check: object) -> Any:
+        @helion.kernel(
+            backend="triton",
+            static_shapes=True,
+            autotune_precompile=None,
+            autotune_benchmark_subprocess=False,
+            autotune_baseline_accuracy_check_fn=check,
+        )
+        def offset(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + 1.0
+            return out
+
+        return offset
+
+    # x + 1 peaks at 16: atol 0.03 x peak admits 0.48 absolute.
+    args = (torch.arange(16, device=DEVICE, dtype=torch.float32),)
+    configs = [helion.Config(block_sizes=[8]), helion.Config(block_sizes=[16])]
+    check = AccuracyCheck(atol=0.03, rtol=0.0, atol_scale="peak")
+    search = FiniteSearch(offset_kernel(check).bind(args), args, configs)
+    point = find_handoff(search)
+    bundle = build_handoff(search, point, tmp_path / "bundle", repetitions=1)
+    case = bundle.manifest["cases"][0]
+    assert (case["atol"], case["rtol"], case["atol_scale"]) == (0.03, 0.0, "peak")
+    # Version-1 evaluators would read scale_atol=False as an unscaled atol.
+    assert bundle.manifest["schema_version"] == 2
+
+    source = (bundle.directory / "case_0/kernel.py").read_text()
+
+    def shifted(delta: float) -> Any:
+        def agent(workspace: Any) -> dict[str, str]:
+            return {
+                "case_0/kernel.py": source + f"\n_original = offset\ndef offset(x):\n"
+                f"    return _original(x) + {delta}\n"
+            }
+
+        return agent
+
+    rejected = bundle.run_agent(shifted(0.6), repetitions=1)
+    assert rejected.cases[0].status == "accuracy_error", rejected.cases[0].error
+    accepted = bundle.run_agent(shifted(0.4), repetitions=1)
+    assert accepted.cases[0].status == "ok", accepted.cases[0].error
+
+    # Refused before the point is used, so the first search's point serves.
+    custom = FiniteSearch(
+        offset_kernel(lambda actual, expected: None).bind(args), args, configs
+    )
+    with pytest.raises(NotImplementedError, match="AccuracyCheck"):
+        build_handoff(custom, point, tmp_path / "custom", repetitions=1)
 
 
 def test_agent_rejects_non_source_replacements_before_writing(tmp_path: Path) -> None:
