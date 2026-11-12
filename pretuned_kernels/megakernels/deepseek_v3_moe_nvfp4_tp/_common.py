@@ -38,6 +38,15 @@ def stable_key(values: torch.Tensor, index: torch.Tensor, count: int) -> torch.T
     return ordered * count + (count - 1 - index.to(torch.int64))
 
 
+# A key below every ``stable_key`` key: a picked expert.
+PICKED = -9223372036854775807
+
+
+def key_index(key: torch.Tensor, count: int) -> torch.Tensor:
+    """The index packed in a ``stable_key`` key's low digits."""
+    return (count - 1 - (key % count + count) % count).to(torch.int32)
+
+
 def routing_keys(
     logits: torch.Tensor,
     correction_bias: torch.Tensor,

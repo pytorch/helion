@@ -55,8 +55,8 @@ pretuned_kernels/
     ├── gemma4_a4b_moe/               # Gemma 4 26B-A4B MoE
     ├── gpt_oss_moe/                  # gpt-oss MoE
     ├── flash_mla/                    # DeepSeek-V3 MLA decode, one request
-    ├── deepseek_v3_moe_nvfp4/        # DeepSeek-V3 NVFP4 MoE
-    ├── deepseek_v3_moe_nvfp4_tp/     # DeepSeek-V3 NVFP4 MoE + all-reduce + RMSNorm, TP4
+    ├── deepseek_v3_moe_nvfp4/        # DeepSeek-V3 NVFP4 MoE, decode and verify
+    ├── deepseek_v3_moe_nvfp4_tp/     # DeepSeek-V3 NVFP4 MoE + all-reduce + RMSNorm, TP4, decode and verify
     ├── deepseek_v3_attention_nvfp4_tp/
     └── muse_spark/
 ```

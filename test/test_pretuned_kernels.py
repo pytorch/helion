@@ -11,6 +11,7 @@ import importlib.util
 import inspect
 import math
 import os
+import re
 import subprocess
 import sys
 from typing import TYPE_CHECKING
@@ -403,6 +404,129 @@ def test_verify_layer_megakernels_generate_code(name: str) -> None:
     kernel.bind(args).to_triton_code(kernel.configs[0])
 
 
+def _deepseek_v3_verify_args(tokens: int, intermediate: int) -> tuple:
+    """The 1-GPU DeepSeek verify kernel's arguments, uninitialized: binding and
+    code generation need only their shapes, strides and dtypes."""
+    from pretuned_kernels.megakernels.deepseek_v3_moe_nvfp4 import (
+        deepseek_v3_moe_nvfp4_verify as single,
+    )
+
+    shape = single.Shape(intermediate=intermediate)
+    e, i, h = shape.num_experts, shape.intermediate, shape.hidden
+
+    def empty(*size: int, dtype: torch.dtype) -> torch.Tensor:
+        return torch.empty(size, device=DEVICE, dtype=dtype)
+
+    u8, f8, f32 = torch.uint8, torch.float8_e4m3fn, torch.float32
+    tensors = {
+        "hidden": empty(tokens, h, dtype=torch.bfloat16),
+        "router_weight": empty(e, h, dtype=torch.bfloat16),
+        "correction_bias": empty(e, dtype=f32),
+        "native_w13": empty(e, 2 * i, h // 2, dtype=u8),
+        "native_w13_scale": empty(e, 2 * i, h // 16, dtype=f8),
+        "w2": empty(e, h, i // 2, dtype=u8),
+        "w2_scale": empty(e, h, i // 16, dtype=f8),
+        "native_shared_w13": empty(2 * i, h // 2, dtype=u8),
+        "native_shared_w13_scale": empty(2 * i, h // 16, dtype=f8),
+        "shared_w2": empty(h, i // 2, dtype=u8),
+        "shared_w2_scale": empty(h, i // 16, dtype=f8),
+        "alpha1": empty(e, dtype=f32),
+        "alpha2": empty(e, dtype=f32),
+        "shared_alpha1": empty(1, dtype=f32),
+        "shared_alpha2": empty(1, dtype=f32),
+        "input_global_scale": empty(1, dtype=f32),
+        "activation_global_scale": empty(1, dtype=f32),
+    }
+    return single._verify_args(tensors, shape)
+
+
+# The tensors the DeepSeek verify megakernels stream through the Gluon ring by
+# TMA: the GEMM operands.  Their configs pick TMA by access position
+# (_TMA_SLOTS), so a kernel or compiler change that renumbers the accesses would
+# silently move TMA to other tensors.
+_DEEPSEEK_VERIFY_RING_TENSORS = [
+    "activation_q_steps",
+    "activation_scale_steps",
+    "hidden_chunked",
+    "input_q_steps",
+    "input_q_steps",
+    "input_scale_steps",
+    "input_scale_steps",
+    "router_weight_chunked",
+    "shared_activation_q_steps",
+    "shared_activation_scale_steps",
+    "shared_w13_scale",
+    "shared_w13_view",
+    "shared_w2_scale",
+    "shared_w2_view",
+    "w13_scale",
+    "w13_view",
+    "w2_scale",
+    "w2_view",
+]
+_DEEPSEEK_TP_VERIFY_RING_TENSORS = [
+    "activation_q_steps",
+    "activation_scale_steps",
+    "hidden_chunked",
+    "input_q_steps",
+    "input_q_steps",
+    "input_q_steps",
+    "input_scale_steps",
+    "input_scale_steps",
+    "input_scale_steps",
+    "router_weight_chunked",
+    "shared_activation_q_steps",
+    "shared_activation_scale_steps",
+    "shared_w13_scale",
+    "shared_w13_view",
+    "shared_w2_scale",
+    "shared_w2_view",
+    "w13_scale",
+    "w13_view",
+    "w13_view",
+    "w2_scale",
+    "w2_view",
+]
+
+
+@skipIfRefEager("tile dependencies are built only in compiled mode")
+@skipIfNotTriton("the gluon tests run in the triton lane")
+@skipUnlessGluon()
+def test_deepseek_v3_verify_megakernels_ring_operands() -> None:
+    from pretuned_kernels.megakernels.deepseek_v3_moe_nvfp4 import (
+        deepseek_v3_moe_nvfp4_verify as single,
+    )
+    from pretuned_kernels.megakernels.deepseek_v3_moe_nvfp4_tp import (
+        deepseek_v3_moe_nvfp4_tp_verify as tp,
+    )
+
+    def ring_tensors(kernel: helion.Kernel, args: tuple) -> list[str]:
+        code = kernel.bind(args).to_triton_code(kernel.configs[0])
+        return sorted(re.findall(r"ring_descriptor\((\w+),", code))
+
+    # The TP4 shard's intermediate size for both: the access order does not
+    # depend on it, and the weights take a quarter of the memory.
+    tokens, intermediate = 8, 2048 // tp.WORLD_SIZE
+    kernel = single.deepseek_v3_moe_nvfp4_verify
+    args = _deepseek_v3_verify_args(tokens, intermediate)
+    assert ring_tensors(kernel, args) == _DEEPSEEK_VERIFY_RING_TENSORS
+    dist.init_process_group(backend="fake", store=FakeStore(), rank=0, world_size=4)
+    try:
+        hidden = single.Shape().hidden
+        bf16 = {"device": DEVICE, "dtype": torch.bfloat16}
+        args = (
+            *args,
+            torch.empty((tokens, hidden), **bf16),
+            torch.empty((hidden,), **bf16),
+            torch.empty((tokens, hidden), **bf16),
+            dist.group.WORLD.group_name,
+        )
+        kernel = tp.deepseek_v3_moe_nvfp4_tp_verify
+        assert ring_tensors(kernel, args) == _DEEPSEEK_TP_VERIFY_RING_TENSORS
+    finally:
+        dist.destroy_process_group()
+
+
 @skipIfRefEager("tile dependencies are built only in compiled mode")
 @skipIfNotTriton("the TP4 megakernels are pinned to backend='triton'")
 def test_muse_spark_tp4_megakernels_compile() -> None:
@@ -610,10 +734,15 @@ def test_muse_spark_moe_ep4_compiles() -> None:
     "name", ["deepseek_v3_moe_nvfp4_tp", "deepseek_v3_attention_nvfp4_tp"]
 )
 def test_deepseek_v3_tp_megakernels_run_on_four_ranks(name: str) -> None:
+    # main() checks every rank's output against the matched references.
+    _run_on_four_ranks(name)
+
+
+def _run_on_four_ranks(name: str) -> None:
+    """Run the module's __main__ on four ranks (torchrun)."""
     _require_four_sm100_gpus()
     if _under_xdist():
         pytest.skip("four-rank runs need every local GPU")
-    # main() checks every rank's output against the matched references.
     subprocess.run(
         [
             sys.executable,
@@ -630,6 +759,16 @@ def test_deepseek_v3_tp_megakernels_run_on_four_ranks(name: str) -> None:
         },
         check=True,
     )
+
+
+@pytest.mark.slow
+@skipIfRefEager("Pretuned kernels use AOT; ref-eager bypasses heuristic logic.")
+@skipIfNotTriton("the gluon tests run in the triton lane")
+@skipUnlessGluon()
+@pytest.mark.timeout(1800)
+def test_deepseek_v3_tp_verify_megakernel_checks_on_four_ranks() -> None:
+    # correctness_check() compares every rank with the single-GPU verify kernel.
+    _run_on_four_ranks("deepseek_v3_moe_nvfp4_tp_verify")
 
 
 @pytest.mark.slow
@@ -1293,6 +1432,15 @@ class TestPretunedKernelsCorrectness(TestCase):
     @skipUnlessGluon()
     def test_qwen3_verify_layer_bf16(self):
         module = _import_pretuned_kernel_module("qwen3_verify_layer_bf16")
+        for tokens in _VERIFY_TOKENS:
+            module.correctness_check(tokens)
+
+    @pytest.mark.slow
+    @pytest.mark.timeout(900)
+    @skipIfCute(_PINNED_TO_GLUON)
+    @skipUnlessGluon()
+    def test_deepseek_v3_moe_nvfp4_verify(self):
+        module = _import_pretuned_kernel_module("deepseek_v3_moe_nvfp4_verify")
         for tokens in _VERIFY_TOKENS:
             module.correctness_check(tokens)
 
