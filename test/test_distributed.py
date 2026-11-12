@@ -38,6 +38,7 @@ from helion._testing import EXAMPLES_DIR
 from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import onlyBackends
+from helion._testing import pairwise
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfNotTriton
@@ -115,11 +116,13 @@ def _remote_views(
 
 
 def _with_pipeline(
-    kernel: helion.Kernel, args: tuple[object, ...], pipeline: str
+    kernel: helion.Kernel, args: tuple[object, ...], pipeline: str, **keys: object
 ) -> BoundKernel[object]:
     bound = kernel.bind(args)
     config = bound.config_spec.default_config().config
-    bound.set_config(helion.Config(**{**config, "cross_loop_pipeline": pipeline}))
+    bound.set_config(
+        helion.Config(**{**config, "cross_loop_pipeline": pipeline, **keys})
+    )
     return bound
 
 
@@ -255,6 +258,32 @@ def inband_view_kernel(
         acc = hl.zeros([tile], dtype=x.dtype)
         for r in hl.static_range(len(peers)):
             acc = acc + peers[r][tile]
+        out[tile] = acc
+    return out
+
+
+@helion.kernel(autotune_effort="none", static_shapes=True)
+def inband_partial_polls_kernel(
+    symm: torch.Tensor,
+    b: torch.Tensor,
+    c: torch.Tensor,
+    rows: torch.Tensor,
+    x: torch.Tensor,
+    group_name: hl.ProcessGroupName,
+) -> torch.Tensor:
+    peers = _remote_views(symm, group_name)
+    b_peers = _remote_views(b, group_name)
+    c_peers = _remote_views(c, group_name)
+    out = torch.empty_like(symm)
+    for tile in hl.tile(symm.size(0)):
+        symm[tile] = x[tile]
+        b[tile] = x[tile]
+        c[tile] = x[tile]
+    # Every rank polls symm in full, b only from rank 0, c at data-dependent rows.
+    for tile in hl.tile(symm.size(0)):
+        acc = b_peers[0][tile]
+        for r, peer in enumerate(peers):
+            acc = acc + peer[tile] + c_peers[r][rows[tile]]
         out[tile] = acc
     return out
 
@@ -869,14 +898,37 @@ class TestDistributed(TestCase, MultiProcessTestCase):
     @skipIfNotCUDA()
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
-    @parametrize("variant", ("inband", "R1", "R1-ws"))
-    @parametrize("pipeline", ("static", "dynamic"))
-    @parametrize("dtype", (torch.float32, torch.bfloat16))
+    # variant: each transport (tagged and untagged inband words, peer counters
+    # with and without warp specialization); pipeline: the static and dynamic
+    # schedules order the done barrier differently; dtype: one element a word
+    # (fp32 tagged) against packed lanes. All pairs, not the product: each case
+    # spawns a world of interpreters.
+    @parametrize(
+        "variant,pipeline,dtype",
+        pairwise(
+            variant=("inband", "inband-untagged", "R1", "R1-ws"),
+            pipeline=("static", "dynamic"),
+            dtype=(torch.float32, torch.bfloat16),
+        ),
+    )
     def test_pipelined_allreduce_replays(
         self, variant: str, pipeline: str, dtype: torch.dtype
     ) -> None:
         if variant == "R1-ws" and torch.cuda.get_device_capability() < (10, 0):
             self.skipTest("warp specialization needs sm100")
+        # Untagged words: the three re-armed slots must keep skewed launches
+        # apart too, and 128-element tiles (32 or 64 words for 128 threads) put
+        # copies of each word in a replicated layout, all landing in their launch.
+        # Some lanes hold the key's own NaN, which would encode as unwritten
+        # (and hang) without its remap; their sums are NaN.
+        key = tile_dependency.UNTAGGED_KEYS[dtype] - (1 << 8 * dtype.itemsize)
+        bits = torch.int16 if dtype.itemsize == 2 else torch.int32
+        keys = (
+            {"cross_loop_inband_untagged": [True], "block_sizes": [128, 128]}
+            if "untagged" in variant
+            else {}
+        )
+        variant = variant.removesuffix("-untagged")
         self._init_process()
         group = dist.group.WORLD
         world, n = self.world_size, 4096
@@ -887,7 +939,7 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         # mixups in packed words.
         lane = torch.arange(n, device=self.device, dtype=dtype) % 16
         args = (symm, x, group.group_name, variant.removesuffix("-ws"), world)
-        bound = _with_pipeline(pipelined_allreduce_kernel, args, pipeline)
+        bound = _with_pipeline(pipelined_allreduce_kernel, args, pipeline, **keys)
         if variant == "R1-ws":
             config = bound.config_spec.default_config().config
             ws = {
@@ -905,6 +957,7 @@ class TestDistributed(TestCase, MultiProcessTestCase):
             # launch's values, which the done barrier orders.
             torch.cuda._sleep(100_000 * ((self.rank + step) % world))
             x.copy_(lane + 4 * step + self.rank)
+            x.view(bits)[::97] = key
             if replay:
                 graph.replay()
                 outs.append(graph_out.clone())
@@ -922,7 +975,8 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         torch.cuda.synchronize()
         for step, out in enumerate(outs):
             expected = world * (lane + 4 * step) + world * (world - 1) // 2
-            torch.testing.assert_close(out, expected, rtol=0, atol=0)
+            expected[::97] = float("nan")
+            torch.testing.assert_close(out, expected, rtol=0, atol=0, equal_nan=True)
         self._cleanup_process()
 
     @skipIfNotCUDA()
@@ -2096,6 +2150,83 @@ class TestDistributedTileDependencies(TestCase):
         self.assertIn("tl.reshape(tl.join(tl.cast(tl.cast(inband_word", code)
         self.assertNotIn("% 2, tl.uint64) * 16", code)
         self.assertIn(f"(x, {2 * world * 2048 + 1}, torch.uint64, True)", code)
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    @parametrize(
+        "dtype", (torch.bfloat16, torch.float16, torch.float32, torch.float8_e4m3fn)
+    )
+    def test_inband_untagged_words(self, dtype: torch.dtype) -> None:
+        world, n = 4, 4096
+        symm, x = torch.zeros(2, n, device=DEVICE, dtype=dtype)
+        group = self._world(world, pipelined_allreduce_kernel)
+        self.addCleanup(pipelined_allreduce_kernel.reset)
+        bound = pipelined_allreduce_kernel.bind((symm, x, group, "inband", world))
+        config = bound.config_spec.default_config().config
+        # One candidate, off by default; a config saved before the key existed
+        # keeps the epoch words too.
+        self.assertEqual(config["cross_loop_inband_untagged"], [False])
+        old = {k: v for k, v in config.items() if k != "cross_loop_inband_untagged"}
+        tagged = bound.to_triton_code(helion.Config(**old))
+        self.assertIn("tile_dependency_peer_epoch << 32", tagged)
+        self.assertNotIn("fence.acq_rel.gpu", tagged)
+        code = bound.to_triton_code(
+            helion.Config(**{**config, "cross_loop_inband_untagged": [True]})
+        )
+        lanes, bits = 8 // dtype.itemsize, 8 * dtype.itemsize
+        ones = sum(1 << (bits * i) for i in range(lanes))
+        # A word packs 8 bytes of elements and no epoch: three launch slots of
+        # half the tagged words each.
+        self.assertIn(f"(x, {3 * world * n // lanes + 1}, torch.uint64, True)", code)
+        self.assertNotIn("tile_dependency_peer_epoch << 32", code)
+        # Pushes are the tagged words' 16-byte stores, one asm per rank, into
+        # this launch's slot; no zeroing, fence or atomics on the push side.
+        self.assertEqual(code.count("st.relaxed.sys.global.v2.u64"), world)
+        self.assertIn("tile_dependency_peer_epoch % 3", code)
+        self.assertNotIn("tl.atomic_", code)
+        self.assertNotIn("fence.acq_rel", code)
+        # The poll re-arms what it read in the previous launch's slot.
+        self.assertIn("tl.where(tile_dependency_peer_epoch % 3 == 0, 2, -1)", code)
+        self.assertEqual(code.count("& 0)"), world)  # one poll a rank
+        # Lanes encode x ^ key (the key's own NaN as key ^ sign) and decode by
+        # xor with the key; polls wait while a lane is zero.
+        key = tile_dependency.UNTAGGED_KEYS[dtype]
+        k = f"tl.full([], {key}, tl.uint{bits})"
+        spare = f"tl.full([], {key ^ 1 << bits - 1}, tl.uint{bits})"
+        self.assertIn(f" == {k}, {spare}, ", code)
+        self.assertIn(f"tl.uint{bits}) ^ {k}, ", code)
+        self.assertIn(f"sub.u64 t, $0, 0x{ones:016x};", code)
+        # (The unparsed code drops the redundant parentheses around the mask.)
+        self.assertIn(f">> {bits - 1} & {ones} != 0", code)
+        self.assertNotIn("setp.ne.b32 p, hi", code)
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    def test_inband_untagged_needs_full_polls(self) -> None:
+        world, n = 4, 4096
+        # Separate allocations: a peer view starts at its symmetric allocation.
+        symm, b, c, x = (torch.zeros(n, device=DEVICE) for _ in range(4))
+        rows = torch.arange(n, device=DEVICE).flip(0)
+        group = self._world(world, inband_partial_polls_kernel)
+        self.addCleanup(inband_partial_polls_kernel.reset)
+        with self.assertLogs(tile_dependency.log, "INFO") as logs:
+            bound = inband_partial_polls_kernel.bind((symm, b, c, rows, x, group))
+        # Only rank 0's b is read, and c at rows only known at run time, so a
+        # word a rank never reads would never be re-armed: only symm is a
+        # candidate, and b and c keep their epochs.
+        lines = sorted(logs.output)
+        self.assertEqual(len(lines), 3)
+        never = "use inband (epoch words: a rank may not poll every word)"
+        self.assertIn(f"on b/b_peers {never}", lines[0])
+        self.assertIn(f"on c/c_peers {never}", lines[1])
+        self.assertIn("on peers/symm use inband (untagged candidate)", lines[2])
+        config = bound.config_spec.default_config().config
+        code = bound.to_triton_code(
+            helion.Config(**{**config, "cross_loop_inband_untagged": [True]})
+        )
+        # symm travels untagged (2 fp32 a word, three slots).
+        words = 3 * world * n // 2 + 2 * (2 * world * n) + 1
+        self.assertIn(f"(x, {words}, torch.uint64, True)", code)
+        self.assertIn("tile_dependency_peer_epoch << 32", code)
+        self.assertIn("tile_dependency_peer_epoch % 3", code)
 
     @skipIfRefEager("tile dependencies are built only in compiled mode")
     @parametrize("world", (2, 4, 8))

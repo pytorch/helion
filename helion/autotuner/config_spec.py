@@ -796,6 +796,7 @@ _BACKEND_GATED_GENERIC_KEYS: frozenset[str] = frozenset(
         "cross_loop_tmem_prefetch",
         "cross_loop_cluster_edges",
         "cross_loop_dry_passes",
+        "cross_loop_inband_untagged",
         "load_cache_modifiers",
         "store_cache_modifiers",
         "host_tensor_descriptors",
@@ -1194,6 +1195,9 @@ class ConfigSpec:
         # implicit cross-root dependency the backend can lower (CuTe offers
         # the barrier pipeline only).
         self.cross_loop_pipeline: EnumFragment | None = None
+        # One entry per inband allocation whose words may travel untagged
+        # (TileDependencyGraph.untagged_candidate_ids, sorted); True sends them so.
+        self.cross_loop_inband_untagged = ListOf(BooleanFragment(), length=0)
         # Whether a cross-rank dependency transports a scatter in band: its
         # guard-skipped tasks need static or claimed (gluon ring) roots.
         self.inband_scatter: bool = False
@@ -2341,6 +2345,7 @@ class ConfigSpec:
             "load_eviction_policies",
             "load_cache_modifiers",
             "store_cache_modifiers",
+            "cross_loop_inband_untagged",
             "indexing",
             "atomic_indexing",
         ):
@@ -2359,6 +2364,7 @@ class ConfigSpec:
             "store_cache_modifiers",
             "cross_loop_cluster_edges",
             "cross_loop_dry_passes",
+            "cross_loop_inband_untagged",
             "indexing",
             "atomic_indexing",
             "pallas_load_buffer_count",
@@ -2418,6 +2424,11 @@ class ConfigSpec:
                 "cluster candidate",
             ),
             ("cross_loop_dry_passes", self.cross_loop_dry_passes, "waiting root"),
+            (
+                "cross_loop_inband_untagged",
+                self.cross_loop_inband_untagged,
+                "untagged candidate",
+            ),
         ):
             if not (self.supports_config_key(key) and flags.length > 0):
                 config.pop(key, None)
@@ -3192,6 +3203,7 @@ class ConfigSpec:
             for key, flags in (
                 ("cross_loop_cluster_edges", self.cross_loop_cluster_edges),
                 ("cross_loop_dry_passes", self.cross_loop_dry_passes),
+                ("cross_loop_inband_untagged", self.cross_loop_inband_untagged),
             )
             if self.supports_config_key(key) and flags.length > 0
         )
@@ -3516,6 +3528,7 @@ class ConfigSpec:
             "load_eviction_policies",
             "load_cache_modifiers",
             "store_cache_modifiers",
+            "cross_loop_inband_untagged",
             "indexing",
             "atomic_indexing",
             "pallas_load_buffer_count",

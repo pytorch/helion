@@ -4734,6 +4734,9 @@ class TileDependencyGraph:
     inband_allocation_ids: frozenset[int] = frozenset()
     # Roots of inband stores whose words every rank's launch polls in full.
     inband_read_roots: frozenset[int] = frozenset()
+    # Inband allocations whose words may travel untagged (_untagged_failure);
+    # codegen sends the ones config cross_loop_inband_untagged enables so.
+    untagged_candidate_ids: frozenset[int] = frozenset()
     # Symmetric allocations whose pushes may travel as tagged words (rules T1-T3,
     # T5 of _tagged_failure); codegen picks the ones it enables for a config.
     tagged_candidate_ids: frozenset[int] = frozenset()
@@ -5026,8 +5029,9 @@ class TileDependencyGraph:
             edges=edges,
         )
 
-    def rank_digest(self) -> str:
-        """Hash the facts every rank must agree on; owners and regions may differ."""
+    def rank_digest(self, untagged: tuple[object, ...] = ()) -> str:
+        """Hash the facts every rank must agree on; owners and regions may differ,
+        so codegen adds the untagged mailboxes those regions chose."""
         peer = self.peer_counter_graph()
         facts = (
             tuple(
@@ -5066,6 +5070,7 @@ class TileDependencyGraph:
                     }
                 )
             ),
+            *((untagged,) if untagged else ()),
         )
         return hashlib.sha256(repr(facts).encode()).hexdigest()[:16]
 
@@ -6930,6 +6935,44 @@ def _scatter_tile(
     )
 
 
+# Per element type, the bits an untagged lane reserves for "unwritten": a negative
+# NaN (payload 1 where the type has payload bits to spare; float8_e4m3fn's only
+# negative NaN, 0xFF, which a cast of a negative NaN does produce). A lane stores
+# enc(x) = bits(x) ^ key, zero only while unwritten; the key's own NaN travels as
+# key ^ sign, the same NaN made positive, so every other value, -0 included,
+# arrives bit for bit. Types with one NaN encoding (fnuz float8, e8m0) have none
+# to spare.
+UNTAGGED_KEYS: dict[torch.dtype, int] = {
+    torch.float32: 0xFF800001,
+    torch.float16: 0xFC01,
+    torch.bfloat16: 0xFF81,
+    torch.float8_e5m2: 0xFD,
+    torch.float8_e4m3fn: 0xFF,
+}
+
+
+def _untagged_failure(
+    accesses: list[TileAccess],
+    task_families: tuple[TaskFamily, ...],
+    read_in_full: bool,
+) -> str | None:
+    """Why an inband allocation's words cannot travel untagged, else None.
+
+    A reader zeroes the untagged words it read in the previous launch's slot,
+    and a source writes a slot again three launches on, after reading this
+    rank's pushes of the launch in between: every rank must surely poll every
+    word, every launch.
+    """
+    store = next(access for access in accesses if access.kind == "store")
+    if _scatter_position(store) is not None:
+        return "a scatter (its fallback words carry the epoch)"
+    if store.dtype not in UNTAGGED_KEYS:
+        return f"{store.dtype}: no spare NaN encoding to mean unwritten"
+    if not read_in_full or not _surely_read_in_full(store, accesses, task_families):
+        return "a rank may not poll every word"
+    return None
+
+
 def _polls_every_rank(
     accesses: tuple[TileAccess, ...],
     inband_allocation_ids: set[int],
@@ -7280,8 +7323,9 @@ def build_tile_dependency_graph(
         if access.allocation_id in crossing_allocation_ids
         and access.allocation_id not in inband_allocation_ids
     }
-    inband_read_roots = {
-        access.root
+    # R6 covers each polled rank; polls at root on every rank read every task.
+    inband_read_ids = {
+        allocation_id
         for allocation_id in inband_allocation_ids
         if _polls_every_rank(
             tuple(accesses_by_allocation[allocation_id]),
@@ -7295,12 +7339,24 @@ def build_tile_dependency_graph(
             for access in accesses_by_allocation[allocation_id]
             if access.owner_rank is not None
         )
+    }
+    inband_read_roots = {
+        access.root
+        for allocation_id in inband_read_ids
         for access in accesses_by_allocation[allocation_id]
         if access.kind == "store"
         and access.root not in keyed_peer_roots
         and _surely_read_in_full(
             access, accesses_by_allocation[allocation_id], task_families
         )
+    }
+    untagged_failures = {
+        allocation_id: _untagged_failure(
+            accesses_by_allocation[allocation_id],
+            task_families,
+            allocation_id in inband_read_ids,
+        )
+        for allocation_id in inband_allocation_ids
     }
     # Tagged candidates among the keyed peer counters.
     tagged_failures = {
@@ -7317,10 +7373,15 @@ def build_tile_dependency_graph(
     }
     for allocation_id, failure in sorted(failures.items()):
         tagged = tagged_failures.get(allocation_id, "")
+        untagged = untagged_failures.get(allocation_id)
         log.info(
             "Cross-rank dependencies on %s use %s",
             "/".join(sorted(tensor_names_by_allocation.get(allocation_id, ()))),
-            "inband"
+            (
+                "inband (untagged candidate)"
+                if untagged is None
+                else f"inband (epoch words: {untagged})"
+            )
             if not failure
             else f"peer_counter ({failure}); tagged candidate"
             if tagged is None
@@ -7335,6 +7396,11 @@ def build_tile_dependency_graph(
         noncanonical_axes=noncanonical_task_origin_block_ids,
         inband_allocation_ids=frozenset(inband_allocation_ids),
         inband_read_roots=frozenset(inband_read_roots),
+        untagged_candidate_ids=frozenset(
+            allocation_id
+            for allocation_id, failure in untagged_failures.items()
+            if failure is None
+        ),
         tagged_candidate_ids=frozenset(
             allocation_id
             for allocation_id, failure in tagged_failures.items()

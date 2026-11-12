@@ -214,6 +214,9 @@ class TritonBackend(Backend):
             return self.uses_triton_compiler and not _compat.is_hip()
         if key in ("load_cache_modifiers", "store_cache_modifiers"):
             return True
+        if key == "cross_loop_inband_untagged":
+            # distributed_ops lowers the in-band transport.
+            return self.uses_triton_compiler and not _compat.is_hip()
         if key == "waves_per_eu":
             return _compat.is_hip()
         if key == "matrix_instr_nonkdim":
@@ -785,9 +788,18 @@ class TritonBackend(Backend):
                 # it covers the transports this config picked (tagged or not).
                 graph = tagged_codegen_graph(device_fn)
                 assert graph is not None
-                out.append(f"_persistent_state_rank_digest={graph.rank_digest()!r}")
-                # And that their tagged pushes cover each tensor once (T7).
                 peer = device_fn.peer_state
+                untagged = tuple(
+                    (allocation_id, box.lanes, box.lane_bits)
+                    for allocation_id, box in sorted(
+                        peer.mailboxes.items() if peer is not None else ()
+                    )
+                    if box.lane_bits is not None
+                )
+                out.append(
+                    f"_persistent_state_rank_digest={graph.rank_digest(untagged)!r}"
+                )
+                # And that their tagged pushes cover each tensor once (T7).
                 if peer is not None and peer.mirrors:
                     shares = tuple(peer.mirrors[i].share for i in sorted(peer.mirrors))
                     out.append(f"_persistent_state_rank_shares={shares!r}")

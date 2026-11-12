@@ -203,6 +203,7 @@ _BASE_VALID_KEYS = """
     cross_loop_tmem_prefetch
     cross_loop_cluster_edges
     cross_loop_dry_passes
+    cross_loop_inband_untagged
 """
 
 # ``BACKEND_SPECIFIC_KEYS``.
@@ -367,6 +368,7 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cross_loop_tmem_prefetch
     cross_loop_cluster_edges
     cross_loop_dry_passes
+    cross_loop_inband_untagged
 """
 
 # ``_CUTE_IMPLICIT_DEFAULT_KEYS``.
@@ -598,7 +600,7 @@ _BASE_TRITON_ACCEPTED = """
     num_sm_multiplier num_stages num_warps pallas_internal_scratch pid_type
     range_flattens range_multi_buffers range_num_stages range_unroll_factors
     range_warp_specializes reduction_fusion reduction_loops static_ranges
-    store_cache_modifiers
+    store_cache_modifiers cross_loop_inband_untagged
 """
 
 # The same census for ``TileIRBackend``.
@@ -622,14 +624,16 @@ _BASE_PALLAS_ACCEPTED = """
 
 # The keys ``TritonBackend.supports_config_key`` decides by the device the
 # row runs on: ``host_tensor_descriptors`` needs a CUDA device of capability
-# >= 9.0, ``cross_loop_pipeline`` and ``cross_loop_dry_passes`` are off on
-# ROCm, ``waves_per_eu`` / ``matrix_instr_nonkdim`` / ``xcd_remap`` are AMD
+# >= 9.0, ``cross_loop_pipeline``, ``cross_loop_dry_passes`` and
+# ``cross_loop_inband_untagged`` are off on ROCm, ``waves_per_eu`` /
+# ``matrix_instr_nonkdim`` / ``xcd_remap`` are AMD
 # tunables accepted only there, and the MTIA tunables only on MTIA.
 _DEVICE_DECIDED_KEYS = frozenset(
     {
         "host_tensor_descriptors",
         "cross_loop_pipeline",
         "cross_loop_dry_passes",
+        "cross_loop_inband_untagged",
         "matrix_instr_nonkdim",
         "waves_per_eu",
         "xcd_remap",
