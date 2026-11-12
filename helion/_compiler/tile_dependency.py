@@ -5724,6 +5724,7 @@ def _rectangular_overlap_sources(
         query_ranges = {axis: values for axis, *values in query_piece.target_ranges}
         lower = {axis: [] for axis in owner.source_domain.axis_order}
         upper = {axis: [] for axis in owner.source_domain.axis_order}
+        disjoint = False
         for allocation_axis in owner.target_domain.axis_order:
             owner_begin, owner_end, owner_step = owner_ranges[allocation_axis]
             query_begin, query_end, query_step = query_ranges[allocation_axis]
@@ -5734,6 +5735,18 @@ def _rectangular_overlap_sources(
                 and sympy.simplify(owner_end - allocation_counts[allocation_axis]) == 0
             ):
                 continue
+            fixed = _constant_range(owner_begin, owner_end)
+            if fixed is not None:
+                # A range no owner coordinate moves (a fixed index on a view
+                # dimension) constrains no owner item: it only decides whether
+                # a fixed query range on that axis meets it at all.
+                query_fixed = _constant_range(query_begin, query_end)
+                if query_fixed is None:
+                    return None
+                if query_fixed[0] < fixed[1] and fixed[0] < query_fixed[1]:
+                    continue
+                disjoint = True
+                break
             interval = _single_axis_interval(
                 # pyrefly: ignore [bad-argument-type]
                 owner_begin,
@@ -5770,6 +5783,8 @@ def _rectangular_overlap_sources(
             )
             # pyrefly: ignore [unsupported-operation]
             upper[owner_axis].append(sympy.ceiling((query_end - offset) / stride))
+        if disjoint:
+            continue
         pieces.append(
             _CoordinateRelationPiece(
                 query_piece.source_bounds_items,
@@ -5788,7 +5803,29 @@ def _rectangular_overlap_sources(
                 ),
             )
         )
+    if not pieces:
+        # Every piece pair is disjoint (fixed indices that never meet). An empty
+        # relation would claim no source; None leaves the edge to the dense path.
+        return None
     return CoordinateRelation(query.source_domain, owner.source_domain, tuple(pieces))
+
+
+def _constant_range(
+    begin: sympy.Expr | int, end: sympy.Expr | int
+) -> tuple[int, int] | None:
+    """``(begin, end)`` of an integer range that depends on no coordinate."""
+    begin, end = (
+        sympy.simplify(sympy.sympify(begin)),
+        sympy.simplify(sympy.sympify(end)),
+    )
+    if (
+        begin.free_symbols
+        or end.free_symbols
+        or begin.is_integer is not True
+        or end.is_integer is not True
+    ):
+        return None
+    return int(begin), int(end)
 
 
 def _dense_overlap_sources(
