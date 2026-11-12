@@ -1185,6 +1185,9 @@ class TestLLMTransport(TestCase):
                 effort_level="max",
             )
         self.assertEqual(captured["payload"]["reasoning"], {"effort": "xhigh"})
+        # Responses counts reasoning against max_output_tokens, so the request
+        # reserves the xhigh reasoning budget (65536) + visible output (512).
+        self.assertEqual(captured["payload"]["max_output_tokens"], 66048)
 
         # Older OpenAI models without xhigh support fall back to "high" for the
         # provider-neutral "max" knob.
@@ -1204,6 +1207,7 @@ class TestLLMTransport(TestCase):
                 effort_level="max",
             )
         self.assertEqual(captured["payload"]["reasoning"], {"effort": "high"})
+        self.assertEqual(captured["payload"]["max_output_tokens"], 33280)
 
         # Modern Claude models (Opus 4.5+, Sonnet 4.6+) use adaptive thinking;
         # the model self-picks its budget so no budget_tokens is sent. Required on
@@ -1252,6 +1256,40 @@ class TestLLMTransport(TestCase):
         )
         self.assertEqual(captured["payload"]["max_tokens"], 8704)
         self.assertNotIn("output_config", captured["payload"])
+
+    def test_incomplete_openai_response_raises(self):
+        """A Responses payload cut off at max_output_tokens raises instead of
+        returning text that cannot parse."""
+        from helion.autotuner.llm.transport import call_provider
+        from helion.autotuner.llm.transport import extract_openai_response_text
+
+        response = {
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [{"content": [{"type": "text", "text": '{"configs": [{'}]}],
+        }
+        with (
+            patch("helion.autotuner.llm.transport._post_json", return_value=response),
+            self.assertRaisesRegex(
+                RuntimeError, "Incomplete.*max_output_tokens.*HELION_LLM_EFFORT_LEVEL"
+            ),
+        ):
+            call_provider(
+                "openai_responses",
+                model="gpt-5.5",
+                api_base="https://api.openai.com",
+                api_key="openai-test-key",
+                messages=[{"role": "user", "content": "suggest configs"}],
+                max_output_tokens=512,
+                request_timeout_s=120.0,
+                effort_level="high",
+            )
+        # Other reasons get no token-budget hint.
+        filtered = {**response, "incomplete_details": {"reason": "content_filter"}}
+        with self.assertRaises(RuntimeError) as raised:
+            extract_openai_response_text(filtered)
+        self.assertIn("content_filter", str(raised.exception))
+        self.assertNotIn("HELION_LLM_EFFORT_LEVEL", str(raised.exception))
 
     def test_transport_fast_mode_payload_and_headers(self):
         """Fast mode sets the Anthropic beta header + speed body field, and is
