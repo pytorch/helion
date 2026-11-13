@@ -2723,6 +2723,7 @@ def emit_cross_loop_schedule(
     if not uses_packet_dispatch:
         assert state_arg is not None
         result: list[ast.stmt] = [
+            *([] if timeline is None else [timeline.clock()]),
             statement_from_string(f"{epoch_var} = tl.load({state_arg} + {worker}) + 1"),
             *([] if timeline is None else timeline.setup(epoch_var, worker)),
         ]
@@ -2797,6 +2798,7 @@ def emit_cross_loop_schedule(
         )
         period = f"tl.cast({packet_count}, tl.uint64)"
         result = [
+            *([] if timeline is None else [timeline.clock()]),
             statement_from_string(
                 f"{raw_dispatch_ticket} = tl.atomic_add("
                 f"{dispatch_ticket_arg}, 1, sem='relaxed', scope='gpu')"

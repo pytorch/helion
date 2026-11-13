@@ -3,7 +3,8 @@ setting), which ``helion.runtime.timeline`` writes out.
 
 Each launch writes one section of a launcher-owned buffer, picked by its epoch,
 so the last ``EPOCHS`` launches stay and CUDA graph replays need no host work.
-A section holds, per worker, ``(epoch << 32 | smid, entry, exit)`` and, per
+A section holds, per worker, ``(epoch << 32 | smid, entry, exit)`` (entry: when
+its grid wait released, before it reads the launch state) and, per
 task of every root, ``(epoch << 32 | worker + 1, start, ready, end)``: ``ready``
 is when the task's last task-level scheduler wait ended. A continuation task
 runs inside the task whose arrival completed it, so its window nests there.
@@ -72,6 +73,8 @@ class Timeline:
     buffer: str
     slot: int
     base: str
+    # The clock read as the grid wait releases.
+    released: str
     # root -> (its first task's word in a section, its task count)
     tasks: dict[int, tuple[int, int]]
     meta: TimelineMeta
@@ -105,6 +108,9 @@ class Timeline:
             buffer=buffer,
             slot=len(device_function.triton_persistent_state_specs) - 1,
             base=device_function.new_var("tile_dependency_timeline_base", dce=False),
+            released=device_function.new_var(
+                "tile_dependency_timeline_released", dce=False
+            ),
             tasks=tasks,
             meta={
                 "prefix": os.fspath(prefix),
@@ -119,8 +125,14 @@ class Timeline:
             },
         )
 
+    def clock(self) -> ast.stmt:
+        """Read the clock right after the grid wait, ahead of the launch state."""
+        self.device_function.sync_roles[self.released] = SyncRole("stamp")
+        return statement_from_string(f"{self.released} = {_NOW}")
+
     def setup(self, epoch: str, worker: str) -> list[ast.stmt]:
-        """This launch's section and the worker's entry stamps."""
+        """This launch's section and the worker's entry stamps (after
+        ``clock``)."""
         index = f"tl.cast({epoch}, tl.int64)"
         word = f"{worker} * {WORKER_WORDS}"
         return [
@@ -128,7 +140,7 @@ class Timeline:
                 f"{self.base} = {self.buffer} + {index} % {EPOCHS} * {self.meta['section']}"
             ),
             self._max(word, f"({index} << 32) | {_SMID}"),
-            self._max(f"{word} + 1", _NOW),
+            self._max(f"{word} + 1", self.released),
         ]
 
     def exit(self, worker: str) -> list[ast.stmt]:
