@@ -4269,6 +4269,7 @@ _CUTE_HEURISTIC_ORDER = (
     "cute_tcgen05_cluster_m2_ffi",
     "cute_tcgen05_dense_schedules",
     "cute_tcgen05_cluster_m2",
+    "cute_tcgen05_default_tile",
     "cute_tcgen05_grouped_worklist",
     "cute_tcgen05_grouped_static_common_k",
     "cute_tcgen05_grouped_dynamic_bk64",

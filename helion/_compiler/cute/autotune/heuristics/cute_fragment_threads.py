@@ -29,7 +29,7 @@ THREADS = (*LEGACY_COVERAGE_THREADS, 1024)
 class CuteFragmentThreadsHeuristic(AutotunerHeuristic):
     name = KEY
     backend = "cute"
-    priority = 61
+    priority = 62
 
     @classmethod
     def register_facts(

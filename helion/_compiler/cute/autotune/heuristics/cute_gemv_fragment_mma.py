@@ -47,7 +47,7 @@ class CuteGemvFragmentMmaHeuristic(AutotunerHeuristic):
     """Eight row threads x four K threads, 32-byte packets, the dot on MMA fragments."""
 
     name = "cute_gemv_fragment_mma"
-    priority = 43
+    priority = 44
     backend = "cute"
 
     @classmethod

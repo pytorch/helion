@@ -1262,7 +1262,7 @@ _BOOLEAN_KEEP_FIELD = KnobCoverage(rollback=False)
 SCAN = FragmentKnob(
     "cute_fragment_scan",
     "scan",
-    58,
+    59,
     (_has_scan, discovery_supported),
     precheck=_kernel_has_scan,
     coverage=KnobCoverage(
@@ -1277,7 +1277,7 @@ SCAN = FragmentKnob(
 REDUCTION = FragmentKnob(
     "cute_fragment_reduction",
     "reduction",
-    59,
+    60,
     (_has_warp_reduction, discovery_supported),
     precheck=_kernel_has_warp_reduction,
     coverage=KnobCoverage(
@@ -1293,7 +1293,7 @@ REDUCTION = FragmentKnob(
 PRIVATE_SCALAR_LOOPS = FragmentKnob(
     "cute_fragment_private_scalar_loops",
     "private_scalar_loops",
-    62,
+    63,
     (fragment_supported, _has_private_scalar_loops),
     root_ids_attr="cute_fragment_private_scalar_loop_root_ids",
     coverage=_BOOLEAN_KEEP_FIELD,
@@ -1301,7 +1301,7 @@ PRIVATE_SCALAR_LOOPS = FragmentKnob(
 REGISTER_LOADS = FragmentKnob(
     "cute_fragment_register_loads",
     "register_loads",
-    63,
+    64,
     (fragment_supported, _has_lane_private_load),
     root_ids_attr="cute_fragment_register_load_root_ids",
     coverage=KnobCoverage(rollback=False, plan=_thread_coupled_plan(None)),
@@ -1309,7 +1309,7 @@ REGISTER_LOADS = FragmentKnob(
 WARP_RESULTS = FragmentKnob(
     "cute_fragment_warp_results",
     "warp_results",
-    64,
+    65,
     roots=_warp_result_roots,
     root_ids_attr="cute_fragment_warp_result_root_ids",
     coverage=KnobCoverage(
@@ -1320,7 +1320,7 @@ WARP_RESULTS = FragmentKnob(
 PRODUCER_CACHE = FragmentKnob(
     "cute_fragment_producer_cache",
     "producer_cache",
-    65,
+    66,
     (fragment_supported, _has_producer_cache_candidates),
     precheck=_kernel_has_producer_cache_candidates,
     coverage=KnobCoverage(rollback=False, resource_override=_producer_cache_resource),
@@ -1328,14 +1328,14 @@ PRODUCER_CACHE = FragmentKnob(
 WARP_SCAN = FragmentKnob(
     "cute_fragment_warp_scan",
     "warp_scan",
-    66,
+    67,
     roots=_warp_scan_roots,
     coverage=_BOOLEAN_KEEP_FIELD,
 )
 TOPK_NETWORK = FragmentKnob(
     "cute_fragment_topk_network",
     "topk_network",
-    67,
+    68,
     roots=_topk_network_roots,
     coverage=_BOOLEAN_KEEP_FIELD,
 )
@@ -1353,14 +1353,14 @@ CTA_TOPK = FragmentKnob(
 ATOMIC_AGGREGATION = FragmentKnob(
     "cute_fragment_atomic_aggregation",
     "atomic_aggregation",
-    68,
+    69,
     (_has_private_int32_updates, discovery_supported),
     coverage=_BOOLEAN_KEEP_FIELD,
 )
 LOCAL_ATOMIC_REGISTERS = FragmentKnob(
     "cute_fragment_local_atomic_registers",
     "local_atomic_registers",
-    69,
+    70,
     roots=_local_atomic_register_roots,
     coverage=KnobCoverage(
         rollback=False,
@@ -1370,7 +1370,7 @@ LOCAL_ATOMIC_REGISTERS = FragmentKnob(
 REGISTER_SNAPSHOTS = FragmentKnob(
     "cute_fragment_register_snapshots",
     "register_snapshots",
-    70,
+    71,
     roots=_register_snapshot_roots,
     coverage=KnobCoverage(
         rollback=False,
@@ -1381,7 +1381,7 @@ REGISTER_SNAPSHOTS = FragmentKnob(
 PUBLISHED_SCALARS = FragmentKnob(
     "cute_fragment_published_scalars",
     "published_scalars",
-    71,
+    72,
     (fragment_supported, _has_scalar_sources),
     root_ids_attr="cute_fragment_published_scalar_root_ids",
     coverage=_BOOLEAN_KEEP_FIELD,
@@ -1389,14 +1389,14 @@ PUBLISHED_SCALARS = FragmentKnob(
 SKIP_ZERO_ATOMICS = FragmentKnob(
     "cute_fragment_skip_zero_atomics",
     "skip_zero_atomics",
-    72,
+    73,
     (_has_dead_zero_int32_updates, discovery_supported),
     coverage=_BOOLEAN_KEEP_FIELD,
 )
 ATOMIC_CONSUMER_FUSION = FragmentKnob(
     "cute_fragment_atomic_consumer_fusion",
     "atomic_consumer_fusion",
-    73,
+    74,
     (fragment_supported, _has_atomic_consumers),
     coverage=KnobCoverage(admit=_consumer_fusion_admits),
 )
@@ -1405,7 +1405,7 @@ ATOMIC_CONSUMER_FUSION = FragmentKnob(
 INTEGER_ATOMIC_EPOCHS = FragmentKnob(
     "cute_fragment_integer_atomic_epochs",
     "integer_atomic_epochs",
-    75,
+    76,
     (_has_integer_atomic_loops, fragment_supported),
     coverage=KnobCoverage(
         admit=_has_fragment_carrier,
@@ -1416,58 +1416,58 @@ INTEGER_ATOMIC_EPOCHS = FragmentKnob(
 PACKET_LOADS = FragmentKnob(
     "cute_fragment_packet_loads",
     "packet_loads",
-    76,
+    77,
     (fragment_supported, _has_packet_load),
     root_ids_attr="cute_fragment_packet_load_root_ids",
 )
 PADDED_ROWS = FragmentKnob(
     "cute_fragment_padded_rows",
     "padded_rows",
-    77,
+    78,
     (discovery_supported, _has_conflict_prone_tile),
 )
 UNROLLED_LOOPS = FragmentKnob(
     "cute_fragment_unrolled_loops",
     "unrolled_loops",
-    78,
+    79,
     (discovery_supported,),
 )
 VECTOR_IO = FragmentKnob(
     "cute_fragment_vector_io",
     "vector_io",
-    79,
+    80,
     (discovery_supported, _has_packet_window),
 )
 BATCHED_LOADS = FragmentKnob(
     "cute_fragment_batched_loads",
     "batched_loads",
-    80,
+    81,
     (discovery_supported, _has_two_host_loads),
 )
 SPLIT_K = FragmentKnob(
     "cute_fragment_split_k",
     "split_k",
-    81,
+    82,
     roots=_fp32_dot_roots,
     coverage=KnobCoverage(carrier=_tf32_carrier(False), plan=_pinned_plan(False)),
 )
 MMA_ROWS = FragmentKnob(
     "cute_fragment_mma_rows",
     "mma_rows",
-    82,
+    83,
     roots=_fp32_dot_roots,
     coverage=KnobCoverage(carrier=_tf32_carrier(True), plan=_pinned_plan(True)),
 )
 SLAB_LOADS = FragmentKnob(
     "cute_fragment_slab_loads",
     "slab_loads",
-    83,
+    84,
     (discovery_supported, _has_slab_plan),
 )
 REGISTER_PRODUCERS = FragmentKnob(
     "cute_fragment_register_producers",
     "register_producers",
-    84,
+    85,
     roots=_register_producer_roots,
     root_ids_attr="cute_fragment_register_producer_root_ids",
     coverage=KnobCoverage(
@@ -1477,7 +1477,7 @@ REGISTER_PRODUCERS = FragmentKnob(
 SCAN_EXPORTS = FragmentKnob(
     "cute_fragment_scan_exports",
     "scan_exports",
-    85,
+    86,
     (_has_completed_scan,),
     coverage=KnobCoverage(
         carrier=_parent_carrier(("cute_fragment_warp_scan", True)),
@@ -1487,7 +1487,7 @@ SCAN_EXPORTS = FragmentKnob(
 WARP_PRODUCER_REGIONS = FragmentKnob(
     "cute_fragment_warp_producer_regions",
     "warp_producer_regions",
-    86,
+    87,
     (_root_has_scan,),
     coverage=KnobCoverage(
         carrier=_parent_carrier(
@@ -1499,13 +1499,13 @@ WARP_PRODUCER_REGIONS = FragmentKnob(
 BOUNDED_GATHER = FragmentKnob(
     "cute_fragment_bounded_gather",
     "bounded_gather",
-    87,
+    88,
     roots=_bounded_gather_roots,
 )
 PURE_PRODUCER_REGIONS = FragmentKnob(
     "cute_fragment_pure_producer_regions",
     "pure_producer_regions",
-    88,
+    89,
     (fragment_supported, _root_plan_is_lazy),
 )
 
