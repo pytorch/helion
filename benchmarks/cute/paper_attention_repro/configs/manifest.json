@@ -1,0 +1,2716 @@
+{
+  "files": [
+    {
+      "mode": "forward",
+      "case_id": "causal.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/causal.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/causal.b4h16s2048d64.helion-cute.json",
+      "sha256": "45de69b45c8f1b9d40e7fe69b622c92cfbe68fe776587254c83dc2870de230cf",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "noop.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/noop.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/noop.b4h16s2048d64.helion-cute.json",
+      "sha256": "1cafda9d1f84c6a8f0786ebde63a552de7cee7c922be965d2e6ca8ff24592727",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "causal.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/causal.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/causal.b4h16s4096d64.helion-cute.json",
+      "sha256": "7f6dc8ff5c70106e12aab7ab1c85a4ce9404be03e65ae5024ee220c70f73aa4e",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "noop.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/noop.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/noop.b4h16s4096d64.helion-cute.json",
+      "sha256": "d7e17d2cfda202de2aabe1a142b16a477440008900bb5257acb030f5c880ef63",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "causal.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/causal.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/causal.b4h16s8192d64.helion-cute.json",
+      "sha256": "8417d1dff43f3f2e6e295ba6231e185369c4e02623d81c7be6a14ad788885f72",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "noop.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/noop.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/noop.b4h16s8192d64.helion-cute.json",
+      "sha256": "35a60fafaa38259d03fe42e19ceca24782ccef5011122c3aa8373acc643c73d4",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "mla-causal.b4h16s2048d192v128",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/mla-causal.b4h16s2048d192v128.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/mla-causal.b4h16s2048d192v128.helion-cute.json",
+      "sha256": "dc3d20e23607eb5a94ddff04ebca3c718feabb4dee62057d0e8b0777c358aa6b",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "gqa-causal.b4h32kv8s2048d128",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/gqa-causal.b4h32kv8s2048d128.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/gqa-causal.b4h32kv8s2048d128.helion-cute.json",
+      "sha256": "f8fd0f93d9cbe4417ac52708d0b47cf1e8c6fc829eeae5b25f9b9d3b6cc9f682",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "mla-causal.b4h16s4096d192v128",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/mla-causal.b4h16s4096d192v128.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/mla-causal.b4h16s4096d192v128.helion-cute.json",
+      "sha256": "67666c26444355f65d96fa19be4ff46880c7cb7658812bdf3a75be85a0f5cbe0",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "gqa-causal.b4h32kv8s4096d128",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/gqa-causal.b4h32kv8s4096d128.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/gqa-causal.b4h32kv8s4096d128.helion-cute.json",
+      "sha256": "911bd443669bff5768a4efcb5c09b1bed230fb45b2977b7d7ea83cea05bdab0a",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "mla-causal.b4h16s8192d192v128",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/mla-causal.b4h16s8192d192v128.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/mla-causal.b4h16s8192d192v128.helion-cute.json",
+      "sha256": "4d781e24a55b9508910247062f0fd454f1387cb3149853c91e9958158cc97bfa",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "gqa-causal.b4h32kv8s8192d128",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/gqa-causal.b4h32kv8s8192d128.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/gqa-causal.b4h32kv8s8192d128.helion-cute.json",
+      "sha256": "584fbbe81b6ab36b129838c8ce425a77539a2555a6af996c07ab05a0d0b14793",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "prefix-lm.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/prefix-lm.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/prefix-lm.b4h16s2048d64.helion-cute.json",
+      "sha256": "7059aaae98e1da4177e22b46dfe081219f1d7669563c81358ff454b669ed2780",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "sliding-window.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/sliding-window.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/sliding-window.b4h16s2048d64.helion-cute.json",
+      "sha256": "f8db273162e0a207ebe946f263f4c47291f74a1b5bc02df352838418787a0430",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "prefix-lm.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/prefix-lm.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/prefix-lm.b4h16s4096d64.helion-cute.json",
+      "sha256": "2692b4802c51add3b45f21a98fe271c88c39224e58203452fb7ccb6213ebc399",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "sliding-window.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/sliding-window.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/sliding-window.b4h16s4096d64.helion-cute.json",
+      "sha256": "724406fe04daff2c5fc30c1fb66b9e9186aadbe2708308e55aa9d1e8b5074578",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "prefix-lm.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/prefix-lm.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/prefix-lm.b4h16s8192d64.helion-cute.json",
+      "sha256": "ec1d6e0d79164440d058fd321fe2ba8532e7176a85ef166d80ca3f5d9fa6ba87",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "sliding-window.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/sliding-window.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/sliding-window.b4h16s8192d64.helion-cute.json",
+      "sha256": "49e401a88ff0b9e15fd87e3e696b667629ede6d783994391e3b2b673163a3225",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "alibi.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/alibi.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/alibi.b4h16s2048d64.helion-cute.json",
+      "sha256": "fb7f60fe1a87020ee880c1cc3864422f0c93a6caa3aa4c1e06bd6c8507f303aa",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "document.b1h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/document.b1h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/document.b1h16s4096d64.helion-cute.json",
+      "sha256": "ca7ac812c563fc192039e5f54bf782c91b0936d215b971657d41b4e55896b866",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "alibi.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/alibi.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/alibi.b4h16s4096d64.helion-cute.json",
+      "sha256": "8fdce28c9dc9a06a29f51170e0a3bff45e8bef73f4766bb8d40932cbd439acd4",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "document.b1h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/document.b1h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/document.b1h16s8192d64.helion-cute.json",
+      "sha256": "c72e9b1d7e66533d7e1a43e4a2286683132412ba80ffdf00bc0a14c0b999d19c",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "document.b1h16s16384d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/document.b1h16s16384d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/document.b1h16s16384d64.helion-cute.json",
+      "sha256": "dd75e824e869ac7d934e35a19c86adf861a82dee0bb44d9cfe68c6158e0c789b",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "alibi.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/alibi.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/alibi.b4h16s8192d64.helion-cute.json",
+      "sha256": "18b55ac36d5d18fb61d44cbe444da016e9b15d5b502a253e4aa7cd3a629f419b",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "rel-bias.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/rel-bias.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/rel-bias.b4h16s2048d64.helion-cute.json",
+      "sha256": "56e49e07e464d115d160320995121386d9f4816af23462fef695a6498f0def7f",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "softcap.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/softcap.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/softcap.b4h16s2048d64.helion-cute.json",
+      "sha256": "141f546888d932ff510451faf2ea9c90d340d4f9a49852ff8cf9f4c187ba6406",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "rel-bias.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/rel-bias.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/rel-bias.b4h16s4096d64.helion-cute.json",
+      "sha256": "56e49e07e464d115d160320995121386d9f4816af23462fef695a6498f0def7f",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "softcap.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/softcap.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/softcap.b4h16s4096d64.helion-cute.json",
+      "sha256": "8f3752e30d975af22694bcabf480af958d870c9daaa24f12d2ffda3ec7224f91",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "rel-bias.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/rel-bias.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/rel-bias.b4h16s8192d64.helion-cute.json",
+      "sha256": "1931fe6ad78dcc2d1751e22c1ef315fc7344260e9d55dd70fc86b4b6bbc931ef",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "softcap.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/softcap.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/softcap.b4h16s8192d64.helion-cute.json",
+      "sha256": "44bb071a5b78b3aefc031b3e96d01499c8402810916465710d161a3bf7b2936e",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "gemma2.b4h16kv8s2048d128",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/gemma2.b4h16kv8s2048d128.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/gemma2.b4h16kv8s2048d128.helion-cute.json",
+      "sha256": "ff159ccbcccbec8d16d3bdde9046f2e70e9ea1c3290f2a4c80dd68dba9aeb12d",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "dilated-sw.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/dilated-sw.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/dilated-sw.b4h16s2048d64.helion-cute.json",
+      "sha256": "938d1cc7e18952b90e7b929a5a5c2959483c1fdeb4298ae1b496567612c7f88e",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "gemma2.b4h16kv8s4096d128",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/gemma2.b4h16kv8s4096d128.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/gemma2.b4h16kv8s4096d128.helion-cute.json",
+      "sha256": "76f0448e0340a62f8b409d0b770c445d273c7d830b5e576846375b0b16f501f4",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "dilated-sw.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/dilated-sw.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/dilated-sw.b4h16s4096d64.helion-cute.json",
+      "sha256": "fafe3086990d6aa312c8ee62b84d1f8ed85488df72a204eb4897b06011d9663b",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "gemma2.b4h16kv8s8192d128",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/gemma2.b4h16kv8s8192d128.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/gemma2.b4h16kv8s8192d128.helion-cute.json",
+      "sha256": "c2d45bc318839789b8ea8c81f1a8d5f03c90df066fffaa416d25535dc6e9a940",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "dilated-sw.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/dilated-sw.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/dilated-sw.b4h16s8192d64.helion-cute.json",
+      "sha256": "eaa008fd2cde2243a5182a0a74cd2e6493a87b191ad218f1a1bf3110781186a4",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "block-diffusion.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/block-diffusion.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/block-diffusion.b4h16s2048d64.helion-cute.json",
+      "sha256": "1309a491513cf077a7065976e2a4fec016fae19669a20466b845c892c531599a",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "natten2d.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/natten2d.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/natten2d.b4h16s2048d64.helion-cute.json",
+      "sha256": "4d3f0bc36988e24e83ddcb0948370f65b0b598d19842e6ccd38f2d87fd413b61",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "block-diffusion.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/block-diffusion.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/block-diffusion.b4h16s4096d64.helion-cute.json",
+      "sha256": "aa697121e314c6d70750cedaa3cf9144f29fdfd7ec3e296caf956a4a80a93a15",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "natten2d.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/natten2d.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/natten2d.b4h16s4096d64.helion-cute.json",
+      "sha256": "4223659ededbf6540a7b30d1406346e09873b6f2c81d86dba4fad4afbab8307c",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "block-diffusion.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/block-diffusion.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/block-diffusion.b4h16s8192d64.helion-cute.json",
+      "sha256": "6d9e24a064d5a6f656de286e7b0727468a600aaeeb46441d27f0c952e53cbdda",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "natten2d.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/natten2d.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/natten2d.b4h16s8192d64.helion-cute.json",
+      "sha256": "37e52341042f850c7102a548c85c7301790790fad9c0f153caa2c15029e1e895",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "sta2d.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/sta2d.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/sta2d.b4h16s2048d64.helion-cute.json",
+      "sha256": "8cd6a2d217f2f9f2c8e791a9ec2d50c0c560dce2c0dfed50d205302e2ec56778",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "sta3d.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/sta3d.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/sta3d.b4h16s2048d64.helion-cute.json",
+      "sha256": "07a74e4bd6692922e39ee99316ca48c06160575168f3f86042074777c2fef509",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "sta2d.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/sta2d.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/sta2d.b4h16s4096d64.helion-cute.json",
+      "sha256": "18d7d65858bf84ecb7f0bc0006754b59993d66286e5374584d6fc7fcfae1d9f5",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "sta3d.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/sta3d.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/sta3d.b4h16s4096d64.helion-cute.json",
+      "sha256": "4aabbff9dfa441882306b01ca746a80ccd5c7a2eccdb3292a3a40e1f350fb55f",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "sta2d.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/sta2d.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/sta2d.b4h16s8192d64.helion-cute.json",
+      "sha256": "7dafac6b611ef3999b5af4b5a30d304c8cfa7552e285d3a3b83487636ce3c243",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "sta3d.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/sta3d.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/sta3d.b4h16s8192d64.helion-cute.json",
+      "sha256": "d456e910780eb3f93fd276219948f8b99611ed7485d0477c74416a379a0893de",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "batchify.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/batchify.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/batchify.b4h16s2048d64.helion-cute.json",
+      "sha256": "24ac03cde02c601e3df705db87723994a5ccc81d780d23f2cc0e73e8dd30264f",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "svg-spatial.b4h16s2176d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/svg-spatial.b4h16s2176d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/svg-spatial.b4h16s2176d64.helion-cute.json",
+      "sha256": "698cf4c4ebe6d04fa9fee063d8c82723bc019849694f6d4aad23bcca9a2a0a90",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "batchify.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/batchify.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/batchify.b4h16s4096d64.helion-cute.json",
+      "sha256": "d2cfa3ddd2edafa72e205cb2cdcc3f5731bda86a6e3cf37495739a1a8bbf7e65",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "svg-spatial.b4h16s4224d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/svg-spatial.b4h16s4224d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/svg-spatial.b4h16s4224d64.helion-cute.json",
+      "sha256": "769f4e889510193e129960c68c391646284c7845923174118daf8822ff33c870",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "batchify.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/batchify.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/batchify.b4h16s8192d64.helion-cute.json",
+      "sha256": "fdf355ba005e14696c0efcc1d34918a88c50ad62a721b0124b157bfce24efa9b",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "svg-spatial.b4h16s8320d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/svg-spatial.b4h16s8320d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/svg-spatial.b4h16s8320d64.helion-cute.json",
+      "sha256": "67d9e8c1a814cfa4cc5795300c5793c7ec808cdd3b3fec463b52c9a28b580236",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "svg-temporal.b4h16s2176d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/svg-temporal.b4h16s2176d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/svg-temporal.b4h16s2176d64.helion-cute.json",
+      "sha256": "ff38dde14d085a202e894f70841f908310d75795ee686864e5238bb9a114e7c0",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "shared-prefix.b1h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/shared-prefix.b1h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/shared-prefix.b1h16s4096d64.helion-cute.json",
+      "sha256": "e88e1924bf9422bf92223779e754a7a5be8b1a5dc645f761e4d38297db3babed",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "svg-temporal.b4h16s4224d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/svg-temporal.b4h16s4224d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/svg-temporal.b4h16s4224d64.helion-cute.json",
+      "sha256": "bdda394dcbd0403ee080afa66fff56bc623296b065df8c33a247a90163466665",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "shared-prefix.b1h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/shared-prefix.b1h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/shared-prefix.b1h16s8192d64.helion-cute.json",
+      "sha256": "68ab2a9a17372e82f7696c9d5bcfcf4545f9a54c41d2a00c4f71118bc04bb3be",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "svg-temporal.b4h16s8320d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/svg-temporal.b4h16s8320d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/svg-temporal.b4h16s8320d64.helion-cute.json",
+      "sha256": "bdff07f69e58ee37a8d8ddb3e8ec2673417c8a293d23f7b1c7eae5f30f427ca7",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "shared-prefix.b1h16s16384d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/shared-prefix.b1h16s16384d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/shared-prefix.b1h16s16384d64.helion-cute.json",
+      "sha256": "d75b059d05c0f3b0d917e23a592ab81675c70702ce96c46115155658bbc67f96",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "global-sw.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/global-sw.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/global-sw.b4h16s2048d64.helion-cute.json",
+      "sha256": "937165fa41e88cd62dd33cb2f39bff1be01f316a128e875cb9455eeb6230f3c4",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "flamingo.b4h16s2048x1024d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/flamingo.b4h16s2048x1024d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/flamingo.b4h16s2048x1024d64.helion-cute.json",
+      "sha256": "c309b5ef47bdb40e4c26714ef4d22cc4ff1de9fb38e1a2b66d9909e68546dd02",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "global-sw.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/global-sw.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/global-sw.b4h16s4096d64.helion-cute.json",
+      "sha256": "857ea1d8503d0f19506eed3c53d805b4dd46c5035c41f5c42ef81e8dfc5a21f5",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "flamingo.b4h16s4096x2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/flamingo.b4h16s4096x2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/flamingo.b4h16s4096x2048d64.helion-cute.json",
+      "sha256": "69f49b2522066f3e1243a76d0e837d9cbf5623f050d5f65bb1bd6c0364dddc3e",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "global-sw.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/global-sw.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/global-sw.b4h16s8192d64.helion-cute.json",
+      "sha256": "0385781388b2ac2376b768d522c64f6cf9ad80a51d04fd44ea26922107a45b6e",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "flamingo.b4h16s8192x4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/flamingo.b4h16s8192x4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/flamingo.b4h16s8192x4096d64.helion-cute.json",
+      "sha256": "0e55da414108346f86419fd905ff316c299e16a3d99f4d279873349dbbb037da",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "vsa.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/vsa.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/vsa.b4h16s2048d64.helion-cute.json",
+      "sha256": "174d7b73896d5ce735c731a4c35678b0553fe63ea9c466ff22d7c2a6c7770f92",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "jetspec-tree.b4h16s64x2112d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/jetspec-tree.b4h16s64x2112d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/jetspec-tree.b4h16s64x2112d64.helion-cute.json",
+      "sha256": "36976278d0526dba115e6687f6da625c72ed1e397a52d36d815d998be54005e7",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "vsa.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/vsa.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/vsa.b4h16s4096d64.helion-cute.json",
+      "sha256": "0218d3748813700cdb292f939b5248a2ee3b506a114df19db69b1d1a429912c5",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "jetspec-tree.b4h16s64x4160d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/jetspec-tree.b4h16s64x4160d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/jetspec-tree.b4h16s64x4160d64.helion-cute.json",
+      "sha256": "d390c57d0b559d28e88f9f06d373e92a3f2d85551c4ecf7ce33bf3f57d084b49",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "vsa.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/vsa.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/vsa.b4h16s8192d64.helion-cute.json",
+      "sha256": "3ec721da9ce0dcc3ff40468ca6759590b27520939c1277d187d0a441caf7a21f",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "jetspec-tree.b4h16s64x8256d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/jetspec-tree.b4h16s64x8256d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/jetspec-tree.b4h16s64x8256d64.helion-cute.json",
+      "sha256": "279664a6e38f5f27197f7170b5eaf9da445260097538cd3a484b8601f8644240",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "jetspec-training.b4h16s128x2176d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/jetspec-training.b4h16s128x2176d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/jetspec-training.b4h16s128x2176d64.helion-cute.json",
+      "sha256": "8f787762e03d73804fa253e641627b12423025b723f38808a6cc6c3ff79a6a74",
+      "origin": "previous GB300 reused"
+    },
+    {
+      "mode": "forward",
+      "case_id": "sandwich.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/sandwich.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/sandwich.b4h16s2048d64.helion-cute.json",
+      "sha256": "d6706f6428c188560c475ec08b4407d21f6e9ba4814f9d9a9a155ca3e933cabe",
+      "origin": "previous GB300 reused"
+    },
+    {
+      "mode": "forward",
+      "case_id": "sandwich.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/sandwich.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/sandwich.b4h16s4096d64.helion-cute.json",
+      "sha256": "d2515457c3b25d05d28ec04a817172621d536bb8c86ff2b87aa3445170d096a5",
+      "origin": "previous GB300 reused"
+    },
+    {
+      "mode": "forward",
+      "case_id": "jetspec-training.b4h16s128x4224d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/jetspec-training.b4h16s128x4224d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/jetspec-training.b4h16s128x4224d64.helion-cute.json",
+      "sha256": "4eded12b82f23d20a891ea366dea1dc1c7e56d770e707f0b73441cee884957f1",
+      "origin": "previous GB300 reused"
+    },
+    {
+      "mode": "forward",
+      "case_id": "sandwich.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/sandwich.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/sandwich.b4h16s8192d64.helion-cute.json",
+      "sha256": "e656bb62c67e7615fd79fad0af755692d055121e2ec37f8acc4db10661620147",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "jetspec-training.b4h16s128x8320d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/jetspec-training.b4h16s128x8320d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/jetspec-training.b4h16s128x8320d64.helion-cute.json",
+      "sha256": "5525ae7a07192a0601624f0f50d2e0572456d325cae0475853a633b338c00794",
+      "origin": "previous GB300 reused"
+    },
+    {
+      "mode": "forward",
+      "case_id": "graphormer-spatial.b4h16s512d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/graphormer-spatial.b4h16s512d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/graphormer-spatial.b4h16s512d64.helion-cute.json",
+      "sha256": "c3eaf9fb011e50c7e9a90d8cc6e9df1a33495bc3c83bcd5a5a14a78fd8036989",
+      "origin": "previous GB300 reused"
+    },
+    {
+      "mode": "forward",
+      "case_id": "graphormer-spatial.b4h16s1024d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/graphormer-spatial.b4h16s1024d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/graphormer-spatial.b4h16s1024d64.helion-cute.json",
+      "sha256": "ed6e0f2cf786e6973980a35df6465085ab7514479d617e446c2cb1723a31dc80",
+      "origin": "previous GB300 reused"
+    },
+    {
+      "mode": "forward",
+      "case_id": "graphormer-spatial.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/graphormer-spatial.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/graphormer-spatial.b4h16s2048d64.helion-cute.json",
+      "sha256": "8313cdb90d9febbb5ba80bad14942ee507518b556ab30e241ef1037f26799fe0",
+      "origin": "previous GB300 reused"
+    },
+    {
+      "mode": "forward",
+      "case_id": "sigmoid-act.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/sigmoid-act.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/sigmoid-act.b4h16s2048d64.helion-cute.json",
+      "sha256": "58de3317a03762c1a011bb58cff1dda5c609e7e3acb1cd0caa3bdc445b877e8c",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "sigmoid-act.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/sigmoid-act.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/sigmoid-act.b4h16s4096d64.helion-cute.json",
+      "sha256": "43f8c4ab7323078958db46f20788bc884bdc7e91f8ad277abdec2e4c2b64d0f0",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "sigmoid-act.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/sigmoid-act.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/sigmoid-act.b4h16s8192d64.helion-cute.json",
+      "sha256": "30cd03e10c7620353b35ea38ee8edc83f5ea1510e6a052a3c97ba0abff2445ca",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "forward",
+      "case_id": "graphormer-edge.b4h16s512d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/graphormer-edge.b4h16s512d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/graphormer-edge.b4h16s512d64.helion-cute.json",
+      "sha256": "780d2fb1aa3e87b8c2ae83833fc9f588d6bfdb6e461fffac775966bd39854c74",
+      "origin": "previous GB300 reused"
+    },
+    {
+      "mode": "forward",
+      "case_id": "graphormer-edge.b4h16s1024d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/graphormer-edge.b4h16s1024d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/graphormer-edge.b4h16s1024d64.helion-cute.json",
+      "sha256": "d5d2927581aa889a1d7b1cf34edd9b5cb39785d635fb57c90a5d4f9b529baeb2",
+      "origin": "previous GB300 reused"
+    },
+    {
+      "mode": "forward",
+      "case_id": "graphormer-edge.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/forward/configs/graphormer-edge.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/forward/graphormer-edge.b4h16s2048d64.helion-cute.json",
+      "sha256": "88869cb2258b1cd11b9a21eaff4f8924b8b1b38cc905912c303e135f40355f08",
+      "origin": "previous GB300 reused"
+    },
+    {
+      "mode": "backward",
+      "case_id": "noop.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/noop.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/noop.b4h16s2048d64.helion-cute.json",
+      "sha256": "5caf822df894b5e2a586107d192935d886e75651901e85716f25e09c9fa42f87",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "noop.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/noop.b4h16s2048d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/noop.b4h16s2048d64.helion-cute.preprocess.json",
+      "sha256": "984f3d2390f2550fda6f2db96c52e6327bc84b7139e3a104acaebdeadbdf0f8b",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "noop.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/noop.b4h16s2048d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/noop.b4h16s2048d64.helion-cute.main.json",
+      "sha256": "8f8be931035738970b9855ff0a8ce6566dbaf4b675b2b17824841fd7163554bd",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "causal.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/causal.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/causal.b4h16s2048d64.helion-cute.json",
+      "sha256": "5c027155f6c59f1fc9e6a4a1be165a26a3a95fdde2f1d845142aa19c5fe7c861",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "causal.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/causal.b4h16s2048d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/causal.b4h16s2048d64.helion-cute.preprocess.json",
+      "sha256": "e6fe3327987caf3e22ef0669e6b84417d8d3643bc378b8615edd26d74f1abbcb",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "causal.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/causal.b4h16s2048d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/causal.b4h16s2048d64.helion-cute.main.json",
+      "sha256": "c97b9e28cb4944313646cc5066ab1266a5f504bb66a012003cf4eee97a6878e4",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "causal.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/causal.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/causal.b4h16s4096d64.helion-cute.json",
+      "sha256": "e6b05ff31ec308da9d0a62f5d614530aef577d08e05dccdf1d44a9326b07ca8f",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "causal.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/causal.b4h16s4096d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/causal.b4h16s4096d64.helion-cute.preprocess.json",
+      "sha256": "2610e428d80351b44c0a51baedbd425753e4d7bbfb467c91d8f1b1666593ff60",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "causal.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/causal.b4h16s4096d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/causal.b4h16s4096d64.helion-cute.main.json",
+      "sha256": "22f2ba12c81e50c5bde60d4bd63f953cb25c3744114c036228e4050e513b8d8d",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "noop.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/noop.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/noop.b4h16s4096d64.helion-cute.json",
+      "sha256": "51be6bc316b33c3d2cb9cc0a4cd484f07aba5799e98c6c6220066fa7abba800f",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "noop.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/noop.b4h16s4096d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/noop.b4h16s4096d64.helion-cute.preprocess.json",
+      "sha256": "828a153736b1e7437e4bd2651bce06de5f19d82f5cae976c5c27f4932c3bc9e9",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "noop.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/noop.b4h16s4096d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/noop.b4h16s4096d64.helion-cute.main.json",
+      "sha256": "733582e1c96b2ebe62e77adb47961657ac4a9043529387127c4a27d9c41b1269",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "causal.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/causal.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/causal.b4h16s8192d64.helion-cute.json",
+      "sha256": "7d9530c6f5b902e01d53bd45a2ee0fc0824324fb64c4cd2059d8471d4dd91dcb",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "causal.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/causal.b4h16s8192d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/causal.b4h16s8192d64.helion-cute.preprocess.json",
+      "sha256": "6be780522a62affab74a2eda098e69e19e53c38910d3f5dfd77fcc613f437240",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "causal.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/causal.b4h16s8192d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/causal.b4h16s8192d64.helion-cute.main.json",
+      "sha256": "519c2d6e6c821e49c613eec51392508fdd6fea4ed80d150977cafae8acac141d",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "noop.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/noop.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/noop.b4h16s8192d64.helion-cute.json",
+      "sha256": "54716be74a8a804364fac941257ba362769b0bcf03a2b41ae3288acb36953ff5",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "noop.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/noop.b4h16s8192d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/noop.b4h16s8192d64.helion-cute.preprocess.json",
+      "sha256": "fbabe72cc3fc75a1d54a47425bfbc75d82a3823ecc78f3af71f098357ade7c02",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "noop.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/noop.b4h16s8192d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/noop.b4h16s8192d64.helion-cute.main.json",
+      "sha256": "d875299eb493c4f58606ef1c8ff3707fb0a780efc50d763758ba2acd78f6b55d",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "gqa-causal.b4h32kv8s2048d128",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/gqa-causal.b4h32kv8s2048d128.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/gqa-causal.b4h32kv8s2048d128.helion-cute.json",
+      "sha256": "9b64a026180353b75e0992bf22296a34df0fd15ba2306616cd67ef071504c14c",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "gqa-causal.b4h32kv8s2048d128",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/gqa-causal.b4h32kv8s2048d128.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/gqa-causal.b4h32kv8s2048d128.helion-cute.preprocess.json",
+      "sha256": "cd9879bf115889537e86ccea1cbd306d6d458adb3c98f482ac7b51c256c33188",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "gqa-causal.b4h32kv8s2048d128",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/gqa-causal.b4h32kv8s2048d128.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/gqa-causal.b4h32kv8s2048d128.helion-cute.main.json",
+      "sha256": "dad62daa0ecac92f670668f9f8ce868d2af4216ef89f2f7dd856ee346172251c",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "prefix-lm.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/prefix-lm.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/prefix-lm.b4h16s2048d64.helion-cute.json",
+      "sha256": "87d0bdc39e0e712116129c64a4da87ff2ade122f6e990dfb404b8ccda6d2a06a",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "prefix-lm.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/prefix-lm.b4h16s2048d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/prefix-lm.b4h16s2048d64.helion-cute.preprocess.json",
+      "sha256": "3972c83c7add21983827a9c578008be117be4a7bead77844004c440b68c086d9",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "prefix-lm.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/prefix-lm.b4h16s2048d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/prefix-lm.b4h16s2048d64.helion-cute.main.json",
+      "sha256": "a8379ff94c311cc650097ae874cb97adbf44ca3f6d8fbf9bc728a55c56e9e2a3",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "gqa-causal.b4h32kv8s4096d128",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/gqa-causal.b4h32kv8s4096d128.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/gqa-causal.b4h32kv8s4096d128.helion-cute.json",
+      "sha256": "04f9323c9ca666cffb39695006d47828d9602841ab2249e122388dc960a16297",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "gqa-causal.b4h32kv8s4096d128",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/gqa-causal.b4h32kv8s4096d128.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/gqa-causal.b4h32kv8s4096d128.helion-cute.preprocess.json",
+      "sha256": "7bb53d9dc2ac7cc913685a3297354ba37dfca5b019839ac6d07addd194ec15de",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "gqa-causal.b4h32kv8s4096d128",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/gqa-causal.b4h32kv8s4096d128.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/gqa-causal.b4h32kv8s4096d128.helion-cute.main.json",
+      "sha256": "2dc702e6cb2e0b288b885323e5c13ceb8a86b16e4fa2af7996b2c2f0de6ffb3c",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "prefix-lm.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/prefix-lm.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/prefix-lm.b4h16s4096d64.helion-cute.json",
+      "sha256": "aa3e530b9f2ead03239a20e1c48490e574259b5c5db8ff4298ef1c1b019d585f",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "prefix-lm.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/prefix-lm.b4h16s4096d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/prefix-lm.b4h16s4096d64.helion-cute.preprocess.json",
+      "sha256": "34c642a10c6ea526267eb8c9f34077dbdeecbaacc5ec8b42911a5f1611a71221",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "prefix-lm.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/prefix-lm.b4h16s4096d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/prefix-lm.b4h16s4096d64.helion-cute.main.json",
+      "sha256": "3d29e119a55c8bffbcbc3f61a23d328325908d3c8e6d904124256f73628ebb80",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "gqa-causal.b4h32kv8s8192d128",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/gqa-causal.b4h32kv8s8192d128.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/gqa-causal.b4h32kv8s8192d128.helion-cute.json",
+      "sha256": "4550b3ab6a74dbd7b71b6213f37c51e6212bd6f28a8be24829570f54e8d443f5",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "gqa-causal.b4h32kv8s8192d128",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/gqa-causal.b4h32kv8s8192d128.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/gqa-causal.b4h32kv8s8192d128.helion-cute.preprocess.json",
+      "sha256": "7cfd3ca5777748b98ba670483f7a1a089ece2a3b0158782e7d771f95f16346f6",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "gqa-causal.b4h32kv8s8192d128",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/gqa-causal.b4h32kv8s8192d128.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/gqa-causal.b4h32kv8s8192d128.helion-cute.main.json",
+      "sha256": "9454879d4f0812d4226e2424cf28ab607b1dfff9c6490670afa96072a9a178aa",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "prefix-lm.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/prefix-lm.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/prefix-lm.b4h16s8192d64.helion-cute.json",
+      "sha256": "c44794f740000056bdfe9c581e720e5114b359a3d17359f4d8ff4f03d9357abd",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "prefix-lm.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/prefix-lm.b4h16s8192d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/prefix-lm.b4h16s8192d64.helion-cute.preprocess.json",
+      "sha256": "0a7ddd08af3a75686a0006c3f206db3210b69398d6a2749bab18a8374519ca03",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "prefix-lm.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/prefix-lm.b4h16s8192d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/prefix-lm.b4h16s8192d64.helion-cute.main.json",
+      "sha256": "4e1c7955435c047e6fe4192ad622e3351852379271ba005aeeb1332cc221f601",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sliding-window.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sliding-window.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sliding-window.b4h16s2048d64.helion-cute.json",
+      "sha256": "0198f3f269a6ecc4434f1a470a1fdb1fc3cf61b954210a3206d5806351ae34f1",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sliding-window.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sliding-window.b4h16s2048d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sliding-window.b4h16s2048d64.helion-cute.preprocess.json",
+      "sha256": "7cb4cd0a89cff722f97735734e6eefabd5e0a62168a60dbe32726e125c34aeae",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sliding-window.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sliding-window.b4h16s2048d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sliding-window.b4h16s2048d64.helion-cute.main.json",
+      "sha256": "7a1713a7aa664fff00f142d16bdd44b9f62b48b4d9feea845b50b4c5f91dd4ee",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "alibi.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/alibi.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/alibi.b4h16s2048d64.helion-cute.json",
+      "sha256": "4600078774c240827e8f5ed6f773fd8d043f6377a52d3e44deda66be880fc6c0",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "alibi.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/alibi.b4h16s2048d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/alibi.b4h16s2048d64.helion-cute.preprocess.json",
+      "sha256": "2c7b461b54c8262fada5a2ec4123f4593c287108269629e6b08d52da83631532",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "alibi.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/alibi.b4h16s2048d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/alibi.b4h16s2048d64.helion-cute.main.json",
+      "sha256": "a123b474c3a704a821825988a74b4336f42739e2f284515460cc2d2acb79c274",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sliding-window.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sliding-window.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sliding-window.b4h16s4096d64.helion-cute.json",
+      "sha256": "a26b122735c3c60fca6b86e4981c26bcb329f8aafd6f787de44552bfd628701b",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sliding-window.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sliding-window.b4h16s4096d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sliding-window.b4h16s4096d64.helion-cute.preprocess.json",
+      "sha256": "229bf46d48ab6b29d3cd3dcaf1fd296cbc70ea230b8ecfc48109b3c4ac0603e8",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sliding-window.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sliding-window.b4h16s4096d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sliding-window.b4h16s4096d64.helion-cute.main.json",
+      "sha256": "55272c7a3423e4c453d78cb6cc367f5eee7a6e2fb0674dd3e056630bc1f010d2",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "alibi.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/alibi.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/alibi.b4h16s4096d64.helion-cute.json",
+      "sha256": "3d1587c2bf04ee564691591ba4193f135a1616a46b25bf5e682f95c49e9d11ee",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "alibi.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/alibi.b4h16s4096d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/alibi.b4h16s4096d64.helion-cute.preprocess.json",
+      "sha256": "da5aec2240dc5262b6e5442f0f90e0271840b00d694c7733d75cbc343e00e684",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "alibi.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/alibi.b4h16s4096d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/alibi.b4h16s4096d64.helion-cute.main.json",
+      "sha256": "9388d90551658f577624039a45236859bd398cd8e8747df8bc8c11efa9eb0979",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sliding-window.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sliding-window.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sliding-window.b4h16s8192d64.helion-cute.json",
+      "sha256": "2f6432a0e271f70411c6386b11c3256b358acdcfd62b7c10ae831a0c4d104ba2",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sliding-window.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sliding-window.b4h16s8192d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sliding-window.b4h16s8192d64.helion-cute.preprocess.json",
+      "sha256": "119a4812f6d18bd2654f05752ec949d87798cc5e5016c4c570499c6717fef45d",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sliding-window.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sliding-window.b4h16s8192d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sliding-window.b4h16s8192d64.helion-cute.main.json",
+      "sha256": "d155685c69bec54668e48b03862b1f78fd84023125ace2f9bec1636ab5317b7c",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "alibi.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/alibi.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/alibi.b4h16s8192d64.helion-cute.json",
+      "sha256": "287ad74f2488f0354e50ec84a2af777c87c9f7dd5bb0ff3969636389791fe337",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "alibi.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/alibi.b4h16s8192d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/alibi.b4h16s8192d64.helion-cute.preprocess.json",
+      "sha256": "16538da620846f64f3d2e59d5c591328f50c54b484d57183ebc4c2b3638fd3fb",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "alibi.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/alibi.b4h16s8192d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/alibi.b4h16s8192d64.helion-cute.main.json",
+      "sha256": "050bd28dbca93ee21367133b6b7ad35029b645358269182e6772bbb73be8f19a",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "document.b1h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/document.b1h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/document.b1h16s4096d64.helion-cute.json",
+      "sha256": "80fa2cdf87f6042ae1a84e9987d371e561d45232d87ea0d0b7246adab93a02b0",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "document.b1h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/document.b1h16s4096d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/document.b1h16s4096d64.helion-cute.preprocess.json",
+      "sha256": "fb472e8ece8196c65b59f2dff6c6313ba212da9a50b9c3f2831e699b01610509",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "document.b1h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/document.b1h16s4096d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/document.b1h16s4096d64.helion-cute.main.json",
+      "sha256": "4fe53470927c8e9aaf4d9124602e2007a57cbdc98ed69586d7690f99d23243ea",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "softcap.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/softcap.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/softcap.b4h16s2048d64.helion-cute.json",
+      "sha256": "5188f47cac73c21f93e674ebffbd4f34133658900b5be523d759e4b65241f850",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "softcap.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/softcap.b4h16s2048d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/softcap.b4h16s2048d64.helion-cute.preprocess.json",
+      "sha256": "845ece2bf67cd795312c711ba3b05cde4e05185c7f0ede8b668984359a82d109",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "softcap.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/softcap.b4h16s2048d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/softcap.b4h16s2048d64.helion-cute.main.json",
+      "sha256": "b05a126e766642fd0781b4fd93b77fadce0982714ba4ece9f416de2d2f7d0e06",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "document.b1h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/document.b1h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/document.b1h16s8192d64.helion-cute.json",
+      "sha256": "c7aff55b606afd8f71041062df215c0cdca3e7a41bdabbcbf8ec63c71aba7ec4",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "document.b1h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/document.b1h16s8192d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/document.b1h16s8192d64.helion-cute.preprocess.json",
+      "sha256": "65436c82ce78e8bb74351e19a3b018bca88a9edb138dd98de93d01846b964f98",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "document.b1h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/document.b1h16s8192d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/document.b1h16s8192d64.helion-cute.main.json",
+      "sha256": "177f0e19c46096b8a21cd08da69da4a7bfea580fb1e99fdaba5387165baf4d24",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "softcap.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/softcap.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/softcap.b4h16s4096d64.helion-cute.json",
+      "sha256": "0f8bcbcdaa0e0366c6e53d7f63122814c73bc04fbd833f824355c96493740690",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "softcap.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/softcap.b4h16s4096d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/softcap.b4h16s4096d64.helion-cute.preprocess.json",
+      "sha256": "bca6fc2ea3839a3843c3d79230d5dd4e8671bbb3d6057491f95d4a559ac3d360",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "softcap.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/softcap.b4h16s4096d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/softcap.b4h16s4096d64.helion-cute.main.json",
+      "sha256": "8eb06242accc1fed78da716cf248486130a379a8801125f873632790c7126f17",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "document.b1h16s16384d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/document.b1h16s16384d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/document.b1h16s16384d64.helion-cute.json",
+      "sha256": "341970c621d7c964ac2ab25d6001ec8bedae285183c0ceb100bb5ade922a8194",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "document.b1h16s16384d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/document.b1h16s16384d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/document.b1h16s16384d64.helion-cute.preprocess.json",
+      "sha256": "1a4478fbbe38e9feec03a1ed03437603a86d2f01afc1f1fb6cb0f7638e824061",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "document.b1h16s16384d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/document.b1h16s16384d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/document.b1h16s16384d64.helion-cute.main.json",
+      "sha256": "2030e0fff6a387c3d440a2c90d6cf4febe8b670163c98441ba01e0ad21ef706a",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "softcap.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/softcap.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/softcap.b4h16s8192d64.helion-cute.json",
+      "sha256": "26af2b8b103d5ce67d85c9a252fa89aeb38514af7536b14b018075097eede3fe",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "softcap.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/softcap.b4h16s8192d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/softcap.b4h16s8192d64.helion-cute.preprocess.json",
+      "sha256": "b2c37bae035a19f8673f516f1111c1ea32a773ae12e87386013ec8f1aa26eb2c",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "softcap.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/softcap.b4h16s8192d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/softcap.b4h16s8192d64.helion-cute.main.json",
+      "sha256": "c988b990c039e6563baabefe09e9a2ed65283c5d991e968c8b7d334a601673b9",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "rel-bias.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/rel-bias.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/rel-bias.b4h16s2048d64.helion-cute.json",
+      "sha256": "03d21b83503840a80c4ad883759f21b78eb951a1dd7674fcff2efaaefce24343",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "rel-bias.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/rel-bias.b4h16s2048d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/rel-bias.b4h16s2048d64.helion-cute.preprocess.json",
+      "sha256": "987a6efbd1329e1102692a8c002c48c9c63b5e297abddac9c158a22fe23c2ff7",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "rel-bias.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/rel-bias.b4h16s2048d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/rel-bias.b4h16s2048d64.helion-cute.main.json",
+      "sha256": "5635703dd1b29601dadf2644763e6b21ca4aa29fcaa5a91b726de76d45fc2092",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "dilated-sw.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/dilated-sw.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/dilated-sw.b4h16s2048d64.helion-cute.json",
+      "sha256": "dc250e1d104e094a5cddd38e2520858ef5cc641ad34c054fd6f54b83c59d6df9",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "dilated-sw.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/dilated-sw.b4h16s2048d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/dilated-sw.b4h16s2048d64.helion-cute.preprocess.json",
+      "sha256": "53f63993728aa9c91af00e4214553820807d0fd6361815aa8727835f5f727b15",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "dilated-sw.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/dilated-sw.b4h16s2048d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/dilated-sw.b4h16s2048d64.helion-cute.main.json",
+      "sha256": "a123b474c3a704a821825988a74b4336f42739e2f284515460cc2d2acb79c274",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "rel-bias.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/rel-bias.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/rel-bias.b4h16s4096d64.helion-cute.json",
+      "sha256": "ce2de8fe98f174715d11d5849cafb0398a2b37d4007ed399d034efa483c9fb4e",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "rel-bias.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/rel-bias.b4h16s4096d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/rel-bias.b4h16s4096d64.helion-cute.preprocess.json",
+      "sha256": "16facd61856602ee15823504ae0ce1649bed6958e9101bc47a58d4a9b4f88d92",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "rel-bias.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/rel-bias.b4h16s4096d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/rel-bias.b4h16s4096d64.helion-cute.main.json",
+      "sha256": "84b59c7c69c2061ee89c04cf6758fa4011dff54e10956ad2c8fc635548f4229d",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "dilated-sw.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/dilated-sw.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/dilated-sw.b4h16s4096d64.helion-cute.json",
+      "sha256": "161d2ef4b6f83a5fee62f12969b2240a9634cd79d2b7378d5ea1a690e3eb7e33",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "dilated-sw.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/dilated-sw.b4h16s4096d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/dilated-sw.b4h16s4096d64.helion-cute.preprocess.json",
+      "sha256": "96155a7a4b8a8b57e63e9e275fd0d7fbcf18bec9147154218e1271800e32eabe",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "dilated-sw.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/dilated-sw.b4h16s4096d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/dilated-sw.b4h16s4096d64.helion-cute.main.json",
+      "sha256": "6b98ebf9794e9f6f61280f5ae722bd81c2e2ece36ecea2d499f25dc63e360929",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "rel-bias.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/rel-bias.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/rel-bias.b4h16s8192d64.helion-cute.json",
+      "sha256": "e518fe1da2b6a96a4570f659fe713946c14bed27cfd53bfbd5794f90676be26c",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "rel-bias.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/rel-bias.b4h16s8192d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/rel-bias.b4h16s8192d64.helion-cute.preprocess.json",
+      "sha256": "e2eac6b4870d4ddb4267ebc96ccd8422e41c828d4d49a2be224e1c8a4ae68d5d",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "rel-bias.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/rel-bias.b4h16s8192d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/rel-bias.b4h16s8192d64.helion-cute.main.json",
+      "sha256": "1b8e7690831ae39693c60fa8894ea6edabf32df69409bef776d1e6c9562973ef",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "dilated-sw.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/dilated-sw.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/dilated-sw.b4h16s8192d64.helion-cute.json",
+      "sha256": "556c70587bab345eee32e4fb63f4e07bef83980f9ebf7fa4830d3e0378a1ee2f",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "dilated-sw.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/dilated-sw.b4h16s8192d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/dilated-sw.b4h16s8192d64.helion-cute.preprocess.json",
+      "sha256": "6a45ea6883628035fcfebe21858f5b12ca1d0433c45f9dacfecf20ecc03dd04b",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "dilated-sw.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/dilated-sw.b4h16s8192d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/dilated-sw.b4h16s8192d64.helion-cute.main.json",
+      "sha256": "a52d94430e4d50972191871f78c3650db95ef6625df7a86cd4ec9329a71834e0",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "gemma2.b4h16kv8s2048d128",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/gemma2.b4h16kv8s2048d128.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/gemma2.b4h16kv8s2048d128.helion-cute.json",
+      "sha256": "63584a51b0ff2b01208c0d0f3c46a99d2ad8031027abfaf23ea92fbd0c40c9f9",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "gemma2.b4h16kv8s2048d128",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/gemma2.b4h16kv8s2048d128.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/gemma2.b4h16kv8s2048d128.helion-cute.preprocess.json",
+      "sha256": "9dfd64720a7dd8fabf139deebf3ff43575a6340fef4065d5ae5a661277478b74",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "gemma2.b4h16kv8s2048d128",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/gemma2.b4h16kv8s2048d128.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/gemma2.b4h16kv8s2048d128.helion-cute.main.json",
+      "sha256": "b0cb716feab77298fc4f40f4627c67686d5f235c792b03aeb84a35646e1522cf",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "natten2d.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/natten2d.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/natten2d.b4h16s2048d64.helion-cute.json",
+      "sha256": "a61e9c9dccb3b96cf0bbf324d91e283c8bd2fdb660b061cca67f9de7538d9f77",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "natten2d.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/natten2d.b4h16s2048d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/natten2d.b4h16s2048d64.helion-cute.preprocess.json",
+      "sha256": "1a8e0f98f50f7d02a12d61b239e9bbaab3f36f77c80d3a9ab587498ff95fcb59",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "natten2d.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/natten2d.b4h16s2048d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/natten2d.b4h16s2048d64.helion-cute.main.json",
+      "sha256": "b5759446b502a5c3e94ac875ebf863964d504f6c81103764c568f18069e5bdf2",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "gemma2.b4h16kv8s4096d128",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/gemma2.b4h16kv8s4096d128.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/gemma2.b4h16kv8s4096d128.helion-cute.json",
+      "sha256": "ba7dc416148e2bb35187dcb109fc795cc912d286694ef333b696f6742945ede2",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "gemma2.b4h16kv8s4096d128",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/gemma2.b4h16kv8s4096d128.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/gemma2.b4h16kv8s4096d128.helion-cute.preprocess.json",
+      "sha256": "eabe3b82f18acc1e0b54e59dd7d7c263ff9beee4d2c70a8183e8b68e9ba776de",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "gemma2.b4h16kv8s4096d128",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/gemma2.b4h16kv8s4096d128.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/gemma2.b4h16kv8s4096d128.helion-cute.main.json",
+      "sha256": "0e7ca21af11e037db424af90189e5d6fe17c2bf6e9e3b3af4f73de6f86b86359",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "natten2d.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/natten2d.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/natten2d.b4h16s4096d64.helion-cute.json",
+      "sha256": "8003a5a0cea134c9067b13e525fb82dd858f4121aebe0030a13399bd3d4ea6ff",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "natten2d.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/natten2d.b4h16s4096d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/natten2d.b4h16s4096d64.helion-cute.preprocess.json",
+      "sha256": "ccb77af131c58a9eb9ad50068db99ce5e37570ab40b6afa4284282b4b16ff3f1",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "natten2d.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/natten2d.b4h16s4096d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/natten2d.b4h16s4096d64.helion-cute.main.json",
+      "sha256": "1a9f29423e76290f5f84c3699af519d830ffde3243299dee5a66d3d0baad24a9",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "gemma2.b4h16kv8s8192d128",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/gemma2.b4h16kv8s8192d128.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/gemma2.b4h16kv8s8192d128.helion-cute.json",
+      "sha256": "bcaadfda61972bed694dab05979b205048da2d052a88ed797f51ed67e682cd0a",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "gemma2.b4h16kv8s8192d128",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/gemma2.b4h16kv8s8192d128.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/gemma2.b4h16kv8s8192d128.helion-cute.preprocess.json",
+      "sha256": "32576a8d4e21eac211f0d0f80ff1df0a5e218336126291276b6a260d29c2b806",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "gemma2.b4h16kv8s8192d128",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/gemma2.b4h16kv8s8192d128.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/gemma2.b4h16kv8s8192d128.helion-cute.main.json",
+      "sha256": "474b916e340bd8a4ac3ec3bd788734a229be7f321b6a843caf7edf836158b948",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "natten2d.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/natten2d.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/natten2d.b4h16s8192d64.helion-cute.json",
+      "sha256": "b101a9a2165df11021469eced4f38321e5840c1a9c7887e704614e4b4a2800c9",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "natten2d.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/natten2d.b4h16s8192d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/natten2d.b4h16s8192d64.helion-cute.preprocess.json",
+      "sha256": "267c40ab855e5e80e5ba3028acebbf532f714922b9f82c634e7bb58306c6741b",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "natten2d.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/natten2d.b4h16s8192d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/natten2d.b4h16s8192d64.helion-cute.main.json",
+      "sha256": "c7597bcb10c01e5a8cd8b60abd943254658b548f62a77e2be3150551991771d3",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "block-diffusion.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/block-diffusion.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/block-diffusion.b4h16s2048d64.helion-cute.json",
+      "sha256": "51b2a3493319999e8e79511877f3aaa48e37f37af4c8108501f2c72360901d93",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "block-diffusion.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/block-diffusion.b4h16s2048d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/block-diffusion.b4h16s2048d64.helion-cute.preprocess.json",
+      "sha256": "861a186d3b6b0aca510522f5151b92876661a1b0bafa271dceee5c93f3b0f6b4",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "block-diffusion.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/block-diffusion.b4h16s2048d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/block-diffusion.b4h16s2048d64.helion-cute.main.json",
+      "sha256": "e62c0a7189f2d5c300c537bd70a8f85c267486383e71fdb6e4d70fe2b654acb4",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sta3d.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sta3d.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sta3d.b4h16s2048d64.helion-cute.json",
+      "sha256": "ff8178aa855b17b75387086334f0199905aa07c8e6758e2e180c597f6b6c6a0a",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sta3d.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sta3d.b4h16s2048d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sta3d.b4h16s2048d64.helion-cute.preprocess.json",
+      "sha256": "3146b4f388682a2e05f2b1deb474cc9adcd3cf2634c4cbf35e8d98d8b0d24774",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sta3d.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sta3d.b4h16s2048d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sta3d.b4h16s2048d64.helion-cute.main.json",
+      "sha256": "f07b2f6e0c6a0da6652c01dc44177de26c018e96d1721222951191f8a16bbd02",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "block-diffusion.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/block-diffusion.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/block-diffusion.b4h16s4096d64.helion-cute.json",
+      "sha256": "5bcef690ce7e5eb01144718bac633c019d95a394839878ea3c6968c899b7830f",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "block-diffusion.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/block-diffusion.b4h16s4096d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/block-diffusion.b4h16s4096d64.helion-cute.preprocess.json",
+      "sha256": "d9845296ff65429cd80b385624bcb007d57fd63b9e959f2eb85880920d1de5ee",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "block-diffusion.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/block-diffusion.b4h16s4096d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/block-diffusion.b4h16s4096d64.helion-cute.main.json",
+      "sha256": "27f05036129f672f066fb090161b85e00fdbb1bc325e8460a66031da8dad560e",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sta3d.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sta3d.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sta3d.b4h16s4096d64.helion-cute.json",
+      "sha256": "f550d5da2732e7c99d0ed20aba89d0acabcc93bd3d2c9b11f6d1483a57424834",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sta3d.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sta3d.b4h16s4096d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sta3d.b4h16s4096d64.helion-cute.preprocess.json",
+      "sha256": "66b574056d94ef64000c04cdb6f18ddcf4dd102be808aee9c02ce70a4e28ee86",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sta3d.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sta3d.b4h16s4096d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sta3d.b4h16s4096d64.helion-cute.main.json",
+      "sha256": "508e9e6f3246aebd592120ca37c3ec86db75c60a522d024d19d4e3a693c37847",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sta3d.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sta3d.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sta3d.b4h16s8192d64.helion-cute.json",
+      "sha256": "594dc1cdc8b7a7ca23ecea43ef20abd8c58e1f6ba107cb06b06dafc5b803ae7c",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sta3d.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sta3d.b4h16s8192d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sta3d.b4h16s8192d64.helion-cute.preprocess.json",
+      "sha256": "62f8cd28414e1c746dadb0014ccc801a7eeb2a6f66bf12f295eb2b389ca38d2f",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sta3d.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sta3d.b4h16s8192d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sta3d.b4h16s8192d64.helion-cute.main.json",
+      "sha256": "efff68d0ba58a3ec710794a753963ea2f7a8ba5cf4f5e6bafa314e872a3203a1",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "block-diffusion.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/block-diffusion.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/block-diffusion.b4h16s8192d64.helion-cute.json",
+      "sha256": "65018e590d9f5ea313d6057a79a478398ac612a17de552895fd56ce04332a61c",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "block-diffusion.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/block-diffusion.b4h16s8192d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/block-diffusion.b4h16s8192d64.helion-cute.preprocess.json",
+      "sha256": "2db76feacf0b3439b6f5f098f965358fe70e00064c3ba2fe88976ebf361612c3",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "block-diffusion.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/block-diffusion.b4h16s8192d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/block-diffusion.b4h16s8192d64.helion-cute.main.json",
+      "sha256": "d8d90c20dad64307c239c19e8e5ddb91d8d82c236b83866df3b6c35bdabdd36d",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "svg-spatial.b4h16s2176d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/svg-spatial.b4h16s2176d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/svg-spatial.b4h16s2176d64.helion-cute.json",
+      "sha256": "4a35754cab67d16c0da7731fd5e738575da66f28875e54ed35a1c845aa589849",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "svg-spatial.b4h16s2176d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/svg-spatial.b4h16s2176d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/svg-spatial.b4h16s2176d64.helion-cute.preprocess.json",
+      "sha256": "e9ac41771a79872c5e952bfa3713defb0619d23b9bb4bc6abbb385aa54d35159",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "svg-spatial.b4h16s2176d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/svg-spatial.b4h16s2176d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/svg-spatial.b4h16s2176d64.helion-cute.main.json",
+      "sha256": "2067f9df9b84bf499e5e7e43244d549d593489962a9a63eb35dad1f269cc9b7f",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sta2d.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sta2d.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sta2d.b4h16s2048d64.helion-cute.json",
+      "sha256": "68fbbf944643e3311520be2a73c1d8591f830290da857da0073334b48ffd30b8",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sta2d.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sta2d.b4h16s2048d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sta2d.b4h16s2048d64.helion-cute.preprocess.json",
+      "sha256": "16f045b566f5a6b6d92c973e6da9eaa92a4eb883135a04186b53f8d2095ca5c1",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sta2d.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sta2d.b4h16s2048d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sta2d.b4h16s2048d64.helion-cute.main.json",
+      "sha256": "c731dde006f4df553a44d243d62568ee2cd49c7614a1930e4eb196cf2da0bd8e",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "svg-spatial.b4h16s4224d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/svg-spatial.b4h16s4224d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/svg-spatial.b4h16s4224d64.helion-cute.json",
+      "sha256": "34d465758aa0101ad49bf8fa30a9650badfe3443fdf4eec43c8e6690f159774f",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "svg-spatial.b4h16s4224d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/svg-spatial.b4h16s4224d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/svg-spatial.b4h16s4224d64.helion-cute.preprocess.json",
+      "sha256": "3ce505bb93ede54a41ace12746e8ce26fc5fe8848c23d68d67cab9e3af1b3a22",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "svg-spatial.b4h16s4224d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/svg-spatial.b4h16s4224d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/svg-spatial.b4h16s4224d64.helion-cute.main.json",
+      "sha256": "0926c059b48d215f91f37d898f9e40ad644c02e59fffbb81c75971be7a01004f",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sta2d.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sta2d.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sta2d.b4h16s4096d64.helion-cute.json",
+      "sha256": "89da3cb967260d84c7996670556b8eddd772d3c5d01f2d7f4b9355144161753b",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sta2d.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sta2d.b4h16s4096d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sta2d.b4h16s4096d64.helion-cute.preprocess.json",
+      "sha256": "37f5520c0fb7d4032f47c31a3740911982d6e2e5d15242d60ac044d187096370",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sta2d.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sta2d.b4h16s4096d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sta2d.b4h16s4096d64.helion-cute.main.json",
+      "sha256": "b78cf56c7a3756479607d4c479380cf61c9d3455891405f8a98cd53d126a4498",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "svg-spatial.b4h16s8320d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/svg-spatial.b4h16s8320d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/svg-spatial.b4h16s8320d64.helion-cute.json",
+      "sha256": "7649bcdba8bfc6285ad6ef7569a542f3add222f32087d3a9920d06191175accd",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "svg-spatial.b4h16s8320d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/svg-spatial.b4h16s8320d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/svg-spatial.b4h16s8320d64.helion-cute.preprocess.json",
+      "sha256": "7bbac5da1dae4a1cca4eda9e272778fdede08c055ec54937c97d6e442e7b789c",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "svg-spatial.b4h16s8320d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/svg-spatial.b4h16s8320d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/svg-spatial.b4h16s8320d64.helion-cute.main.json",
+      "sha256": "2ce6b87d686a37bfafb902efd1be70364cba7a02535e0d6f2ad11034a1d4628a",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sta2d.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sta2d.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sta2d.b4h16s8192d64.helion-cute.json",
+      "sha256": "feb6ebfec6df70631931177a80f05ee845221c29838b988c4675283fbe9fb4ab",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sta2d.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sta2d.b4h16s8192d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sta2d.b4h16s8192d64.helion-cute.preprocess.json",
+      "sha256": "e7f2b3001733b1c9dddcc45d3544aeebe363f28d108bb37cd741c4d127828c0b",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sta2d.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sta2d.b4h16s8192d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sta2d.b4h16s8192d64.helion-cute.main.json",
+      "sha256": "ace453dd20085f4ab58ecbae207dd48e0831d35daa56141a7c9db484df47ce06",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "shared-prefix.b1h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/shared-prefix.b1h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/shared-prefix.b1h16s4096d64.helion-cute.json",
+      "sha256": "a0a4c5cdcb76770e6371beeb50506c6daf6aa40c17a3ac79e3bd54ce97c76a9e",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "shared-prefix.b1h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/shared-prefix.b1h16s4096d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/shared-prefix.b1h16s4096d64.helion-cute.preprocess.json",
+      "sha256": "7b86572d1abec5d039cd07c1816da7c2f9f45c7e3f364260a5f33b02574ab5d9",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "shared-prefix.b1h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/shared-prefix.b1h16s4096d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/shared-prefix.b1h16s4096d64.helion-cute.main.json",
+      "sha256": "6674a6916c0417df28a92e21c3a64e96e514c6e9b854ea5e4657bc6513fc3189",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "batchify.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/batchify.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/batchify.b4h16s2048d64.helion-cute.json",
+      "sha256": "509a2aaa7be13ce276cbdda7d7ce16a0b99feb170c5d542755f19d257c3c9eac",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "batchify.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/batchify.b4h16s2048d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/batchify.b4h16s2048d64.helion-cute.preprocess.json",
+      "sha256": "587bddff2793fe1efc29a38098182e3d430be577f3bfe262136752a1bec59cf6",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "batchify.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/batchify.b4h16s2048d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/batchify.b4h16s2048d64.helion-cute.main.json",
+      "sha256": "7e930433ed317590ecfad24eee1a46449adf62e247bad9c39fc431bd427ea3ea",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "batchify.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/batchify.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/batchify.b4h16s4096d64.helion-cute.json",
+      "sha256": "a43e204a4f7e4c247d48e42564b9265b6d121f82e0cace7d5eb45da84f21201a",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "batchify.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/batchify.b4h16s4096d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/batchify.b4h16s4096d64.helion-cute.preprocess.json",
+      "sha256": "7f21fd21a7548d130ecef902a3e173d221ca161ca2bd33d166e0deb678d63718",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "batchify.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/batchify.b4h16s4096d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/batchify.b4h16s4096d64.helion-cute.main.json",
+      "sha256": "f8ee5b7691306fa327c2058756e0547a846aa330f5cc44888252aa691bb44a8c",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "shared-prefix.b1h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/shared-prefix.b1h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/shared-prefix.b1h16s8192d64.helion-cute.json",
+      "sha256": "f5b9d0be356583df092d1ce9223720c5cc0ae301d0b564b03445b061b9bcf6b4",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "shared-prefix.b1h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/shared-prefix.b1h16s8192d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/shared-prefix.b1h16s8192d64.helion-cute.preprocess.json",
+      "sha256": "0585d8857d5406714a25ce16afd502ac16343e7e8d845ebab426a8387ef406c4",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "shared-prefix.b1h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/shared-prefix.b1h16s8192d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/shared-prefix.b1h16s8192d64.helion-cute.main.json",
+      "sha256": "cb1e3ce9d363b5aa033afa8d908a1a6e9433db271bf2204b924f60f692db6e06",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "batchify.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/batchify.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/batchify.b4h16s8192d64.helion-cute.json",
+      "sha256": "9169e4531cb866ae45cf94962f323c0084891d97847df0c06b032381b97ccd5d",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "batchify.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/batchify.b4h16s8192d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/batchify.b4h16s8192d64.helion-cute.preprocess.json",
+      "sha256": "1bc67c39bf9eccc5f79e7043ab313e1f6c507c5a495b68c396f4bd52cb9f0f56",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "batchify.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/batchify.b4h16s8192d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/batchify.b4h16s8192d64.helion-cute.main.json",
+      "sha256": "54cc65bb6f57508876e700de5e7e8bfc7b2f478a12284d3de2d7f8290b33c786",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "shared-prefix.b1h16s16384d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/shared-prefix.b1h16s16384d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/shared-prefix.b1h16s16384d64.helion-cute.json",
+      "sha256": "44236a1d249b53c01702d77507affdf51d04d5f01cbe1ad2c3f72e0563bf81f0",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "shared-prefix.b1h16s16384d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/shared-prefix.b1h16s16384d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/shared-prefix.b1h16s16384d64.helion-cute.preprocess.json",
+      "sha256": "e14cdaa4b3b4e6abf1008bed68faf1e001fa2cbfe7db9269676f65c7d39b4e34",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "shared-prefix.b1h16s16384d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/shared-prefix.b1h16s16384d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/shared-prefix.b1h16s16384d64.helion-cute.main.json",
+      "sha256": "6615f0eed4954b892e47b19abbf75417d34d5c084d4aa638af942bd166d25504",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "svg-temporal.b4h16s2176d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/svg-temporal.b4h16s2176d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/svg-temporal.b4h16s2176d64.helion-cute.json",
+      "sha256": "0d7eab81895e10fb08f9c0f217e82a62f1b0175ef0599045f16cb455f2aefad7",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "svg-temporal.b4h16s2176d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/svg-temporal.b4h16s2176d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/svg-temporal.b4h16s2176d64.helion-cute.preprocess.json",
+      "sha256": "39b490a10af79af4da1b003c6fad3b7d149b52f1ea427af0864e3eff56b3459a",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "svg-temporal.b4h16s2176d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/svg-temporal.b4h16s2176d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/svg-temporal.b4h16s2176d64.helion-cute.main.json",
+      "sha256": "fbcedad8a7a8b0440bfa258f1b5bca3ad7b4673365925f9d496405d4b5d3824a",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "global-sw.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/global-sw.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/global-sw.b4h16s2048d64.helion-cute.json",
+      "sha256": "2d07e3aef9fc74b2019a22d6becbdd37d7fa3288990b90f5af6548ae426b0aec",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "global-sw.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/global-sw.b4h16s2048d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/global-sw.b4h16s2048d64.helion-cute.preprocess.json",
+      "sha256": "045ab81803c37a39bf3f86402b15f8c532d2ec43c10a4d0ce2d2d0c3c9560022",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "global-sw.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/global-sw.b4h16s2048d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/global-sw.b4h16s2048d64.helion-cute.main.json",
+      "sha256": "13ba713249e77243ea485921335a2d56d2288462f56bfb95ff4e02a99e3a75f3",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sigmoid-act.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sigmoid-act.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sigmoid-act.b4h16s2048d64.helion-cute.json",
+      "sha256": "a52819c54c93f7524dee6a960064464ef559a2cd18205a275f389f9fe72b8fb2",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sigmoid-act.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sigmoid-act.b4h16s2048d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sigmoid-act.b4h16s2048d64.helion-cute.preprocess.json",
+      "sha256": "e747251b9c689339827a660e7e1a7b30e9f9b242aec211fa73a2223e467d93b6",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sigmoid-act.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sigmoid-act.b4h16s2048d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sigmoid-act.b4h16s2048d64.helion-cute.main.json",
+      "sha256": "2a0e75c399df4f858ff1ff76a3b1d47e3c0eb6d26b5d28bbc61bf264ce7f65ac",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "vsa.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/vsa.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/vsa.b4h16s2048d64.helion-cute.json",
+      "sha256": "71236378c4bbce8407bf7e6612f162e194b78b1d4426080b1b9e8efaaff3a35c",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "vsa.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/vsa.b4h16s2048d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/vsa.b4h16s2048d64.helion-cute.preprocess.json",
+      "sha256": "d3e2995794532c1a33b897192bb0c8127d4cbed1d7a4a1f94179c4c9c35479ba",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "vsa.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/vsa.b4h16s2048d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/vsa.b4h16s2048d64.helion-cute.main.json",
+      "sha256": "172b29b253616d7e90f7c7aed939dc74a0fc2025fe88be6d25d9de8c5e2af865",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "svg-temporal.b4h16s4224d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/svg-temporal.b4h16s4224d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/svg-temporal.b4h16s4224d64.helion-cute.json",
+      "sha256": "3ae1d665dce3bca5efdd12b4224dc308f3b0b41882bd656d7d043aae4bb32a90",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "svg-temporal.b4h16s4224d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/svg-temporal.b4h16s4224d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/svg-temporal.b4h16s4224d64.helion-cute.preprocess.json",
+      "sha256": "dce5d1d691b8a4384a02dce2540b40795ffdb06d3275c6d05b3145d38b4dbc33",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "svg-temporal.b4h16s4224d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/svg-temporal.b4h16s4224d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/svg-temporal.b4h16s4224d64.helion-cute.main.json",
+      "sha256": "fbcedad8a7a8b0440bfa258f1b5bca3ad7b4673365925f9d496405d4b5d3824a",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "global-sw.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/global-sw.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/global-sw.b4h16s4096d64.helion-cute.json",
+      "sha256": "f25b09f9aa30359ed184ce7330878a694e5ae7eaf567ef7e8fc3e15819e39724",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "global-sw.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/global-sw.b4h16s4096d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/global-sw.b4h16s4096d64.helion-cute.preprocess.json",
+      "sha256": "b1354f25fc37e13b9a40960a79067c1de06744657dda41aeb81b7df87fa38bfe",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "global-sw.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/global-sw.b4h16s4096d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/global-sw.b4h16s4096d64.helion-cute.main.json",
+      "sha256": "9388d90551658f577624039a45236859bd398cd8e8747df8bc8c11efa9eb0979",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sigmoid-act.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sigmoid-act.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sigmoid-act.b4h16s4096d64.helion-cute.json",
+      "sha256": "7257c366188cee16aa17f09e11a28b5ed8ab24fbe9f67ae329d20e6687c71d08",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sigmoid-act.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sigmoid-act.b4h16s4096d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sigmoid-act.b4h16s4096d64.helion-cute.preprocess.json",
+      "sha256": "fef1cdb0b1b515c8861dd0303d4168d8c63f9fb5ab86a9a7b56451ad6f89cf45",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sigmoid-act.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sigmoid-act.b4h16s4096d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sigmoid-act.b4h16s4096d64.helion-cute.main.json",
+      "sha256": "29ff70a182893e45314b3ab282d4fa767d165be19c33bf4790260e72ddfc9db8",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "vsa.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/vsa.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/vsa.b4h16s4096d64.helion-cute.json",
+      "sha256": "fd7062915747f051d63c9f033ff57a91cf73a4a3eeb974af0a12340f42d353b9",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "vsa.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/vsa.b4h16s4096d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/vsa.b4h16s4096d64.helion-cute.preprocess.json",
+      "sha256": "883ed694322ac08d3704e29ae22fa89a2960c63ddb29a65e34538824c5bda746",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "vsa.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/vsa.b4h16s4096d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/vsa.b4h16s4096d64.helion-cute.main.json",
+      "sha256": "7d614e06ef506beeddfd52e397fcbc25d2e9405d2b2670667600f58041800144",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "svg-temporal.b4h16s8320d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/svg-temporal.b4h16s8320d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/svg-temporal.b4h16s8320d64.helion-cute.json",
+      "sha256": "1335ff02e3694ee759255cf380d916981fa08e096f12de21c0115b888a495e3c",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "svg-temporal.b4h16s8320d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/svg-temporal.b4h16s8320d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/svg-temporal.b4h16s8320d64.helion-cute.preprocess.json",
+      "sha256": "f166d60fe96869f2c7df57a9c361e6211df4e69b991ced64c15e26fe71f46f44",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "svg-temporal.b4h16s8320d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/svg-temporal.b4h16s8320d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/svg-temporal.b4h16s8320d64.helion-cute.main.json",
+      "sha256": "fbcedad8a7a8b0440bfa258f1b5bca3ad7b4673365925f9d496405d4b5d3824a",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "global-sw.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/global-sw.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/global-sw.b4h16s8192d64.helion-cute.json",
+      "sha256": "890a40556bc61926b21713cc103e24fc090012853f1c4b7b978f04b32d6708e8",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "global-sw.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/global-sw.b4h16s8192d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/global-sw.b4h16s8192d64.helion-cute.preprocess.json",
+      "sha256": "5f51b9ec8434d4eb88e65b9a3a02a9b0a0e1a4c2390f9a13d07c3862645456d0",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "global-sw.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/global-sw.b4h16s8192d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/global-sw.b4h16s8192d64.helion-cute.main.json",
+      "sha256": "a503f2357f5ce55363a60eaeaa43b73e2ade4ee667da7c881edd3fb83e3c72d9",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sigmoid-act.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sigmoid-act.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sigmoid-act.b4h16s8192d64.helion-cute.json",
+      "sha256": "c27f847fdf891bc3b43887b5bb3a2d8eb5d1c1c85422299c64c08452548e1ccf",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sigmoid-act.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sigmoid-act.b4h16s8192d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sigmoid-act.b4h16s8192d64.helion-cute.preprocess.json",
+      "sha256": "f81a3f55ab7b106b3a839fa6d7d7936d142f7f25f6715dc777a10b72d9d152b5",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sigmoid-act.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sigmoid-act.b4h16s8192d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sigmoid-act.b4h16s8192d64.helion-cute.main.json",
+      "sha256": "4f898b2fac70537ef8aff5031116d2b3b06f5a0bd9df94e4641205ff8375d40a",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "vsa.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/vsa.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/vsa.b4h16s8192d64.helion-cute.json",
+      "sha256": "9133fa5c7b528b01f0a23172b875b6bfbcfd58790a3bb9c21f6ca456472fbd77",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "vsa.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/vsa.b4h16s8192d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/vsa.b4h16s8192d64.helion-cute.preprocess.json",
+      "sha256": "65c8c46c99f36d864b2428c0aa5caa93dce1ec2c89175dbb7734ce1b7966f296",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "vsa.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/vsa.b4h16s8192d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/vsa.b4h16s8192d64.helion-cute.main.json",
+      "sha256": "0b944bfb2b0f5683523a814106542ba2d08ffdae0be6fe298baf51f0aa26ffb7",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sandwich.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sandwich.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sandwich.b4h16s2048d64.helion-cute.json",
+      "sha256": "bbf2e71dc557a4359f47d51ed7e03eadeca18b4505ca83ac1fc368662daaee29",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sandwich.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sandwich.b4h16s2048d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sandwich.b4h16s2048d64.helion-cute.preprocess.json",
+      "sha256": "930221608902cd684447aca7b403f093a60803ecb3716e32cd09a9311d5032f9",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sandwich.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sandwich.b4h16s2048d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sandwich.b4h16s2048d64.helion-cute.main.json",
+      "sha256": "b369bca1be9b94ecfc6b1045e8ebf6db50ad811800df418c316d1c7fac4b2a06",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "flamingo.b4h16s2048x1024d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/flamingo.b4h16s2048x1024d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/flamingo.b4h16s2048x1024d64.helion-cute.json",
+      "sha256": "e42248dbbe06a8698c69e2b0f8e776f825408ac1029fbd7d53c0b5419e99da3c",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "flamingo.b4h16s2048x1024d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/flamingo.b4h16s2048x1024d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/flamingo.b4h16s2048x1024d64.helion-cute.preprocess.json",
+      "sha256": "1da218f6f5eb52f640fd97cfff9071fb7657fd24a5798b5d06ebae16dec97cb7",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "flamingo.b4h16s2048x1024d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/flamingo.b4h16s2048x1024d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/flamingo.b4h16s2048x1024d64.helion-cute.main.json",
+      "sha256": "4837ce3f7ecd85211b170745410a70829a418aa6dbae20168aa1c0ccfef4821a",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "graphormer-spatial.b4h16s512d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/graphormer-spatial.b4h16s512d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/graphormer-spatial.b4h16s512d64.helion-cute.json",
+      "sha256": "cca104e6b485b4ca9e4bf49279ac999940e29a181e78ec66607fb54f5c2ef0c0",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "graphormer-spatial.b4h16s512d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/graphormer-spatial.b4h16s512d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/graphormer-spatial.b4h16s512d64.helion-cute.preprocess.json",
+      "sha256": "0a110647f09559629e171813863a2620fe474576dc703341d94b3b4a59892caa",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "graphormer-spatial.b4h16s512d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/graphormer-spatial.b4h16s512d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/graphormer-spatial.b4h16s512d64.helion-cute.main.json",
+      "sha256": "8c17eebe7fd3dc6ab93fa148bc9299f94b5118231fd4a35e56fd920b47349523",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "graphormer-edge.b4h16s512d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/graphormer-edge.b4h16s512d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/graphormer-edge.b4h16s512d64.helion-cute.json",
+      "sha256": "25ea5962da7d15926d3d34e9ddba2b13d6dc0ec445b5868d9d43dc1e4b329ff2",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "graphormer-edge.b4h16s512d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/graphormer-edge.b4h16s512d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/graphormer-edge.b4h16s512d64.helion-cute.preprocess.json",
+      "sha256": "f6fd4d272f7b61da26c977f4d62de18adf76e354e573ff622814b0314cff9a52",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "graphormer-edge.b4h16s512d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/graphormer-edge.b4h16s512d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/graphormer-edge.b4h16s512d64.helion-cute.main.json",
+      "sha256": "38afeaae6711a3e055494aba7c80e1997c3e9ea3de4f9cd206f10085fc3300e8",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sandwich.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sandwich.b4h16s4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sandwich.b4h16s4096d64.helion-cute.json",
+      "sha256": "e81384e204226ffa5a002a7f8e49d5f63d772f80fed1320e7a278c4d3e776157",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sandwich.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sandwich.b4h16s4096d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sandwich.b4h16s4096d64.helion-cute.preprocess.json",
+      "sha256": "aade3153c4a188f49d504c3ae653854564c5a82e6b0ed38e8d75978430d8f5cf",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sandwich.b4h16s4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sandwich.b4h16s4096d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sandwich.b4h16s4096d64.helion-cute.main.json",
+      "sha256": "a791e5a547d33c82b3938a5908af6b173dc708df82735c1cbeca2ab59c934844",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "flamingo.b4h16s4096x2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/flamingo.b4h16s4096x2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/flamingo.b4h16s4096x2048d64.helion-cute.json",
+      "sha256": "281de4fafb4508406d9abc441b37ad06efc5b4e9a30145152a354cc0e47cbacb",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "flamingo.b4h16s4096x2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/flamingo.b4h16s4096x2048d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/flamingo.b4h16s4096x2048d64.helion-cute.preprocess.json",
+      "sha256": "6a6b7b89d8e86eb08b1121fe8e734a5723de48c1308f596c9f2e6d5c913e64c3",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "flamingo.b4h16s4096x2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/flamingo.b4h16s4096x2048d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/flamingo.b4h16s4096x2048d64.helion-cute.main.json",
+      "sha256": "bb107755f67797408d960d7cd141826c438f59f2cc8903736cdef806ce44483c",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "graphormer-spatial.b4h16s1024d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/graphormer-spatial.b4h16s1024d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/graphormer-spatial.b4h16s1024d64.helion-cute.json",
+      "sha256": "dd299138f68f8f561bc79fb94b3aaf546895de89fbef32662944c84ca12d1345",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "graphormer-spatial.b4h16s1024d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/graphormer-spatial.b4h16s1024d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/graphormer-spatial.b4h16s1024d64.helion-cute.preprocess.json",
+      "sha256": "8d54441693cec84c8deb906c6babbab17ec7a7ba96430ee913b69d5e260cf6cf",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "graphormer-spatial.b4h16s1024d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/graphormer-spatial.b4h16s1024d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/graphormer-spatial.b4h16s1024d64.helion-cute.main.json",
+      "sha256": "b965a38b51b55eba66c844cbe9119755f355b28bc290e161fb176d407bcca00d",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "graphormer-edge.b4h16s1024d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/graphormer-edge.b4h16s1024d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/graphormer-edge.b4h16s1024d64.helion-cute.json",
+      "sha256": "d80a8336fbe14b539f1d77919a7212c7f5bba532a6df16e3315e7ec71ae14542",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "graphormer-edge.b4h16s1024d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/graphormer-edge.b4h16s1024d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/graphormer-edge.b4h16s1024d64.helion-cute.preprocess.json",
+      "sha256": "72363818a43ce14f7a82e035f70492e3760df4282e5c39ea8e75020c345ac7fe",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "graphormer-edge.b4h16s1024d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/graphormer-edge.b4h16s1024d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/graphormer-edge.b4h16s1024d64.helion-cute.main.json",
+      "sha256": "c3488178881d783143837d7cf3546eed6969d7fe563ec3d5f3452ba115020e31",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sandwich.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sandwich.b4h16s8192d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sandwich.b4h16s8192d64.helion-cute.json",
+      "sha256": "f895fe7a8879f987768bd9df8a013ec1e68894f4abe3c387a3166c1e97da1aca",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sandwich.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sandwich.b4h16s8192d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sandwich.b4h16s8192d64.helion-cute.preprocess.json",
+      "sha256": "0fb5fd43f108d20e1ef72b460c6ad03f1013ea14f67dd2a23c5c3bf30dd764ce",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "sandwich.b4h16s8192d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/sandwich.b4h16s8192d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/sandwich.b4h16s8192d64.helion-cute.main.json",
+      "sha256": "560373927d70f6f3cf393cfd22a982b7f983ad07535dfdb97112933d2618d42b",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "flamingo.b4h16s8192x4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/flamingo.b4h16s8192x4096d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/flamingo.b4h16s8192x4096d64.helion-cute.json",
+      "sha256": "080a6db992148f7366d60dce25ba4d7b237add15435ba9db3b8eb2a7f5bf4a27",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "flamingo.b4h16s8192x4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/flamingo.b4h16s8192x4096d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/flamingo.b4h16s8192x4096d64.helion-cute.preprocess.json",
+      "sha256": "6b86100e36b2191b7cc99a7e78d93d4681a1fe5a5bb9a2a4cec0920667ce0a43",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "flamingo.b4h16s8192x4096d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/flamingo.b4h16s8192x4096d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/flamingo.b4h16s8192x4096d64.helion-cute.main.json",
+      "sha256": "7e930433ed317590ecfad24eee1a46449adf62e247bad9c39fc431bd427ea3ea",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "graphormer-spatial.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/graphormer-spatial.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/graphormer-spatial.b4h16s2048d64.helion-cute.json",
+      "sha256": "97b78ef676b25261b08933c9b4cf480f8fbb7b63eced1c49b0166014f9094917",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "graphormer-spatial.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/graphormer-spatial.b4h16s2048d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/graphormer-spatial.b4h16s2048d64.helion-cute.preprocess.json",
+      "sha256": "e0850b00855d6f601ec5322a3baa3ad546bfad57b5b3a8cb68dbf5e745b445ef",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "graphormer-spatial.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/graphormer-spatial.b4h16s2048d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/graphormer-spatial.b4h16s2048d64.helion-cute.main.json",
+      "sha256": "437f7adf128d36967484928d68249ab546dc3a3467603a6f2a53d67a4ef1e8f3",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "jetspec-training.b4h16s128x2176d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/jetspec-training.b4h16s128x2176d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/jetspec-training.b4h16s128x2176d64.helion-cute.json",
+      "sha256": "f167212416543b4160fa42e1fe4129a4bf74841aaec329b0c6366b6f829f48bb",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "jetspec-training.b4h16s128x2176d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/jetspec-training.b4h16s128x2176d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/jetspec-training.b4h16s128x2176d64.helion-cute.preprocess.json",
+      "sha256": "2421369076dc5568cbd4964c52f18e8ec0e6408fc28830bcf13297343be7084c",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "jetspec-training.b4h16s128x2176d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/jetspec-training.b4h16s128x2176d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/jetspec-training.b4h16s128x2176d64.helion-cute.main.json",
+      "sha256": "953e0d81986660682d5310957ef7b23bb6a3342bf3066f650b68ccb5c3d5e3de",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "graphormer-edge.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/graphormer-edge.b4h16s2048d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/graphormer-edge.b4h16s2048d64.helion-cute.json",
+      "sha256": "21a159a8f1fab3118ac27462b48007211c8f6fd2f6725cabc9b75ed7e30867c5",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "graphormer-edge.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/graphormer-edge.b4h16s2048d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/graphormer-edge.b4h16s2048d64.helion-cute.preprocess.json",
+      "sha256": "c9e147944147f4bea359df54f078c081c2001c75351bb0f4033b55b731fd7018",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "graphormer-edge.b4h16s2048d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/graphormer-edge.b4h16s2048d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/graphormer-edge.b4h16s2048d64.helion-cute.main.json",
+      "sha256": "5b1447c87246c7af186cebce3ea7043ad76785a4de709cd533c4bedf10a010a4",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "jetspec-tree.b4h16s64x2112d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/jetspec-tree.b4h16s64x2112d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/jetspec-tree.b4h16s64x2112d64.helion-cute.json",
+      "sha256": "5a36e97eac26cb5e96f6d69ed60a9e3b843172721aac14b53be176825c384d3c",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "jetspec-tree.b4h16s64x2112d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/jetspec-tree.b4h16s64x2112d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/jetspec-tree.b4h16s64x2112d64.helion-cute.preprocess.json",
+      "sha256": "3f3abe806c31b3f9d09662a84e9ba7b25e40c5034ae8bcb222e60595ae40342f",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "jetspec-tree.b4h16s64x2112d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/jetspec-tree.b4h16s64x2112d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/jetspec-tree.b4h16s64x2112d64.helion-cute.main.json",
+      "sha256": "59dd7b3ed25bb80556527bb8fc8e31419a1af72734ee3f634d09f05bbcbc682e",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "jetspec-training.b4h16s128x4224d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/jetspec-training.b4h16s128x4224d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/jetspec-training.b4h16s128x4224d64.helion-cute.json",
+      "sha256": "649f09c24f93e9be948cd2ee2e8c6057912aa333fddba6a671c01e7b20b83426",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "jetspec-training.b4h16s128x4224d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/jetspec-training.b4h16s128x4224d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/jetspec-training.b4h16s128x4224d64.helion-cute.preprocess.json",
+      "sha256": "4a24e0abd0e2b6de7ea2ca8e00a4dbbc71b3dc6708c1aa424692a2bd1f5aaf85",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "jetspec-training.b4h16s128x4224d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/jetspec-training.b4h16s128x4224d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/jetspec-training.b4h16s128x4224d64.helion-cute.main.json",
+      "sha256": "7d71b4eee982886d5c96575d01631da7840c8103e283614249a4a8ae67e0172e",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "jetspec-tree.b4h16s64x4160d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/jetspec-tree.b4h16s64x4160d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/jetspec-tree.b4h16s64x4160d64.helion-cute.json",
+      "sha256": "f4118cc71933aa9bdcca184750e560f4e1af80f61a52e0e0922811f817110012",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "jetspec-tree.b4h16s64x4160d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/jetspec-tree.b4h16s64x4160d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/jetspec-tree.b4h16s64x4160d64.helion-cute.preprocess.json",
+      "sha256": "69a677b292ca7cd3e99d18c1d03b7f9e136548f65034475e3ec5d39aab317725",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "jetspec-tree.b4h16s64x4160d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/jetspec-tree.b4h16s64x4160d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/jetspec-tree.b4h16s64x4160d64.helion-cute.main.json",
+      "sha256": "61bdf2a026aedb491603ce0bfc52e30a35c8ebc315d9279a291119f71be64951",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "jetspec-training.b4h16s128x8320d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/jetspec-training.b4h16s128x8320d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/jetspec-training.b4h16s128x8320d64.helion-cute.json",
+      "sha256": "ccad4309abf9924f4d54f4b85c4e93006df899c1b125a05a353d33b9f93783c4",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "jetspec-training.b4h16s128x8320d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/jetspec-training.b4h16s128x8320d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/jetspec-training.b4h16s128x8320d64.helion-cute.preprocess.json",
+      "sha256": "4a9d8880ef9df5f87a6c1f8a402d99de146f4c678e5dcc20212e9e236a70fc73",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "jetspec-training.b4h16s128x8320d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/jetspec-training.b4h16s128x8320d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/jetspec-training.b4h16s128x8320d64.helion-cute.main.json",
+      "sha256": "953e0d81986660682d5310957ef7b23bb6a3342bf3066f650b68ccb5c3d5e3de",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "jetspec-tree.b4h16s64x8256d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/jetspec-tree.b4h16s64x8256d64.helion-cute.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/jetspec-tree.b4h16s64x8256d64.helion-cute.json",
+      "sha256": "73c3cb245981977de274742262af4950006e85ae51093afb523c677120906d86",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "jetspec-tree.b4h16s64x8256d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/jetspec-tree.b4h16s64x8256d64.helion-cute.preprocess.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/jetspec-tree.b4h16s64x8256d64.helion-cute.preprocess.json",
+      "sha256": "030acb37bdaa1491f87ac36b151a4b6a6328610a409490bbc69ac81256ec48eb",
+      "origin": "GB300 tuned"
+    },
+    {
+      "mode": "backward",
+      "case_id": "jetspec-tree.b4h16s64x8256d64",
+      "source": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/backward/configs/jetspec-tree.b4h16s64x8256d64.helion-cute.main.json",
+      "file": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/attngym-gb300-paper-cold-20261021T235025Z/configs/backward/jetspec-tree.b4h16s64x8256d64.helion-cute.main.json",
+      "sha256": "5ffe1e27ef0abf5c081cfeda12757f273475c8fe4c356de762e917e468f5e8a7",
+      "origin": "GB300 tuned"
+    }
+  ]
+}
