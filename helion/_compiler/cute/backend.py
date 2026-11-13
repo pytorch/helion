@@ -61,6 +61,7 @@ from .analysis.specialized_mma import _kernel_specialized_mma_plan
 from .analysis.specialized_mma import _specialized_mma_root_mn_block_ids
 from .attention_plan import flash_head_dims_supported
 from .cache_policy_loads import PACKET_LOAD_HELPERS
+from .compile_options import config_compile_options
 from .direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
 from .launch_shape import LaunchShapeFlags
 from .launch_shape import check_launch_shape
@@ -78,7 +79,6 @@ from .state import new_codegen_state
 from .state import new_device_state
 from .state import new_env_state
 from .tcgen05.knobs import launch_epi_warp_groups_knob
-from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from .thread_budget import MAX_THREADS_PER_BLOCK
@@ -4087,7 +4087,6 @@ class CuteBackend(Backend):
                 else None
             )
             launcher_args = [block_arg]
-            compile_options: list[str] = []
             # One --ptxas-options flag carries them all (a second would
             # replace the first).
             ptxas_options: list[str] = []
@@ -4114,14 +4113,6 @@ class CuteBackend(Backend):
                 "split_alias_cpc"
             ):
                 ptxas_options.append("--override-directive-values --maxrregcount=48")
-            if config.advanced_controls_file:
-                ptxas_options.append(
-                    f"--apply-controls {config.advanced_controls_file}"
-                )
-            if ptxas_options:
-                compile_options.append(f"--ptxas-options='{' '.join(ptxas_options)}'")
-            if config.get(TCGEN05_CUBIN_LINEINFO_CONFIG_KEY) is True:
-                compile_options.append("--generate-line-info")
             # ``--enable-tvm-ffi`` is emitted in codegen only when the
             # autotune flag is True so the generated code reflects which
             # configs deliberately requested FFI. The runtime
@@ -4141,11 +4132,11 @@ class CuteBackend(Backend):
                         f"{TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY}=True requires "
                         "tcgen05 CuTe lowering",
                     )
-                compile_options.append("--enable-tvm-ffi")
+            compile_options = config_compile_options(
+                config, ptxas_options=ptxas_options
+            )
             if compile_options:
-                launcher_args.append(
-                    f"cute_compile_options={' '.join(compile_options)!r}"
-                )
+                launcher_args.append(f"cute_compile_options={compile_options!r}")
             return launcher_args
 
         # A whole-root plan that owns the body owns its launch (the
@@ -4936,7 +4927,11 @@ class CuteBackend(Backend):
             # dependent fill kernels ahead of this (``cute_pdl``)
             # kernel instead of memset nodes.
             statements, fill_kernels = lower_host_zero_fill_launches(
-                host, statements, env=env, kernel_name=fn.name
+                host,
+                statements,
+                env=env,
+                kernel_name=fn.name,
+                compile_options=config_compile_options(fn.config),
             )
         return statements, [*metadata, *fill_kernels]
 

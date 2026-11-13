@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import math
 import operator
+import struct
 from typing import TYPE_CHECKING
 from typing import Literal
 from typing import TypeGuard
@@ -17,12 +18,17 @@ from typing import TypeGuard
 import sympy
 import torch
 
+from .... import exc
+from ....autotuner.config_fragment import EnumFragment
+from ....autotuner.config_fragment import IntegerFragment
+from ....autotuner.config_fragment import PowerOfTwoFragment
 from ....language import matmul_ops
 from ....language import tile_ops
 from ....language import view_ops
 from ....language._tracing_ops import _get_symnode
 from ....language._tracing_ops import _mask_to
 from ....language._tracing_ops import _new_var
+from ...compile_environment import ConfigValueExpression
 from ...utils import is_full_slice
 from ..cute_mma_dag import _storage
 from .match_common import scalar_value
@@ -34,6 +40,8 @@ if TYPE_CHECKING:
 
     from torch.fx import Node
 
+    from ....autotuner.config_fragment import ConfigSpecFragment
+    from ....runtime.config import Config
     from ..cute_mma_dag import Access
     from ..cute_mma_dag import Carry
     from ..cute_mma_dag import Loop
@@ -115,6 +123,32 @@ class AttentionCoordinates:
 
 
 @dataclasses.dataclass(frozen=True)
+class RowwiseRescale:
+    """An explicit predicate selecting proposed maxima per row or whole head."""
+
+    threshold: float | ConfigValueExpression
+    headwide: bool = False
+
+    def threshold_for(self, config: Config) -> float:
+        """Resolve the selected threshold without substituting a search default."""
+        if not isinstance(self.threshold, ConfigValueExpression):
+            return self.threshold
+        try:
+            value = self.threshold.evaluate(config)
+        except TypeError as error:
+            raise exc.InvalidConfig(
+                "rowwise rescale threshold must be an integer"
+            ) from error
+        threshold = _exact_config_threshold(value)
+        if threshold is None:
+            raise exc.InvalidConfig(
+                "rowwise rescale threshold must be nonnegative and exactly "
+                "representable as finite float32"
+            )
+        return threshold
+
+
+@dataclasses.dataclass(frozen=True)
 class PagedAttentionPlan:
     """Source semantics, before choosing QK/PV physical MMA orientations."""
 
@@ -159,6 +193,7 @@ class PagedAttentionPlan:
     # Current admission couples this epilogue to capped coefficients. Keep the
     # math and storage facts separate: neither implies the other for a source.
     partial_statistics: tuple[Access, Access] | None = None
+    rowwise_rescale: RowwiseRescale | None = None
 
     @property
     def row_outputs(self) -> tuple[Access, ...]:
@@ -408,11 +443,16 @@ def _nonnegative_reference(value: Node, maximum: Node) -> bool:
     condition, unchanged, zero = value.args
     if _copy(unchanged) is not maximum or not _scalar(zero, 0):
         return False
+    return _nonnegative_finite(condition, maximum)
+
+
+def _nonnegative_finite(condition: object, maximum: Node) -> bool:
     if (
         not _call(condition, torch.ops.aten.bitwise_and.Tensor)
         or len(condition.args) != 2
     ):
         return False
+    assert isinstance(condition, torch.fx.Node)
     lower, upper = condition.args
     if _call(lower, torch.ops.aten.lt.Scalar):
         lower, upper = upper, lower
@@ -426,6 +466,181 @@ def _nonnegative_reference(value: Node, maximum: Node) -> bool:
         and _copy(upper.args[0]) is maximum
         and _scalar(upper.args[1], math.inf)
     )
+
+
+def _exact_fp32_threshold(value: object) -> float | None:
+    if not isinstance(value, (float, int)) or isinstance(value, bool):
+        return None
+    if not 0 <= value <= 3.4028234663852886e38:
+        return None
+    result = float(value)
+    # Preserve the existing literal conversion through Python float before
+    # checking that the emitted FP32 comparison needs no further rounding.
+    return result if struct.unpack("f", struct.pack("f", result))[0] == result else None
+
+
+def _exact_config_threshold(value: object) -> float | None:
+    """A declared integer choice must survive both conversions without rounding."""
+    if type(value) is not int:
+        return None
+    result = _exact_fp32_threshold(value)
+    return result if result == value else None
+
+
+def _rowwise_threshold_domain(fragment: ConfigSpecFragment | None) -> bool:
+    """Admit only a complete known domain; other kernels keep ordinary lowering.
+
+    A search subset is not the domain: users can select any declared Enum choice.
+    Custom fragments may generate values outside these built-in rules.
+    """
+    if fragment is None:
+        return False
+    if type(fragment) is EnumFragment:
+        return bool(fragment.choices) and all(
+            _exact_config_threshold(value) is not None for value in fragment.choices
+        )
+    # Integer defaults are clamped, not rounded onto the generated domain.
+    # In particular, a power-of-two fragment can have an inexact interior default.
+    if type(fragment) is IntegerFragment:
+        return (
+            _exact_config_threshold(fragment.default()) is not None
+            and type(fragment.low) is int
+            and type(fragment.high) is int
+            and (
+                0 <= fragment.low <= fragment.high <= 2**24
+                or fragment.low == fragment.high
+                and _exact_config_threshold(fragment.low) is not None
+            )
+        )
+    if type(fragment) is PowerOfTwoFragment:
+        return (
+            _exact_config_threshold(fragment.default()) is not None
+            and type(fragment.low) is int
+            and type(fragment.high) is int
+            and 0 < fragment.low <= fragment.high <= 2**127
+            and fragment.low & (fragment.low - 1) == 0
+            and fragment.high & (fragment.high - 1) == 0
+        )
+    return False
+
+
+def _rowwise_rescale(
+    predicate: Node, tile_maximum: Node, maximum: Node, program: MmaDagProgram
+) -> RowwiseRescale | None:
+    """Prove row_max > T | ~valid(old) | isnan(row_max), with no extra terms."""
+    terms: list[Node] = []
+    pending: list[object] = [predicate]
+    while pending:
+        term = _copy(pending.pop())
+        if not isinstance(term, torch.fx.Node):
+            return None
+        if _call(term, torch.ops.aten.bitwise_or.Tensor) and len(term.args) == 2:
+            pending.extend(term.args)
+        else:
+            terms.append(term)
+    if len(terms) != 3:
+        return None
+    greater = [t for t in terms if _call(t, torch.ops.aten.gt.Scalar)]
+    invalid = [t for t in terms if _call(t, torch.ops.aten.bitwise_not.default)]
+    nan = [t for t in terms if _call(t, torch.ops.aten.isnan.default)]
+    if len(greater) != 1 or len(invalid) != 1 or len(nan) != 1:
+        return None
+    (comparison,) = greater
+    (invalid_old,) = invalid
+    (nan_maximum,) = nan
+    if (
+        len(comparison.args) != 2
+        or _copy(comparison.args[0]) is not tile_maximum
+        or len(invalid_old.args) != 1
+        or not _nonnegative_finite(invalid_old.args[0], maximum)
+        or len(nan_maximum.args) != 1
+        or _copy(nan_maximum.args[0]) is not tile_maximum
+    ):
+        return None
+    threshold = _copy(comparison.args[1])
+    if _call(threshold, _get_symnode) and isinstance(
+        threshold.meta.get("val"), torch.SymInt
+    ):
+        expression = symnode_sympy(threshold)
+        if not isinstance(expression, sympy.Symbol):
+            return None
+        config_value = program.config_scalars.get(expression)
+        if config_value is None or config_value.operation != "config":
+            return None
+        (name,) = config_value.arguments
+        if not isinstance(name, str) or not _rowwise_threshold_domain(
+            program.config_fragments.get(name)
+        ):
+            return None
+        return RowwiseRescale(config_value)
+    literal = _exact_fp32_threshold(threshold)
+    if literal is None:
+        return None
+    return RowwiseRescale(literal)
+
+
+def _headwide_predicate(
+    predicate: Node, query: Access, maximum: Node, coordinates: AttentionCoordinates
+) -> Node | None:
+    """Prove max(float(bool_rows)) > 0 over exactly one complete logical head.
+
+    The explicit negative-infinity mask excludes padded root rows, including invalid old
+    maxima in those rows. Float32 represents every Boolean value exactly.
+    """
+    if (
+        not _call(predicate, torch.ops.aten.gt.Scalar)
+        or len(predicate.args) != 2
+        or predicate.args[1] != 0.0
+    ):
+        return None
+    reduction = predicate.args[0]
+    if (
+        not _call(reduction, torch.ops.aten.amax.default)
+        or len(reduction.args) not in (2, 3)
+        or reduction.args[1] not in ([0], [-1])
+        or reduction.kwargs
+        or (len(reduction.args) == 3 and reduction.args[2] is not False)
+    ):
+        return None
+    masked = reduction.args[0]
+    if (
+        not _call(masked, _mask_to)
+        or len(masked.args) != 2
+        or not _scalar(masked.args[1], -math.inf)
+        or masked.kwargs
+    ):
+        return None
+    converted = masked.args[0]
+    if (
+        not _call(converted, torch.ops.prims.convert_element_type.default)
+        or len(converted.args) != 2
+        or converted.args[1] is not torch.float32
+        or converted.kwargs
+    ):
+        return None
+    rows = converted.args[0]
+    if not isinstance(rows, torch.fx.Node):
+        return None
+    value = rows.meta.get("val")
+    old = maximum.meta.get("val")
+    result = predicate.meta.get("val")
+    axis = query.tile_dims[0]
+    if (
+        not isinstance(value, torch.Tensor)
+        or value.dtype != torch.bool
+        or value.ndim != 1
+        or not isinstance(old, torch.Tensor)
+        or value.shape != old.shape
+        or not isinstance(result, torch.Tensor)
+        or result.dtype != torch.bool
+        or result.ndim != 0
+        or axis.kind != "root"
+        or axis.size is None
+        or axis.size < axis.extent
+        or axis.extent != coordinates.query_len * coordinates.group
+    ):
+        return None
+    return rows
 
 
 def _block_scaled_access_pair(
@@ -862,11 +1077,41 @@ def match_paged_attention(program: MmaDagProgram) -> PagedAttentionPlan | None:
     ):
         return None
     max_value = _copy(maximum.output)
-    row_max = _other(max_value, torch.ops.aten.maximum.default, maximum.placeholder)
+    proposed_max = max_value
+    rowwise_predicate = None
+    if _call(max_value, torch.ops.aten.where.self):
+        assert isinstance(max_value, torch.fx.Node)
+        if (
+            reference is None
+            or not score_base2
+            or len(max_value.args) != 3
+            or _copy(max_value.args[2]) is not maximum.placeholder
+            or not isinstance(max_value.args[0], torch.fx.Node)
+        ):
+            return None
+        rowwise_predicate = max_value.args[0]
+        proposed_max = _copy(max_value.args[1])
+    row_max = _other(proposed_max, torch.ops.aten.maximum.default, maximum.placeholder)
     if reference is not None:
         row_max = _other(row_max, torch.ops.aten.add.Tensor, reference)
     if not _row_reduction(row_max, torch.ops.aten.amax.default, score, -math.inf):
         return None
+    rowwise_rescale = None
+    if rowwise_predicate is not None:
+        assert isinstance(row_max, torch.fx.Node)
+        head_rows = _headwide_predicate(
+            rowwise_predicate, query, maximum.placeholder, coordinates
+        )
+        rowwise_rescale = _rowwise_rescale(
+            head_rows if head_rows is not None else rowwise_predicate,
+            row_max,
+            maximum.placeholder,
+            program,
+        )
+        if rowwise_rescale is None:
+            return None
+        if head_rows is not None:
+            rowwise_rescale = dataclasses.replace(rowwise_rescale, headwide=True)
     if not _safe_value(safe_max, max_value, -math.inf, 0):
         return None
     accumulators = [carry for carry in loop.carries if _copy(carry.output) is pv]
@@ -1098,4 +1343,5 @@ def match_paged_attention(program: MmaDagProgram) -> PagedAttentionPlan | None:
         output_scale,
         coefficients_capped,
         partial_statistics,
+        rowwise_rescale,
     )

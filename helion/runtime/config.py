@@ -119,6 +119,7 @@ StoreCacheModifierLiteral = Literal["", ".cs", ".wt"]
 CuteAsyncLoadCacheLiteral = Literal["cg", "ca"]
 CuteAsyncStorePolicyLiteral = Literal["default", "l2_evict_last"]
 CuteStorePolicyLiteral = Literal["default", "streaming", "l2_evict_last"]
+CuteCompilerPipelineLiteral = Literal["default", "opt2"]
 CuteExactDivFormLiteral = Literal["redo", "plain"]
 CuteAffineScanScheduleLiteral = Literal[
     "ordinary",
@@ -159,6 +160,7 @@ class Config(Mapping[str, object]):
         load_cache_modifiers: list[LoadCacheModifierLiteral] | None = None,
         store_cache_modifiers: list[StoreCacheModifierLiteral] | None = None,
         cute_store_policy: CuteStorePolicyLiteral | None = None,
+        cute_compiler_pipeline: CuteCompilerPipelineLiteral | None = None,
         cute_exact_div_form: CuteExactDivFormLiteral | None = None,
         cute_async_load_stages: int | None = None,
         cute_async_load_lookahead: int | None = None,
@@ -227,6 +229,9 @@ class Config(Mapping[str, object]):
             cute_store_policy: Cache policy for proven full aligned 16-byte CuTe
                 global store packets ("default", "streaming" = evict-first
                 ``st.global.cs`` for outputs written once, or "l2_evict_last").
+            cute_compiler_pipeline: CuTe compiler optimization pipeline. "default"
+                leaves SDK options unchanged; "opt2" requests optimization level 2.
+                Explicit SDK compiler environment overrides still take precedence.
             cute_async_load_stages: Shared-memory ring stages for eligible CuTe
                 in-place 16-byte state loads. Zero disables the transformation.
             cute_async_load_lookahead: Async-copy groups kept ahead of compute.
@@ -431,6 +436,7 @@ class Config(Mapping[str, object]):
             "load_cache_modifiers": load_cache_modifiers,
             "store_cache_modifiers": store_cache_modifiers,
             "cute_store_policy": cute_store_policy,
+            "cute_compiler_pipeline": cute_compiler_pipeline,
             "cute_exact_div_form": cute_exact_div_form,
             "cute_async_load_stages": cute_async_load_stages,
             "cute_async_load_lookahead": cute_async_load_lookahead,
@@ -769,6 +775,13 @@ class Config(Mapping[str, object]):
         return cast(
             "CuteStorePolicyLiteral",
             self.config.get("cute_store_policy", "default"),
+        )
+
+    @property
+    def cute_compiler_pipeline(self) -> CuteCompilerPipelineLiteral:
+        return cast(
+            "CuteCompilerPipelineLiteral",
+            self.config.get("cute_compiler_pipeline", "default"),
         )
 
     @property

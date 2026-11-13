@@ -89,7 +89,9 @@ if TYPE_CHECKING:
 
     from torch.fx.node import Node
 
+    from ...autotuner.config_fragment import ConfigSpecFragment
     from ...runtime.config import Config
+    from ..compile_environment import ConfigValueExpression
     from ..device_ir import GraphInfo
     from .analysis.separable_index_map import SeparableIndexMap
     from .cute_mma_dag_tcgen05 import StreamedLoopFacts
@@ -171,6 +173,8 @@ MMA_DAG_V_LAG_CHOICES: tuple[int, ...] = (0, 1, 2, 3)
 # Paired non-MMA warps may suspend at barriers, leaving the issuer warps'
 # latency-sensitive waits unchanged. Short and long pipelines can differ.
 MMA_DAG_SLEEP_WAITS_KEY = "cute_mma_dag_sleep_waits"
+# Retire the paired allocation after its last TMEM reads, before output stores.
+MMA_DAG_EARLY_TMEM_RETIREMENT_KEY = "cute_mma_dag_early_tmem_retirement"
 # Paired queries can use a proved rectangular TMA map or scalar shared stores.
 MMA_DAG_QUERY_TMA_KEY = "cute_mma_dag_query_tma"
 # Paired V transport can inspect proved scale metadata before fetching raw bytes.
@@ -449,6 +453,7 @@ MMA_DAG_KEYS: tuple[str, ...] = (
     MMA_DAG_PASS_WARPS_KEY,
     MMA_DAG_V_LAG_KEY,
     MMA_DAG_SLEEP_WAITS_KEY,
+    MMA_DAG_EARLY_TMEM_RETIREMENT_KEY,
     MMA_DAG_QUERY_TMA_KEY,
     MMA_DAG_VALUE_METADATA_SKIP_KEY,
     MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY,
@@ -702,8 +707,8 @@ class Axis:
     kind: str
     extent: int
     loop: int = -1
-    # A tile loop over a fixed block size (``hl.tile(n, block_size=C)`` with
-    # a specialized ``C``): the size is the kernel's, not the config's.
+    # A fixed tile loop or complete root tile (``hl.tile(n, block_size=C)``):
+    # the size is the kernel's, not the config's.
     size: int | None = None
 
 
@@ -1255,6 +1260,14 @@ class MmaDagProgram:
     pass_chains: dict[Node, tuple[Derived, ...]] = dataclasses.field(
         default_factory=dict
     )
+    # Declared integer tunables retain their config identity, not a default or
+    # size hint. Semantic matchers can consume these without an active compiler.
+    config_scalars: dict[sympy.Symbol, ConfigValueExpression] = dataclasses.field(
+        default_factory=dict
+    )
+    config_fragments: dict[str, ConfigSpecFragment] = dataclasses.field(
+        default_factory=dict
+    )
 
     @property
     def dtype(self) -> torch.dtype:
@@ -1560,8 +1573,8 @@ class AxisFacts:
     # the last CTA's rows past the extent are zero-filled operand rows and
     # zero side loads, their stores dropped).  See ``ragged_root_axes``.
     ragged: bool = False
-    # The block size of a fixed-size tile loop axis (``Axis.size``); None
-    # for an axis the config sizes.
+    # The block size of a fixed tile loop or complete root (``Axis.size``);
+    # None for an axis the config sizes.
     fixed: int | None = None
 
     @property
@@ -4850,8 +4863,12 @@ class _Matcher:
                 raise _NotMine
             if kind == AXIS_RDIM and (extent & (extent - 1) or extent % MMA_DAG_K_STEP):
                 raise _NotMine
-            size = self.fixed_sizes.get(block_id) if kind == AXIS_LOOP else None
-            if size is not None and extent % size:
+            size = (
+                self.fixed_sizes.get(block_id)
+                if kind in (AXIS_ROOT, AXIS_LOOP)
+                else None
+            )
+            if kind == AXIS_LOOP and size is not None and extent % size:
                 raise _NotMine
             axis = Axis(len(self.axis_list), block_id, kind, extent, loop, size)
             self.axes[block_id] = axis
@@ -6725,7 +6742,13 @@ class _Matcher:
             source = self.env.block_sizes[block_id].block_size_source
             if block_id in tiled_blocks:
                 if isinstance(source, FixedBlockSizeSource):
-                    raise _NotMine
+                    fixed = self.static_int(source.value)
+                    extent = self.static_int(self.env.block_sizes[block_id].size)
+                    # One fixed root tile owns the complete logical axis.
+                    # Partial fixed root tiling still needs its own coordinate proof.
+                    if fixed is None or extent is None or fixed < extent or fixed < 1:
+                        raise _NotMine
+                    self.fixed_sizes[block_id] = fixed
                 self.axis_of_block(block_id, AXIS_ROOT)
             else:
                 if isinstance(source, FixedBlockSizeSource) and source.value != 1:
@@ -6806,6 +6829,12 @@ class _Matcher:
             scans=tuple(self.scans),
             vec_frag_slots=vec_frag_slots,
             tile_index_loads=dict(self.tile_index_loads),
+            config_scalars={
+                symbol: self.env.config_value_expressions[symbol]
+                for symbol in self.env.tunable_symbols
+                if symbol in self.env.config_value_expressions
+            },
+            config_fragments=dict(self.env.config_spec.user_defined_tunables),
             acc_loads=self.acc_loads,
             store_aux_loads=tuple(store_aux),
             scalar_loads=tuple(self.scalar_loads.values()),

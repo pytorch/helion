@@ -15,6 +15,7 @@ from helion._testing import cpu_render_target
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_paged_attention import paged_online_attention
 from helion._testing.cute_paged_attention_schedule import paged_attention_args
+from helion._testing.cute_paged_v_lag import without_retirement_seeds
 
 if TYPE_CHECKING:
     from helion.runtime.kernel import Kernel
@@ -85,6 +86,7 @@ def test_partial_schedule_seeds_supported_topologies_and_occupancies():
         seeds = MmaDagSeedPlanner(
             facts, bound.config_spec, occupancy_key="cute_min_blocks_per_mp"
         ).configs([])
+        seeds = without_retirement_seeds(seeds)
         assert [
             (
                 seed.get("cute_mma_dag_pass_warps"),

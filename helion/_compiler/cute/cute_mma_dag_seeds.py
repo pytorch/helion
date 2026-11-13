@@ -32,6 +32,7 @@ from .cute_mma_dag import MMA_DAG_CLUSTER_MAX
 from .cute_mma_dag import MMA_DAG_DERIVED_EXCHANGE
 from .cute_mma_dag import MMA_DAG_DERIVED_KEY
 from .cute_mma_dag import MMA_DAG_DERIVED_PASS
+from .cute_mma_dag import MMA_DAG_EARLY_TMEM_RETIREMENT_KEY
 from .cute_mma_dag import MMA_DAG_EPILOGUE_KEY
 from .cute_mma_dag import MMA_DAG_EPILOGUE_ROW
 from .cute_mma_dag import MMA_DAG_EPILOGUE_SPLIT
@@ -743,6 +744,7 @@ class MmaDagSeedPlanner:
         )
         seeds: list[Config] = []
         sleeping: list[Config] = []
+        early_retirement: list[Config] = []
         query_tma: list[Config] = []
         value_metadata: list[Config] = []
         value_metadata_policies: list[Config] = []
@@ -919,6 +921,14 @@ class MmaDagSeedPlanner:
                                                 }
                                             )
                                         )
+                                    early_retirement.append(
+                                        Config.from_dict(
+                                            {
+                                                **seed_config,
+                                                MMA_DAG_EARLY_TMEM_RETIREMENT_KEY: True,
+                                            }
+                                        )
+                                    )
                                     sleeping.append(
                                         Config.from_dict(
                                             {
@@ -980,4 +990,7 @@ class MmaDagSeedPlanner:
         # of relying on two independently unprofitable neighbor moves. Preserve
         # the old prefix and leave the other scheduling knobs uncrossed.
         seeds.extend(value_metadata_probability)
+        # Keep every old seed in order. One ordinary paired counterpart per
+        # V lag exposes retirement independently of PDL and cache policy.
+        seeds.extend(early_retirement)
         return seeds

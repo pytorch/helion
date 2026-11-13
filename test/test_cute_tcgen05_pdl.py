@@ -211,7 +211,11 @@ def test_seeds_carry_the_knob_without_twins_and_normalization_carries_it() -> No
         ] == schedules
         assert all("cute_pdl" not in s.config for s in unsearched)
         normalized = spec.normalized_config(
-            _persistent_config(loop_orders=[[0, 1]], l2_groupings=[1])
+            _persistent_config(
+                loop_orders=[[0, 1]],
+                l2_groupings=[1],
+                cute_compiler_pipeline="default",
+            )
         )
         assert normalized.config["cute_pdl"] is True
         generation = spec.create_config_generation()

@@ -14,6 +14,8 @@ import textwrap
 from typing import TYPE_CHECKING
 
 from ... import exc
+from .compile_options import compile_options_keyword
+from .compile_options import config_compile_options
 from .full_slice_matmul import _bound_names
 from .packed_operand import KEY
 from .packed_operand import PackedOperandPlan
@@ -250,8 +252,9 @@ def generate_packed_operand(
     source = packed_operand_module(plan, min_blocks)
     kernel = f"{module_name}._helion_packed_operand"
     arguments = ", ".join(plan.arguments)
+    options = compile_options_keyword(config_compile_options(config))
     replacement = ast.parse(
-        f"_launcher({kernel}, ({plan.rows // 32}, {plan.columns // 4}, 1), {arguments}, block=(128, 1, 1))"
+        f"_launcher({kernel}, ({plan.rows // 32}, {plan.columns // 4}, 1), {arguments}, block=(128, 1, 1){options})"
     ).body[0]
     start = host.body.index(calls[0])
     host.body[start : start + 2] = [replacement]

@@ -47,7 +47,7 @@ _BASE_VALID_KEYS = """
     cute_collective_copy cute_collective_epilogue cute_collective_mma
     cute_collective_native_seeded cute_collective_operand_packets
     cute_collective_recipe cute_collective_stages cute_collective_static_layouts
-    cute_collective_tmem_a cute_collective_tmem_seed cute_exact_div_form
+    cute_collective_tmem_a cute_collective_tmem_seed cute_compiler_pipeline cute_exact_div_form
     cute_flash_bias_form cute_flash_bias_stage cute_flash_bwd_aux_smem
     cute_flash_bwd_bias_fold cute_flash_bwd_ds_tmem cute_flash_bwd_exp2_emu
     cute_flash_bwd_exp2_f32 cute_flash_bwd_family cute_flash_bwd_hook_cols
@@ -115,7 +115,7 @@ _BASE_VALID_KEYS = """
     cute_mma_dag_epilogue cute_mma_dag_exchange cute_mma_dag_loads
     cute_mma_dag_lookahead cute_mma_dag_pass_warps cute_mma_dag_persistent
     cute_mma_dag_probability_schedule
-    cute_mma_dag_query_tma cute_mma_dag_sleep_waits cute_mma_dag_split cute_mma_dag_stages
+    cute_mma_dag_early_tmem_retirement cute_mma_dag_query_tma cute_mma_dag_sleep_waits cute_mma_dag_split cute_mma_dag_stages
     cute_mma_dag_value_metadata_skip
     cute_mma_dag_value_metadata_read_overlap
     cute_mma_dag_store cute_mma_dag_v_lag
@@ -207,7 +207,7 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_collective_copy cute_collective_epilogue cute_collective_mma
     cute_collective_native_seeded cute_collective_operand_packets
     cute_collective_recipe cute_collective_stages cute_collective_static_layouts
-    cute_collective_tmem_a cute_collective_tmem_seed cute_exact_div_form
+    cute_collective_tmem_a cute_collective_tmem_seed cute_compiler_pipeline cute_exact_div_form
     cute_flash_bias_form cute_flash_bias_stage cute_flash_bwd_aux_smem
     cute_flash_bwd_bias_fold cute_flash_bwd_ds_tmem cute_flash_bwd_exp2_emu
     cute_flash_bwd_exp2_f32 cute_flash_bwd_family cute_flash_bwd_hook_cols
@@ -275,7 +275,7 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_mma_dag_epilogue cute_mma_dag_exchange cute_mma_dag_loads
     cute_mma_dag_lookahead cute_mma_dag_pass_warps cute_mma_dag_persistent
     cute_mma_dag_probability_schedule
-    cute_mma_dag_query_tma cute_mma_dag_sleep_waits cute_mma_dag_split cute_mma_dag_stages
+    cute_mma_dag_early_tmem_retirement cute_mma_dag_query_tma cute_mma_dag_sleep_waits cute_mma_dag_split cute_mma_dag_stages
     cute_mma_dag_value_metadata_skip
     cute_mma_dag_value_metadata_read_overlap
     cute_mma_dag_store cute_mma_dag_v_lag
@@ -360,7 +360,7 @@ _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     cute_collective_copy cute_collective_epilogue cute_collective_mma
     cute_collective_native_seeded cute_collective_operand_packets
     cute_collective_recipe cute_collective_stages cute_collective_static_layouts
-    cute_collective_tmem_a cute_collective_tmem_seed cute_exact_div_form
+    cute_collective_tmem_a cute_collective_tmem_seed cute_compiler_pipeline cute_exact_div_form
     cute_fp32_dot cute_fragment_atomic_aggregation
     cute_fragment_atomic_consumer_fusion cute_fragment_batched_loads
     cute_fragment_bounded_gather cute_fragment_cta_topk cute_fragment_half_mma
@@ -418,7 +418,7 @@ _BASE_CUTE_ACCEPTED = """
     cute_collective_copy cute_collective_epilogue cute_collective_mma
     cute_collective_native_seeded cute_collective_operand_packets
     cute_collective_recipe cute_collective_stages cute_collective_static_layouts
-    cute_collective_tmem_a cute_collective_tmem_seed cute_exact_div_form
+    cute_collective_tmem_a cute_collective_tmem_seed cute_compiler_pipeline cute_exact_div_form
     cute_flash_bias_form cute_flash_bias_stage cute_flash_bwd_aux_smem
     cute_flash_bwd_bias_fold cute_flash_bwd_ds_tmem cute_flash_bwd_exp2_emu
     cute_flash_bwd_exp2_f32 cute_flash_bwd_family cute_flash_bwd_hook_cols
@@ -486,7 +486,7 @@ _BASE_CUTE_ACCEPTED = """
     cute_mma_dag_epilogue cute_mma_dag_exchange cute_mma_dag_loads
     cute_mma_dag_lookahead cute_mma_dag_pass_warps cute_mma_dag_persistent
     cute_mma_dag_probability_schedule
-    cute_mma_dag_query_tma cute_mma_dag_sleep_waits cute_mma_dag_split cute_mma_dag_stages
+    cute_mma_dag_early_tmem_retirement cute_mma_dag_query_tma cute_mma_dag_sleep_waits cute_mma_dag_split cute_mma_dag_stages
     cute_mma_dag_value_metadata_skip
     cute_mma_dag_value_metadata_read_overlap
     cute_mma_dag_store cute_mma_dag_v_lag

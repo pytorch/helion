@@ -20,8 +20,10 @@ from torch.utils._python_dispatch import _get_current_dispatch_mode_stack
 from torch.utils._pytree import tree_leaves
 
 from .._compiler.cute.cutedsl_compat import _cute_backend_requirement_error
+from .._compiler.cute.full_tile_bounds import prove_full_tile_launch
 from .._compiler.cute.target_facts import B200
 from .._utils import triton_is_available
+from ..runtime.config import Config
 from . import cpu_render_target
 from . import default_cute_mma_support
 from . import patch_cute_mma_support
@@ -32,8 +34,10 @@ if TYPE_CHECKING:
     from collections.abc import Generator
     from pathlib import Path
     from types import ModuleType
+    from typing import Any
     from unittest.mock import MagicMock
 
+    from .._compiler.cute.full_tile_bounds import FullTilePlan
     from ..runtime.kernel import BoundKernel
     from ..runtime.kernel import Kernel
 
@@ -63,6 +67,28 @@ def tcgen05_target() -> ExitStack:
         )
     )
     return stack
+
+
+def check_config_compile_options(bound: BoundKernel, config: Config) -> None:
+    """Exercise a real emitter while keeping its device source and ABI fixed."""
+    original = ast.parse(bound.to_code(config))
+    requested = Config.from_dict(
+        config.config
+        | {
+            "cute_compiler_pipeline": "opt2",
+            "advanced_controls_file": "control.txt",
+        }
+    )
+    configured = ast.parse(bound.to_code(requested))
+    observed = []
+    for node in ast.walk(configured):
+        if isinstance(node, ast.Call):
+            for keyword in list(node.keywords):
+                if keyword.arg == "cute_compile_options":
+                    observed.append(ast.literal_eval(keyword.value))
+                    node.keywords.remove(keyword)
+    assert observed == ["--opt-level 2 --ptxas-options='--apply-controls control.txt'"]
+    assert ast.dump(configured) == ast.dump(original)
 
 
 def stage_sources(source: str) -> list[str]:
@@ -287,3 +313,32 @@ def cuda_fake(backend: object, tensor: torch.Tensor) -> torch.Tensor:
             requires_grad=tensor.requires_grad,
         )
     return FakeTensor(tensor.fake_mode, meta, torch.device("cuda:0"))
+
+
+def full_tile_launch_plan(
+    prefix: str = "n = input_tensor.numel(); flat = input_tensor.view(-1)",
+    *,
+    grid: str = "((n + BLOCK - 1) // BLOCK,)",
+    block: str = "(4, 1, 1)",
+    arguments: str = "flat, out, n",
+    keyword: str = "block",
+    integer_parameters: tuple[str, ...] = ("n",),
+    constants: dict[str, Any] | None = None,
+    rank: int = 1,
+) -> FullTilePlan | None:
+    body = ast.parse(
+        prefix
+        + "\nout = torch.empty_like(flat)\nBLOCK = 8\n"
+        + f"_launcher(kernel, {grid}, {arguments}, {keyword}={block})\n"
+        + "return out\n"
+    ).body
+    return prove_full_tile_launch(
+        body,
+        kernel_name="kernel",
+        parameter_names=("x", "y", "n"),
+        tensor_parameters={"x": rank, "y": rank},
+        integer_parameters=integer_parameters,
+        tensor_inputs={"input_tensor": 2, "other": 2},
+        scalar_inputs={"length", "runtime"},
+        constexpr_values={"BLOCK": 8} if constants is None else constants,
+    )

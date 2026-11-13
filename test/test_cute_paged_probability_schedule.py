@@ -9,6 +9,7 @@ from helion._testing import cpu_render_target
 from helion._testing.cute_optional_lse import optional_lse_config
 from helion._testing.cute_paged_reference import reference_attention_bound
 from helion._testing.cute_paged_v_lag import paired_v_lag_bound
+from helion._testing.cute_paged_v_lag import without_retirement_seeds
 
 pytestmark = pytest.mark.cpu_only
 KEY = "cute_mma_dag_probability_schedule"
@@ -96,6 +97,7 @@ def test_probability_seeds_share_admission_and_keep_serial_default():
         assert all(
             seed.get("cute_pdl_release", "auto") != "loader_tail" for seed in seeds
         )
+        seeds = without_retirement_seeds(seeds)
         assert seeds[0].get(KEY, "serial") == "serial"
         probed = [seed for seed in seeds if seed.get(KEY, "serial") != "serial"]
         assert sorted(

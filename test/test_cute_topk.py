@@ -1248,7 +1248,10 @@ def test_topk_geometry_survives_flat_config_roundtrip(
     )
     topk_spec.normalize(config)
     generation = ConfigGeneration(topk_spec)
-    assert generation.unflatten(generation.flatten(config)) == config
+    assert generation.unflatten(generation.flatten(config)).config == {
+        **config.config,
+        "cute_compiler_pipeline": "default",
+    }
 
 
 @pytest.mark.parametrize("vector", [1, 2, 4, 8])
@@ -1258,7 +1261,10 @@ def test_topk_output_vector_survives_flat_config_roundtrip(
     config = helion.Config(cute_topk_output_vector_width=vector)
     topk_spec.normalize(config)
     generation = ConfigGeneration(topk_spec)
-    assert generation.unflatten(generation.flatten(config)) == config
+    assert generation.unflatten(generation.flatten(config)).config == {
+        **config.config,
+        "cute_compiler_pipeline": "default",
+    }
 
 
 @pytest.mark.parametrize("mode", ["gather", "decode"])
@@ -1269,7 +1275,10 @@ def test_topk_value_mode_survives_flat_config_roundtrip(
     config = helion.Config(cute_topk_value_mode=mode)
     topk_spec.normalize(config)
     generation = ConfigGeneration(topk_spec)
-    assert generation.unflatten(generation.flatten(config)) == config
+    assert generation.unflatten(generation.flatten(config)).config == {
+        **config.config,
+        "cute_compiler_pipeline": "default",
+    }
 
 
 def test_topk_invalid_value_mode_normalizes_to_gather(topk_spec: ConfigSpec) -> None:
@@ -1286,7 +1295,10 @@ def test_topk_key_dtype_survives_flat_config_roundtrip(
     config = helion.Config(cute_topk_key_dtype=key_dtype)
     topk_spec.normalize(config)
     generation = ConfigGeneration(topk_spec)
-    assert generation.unflatten(generation.flatten(config)) == config
+    assert generation.unflatten(generation.flatten(config)).config == {
+        **config.config,
+        "cute_compiler_pipeline": "default",
+    }
 
 
 def test_topk_invalid_key_dtype_normalizes_to_int32(topk_spec: ConfigSpec) -> None:
@@ -1303,7 +1315,10 @@ def test_topk_rank_mode_survives_flat_config_roundtrip(
     config = helion.Config(cute_topk_rank_mode=rank_mode)
     topk_spec.normalize(config)
     generation = ConfigGeneration(topk_spec)
-    assert generation.unflatten(generation.flatten(config)) == config
+    assert generation.unflatten(generation.flatten(config)).config == {
+        **config.config,
+        "cute_compiler_pipeline": "default",
+    }
 
 
 def test_topk_invalid_rank_mode_normalizes_to_signed(topk_spec: ConfigSpec) -> None:
@@ -1320,7 +1335,10 @@ def test_topk_selection_layout_survives_flat_config_roundtrip(
     config = helion.Config(cute_topk_selection_layout=layout)
     topk_spec.normalize(config)
     generation = ConfigGeneration(topk_spec)
-    assert generation.unflatten(generation.flatten(config)) == config
+    assert generation.unflatten(generation.flatten(config)).config == {
+        **config.config,
+        "cute_compiler_pipeline": "default",
+    }
 
 
 def test_topk_invalid_selection_layout_normalizes_to_replicated(
@@ -1339,7 +1357,10 @@ def test_topk_sort_network_config_roundtrip(
     config = helion.Config(cute_topk_sort_network=network)
     topk_spec.normalize(config)
     generation = ConfigGeneration(topk_spec)
-    assert generation.unflatten(generation.flatten(config)) == config
+    assert generation.unflatten(generation.flatten(config)).config == {
+        **config.config,
+        "cute_compiler_pipeline": "default",
+    }
     assert helion.Config.from_json(config.to_json()) == config
 
 
@@ -2817,7 +2838,10 @@ def test_packed_rare_config(
     config.config[key] = valid
     spec.normalize(config)
     generation = ConfigGeneration(spec)
-    assert generation.unflatten(generation.flatten(config)) == config
+    assert generation.unflatten(generation.flatten(config)).config == {
+        **config.config,
+        "cute_compiler_pipeline": "default",
+    }
     invalid_config = helion.Config()
     invalid_config.config[key] = invalid
     with pytest.raises(exc.InvalidConfig, match="must be one of"):
@@ -3586,7 +3610,10 @@ def test_balanced_config_roundtrip_and_default(monkeypatch: pytest.MonkeyPatch) 
     config = helion.Config(cute_topk_merge_schedule="balanced")
     spec.normalize(config)
     generation = ConfigGeneration(spec)
-    assert generation.unflatten(generation.flatten(config)) == config
+    assert generation.unflatten(generation.flatten(config)).config == {
+        **config.config,
+        "cute_compiler_pipeline": "default",
+    }
     for invalid in (True, 1, "tree"):
         with pytest.raises(exc.InvalidConfig):
             spec.normalize(helion.Config(cute_topk_merge_schedule=invalid))

@@ -437,19 +437,6 @@ def _create_cute_wrapper(
     cluster_shape = _cute_cluster_shape(cute_kernel, wrapper_plans)
     if cluster_shape is not None:
         launch_suffix += f", cluster={list(cluster_shape)!r}"
-    preferred_smem_carveout = getattr(
-        cast("Any", cute_kernel), "_helion_cute_preferred_smem_carveout", None
-    )
-    if preferred_smem_carveout is not None:
-        if (
-            type(preferred_smem_carveout) is not int
-            or not 0 <= preferred_smem_carveout <= 100
-        ):
-            raise ValueError(
-                "invalid _helion_cute_preferred_smem_carveout: "
-                f"{preferred_smem_carveout!r}"
-            )
-        launch_suffix += f", preferred_smem_carveout={preferred_smem_carveout}"
     # G2-H (cute_plan.md, see plan: G2-H CLC): CLC kernels need PDL
     # enabled at the host launch so ``nvvm.clusterlaunchcontrol_try_cancel``
     # returns valid responses. ``use_pdl`` is set on the per-matmul

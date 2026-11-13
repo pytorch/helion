@@ -1126,6 +1126,7 @@ class ConfigSpec:
         self.cute_mma_dag_pass_warps: EnumFragment | None = None
         self.cute_mma_dag_v_lag: EnumFragment | None = None
         self.cute_mma_dag_sleep_waits: EnumFragment | None = None
+        self.cute_mma_dag_early_tmem_retirement: EnumFragment | None = None
         self.cute_mma_dag_query_tma: EnumFragment | None = None
         self.cute_mma_dag_value_metadata_skip: EnumFragment | None = None
         self.cute_mma_dag_value_metadata_read_overlap: EnumFragment | None = None

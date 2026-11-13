@@ -8153,6 +8153,7 @@ class TestCuteAutotuner(TestCase):
             {
                 "block_sizes",
                 "num_threads",
+                "cute_compiler_pipeline",
                 "flatten_loops",
                 "loop_orders",
                 "cute_vector_widths",
@@ -8192,40 +8193,7 @@ class TestCuteAutotuner(TestCase):
         configs = [gen.random_config() for _ in range(20)]
         self.assertTrue(any(config.num_threads for config in configs))
         for config in configs:
-            self.assertLessEqual(
-                set(config.config),
-                {
-                    "block_sizes",
-                    "num_threads",
-                    "flatten_loops",
-                    "loop_orders",
-                    "cute_vector_widths",
-                    "cute_lane_layouts",
-                    "cute_cluster_n",
-                    "cute_min_blocks_per_mp",
-                    "cute_proven_bounds",
-                    "cute_packet_prefetch",
-                    "cute_independent_reduction",
-                    "cute_cluster_warp_online",
-                    "cute_register_row",
-                    "cute_register_row_tensor_copy",
-                    "cute_scalar_epilogue",
-                    "cute_scalar_epilogue_keep_inputs",
-                    "cute_scalar_epilogue_owner_fold",
-                    "cute_warp_fp32_redux",
-                    "cute_register_tile_warp_fold",
-                    "cute_register_tile_store_first",
-                    "cute_replicated_reduction",
-                    "cute_vector_packet_unroll",
-                    "cute_vloop_sink",
-                    "cute_lane_unroll",
-                    "cute_pdl",
-                    "cute_pdl_release",
-                    "cute_pdl_spread",
-                    "cute_store_policy",
-                    "load_eviction_policies",
-                },
-            )
+            self.assertLessEqual(set(config.config), flat_keys)
             self.assertNotIn("persistent", config.pid_type)
             explicit_threads = [nt for nt in config.num_threads if nt > 0]
             if explicit_threads:
@@ -8995,7 +8963,7 @@ class TestCuteAutotuner(TestCase):
         ):
             flat = generation.flatten(config)
             generation.encode_config(flat)
-            expected = dict(config.config)
+            expected = dict(config.config, cute_compiler_pipeline="default")
             expected.pop("cute_vector_widths", None)
             expected.pop("cute_lane_layouts", None)
             self.assertEqual(generation.unflatten(flat).config, expected)

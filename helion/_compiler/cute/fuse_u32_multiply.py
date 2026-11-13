@@ -84,6 +84,15 @@ def _shifted(node: object, targets: tuple[object, ...]) -> _Value | None:
     return args[0] if args is not None and args[1] == 16 else None
 
 
+def _carry_source(node: object) -> _Value | None:
+    # Once _match_carries proves the four unsigned 16-bit limbs, t0, t1,
+    # and t2 are all below 2**32. Their upper halves therefore fit in 16 bits.
+    # The explicit mask needed by Pallas's signed-int32 lowering is redundant
+    # for this int64 identity; accept only that exact mask, or the bare shift.
+    unmasked = _masked(node, _MASK16)
+    return _shifted(node if unmasked is None else unmasked, _SHR)
+
+
 def _operand_from_limbs(low: _Value, high: _Value) -> _Value | None:
     if type(low) is int and type(high) is int:
         if 0 <= low <= _MASK16 and 0 <= high <= _MASK16:
@@ -117,7 +126,7 @@ def _match_carries(t2: object) -> _LimbProduct | None:
     for cross, low_t1 in _commutative_args(t2, (_ADD,)):
         t1 = _masked(low_t1, _MASK16)
         for product, carry in _commutative_args(t1, (_ADD,)):
-            t0 = _shifted(carry, _SHR)
+            t0 = _carry_source(carry)
             for a0, b0 in _commutative_args(t0, (_MUL,)):
                 for a1, other_b0 in _commutative_args(product, (_MUL,)):
                     if other_b0 != b0:
@@ -171,12 +180,12 @@ def _match_high(node: torch.fx.Node) -> _LimbProduct | None:
     if terms is None:
         return None
     for index, term in enumerate(terms):
-        product = _match_carries(_shifted(term, _SHR))
+        product = _match_carries(_carry_source(term))
         if product is None:
             continue
         others = terms[:index] + terms[index + 1 :]
         for carry, upper_product in (others, (others[1], others[0])):
-            if _shifted(carry, _SHR) is not product.t1:
+            if _carry_source(carry) is not product.t1:
                 continue
             if (product.a1, product.b1) in _commutative_args(upper_product, (_MUL,)):
                 return product

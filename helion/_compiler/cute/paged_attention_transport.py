@@ -18,6 +18,7 @@ from torch.utils._sympy.functions import PythonMod
 from . import target_facts
 from .analysis.paged_attention_pair import paired_attention_item_axis
 from .cute_mma_dag import MMA_DAG_ATTENTION_PASS_WARPS
+from .cute_mma_dag import MMA_DAG_EARLY_TMEM_RETIREMENT_KEY
 from .cute_mma_dag import MMA_DAG_L2_HINTS
 from .cute_mma_dag import MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
 from .cute_mma_dag import MMA_DAG_PASS_WARPS_ATTENTION_SCOPED
@@ -165,6 +166,7 @@ class PagedAttentionSchedule:
     paired_items: bool = False
     v_lag: int = 0
     sleep_waits: bool = False
+    early_tmem_retirement: bool = False
     probability_schedule: str = MMA_DAG_PROBABILITY_SCHEDULE_SERIAL
     query_tma: PagedQueryTma | None = None
     value_metadata_skip: bool = False
@@ -207,6 +209,11 @@ def plan_paged_attention_schedule(
         return None
     sleep_waits = config.get(MMA_DAG_SLEEP_WAITS_KEY, False)
     if type(sleep_waits) is not bool or (sleep_waits and not paired_items):
+        return None
+    early_tmem_retirement = config.get(MMA_DAG_EARLY_TMEM_RETIREMENT_KEY, False)
+    if type(early_tmem_retirement) is not bool or (
+        early_tmem_retirement and not paired_items
+    ):
         return None
     probability_schedule = config.get(
         MMA_DAG_PROBABILITY_SCHEDULE_KEY, MMA_DAG_PROBABILITY_SCHEDULE_SERIAL
@@ -273,6 +280,7 @@ def plan_paged_attention_schedule(
         paired_items=paired_items,
         v_lag=v_lag,
         sleep_waits=sleep_waits,
+        early_tmem_retirement=early_tmem_retirement,
         probability_schedule=probability_schedule,
         query_tma=paged_query_tma(transport, facts.query_columns)
         if use_query_tma
@@ -354,6 +362,13 @@ def _paged_attention_schedule_facts(
         if per_key
         else 64
     )
+    if (
+        semantic.rowwise_rescale is not None
+        and semantic.rowwise_rescale.headwide
+        and query_columns != transport.query_rows
+    ):
+        # The native head vote must not include a padded register row.
+        return None
     # Two heads double the resident raw/Q/P/state panels. The 180 KiB
     # conservative aligned budget includes the optional query barrier and
     # 48 bytes of value metadata flags/barriers. The largest (40-query)

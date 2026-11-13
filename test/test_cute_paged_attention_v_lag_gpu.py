@@ -42,3 +42,22 @@ def test_paired_v_lag_empty_int64_bounds(lag):
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("paired attention uses SM100 tensor memory")
     check_paired_v_lag_extreme_bounds(lag, DEVICE)
+
+
+@skipIfNotCUDA()
+def test_serial_nonreference_retirement_replay():
+    # Match the seeded serial/non-PDL schedule at the missing N32 panel width.
+    # The ordinary per-key body exercises its in-loop PV drain, full O/LSE,
+    # changed lengths/data and backing-buffer graph replay checks.
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("paired attention uses SM100 tensor memory")
+    check_paired_v_lag_replay(
+        3,
+        "per_key",
+        4,
+        False,
+        False,
+        False,
+        DEVICE,
+        early_tmem_retirement=True,
+    )

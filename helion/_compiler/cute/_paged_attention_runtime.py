@@ -69,6 +69,38 @@ def _scaled_s2f6x2_to_bf16x2(
     return cutlass.Int32(llvm.bitcast(T.i32(), result, loc=loc, ip=ip))
 
 
+@dsl_user_op
+def _native_s2f6x2_to_bf16x2(
+    values: cutlass.Int32,
+    scales: cutlass.Int32,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> cutlass.Int32:
+    """Native signed-byte/UE8M0 conversion with exact per-halfword NaN bits.
+
+    Scale bytes are unmodified. In particular, scale0 preserves subnormals;
+    each scale255 independently selects the authored canonical BF16 NaN.
+    The selects contain no control flow or collective operation.
+    """
+    result = _scaled_s2f6x2_to_bf16x2(values, scales, loc=loc, ip=ip)
+    low = arith.select(
+        ((scales & 255) == 255).ir_value(loc=loc, ip=ip),
+        cutlass.Int32(0x7FC0).ir_value(loc=loc, ip=ip),
+        (result & 0xFFFF).ir_value(loc=loc, ip=ip),
+        loc=loc,
+        ip=ip,
+    )
+    high = arith.select(
+        ((cutlass.Int32(scales >> 8) & 255) == 255).ir_value(loc=loc, ip=ip),
+        cutlass.Int32(0x7FC00000).ir_value(loc=loc, ip=ip),
+        (result & cutlass.Int32(-65536)).ir_value(loc=loc, ip=ip),
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Int32(arith.ori(low, high, loc=loc, ip=ip))
+
+
 @cute.jit
 def _pack_postscaled_bf16(
     low: cutlass.Float32,

@@ -29,6 +29,7 @@ from ..cute_mma_dag import MMA_DAG_DEFAULT_WARPS
 from ..cute_mma_dag import MMA_DAG_DERIVED_CHOICES
 from ..cute_mma_dag import MMA_DAG_DERIVED_KEY
 from ..cute_mma_dag import MMA_DAG_DERIVED_PASS
+from ..cute_mma_dag import MMA_DAG_EARLY_TMEM_RETIREMENT_KEY
 from ..cute_mma_dag import MMA_DAG_EPILOGUE_CHOICES
 from ..cute_mma_dag import MMA_DAG_EPILOGUE_KEY
 from ..cute_mma_dag import MMA_DAG_EPILOGUE_ROW
@@ -316,6 +317,7 @@ def enable_cute_mma_dag_search(config_spec: ConfigSpec, facts: CuteMmaDagFacts) 
     # Facts can be re-registered on an existing spec after a proof changes.
     config_spec.cute_mma_dag_v_lag = None
     config_spec.cute_mma_dag_sleep_waits = None
+    config_spec.cute_mma_dag_early_tmem_retirement = None
     config_spec.cute_mma_dag_query_tma = None
     config_spec.cute_mma_dag_probability_schedule = None
     config_spec.cute_mma_dag_value_metadata_skip = None
@@ -323,6 +325,9 @@ def enable_cute_mma_dag_search(config_spec: ConfigSpec, facts: CuteMmaDagFacts) 
     if facts.attention is not None and facts.attention.paired_items:
         config_spec.cute_mma_dag_v_lag = EnumFragment(choices=MMA_DAG_V_LAG_CHOICES)
         config_spec.cute_mma_dag_sleep_waits = EnumFragment(choices=(False, True))
+        config_spec.cute_mma_dag_early_tmem_retirement = EnumFragment(
+            choices=(False, True)
+        )
         if facts.attention.reference_scores:
             config_spec.cute_mma_dag_probability_schedule = EnumFragment(
                 choices=MMA_DAG_PROBABILITY_SCHEDULE_CHOICES
@@ -548,6 +553,7 @@ def _pin_paired_knobs(config: dict[str, object]) -> None:
     for key, default in (
         (MMA_DAG_V_LAG_KEY, 0),
         (MMA_DAG_SLEEP_WAITS_KEY, False),
+        (MMA_DAG_EARLY_TMEM_RETIREMENT_KEY, False),
         (MMA_DAG_QUERY_TMA_KEY, False),
         (MMA_DAG_VALUE_METADATA_SKIP_KEY, False),
         (MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY, False),
@@ -625,6 +631,10 @@ def _normalize_cute_mma_dag(
                 config.pop(key, None)
     for key, fragment in (
         (MMA_DAG_SLEEP_WAITS_KEY, config_spec.cute_mma_dag_sleep_waits),
+        (
+            MMA_DAG_EARLY_TMEM_RETIREMENT_KEY,
+            config_spec.cute_mma_dag_early_tmem_retirement,
+        ),
         (MMA_DAG_QUERY_TMA_KEY, config_spec.cute_mma_dag_query_tma),
     ):
         if fragment is not None or key in config:

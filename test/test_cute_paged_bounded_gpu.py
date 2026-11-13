@@ -18,10 +18,16 @@ from helion._testing.cute_paged_bounded import bounded_partial_merge
 
 @skipIfNotCUDA()
 @pytest.mark.parametrize(
-    "rows,fast_math,query_tma", [(1, False, False), (4, True, True), (5, False, True)]
+    "rows,fast_math,query_tma,early_retirement",
+    [
+        (1, False, False, False),
+        (4, True, True, False),
+        (5, False, True, False),
+        (4, False, False, True),
+    ],
 )
 def test_raw_statistics_match_written_source_and_changed_graph(
-    rows, fast_math, query_tma
+    rows, fast_math, query_tma, early_retirement
 ):
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("the paired attention transport uses SM100")
@@ -50,8 +56,14 @@ def test_raw_statistics_match_written_source_and_changed_graph(
         cute_mma_dag_query_tma=query_tma,
         cute_pdl=rows == 5,
         cute_pdl_capture_overlap=rows == 5,
+        cute_mma_dag_early_tmem_retirement=early_retirement,
     )
-    assert "maximum_output=" in bound.to_code(config)
+    source = bound.to_code(config)
+    assert "maximum_output=" in source and "denominator_output=" in source
+    assert ("early_tmem_retirement=True" in source) == early_retirement
+    assert "probability_schedule=" not in source
+    # The added N32 case is the serial/non-PDL/non-TMA seeded schedule with
+    # all three partial outputs; retain the original three default cases.
     compiled = bound.compile_config(config)
     compiled(*values)
     with cuda_graph_for_replay() as graph:

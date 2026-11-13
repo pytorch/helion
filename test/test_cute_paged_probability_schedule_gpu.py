@@ -52,3 +52,35 @@ def test_probability_schedule_source_and_graph_replay(
         DEVICE,
         capture_overlap=capture_overlap,
     )
+
+
+@skipIfNotCUDA()
+@pytest.mark.parametrize(
+    "schedule,form,query_len,sleep,lag,capture_overlap",
+    [
+        ("early", "mapped", 1, False, 0, False),
+        ("early_tmem", "per_key", 5, True, 3, True),
+    ],
+)
+def test_retirement_source_and_graph_replay(
+    schedule, form, query_len, sleep, lag, capture_overlap
+):
+    # Check enabled retirement at N8 and N40, including the longer drain
+    # with query TMA and PDL overlap. Serial N32 lives in the V-lag module.
+    # Existing cases above keep exercising the default final-join retirement.
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("paired attention uses SM100 tensor memory")
+    check_probability_schedule_replay(
+        schedule,
+        form,
+        query_len,
+        False,
+        False,
+        False,
+        sleep,
+        lag,
+        True,
+        DEVICE,
+        capture_overlap=capture_overlap,
+        early_tmem_retirement=True,
+    )

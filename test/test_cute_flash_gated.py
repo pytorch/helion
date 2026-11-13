@@ -864,6 +864,7 @@ def test_hstu_selects_gated_body_at_fused_tiles(head_dim: int) -> None:
             "cute_flash_kv_stage",
             "cute_flash_gate_warpgroups",
             "cute_flash_gated_row_warps",
+            "cute_compiler_pipeline",
         ]
         all_seeds = [seed.config for seed in spec.autotune_seed_configs()]
         assert all_seeds[0]["block_sizes"] == [128, 128]

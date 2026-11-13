@@ -58,6 +58,8 @@ from helion._testing import DEVICE
 from helion._testing import EXAMPLES_DIR
 from helion._testing import code_and_output
 from helion._testing import import_path
+from helion._testing.cute_recurrence_host import gdn_test_wrapper as _gdn_test_wrapper
+from helion._testing.cute_recurrence_host import gdn_wrapper_plan as _wrapper_plan
 from helion._testing.tunable_fragments import load_host_function
 import helion.language as hl
 
@@ -1438,50 +1440,6 @@ def test_gdn_recurrence_geometry_helpers() -> None:
     assert not gdn_shape_admitted(dhead=64, chunk=128, dstate=128, block_v=256)
 
 
-def _wrapper_plan(**overrides: object) -> dict[str, object]:
-    layout = gdn_tmem_layout(64, 128)
-    assert layout is not None
-    plan: dict[str, object] = {
-        "kind": "gdn_recurrence_sm100",
-        "k_idx": 0,
-        "w_idx": 1,
-        "u_idx": 2,
-        "g_idx": 3,
-        "h_idx": 4,
-        "batch": 2,
-        "heads": 8,
-        "seqlen": 1024,
-        "chunk": 128,
-        "dhead": 64,
-        "dstate": 128,
-        "num_chunks": 8,
-        "block_v": 128,
-        "epilogue_warps": 8,
-        "stages": 3,
-        "token_groups": 2,
-        "mma_m": 128,
-        "threads": 288,
-        "tmem_cols": layout.alloc_cols,
-        "smem_bytes": gdn_smem_bytes(128, 64, 128, 3, 128),
-        "state_col": layout.state_col,
-        "state_image_col": layout.state_image_col,
-        "acc_col": layout.acc_col,
-        "update_image_col": layout.update_image_col,
-        "device_abi": 5,
-    }
-    plan.update(overrides)
-    return plan
-
-
-def _tensor_schema(dtype: torch.dtype, shape: tuple[int, ...]) -> tuple[object, ...]:
-    strides = []
-    stride = 1
-    for dim in reversed(shape):
-        strides.append(stride)
-        stride *= dim
-    return ("tensor", str(dtype), len(shape), shape, tuple(reversed(strides)))
-
-
 def test_gdn_recurrence_schedule_sources_fingerprint_the_disk_cache() -> None:
     """Editing the schedule must change the on-disk compile cache key.
 
@@ -1507,21 +1465,7 @@ def test_gdn_recurrence_schedule_sources_fingerprint_the_disk_cache() -> None:
 
 
 def test_gdn_recurrence_wrapper_calls_external_host_schedule() -> None:
-    from helion.runtime.cute.launcher import _create_cute_wrapper
-
-    def dummy_kernel(*_args: object) -> None:
-        pass
-
-    dummy_kernel._helion_cute_wrapper_plans = [_wrapper_plan()]  # type: ignore[attr-defined]
-    schema = (
-        _tensor_schema(torch.bfloat16, (2, 1024, 8, 64)),
-        _tensor_schema(torch.bfloat16, (2, 1024, 8, 64)),
-        _tensor_schema(torch.bfloat16, (2, 1024, 8, 128)),
-        _tensor_schema(torch.float32, (2, 1024, 8)),
-        _tensor_schema(torch.bfloat16, (2, 8, 8, 64, 128)),
-        ("scalar_constexpr", "int", 128, 128),
-    )
-    wrapper = _create_cute_wrapper(dummy_kernel, schema, (288, 1, 1))
+    wrapper = _gdn_test_wrapper()
     source = inspect.getsource(cast("Callable[..., object]", wrapper))
     assert "_helion_cute_kernel_tag = 'gdn_recurrence_sm100'" in source
     assert (

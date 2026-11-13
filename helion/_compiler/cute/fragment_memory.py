@@ -8,6 +8,7 @@ writes staged tiles back: scalar element walks, 16-byte row packets
 from __future__ import annotations
 
 import ast
+import dataclasses
 import math
 from typing import TYPE_CHECKING
 from typing import cast
@@ -520,6 +521,8 @@ class FragmentMemoryEmitter(FragmentContext):
         deferred_updates: list[tuple[Callable[[tuple[str, ...]], None], bool]]
         | None = None,
         direct: DirectStoreSink | None = None,
+        *,
+        defer_load: bool = False,
     ) -> object:
         if store and node in self.direct_stores:
             # Written by the tf32 mma lanes of the dot it stores.
@@ -798,6 +801,22 @@ class FragmentMemoryEmitter(FragmentContext):
             load,
             logical_domain=logical_domain if index_domains or domain_bounds else None,
         )
+        if defer_load:
+            # A complete owner may consume this same guarded address recipe
+            # directly. Retain every index/mask dependency until that read.
+            if not host_load_is_readonly(node, self.env, self.graphs):
+                raise exc.InvalidConfig(
+                    "deferred fragment load requires readonly storage"
+                )
+            dependencies = tuple(
+                value
+                for value in (
+                    *(values[index] for index in indices if isinstance(index, Node)),
+                    mask_value,
+                )
+                if isinstance(value, Fragment)
+            )
+            return dataclasses.replace(loaded_fragment, dependencies=dependencies)
         if node in self.snapshot_loads:
             slots = (math.prod(shape) + self.threads - 1) // self.threads
             name = self.df.new_var("fragment_snapshot")

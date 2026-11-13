@@ -7161,6 +7161,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     roundtrip.config,
                     {
                         **seed.config,
+                        "cute_compiler_pipeline": "default",
                         cute_flash.FLASH_SOFTMAX_LOWERING_KEY: "auto",
                         cute_flash.FLASH_ROW_SUM_SCHEDULE_KEY: "post_acquire",
                     },

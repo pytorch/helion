@@ -25,6 +25,7 @@ from helion._testing.cute_optional_lse import optional_lse_fixture
 from helion._testing.cute_paged_positive_zero import positive_zero_attention_fixture
 from helion._testing.cute_paged_v_lag import paired_v_lag_bound
 from helion._testing.cute_paged_v_lag import paired_v_lag_config
+from helion._testing.cute_paged_v_lag import without_retirement_seeds
 import helion.language as hl
 
 pytestmark = pytest.mark.cpu_only
@@ -153,6 +154,7 @@ def test_ordinary_source_without_positive_zero_has_no_metadata_fragment():
 def test_reregistered_facts_remove_stale_paired_fragments(lost_proof):
     keys = (
         "cute_mma_dag_v_lag",
+        "cute_mma_dag_early_tmem_retirement",
         "cute_mma_dag_sleep_waits",
         "cute_mma_dag_query_tma",
         "cute_mma_dag_probability_schedule",
@@ -237,12 +239,12 @@ def test_metadata_seeds_preserve_prefix_and_cover_tma_policy_anchors():
         facts = spec.cute_mma_dag_facts
         assert facts is not None
         planner = MmaDagSeedPlanner(facts, spec, occupancy_key="cute_min_blocks_per_mp")
-        old = planner.configs(planner.ranked())
+        old = without_retirement_seeds(planner.configs(planner.ranked()))
     with _surface() as (bound, spec):
         facts = spec.cute_mma_dag_facts
         assert facts is not None and facts.attention is not None
         planner = MmaDagSeedPlanner(facts, spec, occupancy_key="cute_min_blocks_per_mp")
-        seeds = planner.configs(planner.ranked())
+        seeds = without_retirement_seeds(planner.configs(planner.ranked()))
         assert seeds[: len(old)] == old
         tail = seeds[len(old) :]
         extra = [seed for seed in tail if not seed.get(OVERLAP, False)]
@@ -335,7 +337,7 @@ def test_written_metadata_and_early_probability_have_joint_cache_anchors():
             planner = MmaDagSeedPlanner(
                 facts, spec, occupancy_key="cute_min_blocks_per_mp"
             )
-            seeds = planner.configs(planner.ranked())
+            seeds = without_retirement_seeds(planner.configs(planner.ranked()))
             combined = [
                 seed
                 for seed in seeds

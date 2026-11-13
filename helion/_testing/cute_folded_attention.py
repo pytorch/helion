@@ -235,8 +235,14 @@ def folded_attention_reference(
     value_post_scale_log2: int = 0,
     output_scale_log2: int = 0,
     value_positive_zero: bool = False,
+    rowwise_rescale_threshold: float | None = None,
+    headwide_rescale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Eager page recurrence with independent logical-to-original-layout mapping."""
+    assert rowwise_rescale_threshold is None or reference_scores
+    assert not headwide_rescale or (
+        reference_scores and rowwise_rescale_threshold is not None
+    )
     q, k, v, ks, vs, pages, lengths = (cast("torch.Tensor", arg) for arg in args[:7])
     window = cast("int | None", args[7])
     exponential = torch.exp2 if base2_scores else torch.exp
@@ -299,7 +305,17 @@ def folded_attention_reference(
                     visible &= keys[None, :] >= positions[:, None] - window
                 scores = torch.where(visible, scores, -float("inf"))
                 if reference_scores:
-                    next_maximum = torch.maximum(maximum, scores.amax(1) + reference)
+                    tile_maximum = scores.amax(1)
+                    next_maximum = torch.maximum(maximum, tile_maximum + reference)
+                    if rowwise_rescale_threshold is not None:
+                        needs_rescale = (
+                            (tile_maximum > rowwise_rescale_threshold)
+                            | ~((maximum >= 0) & (maximum < float("inf")))
+                            | torch.isnan(tile_maximum)
+                        )
+                        if headwide_rescale:
+                            needs_rescale = needs_rescale.any()
+                        next_maximum = torch.where(needs_rescale, next_maximum, maximum)
                 else:
                     next_maximum = torch.maximum(maximum, scores.amax(1))
                 safe_maximum = torch.where(

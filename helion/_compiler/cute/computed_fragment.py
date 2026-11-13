@@ -73,6 +73,8 @@ from .reduction_coordinates import independent_reduction_coordinates
 from .reduction_coordinates import owned_iota_reduction_axes
 from .reduction_coordinates import physical_capture_axes
 from .reduction_coordinates import reduction_coordinate_proof
+from .repeated_block_ids import matmul_sum_collapse_nodes
+from .repeated_block_ids import scalar_repeated_block_id
 from .scalar_lowering import scalar_lowering_context
 from .scan_analysis import additive_scan_helper
 from .scan_analysis import completed_scan_plans
@@ -1429,8 +1431,9 @@ def computed_fragment_supported(
         return False
 
     # Only roots needing independent static coordinates or resident computed
-    # contractions/scans use this fallback. Explicitly tiled contractions and
-    # native collective configurations keep their existing code generation.
+    # contractions/scans use this fallback. Tiled contractions also need it
+    # when a value repeats scalar coordinates; the ordinary matmul/stack/view
+    # exemptions and native collective configuration checks still apply.
     def computed(node: Node) -> bool:
         if node.target in (
             torch.ops.aten.permute.default,
@@ -1466,7 +1469,10 @@ def computed_fragment_supported(
         if is_ordered_selection(node)
     ]
 
+    collapsed_nodes: set[Node] | None = None
+
     def needs_coordinates(node: Node) -> bool:
+        nonlocal collapsed_nodes
         index = static_tensor_index(node)
         if index is not None and not shape_only_indices(*index):
             return True
@@ -1500,6 +1506,14 @@ def computed_fragment_supported(
             return True
         if node.target is _tracing_ops._host_tensor:
             return False
+        if (
+            node.op == "call_function"
+            and scalar_repeated_block_id(env, node) is not None
+        ):
+            if collapsed_nodes is None:
+                collapsed_nodes = matmul_sum_collapse_nodes(env, graphs)
+            if node not in collapsed_nodes:
+                return True
         if node.target in (
             torch.ops.aten.view.default,
             torch.ops.aten.reshape.default,
@@ -2203,7 +2217,13 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
     ):
         return decline()
     root = graphs[root.graph_id]
-    compiler = FragmentCompiler(cg, graphs)
+    from .conditional_attention_codegen import conditional_attention_compiler
+
+    compiler = (
+        conditional_attention_compiler(cg, graphs)
+        if not fragment_schedule_required
+        else None
+    ) or FragmentCompiler(cg, graphs)
     if compiler.df.config.get("cute_fragment_warp_producer_regions", False):
         from .warp_producer_regions import WarpProducerRecorder
         from .warp_producer_regions import producer_prefix

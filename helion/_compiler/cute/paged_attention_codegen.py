@@ -192,6 +192,8 @@ def codegen_paged_attention(cg: GenerateAST, schedule: PagedAttentionSchedule) -
         panel_arg += f", v_lag={schedule.v_lag}"
     if schedule.paired_items and schedule.sleep_waits:
         panel_arg += ", sleep_waits=True"
+    if schedule.paired_items and schedule.early_tmem_retirement:
+        panel_arg += ", early_tmem_retirement=True"
     if schedule.probability_schedule != MMA_DAG_PROBABILITY_SCHEDULE_SERIAL:
         assert schedule.paired_items and semantic.score_reference is not None
         panel_arg += f", probability_schedule={schedule.probability_schedule!r}"
@@ -200,6 +202,11 @@ def codegen_paged_attention(cg: GenerateAST, schedule: PagedAttentionSchedule) -
         panel_arg += ", reference_scores=True"
     if semantic.score_base2:
         panel_arg += ", base2_scores=True"
+    if semantic.rowwise_rescale is not None:
+        assert semantic.score_reference is not None and semantic.score_base2
+        panel_arg += f", rowwise_rescale_threshold={semantic.rowwise_rescale.threshold_for(df.config)!r}"
+        if semantic.rowwise_rescale.headwide:
+            panel_arg += ", headwide_rescale=True"
     if semantic.coefficients_capped:
         assert schedule.paired_items and semantic.partial_statistics is not None
         panel_arg += ", coefficients_capped=True"
