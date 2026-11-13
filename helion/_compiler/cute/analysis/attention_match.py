@@ -203,6 +203,7 @@ def _attention_is_block_symnode(node: torch.fx.Node, block_id: int) -> bool:
         node.op == "call_function"
         and node.target is _get_symnode
         and len(node.args) >= 1
+        and isinstance(node.args[0], str)
         and node.args[0] == f"block_size_{block_id}"
     )
 

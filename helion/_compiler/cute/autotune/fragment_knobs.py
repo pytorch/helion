@@ -47,6 +47,7 @@ from ....language import memory_ops
 from ....language import scan_ops
 from ....runtime.config import Config
 from ...autotuner_heuristics.registry import AutotunerHeuristic
+from ..fragment_dot_support import fragment_half_dot_supported
 from .config_keys import CUTE_FRAGMENT_KEYS
 from .heuristics import cute_fragment_bounded_gather
 from .heuristics import cute_fragment_threads
@@ -837,6 +838,10 @@ def _has_integer_atomic_loops(env: CompileEnvironment, region: FragmentRegion) -
     return bool(integer_atomic_loop_graphs(region.graphs))
 
 
+def _has_half_dot(env: CompileEnvironment, region: FragmentRegion) -> bool:
+    return any(fragment_half_dot_supported(node, env) for node in _nodes(region))
+
+
 def _has_packet_load(env: CompileEnvironment, region: FragmentRegion) -> bool:
     """A read-only host load of a packet dtype the aligned packet walk may stage."""
     from ..packet_loads import PACKET_DTYPES
@@ -1504,6 +1509,13 @@ PURE_PRODUCER_REGIONS = FragmentKnob(
     (fragment_supported, _root_plan_is_lazy),
 )
 
+HALF_MMA = FragmentKnob(
+    "cute_fragment_half_mma",
+    "half_mma",
+    90,
+    (_has_half_dot, discovery_supported),
+)
+
 FRAGMENT_KNOBS: tuple[FragmentKnob, ...] = (
     SCAN,
     REDUCTION,
@@ -1534,6 +1546,7 @@ FRAGMENT_KNOBS: tuple[FragmentKnob, ...] = (
     WARP_PRODUCER_REGIONS,
     BOUNDED_GATHER,
     PURE_PRODUCER_REGIONS,
+    HALF_MMA,
 )
 
 # ``config_keys.CUTE_FRAGMENT_KEYS`` is the key table the search surface
@@ -1590,6 +1603,8 @@ CuteFragmentPureProducerRegionsHeuristic = fragment_knob_heuristic(
     PURE_PRODUCER_REGIONS
 )
 
+CuteFragmentHalfMmaHeuristic = fragment_knob_heuristic(HALF_MMA)
+
 register_fragment_scan_coverage = fragment_knob_registrar(SCAN)
 register_fragment_reduction_coverage = fragment_knob_registrar(REDUCTION)
 register_fragment_private_scalar_loops_coverage = fragment_knob_registrar(
@@ -1641,3 +1656,4 @@ register_fragment_bounded_gather_coverage = fragment_knob_registrar(BOUNDED_GATH
 register_fragment_pure_producer_regions_coverage = fragment_knob_registrar(
     PURE_PRODUCER_REGIONS
 )
+register_fragment_half_mma_coverage = fragment_knob_registrar(HALF_MMA)

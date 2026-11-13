@@ -17,6 +17,7 @@ from helion._compiler.cute.tcgen05_config import seeds
 from helion._compiler.cute.tcgen05_config import surface
 from helion._testing import cpu_render_target
 from helion._testing.cute_codegen import cuda_fake
+from helion._testing.cute_mma_dag import _ordinary_gemm
 from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
@@ -32,18 +33,6 @@ if TYPE_CHECKING:
     from collections.abc import Generator
 
     from helion.runtime.kernel import BoundKernel
-
-
-def _ordinary_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    m, k = a.shape
-    _, n = b.shape
-    out = torch.empty((m, n), dtype=a.dtype, device=a.device)
-    for tile_m, tile_n in hl.tile((m, n)):
-        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-        for tile_k in hl.tile(k):
-            acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
-        out[tile_m, tile_n] = acc.to(out.dtype)
-    return out
 
 
 def _reshape_view_lhs_gemm(x3: torch.Tensor, w: torch.Tensor) -> torch.Tensor:

@@ -4372,6 +4372,7 @@ _CUTE_HEURISTIC_ORDER = (
     "cute_fragment_bounded_gather",
     "cute_fragment_pure_producer_regions",
     "cute_radix_selection",
+    "cute_fragment_half_mma",
 )
 
 
@@ -6110,34 +6111,6 @@ class TestCuteFp8GemmSkinnyMHeuristic(TestCase):
                 self.assertIsNone(
                     CuteFp8GemmSkinnyMHeuristic.get_seed_config(env, MagicMock())
                 )
-
-    def test_compiler_seed_configs_records_heuristic(self) -> None:
-        # The heuristic must be wired into the cute backend registry so the
-        # generic compiler_seed_configs() path emits its seed and records it.
-        env = self._make_cute_env()
-        env.config_spec.matmul_facts.append(self._matmul_fact(static_m=1))
-        configs = compiler_seed_configs(env, MagicMock())
-        self.assertIn(
-            _FP8_SKINNY_M_SEED_BLOCK_SIZES,
-            [config.config["block_sizes"] for config in configs],
-        )
-        self.assertIn(
-            CuteFp8GemmSkinnyMHeuristic.name,
-            env.config_spec.autotuner_heuristics,
-        )
-
-    def test_compiler_seed_configs_skips_large_m(self) -> None:
-        env = self._make_cute_env()
-        env.config_spec.matmul_facts.append(self._matmul_fact(static_m=1024))
-        configs = compiler_seed_configs(env, MagicMock())
-        self.assertNotIn(
-            CuteFp8GemmSkinnyMHeuristic.name,
-            env.config_spec.autotuner_heuristics,
-        )
-        self.assertNotIn(
-            _FP8_SKINNY_M_SEED_BLOCK_SIZES,
-            [config.config["block_sizes"] for config in configs],
-        )
 
     @onlyBackends(["cute"])
     @skipIfRefEager("Compiler seed configs are not generated in ref eager mode")

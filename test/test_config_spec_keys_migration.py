@@ -90,7 +90,7 @@ _BASE_VALID_KEYS = """
     cute_flash_ws_k_stage_extra cute_flash_ws_loader_warp cute_flash_ws_mask_phases
     cute_flash_ws_one_pass cute_fp32_dot cute_fragment_atomic_aggregation
     cute_fragment_atomic_consumer_fusion cute_fragment_batched_loads
-    cute_fragment_bounded_gather cute_fragment_cta_topk
+    cute_fragment_bounded_gather cute_fragment_cta_topk cute_fragment_half_mma
     cute_fragment_integer_atomic_epochs cute_fragment_local_atomic_registers
     cute_fragment_mma_rows cute_fragment_packet_loads cute_fragment_padded_rows
     cute_fragment_private_scalar_loops cute_fragment_producer_cache
@@ -245,7 +245,7 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_flash_ws_k_stage_extra cute_flash_ws_loader_warp cute_flash_ws_mask_phases
     cute_flash_ws_one_pass cute_fp32_dot cute_fragment_atomic_aggregation
     cute_fragment_atomic_consumer_fusion cute_fragment_batched_loads
-    cute_fragment_bounded_gather cute_fragment_cta_topk
+    cute_fragment_bounded_gather cute_fragment_cta_topk cute_fragment_half_mma
     cute_fragment_integer_atomic_epochs cute_fragment_local_atomic_registers
     cute_fragment_mma_rows cute_fragment_packet_loads cute_fragment_padded_rows
     cute_fragment_private_scalar_loops cute_fragment_producer_cache
@@ -351,7 +351,7 @@ _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     cute_collective_tmem_a cute_collective_tmem_seed cute_exact_div_form
     cute_fp32_dot cute_fragment_atomic_aggregation
     cute_fragment_atomic_consumer_fusion cute_fragment_batched_loads
-    cute_fragment_bounded_gather cute_fragment_cta_topk
+    cute_fragment_bounded_gather cute_fragment_cta_topk cute_fragment_half_mma
     cute_fragment_integer_atomic_epochs cute_fragment_local_atomic_registers
     cute_fragment_mma_rows cute_fragment_packet_loads cute_fragment_padded_rows
     cute_fragment_private_scalar_loops cute_fragment_producer_cache
@@ -451,7 +451,7 @@ _BASE_CUTE_ACCEPTED = """
     cute_flash_ws_k_stage_extra cute_flash_ws_loader_warp cute_flash_ws_mask_phases
     cute_flash_ws_one_pass cute_fp32_dot cute_fragment_atomic_aggregation
     cute_fragment_atomic_consumer_fusion cute_fragment_batched_loads
-    cute_fragment_bounded_gather cute_fragment_cta_topk
+    cute_fragment_bounded_gather cute_fragment_cta_topk cute_fragment_half_mma
     cute_fragment_integer_atomic_epochs cute_fragment_local_atomic_registers
     cute_fragment_mma_rows cute_fragment_packet_loads cute_fragment_padded_rows
     cute_fragment_private_scalar_loops cute_fragment_producer_cache

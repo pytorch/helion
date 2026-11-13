@@ -1015,6 +1015,7 @@ class ConfigSpec:
         self.static_ranges: BlockIdSequence[StaticRangeSpec] = BlockIdSequence()
 
         self.allowed_pid_types: tuple[PidTypeLiteral, ...] = tuple(VALID_PID_TYPES)
+        self.cute_ordered_phase_pid_search: bool = False
         # Why each disabled pid_type was removed, for search-space logging.
         self.disallowed_pid_type_reasons: dict[str, str] = {}
         # All independent vetoes, including callers without a diagnostic reason.
@@ -1140,6 +1141,11 @@ class ConfigSpec:
         # distributed shared memory, or the fixup grid's global workspace.
         self.cute_mma_dag_split: EnumFragment | None = None
         self.cute_mma_dag_facts: CuteMmaDagFacts | None = None
+        # A single MMA-DAG phase in an explicitly ordered launch bundle.
+        self.cute_mma_dag_phase_index: int | None = None
+        self.cute_mma_dag_phase_eviction_map: dict[int, int] = {}
+        self.cute_mma_dag_phase_load_slots: frozenset[int] = frozenset()
+        self.cute_mma_dag_phase_owned_blocks: frozenset[int] = frozenset()
         # Enabled only when the register sub-block family
         # (``cute_register_subblocks``, cute_register_subblocks.py) admits
         # the root: the family switch and its knobs; the facts carry the
@@ -1202,6 +1208,8 @@ class ConfigSpec:
         self.cute_fragment_reduction_search_enabled = False
         self.cute_fp32_dot_root_ids: frozenset[int] = frozenset()
         self.cute_fp32_dot_search_enabled = False
+        self.cute_fragment_half_mma_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_half_mma_search_enabled = False
         self.cute_fp32_dot_seed_worthy = False
         self.cute_fragment_thread_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_threads_search_enabled = False

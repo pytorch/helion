@@ -147,13 +147,26 @@ def promote_partitioned_outputs_pass(
 
         spec = env.config_spec
         if len(device_ir.phases) > 1 and ordered_phases_supported(func, device_ir):
+            from .local_atomic import local_atomic_allocations
+            from .reduction_coordinates import captured_reduction_coordinates
+
             # The single persistent launch shares one thread block
             # across phases (and cannot host the tcgen05 pipeline).
-            # Ordered per-phase launches tune each phase alone; the
-            # persistent launch stays the default.
+            # Ordered per-phase launches tune each phase alone.
+            # Give captured reductions and local atomics whole-root ownership
+            # in the conservative reference (see physical_capture_axes).
+            # Alternative PID owners remain searchable subject to codegen's
+            # coordinate proofs. Free iota ownership is config-dependent
+            # (owned_iota_reduction_axes), so it cannot select a bind-time default.
+            persistent = tuple(p for p in spec.allowed_pid_types if p != "flat")
+            spec.cute_ordered_phase_pid_search = True
             spec.allowed_pid_types = (
-                *(p for p in spec.allowed_pid_types if p != "flat"),
-                "flat",
+                ("flat", *persistent)
+                if (
+                    captured_reduction_coordinates(env, device_ir.graphs)
+                    or local_atomic_allocations(device_ir.graphs)
+                )
+                else (*persistent, "flat")
             )
         else:
             spec.disallow_pid_type("flat", reason=BARRIER_PID_TYPE_REASON)

@@ -743,9 +743,10 @@ def _fused_recompute_pays(
     reused axis the MMA tile covers twice keeps its single launch.  The gate
     compares against the fused derived-operand lowering (``cute_mma_dag``), so
     it applies when that lowering's config-free matcher admits the program
-    (a floating recipe over the operand path); integer casts and bitfield
-    unpacks have no fused native operand path and keep the admission above
-    (``_fused_register_mma_admitted`` covers their register-MMA regime).
+    (a floating or supported byte recipe over the operand path). Wider
+    integer casts and bitfield unpacks without a fused native operand path
+    keep the admission above (``_fused_register_mma_admitted`` covers their
+    register-MMA regime).
     ``host`` is the planner's temporary compile of the unfissioned program,
     whose shapes the planner specialized; the fused program only has them
     when the kernel is static, so the gate is honored for static kernels

@@ -1,4 +1,4 @@
-"""Shared runners for the ``cute_mma_dag`` runtime tests.
+"""Shared kernels, config helpers and runners for CuTe MMA tests.
 
 ``test/test_cute_mma_dag_gpu.py`` (the warp mode) and
 ``test/test_cute_mma_dag_tcgen05_gpu.py`` (the tensor-memory mode) compile
@@ -16,10 +16,13 @@ from typing import TYPE_CHECKING
 import torch
 
 import helion
+import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Sequence
+
+    from helion.runtime.kernel import BoundKernel
 
 LAUNCHES = 2
 """Launches per cute compile whose outputs must agree bitwise: a race or an
@@ -198,3 +201,43 @@ def assert_tf32_bf16_dot(
             "BF16 rounding interval misses the TF32 accumulation bound",
             (~valid).nonzero()[:8].tolist(),
         )
+
+
+CPU_DEVICE = "cpu"
+
+
+def _ordinary_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    m, k = a.shape
+    _, n = b.shape
+    out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+    for tile_m, tile_n in hl.tile((m, n)):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
+        out[tile_m, tile_n] = acc.to(out.dtype)
+    return out
+
+
+def bind_cpu_gemm(shape: tuple[int, int, int], dtype: torch.dtype) -> BoundKernel:
+    m, n, k = shape
+    args = (
+        torch.empty((m, k), dtype=dtype, device=CPU_DEVICE),
+        torch.empty((k, n), dtype=dtype, device=CPU_DEVICE),
+    )
+    return helion.kernel(_ordinary_gemm, backend="cute", static_shapes=True).bind(args)
+
+
+def normalize_config(
+    bound: BoundKernel, config: helion.Config, *, fix: bool
+) -> dict[str, object]:
+    """Normalize a detached config, optionally repairing invalid MMA choices."""
+    copied = helion.Config(
+        **{k: list(v) if isinstance(v, list) else v for k, v in config.config.items()}  # pyrefly: ignore[bad-argument-type]
+    )
+    with bound.env:
+        bound.config_spec.normalize(copied, _fix_invalid=fix)
+    return copied.config
+
+
+def repaired_config(bound: BoundKernel, config: helion.Config) -> dict[str, object]:
+    return normalize_config(bound, config, fix=True)

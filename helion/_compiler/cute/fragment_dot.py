@@ -1,7 +1,7 @@
-"""Contractions of a computed fragment: staged ``hl.dot`` and the tf32 ``mma.sync`` path.
+"""Contractions of a computed fragment: staged ``hl.dot`` and ``mma.sync``.
 
 ``FragmentDotEmitter`` lowers a dot over staged operands either as a per-element
-serial contraction or, under ``cute_fp32_dot``, as a tf32 ``mma.sync`` phase whose
+serial contraction or as a half/tf32 ``mma.sync`` phase whose
 lanes may write the result straight to the host store (``DirectStoreSink``).  It
 builds on the memory emitter for that direct store."""
 
@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import math
+from typing import TYPE_CHECKING
 from typing import cast
 
 import torch
@@ -26,9 +27,14 @@ from ..runtime_tensor_guards import runtime_tensors_are_proven_disjoint
 from .fragment_context import DirectStoreSink
 from .fragment_context import Fragment
 from .fragment_context import HostTensor
+from .fragment_dot_support import fragment_half_dot_supported
+from .fragment_dot_support import fragment_tf32_dot_supported
 from .fragment_memory import FragmentMemoryEmitter
 
-# ``mma.sync`` helpers of the tf32 fragment contraction (``cute_fp32_dot``).
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+# Shared ``mma.sync`` and operand-packing helpers.
 _FRAGMENT_MMA_RUNTIME = "_helion_fragment_mma"
 
 
@@ -37,19 +43,22 @@ _FRAGMENT_MMA_PREAMBLE = (
 )
 
 
-def _mma_operand_conflict_free(layout: tuple[int, int], role: str) -> bool:
-    """Whether one ``mma.sync.m16n8k8`` operand word read from a staged tile
+def _mma_operand_conflict_free(
+    layout: tuple[int, int], role: str, k_stride: int = 1
+) -> bool:
+    """Whether one ``mma.sync`` operand word read from a staged tile
     of *layout* ``(row bytes, element bytes)`` is bank-conflict-free (lanes
     that share a bank share the word).  Lane ``(g, c) = (lane // 4, lane %
-    4)`` reads the A word at ``(g, c)`` (the other words shift rows or k by
-    a multiple of 4) and the B word at ``(c, g)``."""
+    4)`` reads the A word at ``(g, c)`` and the B word at ``(c, g)`` for
+    TF32. Half operands double each K coordinate and pack adjacent elements.
+    The other words shift rows or K by a multiple of four."""
     row_bytes, itemsize = layout
     if row_bytes % 4:
         return False
     banks: dict[int, set[int]] = {}
     for lane in range(32):
         g, c = lane // 4, lane % 4
-        row, col = (g, c) if role == "a" else (c, g)
+        row, col = (g, c * k_stride) if role == "a" else (c * k_stride, g)
         word = (row * row_bytes + col * itemsize) // 4
         banks.setdefault(word % 32, set()).add(word)
     return all(len(words) == 1 for words in banks.values())
@@ -72,13 +81,13 @@ def _consumed_by_direct_store(_coords: tuple[str, ...]) -> str:
 
 
 class FragmentDotEmitter(FragmentMemoryEmitter):
-    """``hl.dot`` over staged fragments, including the tf32 mma.sync path."""
+    """``hl.dot`` over staged fragments, including native mma.sync paths."""
 
     def materialize_padded(self, value: Fragment, pad: int) -> Fragment:
         """Copy *value* into a fresh shared buffer whose rows are *pad*
         elements longer than the tile's.  The returned fragment keeps the
         tile's shape and reads the padded rows; it lives only as a contraction
-        operand (``emit_tf32_mma``), never as a result."""
+        operand (``emit_mma``), never as a result."""
         shape = value.shape
         padded_shape = (*shape[:-1], shape[-1] + pad)
         self.held.append(value)
@@ -109,9 +118,11 @@ class FragmentDotEmitter(FragmentMemoryEmitter):
             else out_dtype
         )
         left_fake = cast("torch.Tensor", cast("Node", node.args[0]).meta["val"])
-        mma_contraction = self.tf32_mma_contraction(
+        mma_contraction = self.mma_contraction(
             node, lhs, rhs, acc, shape, left_fake, compute_dtype
         )
+        half = lhs.dtype in (torch.float16, torch.bfloat16)
+        k_step = 16 if half else 8
         # Operand recipes must finish before the contraction begins: the same
         # input can have different coordinates in its two operand roles.
         if mma_contraction is None:
@@ -124,13 +135,12 @@ class FragmentDotEmitter(FragmentMemoryEmitter):
             # one tile along the other output axis) whose recipe rests on
             # staged data is read in place by the mma lanes: no copy, no
             # barrier, no second buffer; its leaves' padded rows keep the
-            # reads conflict-free.  Otherwise rows are padded to an odd
-            # multiple of 4 (A) / 8 (B) banks so the lane fragments of one
-            # mma read 32 distinct banks.
+            # reads conflict-free. Otherwise rows are padded for the MMA's
+            # operand dtype and role so one instruction reads distinct banks.
             whole = (
                 shape[-2] % 16 == 0
                 and shape[-1] % 8 == 0
-                and mma_contraction % 8 == 0
+                and mma_contraction % k_step == 0
                 and mma_contraction == lhs.shape[-1]
             )
 
@@ -150,17 +160,28 @@ class FragmentDotEmitter(FragmentMemoryEmitter):
                 return (
                     operand.cheap
                     and operand.physical_row is not None
-                    and _mma_operand_conflict_free(operand.physical_row, role)
+                    and _mma_operand_conflict_free(
+                        operand.physical_row, role, 2 if half else 1
+                    )
                 )
 
+            def padding(extent: int, role: str) -> int:
+                if half:
+                    # A reads eight row groups by four packed K pairs; B
+                    # reads four K-pair rows by eight columns. An odd multiple
+                    # of four words spreads both patterns across the banks.
+                    words = -(-extent // 2)
+                    return 2 * (words + _mma_row_pad(words, 4)) - extent
+                return _mma_row_pad(extent, 4 if role == "a" else 8)
+
             if not in_place(lhs, "a", shape[-1] <= 8):
-                lhs = self.materialize_padded(lhs, _mma_row_pad(lhs.shape[-1], 4))
+                lhs = self.materialize_padded(lhs, padding(lhs.shape[-1], "a"))
             self.held.append(lhs)
             if not in_place(rhs, "b", shape[-2] <= 16):
-                rhs = self.materialize_padded(rhs, _mma_row_pad(rhs.shape[-1], 8))
+                rhs = self.materialize_padded(rhs, padding(rhs.shape[-1], "b"))
             self.held.append(rhs)
         if mma_contraction is not None:
-            result = self.emit_tf32_mma(
+            result = self.emit_mma(
                 lhs,
                 rhs,
                 acc,
@@ -255,7 +276,7 @@ class FragmentDotEmitter(FragmentMemoryEmitter):
             return None if extent is None else min(capacity, extent)
         return capacity
 
-    def tf32_mma_contraction(
+    def mma_contraction(
         self,
         node: Node,
         lhs: Fragment,
@@ -265,17 +286,18 @@ class FragmentDotEmitter(FragmentMemoryEmitter):
         left_fake: torch.Tensor,
         compute_dtype: torch.dtype,
     ) -> int | None:
-        """The static K of a dot ``cute_fp32_dot="tf32_mma"`` lowers through
-        ``mma.sync``; None keeps the serial FMA contraction (knob off, half or
-        wide operands, a dynamic contraction bound, a one-warp-short CTA)."""
-        from .autotune.heuristics.cute_fp32_dot import fragment_tf32_dot_supported
-
-        if self.df.config.get("cute_fp32_dot", "simt") != "tf32_mma":
+        """The static K of an enabled native MMA; otherwise use serial FMA."""
+        half = self.df.config.get(
+            "cute_fragment_half_mma", False
+        ) and fragment_half_dot_supported(node, self.env)
+        tf32 = self.df.config.get(
+            "cute_fp32_dot", "simt"
+        ) == "tf32_mma" and fragment_tf32_dot_supported(node, self.env)
+        if not half and not tf32:
             return None
         if (
             compute_dtype != torch.float32
             or self.threads % 32 != 0
-            or not fragment_tf32_dot_supported(node, self.env)
             or (acc is not None and acc.dtype != torch.float32)
             or len(lhs.shape) < 2
             or len(rhs.shape) < 2
@@ -346,7 +368,7 @@ class FragmentDotEmitter(FragmentMemoryEmitter):
     def direct_store_sink(
         self, node: Node, values: dict[Node, object], shape: tuple[int, ...]
     ) -> DirectStoreSink | None:
-        """The host store a tf32 mma may write from its lanes: the dot's only
+        """The host store an mma may write from its lanes: the dot's only
         user, storing the dot itself (no cast or view between them) into a
         host tensor window of the dot's shape, in the same graph, with every
         other input of the store already lowered and no host memory effect
@@ -458,7 +480,7 @@ class FragmentDotEmitter(FragmentMemoryEmitter):
                 f"    cute.copy({atom}, {packet}, cute.make_tensor({pointer}.align({2 * itemsize}), cute.make_layout((2,))))"
             )
 
-    def emit_tf32_mma(
+    def emit_mma(
         self,
         lhs: Fragment,
         rhs: Fragment,
@@ -468,22 +490,27 @@ class FragmentDotEmitter(FragmentMemoryEmitter):
         out_dtype: torch.dtype,
         sink: DirectStoreSink | None = None,
     ) -> Fragment:
-        """Contract through ``mma.sync.aligned.m16n8k8`` tf32 (``cute_fp32_dot``).
+        """Contract through m16n8k8 TF32 or m16n8k16 FP16/BF16 ``mma.sync``.
 
-        Each warp owns whole 16 x 8 output tiles of the (batched) product and
-        walks K in steps of 8: lane ``(g, c) = (lane // 4, lane % 4)`` reads
+        Each warp owns whole 16 x 8 output tiles of the (batched) product.
+        TF32 walks K in steps of 8: lane ``(g, c) = (lane // 4, lane % 4)`` reads
         A rows ``g``/``g + 8`` at k ``c``/``c + 4`` and B column ``g`` at the
         same k straight from the staged fp32 operand buffers (six smem reads
         per 1024 MACs instead of two per MAC; the padded rows keep the 32
         reads of one instruction in 32 banks), feeds their bit patterns to the
         tensor core, which truncates them to tf32, and writes its four fp32
         results ``(g, 2c)``, ``(g, 2c + 1)``, ``(g + 8, 2c)``, ``(g + 8, 2c + 1)``.
-        Partial tiles (M % 16, N % 8, K % 8) read zeros past the operand and
+        Partial tiles (M % 16, N % 8, K % k_step) read zeros past the operand and
         skip the writes past the result, so every qualifying dot of the root
         takes the mode.
 
-        ``cute_fragment_split_k``: when the dot has fewer tiles than the CTA
-        has warps, the idle warps take a share of K: ``splits`` warps walk
+        Half operands double the K step and each word packs two adjacent K
+        elements. The same four FP32 accumulators and store layout apply.
+
+        TF32-eligible dots expose the split-K and row-walk knobs; in a mixed
+        kernel these schedules apply to its half dots too. When a dot has fewer
+        tiles than the CTA has warps, the idle warps take a share of K:
+        ``splits`` warps walk
         disjoint step ranges of one tile (the accumulator joins split 0) and
         write fp32 partials; the result reads their sum.  Returns the result
         fragment (a staged tile, or the partial-summing view).
@@ -495,12 +522,15 @@ class FragmentDotEmitter(FragmentMemoryEmitter):
         returned fragment must never be read.
         """
         rows, cols = shape[-2], shape[-1]
+        half = lhs.dtype in (torch.float16, torch.bfloat16)
+        k_step = 16 if half else 8
+        kind = "bf16" if lhs.dtype == torch.bfloat16 else "f16" if half else "tf32"
         batch_shape = shape[:-2]
         tiles_m = -(-rows // 16)
         tiles_n = -(-cols // 8)
         tiles = math.prod(batch_shape) * tiles_m * tiles_n
         warps = self.threads // 32
-        steps = -(-contraction // 8)
+        steps = -(-contraction // k_step)
         splits = 1
         if self.split_k and tiles < warps and steps > 1:
             splits = max(
@@ -534,6 +564,7 @@ class FragmentDotEmitter(FragmentMemoryEmitter):
         lane = self.df.new_var("fragment_mma_lane")
         group = self.df.new_var("fragment_mma_group")
         quad = self.df.new_var("fragment_mma_quad")
+        k_quad = f"2 * {quad}" if half else quad
         row = self.df.new_var("fragment_mma_row")
         col = self.df.new_var("fragment_mma_col")
         self.emit(f"{lane} = {self.thread} % 32")
@@ -560,7 +591,9 @@ class FragmentDotEmitter(FragmentMemoryEmitter):
                     continue
                 self.guarded_assign(
                     name,
-                    self.cast(acc.broadcast((*batch, r, c_abs)), torch.float32),
+                    lambda coords=(*batch, r, c_abs): self.cast(
+                        acc.broadcast(coords), torch.float32
+                    ),
                     f"{f32}(0)",
                     self.in_bounds(r, rows, 16)
                     + self.in_bounds(c_abs, cols)
@@ -572,23 +605,41 @@ class FragmentDotEmitter(FragmentMemoryEmitter):
             coords: tuple[str, str],
             bounds: list[str],
             batch: tuple[str, ...],
+            k_axis: int,
         ) -> str:
             name = self.df.new_var("fragment_mma_operand")
             self.guarded_assign(
                 name,
-                self.cast(fragment.broadcast((*batch, *coords)), torch.float32),
+                lambda: self.cast(fragment.broadcast((*batch, *coords)), torch.float32),
                 f"{f32}(0)",
                 bounds,
             )
-            return f"{rt}.f32_bits({name})"
+            if not half:
+                return f"{rt}.f32_bits({name})"
+            other = self.df.new_var("fragment_mma_operand")
+            next_coords = list(coords)
+            next_coords[k_axis] = f"({coords[k_axis]}) + 1"
+            self.guarded_assign(
+                other,
+                lambda: self.cast(
+                    fragment.broadcast((*batch, *next_coords)), torch.float32
+                ),
+                f"{f32}(0)",
+                bounds + self.in_bounds(next_coords[k_axis], contraction, k_step),
+            )
+            # Packed pairs use the half-precision operand type, not the accumulator type.
+            half_kind = "bf16" if lhs.dtype == torch.bfloat16 else "f16"
+            return f"{rt}.pack_{half_kind}x2({name}, {other})"
 
         def a_words(k0: str, k1: str, batch: tuple[str, ...]) -> list[str]:
             return [
                 operand(
                     lhs,
                     (r, k),
-                    self.in_bounds(r, rows, 16) + self.in_bounds(k, contraction),
+                    self.in_bounds(r, rows, 16)
+                    + self.in_bounds(k, contraction, k_step),
                     batch,
+                    1,
                 )
                 for r, k in ((row, k0), (row8, k0), (row, k1), (row8, k1))
             ]
@@ -598,8 +649,9 @@ class FragmentDotEmitter(FragmentMemoryEmitter):
                 operand(
                     rhs,
                     (k, col),
-                    self.in_bounds(k, contraction) + self.in_bounds(col, cols),
+                    self.in_bounds(k, contraction, k_step) + self.in_bounds(col, cols),
                     batch,
+                    0,
                 )
                 for k in (k0, k1)
             ]
@@ -643,7 +695,10 @@ class FragmentDotEmitter(FragmentMemoryEmitter):
                 )
                 self.emit(f"{row} = ({tile_row}) % {tiles_m} * 16 + {group}")
                 ks = [
-                    (f"{index * 8} + {quad}", f"{index * 8 + 4} + {quad}")
+                    (
+                        f"{index * k_step} + {k_quad}",
+                        f"{index * k_step + k_step // 2} + {k_quad}",
+                    )
                     for index in range(steps)
                 ]
                 hoisted = [a_words(k0, k1, batch) for k0, k1 in ks]
@@ -660,7 +715,7 @@ class FragmentDotEmitter(FragmentMemoryEmitter):
                     for (k0, k1), words in zip(ks, hoisted, strict=True):
                         words = [*words, *b_words(k0, k1, batch)]
                         self.emit(
-                            f"{', '.join(accs)} = {rt}.mma_tf32({', '.join([*words, *accs])})"
+                            f"{', '.join(accs)} = {rt}.mma_{kind}({', '.join([*words, *accs])})"
                         )
                     emit_stores(accs, batch, col_base)
                 self.cg.add_statement(n_loop)
@@ -695,11 +750,11 @@ class FragmentDotEmitter(FragmentMemoryEmitter):
                         if splits > 1
                         else step
                     )
-                    k0 = f"{base_step} * 8 + {quad}"
-                    k1 = f"{base_step} * 8 + {quad} + 4"
+                    k0 = f"{base_step} * {k_step} + {k_quad}"
+                    k1 = f"{base_step} * {k_step} + {k_quad} + {k_step // 2}"
                     words = [*a_words(k0, k1, batch), *b_words(k0, k1, batch)]
                     self.emit(
-                        f"{', '.join(accs)} = {rt}.mma_tf32({', '.join([*words, *accs])})"
+                        f"{', '.join(accs)} = {rt}.mma_{kind}({', '.join([*words, *accs])})"
                     )
                 self.cg.add_statement(k_loop)
                 emit_stores(accs, batch, col_base)
@@ -731,17 +786,24 @@ class FragmentDotEmitter(FragmentMemoryEmitter):
     @staticmethod
     def in_bounds(index: str, extent: int, tile: int = 8) -> list[str]:
         """The predicate keeping *index* inside an axis the mma tiles may
-        overhang (16 rows, 8 columns, 8 k); empty when *tile* divides *extent*."""
+        overhang (16 rows, 8 columns, 8 or 16 K); empty when *tile* divides *extent*."""
         return [f"({index}) < {extent}"] if extent % tile else []
 
     def guarded_assign(
-        self, name: str, value: str, fallback: str, bounds: list[str]
+        self, name: str, value: Callable[[], str], fallback: str, bounds: list[str]
     ) -> None:
         if not bounds:
-            self.emit(f"{name} = {value}")
+            self.emit(f"{name} = {value()}")
             return
         self.emit(f"{name} = {fallback}")
-        self.emit(f"if {' and '.join(bounds)}:\n    {name} = {value}")
+        branch = statement_from_string(f"if {' and '.join(bounds)}:\n    pass")
+        assert isinstance(branch, ast.If)
+        branch.body.clear()
+        # A pointwise recipe may emit loads while being rendered. Build the
+        # entire recipe under the bounds check, including packed high halves.
+        with self.cg.set_statements(cast("list[ast.AST]", branch.body)):
+            self.emit(f"{name} = {value()}")
+        self.cg.add_statement(branch)
 
     def emit_fragment_mma_preamble(self) -> None:
         """Record that the ``mma.sync`` helpers' import is needed; the root's

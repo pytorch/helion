@@ -14,7 +14,6 @@ import pytest
 import torch
 
 from test.cute_population_contracts import tcgen05_mma_support
-from test.test_cute_tcgen05_ordinary_exploration import _ordinary_gemm
 
 import helion
 from helion._compiler.cute.tcgen05_config import surface
@@ -22,6 +21,8 @@ from helion._compiler.cute.tcgen05_lifecycle import Tcgen05LifecycleContext
 from helion._testing import DEVICE
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
+from helion._testing.cute_mma_dag import CPU_DEVICE
+from helion._testing.cute_mma_dag import bind_cpu_gemm as _bind_gemm
 import helion.language as hl
 
 # The B200 model with tcgen05 MMA support, CUDA hidden, the inputs traced
@@ -36,7 +37,6 @@ pytestmark = [
     ),
 ]
 
-CPU_DEVICE = "cpu"
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -118,15 +118,6 @@ def _bias_gemm(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor) -> torch.Te
             acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
         out[tile_m, tile_n] = (acc + bias[tile_m, tile_n]).to(out.dtype)
     return out
-
-
-def _bind_gemm(shape: tuple[int, int, int], dtype: torch.dtype) -> BoundKernel:
-    m, n, k = shape
-    args = (
-        torch.empty((m, k), dtype=dtype, device=CPU_DEVICE),
-        torch.empty((k, n), dtype=dtype, device=CPU_DEVICE),
-    )
-    return helion.kernel(_ordinary_gemm, backend="cute", static_shapes=True).bind(args)
 
 
 def _bind_bmm(shape: tuple[int, int, int, int], dtype: torch.dtype) -> BoundKernel:

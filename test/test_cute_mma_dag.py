@@ -26,9 +26,6 @@ import sympy
 import torch
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
-from test.test_cute_tcgen05_fixed_chain import CPU_DEVICE
-from test.test_cute_tcgen05_fixed_chain import _bind_gemm
-
 import helion
 from helion._compiler.cute import cute_mma_dag as dag
 from helion._compiler.cute import cutedsl_compat
@@ -42,6 +39,8 @@ from helion._compiler.cute.cute_warp_mma_gemm import warp_mma_warp_layout
 from helion._compiler.cute.state import cute_env_state
 from helion._compiler.host_function import SymbolOrigin
 from helion._compiler.variable_origin import BlockSizeOrigin
+from helion._testing.cute_mma_dag import CPU_DEVICE
+from helion._testing.cute_mma_dag import bind_cpu_gemm as _bind_gemm
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 import helion.language as hl
@@ -817,6 +816,27 @@ def _stale_carry(k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.
     return out, out2
 
 
+def _carry_copy_statements(body: str, target: int, source: int) -> list[str]:
+    """Carry writes backed by snapshots of the matching source coordinates."""
+    snapshots = dict(
+        re.findall(rf"(md_cnext(?:_\d+)?) = (md_c{source}_\d+_\d+_\d+)", body)
+    )
+    copies = []
+    snapshot_positions = []
+    write_positions = []
+    for match in re.finditer(
+        rf"md_c{target}_(\d+_\d+_\d+) = (md_cnext(?:_\d+)?)\b", body
+    ):
+        coords, temporary = match.groups()
+        assert snapshots[temporary] == f"md_c{source}_{coords}"
+        copies.append(match.group())
+        snapshot_positions.append(body.index(f"{temporary} = {snapshots[temporary]}"))
+        write_positions.append(match.start())
+    if copies:
+        assert max(snapshot_positions) < min(write_positions)
+    return copies
+
+
 def test_a_carry_read_after_its_in_place_update_gets_a_fresh_slot_and_a_copy() -> None:
     # The carry ``acc`` feeds ``proj`` after ``new`` would have overwritten it:
     # ``new`` takes a fresh slot (slot 1) and moves into the carry's registers
@@ -832,7 +852,7 @@ def test_a_carry_read_after_its_in_place_update_gets_a_fresh_slot_and_a_copy() -
     body = _kernel_body(_source(bound, _config(64, 64, warps=4, stages=2)))
     loop = _loop_and_after(body)
     mmas = [m.start() for m in re.finditer(rf"{RT}\.mma_bf16\(", loop)]
-    copies = re.findall(r"md_c0_\d+_\d+_\d+ = md_c1_\d+_\d+_\d+", loop)
+    copies = _carry_copy_statements(loop, 0, 1)
     assert len(copies) == 32
     assert mmas[-1] < loop.index(copies[0])
 
@@ -2822,7 +2842,7 @@ def test_two_loop_dots_on_one_carry_copy_before_the_rescale() -> None:
     loop = _loop_and_after(
         _kernel_body(_source(after, _config(64, 64, warps=4, stages=2)))
     )
-    copies = re.findall(r"md_c0_\d+_\d+_\d+ = md_c1_\d+_\d+_\d+", loop)
+    copies = _carry_copy_statements(loop, 0, 1)
     assert len(copies) == 32
     assert loop.rindex(f"{RT}.mma_bf16(") < loop.index(copies[0])
 
@@ -3582,7 +3602,7 @@ def test_wy_runs_the_neumann_chain_on_tf32_mmas() -> None:
     assert len(re.findall(rf"{RT}\.sts_f32\(md_t", body)) == 32
     assert f"{RT}.sts_v4_f32(" not in body
     # dot(Apow, Apow) lands in a fresh slot and moves into Apow's carry.
-    copies = re.findall(r"md_c1_\d+_\d+_\d+ = md_c3_\d+_\d+_\d+", body)
+    copies = _carry_copy_statements(body, 1, 3)
     assert len(copies) == 32
     # A_inv is stored as fp32 pairs (16 per lane) between the chain and the
     # w loop.
@@ -4411,11 +4431,7 @@ def test_a_rescaled_acc_whose_leaf_an_operand_reads_takes_a_fresh_slot(
         rescales = re.findall(
             rf"= md_c{carry.slot}_\d+_\d+_\d+ \* v_\d+$", loop, re.MULTILINE
         )
-        copies = re.findall(
-            rf"^\s*md_c{carry.slot}_\d+_\d+_\d+ = md_c{t_dot.slot}_\d+_\d+_\d+$",
-            loop,
-            re.MULTILINE,
-        )
+        copies = _carry_copy_statements(loop, carry.slot, t_dot.slot)
         assert len(rescales) == regs == len(copies)
         # Nothing writes the carry's registers before the copies behind the
         # dot's last MMA: the operand reads them intact.
@@ -5273,8 +5289,8 @@ def test_the_tma_ring_fetches_each_ring_tile_as_one_bulk_tensor_copy() -> None:
         "cutlass.Int32((md_i + 1) * 64), cutlass.Int32(md_a0)"
     )
     loop = _loop_body(body, "md_i")
-    assert "md_stage = (md_cnt0 + md_i) % 2" in loop
-    assert re.search(r"^ *md_par = \(md_cnt0 \+ md_i\) // 2 & 1$", loop, re.MULTILINE)
+    assert "md_stage = md_cnt0 % 2" in loop
+    assert re.search(r"^ *md_par = md_cnt0 // 2 & 1$", loop, re.MULTILINE)
     wait = loop.index("_helion_mma_dag_tc.mbar_wait(md_full0 + md_stage, md_par)")
     assert (
         loop.index("cute.arch.cp_async_wait_group(0)")
@@ -5295,7 +5311,7 @@ def test_the_tma_ring_fetches_each_ring_tile_as_one_bulk_tensor_copy() -> None:
         f"{RT}.cp_async_16(md_t2" not in body and f"{RT}.cp_async_16(md_t3" not in body
     )
     assert f"{RT}.cp_async_16(md_t0" in body
-    assert re.search(r"^ {4}md_cnt0 = md_cnt0 \+ \(1 - 0\)$", body, re.MULTILINE)
+    assert re.search(r"^ {8}md_cnt0 = md_cnt0 \+ 1$", body, re.MULTILINE)
     assert "'kind': 'helion_mma_dag_tma', 'tma_count': 2" in source
     assert (
         "'tma0_box': [64, 16, 1, 1, 1], 'tma0_swizzle': 's128b', 'tma0_elem': 2"
@@ -5311,8 +5327,8 @@ def test_the_tma_ring_fetches_each_ring_tile_as_one_bulk_tensor_copy() -> None:
 
 def test_a_re_entered_tma_ring_counts_its_iterations_across_the_outer_loop() -> None:
     # The nested ring's slot and barrier parity follow a running count the
-    # outer loop never resets: the count advances by the inner trip count
-    # after the inner loop, ahead of the next iteration's early prologue.
+    # outer loop never resets: the count advances once per inner iteration,
+    # ahead of the next outer iteration's early prologue.
     bf16, f32 = torch.bfloat16, torch.float32
     do = torch.empty((4, 64, 128), dtype=bf16, device=CPU_DEVICE)
     h = torch.empty((4, 128, 128), dtype=bf16, device=CPU_DEVICE)
@@ -5322,7 +5338,7 @@ def test_a_re_entered_tma_ring_counts_its_iterations_across_the_outer_loop() -> 
         _source(bound, _config(64, 64, warps=4, stages=2, cute_mma_dag_loads="tma"))
     )
     outer = _loop_body(body, "md_i")
-    inner_end = outer.index("md_cnt1 = md_cnt1 + (2 - 0)")
+    inner_end = outer.index("md_cnt1 = md_cnt1 + 1")
     assert outer.index("for md_i1 in") < inner_end
     early = outer.index(
         "_helion_mma_dag_tc.prims.mbarrier_arrive_expect_tx(md_full1 + (md_cnt1 + 0) % 2, 16384)",
@@ -5330,7 +5346,7 @@ def test_a_re_entered_tma_ring_counts_its_iterations_across_the_outer_loop() -> 
     )
     assert early > inner_end
     inner = _loop_body(body, "md_i1")
-    assert "md_stage1 = (md_cnt1 + md_i1) % 2" in inner
+    assert "md_stage1 = md_cnt1 % 2" in inner
     assert "_helion_mma_dag_tc.mbar_wait(md_full1 + md_stage1, md_par)" in inner
     # The aux ring shares the slot expression.
     ring = _kernel_body(
@@ -7343,10 +7359,9 @@ def test_dwk_reads_the_column_sum_of_its_fragment_beside_it() -> None:
     assert re.search(r"= md_v_\d+ \* md_fv_0\b", epilogue)
 
 
-def test_a_vector_inside_an_operand_chain_is_not_mine() -> None:
-    # The operand passes evaluate per tile element, not per fragment
-    # register: a dot operand reading a vector (``(acc * rowsum).to(bf16)``)
-    # declines, while the same value stored is admitted.
+def test_a_vector_inside_an_operand_chain_is_materialized_in_registers() -> None:
+    # The stored expression stays fused; a dot operand reading a vector
+    # (``(acc * rowsum).to(bf16)``) gets a register fragment before exchange.
     bf16, f32 = torch.bfloat16, torch.float32
     b, m, k, n, p = 4, 64, 128, 32, 16
     a = torch.empty((b, m, k), dtype=bf16, device=CPU_DEVICE)
@@ -7362,9 +7377,11 @@ def test_a_vector_inside_an_operand_chain_is_not_mine() -> None:
         "Store",
     ]
     bound = _bind_fn(_row_scaled_operand, (a, w, c, out))
-    with bound.env, bound.host_function:
-        assert dag.match_mma_dag(bound.host_function.device_ir.graphs) is None
-    assert bound.config_spec.cute_mma_dag is None
+    program = _program(bound)
+    assert any(step.vecs for step in program.derived)
+    assert not program.pass_chains
+    body = _kernel_body(_source(bound, _config(32, warps=4, stages=2)))
+    assert f"{RT}.mma_bf16(" in body
 
 
 def _row_scaled_stored(
@@ -8119,6 +8136,49 @@ def test_a_one_row_tile_is_computed_at_the_mma_atom() -> None:
     assert "md_a0 + md_L0_rowl" not in body
 
 
+def _single_axis_keepdim(a: torch.Tensor, b: torch.Tensor, dim: int) -> torch.Tensor:
+    dim = hl.specialize(dim)
+    out = torch.empty_strided(
+        (a.size(0), a.size(0)), (32, 1), dtype=torch.float32, device=a.device
+    )
+    for rows in hl.tile(a.size(0)):
+        score = hl.dot(a[rows, :], b[:, rows])
+        summed = torch.sum(score, dim=dim, keepdim=True)
+        out[rows, rows] = score + summed
+    return out
+
+
+@pytest.mark.parametrize("m", (1, 16))
+@pytest.mark.parametrize("dim", (0, 1))
+def test_keepdim_vector_preserves_a_configured_singleton_axis(m: int, dim: int) -> None:
+    # Both fragment dimensions share one tile axis. The keepdim singleton
+    # still distinguishes which dimension the reduced vector varies along.
+    # Padded RHS/output row pitches avoid an unrelated alignment rejection.
+    args = (
+        torch.empty((m, 32), dtype=torch.bfloat16, device=CPU_DEVICE),
+        torch.empty((32, 32), dtype=torch.bfloat16, device=CPU_DEVICE)[:, :m],
+        dim,
+    )
+    bound = _bind_fn(_single_axis_keepdim, args)
+    with bound.env, bound.host_function:
+        root_blocks = bound.host_function.device_ir.grid_block_ids[0]
+        assert len(root_blocks) == 1
+        root_block = bound.env.canonical_block_id(root_blocks[0])
+        program = dag.match_mma_dag(
+            bound.host_function.device_ir.graphs,
+            resolve_block_size=lambda block: (
+                m if bound.env.canonical_block_id(block) == root_block else None
+            ),
+        )
+    # This tests the matcher before hardware geometry admission: a symbolic
+    # one-lane tile keeps its axis and the inserted keepdim axis stays distinct.
+    assert program is not None
+    assert any(
+        axis.kind == dag.AXIS_ROOT and axis.block_id == root_block
+        for axis in program.axes
+    )
+
+
 def test_a_block_below_the_atom_guards_against_the_block_and_the_extent() -> None:
     # M = 24 under blocks of 8: three CTAs each compute the 16-row atom and
     # own eight rows; the guard tests the block, and (24 % 8 == 0) only the
@@ -8725,12 +8785,14 @@ def test_varlen_state_pass_is_admitted_with_tensor_loop_bounds() -> None:
     assert [store.region for store in program.stores].count("epilogue") == 1
     body = _kernel_body(_source(bound, _config(32, warps=4, stages=2)))
     assert SIMT_FALLBACK not in body
-    assert body.count(f"cutlass.Int32({RT}.ldg_s64(") == 2
+    assert body.count(f"{RT}.ldg_s64(") == 2
+    assert f"cutlass.Int32({RT}.ldg_s64(" not in body
     assert "for md_i in cutlass.range(md_scalar, md_scalar_1):" in body
     # The ring prologue and the refill are guarded by the dynamic bounds.
     assert "if md_scalar < md_scalar_1:" in body
     assert "if md_i + 1 < md_scalar_1:" in body
-    assert "md_stage = (md_i - md_scalar) % 2" in body
+    # Ring selection stays narrow even with an Int64 logical induction value.
+    assert "md_stage = md_ring0 % 2" in body
     assert f"{RT}.mma_bf16(" in body
     # (The dense form keeps its static trip count.)
     (dense_loop,) = _program(_bind_fwd_h_delta()).loops
@@ -9768,8 +9830,8 @@ def test_the_rounding_root_is_found_through_views() -> None:
 
 
 _COMPILED_PATH = pytest.mark.skipif(
-    os.environ.get("HELION_INTERPRET") == "1",
-    reason="the tests pin configs and inspect generated code",
+    os.environ.get("HELION_INTERPRET") == "1" or not torch.cuda.is_available(),
+    reason="runtime checks require native CUDA and pinned compiled configs",
 )
 
 

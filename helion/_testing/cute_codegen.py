@@ -6,6 +6,7 @@ import ast
 from contextlib import ExitStack
 from contextlib import contextmanager
 import importlib.util
+import sys
 from typing import TYPE_CHECKING
 from unittest import SkipTest
 from unittest.mock import patch
@@ -26,6 +27,8 @@ from . import patch_target_facts
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Generator
+    from pathlib import Path
+    from types import ModuleType
     from unittest.mock import MagicMock
 
     from ..runtime.kernel import BoundKernel
@@ -43,6 +46,16 @@ def stage_sources(source: str) -> list[str]:
         and isinstance(node.args[0], ast.Constant)
         and isinstance(node.args[0].value, str)
     ]
+
+
+def load_generated_module(path: Path) -> ModuleType:
+    """Execute a generated module anew, including repeated uses of one stem."""
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def require_cute_codegen() -> None:

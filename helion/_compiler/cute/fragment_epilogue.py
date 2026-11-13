@@ -492,8 +492,11 @@ def _shape_only_subscript(node: Node) -> bool:
         isinstance(source_value, torch.Tensor)
         and isinstance(output_value, torch.Tensor)
         and isinstance(indices, (list, tuple))
-        and all(index is None or index == slice(None) for index in indices)
-        and sum(index == slice(None) for index in indices) == source_value.ndim
+        and all(
+            index is None or (isinstance(index, slice) and index == slice(None))
+            for index in indices
+        )
+        and sum(isinstance(index, slice) for index in indices) == source_value.ndim
         and len(indices) == output_value.ndim
     )
 

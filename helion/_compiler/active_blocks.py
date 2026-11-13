@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import sympy
 import torch
 
+from ..language import memory_ops
 from ..language.matmul_ops import MATMUL_FACT_ID_META
 from .compile_environment import CompileEnvironment
 from .device_ir import ForLoopGraphInfo
@@ -16,13 +17,20 @@ from .utils import compute_slice_size
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+    from collections.abc import Iterator
     from collections.abc import Sequence
+
+    from torch.fx import Node
 
     from .device_ir import GraphInfo
 
 
 def active_block_ids(
-    graphs: Sequence[GraphInfo], root_blocks: Iterable[int], env: CompileEnvironment
+    graphs: Sequence[GraphInfo],
+    root_blocks: Iterable[int],
+    env: CompileEnvironment,
+    *,
+    include_literal_slices: bool = False,
 ) -> frozenset[int]:
     """Keep shape/index symbols, explicit loops and actual reduction lowerings."""
     result = set(root_blocks)
@@ -47,6 +55,13 @@ def active_block_ids(
             result.update(graph.block_ids)
         for node in graph.graph.nodes:
             visit(node.meta.get("val"))
+            if include_literal_slices:
+                # Full slices own logical axes even when their extents are
+                # literal. Read the memory operation's indices, not padded
+                # factory/result shapes that can equal an unrelated axis.
+                for extent in _memory_slice_extents(node):
+                    if (block_id := env.resolve_block_id(extent)) is not None:
+                        result.add(block_id)
             lowering = node.meta.get("lowering")
             if isinstance(lowering, ReductionLowering):
                 result.add(lowering.block_index)
@@ -59,6 +74,25 @@ def active_block_ids(
                     if block_id is not None
                 )
     return frozenset(result)
+
+
+def _memory_slice_extents(node: Node) -> Iterator[int | torch.SymInt]:
+    target = (
+        node.args[0]
+        if node.op == "call_function" and node.target is memory_ops.load
+        else memory_write_target(node)
+    )
+    if target is None or not isinstance(node.args[1], (list, tuple)):
+        return
+    tensor = torch.fx.map_arg(target, lambda n: n.meta["val"])
+    if isinstance(tensor, tuple):
+        tensor = tensor[0]
+    assert isinstance(tensor, torch.Tensor)
+    indices = torch.fx.map_arg(node.args[1], lambda n: n.meta["val"])
+    indices = [index for index in indices if index is not None]
+    for size, index in zip(tensor.shape, indices, strict=True):
+        if isinstance(index, slice):
+            yield compute_slice_size(index, size)
 
 
 def unused_block_ids(
@@ -79,19 +113,8 @@ def unused_block_ids(
             # Scalar stores have no tensor result carrying full-slice axes.
             # Match their logical extents directly: compute_shape can allocate
             # new reduction dimensions, which this liveness analysis must not do.
-            if (target := memory_write_target(node)) is not None and isinstance(
-                node.args[1], (list, tuple)
-            ):
-                tensor = torch.fx.map_arg(target, lambda n: n.meta["val"])
-                if isinstance(tensor, tuple):
-                    tensor = tensor[0]
-                assert isinstance(tensor, torch.Tensor)
-                indices = torch.fx.map_arg(node.args[1], lambda n: n.meta["val"])
-                indices = [index for index in indices if index is not None]
-                for size, index in zip(tensor.shape, indices, strict=True):
-                    if not isinstance(index, slice):
-                        continue
-                    extent = compute_slice_size(index, size)
+            if memory_write_target(node) is not None:
+                for extent in _memory_slice_extents(node):
                     # ShapeEnv can know equal extents whose expression keys differ.
                     used = set()
                     for block_id in unused:

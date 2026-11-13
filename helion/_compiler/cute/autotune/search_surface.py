@@ -20,7 +20,6 @@ import torch
 
 from ...._compat import target_device_capability as get_target_device_capability
 from ...._utils import prev_power_of_2
-from ....autotuner.block_id_sequence import BlockIdSequence
 from ....autotuner.config_fragment import BooleanFragment
 from ....autotuner.config_fragment import ConfigSpecFragment
 from ....autotuner.config_fragment import EnumFragment
@@ -310,7 +309,7 @@ _FRAGMENT_OPTIONS: dict[str, _FragmentOption] = {
     ),
     "cute_fragment_packet_loads": _FragmentOption(
         lambda spec, config: spec.cute_fragment_packet_load_root_ids,
-        "a complete fragment root with readonly Float32, Float16 or BFloat16 host loads",
+        "a complete fragment root with readonly Float32, Float16, BFloat16, Int8 or Uint8 host loads",
     ),
     "cute_fragment_padded_rows": _FragmentOption(
         lambda spec, config: spec.cute_fragment_padded_rows_root_ids,
@@ -345,6 +344,10 @@ _FRAGMENT_OPTIONS: dict[str, _FragmentOption] = {
         lambda spec, config: spec.cute_fp32_dot_root_ids,
         "an fp32 hl.dot in a computed fragment under tf32 dot precision",
         ("simt", "tf32_mma"),
+    ),
+    "cute_fragment_half_mma": _FragmentOption(
+        lambda spec, config: spec.cute_fragment_half_mma_root_ids,
+        "an FP16/BF16 hl.dot with FP32 accumulation in a computed fragment on SM80+",
     ),
     "cute_fragment_scan": _FragmentOption(
         lambda spec, config: spec.cute_fragment_scan_root_ids,
@@ -2098,6 +2101,9 @@ def normalize_knobs(
     _normalize_fragment_option(
         config_spec, config, "cute_fp32_dot", fix_invalid=fix_invalid
     )
+    _normalize_fragment_option(
+        config_spec, config, "cute_fragment_half_mma", fix_invalid=fix_invalid
+    )
     _normalize_cute_fragment_threads(config_spec, config, fix_invalid=fix_invalid)
     _normalize_fragment_option(
         config_spec, config, "cute_fragment_producer_cache", fix_invalid=fix_invalid
@@ -2817,7 +2823,7 @@ def cute_flat_fields(
         fields["cute_fragment_padded_rows"] = BooleanFragment()
     if config_spec.cute_fragment_unrolled_loops_search_enabled:
         fields["cute_fragment_unrolled_loops"] = BooleanFragment()
-    # The tile transport knobs (one statement: this method sits at a
+    # Fragment MMA and tile transport booleans (one statement: this sits at a
     # size past which pyrefly drops its narrowing of the fields below).
     fields.update(
         {
@@ -2842,6 +2848,10 @@ def cute_flat_fields(
                 (
                     config_spec.cute_fragment_slab_loads_search_enabled,
                     "cute_fragment_slab_loads",
+                ),
+                (
+                    config_spec.cute_fragment_half_mma_search_enabled,
+                    "cute_fragment_half_mma",
                 ),
             )
             if enabled
@@ -3576,12 +3586,18 @@ def cute_flat_fields(
     if (
         config_spec.supports_config_key("pid_type")
         and "pid_type" not in fields
-        and config_spec.allowed_pid_types[0] != "flat"
+        and (
+            config_spec.allowed_pid_types[0] != "flat"
+            or (
+                config_spec.cute_ordered_phase_pid_search
+                and len(config_spec.allowed_pid_types) > 1
+            )
+        )
     ):
         # SIMT normally omits this coordinate and defaults to flat.
-        # Barriers require a persistent launch in the reference and in
-        # every candidate, including after a flatten/unflatten round trip;
-        # CuTe may also search their ordered ``flat`` phase launches.
+        # Non-ordered barriers can disallow flat. Ordered barriers keep this
+        # coordinate even when captured reductions or CTA-local atomics need
+        # flat launches for the conservative reference.
         fields["pid_type"] = EnumFragment(config_spec.allowed_pid_types)
     if config_spec.cross_loop_pipeline is not None:
         fields["cross_loop_pipeline"] = config_spec.cross_loop_pipeline
@@ -3627,6 +3643,7 @@ def flatten_missing_field_default(
         return True, False
     if key in (
         "cute_fragment_register_loads",
+        "cute_fragment_half_mma",
         "cute_fragment_warp_scan",
         "cute_fragment_topk_network",
         "cute_fragment_cta_topk",

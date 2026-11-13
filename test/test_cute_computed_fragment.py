@@ -88,6 +88,57 @@ def test_static_fragment_axes_transpose_and_loop_carry(size, steps):
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_runtime_loop_bounds(
+    x: torch.Tensor, bounds: torch.Tensor, step: hl.constexpr
+):
+    out = torch.empty_like(x)
+    for row in hl.grid(x.size(0)):
+        value = hl.dot(x[row, :, :], x[row, :, :].T)
+        begin = bounds[row, 0] + 1
+        end = torch.minimum(bounds[row, 1], bounds[row, 2])
+        for index in hl.grid(begin, end, step):
+            value = value + x[row, :, :] * (index + 1)
+        out[row, :, :] = value
+    return out
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.parametrize("step", [1, 2])
+def test_fragment_runtime_loop_bounds_native_replay(step):
+    # Both range bounds are tensor-derived recipes. A zero-trip row
+    # and changed metadata on graph replay also rule out evaluating the end
+    # inside the body or caching the first invocation's range.
+    bounds_cpu = torch.tensor([[0, 8, 6], [5, 3, 9], [-1, 7, 5]])
+    bounds = bounds_cpu.to(DEVICE)
+    x = torch.arange(3 * 4 * 4, device=DEVICE).reshape(3, 4, 4).float()
+    bound = _fragment_runtime_loop_bounds.bind((x, bounds, step))
+    config = bound.config_spec.default_config()
+    source = bound.to_code(config)
+    assert "fragment_smem" in source
+    compiled = bound.compile_config(config)
+
+    def reference():
+        factors = [
+            sum(index + 1 for index in range(start + 1, min(end, cap), step))
+            for start, end, cap in bounds_cpu.tolist()
+        ]
+        return (
+            x @ x.transpose(-2, -1)
+            + x * torch.tensor(factors, device=DEVICE)[:, None, None]
+        )
+
+    torch.testing.assert_close(compiled(x, bounds, step), reference(), rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = compiled(x, bounds, step)
+    bounds_cpu.copy_(torch.tensor([[8, 2, 4], [-1, 9, 8], [0, 5, 7]]))
+    bounds.copy_(bounds_cpu)
+    x.add_(1)
+    graph.replay()
+    torch.testing.assert_close(actual, reference(), rtol=0, atol=0)
+
+
 @helion.kernel(backend="cute", autotune_effort="none")
 def _fragment_parallel_carries(x: torch.Tensor, y: torch.Tensor, steps: hl.constexpr):
     size = hl.specialize(x.size(1))
@@ -4596,22 +4647,28 @@ def test_fragment_packet_loads_preserves_old_population_rng(strategy_name):
         assert actual[-1]["cute_fragment_packet_loads"] is True
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_fragment_packet_loads_half_types_take_eight_byte_packets(dtype):
-    # Four 16-bit scalars per packet: the same loop body as the fp32 packet
-    # (the DSL's AST preprocessing of its conditionals stays bounded) over an
-    # 8-byte vector copy.
+@pytest.mark.parametrize(
+    "dtype,scalar",
+    [
+        (torch.float16, "cutlass.Float16"),
+        (torch.bfloat16, "cutlass.BFloat16"),
+        (torch.int8, "cutlass.Int8"),
+        (torch.uint8, "cutlass.Uint8"),
+    ],
+)
+def test_fragment_packet_loads_narrow_types_take_four_lane_packets(dtype, scalar):
+    # Four scalars per packet keep the DSL's AST preprocessing bounded.
     with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound = cpu_bind(_fragment_uncached_cheap, (torch.ones(3, 17, dtype=dtype),))
         assert bound.config_spec.cute_fragment_packet_load_root_ids
         config = bound.config_spec.default_config()
         config.config["cute_fragment_packet_loads"] = True
         code = bound.to_code(config)
-    scalar = "cutlass.Float16" if dtype is torch.float16 else "cutlass.BFloat16"
+    packet_bytes = 4 * dtype.itemsize
     assert f"cute.make_rmem_tensor(cute.make_layout((4,)), {scalar})" in code
-    assert ".align(8), cute.make_layout((4,))" in code
+    assert f".align({packet_bytes}), cute.make_layout((4,))" in code
     assert (
-        f"cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), {scalar}, num_bits_per_copy=64)"
+        f"cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), {scalar}, num_bits_per_copy={8 * packet_bytes})"
         in code
     )
     assert "fragment_packet_address % 4 == 0" in code
