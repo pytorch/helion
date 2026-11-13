@@ -15,6 +15,7 @@ from test.test_cute_resident_reductions_codegen import _kernel_and_arguments
 from helion._compiler.cute.autotune.heuristics.cute_resident_reductions import (
     CuteResidentReductionHeuristic,
 )
+from helion._testing.cute_cache_sources import helion_imports
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.precompile_future import _load_compiled_fn
@@ -57,6 +58,21 @@ def _key(kernel: SimpleNamespace) -> str | None:
 @pytest.mark.parametrize(
     "kind,edited,unrelated",
     [
+        (
+            "helion_paged_attention",
+            "_compiler/cute/_paged_attention_reference_compute.py",
+            "helion_flash",
+        ),
+        (
+            "helion_paged_attention",
+            "_compiler/cute/_paged_attention_io.py",
+            "helion_flash",
+        ),
+        (
+            "helion_paged_attention",
+            "_compiler/cute/_warp_mma_runtime.py",
+            "helion_flash",
+        ),
         (
             "gathered_mma_tma",
             "_compiler/cute/gathered_mma_runtime.py",
@@ -484,3 +500,10 @@ def test_helper_kinds_and_plan_kinds_are_disjoint() -> None:
     )
     table = source_dependencies.wrapper_dependencies()
     assert set(source_dependencies._HELPER_KIND_DEPENDENCIES) <= set(table)
+
+
+def test_paged_dependency_declaration_is_import_closed() -> None:
+    dependencies = source_dependencies.wrapper_dependencies()["helion_paged_attention"]
+    declared = set(dependencies) | set(source_dependencies._COMMON_DEPENDENCIES)
+    imported = set().union(*(helion_imports(path) for path in dependencies))
+    assert imported <= declared

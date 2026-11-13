@@ -62,7 +62,9 @@ def _plain_tcgen05_plan_bakes(plan: dict[str, object]) -> bool:
     return False
 
 
-# The wrapper-plan kinds whose host wrapper bakes the tensor layouts.
+# Plans exempting a declared matmul from the compiler's shape-bake veto.
+# Runtime launch_descriptor.wrapper_plan_bakes_tensor_shapes separately checks
+# the launch plan (including partial TMA tiles); membership here is not enough.
 _BAKING_PLAN_KINDS = frozenset(
     {
         "helion_small_biased_attention",

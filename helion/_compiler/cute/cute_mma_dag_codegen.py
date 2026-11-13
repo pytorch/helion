@@ -158,6 +158,11 @@ def codegen_mma_dag(cg: GenerateAST) -> bool:
     # This render's exact fp32 widenings (``MmaDagEmitterBase.retyped``): fresh per
     # kernel, the names recur from one render of a bound kernel to the next.
     df.cute_state.root_plans.mma_dag_exact_f32 = {}
+    if plan.attention is not None:
+        from .paged_attention_codegen import codegen_paged_attention
+
+        codegen_paged_attention(cg, plan.attention)
+        return True
     if plan.compute == MMA_DAG_TCGEN05:
         from .cute_mma_dag_tcgen05 import codegen_mma_dag_tcgen05
 

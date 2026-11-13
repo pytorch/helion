@@ -345,7 +345,7 @@ def test_native_row_union_dependent_launch_cuda(
     offsets rewritten between them; a read ahead of the wait would see the
     other layout's rows."""
     _require_sm100()
-    from test.test_cute_pdl import _produce
+    from helion._testing.cute_pdl import produce as _produce
 
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(93217)

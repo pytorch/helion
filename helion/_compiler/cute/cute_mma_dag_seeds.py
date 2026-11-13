@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 from typing import cast
 
 from ...runtime.config import Config
+from .cute_mma_dag import AXIS_LEAD
 from .cute_mma_dag import AXIS_LOOP
 from .cute_mma_dag import AXIS_ROOT
 from .cute_mma_dag import MMA_DAG_AUX_KEY
@@ -46,6 +47,7 @@ from .cute_mma_dag import MMA_DAG_LOOKAHEAD_KEY
 from .cute_mma_dag import MMA_DAG_LOOKAHEAD_OFF
 from .cute_mma_dag import MMA_DAG_LOOKAHEAD_ON
 from .cute_mma_dag import MMA_DAG_PASS_WARP_STAGES
+from .cute_mma_dag import MMA_DAG_PASS_WARPS_ATTENTION_SCOPED
 from .cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
 from .cute_mma_dag import MMA_DAG_PASS_WARPS_MMA
 from .cute_mma_dag import MMA_DAG_PASS_WARPS_OFF
@@ -69,6 +71,7 @@ from .cute_mma_dag import mma_dag_pass_warps_lead
 from .cute_mma_dag import mma_dag_pass_warps_reason
 from .cute_mma_dag import mma_dag_seed_configs
 from .cute_mma_dag import mma_dag_seed_variants
+from .cute_mma_dag import paged_attention_pass_warp_choices
 from .cute_mma_dag_tcgen05 import tcgen05_corner_seeds
 from .cute_mma_dag_tcgen05 import tcgen05_lookahead_stages
 from .cute_mma_dag_tcgen05 import tcgen05_persistent_ctas
@@ -788,4 +791,56 @@ class MmaDagSeedPlanner:
                         )
                     continue
             seeds.append(Config.from_dict(config))
+        attention = facts.attention
+        if attention is not None and spec.supports_config_key(self.occupancy_key):
+            from .paged_attention_config import paged_attention_config_reason
+            from .paged_attention_config import paged_attention_required_knobs
+
+            # A measured default is not implied by semantic recognition.
+            # Append the explicit topology after the ordinary seed ranking.
+            sizes = {
+                axis.block_id: 1 if axis.kind == AXIS_LEAD else axis.extent
+                for axis in facts.axes
+            }
+            for axis, extent in (
+                (attention.query_axis, attention.query_block),
+                (attention.key_axis, attention.key_width),
+                (attention.dimension_axis, attention.dimension),
+            ):
+                sizes[facts.axes[axis].block_id] = extent
+            block_sizes = list(default_sizes)
+            for block_id in block_ids:
+                if block_id in sizes:
+                    block_sizes[spec.block_sizes.block_id_to_index(block_id)] = sizes[
+                        block_id
+                    ]
+            for pass_warps in paged_attention_pass_warp_choices(facts):
+                occupancies = attention.min_blocks_per_mp_choices(
+                    scoped_registers=pass_warps == MMA_DAG_PASS_WARPS_ATTENTION_SCOPED
+                )
+                config = {
+                    **paged_attention_required_knobs(facts),
+                    "block_sizes": block_sizes,
+                    MMA_DAG_PASS_WARPS_KEY: pass_warps,
+                    self.occupancy_key: occupancies[0],
+                    "cute_pdl": False,
+                    "pid_type": "flat",
+                    "load_eviction_policies": [""] * eviction_length,
+                }
+                if (
+                    paged_attention_config_reason(facts, sizes, config) is None
+                    and mma_dag_config_reason(
+                        facts,
+                        sizes,
+                        attention.compute_warps,
+                        attention.raw_stages,
+                        MMA_DAG_TCGEN05,
+                        pass_warps=pass_warps,
+                    )
+                    is None
+                ):
+                    for occupancy in occupancies:
+                        seeds.append(
+                            Config.from_dict({**config, self.occupancy_key: occupancy})
+                        )
         return seeds

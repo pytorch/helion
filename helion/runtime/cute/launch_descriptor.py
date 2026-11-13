@@ -89,8 +89,10 @@ def wrapper_plan_bakes_tensor_shapes(plan: dict[str, object]) -> bool:
     """
     kind = str(plan.get("kind", ""))
     if kind in {
-        # The alias guard contributes no runtime-layout requirement;
-        # alias-only MMA plans may use guarded layout specialization.
+        # Paged attention uses the guarded shape/stride schema. The alias
+        # guard is shared by all MMA-DAG kernels and contributes no runtime-
+        # layout requirement; alias-only plans can therefore specialize too.
+        "helion_paged_attention",
         "helion_mma_dag_alias",
         "helion_small_biased_attention",
         "helion_flash_row_mma",
