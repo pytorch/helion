@@ -169,6 +169,28 @@ _OPMATH_SCALAR_TARGETS = {
 }
 
 
+def _value_input_occurrences(node: Node) -> list[Node]:
+    """Current operand occurrences, without post-lowering scheduler edges."""
+    inputs: list[Node] = []
+    map_arg(
+        (node.args, {**node.kwargs, "_extra_deps": None}),
+        lambda source: inputs.append(source),
+    )
+    return inputs
+
+
+def lowering_input_nodes(node: Node) -> list[Node]:
+    """Inductor input slots, or unique value operands for other lowerings.
+
+    Prepared slots remain distinct after CSE merges their source nodes.
+    Nodes without an InductorLowering have no named slots, including unprepared
+    nodes and AtenLowering/APIFuncLowering nodes; each source is listed once.
+    """
+    if isinstance(lowering := node.meta.get("lowering"), InductorLowering):
+        return lowering.input_nodes(node)
+    return list(dict.fromkeys(_value_input_occurrences(node)))
+
+
 def opmath_scalar_dtype(node: Node) -> torch.dtype | None:
     """The fp16/bf16 dtype of ``node`` when it combines a SymFloat or SymInt
     (a Python host scalar) with 16-bit tensors and torch computes it at
@@ -183,7 +205,13 @@ def opmath_scalar_dtype(node: Node) -> torch.dtype | None:
         for arg in node.args
     ):
         return None
-    tensors = InductorLowering.input_fake_tensors(node)
+    # Preparation may replace a stale lowering after an operand rewrite.
+    # Dtype promotion uses the current operands, never the previous slots.
+    tensors = [
+        value
+        for source in _value_input_occurrences(node)
+        if isinstance(value := source.meta["val"], torch.Tensor)
+    ]
     if not tensors:
         return None
     dtype = functools.reduce(torch.promote_types, [t.dtype for t in tensors])
@@ -387,12 +415,14 @@ def prepare_node_lowering(
         for inp_node in current_input_nodes:
             current_input_names.append(node_to_buf_name_mapping[inp_node])
 
-        used_input_names = strip_unused_inputs(
+        used_input_names, input_slots = strip_unused_inputs(
             new_node,
             buffer.get_read_names(),
             dict(zip(current_input_nodes, current_input_names, strict=True)),
         )
-        new_node.meta["lowering"] = lowering = lowering_cls(buffer, used_input_names)
+        new_node.meta["lowering"] = lowering = lowering_cls(
+            buffer, used_input_names, input_slots
+        )
         lowering.input_layouts = input_layouts
         new_node.meta["orig_node"] = node
         if isinstance(lowering, ReductionLowering):
@@ -423,10 +453,12 @@ def strip_unused_inputs(
     node: torch.fx.Node,
     used_input_names: OrderedSet[str],
     input_names: dict[torch.fx.Node, str],
-) -> list[str]:
+) -> tuple[list[str], tuple[int, ...]]:
     """
-    Remove unused inputs from the node.  Inplace updates node.args and
-    node.kwargs to replace unused inputs with None.
+    Replace unused inputs with None, retaining repeated used operands.
+
+    The FX arguments also describe the operation to semantic matchers. Their
+    multiplicity must survive even though Inductor names each input only once.
 
     Args:
         node: Node to mutate args of
@@ -434,21 +466,24 @@ def strip_unused_inputs(
         input_names: Mapping of node inputs to their names.
 
     Returns:
-        list[str]: List of names that were used in the lowering.
+        Used names and a lowering slot for each occurrence. Slots preserve the
+        input-name association if CSE later merges distinct nodes.
     """
 
     def mask_unused_inputs(n: torch.fx.Node) -> torch.fx.Node | None:
-        if (name := input_names[n]) in used_input_names and name not in seen_names:
-            seen_names.setdefault(name)
+        if (name := input_names[n]) in used_input_names:
+            slot = seen_names.setdefault(name, len(seen_names))
+            input_slots.append(slot)
             return n
         return None
 
     assert len(input_names) == len(node._input_nodes)
-    seen_names: dict[str, None] = {}
+    seen_names: dict[str, int] = {}
+    input_slots: list[int] = []
     node.args = map_arg(node.args, mask_unused_inputs)
     node.kwargs = map_arg(node.kwargs, mask_unused_inputs)
     assert len(seen_names) == len(used_input_names)
-    return [*seen_names]
+    return [*seen_names], tuple(input_slots)
 
 
 def create_extra_node(
@@ -503,10 +538,37 @@ def _unpack_symint(x: torch.SymInt | int) -> sympy.Expr:
 class InductorLowering(Lowering):
     buffer: ComputedBuffer
     input_names: list[str]
+    # Each occurrence retains its original lowering slot. Slots are numbered
+    # in first-seen order; CSE may merge them, but a repeated group cannot split.
+    input_slots: tuple[int, ...]
     # Size and stride of each node input the inner function loads, by name.
     input_layouts: dict[str, tuple[list[sympy.Expr], list[sympy.Expr]]] = (
         dataclasses.field(default_factory=dict)
     )
+
+    def input_nodes(self, node: torch.fx.Node) -> list[torch.fx.Node]:
+        """Value inputs aligned with lowering names, excluding scheduler edges."""
+        if node.op != "call_function":
+            # Rolled graph-boundary values can inherit a producer's metadata;
+            # they do not call that producer or consume its operand slots.
+            return []
+        inputs = _value_input_occurrences(node)
+        if len(inputs) != len(self.input_slots):
+            raise exc.InternalError(
+                AssertionError(
+                    f"{node.name}: lowered value inputs changed "
+                    f"({len(self.input_slots)} occurrences expected, {len(inputs)} found)"
+                )
+            )
+        values: list[torch.fx.Node] = []
+        for source, slot in zip(inputs, self.input_slots, strict=True):
+            if slot == len(values):
+                values.append(source)
+            elif source is not values[slot]:
+                raise exc.InternalError(
+                    AssertionError(f"{node.name}: repeated lowered value input changed")
+                )
+        return values
 
     def input_asts(self, ctx: LoweringContext, node: torch.fx.Node) -> list[ast.AST]:
         def visit(n: torch.fx.Node) -> None:
@@ -566,21 +628,17 @@ class InductorLowering(Lowering):
         )
         opmath_dtype = opmath_scalar_dtype(node)
         input_asts: list[ast.AST] = []
-        # _extra_deps should not be included in the inductor node inputs
-        map_arg((node.args, {**node.kwargs, "_extra_deps": None}), visit)
+        for source in self.input_nodes(node):
+            visit(source)
         assert len(input_asts) == len(self.input_names)
         return input_asts
 
-    @staticmethod
-    def input_fake_tensors(node: torch.fx.Node) -> list[torch.Tensor]:
-        def visit(n: torch.fx.Node) -> torch.fx.Node:
-            if isinstance(val := n.meta["val"], torch.Tensor):
-                result.append(val)
-            return n
-
-        result: list[torch.Tensor] = []
-        map_arg((node.args, node.kwargs), visit)
-        return result
+    def input_fake_tensors(self, node: torch.fx.Node) -> list[torch.Tensor]:
+        return [
+            val
+            for source in self.input_nodes(node)
+            if isinstance(val := source.meta["val"], torch.Tensor)
+        ]
 
     def codegen(self, ctx: LoweringContext, node: torch.fx.Node) -> object:
         raise NotImplementedError(
@@ -999,8 +1057,9 @@ class ReductionLowering(InductorLowering):
         self,
         buffer: ComputedBuffer,
         input_names: list[str],
+        input_slots: tuple[int, ...],
     ) -> None:
-        super().__init__(buffer, input_names)
+        super().__init__(buffer, input_names, input_slots)
         reduction = self.buffer.data
         assert isinstance(reduction, Reduction)
         reduction_ranges = reduction.reduction_ranges
@@ -1168,7 +1227,12 @@ class ReductionLowering(InductorLowering):
 
         dims = node.kwargs.get("dim", node.kwargs.get("dims"))
         if dims is None:
-            schema = node.meta["original_aten"]._schema
+            # Decomposition may change the overload (e.g. any.default into
+            # amax.default). Positional arguments belong to the actual FX target,
+            # while original_aten describes the user operation for diagnostics.
+            target = node.target
+            assert isinstance(target, torch._ops.OpOverload)
+            schema = target._schema
             assert isinstance(schema, torch._C.FunctionSchema)
             for index, arg in enumerate(schema.arguments):
                 if arg.name in {"dim", "dims"}:

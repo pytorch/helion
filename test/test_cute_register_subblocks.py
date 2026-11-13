@@ -211,7 +211,7 @@ def test_admits_varlen_forward_gram(l2norm: bool) -> None:
     assert program.zero_owned == frozenset()
     assert program.n_mode == "tiled"
     # the fused q row norm is one row reduction per tier (``q * q`` is
-    # ``mul(q, None)`` in the lowered IR); tiers 1-3 still merge into one
+    # ``mul(q, q)`` in the lowered IR); tiers 1-3 still merge into one
     # rolled unit
     assert [len(r) for r in _row_reductions(program)] == [int(l2norm)] * 4
     assert [run for run, _items in program.merged] == [(1, 2, 3)]
@@ -823,9 +823,8 @@ def test_identical_trips_are_distinct_writes() -> None:
 
 
 def test_repeated_operands() -> None:
-    # ``x * x`` is ``mul(x, None)`` in the lowered IR (``strip_unused_inputs``
-    # keeps the first occurrence of an input): the matcher restores the one
-    # other Node operand
+    # Repeated semantic operands retain their identity even though Inductor
+    # names the shared input only once.
     bound = _bind(_row_norm_dot, _small_args())
     program, reason = _program(bound)
     assert program is not None and reason is None
@@ -838,21 +837,17 @@ def test_repeated_operands() -> None:
     assert program is not None and reason is None
     body = _kernel_body(_source(bound, block_sizes=[16], **{KEY: "on"}))
     assert body.count("_helion_rsb.mma_tf32(") == 4 and "sel_ge_f32" in body
-    # the rule itself: the None of a lowered binary op is its other operand;
-    # several candidates, or a None on an unlowered node, decline
+    # A pruned value is not evidence for a repeated operand, with or without
+    # a prepared lowering. Both lowered and unlowered None values decline.
     graph = torch.fx.Graph()
     m = graph.placeholder("m")
     x = graph.placeholder("x")
-    mul = graph.call_function(torch.ops.aten.mul.Tensor, (x, None))
-    mul.meta["lowering"] = object()
-    assert family._Matcher.lowered_args(mul) == (x, x)
-    where = graph.call_function(torch.ops.aten.where.self, (m, x, None))
-    where.meta["lowering"] = object()
-    with pytest.raises(family._NotMine, match="ambiguous repeated operand"):
-        family._Matcher.lowered_args(where)
-    bare = graph.call_function(torch.ops.aten.mul.Tensor, (x, None))
-    with pytest.raises(family._NotMine, match="None operand"):
-        family._Matcher.lowered_args(bare)
+    for lowered in (False, True):
+        mul = graph.call_function(torch.ops.aten.mul.Tensor, (x, None))
+        if lowered:
+            mul.meta["lowering"] = object()
+        with pytest.raises(family._NotMine, match="None operand"):
+            family._Matcher.lowered_args(mul)
     plain = graph.call_function(torch.ops.aten.mul.Tensor, (x, m))
     assert family._Matcher.lowered_args(plain) == (x, m)
 

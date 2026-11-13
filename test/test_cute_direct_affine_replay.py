@@ -748,6 +748,25 @@ def test_feature_reduction_split_rejects_raw_fallback_and_name_capture() -> None
     )
 
 
+def test_feature_reduction_cannot_insert_cta_barriers_in_one_warp() -> None:
+    loop = _feature_reduction_loop()
+    marker = loop.body[2]
+    assert isinstance(marker, ast.Assign) and isinstance(marker.value, ast.Call)
+    marker.value.keywords.append(
+        ast.keyword(arg="owner_lane", value=ast.Constant("element"))
+    )
+    marker.value.args[0] = ast.Name(id="effect_value", ctx=ast.Load())
+    loop.body[2:2] = ast.parse(
+        "effect_value = _cute_inline_asm_elementwise((value,), "
+        "asm='mov.b32 $0, $1;', constraints='=f,f', "
+        "dtype=cutlass.Float32, is_pure=False, pack=1)"
+    ).body
+    assert (
+        emission_impl._split_feature_reduction_loop(loop, {}, "lane", frozenset())
+        is None
+    )
+
+
 def _value_replay(label: str, *roles: str) -> DirectAffineValueReplay:
     arguments = ", ".join(f"source_{role}" for role in roles)
     bindings = DirectAffineReplayBindings(

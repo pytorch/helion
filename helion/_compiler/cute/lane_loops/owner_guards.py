@@ -1098,14 +1098,36 @@ def _guard_stmt_with_owner(stmt: ast.AST, predicates: list[str]) -> ast.AST:
     )
 
 
+def _has_impure_inline_asm(stmt: ast.AST) -> bool:
+    """Recognize opaque assembly even when its result is an unused assignment.
+
+    CuTe emits ``is_pure`` as a literal Boolean keyword. Inspect nested
+    expressions too: a pure outer call does not make an impure argument pure.
+    """
+    for node in ast.walk(stmt):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_cute_inline_asm_elementwise"
+        ):
+            continue
+        purity = next(kw.value for kw in node.keywords if kw.arg == "is_pure")
+        assert isinstance(purity, ast.Constant) and type(purity.value) is bool
+        if not purity.value:
+            return True
+    return False
+
+
 def _has_side_effect(stmt: ast.AST) -> bool:
     """Return True when ``stmt`` produces an observable side effect (a store,
-    an in-place / atomic write, or any non-plain-assignment statement such as
+    an in-place / atomic write, impure assembly, or any non-plain-assignment such as
     an ``if mask: tensor[...].store(...)``)."""
     from ...ast_read_writes import ReadWrites
 
     if isinstance(stmt, ast.Assign):
-        return bool(ReadWrites.from_ast(stmt).inplace_writes)
+        return bool(ReadWrites.from_ast(stmt).inplace_writes) or _has_impure_inline_asm(
+            stmt
+        )
     # Conservatively treat structured / expression statements as
     # side-effecting (store calls live inside ``if`` blocks / bare exprs).
     return True

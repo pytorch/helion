@@ -19,7 +19,6 @@ import torch
 from torch._inductor.ir import Reduction
 from torch._inductor.virtualized import V
 from torch.fx import Node
-from torch.fx.node import map_arg
 
 from ... import exc
 from ...language import _tracing_ops
@@ -230,11 +229,7 @@ class FragmentCompiler(
 
     def pointwise(self, node: Node, values: dict[Node, object]) -> Fragment:
         lowering = cast("PointwiseLowering | ReductionLowering", node.meta["lowering"])
-        inputs: list[Node] = []
-        map_arg(
-            (node.args, {**node.kwargs, "_extra_deps": None}),
-            lambda x: inputs.append(x),
-        )
+        inputs = lowering.input_nodes(node)
         lookup: dict[str, tuple[Node, Fragment]] = {}
         for name, source in zip(lowering.input_names, inputs, strict=True):
             value = values[source]
@@ -2119,11 +2114,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             # Captured placeholders do not invoke their producer's inner function.
             if node.op != "call_function":
                 continue
-            inputs: list[Node] = []
-            map_arg(
-                (node.args, {**node.kwargs, "_extra_deps": None}),
-                inputs.append,
-            )
+            inputs = lowering.input_nodes(node)
             input_layouts = {
                 source: lowering.input_layouts[name]
                 for name, source in zip(lowering.input_names, inputs, strict=True)

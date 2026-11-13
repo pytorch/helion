@@ -36,6 +36,7 @@ from .compile_environment import FixedBlockSizeSource
 from .compile_environment import _has_unbacked
 from .compile_environment import _symint_free_symbols
 from .compile_environment import _symint_sympy_expr
+from .fx_side_effects import is_impure_node
 from .indexing_strategy import _contiguous_integer_tensor_index
 from .indexing_strategy import subscript_index_scale
 from .indexing_strategy import subscript_tile_info
@@ -230,7 +231,9 @@ def _may_access_memory_unseen(node: torch.fx.Node, state: CompilerState) -> bool
         return False
     # Peer views, and the local copies other ranks reach through theirs.
     symmetric = {*state.peer_views, *(v[0] for v in state.peer_views.values() if v)}
-    return (is_api_func(node.target) and node.is_impure(impure_random=False)) or any(
+    return (
+        is_api_func(node.target) and is_impure_node(node, impure_random=False)
+    ) or any(
         not symmetric.isdisjoint(state.ssa_storages(value))
         for arg in node.all_input_nodes
         if isinstance(value := arg.meta.get("val"), torch.Tensor)

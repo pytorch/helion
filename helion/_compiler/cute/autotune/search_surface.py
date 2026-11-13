@@ -2439,6 +2439,8 @@ def normalize_reduction_threads(
             for i, spec in enumerate(config_spec.reduction_loops):
                 if i >= len(new_loops):
                     break
+                if spec.persistent_reason is not None:
+                    continue
                 if new_loops[i] is None and spec.size_hint > available:
                     # When other_threads consumes the entire CuTe 1024 thread
                     # budget there is no thread budget left for the reduction

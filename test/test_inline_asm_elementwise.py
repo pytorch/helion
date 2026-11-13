@@ -39,6 +39,93 @@ _MUL_F32X2_ASM = """
 
 @onlyBackends(["triton", "cute"])
 class TestInlineAsmElementwise(RefEagerTestDisabled, TestCase):
+    def _check_discarded_impure_outputs(self, multiple_outputs: bool) -> None:
+        @helion.kernel(autotune_effort="none")
+        def kernel_discarded_impure(
+            x: torch.Tensor, addresses: torch.Tensor, multiple: hl.constexpr
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                value = x[tile]
+                address = addresses[tile]
+                if multiple:
+                    hl.inline_asm_elementwise(
+                        "atom.global.exch.b32 $0, [$2], $3; mov.b32 $1, $3;",
+                        "=r,=r,l,r",
+                        [address, value],
+                        dtype=(torch.int32, torch.int32),
+                        is_pure=False,
+                        pack=1,
+                    )
+                else:
+                    hl.inline_asm_elementwise(
+                        "atom.global.exch.b32 $0, [$1], $2;",
+                        "=r,l,r",
+                        [address, value],
+                        dtype=torch.int32,
+                        is_pure=False,
+                        pack=1,
+                    )
+                out[tile] = value + 9
+            return out
+
+        # Every physical lane has a valid pointer: use one complete tile, with
+        # no tail or masked address. Keep the pointed-to allocation alive until
+        # both the external effect and the ordinary output have been checked.
+        x = torch.arange(1, 129, dtype=torch.int32, device=DEVICE)
+        effects = torch.zeros_like(x)
+        addresses = (
+            torch.arange(128, dtype=torch.int64, device=DEVICE) * effects.element_size()
+            + effects.data_ptr()
+        )
+        code, out = code_and_output(
+            kernel_discarded_impure,
+            (x, addresses, multiple_outputs),
+            block_sizes=[128],
+            num_warps=4,
+        )
+        self.assertIn(_INLINE_ASM_CALL, code)
+        torch.testing.assert_close(out, x + 9)
+        # Exchange is idempotent: this proves retention and native execution,
+        # while the separate CPU tests check whether an effect is duplicated.
+        torch.testing.assert_close(effects, x)
+
+    @pytest.mark.skipif(DEVICE.type != "cuda", reason="inline assembly requires CUDA")
+    @skipIfRocm("PTX inline assembly requires CUDA")
+    @skipIfTileIR("TileIR does not support inline_asm_elementwise")
+    def test_inline_asm_discarded_impure_single_output(self):
+        self._check_discarded_impure_outputs(False)
+
+    @pytest.mark.skipif(DEVICE.type != "cuda", reason="inline assembly requires CUDA")
+    @skipIfRocm("PTX inline assembly requires CUDA")
+    @skipIfTileIR("TileIR does not support inline_asm_elementwise")
+    def test_inline_asm_discarded_impure_multiple_outputs(self):
+        self._check_discarded_impure_outputs(True)
+
+    @pytest.mark.skipif(DEVICE.type != "cuda", reason="inline assembly requires CUDA")
+    @skipIfRocm("PTX inline assembly requires CUDA")
+    @skipIfTileIR("TileIR does not support inline_asm_elementwise")
+    def test_inline_asm_single_element_output_tuple(self):
+        @helion.kernel(autotune_effort="none")
+        def kernel_singleton_tuple(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                (value,) = hl.inline_asm_elementwise(
+                    "add.u32 $0, $1, 7;",
+                    "=r,r",
+                    [x[tile]],
+                    dtype=(torch.int32,),
+                    is_pure=False,
+                    pack=1,
+                )
+                out[tile] = value
+            return out
+
+        x = torch.arange(32, dtype=torch.int32, device=DEVICE)
+        code, out = code_and_output(kernel_singleton_tuple, (x,))
+        self.assertIn(_INLINE_ASM_CALL, code)
+        torch.testing.assert_close(out, x + 7)
+
     @pytest.mark.skipif(
         DEVICE.type != "cuda", reason="inline_asm_elementwise is only supported on CUDA"
     )

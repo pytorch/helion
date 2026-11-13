@@ -211,6 +211,19 @@ def test_row_reduction_respects_required_persistence_and_row_floor() -> None:
     assert not TileIRRowReductionHeuristic.is_eligible(_env(spec), SimpleNamespace())
 
 
+def test_row_reduction_seed_normalizes_required_persistent_slot() -> None:
+    spec = _reduction_spec()
+    spec.reduction_loops[0].persistent_reason = "complete ownership"
+    seeds = TileIRRowReductionHeuristic.get_seed_configs(_env(spec), SimpleNamespace())
+    assert seeds
+    assert all(seed.reduction_loops == [None] for seed in seeds)
+    generation = spec.create_config_generation()
+    assert all(generation.unflatten(generation.flatten(seed)) == seed for seed in seeds)
+    legacy = helion.Config(block_sizes=[1], reduction_loops=[4096])
+    spec.normalize(legacy)
+    assert legacy.reduction_loops == [None]
+
+
 def test_small_reduction_batches_independent_groups() -> None:
     spec = _reduction_spec(width=32)
     spec.reduction_loops.clear()

@@ -7,6 +7,7 @@ import torch
 from torch.fx import map_arg
 
 from ..language import _MEMORY_OPS
+from ..language import _tracing_ops
 from ..language import atomic_add
 from ..language import atomic_and
 from ..language import atomic_cas
@@ -32,9 +33,12 @@ from ..language.view_ops import join as hl_join
 from ..language.view_ops import split as hl_split
 from .aten_lowering import aten_lowering_dispatch
 from .compile_environment import CompileEnvironment
+from .fx_side_effects import is_impure_node
 from .host_function import HostFunction
 from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import ReductionLowering
+from .runtime_tensor_guards import register_tensor_alias_specializations
+from .runtime_tensor_guards import tensors_have_proven_disjoint_storage
 
 if TYPE_CHECKING:
     from .compile_environment import BlockSizeInfo
@@ -67,6 +71,10 @@ _ATOMIC_OPS: tuple[object, ...] = (
 FREE_IOTA_REDUCTION_META = "helion_free_iota_reduction"
 
 
+class EffectfulReductionReplay(NotImplementedError):
+    """Rolling needs to replay a volatile value or cross an opaque effect."""
+
+
 class ReductionRoller:
     """This does the opposite of unrolling, it takes persistent reductions and turns them into looped reductions."""
 
@@ -76,11 +84,14 @@ class ReductionRoller:
         rdim: BlockSizeInfo,
         graph_id_to_info: dict[int, RolledReductionInfo],
         enable_fusion: bool = False,
+        *,
+        allow_unbound_alias_facts: bool = False,
     ) -> None:
         self.device_ir = device_ir
         self.rdim = rdim
         self.graph_id_to_info = graph_id_to_info
         self.enable_fusion = enable_fusion
+        self.allow_unbound_alias_facts = allow_unbound_alias_facts
         # inner graph contains ops on the reduction dimension
         self.inner_args: list[torch.fx.Node] = []
         self.inner_graph: torch.fx.Graph = torch.fx.Graph()
@@ -95,6 +106,97 @@ class ReductionRoller:
         self.available: set[torch.fx.Node] = set()
         self.graphs_added: list[int] = []
         self._size_node: torch.fx.Node | None = None
+        self._node_positions: dict[torch.fx.Node, int] = {}
+        self._effects_seen: list[torch.fx.Node] = []
+        self._effect_cache: dict[torch.fx.Node, bool] = {}
+        self._memory_read_cache: dict[torch.fx.Node, bool] = {}
+        self._inner_has_effect = False
+        self._replayed_reads: set[torch.fx.Node] = set()
+        self._replay_error: EffectfulReductionReplay | None = None
+
+    def _record_replay_error(self, message: str) -> None:
+        # Finish the structural analysis so saved config slots retain their
+        # graph ownership. process() must still fail before returning a graph;
+        # these unsafe analysis copies can never be used for emitted code.
+        if self._replay_error is None:
+            self._replay_error = EffectfulReductionReplay(message)
+
+    def _nested_nodes(self, node: torch.fx.Node) -> list[torch.fx.Node]:
+        # DeviceIR imports the roller, so resolve its graph-edge helper lazily.
+        from .device_ir import control_flow_child_graph_ids
+
+        return [
+            child
+            for graph_id in control_flow_child_graph_ids(node)
+            for child in self.device_ir.graphs[graph_id].graph.nodes
+        ]
+
+    def _has_effect(self, node: torch.fx.Node) -> bool:
+        if node not in self._effect_cache:
+            self._effect_cache[node] = self._compute_has_effect(node)
+        return self._effect_cache[node]
+
+    def _compute_has_effect(self, node: torch.fx.Node) -> bool:
+        if node.op != "call_function":
+            return False
+        if node.target in (_tracing_ops._phi, _tracing_ops._new_var):
+            return False
+        if children := self._nested_nodes(node):
+            # Control-flow markers are impure for DCE, not intrinsically
+            # volatile. Pure loop-carried computations may be replayed.
+            return any(self._has_effect(child) for child in children)
+        return is_impure_node(node)
+
+    def _reads_memory(self, node: torch.fx.Node) -> bool:
+        if node not in self._memory_read_cache:
+            self._memory_read_cache[node] = node.target is load or any(
+                self._reads_memory(child) for child in self._nested_nodes(node)
+            )
+        return self._memory_read_cache[node]
+
+    def _effect_may_change_read(
+        self, effect: torch.fx.Node, read: torch.fx.Node
+    ) -> bool:
+        if children := self._nested_nodes(effect):
+            return any(
+                self._effect_may_change_read(child, read)
+                for child in children
+                if self._has_effect(child)
+            )
+        if children := self._nested_nodes(read):
+            return any(
+                self._effect_may_change_read(effect, child)
+                for child in children
+                if self._reads_memory(child)
+            )
+        if effect.target not in (store, *_ATOMIC_OPS) or read.target is not load:
+            return True
+        written, loaded = effect.args[0], read.args[0]
+        if not isinstance(written, torch.fx.Node) or not isinstance(
+            loaded, torch.fx.Node
+        ):
+            return True
+        destination, source = written.meta.get("val"), loaded.meta.get("val")
+        if not isinstance(destination, torch.Tensor) or not isinstance(
+            source, torch.Tensor
+        ):
+            return True
+        env = CompileEnvironment.current()
+        if all(
+            env.tensor_storage_input_source(tensor) is not None
+            for tensor in (destination, source)
+        ):
+            # Record negative facts too: a later call with disjoint storage
+            # must be able to select a rolled binding instead of this one.
+            register_tensor_alias_specializations(env)
+        # During binding the registered classifier supplies the initial fact;
+        # codegen checks the immutable fact saved in the dispatch key.
+        return not tensors_have_proven_disjoint_storage(
+            env,
+            destination,
+            source,
+            allow_unbound=self.allow_unbound_alias_facts,
+        )
 
     def is_reduction(self, node: torch.fx.Node) -> bool:
         """Check if a node is a reduction"""
@@ -372,6 +474,8 @@ class ReductionRoller:
         self.inner_nodes = {}
         self.inner_count = 0
         self.inner_available = set()
+        self._inner_has_effect = False
+        self._replayed_reads = set()
 
         def readd(node: torch.fx.Node) -> None:
             if (
@@ -383,6 +487,24 @@ class ReductionRoller:
             if node.op == "placeholder":
                 self.get_inner_arg(node)
                 return
+            if self._has_effect(node):
+                # A value used on both sides of a reduction would be recomputed
+                # in the next sweep. Opaque effects and volatile results cannot
+                # be replayed; keep this reduction persistent instead.
+                self._record_replay_error(
+                    "reduction sweeps cannot duplicate an effectful producer"
+                )
+            if self._reads_memory(node) and any(
+                self._node_positions[node] < self._node_positions[effect]
+                and self._effect_may_change_read(effect, node)
+                for effect in self._effects_seen
+            ):
+                # Even a discarded assembly result can overwrite an earlier
+                # load's storage. Replaying that load would combine the new
+                # memory value with a reduction of the original value.
+                self._record_replay_error(
+                    "reduction sweeps cannot reload memory across an effect"
+                )
             for n in node.all_input_nodes:
                 readd(n)
             new_node = self.inner_graph.create_node(
@@ -393,6 +515,8 @@ class ReductionRoller:
             )
             new_node.meta.update(node.meta)
             self.inner_nodes[node] = new_node
+            if self._reads_memory(node):
+                self._replayed_reads.add(node)
 
         # re-add any nodes that still have pending users
         for node in inner_nodes:
@@ -669,7 +793,7 @@ class ReductionRoller:
                     return False
                 origin = HostFunction.current().tensor_to_origin.get(val)
                 return origin is not None and not origin.is_argument()
-            return not (node.is_impure() or node.target is load)
+            return not (is_impure_node(node) or node.target is load)
 
         order: list[torch.fx.Node] = []
         deferred: list[torch.fx.Node] = []
@@ -690,7 +814,7 @@ class ReductionRoller:
                 deferred_set.add(node)
                 continue
             if deferred:
-                if node.op != "call_function" or node.is_impure():
+                if node.op != "call_function" or is_impure_node(node):
                     flush_through(len(deferred) - 1)
                 else:
                     is_load = node.target is load
@@ -712,8 +836,16 @@ class ReductionRoller:
         return order
 
     def process(self, graph: torch.fx.Graph) -> torch.fx.Graph:
-        nodes = self._reorder_for_fusion(graph) if self.enable_fusion else graph.nodes
+        nodes = list(
+            self._reorder_for_fusion(graph) if self.enable_fusion else graph.nodes
+        )
+        self._node_positions = {node: i for i, node in enumerate(nodes)}
         for node in nodes:
+            has_effect = self._has_effect(node)
+            if has_effect:
+                # Include the current outer effect: flushing a producer before
+                # it must not prepare a replay that will execute after it.
+                self._effects_seen.append(node)
             if self.should_go_in_inner_graph(node):
                 if not all(
                     (n in self.available or n in self.inner_available)
@@ -729,15 +861,28 @@ class ReductionRoller:
                 new_node.meta.update(node.meta)
                 self.inner_nodes[node] = new_node
                 self.inner_count += self.is_nontrivial(node)
+                self._inner_has_effect |= has_effect
                 if not self.is_reduction(node):
                     self.inner_available.add(node)
             else:
                 if (
                     not all((n in self.available) for n in node.all_input_nodes)
                     or node.op == "output"
-                    or (node.is_impure() and self.inner_count > 0)
+                    or (is_impure_node(node) and self.inner_count > 0)
+                    or (self._reads_memory(node) and self._inner_has_effect)
                 ):
                     self.start_new_graph()
+                if has_effect and any(
+                    self._effect_may_change_read(node, read)
+                    for read in self._replayed_reads
+                ):
+                    # A previous flush may already have queued loads for the
+                    # next sweep, without increasing inner_count. This effect
+                    # will execute before those loads even when there is no
+                    # new graph to flush yet.
+                    self._record_replay_error(
+                        "reduction sweeps cannot reload memory across an effect"
+                    )
                 new_node = self.outer_graph.create_node(
                     node.op,
                     node.target,
@@ -749,6 +894,8 @@ class ReductionRoller:
                 self.outer_count += self.is_nontrivial(node)
                 self.available.add(node)
             self.seen.add(node)
+        if self._replay_error is not None:
+            raise self._replay_error
         return self.outer_graph
 
     def is_nontrivial(self, node: torch.fx.Node) -> bool:

@@ -306,9 +306,7 @@ class TileStrategyDispatch:
             and bs.block_id not in inactive_aliases
             and (active_block_ids is None or bs.block_id in active_block_ids)
         ]
-        reduction_loop_block_ids = set(
-            env.config_spec.reduction_loops.valid_block_ids()
-        )
+        reduction_loop_block_ids = env.config_spec.rollable_reduction_block_ids()
         for block_id in rdims:
             reduction_loop = env.config_spec.reduction_loops.config_get(
                 config.reduction_loops, block_id, None

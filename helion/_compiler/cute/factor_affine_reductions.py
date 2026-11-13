@@ -42,6 +42,7 @@ from ..ast_extension import clone_ast
 from ..ast_extension import create
 from ..ast_extension import expr_from_string
 from ..ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
+from ..fx_side_effects import is_impure_node
 from ._ast_pass_utils import assigned_name
 from ._ast_pass_utils import call_path_str
 from ._ast_pass_utils import loop_extent
@@ -485,7 +486,7 @@ def factor_affine_reductions(graph: torch.fx.Graph, *, fast_math: bool) -> int:
         if _rewrite_sum(graph, node):
             changed += 1
     if changed:
-        graph.eliminate_dead_code()
+        graph.eliminate_dead_code(is_impure_node=is_impure_node)
         graph.lint()
     return changed
 

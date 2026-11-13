@@ -2800,6 +2800,48 @@ def _rewrite_scratch_init_for_pre_broadcast(
     stmts.append(replacement)
 
 
+def _tile_pre_broadcast_inputs(
+    graph: torch.fx.Graph,
+    consumer: torch.fx.Node,
+    is_pre_broadcast: Callable[[torch.fx.Node], bool],
+    new_nodes: list[torch.fx.Node],
+) -> None:
+    """Adapt each selected source once per consumer, preserving repeated inputs."""
+    if consumer.op != "call_function" or is_pre_broadcast(consumer):
+        return
+    value = consumer.meta.get("val")
+    if not isinstance(value, torch.Tensor) or len(value.shape) < 2:
+        return
+    width = value.shape[-1]
+    if not isinstance(width, torch.SymInt) and int(width) == PRE_BROADCAST_SIZE:
+        return
+    args = list(consumer.args)
+    tiled_inputs: dict[torch.fx.Node, torch.fx.Node] = {}
+    for index, arg in enumerate(args):
+        if not isinstance(arg, torch.fx.Node) or not is_pre_broadcast(arg):
+            continue
+        arg_value = arg.meta.get("val")
+        if not isinstance(arg_value, torch.Tensor):
+            continue
+        if not (
+            isinstance(arg_value.shape[-1], int)
+            and arg_value.shape[-1] == PRE_BROADCAST_SIZE
+        ):
+            continue
+        if arg not in tiled_inputs:
+            with graph.inserting_before(consumer):
+                tiled = graph.call_function(_pre_broadcast_tile, args=(arg, width))
+            tiled.meta = {
+                **arg.meta,
+                "val": arg_value.new_empty([*arg_value.shape[:-1], width]),
+            }
+            new_nodes.append(tiled)
+            tiled_inputs[arg] = tiled
+        args[index] = tiled_inputs[arg]
+    if tiled_inputs:
+        consumer.args = tuple(args)
+
+
 def _rewrite_outer_subscripts_for_pre_broadcast(
     for_loop_node: torch.fx.Node | None,
     candidates: dict[int, torch.fx.Node],
@@ -2922,44 +2964,12 @@ def _rewrite_outer_subscripts_for_pre_broadcast(
 
     new_nodes: list[torch.fx.Node] = []
     for node in list(outer_graph.nodes):
-        if node.op != "call_function" or node.name in all_pre_broadcast_outer:
-            continue
-        node_val = node.meta.get("val", None)
-        if not isinstance(node_val, torch.Tensor) or len(node_val.shape) < 2:
-            continue
-        last_dim = node_val.shape[-1]
-        last_dim_is_sym = isinstance(last_dim, torch.SymInt)
-        if not last_dim_is_sym and int(last_dim) == PRE_BROADCAST_SIZE:
-            continue
-        args_list = list(node.args)
-        changed = False
-        for ai, arg in enumerate(args_list):
-            if not isinstance(arg, torch.fx.Node):
-                continue
-            if arg.name not in all_pre_broadcast_outer:
-                continue
-            arg_val = arg.meta.get("val", None)
-            if not isinstance(arg_val, torch.Tensor):
-                continue
-            if not (
-                isinstance(arg_val.shape[-1], int)
-                and arg_val.shape[-1] == PRE_BROADCAST_SIZE
-            ):
-                continue
-            with outer_graph.inserting_before(node):
-                tiled = outer_graph.call_function(
-                    _pre_broadcast_tile,
-                    args=(arg, last_dim),
-                )
-            tiled.meta = {
-                **arg.meta,
-                "val": arg_val.new_empty([*arg_val.shape[:-1], last_dim]),
-            }
-            new_nodes.append(tiled)
-            args_list[ai] = tiled
-            changed = True
-        if changed:
-            node.args = tuple(args_list)
+        _tile_pre_broadcast_inputs(
+            outer_graph,
+            node,
+            lambda arg: arg.name in all_pre_broadcast_outer,
+            new_nodes,
+        )
 
     # Re-prepare lowerings for modified outer nodes
     all_to_prepare = reshaped + new_nodes
@@ -3040,44 +3050,9 @@ def _annotate_pre_broadcast(
 
     # --- Step 3: insert _pre_broadcast_tile where pre-broadcast values feed wider-dim ops ---
     for node in list(graph.nodes):
-        if node.op != "call_function" or node.name in pre_broadcast_nodes:
-            continue
-        node_val = _node_val(node)
-        if node_val is None or len(node_val.shape) < 2:
-            continue
-        last_dim = node_val.shape[-1]
-        last_dim_is_sym = isinstance(last_dim, torch.SymInt)
-        if not last_dim_is_sym and int(last_dim) == PRE_BROADCAST_SIZE:
-            continue
-        args_list = list(node.args)
-        changed = False
-        for ai, arg in enumerate(args_list):
-            if not isinstance(arg, torch.fx.Node):
-                continue
-            if arg.name not in pre_broadcast_nodes:
-                continue
-            arg_val = _node_val(arg)
-            if arg_val is None:
-                continue
-            if not (
-                isinstance(arg_val.shape[-1], int)
-                and arg_val.shape[-1] == PRE_BROADCAST_SIZE
-            ):
-                continue
-            with graph.inserting_before(node):
-                tiled = graph.call_function(
-                    _pre_broadcast_tile,
-                    args=(arg, last_dim),
-                )
-            tiled.meta = {
-                **arg.meta,
-                "val": arg_val.new_empty([*arg_val.shape[:-1], last_dim]),
-            }
-            new_nodes.append(tiled)
-            args_list[ai] = tiled
-            changed = True
-        if changed:
-            node.args = tuple(args_list)
+        _tile_pre_broadcast_inputs(
+            graph, node, lambda arg: arg.name in pre_broadcast_nodes, new_nodes
+        )
 
     # --- Step 4: insert unsqueeze for lower-rank non-pre-broadcast values ---
     # Reductions produce rank R-1. Pre-broadcast nodes now have rank R+1

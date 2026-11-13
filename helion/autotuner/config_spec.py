@@ -1456,6 +1456,14 @@ class ConfigSpec:
                 f"Backend {self.backend_name!r} returned unknown tunables: {sorted(unknown_tunables)!r}"
             )
 
+    def rollable_reduction_block_ids(self) -> set[int]:
+        """Axes that may roll, without changing legacy reduction-loop slots."""
+        return {
+            spec.block_id
+            for spec in self.reduction_loops
+            if spec.persistent_reason is None
+        }
+
     @property
     def compiler_coverage_groups(self) -> tuple[CompilerCoverageGroup, ...]:
         return self._compiler_coverage_groups
@@ -2084,9 +2092,12 @@ class ConfigSpec:
             if isinstance(reduction_loops, list):
                 new_loops = list(reduction_loops)
                 changed = False
+                rollable_ids = self.rollable_reduction_block_ids()
                 for i, spec in enumerate(self.reduction_loops):
                     if i >= len(new_loops):
                         break
+                    if spec.block_id not in rollable_ids:
+                        continue
                     block_threshold, max_chunk = spec._limits(self)
                     if block_threshold is None:
                         continue
@@ -3537,17 +3548,23 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         size_hint: int,
         allow_non_power_of_two: bool = False,
         allow_full_extent: bool = False,
+        persistent_reason: str | None = None,
     ) -> None:
         super().__init__([block_id])
         self.size_hint = size_hint
         self.allow_non_power_of_two = allow_non_power_of_two
         self.allow_full_extent = allow_full_extent
+        self.persistent_reason = persistent_reason
 
     def _full_extent_chunk(self) -> int | None:
         # A padded single iteration can preserve vector packets where an exact
         # non-power-of-two chunk leaves too few elements per thread. Keep it
         # distinct from persistent None, just like an exact full-width chunk.
-        if self.allow_full_extent and self.size_hint >= 8:
+        if (
+            self.persistent_reason is None
+            and self.allow_full_extent
+            and self.size_hint >= 8
+        ):
             return next_power_of_2(self.size_hint)
         return None
 
@@ -3566,6 +3583,9 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         # - flatten: Config value -> flat integer via _encode_flat_value()
         low = 8  # TODO(jansel): is smaller needed?
         high = next_power_of_2(max(low, self.size_hint))
+        if self.persistent_reason is not None:
+            # Keep the saved-config slot but remove unsafe chunks from search.
+            return BlockSizeFragment(high, high, high)
         default = min(high, 4096)
         # Cap default at the backend's max reduction loop so that
         # large reductions default to looped rather than persistent.
@@ -3615,6 +3635,8 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         # round-trip None into a slow looped config (e.g. size_hint=32000 ->
         # default 4096 -> reduction_loops=[4096]).
         # The backend may repair search/cache/seed budgets before decoding.
+        if self.persistent_reason is not None:
+            return self._flat_fragment(base).high
         value = base.search_surface.explicit_reduction_chunk(base, self, value)
         if value is None:
             return self._flat_fragment(base).high
@@ -3637,6 +3659,14 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
             normalized = value
         else:
             normalized = super()._normalize(name, value)
+        if self.persistent_reason is not None:
+            log.warning(
+                "%s=%s uses a persistent reduction instead: %s",
+                name,
+                normalized,
+                self.persistent_reason,
+            )
+            return None
         # A looped chunk of 1 is degenerate: "hold the whole axis" is encoded as
         # ``None`` (persistent), not 1, and ``LoopedReductionStrategy`` rejects a
         # block size <= 1.  The autotuner search never proposes < 8 (its fragment

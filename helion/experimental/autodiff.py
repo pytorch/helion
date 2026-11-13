@@ -29,6 +29,7 @@ from torch.fx.node import Node
 from torch.fx.node import map_arg
 
 from .. import exc
+from .._compiler.fx_side_effects import is_impure_node
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -47,6 +48,25 @@ if TYPE_CHECKING:
 # AOT-autograd compilation, which has internal mutable state that is not
 # thread-safe.
 _backward_cache_lock: threading.Lock = threading.Lock()
+
+
+def _validate_required_tensor_arguments(
+    target: object, args: tuple[object, ...], kwargs: Mapping[str, object]
+) -> None:
+    if not isinstance(target, torch._ops.OpOverload):
+        return
+    for index, argument in enumerate(target._schema.arguments):
+        if index < len(args):
+            value = args[index]
+        elif argument.name in kwargs:
+            value = kwargs[argument.name]
+        else:
+            continue
+        if value is None and isinstance(argument.type, torch.TensorType):
+            raise exc.AutodiffNotSupported(
+                f"{target}: required Tensor argument {argument.name} "
+                "was pruned by lowering"
+            )
 
 
 @dataclass
@@ -268,10 +288,8 @@ class GraphAnalyzer:
 
             elif target_name == "dot":
                 # Lower hl.dot -> a rank-appropriate aten matmul, mirroring the
-                # scan-path lowering. Crucially this consumes only the two operand
-                # args, so hl.dot's `acc=None`/`out_dtype=None` defaults never
-                # reach the None-coalescing fixup below (which would otherwise
-                # replace `out_dtype=None` with a tensor and break AOT diff).
+                # scan-path lowering. Consume only the two operands; hl.dot's
+                # optional out_dtype/acc arguments are not aten matmul inputs.
                 a0, a1 = node.args[0], node.args[1]
                 assert isinstance(a0, Node) and isinstance(a1, Node)
                 lhs = node_map[a0]
@@ -315,14 +333,10 @@ class GraphAnalyzer:
                 node_map[node] = new_node
 
             elif target_name != "_host_tensor":
-                # Restore None placeholders from strip_unused_inputs (duplicate
-                # arg coalescing) and reinject `_extra_args` kwargs.
-                # Inject extra_args FIRST: the first_node_arg fill consumes all
-                # Nones and leaves no slots for extra_args injection.  Order:
-                # 1. fill known extra_args into their specific None slots
-                # 2. fill any remaining Nones with first_node_arg (strip_unused
-                #    coalescing always uses the first non-None node arg as a
-                #    placeholder for the duplicated arg)
+                # Preserve the legacy multi-buffer convention: _extra_args
+                # fills positional None holes. It does not identify original
+                # schema slots or distinguish optional None from pruned inputs.
+                # Repeated semantic operands already remain in node.args.
                 args = node.args
                 kwargs = dict(node.kwargs)
                 extra_args = kwargs.pop("_extra_args", None)
@@ -337,11 +351,7 @@ class GraphAnalyzer:
                             extra_idx += 1
                     args = tuple(args_list)
 
-                # After extra_args injection, fill any remaining Nones caused
-                # by strip_unused_inputs coalescing with first_node_arg.
-                first_node_arg = next((a for a in args if isinstance(a, Node)), None)
-                if first_node_arg is not None:
-                    args = tuple(first_node_arg if a is None else a for a in args)
+                _validate_required_tensor_arguments(target, args, kwargs)
 
                 _assert_all_mapped(node, args, kwargs, node_map)
                 new_args = map_arg(args, node_map.get)
@@ -1536,6 +1546,7 @@ class GraphAnalyzer:
             else a
             for a in n.args
         )
+        _validate_required_tensor_arguments(n.target, args, n.kwargs)
         new_args = map_arg(args, sub_node_map.get)  # pyrefly: ignore [bad-specialization]
         new_kwargs = map_arg(dict(n.kwargs), sub_node_map.get)
         if n.target in matmul_ops:
@@ -2942,7 +2953,7 @@ def differentiate_graph(
         if _rewrite_reverse_cumsum(gm.graph):
             # Drop the now-orphaned rev/cumsum nodes the rewrite left behind so
             # they aren't emitted as dead `torch.flip`/`torch.cumsum` lines.
-            gm.graph.eliminate_dead_code()
+            gm.graph.eliminate_dead_code(is_impure_node=is_impure_node)
         gm.recompile()
         backward_graph = gm.graph
         if bw_module_holder is not None:

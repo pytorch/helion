@@ -19,6 +19,7 @@ from typing import cast
 import torch
 
 from ...language.inline_asm_ops import inline_asm_elementwise
+from ..fx_side_effects import is_impure_node
 
 _Value = int | torch.fx.Node
 _MASK16 = (1 << 16) - 1
@@ -232,6 +233,6 @@ def fuse_u32_multiply(graph: torch.fx.Graph) -> int:
             continue
         changed += 1
     if changed:
-        graph.eliminate_dead_code()
+        graph.eliminate_dead_code(is_impure_node=is_impure_node)
         graph.lint()
     return changed
