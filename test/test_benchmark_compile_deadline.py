@@ -354,7 +354,9 @@ def _provider(
     provider.settings = Settings(
         autotune_log_level=logging.CRITICAL,
         autotune_accuracy_check=False,
-        **settings,  # pyrefly: ignore[bad-argument-type]
+        # Pinned: the default is higher in fbcode, and the worker's compile
+        # deadline never goes below it.
+        **{"autotune_benchmark_timeout": 30, **settings},  # pyrefly: ignore[bad-argument-type]
     )
     provider.config_spec = SimpleNamespace(
         compiler_seed_timeout_retry_repetitions=retry_repetitions
