@@ -1754,6 +1754,36 @@ class TestStaticInnerLoopWorklist(unittest.TestCase):
         with self.assertRaisesRegex(exc.InvalidConfig, "multiple of the sublane 16"):
             self._bound().to_triton_code(_worklist_config([8, 256, 128]))
 
+    def test_buffer_counts_reach_the_launcher(self):
+        bound = self._bound()
+        config = helion.Config(
+            block_sizes=[32, 256, 128],
+            pallas_loop_type="unroll",
+            pallas_worklist_grouping=1,
+            pallas_worklist_buffer_count=[3, 4, 2],
+        )
+        code = bound.to_triton_code(config)
+        args, kwargs = self._launcher_call(code)
+        self.assertEqual(
+            ast.literal_eval(kwargs["_compact_buffer_counts"]),
+            {args.index("lhs"): 3, args.index("rhs"): 4},
+        )
+        default = bound.to_triton_code(_worklist_config([32, 256, 128]))
+        self.assertNotIn("_compact_buffer_counts", default)
+
+    @staticmethod
+    def _launcher_call(code):
+        """The tensor args (as source) and keywords of the ``_launcher`` call."""
+        (call,) = [
+            node
+            for node in ast.walk(ast.parse(code))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_launcher"
+        ]
+        args = [ast.unparse(arg) for arg in call.args[2:]]  # after kernel, grid
+        return args, {kw.arg: kw.value for kw in call.keywords}
+
 
 @skipUnlessPallas("compact worklist numerics need Pallas TPU")
 class TestStaticInnerLoopNumerics(unittest.TestCase):
@@ -1764,7 +1794,7 @@ class TestStaticInnerLoopNumerics(unittest.TestCase):
     the reference's.
     """
 
-    def _check(self, lengths, *, extra_rows=0):
+    def _check(self, lengths, *, extra_rows=0, buffer_counts=None):
         offsets = _offsets(lengths)
         total = int(offsets[-1])
         torch.manual_seed(0)
@@ -1774,9 +1804,10 @@ class TestStaticInnerLoopNumerics(unittest.TestCase):
         args = (lhs.to(DEVICE), rhs.to(DEVICE), offsets.to(DEVICE))
         for block in (16, 32):
             with self.subTest(block=block):
-                code, out = code_and_output(
-                    _grouped_gemm_kernel, args, **_worklist_config([block, 256, 128])
-                )
+                config = dict(_worklist_config([block, 256, 128]))
+                if buffer_counts is not None:
+                    config["pallas_worklist_buffer_count"] = buffer_counts
+                code, out = code_and_output(_grouped_gemm_kernel, args, **config)
                 self.assertIn("_compact_fill_worklist=_fill_worklist", code)
                 torch.testing.assert_close(out[:total].cpu(), ref, rtol=2e-2, atol=2e-2)
 
@@ -1792,6 +1823,9 @@ class TestStaticInnerLoopNumerics(unittest.TestCase):
 
     def test_rows_past_the_last_offset(self):
         self._check([5, 0, 20, 7], extra_rows=19)
+
+    def test_buffer_counts(self):
+        self._check([5, 40, 3, 30, 70], buffer_counts=[3, 4, 2])
 
 
 @skipUnlessPallas("fill_owner_tiles writes SMEM refs inside a Pallas kernel")
@@ -3675,10 +3709,10 @@ class TestCompactWindowSpec(unittest.TestCase):
         num_work = jnp.asarray([4], jnp.int32)
         t = torch.zeros(rows, 8)
         load = _compact_aligned_window_block_spec(
-            t, block, sublane, starts, extents, None
+            t, block, sublane, starts, extents, None, 2
         )
         store = _compact_aligned_window_block_spec(
-            t, block, sublane, starts, extents, num_work
+            t, block, sublane, starts, extents, num_work, 2
         )
         stored = []
         for wid in range(4):

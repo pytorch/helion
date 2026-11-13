@@ -165,6 +165,7 @@ _BASE_VALID_KEYS = """
     pallas_emit_pipeline_group_size pallas_fold_dot_lhs_cast
     pallas_indirect_access_mode pallas_internal_scratch pallas_load_buffer_count
     pallas_loop_type pallas_pre_broadcast pallas_use_low_level_scheduler
+    pallas_worklist_buffer_count
     pallas_worklist_grouping pid_type prefetch_indexing range_flattens
     range_multi_buffers range_num_stages range_unroll_factors
     range_warp_specializes reduction_fusion
@@ -333,7 +334,8 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     metal_tabulate_max_entries num_ctas num_threads occupancy
     pallas_emit_pipeline_group_size pallas_fold_dot_lhs_cast
     pallas_indirect_access_mode pallas_load_buffer_count pallas_loop_type
-    pallas_pre_broadcast pallas_use_low_level_scheduler pallas_worklist_grouping
+    pallas_pre_broadcast pallas_use_low_level_scheduler
+    pallas_worklist_buffer_count pallas_worklist_grouping
     prefetch_indexing store_cache_modifiers tcgen05_ab_stages
     tcgen05_ab_startup_prefill tcgen05_acc_stages tcgen05_acc_wait_placement
     tcgen05_aux_fragment_hoist
@@ -635,7 +637,8 @@ _BASE_PALLAS_ACCEPTED = """
     block_sizes flatten_loops loop_orders pallas_emit_pipeline_group_size
     pallas_fold_dot_lhs_cast pallas_indirect_access_mode pallas_internal_scratch
     pallas_load_buffer_count pallas_loop_type pallas_pre_broadcast
-    pallas_use_low_level_scheduler pallas_worklist_grouping
+    pallas_use_low_level_scheduler
+    pallas_worklist_buffer_count pallas_worklist_grouping
 """
 
 

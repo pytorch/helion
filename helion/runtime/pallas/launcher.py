@@ -2624,6 +2624,7 @@ def default_pallas_launcher(
     _compact_fill_worklist: Callable[..., object] | None = None,
     _compact_upper: int = 0,
     _compact_sublane: int = 0,
+    _compact_buffer_counts: dict[int, int] | None = None,
     _compact_offset_arg_indices: list[int] | None = None,
     _compact_metadata_fields: list[str] | None = None,
     _compact_owner_ref_pos: int = 0,
@@ -2756,6 +2757,7 @@ def default_pallas_launcher(
                 _compact_fill_worklist=_compact_fill_worklist,
                 _compact_upper=_compact_upper,
                 _compact_sublane=_compact_sublane,
+                _compact_buffer_counts=_compact_buffer_counts,
                 _compact_offset_arg_indices=_compact_offset_arg_indices,
                 _compact_metadata_fields=_compact_metadata_fields,
                 _compact_owner_ref_pos=_compact_owner_ref_pos,
@@ -2803,6 +2805,7 @@ def _compact_window_block_spec(
     window: int,
     ref_pos: int,
     scalar_refs: tuple[object, ...],
+    buffer_count: int = 2,
 ) -> object:
     """BlockSpec for one compact-worklist window: up to ``window`` rows of dim 0
     at the runtime row offset in ``scalar_refs[ref_pos]``, other dims full.
@@ -2853,7 +2856,8 @@ def _compact_window_block_spec(
         size = jnp.clip(jnp.int32(_rows) - start, 0, _window)
         return (pl.ds(start, size), *(jnp.int32(0) for _ in range(_nd - 1)))
 
-    return pl.BlockSpec(block_shape, index_map)  # type: ignore[union-attr]
+    mode = None if buffer_count == 2 else pl.Buffered(buffer_count)  # type: ignore[union-attr]
+    return pl.BlockSpec(block_shape, index_map, pipeline_mode=mode)  # type: ignore[union-attr]
 
 
 def _compact_aligned_window_block_spec(
@@ -2863,6 +2867,7 @@ def _compact_aligned_window_block_spec(
     start_ref: object,
     extent_ref: object,
     num_work_ref: object | None,
+    buffer_count: int,
 ) -> object:
     """BlockSpec for a sublane-aligned compact window (in-kernel worklist).
 
@@ -2893,7 +2898,8 @@ def _compact_aligned_window_block_spec(
         return (pl.ds(lo, hi - lo), *(jnp.int32(0) for _ in range(ndim - 1)))
 
     block_shape = (pl.BoundedSlice(window), *t.shape[1:])  # type: ignore[attr-defined]
-    return pl.BlockSpec(block_shape, index_map)
+    mode = None if buffer_count == 2 else pl.Buffered(buffer_count)
+    return pl.BlockSpec(block_shape, index_map, pipeline_mode=mode)
 
 
 def _pallas_compact_in_out_specs(
@@ -2917,6 +2923,7 @@ def _pallas_compact_in_out_specs(
     sublane: int = 0,
     num_work_ref: object | None = None,
     tile_extent_ref_pos: int = 2,
+    buffer_counts: dict[int, int] | None = None,
 ) -> tuple[list[object], object]:
     """Build in/out BlockSpecs for the compact-worklist emit_pipeline.
 
@@ -2931,10 +2938,12 @@ def _pallas_compact_in_out_specs(
 
     A nonzero ``sublane`` (in-kernel worklist) slices the compact tensors at
     sublane-aligned rows instead (``_compact_aligned_window_block_spec``);
-    ``num_work_ref`` is then the SMEM ``num_work`` scalar.
+    ``num_work_ref`` is then the SMEM ``num_work`` scalar. ``buffer_counts``
+    maps an input's arg index to its pipeline buffer count (default 2).
     """
     aligned_set = aligned_set or set()
     ordered_aligned_set = ordered_aligned_set or set()
+    buffer_counts = buffer_counts or {}
     all_positions = sorted(set(tensor_arg_indices) | set(output_indices))
     arg_to_tpos = {orig: tpos for tpos, orig in enumerate(all_positions)}
 
@@ -2943,6 +2952,7 @@ def _pallas_compact_in_out_specs(
             return pl.BlockSpec(memory_space=pltpu.HBM)  # type: ignore[union-attr]
         t = args[idx]
         assert _is_torch_tensor_or_jax_array(t)
+        buffer_count = 2 if is_output else buffer_counts.get(idx, 2)
         if idx in aligned_set and sublane:
             return _compact_aligned_window_block_spec(
                 t,
@@ -2951,6 +2961,7 @@ def _pallas_compact_in_out_specs(
                 scalar_refs[tile_start_ref_pos],
                 scalar_refs[tile_extent_ref_pos],
                 num_work_ref if is_output else None,
+                buffer_count,
             )
         if idx in aligned_set:
             # compact_aligned_load / compact_exact_store: one compact_block-row
@@ -2959,7 +2970,7 @@ def _pallas_compact_in_out_specs(
             # sizing and the tensor-end hazard: _compact_window_block_spec.
             # Windowed on dim 0 only: emit_pipeline rejects it on the lane dim.
             return _compact_window_block_spec(
-                t, compact_block, tile_start_ref_pos, scalar_refs
+                t, compact_block, tile_start_ref_pos, scalar_refs, buffer_count
             )
         if idx in ordered_aligned_set:
             # Resident caching: per-range resident window sized ``ordered_window``
@@ -2992,7 +3003,10 @@ def _pallas_compact_in_out_specs(
                     )
 
                 mem = pltpu.SMEM if idx in smem_set else None  # type: ignore[union-attr]
-                return pl.BlockSpec(block_shape, index_map, memory_space=mem)  # type: ignore[union-attr]
+                mode = None if buffer_count == 2 else pl.Buffered(buffer_count)  # type: ignore[union-attr]
+                return pl.BlockSpec(  # type: ignore[union-attr]
+                    block_shape, index_map, memory_space=mem, pipeline_mode=mode
+                )
         return _pallas_make_block_spec(pl, jnp, pltpu, t, entry, idx in smem_set)
 
     in_specs = [_spec_for(idx, False) for idx in tensor_arg_indices]
@@ -3054,6 +3068,7 @@ def _pallas_compile_compact_jit_fn(
     fill_worklist: Callable[..., object] | None = None,
     upper: int = 0,
     sublane: int = 0,
+    buffer_counts: dict[int, int] | None = None,
     aligned_arg_indices: list[int] | None = None,
     tile_start_ref_pos: int = 1,
     compact_block: int = 1,
@@ -3168,6 +3183,7 @@ def _pallas_compile_compact_jit_fn(
             sublane=sublane,
             num_work_ref=num_work_smem,
             tile_extent_ref_pos=tile_extent_ref_pos,
+            buffer_counts=buffer_counts,
         )
         out_specs_seq = (
             list(out_specs) if isinstance(out_specs, (list, tuple)) else [out_specs]
@@ -3331,6 +3347,7 @@ def _pallas_install_compact_launcher_cache(
     _compact_fill_worklist: Callable[..., object] | None = None,
     _compact_upper: int = 0,
     _compact_sublane: int = 0,
+    _compact_buffer_counts: dict[int, int] | None = None,
     # Resident-cache (owner-cache) compile params; default to inactive so a
     # non-resident compact kernel compiles unchanged.
     _compact_ordered_aligned_arg_indices: list[int] | None = None,
@@ -3375,6 +3392,7 @@ def _pallas_install_compact_launcher_cache(
         fill_worklist=_compact_fill_worklist,
         upper=_compact_upper,
         sublane=_compact_sublane,
+        buffer_counts=_compact_buffer_counts,
         offset_arg_indices=_compact_offset_arg_indices or [],
         metadata_fields=_compact_metadata_fields or [],
         owner_ref_pos=_compact_owner_ref_pos,
