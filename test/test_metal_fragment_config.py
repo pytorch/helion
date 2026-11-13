@@ -18,6 +18,7 @@ from helion._compiler.metal.fragment_mma import _max_offset
 from helion._compiler.metal.search_surface import kernel_facts
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.metal_fragment import fp8_rows
 from helion._testing.metal_fragment import nvfp4_cpu_args
 from helion._testing.metal_fragment import nvfp4_rows
 from helion._testing.metal_fragment import views_epilogue
@@ -207,20 +208,45 @@ class TestFragmentConfig(unittest.TestCase):
         self.assertIn("fragment=", fragment)
         with self.assertRaisesRegex(exc.InvalidConfig, "metal_matmul must be one of"):
             bound.config_spec.normalize(helion.Config(metal_matmul="tensor"))
+        with self.assertRaisesRegex(exc.InvalidConfig, "metal_matmul must be one of"):
+            bound.config_spec.normalize(helion.Config(metal_matmul=None))
+        for cap in (16.0, True, 32, None):
+            with self.assertRaisesRegex(
+                exc.InvalidConfig, "metal_tabulate_max_entries must be one of"
+            ):
+                bound.config_spec.normalize(
+                    helion.Config(
+                        metal_matmul="fragment", metal_tabulate_max_entries=cap
+                    )
+                )
 
     def test_search(self) -> None:
         """The search tries ``metal_matmul`` where both lowerings apply, from
-        a fragment seed beside the MPP default, which leaves the key out, and
-        repairs a fragment config to one SIMD group; a matmul the fragment run
-        can't lower, and a kernel with none, have no such field."""
+        fragment seeds beside the MPP default, which leaves the key out, and
+        ``metal_tabulate_max_entries`` at the caps that admit the kernel's
+        tables, and repairs a fragment config to one SIMD group; a matmul the
+        fragment run can't lower, and a kernel with none, have neither
+        field."""
         spec = nvfp4_rows.bind(nvfp4_cpu_args()).config_spec
         field = spec._flat_fields()["metal_matmul"]
         assert isinstance(field, EnumFragment)
         self.assertEqual(field.choices, ("mpp", "fragment"))
         self.assertNotIn("metal_matmul", spec.default_config().config)
+        tables = spec._flat_fields()["metal_tabulate_max_entries"]
+        assert isinstance(tables, EnumFragment)
+        # The code's nibble takes 16 entries.  The E4M3 scale's 7-bit field
+        # takes none: its shift is an integer of promoted type, and the cast
+        # after it reads the whole byte.
+        self.assertEqual(tables.choices, (0, 16))
         self.assertEqual(
-            [c.config.get("metal_matmul") for c in spec.autotune_seed_configs()],
-            ["fragment"],
+            [
+                (
+                    c.config.get("metal_matmul"),
+                    c.config.get("metal_tabulate_max_entries"),
+                )
+                for c in spec.autotune_seed_configs()
+            ],
+            [("fragment", None), ("fragment", 16)],
         )
         # The search repairs a fragment config to one SIMD group.
         repaired = helion.Config(
@@ -232,12 +258,24 @@ class TestFragmentConfig(unittest.TestCase):
         bare = helion.Config(block_sizes=[16, 16, 64], metal_matmul="fragment")
         spec.normalize(bare)
         self.assertEqual(bare["num_warps"], 1)
+        # A byte's decode takes a 256-entry table.
+        fp8_args = (
+            torch.randn(8, 224).to(torch.bfloat16),
+            torch.randint(-(2**31), 2**31 - 1, (40, 56), dtype=torch.int32),
+            torch.randint(120, 130, (40, 7), dtype=torch.uint8),
+        )
+        spec = fp8_rows.bind(fp8_args).config_spec
+        tables = spec._flat_fields()["metal_tabulate_max_entries"]
+        assert isinstance(tables, EnumFragment)
+        self.assertEqual(tables.choices, (0, 256))
         x = torch.randn(16, 32, dtype=torch.float16)
         y = torch.randn(32, 16, dtype=torch.float16)
         for kernel, kernel_args in ((centered, (x, y)), (add, (x, x))):
             with self.subTest(kernel=kernel.name):
                 spec = kernel.bind(kernel_args).config_spec
-                self.assertNotIn("metal_matmul", spec._flat_fields())
+                fields = spec._flat_fields()
+                self.assertNotIn("metal_matmul", fields)
+                self.assertNotIn("metal_tabulate_max_entries", fields)
 
     def test_threads(self) -> None:
         """The search gives a matmul config a threadgroup its matmuls run
