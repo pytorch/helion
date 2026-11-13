@@ -23,7 +23,7 @@ from ..inductor_lowering import PointwiseLowering
 from ..inductor_lowering import ReductionLowering
 from ..matmul_utils import _compute_out_dtype
 from ..matmul_utils import _needs_f32_accumulator
-from ..runtime_tensor_guards import runtime_tensors_are_proven_disjoint
+from ..runtime_tensor_guards import tensors_have_proven_disjoint_storage
 from .fragment_context import DirectStoreSink
 from .fragment_context import Fragment
 from .fragment_context import HostTensor
@@ -310,18 +310,12 @@ class FragmentDotEmitter(FragmentMemoryEmitter):
         return contraction
 
     def host_storages_disjoint(self, left: torch.Tensor, right: torch.Tensor) -> bool:
-        """Whether two host tensors are proved to view disjoint storage: a
-        different fake storage and either one freshly allocated by a wrapper
-        factory on this call (an in-kernel ``torch.empty``), or the bound
-        dispatch key's alias matrix.  Two inputs with different fake storages
-        alone prove nothing: a caller may pass overlapping views."""
-        if left.untyped_storage() == right.untyped_storage():
-            return False
-        if self.env.tensor_storage_is_compiler_allocated(
-            left
-        ) or self.env.tensor_storage_is_compiler_allocated(right):
-            return True
-        return runtime_tensors_are_proven_disjoint(self.env, left, right)
+        """Prove every possible host storage pair before moving a store.
+
+        A host join can alias a fresh allocation despite having a distinct
+        synthetic storage. Invalidated or unknown origins provide no proof.
+        """
+        return tensors_have_proven_disjoint_storage(self.env, left, right)
 
     def direct_store_in_order(self, node: Node, user: Node) -> bool:
         """Whether the lanes may write ``user``'s window at ``node``'s position.

@@ -2465,11 +2465,18 @@ class CuteBackend(Backend):
         return statements
 
     def tensors_proven_disjoint(
-        self, env: CompileEnvironment, left: torch.Tensor, right: torch.Tensor
+        self,
+        env: CompileEnvironment,
+        left: torch.Tensor,
+        right: torch.Tensor,
+        *,
+        allow_unbound: bool = False,
     ) -> bool:
         from ..runtime_tensor_guards import runtime_tensors_are_proven_disjoint
 
-        return runtime_tensors_are_proven_disjoint(env, left, right)
+        return runtime_tensors_are_proven_disjoint(
+            env, left, right, allow_unbound=allow_unbound
+        )
 
     def new_env_state(self) -> CuteEnvState:
         return new_env_state()

@@ -48,6 +48,7 @@ from ..fx_load_trace import trace_to_load_tensor
 from ..host_function import HostFunction
 from ..indexing_strategy import exact_tile_block_ids
 from ..indexing_strategy import subscript_tile_info
+from ..runtime_tensor_guards import tensors_have_proven_disjoint_storage
 from ..tile_strategy import DeviceLoopState
 from ..variable_origin import TileBeginOrigin
 from ..variable_origin import TileEndOrigin
@@ -1106,15 +1107,14 @@ def _grouped_ab_k_loop_supported(
         isinstance(output, torch.Tensor)
         and output.is_contiguous()
         and env.tensor_storage_is_compiler_allocated(output)
-        and id(output.untyped_storage())
-        not in {
-            id(tensor.untyped_storage())
+        and all(
+            tensors_have_proven_disjoint_storage(env, output, tensor)
             for tensor in (
                 *env.input_sources,
                 proof.lhs.source_fake,
                 proof.rhs.source_fake,
             )
-        }
+        )
         and all(
             0 < env.size_hint(tensor.numel()) <= (1 << 31) - 1
             for tensor in (proof.lhs.source_fake, rhs, output)

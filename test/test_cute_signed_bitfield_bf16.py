@@ -275,13 +275,16 @@ def _physical(monkeypatch):
     )
     from helion._compiler.compile_environment import CompileEnvironment
 
-    monkeypatch.setattr(
-        CompileEnvironment,
-        "current",
-        lambda: SimpleNamespace(index_type=lambda: "cutlass.Int32"),
+    source = case.source.meta["val"]
+    fresh_storage = case.output.meta["val"].untyped_storage()
+    compile_env = SimpleNamespace(
+        index_type=lambda: "cutlass.Int32",
+        input_sources={source: None},
+        tensor_storage_provenance=lambda tensor: (
+            (tensor.untyped_storage(), tensor.untyped_storage() is fresh_storage),
+        ),
     )
-    monkeypatch.setattr(sb.HostFunction, "current", lambda: None)
-    monkeypatch.setattr(sb, "_fresh_tensors", lambda host: {case.output.meta["val"]})
+    monkeypatch.setattr(CompileEnvironment, "current", lambda: compile_env)
     monkeypatch.setattr(
         "helion._compiler.runtime_tensor_guards.runtime_tensors_are_proven_disjoint",
         lambda *args: False,
@@ -406,7 +409,6 @@ def test_physical_proof_declines_before_store_change(monkeypatch, fault):
         cute_codegen_state(state.codegen).branch_path = [(7, 0)]
     elif fault == "alias":
         case.output.meta["val"] = case.source.meta["val"]
-        monkeypatch.setattr(sb, "_fresh_tensors", lambda host: set())
     elif fault == "effect":
         with case.graph.inserting_before(case.store):
             _node(case.graph, torch.ops.aten.zero_.default, (case.source,), torch.int8)

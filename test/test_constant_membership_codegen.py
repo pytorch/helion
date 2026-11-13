@@ -118,7 +118,7 @@ def test_symbolic_collection_membership_is_not_folded():
         assert isinstance(bound.host_function.local_types["nonmember"], SymBoolType)
 
 
-@pytest.mark.parametrize("form", ["literal", "custom", "symbolic"])
+@pytest.mark.parametrize("form", ["literal", "symbolic"])
 def test_namedtuple_membership_uses_proved_values(form):
     with cpu_render_target():
         bound = cpu_bind(
@@ -138,6 +138,20 @@ def test_namedtuple_membership_uses_proved_values(form):
         if form == "literal":
             assert scalar_additions(bound) == [3, 13, 19]
         ast.parse(bound.to_code(bound.config_spec.default_config()))
+
+
+def test_custom_namedtuple_membership_is_refused():
+    with (
+        cpu_render_target(),
+        pytest.raises(
+            helion.exc.TypeInferenceError,
+            match="Host operations with custom record or container protocols",
+        ),
+    ):
+        cpu_bind(
+            helion.kernel(record_membership, static_shapes=False),
+            (torch.ones(7), "custom"),
+        )
 
 
 # Each form exercises a distinct propagation edge, rather than a tuning grid:

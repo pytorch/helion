@@ -115,7 +115,7 @@ def host_load_is_readonly(
     alias a host storage; their normal initialization/update barriers remain.
     """
     from ...language import creation_ops
-    from ..runtime_tensor_guards import runtime_tensors_are_proven_disjoint
+    from ..runtime_tensor_guards import tensors_have_proven_disjoint_storage
     from .local_atomic import _reachable_graphs
     from .local_atomic import atomic_target_origins
 
@@ -156,17 +156,10 @@ def host_load_is_readonly(
         target_storage = target.untyped_storage()
         if source_storage == target_storage:
             return False
-        # Fake storage inequality alone does not prove that two runtime
-        # arguments are disjoint (including distinct DLPack wrappers). A
-        # storage a wrapper factory freshly allocated on this call (a
-        # ``torch.zeros`` output, say) cannot alias any other storage, and
-        # otherwise the dispatch-keyed alias matrix decides.
-        if (
-            not env.tensor_storage_is_compiler_allocated(source)
-            and not env.tensor_storage_is_compiler_allocated(target)
-            and not runtime_tensors_are_proven_disjoint(
-                env, source, target, allow_unbound=allow_unbound
-            )
+        # Check every possible origin: synthetic join storage can alias a
+        # fresh allocation, and invalidated input facts cannot be reused.
+        if not tensors_have_proven_disjoint_storage(
+            env, source, target, allow_unbound=allow_unbound
         ):
             return False
     return True

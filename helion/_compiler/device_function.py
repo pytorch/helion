@@ -43,6 +43,7 @@ from .host_function import HostFunction
 from .host_function import NoCurrentFunction
 from .lane_loop_context import LaneLoopContext
 from .output_header import reserved_names
+from .runtime_tensor_guards import tensor_pairs_with_proven_disjoint_storage
 from .source_location import SyntheticLocation
 from .variable_origin import BlockSizeOrigin
 from .variable_origin import GridOrigin
@@ -1436,48 +1437,24 @@ class DeviceFunction:
 
         Different user/global tensor arguments are not a non-aliasing proof:
         callers may pass the same tensor, or overlapping views, under multiple
-        names.  A tensor backed by storage absent from the original function
-        inputs cannot overlap an external input or a separately allocated
-        output.  Two external inputs are disjoint only when the current runtime
-        storage spans do not overlap and that predicate is part of the bound
-        kernel cache key.  The predicate compares whole storages, so it also
-        covers host-side views (``x.view(...)``) through the input whose
+        names. Positively identified wrapper allocations cannot overlap an
+        external input or another allocation. Synthetic host-join storage
+        instead represents every branch's possible storage, all of which must
+        prove disjointness. Two external inputs are disjoint only when their
+        current runtime storage spans do not overlap and that predicate is part
+        of the bound kernel cache key. The predicate compares whole storages,
+        so it also covers host-side views (``x.view(...)``) through the input whose
         storage they share.  Origin type alone is insufficient: host-local
         ``torch.empty``-family outputs commonly carry ``NameOrigin`` too.
         """
-        env = CompileEnvironment.current()
-        host_function = HostFunction.current()
-        input_storages = {
-            id(tensor.untyped_storage()): tensor for tensor in env.input_sources
-        }
-        origins: dict[str, tuple[str, int, torch.Tensor | None]] = {}
-        for arg in self.arguments:
-            if not isinstance(arg, TensorArg):
-                continue
-            origin = host_function.tensor_to_origin.get(arg.fake_value)
-            root = origin.root_rw_name() if origin is not None else None
-            if root is not None:
-                storage = id(arg.fake_value.untyped_storage())
-                origins[arg.name] = (
-                    root,
-                    storage,
-                    arg.fake_value
-                    if arg.fake_value in env.input_sources
-                    else input_storages.get(storage),
-                )
-        return {
-            frozenset((left_name, right_name))
-            for left_name, (left_root, left_storage, left_input) in origins.items()
-            for right_name, (right_root, right_storage, right_input) in origins.items()
-            if left_name < right_name
-            and left_root != right_root
-            and left_storage != right_storage
-            and (
-                left_input is None
-                or right_input is None
-                or env.backend.tensors_proven_disjoint(env, left_input, right_input)
-            )
-        }
+        return tensor_pairs_with_proven_disjoint_storage(
+            CompileEnvironment.current(),
+            {
+                arg.name: arg.fake_value
+                for arg in self.arguments
+                if isinstance(arg, TensorArg)
+            },
+        )
 
     def proven_tensor_stride_values(self) -> dict[tuple[str, int], int]:
         """Return tensor strides whose exact value is cache-safe.

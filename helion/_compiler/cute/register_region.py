@@ -39,7 +39,7 @@ from ..device_ir import RootGraphInfo
 from ..host_function import HostFunction
 from ..inductor_lowering import ReductionLowering
 from ..program_id import XYZProgramIDs
-from ..runtime_tensor_guards import runtime_tensors_are_proven_disjoint
+from ..runtime_tensor_guards import tensors_have_proven_disjoint_storage
 from ..tile_strategy import DeviceGridState
 from .bounded_gather import integer_bounds
 from .register_program import emit_register_program
@@ -584,11 +584,7 @@ def plan_register_region(
         for other in tensors[:index]:
             if output.untyped_storage()._cdata == other.untyped_storage()._cdata:
                 return None
-            if (
-                not env.tensor_storage_is_compiler_allocated(output)
-                and not env.tensor_storage_is_compiler_allocated(other)
-                and not runtime_tensors_are_proven_disjoint(env, output, other)
-            ):
+            if not tensors_have_proven_disjoint_storage(env, output, other):
                 return None
     module = _tensor_graph(root, loads, stores, groups, graphs)
     if module is None:

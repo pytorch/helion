@@ -28,6 +28,37 @@ def _copy_with_metadata(x, requires: hl.constexpr):
 
 
 @helion.kernel(static_shapes=True, autotune_effort="none")
+def _conditional_output(x, flag: int):
+    if flag > 0:
+        x.t_()
+    output_size = x.size(0)
+    out = torch.empty((output_size,), dtype=x.dtype, device=x.device)
+    for row in hl.tile(output_size):
+        out[row] = 1.0
+    return out
+
+
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def _transpose_then_add_inplace(x, flag: int):
+    if flag > 0:
+        x.t_()
+    for tile in hl.tile(x.shape):
+        x[tile] = x[tile] + 1
+    return x
+
+
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def _specialized_conditional_output(x, flag: hl.constexpr):
+    output_size = x.size(1) if flag > 0 else x.size(0)
+    if flag > 0:
+        x.t_()
+    out = torch.empty((output_size,), dtype=x.dtype, device=x.device)
+    for row in hl.tile(output_size):
+        out[row] = 1.0
+    return out
+
+
+@helion.kernel(static_shapes=True, autotune_effort="none")
 def _scalar_sized_output(x, size: int, specialize_size: hl.constexpr):
     if specialize_size:
         size = hl.specialize(size)
@@ -158,6 +189,64 @@ def test_specialized_scalar_outputs_follow_normal_dispatch():
     for size in (8, 4, 8):
         out = _scalar_sized_output(torch.ones(8), size, True)
         torch.testing.assert_close(out, torch.ones(size))
+
+
+@onlyBackends(["pallas"])
+@skipIfPallasTpu("executes the Pallas CPU interpreter with CPU input tensors")
+@pytest.mark.parametrize("static_shapes", [False, True])
+def test_conditional_output_metadata_follows_normal_dispatch(static_shapes):
+    kernel = helion.kernel(
+        _conditional_output.fn,
+        backend="pallas",
+        static_shapes=static_shapes,
+        autotune_effort="none",
+        config=helion.Config(block_sizes=[8]),
+    )
+    first_bound = None
+    for flag in (1, 0, 1):
+        x = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+        bound = kernel.bind((x, flag))
+        if first_bound is None:
+            first_bound = bound
+        assert bound is first_bound
+        out = kernel(x, flag)
+        torch.testing.assert_close(out, torch.ones(x.size(0)))
+
+
+@onlyBackends(["pallas"])
+@skipIfPallasTpu("executes the Pallas CPU interpreter with CPU input tensors")
+def test_host_transpose_inplace_writes_back_across_cached_calls():
+    kernel = helion.kernel(
+        _transpose_then_add_inplace.fn,
+        backend="pallas",
+        static_shapes=True,
+        autotune_effort="none",
+        config=helion.Config(block_sizes=[8, 8]),
+    )
+    first_bound = None
+    for flag in (1, 0, 1, 1):
+        x = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+        storage_alias = x.view(-1)
+        expected = x.t() + 1 if flag > 0 else x + 1
+        bound = kernel.bind((x, flag))
+        if first_bound is None:
+            first_bound = bound
+        assert bound is first_bound
+        actual = kernel(x, flag)
+        assert actual is x
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            storage_alias, torch.arange(32, dtype=torch.float32) + 1, rtol=0, atol=0
+        )
+
+
+@onlyBackends(["pallas"])
+@skipIfPallasTpu("executes the Pallas CPU interpreter with CPU input tensors")
+def test_specializing_control_before_mutation_preserves_output_shape():
+    for flag in (1, 0, 1):
+        x = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+        out = _specialized_conditional_output(x, flag)
+        torch.testing.assert_close(out, torch.ones(x.size(0)))
 
 
 @onlyBackends(["pallas"])

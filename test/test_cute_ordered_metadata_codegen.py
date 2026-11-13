@@ -312,7 +312,6 @@ def test_registered_fragment_metadata_remains_supported(kernel):
         _overloaded_metadata_argument_phases,
         _effectful_callee_phases,
         _fragment_truth_condition_phases,
-        _class_truth_condition_phases,
         _fragment_constructor_condition_phases,
     ],
 )
@@ -324,6 +323,19 @@ def test_opaque_host_predicates_are_not_replayed(kernel):
         with pytest.raises(helion.exc.BackendUnsupported, match="pure"):
             bound.to_code(helion.Config.from_dict(config))
         assert len(_HOST_EFFECTS) == calls
+
+
+def test_class_truth_is_refused_before_structural_proxy_evaluation():
+    effects = list(_HOST_EFFECTS)
+    with (
+        cpu_target(),
+        pytest.raises(
+            helion.exc.TypeInferenceError,
+            match="custom record or container protocols",
+        ),
+    ):
+        cpu_bind(_class_truth_condition_phases, (torch.ones(8),))
+    assert effects == _HOST_EFFECTS
 
 
 @pytest.mark.parametrize("shift", [None, 2.0])
