@@ -32,6 +32,9 @@ from .base_cache import LooseAutotuneCacheKey
 from .base_cache import StrictAutotuneCacheKey
 from .base_cache import _requires_uncached_tuning
 from .base_cache import _UncachedAutotuneCache
+from .base_search import PopulationBasedSearch
+from .benchmarking import _resolve_l2_flush_mode
+from .benchmarking import final_selection_l2_flush_mode
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -109,39 +112,69 @@ def _search_policy_json_value(
         active.remove(value_id)
 
 
-def _hash_policy(policy: object) -> str:
-    encoded = json.dumps(
-        policy, sort_keys=True, separators=(",", ":"), allow_nan=False
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+def _hash_search_policy(encoded: bytes) -> str:
+    # Includes default one-bank searches: old winners may have been validated
+    # with changed metadata identity, uncloned callback captures, or undetected
+    # writes to callback-only operands (including with custom accuracy checks),
+    # or callbacks whose shared closure cells were split by partial cloning
+    # or serialization to the benchmark worker.
+    return hashlib.sha256(b"helion.input_clone.v6\0" + encoded).hexdigest()
 
 
 def _search_policy_hash(
     autotuner: BaseSearch, *, cute_flash_search_enabled: bool
 ) -> str:
-    """Hash the search settings a cache key must cover beyond the kernel and
-    its inputs.
+    """Hash the effective clone, accuracy, search and timing policy.
 
-    For CuTe flash kernels this is the whole effective built-in search policy:
-    a cached quick or explicitly truncated search must not satisfy a later
-    full request, and unknown/custom policies get a unique one-shot key.
-    Other kernels key only an :class:`AccuracyCheck` that validates the
-    search, so a config accepted under one check is not reused under a
-    different one; without one they retain their historical cache keys (which
-    also leave out their search settings and ``autotune_baseline_fn``).
+    CuTe flash keys cover the full search policy. Other kernels also key an
+    enabled AccuracyCheck independently of their bank and final-selection
+    policies. Unknown/custom flash policies get a unique one-shot key. Clone
+    semantics version ordinary one-bank keys across every backend and AOT mode.
     """
-    if not cute_flash_search_enabled:
+    banks = autotuner.settings.autotune_benchmark_input_banks
+    resident_bank_policy = None
+    if banks > 1:
+        regimes = (_resolve_l2_flush_mode(None), final_selection_l2_flush_mode())
+        if "off" in regimes:
+            resident_bank_policy = {
+                "input_banks": banks,
+                "search_l2_flush_mode": regimes[0],
+                "final_l2_flush_mode": regimes[1],
+            }
+    if cute_flash_search_enabled:
+        policy = autotuner.cache_policy()
+    else:
+        policy = None
+        if isinstance(autotuner, PopulationBasedSearch):
+            default = autotuner._final_selection_from_settings(autotuner.settings)
+            if autotuner.final_selection != default:
+                policy = {
+                    "input_banks": banks,
+                    "final_selection": autotuner.final_selection,
+                }
         accuracy_check = keyable_accuracy_check(autotuner.settings)
-        if accuracy_check is None or not autotuner.settings.autotune_accuracy_check:
-            return ""
-        return _hash_policy(
-            {
+        if accuracy_check is not None and autotuner.settings.autotune_accuracy_check:
+            # Accuracy validation applies independently of bank count, timing
+            # regime and an explicitly overridden final-selection policy.
+            policy = {
                 "schema": "accuracy_check_policy_v1",
                 "autotune_baseline_accuracy_check_fn": accuracy_check.cache_policy(),
+                "input_banks": banks,
+                "search_policy": policy,
             }
-        )
+        if policy is None:
+            # Keep the existing bank/regime distinctions within the current
+            # clone version for local, remote and AOT selection alike.
+            if banks == 1:
+                return _hash_search_policy(b"")
+            if resident_bank_policy is not None:
+                return _hash_search_policy(
+                    json.dumps(resident_bank_policy, sort_keys=True).encode()
+                )
+            return _hash_search_policy(
+                f"helion.benchmark_input_banks.v1:{banks}".encode()
+            )
 
-    policy = autotuner.cache_policy()
     if policy is None:
         log.warning(
             "CuTe-flash autotune cache reuse is disabled for unsupported search "
@@ -149,11 +182,24 @@ def _search_policy_hash(
             type(autotuner).__qualname__,
         )
         policy = _uncacheable_search_policy(autotuner)
+    if resident_bank_policy is not None:
+        policy = {"search_policy": policy, "resident_banks": resident_bank_policy}
     try:
-        return _hash_policy(_search_policy_json_value(policy))
+        canonical_policy = _search_policy_json_value(policy)
+        encoded = json.dumps(
+            canonical_policy,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
     except (TypeError, ValueError) as error:
-        log.warning("CuTe-flash autotune cache reuse is disabled: %s", error)
-        return _hash_policy(_uncacheable_search_policy(autotuner))
+        log.warning("Autotune cache reuse is disabled: %s", error)
+        encoded = json.dumps(
+            _uncacheable_search_policy(autotuner),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    return _hash_search_policy(encoded)
 
 
 def get_helion_cache_dir() -> Path:

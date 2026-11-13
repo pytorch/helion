@@ -409,8 +409,10 @@ def test_trace_uses_existing_log_details_environment(
     assert rows[-1]["best_perf_ms"] == 1.0
 
 
+@pytest.mark.parametrize("record_trace", [False, True])
 def test_rebenchmark_trace_does_not_report_retained_timing_as_measured(
     tmp_path: Path,
+    record_trace: bool,
 ) -> None:
     base = tmp_path / "rebenchmark"
     path = base.with_suffix(".trace.jsonl")
@@ -438,11 +440,17 @@ def test_rebenchmark_trace_does_not_report_retained_timing_as_measured(
             members,
             [1.5, 1.5, 0.8],
             trace_results=[None, IsolatedBenchmarkFailure("timeout"), 0.8],
+            record_trace=record_trace,
         )
     rows = [row for row in _rows(path) if row["event"] == "rebenchmark"]
-    assert [row["status"] for row in rows] == ["timeout", "ok"]
-    assert [row["perf_ms"] for row in rows] == [None, 0.8]
-    assert members[0].perf == 1.5
+    assert [row["status"] for row in rows] == (
+        ["timeout", "ok"] if record_trace else []
+    )
+    assert [row["perf_ms"] for row in rows] == ([None, 0.8] if record_trace else [])
+    assert members[0].perfs == [1.5]
+    assert members[1].perfs == [1.5]
+    assert members[2].perfs == [1.5, 0.8]
+    assert search.best_perf_so_far == 0.8
 
 
 @pytest.mark.parametrize("relative_to", [None, "baseline"])

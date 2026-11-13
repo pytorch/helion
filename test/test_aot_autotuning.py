@@ -53,6 +53,7 @@ from helion.autotuner.heuristic_generator import select_config_subset
 import helion.language as hl
 from helion.runtime.config import Config
 from helion.runtime.kernel import _constexpr_key
+from helion.runtime.settings import Settings
 
 pytestmark = pytest.mark.cpu_only
 
@@ -916,13 +917,12 @@ def test_aot_cache_canonicalizes_defaults_for_compile_get(
     )
     bound_kernel = SimpleNamespace(
         kernel=kernel_api,
+        settings=Settings(),
         config_spec=SimpleNamespace(cute_flash_search_enabled=False),
         is_cacheable=lambda: True,
     )
     autotuner = SimpleNamespace(
-        kernel=bound_kernel,
-        args=(tensor,),
-        settings=SimpleNamespace(autotune_baseline_accuracy_check_fn=None),
+        kernel=bound_kernel, settings=bound_kernel.settings, args=(tensor,)
     )
     monkeypatch.setenv("HELION_AOT_MODE", "compile")
     monkeypatch.setattr(aot_cache_module, "get_aot_data_dir", lambda: tmp_path)

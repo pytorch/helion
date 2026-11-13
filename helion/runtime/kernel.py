@@ -2938,6 +2938,10 @@ class Kernel(Generic[_R]):
             raise exc.InvalidAPIUsage(
                 "autotune_multi relative_to='baseline' requires autotune_baseline_fn"
             )
+        if self.settings.autotune_benchmark_input_banks > 1:
+            raise exc.InvalidAPIUsage(
+                "autotune_multi does not support rotating benchmark input banks"
+            )
         if self.settings.autotune_benchmark_fn is not None:
             raise exc.InvalidAPIUsage(
                 "autotune_multi does not support autotune_benchmark_fn"

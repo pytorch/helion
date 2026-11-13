@@ -552,8 +552,9 @@ class TestLLMGuidedSearch(TestCase):
             def __exit__(self, *exc_info) -> None:
                 pass
 
-            def warm(self, index: int, duration_ms: int) -> None:
+            def warm(self, index: int, duration_ms: int) -> float:
                 self.windows.append(("warm", index, duration_ms))
+                return rebench_perf_by_key[repr(self.finalists[index].config)]
 
             def measure(
                 self,

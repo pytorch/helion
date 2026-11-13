@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
@@ -11,12 +12,60 @@ import torch
 
 from helion.autotuner.handoff_inputs import _load_inputs
 from helion.autotuner.handoff_inputs import _save_inputs
+from helion.autotuner.handoff_inputs import _SavedInputs
 from helion.autotuner.tensor_serialization import save_tensor_tree
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 pytestmark = pytest.mark.cpu_only
+
+
+def _handoff_callback(value=None):
+    return value
+
+
+@dataclasses.dataclass
+class _HandoffCallbackHolder:
+    callback: object
+
+
+@pytest.mark.parametrize("container", ["direct", "list", "record"])
+def test_handoff_refuses_callbacks_before_overwriting_inputs(
+    container, monkeypatch, tmp_path
+):
+    tensor = torch.arange(4)
+    monkeypatch.setattr(_handoff_callback, "__defaults__", (tensor,))
+    if container == "list":
+        value = [_handoff_callback]
+    elif container == "record":
+        value = _HandoffCallbackHolder(_handoff_callback)
+    else:
+        value = _handoff_callback
+    path = tmp_path / "inputs.pt"
+    path.write_bytes(b"existing handoff inputs")
+    with pytest.raises(TypeError, match="handoff.*callback"):
+        _save_inputs((tensor, value), path)
+    assert path.read_bytes() == b"existing handoff inputs"
+    assert _handoff_callback() is tensor
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_handoff_refuses_legacy_callback_files(wrapped, monkeypatch, tmp_path):
+    tensor = torch.arange(4)
+    monkeypatch.setattr(_handoff_callback, "__defaults__", (tensor,))
+    value = (tensor, {"callback": _handoff_callback})
+    saved = (
+        _SavedInputs(value, (tensor.untyped_storage().data_ptr() % 256,))
+        if wrapped
+        else value
+    )
+    path = tmp_path / "legacy.pt"
+    torch.save(saved, path)
+    # A by-name callback would now observe this new default, not the saved tensor.
+    monkeypatch.setattr(_handoff_callback, "__defaults__", (torch.full((4,), 99),))
+    with pytest.raises(TypeError, match="handoff.*callback"):
+        _load_inputs(path)
 
 
 @pytest.mark.parametrize(
