@@ -46,6 +46,7 @@ from ..strategies import TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY
 from ..strategies import TCGEN05_WARP_SPEC_STORE_WARPS_KEY
 from ..strategies import Tcgen05LayoutStrategy
 from ..strategies import Tcgen05PersistenceModel
+from ..strategies import tcgen05_explicit_epilogue_tile_supported
 from ..tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP
 from ..tcgen05_constants import TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
@@ -59,6 +60,8 @@ from ..tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
+from ..tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N
+from ..tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_N
 from ..tcgen05_constants import TCGEN05_REGION_PID_TYPE_CHOICES
 from ..tcgen05_constants import TCGEN05_REGION_PID_TYPE_INHERIT
 from ..tcgen05_constants import TCGEN05_REGION_PID_TYPES_CONFIG_KEY
@@ -996,6 +999,44 @@ def _config_is_two_cta_mma(
     return (
         bm == TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
         and state.matmul_input_dtype == torch.float8_e4m3fn
+    )
+
+
+def _plain_narrow_subtile_facts(
+    state: CuteTcgen05Config, *, bm: int, bn: int, cluster_m: int
+) -> bool:
+    """The epilogue facts of ``cute_mma``'s plain narrow-subtile rule.
+
+    A plain 16-bit store on the 256-wide two-CTA tile -- one output, no
+    broadcast rows, no auxiliary operand (an exact-shape one keeps the
+    plan's with-source subtile) -- renders ``(128,
+    TCGEN05_PLAIN_NARROW_SUBTILE_N)`` subtiles.  The plan also asks for
+    static full tiles, a row-major output and a TMA-store epilogue; the
+    callers that know those facts check them.
+    """
+    facts = state.rowvec_aux_facts
+    constraints = state.ab_stages_three_search_constraints
+    return (
+        facts is not None
+        and constraints is not None
+        and facts.output_itemsize == 2
+        and not facts.rows
+        and facts.output_count == 1
+        and not state.aux_kernel_detected
+        and constraints.dtype_bytes == 2
+        and cluster_m == 2
+        and bn == TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N
+        and facts.exact_aux_count == 0
+        and tcgen05_explicit_epilogue_tile_supported(
+            is_two_cta=True,
+            bm=bm,
+            bn=bn,
+            tile_shape=(
+                128,
+                TCGEN05_PLAIN_NARROW_SUBTILE_N,
+                TCGEN05_PLAIN_NARROW_SUBTILE_N,
+            ),
+        )
     )
 
 

@@ -48,6 +48,7 @@ from ..strategies import TCGEN05_WARP_SPEC_STORE_WARPS_KEY
 from ..strategies import Tcgen05LayoutStrategy
 from ..strategies import Tcgen05PersistenceModel
 from ..strategies import Tcgen05Strategy
+from ..tcgen05.knobs import epi_subtile_n_knob
 from ..tcgen05_constants import TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_AUX_LOAD_MODE_EPI_TMA
@@ -62,6 +63,7 @@ from ..tcgen05_constants import TCGEN05_C_STORE_MODE_DIRECT
 from ..tcgen05_constants import TCGEN05_CLUSTER_N2_SEED_L2_GROUPING
 from ..tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
+from ..tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_N
 from ..tcgen05_constants import TCGEN05_REGION_PID_TYPE_INHERIT
 from ..tcgen05_constants import TCGEN05_REGION_PID_TYPES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_SMALL_GRID_DIRECT_STORE_MAX_BN
@@ -352,6 +354,34 @@ def _paired_pipeline_parameters(
     ):
         return None
     return cast("tuple[int, int, int, int, int]", (bm, bn, bk, c_stages, acc_stages))
+
+
+def _paired_pipeline_store_subtile_n(
+    state: CuteTcgen05Config, config: dict[str, object], *, bm: int, bn: int, bk: int
+) -> int | None:
+    """The C-ring subtile width the 256-row pair's store codegen allocates.
+
+    A configured ``tcgen05_epi_subtile_n`` wins; otherwise the plain
+    narrow rule's 32 columns where codegen applies it: the epilogue facts
+    ``epilogue_subtile`` checks (``_plain_narrow_subtile_facts``) plus the
+    static full tiles, row-major output and TMA-store epilogue the plan
+    also asks for.  ``None`` keeps ``pipeline_smem_bytes``' with-source
+    tile, the only place that width is computed.
+    """
+    configured = epi_subtile_n_knob(config)
+    if configured is not None:
+        return configured
+    pipeline_facts = state.pipeline_smem_facts
+    if (
+        bm == TCGEN05_TWO_CTA_BLOCK_M
+        and pipeline_facts is not None
+        and not pipeline_facts.output_column_major
+        and config.get("tcgen05_c_store_mode", "normal") == "normal"
+        and facts._plain_narrow_subtile_facts(state, bm=bm, bn=bn, cluster_m=2)
+        and facts._static_full_tiles(state, bm=bm, bn=bn, bk=bk)
+    ):
+        return TCGEN05_PLAIN_NARROW_SUBTILE_N
+    return None
 
 
 def _region_two_cta_tile(
