@@ -2621,6 +2621,9 @@ def default_pallas_launcher(
     _uses_remote_copy: bool = False,
     _matmul_dot_general: dict[str, object] | None = None,
     _compact_build_worklist: Callable[..., object] | None = None,
+    _compact_fill_worklist: Callable[..., object] | None = None,
+    _compact_upper: int = 0,
+    _compact_sublane: int = 0,
     _compact_offset_arg_indices: list[int] | None = None,
     _compact_metadata_fields: list[str] | None = None,
     _compact_owner_ref_pos: int = 0,
@@ -2642,9 +2645,11 @@ def default_pallas_launcher(
 
     Dispatch is driven entirely by launcher-observable inputs:
 
-    - ``_compact_build_worklist`` present → the kernel builds a
-      dynamic-``num_work`` grid via ``_pallas_compile_compact_jit_fn``
-      (compact-worklist path).
+    - ``_compact_build_worklist`` or ``_compact_fill_worklist`` present → the
+      kernel runs a dynamic-``num_work`` grid via
+      ``_pallas_compile_compact_jit_fn`` (compact-worklist path); the
+      worklist is built by XLA ops before the kernel or, with
+      ``_compact_fill_worklist``, inside it.
     - Otherwise → the standard ``_pallas_compile_jit_fn`` path.
       ``_pallas_compile_jit_fn`` internally chooses between a plain
       ``grid`` + ``BlockSpec`` layout (no scratch) and the
@@ -2660,11 +2665,12 @@ def default_pallas_launcher(
     are excluded from pallas_call inputs to save VMEM.  Their results are
     returned as torch tensors.
     """
-    if _compact_build_worklist is not None and _collective_id is not None:
+    compact = _compact_build_worklist is not None or _compact_fill_worklist is not None
+    if compact and _collective_id is not None:
         raise RuntimeError(
             "Pallas remote_barrier is not supported by compact_worklist kernels"
         )
-    if _compact_build_worklist is None and 0 in grid:
+    if not compact and 0 in grid:
         # No program executes. Preserve in-place buffers and materialize only
         # empty output placeholders, whose contents require no initialization.
         inplace_indices = set(
@@ -2708,7 +2714,7 @@ def default_pallas_launcher(
                     for output in cast("list[torch.Tensor]", empty_outputs)
                 )
                 return outputs[0] if len(outputs) == 1 else outputs
-    if _compact_build_worklist is not None:
+    if compact:
         # Resident-cache correctness backstop: runs EVERY call (the offset arrays are
         # runtime data even when the compiled kernel is cached for this grid), raising
         # rather than silently over-reading the resident window when a source's ordered
@@ -2732,7 +2738,7 @@ def default_pallas_launcher(
         or cache[4] is None
         or cast("_LauncherFastPath", cache[4]).specialization_key != specialization_key
     ):
-        if _compact_build_worklist is not None:
+        if compact:
             cache = _pallas_install_compact_launcher_cache(
                 pallas_kernel,
                 grid,
@@ -2747,6 +2753,9 @@ def default_pallas_launcher(
                 _ds_pad_dims=_ds_pad_dims,
                 _pallas_interpret=_pallas_interpret,
                 _compact_build_worklist=_compact_build_worklist,
+                _compact_fill_worklist=_compact_fill_worklist,
+                _compact_upper=_compact_upper,
+                _compact_sublane=_compact_sublane,
                 _compact_offset_arg_indices=_compact_offset_arg_indices,
                 _compact_metadata_fields=_compact_metadata_fields,
                 _compact_owner_ref_pos=_compact_owner_ref_pos,
@@ -2847,6 +2856,46 @@ def _compact_window_block_spec(
     return pl.BlockSpec(block_shape, index_map)  # type: ignore[union-attr]
 
 
+def _compact_aligned_window_block_spec(
+    t: object,
+    window: int,
+    sublane: int,
+    start_ref: object,
+    extent_ref: object,
+    num_work_ref: object | None,
+) -> object:
+    """BlockSpec for a sublane-aligned compact window (in-kernel worklist).
+
+    ``fill_owner_tiles`` splits each owner at ``sublane``-aligned rows, so work
+    item ``wid``'s rows ``[start, end)`` lie in ``[start - start % sublane,
+    cdiv(end, sublane) * sublane)`` of at most ``window`` rows.
+
+    An output window (``num_work_ref`` given) ends at ``end - end % sublane``
+    instead (except on the last work item) because ``ordered_carry`` holds each
+    owner's partial last sublane tile for the next work item to fold and write.
+    """
+    from jax.experimental import pallas as pl
+    import jax.numpy as jnp
+
+    rows = int(t.shape[0])  # type: ignore[attr-defined]
+    ndim = int(t.ndim)  # type: ignore[attr-defined]
+
+    def index_map(wid: object) -> tuple[object, ...]:
+        start = start_ref[wid]  # type: ignore[index]
+        end = start + extent_ref[wid]  # type: ignore[index]
+        lo = start - start % sublane
+        hi = (end + sublane - 1) // sublane * sublane
+        if num_work_ref is not None:
+            last = wid == num_work_ref[0] - 1  # type: ignore[index]
+            hi = jnp.where(last, hi, end - end % sublane)
+        hi = jnp.minimum(hi, rows)
+        lo = pl.multiple_of(lo, sublane)
+        return (pl.ds(lo, hi - lo), *(jnp.int32(0) for _ in range(ndim - 1)))
+
+    block_shape = (pl.BoundedSlice(window), *t.shape[1:])  # type: ignore[attr-defined]
+    return pl.BlockSpec(block_shape, index_map)
+
+
 def _pallas_compact_in_out_specs(
     pl: object,
     jnp: object,
@@ -2865,6 +2914,9 @@ def _pallas_compact_in_out_specs(
     ordered_aligned_set: set[int] | None = None,
     range_start_ref_pos: int = -1,
     ordered_window: int = 0,
+    sublane: int = 0,
+    num_work_ref: object | None = None,
+    tile_extent_ref_pos: int = 2,
 ) -> tuple[list[object], object]:
     """Build in/out BlockSpecs for the compact-worklist emit_pipeline.
 
@@ -2876,17 +2928,30 @@ def _pallas_compact_in_out_specs(
     across work items; everything else is full/SMEM.  ``scalar_refs`` are the SMEM refs
     holding the worklist metadata tables; every ``index_map`` receives only
     ``wid`` and closes over them.
+
+    A nonzero ``sublane`` (in-kernel worklist) slices the compact tensors at
+    sublane-aligned rows instead (``_compact_aligned_window_block_spec``);
+    ``num_work_ref`` is then the SMEM ``num_work`` scalar.
     """
     aligned_set = aligned_set or set()
     ordered_aligned_set = ordered_aligned_set or set()
     all_positions = sorted(set(tensor_arg_indices) | set(output_indices))
     arg_to_tpos = {orig: tpos for tpos, orig in enumerate(all_positions)}
 
-    def _spec_for(idx: int) -> object:
+    def _spec_for(idx: int, is_output: bool) -> object:
         if idx in hbm_set:
             return pl.BlockSpec(memory_space=pltpu.HBM)  # type: ignore[union-attr]
         t = args[idx]
         assert _is_torch_tensor_or_jax_array(t)
+        if idx in aligned_set and sublane:
+            return _compact_aligned_window_block_spec(
+                t,
+                compact_block,
+                sublane,
+                scalar_refs[tile_start_ref_pos],
+                scalar_refs[tile_extent_ref_pos],
+                num_work_ref if is_output else None,
+            )
         if idx in aligned_set:
             # compact_aligned_load / compact_exact_store: one compact_block-row
             # window at tile_start, so Pallas prefetches and double-buffers both
@@ -2930,8 +2995,8 @@ def _pallas_compact_in_out_specs(
                 return pl.BlockSpec(block_shape, index_map, memory_space=mem)  # type: ignore[union-attr]
         return _pallas_make_block_spec(pl, jnp, pltpu, t, entry, idx in smem_set)
 
-    in_specs = [_spec_for(idx) for idx in tensor_arg_indices]
-    out_list = [_spec_for(idx) for idx in output_indices]
+    in_specs = [_spec_for(idx, False) for idx in tensor_arg_indices]
+    out_list = [_spec_for(idx, True) for idx in output_indices]
     out_specs = out_list if len(out_list) > 1 else out_list[0]
     return in_specs, out_specs
 
@@ -2981,11 +3046,14 @@ def _pallas_compile_compact_jit_fn(
     _scratch_shapes: list[object] | None,
     _smem_arg_indices: list[int] | None,
     _hbm_arg_indices: list[int] | None,
-    build_worklist: Callable[..., object],
     offset_arg_indices: list[int],
     metadata_fields: list[str],
     owner_ref_pos: int,
     num_scalar_prefetch: int,
+    build_worklist: Callable[..., object] | None = None,
+    fill_worklist: Callable[..., object] | None = None,
+    upper: int = 0,
+    sublane: int = 0,
     aligned_arg_indices: list[int] | None = None,
     tile_start_ref_pos: int = 1,
     compact_block: int = 1,
@@ -2995,10 +3063,19 @@ def _pallas_compile_compact_jit_fn(
     interpret: bool = False,
     placeholder_fn: Callable[[object], object] | None = None,
 ) -> _PallasCompileResult:
-    """Build the compact-worklist jit_fn: build metadata in-jit -> dynamic grid."""
+    """Build the compact-worklist jit_fn: build metadata in-jit -> dynamic grid.
+
+    ``build_worklist`` builds the metadata with XLA ops before the kernel.
+    ``fill_worklist`` instead runs inside the kernel and writes it into SMEM
+    tables of ``upper`` entries; the compact tensors are then sliced at
+    ``sublane``-aligned rows (``_pallas_compact_in_out_specs``). Exactly one
+    of the two is given.
+    """
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
     import jax.numpy as jnp
+
+    assert (build_worklist is None) != (fill_worklist is None)
 
     (
         tensor_arg_indices,
@@ -3049,8 +3126,104 @@ def _pallas_compile_compact_jit_fn(
     pass_positions = hbm_in_positions | {n_inputs + p for p in hbm_out_positions}
     pipe_positions = [p for p in range(n_io) if p not in pass_positions]
     num_launch_scalar_prefetch = num_scalar_prefetch + 1
+    tile_extent_ref_pos = (
+        metadata_fields.index("tile_extents")
+        if "tile_extents" in metadata_fields
+        else -1
+    )
+    # In-kernel worklist: the kernel reads an SMEM offsets tensor from the SMEM
+    # copy ``fill_worklist`` reads, so that tensor is not pipelined.
+    smem_offset_tpos = [
+        tp
+        for tp, idx in zip(offset_tpos, offset_arg_indices, strict=True)
+        if fill_worklist is not None and idx in smem_set
+    ]
+    pipe_positions = [p for p in pipe_positions if p not in smem_offset_tpos]
+
+    def run_pipeline(
+        io_any: tuple[object, ...],
+        metadata_smem: tuple[object, ...],
+        kernel_scratch: tuple[object, ...],
+        num_work_smem: object,
+        smem_inputs: dict[int, object],
+    ) -> None:
+        in_specs, out_specs = _pallas_compact_in_out_specs(
+            pl,
+            jnp,
+            pltpu,
+            args,
+            tensor_arg_indices,
+            _output_indices,
+            _block_spec_info,
+            smem_set,
+            hbm_set,
+            owner_ref_pos,
+            metadata_smem,
+            aligned_set,
+            tile_start_ref_pos,
+            compact_block,
+            ordered_set,
+            range_start_ref_pos,
+            ordered_window,
+            sublane=sublane,
+            num_work_ref=num_work_smem,
+            tile_extent_ref_pos=tile_extent_ref_pos,
+        )
+        out_specs_seq = (
+            list(out_specs) if isinstance(out_specs, (list, tuple)) else [out_specs]
+        )
+        all_specs = list(in_specs) + out_specs_seq
+        pipe_in_specs = [all_specs[p] for p in pipe_positions if p < n_inputs]
+        pipe_out_specs = [all_specs[p] for p in pipe_positions if p >= n_inputs]
+        pipe_any = [io_any[p] for p in pipe_positions]
+
+        def pipeline_body(*block_refs: object) -> None:
+            merged = list(io_any)
+            for p, ref in smem_inputs.items():
+                merged[p] = ref
+            for p, block in zip(pipe_positions, block_refs, strict=True):
+                merged[p] = block
+            reordered_kernel(*metadata_smem, *merged, *kernel_scratch)  # type: ignore[operator]
+
+        # Correctness relies on emit_pipeline running grid steps
+        # sequentially in ascending order (a later work item re-writes
+        # the previous item's spilled store rows) and re-fetching an
+        # input block only when its index map changes (owner-indexed
+        # k/v reuse).
+        pltpu.emit_pipeline(  # type: ignore[union-attr]
+            pipeline_body,
+            # num_work may be 0 (empty batch): zero steps, empty output.
+            grid=(num_work_smem[0],),  # type: ignore[index]
+            in_specs=pipe_in_specs,
+            out_specs=pipe_out_specs,
+        )(*pipe_any)
+
+    def kernel_call(
+        kernel_body: Callable[..., None], all_scratch: list[object]
+    ) -> Callable[..., object]:
+        mesh = pltpu.TensorCoreMesh(axis_name="_helion_core", num_cores=1)
+        return pl.kernel(  # type: ignore[union-attr]
+            kernel_body,
+            out_shape_arg,
+            mesh=mesh,
+            # scratch kwarg name is version-dependent (scratch_shapes vs
+            # scratch_types); pass whichever this pallas exposes.
+            **{_pallas_kernel_scratch_kwarg(pl): all_scratch},  # pyrefly: ignore[bad-argument-type]
+            compiler_params=pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
+                # The device capacity is also the largest scoped-Vmem XLA will
+                # accept, so never request more: a bare kernel call is clamped
+                # down with a warning, but the same request inside a shard_map
+                # is rejected outright (INVALID_ARGUMENT; see
+                # https://openxla.org/xla/errors/error_0200).
+                # Resident caching sizes its physical window conservatively
+                # from this capacity during backend setup.
+                vmem_limit_bytes=_get_vmem_limit_bytes(pltpu, interpret),
+            ),
+            interpret=interpret,
+        )
 
     def jit_fn(*jax_inputs: object) -> object:
+        assert build_worklist is not None
         offsets = [jax_inputs[tp] for tp in offset_tpos]
         metadata = build_worklist(*offsets)
         # Keep the dynamic grid bound explicit rather than closing over the
@@ -3083,79 +3256,47 @@ def _pallas_compile_compact_jit_fn(
             scalar_smem = rest[n_kernel_scratch:]
             for src, dst in zip(scalar_any, scalar_smem, strict=True):
                 pltpu.sync_copy(src, dst)  # type: ignore[union-attr]
-            num_work_smem = scalar_smem[0]
-            metadata_smem = scalar_smem[1:]
-
-            in_specs, out_specs = _pallas_compact_in_out_specs(
-                pl,
-                jnp,
-                pltpu,
-                args,
-                tensor_arg_indices,
-                _output_indices,
-                _block_spec_info,
-                smem_set,
-                hbm_set,
-                owner_ref_pos,
-                tuple(metadata_smem),
-                aligned_set,
-                tile_start_ref_pos,
-                compact_block,
-                ordered_set,
-                range_start_ref_pos,
-                ordered_window,
+            run_pipeline(
+                io_any, tuple(scalar_smem[1:]), kernel_scratch, scalar_smem[0], {}
             )
-            out_specs_seq = (
-                list(out_specs) if isinstance(out_specs, (list, tuple)) else [out_specs]
+
+        return kernel_call(kernel_body, all_scratch)(*scalar_prefetch, *jax_inputs)
+
+    def fill_jit_fn(*jax_inputs: object) -> object:
+        assert fill_worklist is not None
+        assert upper > 0
+        offset_types = [
+            pltpu.SMEM(tuple(jax_inputs[tp].shape), jax_inputs[tp].dtype)  # type: ignore[union-attr,attr-defined]
+            for tp in offset_tpos
+        ]
+        table_types = [
+            pltpu.SMEM((1,), jnp.int32),  # type: ignore[union-attr]
+            *(pltpu.SMEM((upper,), jnp.int32) for _ in metadata_fields),  # type: ignore[union-attr]
+        ]
+        all_scratch: list[object] = [*scratch_shapes, *offset_types, *table_types]
+        tables_at = n_io + n_kernel_scratch + len(offset_tpos)
+
+        def kernel_body(*refs: object) -> None:
+            io_any = refs[:n_io]
+            kernel_scratch = refs[n_io : n_io + n_kernel_scratch]
+            offset_smem = refs[n_io + n_kernel_scratch : tables_at]
+            num_work_smem, *metadata_smem = refs[tables_at:]
+            for tp, dst in zip(offset_tpos, offset_smem, strict=True):
+                pltpu.sync_copy(io_any[tp], dst)  # type: ignore[union-attr]
+            fill_worklist(*offset_smem, num_work_smem, *metadata_smem)
+            smem_inputs = {
+                tp: ref
+                for tp, ref in zip(offset_tpos, offset_smem, strict=True)
+                if tp in smem_offset_tpos
+            }
+            run_pipeline(
+                io_any, tuple(metadata_smem), kernel_scratch, num_work_smem, smem_inputs
             )
-            all_specs = list(in_specs) + out_specs_seq
-            pipe_in_specs = [all_specs[p] for p in pipe_positions if p < n_inputs]
-            pipe_out_specs = [all_specs[p] for p in pipe_positions if p >= n_inputs]
-            pipe_any = [io_any[p] for p in pipe_positions]
 
-            def pipeline_body(*block_refs: object) -> None:
-                merged = list(io_any)
-                for p, block in zip(pipe_positions, block_refs, strict=True):
-                    merged[p] = block
-                reordered_kernel(*metadata_smem, *merged, *kernel_scratch)  # type: ignore[operator]
-
-            # Correctness relies on emit_pipeline running grid steps
-            # sequentially in ascending order (a later work item re-writes
-            # the previous item's spilled store rows) and re-fetching an
-            # input block only when its index map changes (owner-indexed
-            # k/v reuse).
-            pltpu.emit_pipeline(  # type: ignore[union-attr]
-                pipeline_body,
-                # num_work may be 0 (empty batch): zero steps, empty output.
-                grid=(num_work_smem[0],),  # type: ignore[index]
-                in_specs=pipe_in_specs,
-                out_specs=pipe_out_specs,
-            )(*pipe_any)
-
-        mesh = pltpu.TensorCoreMesh(axis_name="_helion_core", num_cores=1)
-        call = pl.kernel(  # type: ignore[union-attr]
-            kernel_body,
-            out_shape_arg,
-            mesh=mesh,
-            # scratch kwarg name is version-dependent (scratch_shapes vs
-            # scratch_types); pass whichever this pallas exposes.
-            **{_pallas_kernel_scratch_kwarg(pl): all_scratch},  # pyrefly: ignore[bad-argument-type]
-            compiler_params=pltpu.CompilerParams(  # pyrefly: ignore[bad-instantiation]
-                # The device capacity is also the largest scoped-Vmem XLA will
-                # accept, so never request more: a bare kernel call is clamped
-                # down with a warning, but the same request inside a shard_map
-                # is rejected outright (INVALID_ARGUMENT; see
-                # https://openxla.org/xla/errors/error_0200).
-                # Resident caching sizes its physical window conservatively
-                # from this capacity during backend setup.
-                vmem_limit_bytes=_get_vmem_limit_bytes(pltpu, interpret),
-            ),
-            interpret=interpret,
-        )
-        return call(*scalar_prefetch, *jax_inputs)
+        return kernel_call(kernel_body, all_scratch)(*jax_inputs)
 
     return _PallasCompileResult(
-        jit_fn=_x64_scoped_jit_fn(jit_fn),
+        jit_fn=_x64_scoped_jit_fn(jit_fn if fill_worklist is None else fill_jit_fn),
         tensor_arg_indices=tensor_arg_indices,
         output_only_indices=output_only_indices,
         arg_to_tensor_pos=arg_to_tensor_pos,
@@ -3178,7 +3319,6 @@ def _pallas_install_compact_launcher_cache(
     _hbm_arg_indices: list[int] | None,
     _ds_pad_dims: list[tuple[int, int, int, int]] | None,
     _pallas_interpret: bool | None,
-    _compact_build_worklist: Callable[..., object],
     _compact_offset_arg_indices: list[int] | None,
     _compact_metadata_fields: list[str] | None,
     _compact_owner_ref_pos: int,
@@ -3186,6 +3326,11 @@ def _pallas_install_compact_launcher_cache(
     _compact_aligned_arg_indices: list[int] | None,
     _compact_tile_start_ref_pos: int,
     _compact_block: int,
+    _compact_build_worklist: Callable[..., object] | None = None,
+    # In-kernel worklist (``_fill_worklist``) params.
+    _compact_fill_worklist: Callable[..., object] | None = None,
+    _compact_upper: int = 0,
+    _compact_sublane: int = 0,
     # Resident-cache (owner-cache) compile params; default to inactive so a
     # non-resident compact kernel compiles unchanged.
     _compact_ordered_aligned_arg_indices: list[int] | None = None,
@@ -3227,6 +3372,9 @@ def _pallas_install_compact_launcher_cache(
         _smem_arg_indices=_smem_arg_indices,
         _hbm_arg_indices=_hbm_arg_indices,
         build_worklist=_compact_build_worklist,
+        fill_worklist=_compact_fill_worklist,
+        upper=_compact_upper,
+        sublane=_compact_sublane,
         offset_arg_indices=_compact_offset_arg_indices or [],
         metadata_fields=_compact_metadata_fields or [],
         owner_ref_pos=_compact_owner_ref_pos,
