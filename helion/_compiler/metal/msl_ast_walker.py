@@ -71,10 +71,15 @@ class EmitState:
     #: Each fragment group's accumulator root to its fragment grid ``(rows,
     #: cols, transposed)`` (``fragment_mma``).
     fragments: dict[str, tuple[int, int, int]] = dataclasses.field(default_factory=dict)
-    #: The kernel's names that are integer constants, which a fragment run
-    #: folds its elements' index arithmetic over (``fragment_mma``'s
-    #: ``kernel_constants``).
-    constants: dict[str, int] = dataclasses.field(default_factory=dict)
+    #: The kernel's names that are constants, which a fragment run folds its
+    #: elements' index arithmetic over and tabulates their decodes with
+    #: (``fragment_mma``'s ``kernel_constants``).
+    constants: dict[str, int | float] = dataclasses.field(default_factory=dict)
+    #: Each ``constant`` table (``tabulate``) by its element type and
+    #: entries, to its name; the kernel's source declares them.
+    tables: dict[tuple[str, tuple[str, ...]], str] = dataclasses.field(
+        default_factory=dict
+    )
     #: The element an element loop's ``_helion_mpp_put`` writes.
     put: str = "*_it"
 
@@ -563,8 +568,8 @@ def _emit_for(
       _it != coop.end(); _it++)`` with the tensor's names substituted by
       ``(*_it)`` in the body, or a fragment group's unrolled loop over the
       elements each lane holds (``fragment_mma.fragment_elements``)
-    - ``_helion_mpp_fragments(acc, steps, facts)`` → a fragment group's op
-      over one K tile (``fragment_mma.emit_fragment_run``)
+    - ``_helion_mpp_fragments(acc, steps, facts, tables)`` → a fragment
+      group's op over one K tile (``fragment_mma.emit_fragment_run``)
     """
     pad = " " * indent
     it = stmt.iter
