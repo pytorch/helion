@@ -331,6 +331,24 @@ def _loop_bounds(device_ir: DeviceIR) -> dict[int, tuple[object, object]]:
     return {block: b for block, b in bounds.items() if block not in ambiguous}
 
 
+def _staged_matmuls(plan: MppPlan) -> tuple[tuple[int, int, int], ...]:
+    """``MetalKernelFacts.staged_matmuls``: the MPP plan's K-loop groups
+    with one operand staged per K tile beside a device view."""
+    found = []
+    for group in plan.by_matmul.values():
+        per_tile = [
+            op.staged and op.hoist is None and op.elements is None
+            for op in (group.lhs, group.rhs)
+        ]
+        if not group.levels or per_tile.count(True) != 1:
+            continue
+        if per_tile[1] and group.lhs.view is not None:
+            found.append((group.m_block, group.n_block, group.k_block))
+        elif per_tile[0] and group.rhs.view is not None:
+            found.append((group.n_block, group.m_block, group.k_block))
+    return tuple(found)
+
+
 class MetalBackend(Backend):
     """Metal Shading Language (MSL) code generation backend for macOS."""
 
@@ -338,8 +356,9 @@ class MetalBackend(Backend):
 
     def autotuner_heuristics(self) -> tuple[AutotunerHeuristicType, ...]:
         from .row_reduction_heuristic import MetalRowReductionHeuristic
+        from .staged_matmul_heuristic import MetalStagedMatmulHeuristic
 
-        return (MetalRowReductionHeuristic,)
+        return (MetalRowReductionHeuristic, MetalStagedMatmulHeuristic)
 
     @staticmethod
     def _get_dtype_to_metal() -> dict[torch.dtype, str]:
@@ -613,8 +632,11 @@ class MetalBackend(Backend):
         ``metal_matmul`` to the search): the planner's fragment trial on
         copies of the graphs, with no block spread over threads.  Then the
         sizes of the tables its fragment elements would read
-        (``metal_tabulate_max_entries``), and a ``range_num_stages`` slot per
-        K loop, for loading its runs' operands a tile ahead."""
+        (``metal_tabulate_max_entries``), a ``range_num_stages`` slot per
+        K loop, for loading its runs' operands a tile ahead, and the blocks
+        of the matmuls that stage an operand per K tile
+        (``MetalKernelFacts.staged_matmuls``, which the staged-matmul seeds
+        read)."""
         from ..compile_environment import CompileEnvironment
         from ..compile_environment import FixedBlockSizeSource
         from ..device_ir import ForLoopGraphInfo
@@ -651,7 +673,11 @@ class MetalBackend(Backend):
             except exc.BackendUnsupported:
                 plan = None
             free = free_arange_blocks()
-        launch_facts = MetalKernelFacts()
+        # The MPP matmuls that stage an operand per K tile, which the staged
+        # matmul heuristic seeds tall tiles for.
+        launch_facts = MetalKernelFacts(
+            staged_matmuls=() if mpp is None else _staged_matmuls(mpp)
+        )
         reductions = any(
             info.reduction for info in CompileEnvironment.current().block_sizes
         )
@@ -693,14 +719,16 @@ class MetalBackend(Backend):
             # cases of one launch, each with its own tiles, and sibling loops
             # don't nest, so those kernels get no fit (follow-up).
             if any(loops) and len(device_ir.grid_block_ids) == 1 and len(loops) <= 2:
-                launch_facts = MetalKernelFacts(
+                launch_facts = dataclasses.replace(
+                    launch_facts,
                     thread_loops=tuple(loops),
                     literal_threads=tuple(literals),
                     reduced_after_loop=frozenset(
                         blocks_reduced_after_loop(device_ir) & tunable
                     ),
                 )
-                config_spec.backend_facts = launch_facts
+        if launch_facts != MetalKernelFacts():
+            config_spec.backend_facts = launch_facts
         if plan is None:
             return
         blocks = tuple(sorted({group.k_block for group in plan.by_matmul.values()}))

@@ -30,8 +30,11 @@ import helion
 from helion import exc
 from helion._compiler.metal import mpp_matmul
 from helion._compiler.metal import tile_sharing
+from helion._compiler.metal.staged_matmul_heuristic import MetalStagedMatmulHeuristic
 from helion._testing import import_example
 from helion._testing.metal import run_with_msl
+from helion._testing.metal_staged import dequant_args
+from helion._testing.metal_staged import dequant_mm
 import helion.language as hl
 
 attention = import_example("attention").attention
@@ -17645,6 +17648,37 @@ class TestTileSharingRules(unittest.TestCase):
         tiles = [("A", "float", 512), ("B", "float", 1024), ("C", "float", 2048)]
         _, kept = _share(source, tiles)
         self.assertEqual(kept, [("A", "float", 512), ("B", "float", 2048)])
+
+
+@_requires_mps
+class TestStagedMatmulSeedsRun(unittest.TestCase):
+    def test_seeds_compile_and_match(self) -> None:
+        """Every seed compiles to an MPP run with the staging dealt over the
+        rows' threads and matches the reference, at a tail on every side."""
+        args = dequant_args(300, 80, 544, "mps")
+        x, wq, s = (t.cpu() for t in args)
+        shifts = torch.arange(8) * 4
+        nib = ((wq.long()[..., None] >> shifts) & 0xF).reshape(80, 544)
+        w = ((nib.double() - 8.0) * s.double().repeat_interleave(32, 1)).to(
+            torch.bfloat16
+        )
+        ref = x.double() @ w.double().T
+        bound = dequant_mm.bind(args)
+        assert bound.host_function is not None
+        with bound.env:
+            seeds = MetalStagedMatmulHeuristic.get_seed_configs(
+                bound.env, bound.host_function.device_ir
+            )
+        self.assertEqual(len(seeds), 4)
+        for seed in seeds:
+            with self.subTest(seed=seed):
+                out, _, msl = run_with_msl(dequant_mm, args, seed)
+                assert isinstance(out, torch.Tensor)
+                torch.testing.assert_close(
+                    out.cpu().double(), ref, rtol=2e-2, atol=2e-1
+                )
+                self.assertIn("matmul2d_descriptor(256,", msl)
+                self.assertRegex(msl, r"for \(int lane_\d+ = tid\[0\];")
 
 
 if __name__ == "__main__":
