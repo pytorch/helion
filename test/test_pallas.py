@@ -990,6 +990,8 @@ def kernel_output_index_remapping(
 
     Iterates over the combined batch*heads dimension and the seq_len dimension.
     """
+    batch = hl.specialize(batch)
+    heads = hl.specialize(heads)
     batch_heads, seq_len, head_dim = x.size()
     out = torch.empty([batch, heads, seq_len, head_dim], dtype=x.dtype, device=x.device)
     for bh in hl.grid(batch_heads):
@@ -1598,7 +1600,7 @@ class TestPallas(TestCase):
         with self.subTest(name="shrunken_blockspec"):
             self.assertIn(
                 "pl.BlockSpec((1, 1, _BLOCK_SIZE_1, 128), "
-                "lambda _j: (offset_0 // heads, offset_0 % heads, _j, 0)",
+                f"lambda _j: (offset_0 // {heads}, offset_0 % {heads}, _j, 0)",
                 code,
             )
 

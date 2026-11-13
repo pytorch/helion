@@ -19,11 +19,54 @@ from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import xfailIfPallas
+from helion._testing.constant_membership import filtered_collection_predicate
+from helion._testing.constant_membership import filtered_collection_reduction
 import helion.language as hl
 
 
 @onlyBackends(["triton", "pallas", "cute"])
 class TestControlFlow(RefEagerTestBase, TestCase):
+    @onlyBackends(["triton", "cute"])
+    @skipIfRefEager("checks reuse of the compiled binding")
+    def test_filtered_host_collection_device_branch(self):
+        kernel = helion.kernel(
+            filtered_collection_predicate,
+            config=helion.Config(block_sizes=[8]),
+        )
+        x = torch.arange(7, device=DEVICE, dtype=torch.float32)
+        original = x.clone()
+        bound = kernel.bind((x, 3, "truth", True))
+        for limit, bias in ((3, 7), (0, 3), (3, 7)):
+            self.assertIs(kernel.bind((x, limit, "truth", True)), bound)
+            torch.testing.assert_close(
+                kernel(x, limit, "truth", True), x + bias, rtol=0, atol=0
+            )
+        torch.testing.assert_close(x, original, rtol=0, atol=0)
+
+    @onlyBackends(["triton", "cute"])
+    @skipIfRefEager("checks reuse of the compiled binding")
+    def test_filtered_host_reduction_passes_current_scalar(self):
+        x = torch.arange(7, device=DEVICE, dtype=torch.float32)
+        for form in ("sum", "float", "any", "shape"):
+            kernel = helion.kernel(
+                filtered_collection_reduction,
+                config=helion.Config(block_sizes=[8]),
+            )
+            bound = kernel.bind((x, 3, form))
+            for limit in (9, 0, 1, 9):
+                self.assertIs(kernel.bind((x, limit, form)), bound)
+                choices = x.shape if form == "shape" else (1, 2, 3)
+                values = [value for value in choices if value > limit]
+                bias = {
+                    "sum": sum(values),
+                    "shape": sum(values),
+                    "float": sum(values, 0.5),
+                    "any": any(values),
+                }[form]
+                torch.testing.assert_close(
+                    kernel(x, limit, form), x + bias, rtol=0, atol=0
+                )
+
     def test_if_arg(self):
         @helion.kernel()
         def fn(x, v):

@@ -14,6 +14,7 @@ from typing import Callable
 from typing import cast
 
 import torch
+from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 
 from ... import exc
 from ..._compat import num_compute_units
@@ -280,9 +281,13 @@ class PallasBackend(Backend):
         super().__init__()
         # Filled by ``build_launcher_args``; the launcher returns these tensors.
         self._output_only_names: list[str] = []
+        self._cacheable_output_only_names: list[str] = []
 
     def output_only_names(self) -> list[str]:
         return self._output_only_names
+
+    def cacheable_output_only_names(self) -> list[str]:
+        return self._cacheable_output_only_names
 
     @property
     def supports_autotune_multi(self) -> bool:
@@ -316,9 +321,9 @@ class PallasBackend(Backend):
 
     @property
     def requires_shape_specialized_module(self) -> bool:
-        # Pallas modules hold monomorphic, shape-specific cached state
-        # (output-meta descriptor, launcher cache, ds-pad decision, signature
-        # lock), so each static-shape specialization needs its own module.
+        # Static-shape output-meta slots are fixed for an input specialization,
+        # so those bindings need separate modules. Other output metadata is
+        # rebuilt per call; launcher entries separately key actual geometry.
         return True
 
     def max_reduction_threads(self) -> int | None:
@@ -1649,6 +1654,7 @@ class PallasBackend(Backend):
         from ..device_function import DeviceFunction
         from ..device_function import TensorArg
         from ..host_function import HostFunction
+        from ..variable_origin import BlockSizeOrigin
 
         device_fn = DeviceFunction.current()
 
@@ -1712,13 +1718,39 @@ class PallasBackend(Backend):
         # allocations to ``device='meta'`` and capture the launcher return.
         output_only_set = set(output_indices) - set(inplace_indices)
         output_only_names: list[str] = []
+        cacheable_output_only_names: list[str] = []
         if sorted_args is not None:
+            env = CompileEnvironment.current()
+            host_fn = HostFunction.current()
+            configured_symbols = {
+                symbol
+                for symbol, info in host_fn.expr_to_origin.items()
+                if isinstance(info.origin, BlockSizeOrigin)
+            }
             for i in output_indices:
                 if i in output_only_set:
                     arg = sorted_args[i]
                     assert isinstance(arg, TensorArg)
+                    # Backed input dimensions and configured block sizes are
+                    # fixed by a static-shape binding. Other metadata must be
+                    # recomputed before the launcher selects its specialization.
+                    metadata = (
+                        *arg.fake_value.shape,
+                        *arg.fake_value.stride(),
+                        arg.fake_value.storage_offset(),
+                    )
+                    if not any(
+                        isinstance(value, torch.SymInt)
+                        and free_unbacked_symbols(
+                            env.specialize_expr(env.shape_env.replace(value._sympy_()))
+                        )
+                        - configured_symbols
+                        for value in metadata
+                    ):
+                        cacheable_output_only_names.append(arg.host_str())
                     output_only_names.append(arg.host_str())
         self._output_only_names = output_only_names
+        self._cacheable_output_only_names = cacheable_output_only_names
 
         launcher_args = [*args]
         if has_rng_ops:

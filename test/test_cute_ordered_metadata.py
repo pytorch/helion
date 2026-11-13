@@ -8,6 +8,7 @@ import torch
 import helion
 from helion._testing import DEVICE
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.constant_membership import ordered_membership_phases
 from helion._testing.cute_ordered_metadata import computed_metadata_phases
 
 
@@ -39,3 +40,20 @@ def test_ordered_computed_storage_view_replay(shift):
     expected_owner = original.clone()
     expected_owner[3:].as_strided((2, 7, 8), (128, 12, 1)).mul_(-0.5)
     torch.testing.assert_close(owner, expected_owner, rtol=0, atol=0)
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("mode,bias", [("fast", 3), ("missing", 7)])
+def test_ordered_membership_native_replay(mode, bias):
+    x = torch.arange(7, device=DEVICE).float()
+    bound = helion.kernel(
+        ordered_membership_phases, backend="cute", static_shapes=True
+    ).bind((x, mode))
+    config = dict(bound.config_spec.default_config()) | {"pid_type": "flat"}
+    compiled = bound.compile_config(helion.Config.from_dict(config))
+    for delta in (0, 1):
+        changed = x + delta
+        torch.testing.assert_close(
+            compiled(changed, mode), (changed + bias) * 2, rtol=0, atol=0
+        )

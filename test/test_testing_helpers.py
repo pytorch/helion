@@ -26,6 +26,7 @@ from helion._testing import pairwise
 from helion._testing import patch_target_facts
 from helion._testing import sharding
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import tcgen05_target
 from helion._testing.sharding import MIN_WEIGHT
 from helion._testing.sharding import assign_shards
 from helion._testing.sharding import load_durations
@@ -94,6 +95,19 @@ def test_patch_target_runtime_versions_restore_nested_models(monkeypatch):
         assert _hardware.get_hardware_info() is cuda
         assert not _compat.is_hip()
     assert (torch.version.cuda, torch.version.hip) == ("host-cuda", "host-hip")
+
+
+def test_tcgen05_target_models_runtime_and_restores_nested_contexts(monkeypatch):
+    monkeypatch.setattr(torch.version, "cuda", None)
+    monkeypatch.setattr(torch.version, "hip", "host-hip")
+    expected = (B200.runtime_version, None)
+    with tcgen05_target():
+        assert (torch.version.cuda, torch.version.hip) == expected
+        with pytest.raises(RuntimeError, match="leave tcgen05 model"), tcgen05_target():
+            assert (torch.version.cuda, torch.version.hip) == expected
+            raise RuntimeError("leave tcgen05 model")
+        assert (torch.version.cuda, torch.version.hip) == expected
+    assert (torch.version.cuda, torch.version.hip) == (None, "host-hip")
 
 
 @pytest.mark.parametrize("device_kind,is_hip", [("cuda", True), ("rocm", False)])

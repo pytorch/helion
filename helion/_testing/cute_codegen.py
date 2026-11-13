@@ -7,6 +7,7 @@ from contextlib import ExitStack
 from contextlib import contextmanager
 import importlib.util
 import sys
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest import SkipTest
 from unittest.mock import patch
@@ -19,9 +20,11 @@ from torch.utils._python_dispatch import _get_current_dispatch_mode_stack
 from torch.utils._pytree import tree_leaves
 
 from .._compiler.cute.cutedsl_compat import _cute_backend_requirement_error
+from .._compiler.cute.target_facts import B200
 from .._utils import triton_is_available
 from . import cpu_render_target
 from . import default_cute_mma_support
+from . import patch_cute_mma_support
 from . import patch_target_facts
 
 if TYPE_CHECKING:
@@ -33,6 +36,33 @@ if TYPE_CHECKING:
 
     from ..runtime.kernel import BoundKernel
     from ..runtime.kernel import Kernel
+
+
+def tcgen05_mma_support() -> SimpleNamespace:
+    """Fresh legacy tcgen05 support record, without supported_impls or FP8."""
+    return SimpleNamespace(universal=True, warp_f16bf16=True, tcgen05_f16bf16=True)
+
+
+def b200_target() -> ExitStack:
+    """The B200 capability, SM count and HIP flag without CUDA work."""
+    stack = ExitStack()
+    stack.enter_context(
+        patch_target_facts(capability=(10, 0), num_sm=148, is_hip=False)
+    )
+    return stack
+
+
+def tcgen05_target() -> ExitStack:
+    """``b200_target`` plus tcgen05 MMA support, the B200 opt-in SMEM capacity
+    (the budget derives from it) and the B200 hardware identity."""
+    stack = b200_target()
+    stack.enter_context(patch_cute_mma_support(tcgen05_mma_support()))
+    stack.enter_context(
+        patch_target_facts(
+            smem_capacity_bytes=232448, hardware=B200.hardware_info(), is_hip=False
+        )
+    )
+    return stack
 
 
 def stage_sources(source: str) -> list[str]:

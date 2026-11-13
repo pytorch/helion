@@ -335,6 +335,10 @@ class Backend(abc.ABC):
         """
         return []
 
+    def cacheable_output_only_names(self) -> list[str]:
+        """Output placeholders whose metadata is fixed by input specialization."""
+        return self.output_only_names()
+
     @property
     def lowers_integer_powers(self) -> bool:
         """Whether scalar device expressions prove bounded integer powers
@@ -544,26 +548,21 @@ class Backend(abc.ABC):
         distinct Python modules (i.e. the generated module holds shape-specific
         mutable state cached across calls).
 
-        The Pallas runtime treats each generated module as the state container for
-        one static specialization -- the output-meta descriptor
-        (``_helion_output_meta_cache_N``), the launcher cache (``_pallas_cache``),
-        the ``_LauncherFastPath`` ds-pad decision, and ``_DirectCallKernel``'s
-        signature lock are all monomorphic (populated on first call, reused as-is).
-        Since ``PyCodeCache`` keys modules by source text, a shape-polymorphic body
-        (e.g. ``compact_worklist``) would otherwise share one module across shapes
-        and inherit the first shape's state; the compiler folds the input signature
-        into the module cache key to prevent that.
+        Pallas caches output-meta descriptors proven fixed by a static input
+        specialization on the generated module. Since ``PyCodeCache`` keys
+        modules by source text, distinct static bindings could otherwise share
+        a module and inherit its first descriptors. The compiler folds the input
+        signature into the module cache key to prevent that.
 
         Backends that allocate outputs fresh each call and hold no shape-dependent
         module state (e.g. Triton) return False and may freely share a module
         across shapes.
 
-        The per-module signature only discriminates shapes that ``bind()`` already
-        keys to distinct BoundKernels -- i.e. shapes derived from tensor metadata
-        (shape/dtype/stride/device). An output extent driven by an *unbacked* scalar
-        arg is collapsed by ``bind()`` to a single BoundKernel, so it is not
-        distinguished here; such kernels must ``hl.specialize()`` the scalar to get a
-        distinct module per extent.
+        This signature only distinguishes inputs that ``bind()`` already keys to
+        separate BoundKernels. Pallas creates other output descriptors per call
+        and keys launcher state, padding decisions and direct-call signatures
+        by the actual argument metadata. Runtime scalar extents and post-mutation
+        shapes therefore do not require a separate module per value.
         """
         return False
 

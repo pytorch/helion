@@ -370,19 +370,25 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, x + x.stride(0))
         self.assertIn("stride = x.stride(0)", code)
 
-        # CuTe guards the unit-stride axes and byte-alignment class needed by
-        # vector copies. Exact stride values within that class stay dynamic.
+        # empty_like separates canonical and noncanonical input layouts.
+        # Exact strides within the noncanonical class remain runtime values.
         padded = torch.empty_strided(
             x.size(), (2 * x.stride(0), 1), dtype=x.dtype, device=x.device
         )
         padded.copy_(x)
-        self.assertIs(fn.bind((x,)), fn.bind((padded,)))
+        self.assertIsNot(fn.bind((x,)), fn.bind((padded,)))
         torch.testing.assert_close(fn(padded), padded + padded.stride(0))
+        more_padded = torch.empty_strided(
+            x.size(), (3 * x.stride(0), 1), dtype=x.dtype, device=x.device
+        )
+        more_padded.copy_(x)
+        self.assertIs(fn.bind((padded,)), fn.bind((more_padded,)))
+        torch.testing.assert_close(fn(more_padded), more_padded + more_padded.stride(0))
         transposed = x.T
         if fn.settings.backend == "cute":
-            self.assertIsNot(fn.bind((x,)), fn.bind((transposed,)))
+            self.assertIsNot(fn.bind((padded,)), fn.bind((transposed,)))
         else:
-            self.assertIs(fn.bind((x,)), fn.bind((transposed,)))
+            self.assertIs(fn.bind((padded,)), fn.bind((transposed,)))
         torch.testing.assert_close(fn(transposed), transposed + transposed.stride(0))
 
     def test_unspecialized_device_stride_uses_current_layout(self):
@@ -427,12 +433,18 @@ class TestSpecialize(RefEagerTestBase, TestCase):
             x.size(), (2 * x.stride(0), 1), dtype=x.dtype, device=x.device
         )
         padded.copy_(x)
-        self.assertIs(fn.bind((x,)), fn.bind((padded,)))
+        self.assertIsNot(fn.bind((x,)), fn.bind((padded,)))
         torch.testing.assert_close(fn(padded), padded + 3)
+        more_padded = torch.empty_strided(
+            x.size(), (3 * x.stride(0), 1), dtype=x.dtype, device=x.device
+        )
+        more_padded.copy_(x)
+        self.assertIs(fn.bind((padded,)), fn.bind((more_padded,)))
+        torch.testing.assert_close(fn(more_padded), more_padded + 3)
         if fn.settings.backend == "cute":
-            self.assertIsNot(fn.bind((x,)), fn.bind((transposed,)))
+            self.assertIsNot(fn.bind((padded,)), fn.bind((transposed,)))
         else:
-            self.assertIs(fn.bind((x,)), fn.bind((transposed,)))
+            self.assertIs(fn.bind((padded,)), fn.bind((transposed,)))
         torch.testing.assert_close(fn(transposed), transposed + 1)
 
     def test_specialize_stride_basic(self):

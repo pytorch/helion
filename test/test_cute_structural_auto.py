@@ -9,12 +9,12 @@ import pytest
 import torch
 
 from test.cute_population_contracts import tcgen05_mma_support
-from test.test_cute_structural_compatibility import _pointwise
 
 import helion
 from helion._testing import cpu_render_target
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_structural_kernels import _pointwise
 from helion.runtime.cute.structural_config import CuteStructuralConfig
 from helion.runtime.cute.structural_config import StructuralPolicyError
 from helion.runtime.cute.structural_policy import CUTE_STRUCTURAL_SETTINGS

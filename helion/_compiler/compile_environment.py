@@ -145,9 +145,11 @@ class RuntimeInputSpecialization:
     ``prepared_guard_factory`` optionally builds, from the source projections
     and an expected classifier result, a cheaper predicate over the raw call
     arguments that holds exactly when the classifier would produce that result
-    again.  The prepared eager call evaluates it only after pinning every
+    again. Fast/prepared dispatch evaluates it only after pinning every
     argument's type, dtype, shape, stride and device, so the predicate needs to
-    read just the facts those pins leave open (pointers and storage spans).
+    read just the facts those pins leave open, such as pointers, storage spans
+    or tensor layout. Factories must also prove that their source paths are
+    covered by those pins; an arbitrary attribute is not covered.
     Runtime cache state is deliberately excluded from descriptor equality.
     """
 
@@ -593,6 +595,13 @@ class CompileEnvironment:
         # base alignment of any view of it.
         self._fresh_allocation_storages: set[torch.UntypedStorage] = set()
         self._zero_filled_allocation_storages: set[torch.UntypedStorage] = set()
+        # A host-selected tensor can change layout without changing the input
+        # signature. Derived host results must not inherit a representative
+        # layout, even when input shapes and strides are otherwise static.
+        self._runtime_layout_storages: set[torch.UntypedStorage] = set()
+        self._runtime_layout_stride_symbols: dict[
+            torch.UntypedStorage, set[sympy.Symbol]
+        ] = {}
         self._runtime_arg_values_by_name: contextvars.ContextVar[
             dict[str, object] | None
         ] = contextvars.ContextVar(
@@ -697,6 +706,9 @@ class CompileEnvironment:
         # Runtime-dependent optimizations must match this snapshot before they
         # consume a live alignment or aliasing fact.
         self.bound_runtime_input_specialization_results: dict[str, typing.Hashable] = {}
+        # Relocatable metadata facts are exported without granting the reusable
+        # storage-property/cache promises of the mapping above.
+        self.bound_metadata_specialization_results: dict[str, typing.Hashable] = {}
         self._tensor_input_source_cache: dict[int, Source | None] = {}
         self.jagged_tile_parent_ids: dict[int, list[int]] = {}
         self.jagged_tile_mask_shapes: dict[int, list[torch.SymInt]] = {}
@@ -1208,6 +1220,80 @@ class CompileEnvironment:
         """
         return fake_tensor.untyped_storage() in self._fresh_allocation_storages
 
+    def tensor_has_canonical_contiguous_strides(self, tensor: torch.Tensor) -> bool:
+        """Prove the canonical dense formula without ordering by size hints."""
+        expected: int | torch.SymInt = 1
+        for size, stride in reversed(
+            tuple(zip(tensor.size(), tensor.stride(), strict=True))
+        ):
+            if not self.known_equal(stride, expected):
+                return False
+            expected = expected * torch.sym_max(1, size)
+        return True
+
+    def _prove_empty_like_layout(
+        self, tensor: torch.Tensor, result: torch.Tensor
+    ) -> bool:
+        from .runtime_tensor_guards import _guard_canonical_layout
+
+        # In rank one, compaction always yields stride one for a nondegenerate
+        # extent. Empty/singleton tensors instead preserve arbitrary strides.
+        if tensor.ndim == 0 or (
+            tensor.ndim == 1 and isinstance(tensor.size(0), int) and tensor.size(0) > 1
+        ):
+            if tensor.ndim:
+                with torch.no_grad():
+                    result.as_strided_(result.size(), (1,), result.storage_offset())
+            return True
+        if (
+            tensor.ndim == 1
+            and isinstance(tensor.size(0), torch.SymInt)
+            and not self.tensor_has_canonical_contiguous_strides(tensor)
+        ):
+            # A noncanonical one-dimensional input still compacts to stride
+            # one when its actual extent exceeds one. Zero/singleton inputs
+            # share the runtime-stride path without changing their metadata.
+            if _guard_canonical_layout(
+                self, tensor, require_input=False, coalesce_degenerate=True
+            ) == (2,):
+                with torch.no_grad():
+                    result.as_strided_(result.size(), (1,), result.storage_offset())
+                return True
+        if self.tensor_has_runtime_layout(tensor):
+            return False
+        trusted = (
+            self.settings.static_shapes
+            or self.tensor_layout_is_symbolically_exact(tensor)
+        )
+        if trusted and all(
+            isinstance(value, int) for value in (*tensor.size(), *tensor.stride())
+        ):
+            return True
+        if not (
+            self.tensor_has_canonical_contiguous_strides(tensor)
+            and self.tensor_has_canonical_contiguous_strides(result)
+        ):
+            return False
+        classes = _guard_canonical_layout(self, tensor, require_input=not trusted)
+        if classes is None:
+            return False
+        # Guarded extent classes make the clamp explicit without asking
+        # ShapeEnv to simplify Max(1, size) using its bind-time ranges.
+        strides: list[int | torch.SymInt] = []
+        expected: int | torch.SymInt = 1
+        for size, extent_class in reversed(
+            tuple(zip(result.size(), classes, strict=True))
+        ):
+            strides.append(expected)
+            expected = expected * (size if extent_class in (None, 2) else 1)
+        shape = tuple(
+            size if extent_class in (None, 2) else extent_class
+            for size, extent_class in zip(result.size(), classes, strict=True)
+        )
+        with torch.no_grad():
+            result.as_strided_(shape, tuple(reversed(strides)), result.storage_offset())
+        return True
+
     def tensor_storage_is_zero_filled_allocation(
         self, fake_tensor: torch.Tensor
     ) -> bool:
@@ -1219,6 +1305,99 @@ class CompileEnvironment:
         to it afterwards is the caller's proof.
         """
         return fake_tensor.untyped_storage() in self._zero_filled_allocation_storages
+
+    def tensor_has_runtime_layout(self, tensor: torch.Tensor) -> bool:
+        return tensor.untyped_storage() in self._runtime_layout_storages
+
+    def mark_runtime_tensor_layout(self, tensor: torch.Tensor) -> None:
+        storage = tensor.untyped_storage()
+        self._runtime_layout_storages.add(storage)
+        self._symbolically_exact_layout_storages.discard(storage)
+
+    @contextlib.contextmanager
+    def track_runtime_layout_mutations(self, inputs: object) -> typing.Iterator[None]:
+        """Retain exact aliases only when the host call preserves their metadata."""
+        tensors = [
+            value
+            for value in pytree.tree_leaves(inputs)
+            if isinstance(value, torch.Tensor)
+        ]
+        before = (
+            [
+                (
+                    value,
+                    value.untyped_storage(),
+                    (*value.size(), *value.stride(), value.storage_offset()),
+                )
+                for value in tensors
+            ]
+            if any(self.tensor_has_runtime_layout(value) for value in tensors)
+            else []
+        )
+        yield
+        for value, storage, metadata in before:
+            current = (*value.size(), *value.stride(), value.storage_offset())
+            if (
+                value.untyped_storage() is not storage
+                or len(metadata) != len(current)
+                or any(
+                    not self.known_equal(left, right)
+                    for left, right in zip(metadata, current, strict=True)
+                )
+            ):
+                # An out= call may resize an existing destination. Update the
+                # original fake as well as the result: callers can discard the
+                # return value and keep reading the destination's existing type.
+                runtime_value = self.runtime_layout_tensor(value)
+                with torch.no_grad():
+                    value.as_strided_(
+                        value.size(), runtime_value.stride(), value.storage_offset()
+                    )
+
+    def propagate_runtime_tensor_layout(self, inputs: object, result: object) -> None:
+        """Carry host-selection layout uncertainty through tensor operations."""
+        input_storages = {
+            value.untyped_storage()
+            for value in pytree.tree_leaves(inputs)
+            if isinstance(value, torch.Tensor)
+        }
+        if input_storages & self._runtime_layout_storages:
+            for value in pytree.tree_leaves(result):
+                if (
+                    isinstance(value, torch.Tensor)
+                    and value.untyped_storage() not in input_storages
+                ):
+                    # Views already share their source's marker. The host-call
+                    # snapshot separately handles mutations of existing inputs.
+                    self.mark_runtime_tensor_layout(value)
+
+    def runtime_layout_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Use actual host strides while preserving the fake storage alias."""
+        storage = tensor.untyped_storage()
+        self.mark_runtime_tensor_layout(tensor)
+        known_symbols = self._runtime_layout_stride_symbols.setdefault(storage, set())
+        strides: list[int | torch.SymInt] = []
+        changed = False
+        for dim, stride in enumerate(tensor.stride()):
+            symbols = (
+                _symint_free_symbols(stride)
+                if isinstance(stride, torch.SymInt)
+                else set()
+            )
+            if symbols and symbols <= known_symbols:
+                # A view of this storage already expresses its runtime layout.
+                # A fresh allocation has its own symbol set and origin.
+                strides.append(stride)
+                continue
+            new_stride = self.cached_create_unbacked_symint(
+                ("runtime_tensor_layout", tensor, dim), self.size_hint(stride)
+            )
+            known_symbols.update(_symint_free_symbols(new_stride))
+            strides.append(new_stride)
+            changed = True
+        if not changed:
+            return tensor
+        return torch.as_strided(tensor, tensor.size(), strides, tensor.storage_offset())
 
     def register_tensor_factory_layout(
         self,
@@ -1233,9 +1412,13 @@ class CompileEnvironment:
         ``out=`` nor aliases an argument produces fresh storage, recorded for
         base-alignment proofs; for ``Tensor.new_*`` the receiver is passed as
         the first argument.  Exact layout provenance is narrower:
-        ``torch.empty`` creates a fresh layout determined entirely by its host
-        arguments, and ``torch.empty_like`` defaults to preserving its input's
-        layout, so it is exact only when that input already has this proof.
+        ``torch.empty/empty_strided/zeros/ones/full`` and ``Tensor.new_*``
+        create fresh layouts determined by their shape/stride arguments,
+        not the receiver's strides.
+        ``torch.empty_like`` can compact a non-dense input. Exactness requires
+        a fixed trusted layout or a proved canonical dense layout; ordinary
+        inputs also carry a runtime layout guard. Ambiguous dynamic layouts
+        retain runtime stride reads.
         Other factories conservatively remain runtime-strided until their
         layout contracts are added here.
         """
@@ -1260,15 +1443,34 @@ class CompileEnvironment:
         if _factory_fills_positive_zero(factory, args, kwargs):
             self._zero_filled_allocation_storages.add(result_storage)
         is_exact = False
-        if factory is torch.empty:
+        if factory in (
+            torch.empty,
+            torch.empty_strided,
+            torch.zeros,
+            torch.ones,
+            torch.full,
+            torch.Tensor.new_empty,
+            torch.Tensor.new_empty_strided,
+            torch.Tensor.new_zeros,
+            torch.Tensor.new_ones,
+            torch.Tensor.new_full,
+        ):
             is_exact = True
         elif factory is torch.empty_like:
             like_input = args[0] if args else kwargs.get("input")
-            is_exact = self.settings.static_shapes or (
-                isinstance(like_input, torch.Tensor)
-                and self.tensor_layout_is_symbolically_exact(like_input)
-            )
+            is_exact = isinstance(
+                like_input, torch.Tensor
+            ) and self._prove_empty_like_layout(like_input, result)
+            if not is_exact:
+                # Both sizes and strides affect preserve-versus-compact and
+                # dimension ordering. Bind-time hints cannot fix that choice,
+                # even when empty_strided specifies its input layout exactly.
+                self.mark_runtime_tensor_layout(result)
         if is_exact:
+            # The fresh-storage/alias checks above ensure that this cannot
+            # erase uncertainty belonging to an existing marked input/view.
+            self._runtime_layout_storages.discard(result_storage)
+            self._runtime_layout_stride_symbols.pop(result_storage, None)
             self._symbolically_exact_layout_storages.add(result_storage)
 
     def runtime_value_for_tensor(self, fake_tensor: torch.Tensor) -> object | None:

@@ -386,7 +386,6 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         if _get_backend() == "triton":
             self.assertIn("tl.atomic_add", code)
 
-    @xfailIfPallas("view-backed atomic_add targets are not supported on Pallas")
     def test_basic_atomic_add_strided_target(self):
         x_base = torch.zeros(16, device=DEVICE)
         x = x_base[::2]
