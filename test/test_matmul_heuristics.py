@@ -34,6 +34,7 @@ from helion.autotuner.config_fragment import ListOf
 from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.config_spec import DotAxes
 from helion.autotuner.config_spec import DotAxisKind
+from helion.autotuner.config_spec import DotSite
 from helion.autotuner.config_spec import KernelGridFact
 from helion.autotuner.config_spec import LiveTile
 from helion.autotuner.config_spec import LoopAxisFact
@@ -108,6 +109,54 @@ def test_arch_formula_front_ends_supply_execution_defaults() -> None:
         assert multi.promote_seed_to_default is True
         assert (("cuda", arch),) == formula.HARDWARE_TARGETS
         assert order.index(formula.__name__) < order.index(multi.__name__)
+
+
+@pytest.mark.parametrize(
+    ("m", "dtype", "loop_id", "expected_m"),
+    [
+        (32, torch.bfloat16, 2, 32),
+        (33, torch.bfloat16, 2, 64),
+        (64, torch.bfloat16, 2, 64),
+        (65, torch.bfloat16, 2, 32),
+        (48, torch.float16, 2, 32),
+        (48, torch.bfloat16, 1, 32),
+    ],
+)
+def test_h100_small_bf16_matmul_default(
+    m: int, dtype: torch.dtype, loop_id: int, expected_m: int
+) -> None:
+    fact = _matmul_fact(static_m=m)._replace(lhs_dtype=dtype, rhs_dtype=dtype)
+    axes = DotAxes(
+        DotAxisKind.TUNABLE_TILED,
+        DotAxisKind.TUNABLE_TILED,
+        DotAxisKind.TUNABLE_TILED,
+        m,
+        1024,
+        1024,
+    )
+    site = DotSite(0, True, (LoopAxisFact(loop_id, 1024),))
+    mm = SimpleNamespace(
+        attribution_complete=True,
+        matmuls=(SimpleNamespace(axes=axes, site=site),),
+        pipelined_regions=(object(),),
+    )
+    grid = KernelGridFact((RootGridFact(1, (0, 1)),), ((0, 1),))
+    spec = SimpleNamespace(
+        block_sizes=[SimpleNamespace(block_id=i) for i in range(3)],
+        kernel_matmul_fact=mm,
+        kernel_grid_fact=grid,
+    )
+    env = SimpleNamespace(config_spec=spec)
+    primary = MatmulSeedDraft([32, 32, 256], 2, 4)
+    aspect = MatmulSeedDraft([64, 16, 256], 4, 4)
+    promoted = TritonH100FormulaMatmulHeuristic._promote_aspect_seed(
+        cast("Any", env), fact, primary, aspect
+    )
+    assert promoted == (expected_m == 64)
+    if promoted:
+        assert not TritonH100FormulaMatmulHeuristic._promote_aspect_seed(
+            cast("Any", env), fact, primary, primary
+        )
 
 
 def test_h100_base_tile_is_unchanged_by_tmem_budget() -> None:
