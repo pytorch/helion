@@ -15,6 +15,7 @@ from __future__ import annotations
 import torch
 
 import helion
+from helion._testing import DEVICE
 import helion.language as hl
 
 # Optional vLLM baseline: the production kernel this is benchmarked against. The
@@ -200,13 +201,13 @@ def correctness_check() -> None:
     torch.manual_seed(0)
     for num_tokens, intermediate in _bench_shapes():
         x = torch.randn(
-            num_tokens, 2 * intermediate, device="cuda", dtype=torch.bfloat16
+            num_tokens, 2 * intermediate, device=DEVICE, dtype=torch.bfloat16
         )
         out = torch.empty(
-            num_tokens, intermediate, device="cuda", dtype=torch.float8_e4m3fn
+            num_tokens, intermediate, device=DEVICE, dtype=torch.float8_e4m3fn
         )
         scales = torch.empty(
-            num_tokens, intermediate // group_size, device="cuda", dtype=torch.float32
+            num_tokens, intermediate // group_size, device=DEVICE, dtype=torch.float32
         )
         out_ref = torch.empty_like(out)
         scales_ref = torch.empty_like(scales)
@@ -230,13 +231,13 @@ def main(verbose: bool = True) -> dict:
     def make_calls(shape: tuple[int, int]) -> tuple:
         num_tokens, intermediate = shape
         x = torch.randn(
-            num_tokens, 2 * intermediate, device="cuda", dtype=torch.bfloat16
+            num_tokens, 2 * intermediate, device=DEVICE, dtype=torch.bfloat16
         )
         out = torch.empty(
-            num_tokens, intermediate, device="cuda", dtype=torch.float8_e4m3fn
+            num_tokens, intermediate, device=DEVICE, dtype=torch.float8_e4m3fn
         )
         scales = torch.empty(
-            num_tokens, intermediate // group_size, device="cuda", dtype=torch.float32
+            num_tokens, intermediate // group_size, device=DEVICE, dtype=torch.float32
         )
         # Separate ref tensors so the baselines don't clobber helion's in-place
         # outputs (the kernel mutates out and scales).
