@@ -2050,16 +2050,23 @@ def flush_inband_polls(cg: CodegenInterface, node: torch.fx.Node) -> None:
     voting = [poll for poll in polls if poll.threads is not None]
     if voting:
         # A per-thread spin reloads one asm's words at a time; this reloads all.
+        # The first trip votes on the first loads, so the vote is emitted once.
         stale = device_function.new_var("inband_stale", dce=False)
+        first = device_function.new_var("inband_first", dce=False)
         device_function.sync_roles[stale] = SyncRole("poll")
-        cg.add_statement(
-            statement_from_string(f"{stale} = {_stale(peer.epoch, voting)}")
-        )
+        cg.add_statement(statement_from_string(f"{stale} = 1"))
+        cg.add_statement(statement_from_string(f"{first} = 1"))
+        reload = statement_from_string(f"if {first} == 0: pass")
+        assert isinstance(reload, ast.If)
+        reload.body = [
+            *(poll.load(peer.epoch) for poll in voting),
+            *_scatter_fallback(cg, peer, scattered),
+        ]
         loop = statement_from_string(f"while {stale} != 0: pass")
         assert isinstance(loop, ast.While)
         loop.body = [
-            *(poll.load(peer.epoch) for poll in voting),
-            *_scatter_fallback(cg, peer, scattered),
+            reload,
+            statement_from_string(f"{first} = 0"),
             statement_from_string(f"{stale} = {_stale(peer.epoch, voting)}"),
         ]
         cg.add_statement(loop)
