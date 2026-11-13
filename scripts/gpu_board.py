@@ -139,11 +139,12 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
     from collections.abc import Iterator
     from collections.abc import Sequence
+    from types import EllipsisType
 
 # The script's version: an ISO date, with ".N" for later changes on the same
 # day. Bump it with every change: the published copy is only replaced by a
 # strictly newer version.
-VERSION = "2026-11-12.1"
+VERSION = "2026-11-13.1"
 # The version of the file formats; see "Compatibility" above.
 PROTOCOL = 1
 DEFAULT_BOARD = Path("/tmp/gpu-board")
@@ -162,6 +163,16 @@ ACTIVE_WINDOW_SECONDS = 3600.0
 PICK_SAMPLES = 3
 SAMPLE_INTERVAL_SECONDS = 0.7
 NVIDIA_SMI_TIMEOUT = 20
+# nvidia-smi answers in a fraction of a second, but took up to 20 seconds
+# while a thousand test workers started on the machine.
+NVIDIA_SMI_ATTEMPTS = 3
+# The pause before asking again after a call that failed at once (a timeout
+# has waited long enough).
+NVIDIA_SMI_RETRY_SECONDS = 1.0
+# nvidia-smi's exit statuses on a machine where CUDA has no GPU to use: no
+# devices found, the driver not loaded. (12, the NVML library not found, is
+# not one of them: CUDA does not need NVML, so the GPUs may be in use.)
+NVIDIA_SMI_NO_GPUS = (6, 9)
 
 
 # ---------------------------------------------------------------------------
@@ -239,17 +250,62 @@ class Gpu:
 
 
 def _nvidia_smi(*args: str) -> str | None:
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", *args],
-            capture_output=True,
-            text=True,
-            timeout=NVIDIA_SMI_TIMEOUT,
-            check=True,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return result.stdout
+    """nvidia-smi's output, or None on a machine without nvidia-smi or
+    without GPUs for it (NVIDIA_SMI_NO_GPUS).
+
+    A call that times out or fails any other way is tried again and then
+    raises NvidiaSmiError: the GPUs are there and their state is unknown,
+    which must not pass for a machine without GPUs (or for GPUs without
+    processes).
+    """
+    failures: list[str] = []
+    # Whether every failure is what load does: a timeout, no process or
+    # memory to start nvidia-smi with, nvidia-smi killed (the OOM killer).
+    # Any other signal is nvidia-smi crashing, a fault like an exit status.
+    busy = True
+    timed_out = False
+    for attempt in range(NVIDIA_SMI_ATTEMPTS):
+        if attempt and not timed_out:
+            time.sleep(NVIDIA_SMI_RETRY_SECONDS)
+        timed_out = False
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", *args],
+                capture_output=True,
+                text=True,
+                timeout=NVIDIA_SMI_TIMEOUT,
+                check=True,
+            )
+        except FileNotFoundError:
+            return None
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            failures.append(f"did not answer within {NVIDIA_SMI_TIMEOUT}s")
+        except subprocess.CalledProcessError as e:
+            if e.returncode in NVIDIA_SMI_NO_GPUS:
+                return None
+            said = (e.stderr or e.stdout or "").strip().splitlines()
+            failures.append(
+                f"exited with status {e.returncode}"
+                + (f" ({said[0][:MAX_FIELD_CHARS]})" if said else "")
+            )
+            busy = busy and e.returncode == -signal.SIGKILL
+        except OSError as e:
+            failures.append(f"could not run ({e.strerror})")
+            busy = busy and e.errno in (errno.EAGAIN, errno.ENOMEM)
+        else:
+            return result.stdout
+    # A fault (an exit status, a nvidia-smi that cannot start) is not cleared
+    # by asking again later, so it must not read as a busy machine.
+    advice = (
+        "a busy machine? try again"
+        if busy
+        else f"run `nvidia-smi {' '.join(args)}` to see why"
+    )
+    raise NvidiaSmiError(
+        f"nvidia-smi {', then '.join(dict.fromkeys(failures))} in "
+        f"{NVIDIA_SMI_ATTEMPTS} attempts: the GPUs' state is unknown ({advice})"
+    )
 
 
 def parse_gpu_csv(text: str) -> list[Gpu]:
@@ -306,7 +362,8 @@ def sample_gpus(
     owner_of: Callable[[int], str] = pid_user,
 ) -> list[Gpu] | None:
     """The GPUs with utilization averaged over ``samples`` readings, or None
-    when nvidia-smi is unavailable."""
+    on a machine without nvidia-smi or without GPUs for it.  Raises
+    NvidiaSmiError when it is there but does not answer."""
     readings: list[list[Gpu]] = []
     for i in range(samples):
         if i:
@@ -316,6 +373,11 @@ def sample_gpus(
             "--format=csv,noheader,nounits",
         )
         if text is None:
+            if readings:
+                raise NvidiaSmiError(
+                    "nvidia-smi listed the GPUs and then found none: "
+                    "the GPUs' state is unknown"
+                )
             return None
         readings.append(parse_gpu_csv(text))
     gpus = readings[-1]
@@ -327,11 +389,24 @@ def sample_gpus(
             if g.index == gpu.index
         ]
         gpu.utilization = sum(utils) / len(utils)
-    processes = _nvidia_smi(
-        "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader,nounits"
-    )
+    try:
+        processes = _nvidia_smi(
+            "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader,nounits"
+        )
+        if processes is None:
+            # The GPUs answered, so they are there: without their processes
+            # a busy one would look free.
+            raise NvidiaSmiError(
+                "nvidia-smi listed the GPUs but not their processes: "
+                "the GPUs' state is unknown"
+            )
+    except NvidiaSmiError:
+        if len(gpus) > 1:
+            raise
+        # One GPU is not shared, so nothing is decided by who runs on it.
+        processes = ""
     by_uuid = {gpu.uuid: gpu for gpu in gpus}
-    for uuid, pid in parse_process_csv(processes or ""):
+    for uuid, pid in parse_process_csv(processes):
         gpu = by_uuid.get(uuid)
         if gpu is not None:
             user = owner_of(pid)
@@ -434,6 +509,15 @@ class BoardError(Exception):
 
 class LockTimeout(BoardError):
     """Someone held the board lock for longer than LOCK_TIMEOUT_SECONDS."""
+
+
+class NvidiaSmiError(BoardError):
+    """nvidia-smi is installed but did not answer, so what runs on the GPUs
+    is unknown."""
+
+
+class NoSuchGpu(BoardError):
+    """A claim names a GPU this machine does not have."""
 
 
 class SecurityAlert(BoardError):
@@ -1641,7 +1725,7 @@ def render_status(
     lines = []
     if not truth:
         lines.append(
-            "nvidia-smi is unavailable: the GPU states below come from claims only"
+            "no nvidia-smi reading: the GPU states below come from claims only"
         )
     elif len(views) == 1:
         lines.append(
@@ -1726,16 +1810,24 @@ def render_status(
 
 
 class Board:
-    """The board as one command sees it: GPUs, claims and findings. Pass the
-    BoardDir a caller already holds (locked), so the lock and the reads are
-    on the same directory."""
+    """The board as one command sees it: GPUs, claims and findings.
 
-    def __init__(self, samples: int = 1, board: BoardDir | None = None) -> None:
+    ``gpus`` is what the caller read with ``sample_gpus`` (None on a machine
+    without nvidia-smi), before taking the board lock: nvidia-smi can take a
+    minute on a busy machine, and every account's commands wait for the
+    lock. The commands that only touch claims and messages pass none, so
+    they work while nvidia-smi does not answer. ``board`` is the BoardDir a
+    caller already holds (locked), so the lock and the reads are on the same
+    directory."""
+
+    def __init__(
+        self, board: BoardDir | None = None, gpus: list[Gpu] | None = None
+    ) -> None:
         self.dir = board or BoardDir(board_dir())
         self.root = self.dir.root
         self.me = self.dir.me
         self.now = time.time()
-        self.gpus = sample_gpus(samples)
+        self.gpus = gpus
         self.truth = self.gpus is not None
         self.dir.check_published()
         claims = load_claims(self.dir)
@@ -1745,7 +1837,8 @@ class Board:
         publish_bootstrap(self.dir)
         self.claims = prune_own(self.dir, claims, self.now)
         if self.gpus is None:
-            # No nvidia-smi: show whatever GPUs the claims mention.
+            # No reading (no nvidia-smi, one that does not answer, or a
+            # command that needs none): the GPUs the claims mention.
             indices = sorted(
                 {i for c in self.claims if c.live(self.now) for i in c.gpus}
             )
@@ -1808,8 +1901,9 @@ def pick_and_claim(
     """Choose ``count`` GPUs and claim them under the board lock, so two picks
     that overlap never take the same GPU."""
     directory = BoardDir(board_dir())
+    gpus = sample_gpus(samples)
     with directory.lock():
-        board = Board(samples, directory)
+        board = Board(directory, gpus)
         chosen = choose(board.views, count, shared, prefer)
         if len(chosen) < count:
             raise NotEnoughGpus(board, chosen, count)
@@ -1880,6 +1974,7 @@ def claim_gpus(
     note: str = "",
     force: bool | None = None,
     shared: bool = False,
+    sampled: list[Gpu] | EllipsisType | None = ...,
 ) -> tuple[Board, Claim, dict[int, str]]:
     """Claim specific GPUs under the board lock, returning problems to report.
 
@@ -1889,15 +1984,19 @@ def claim_gpus(
     behavior for ordinary conflicts, but refuses cleanup-unconfirmed claims.
     After inspecting and confirming cleanup, the owner should release the
     retained claim by id. ``shared`` permits idle processes, never unconfirmed
-    cleanup. GPUs nvidia-smi does not list raise BoardError.
+    cleanup. GPUs nvidia-smi does not list raise NoSuchGpu. ``sampled`` is
+    what ``sample_gpus`` just returned to the caller, so the GPUs are not read
+    a second time; without it they are read here.
     """
     directory = BoardDir(board_dir())
+    if sampled is ...:
+        sampled = sample_gpus()
     with directory.lock():
-        board = Board(1, directory)
+        board = Board(directory, sampled)
         known = {v.gpu.index for v in board.views}
         unknown = [g for g in gpus if g not in known]
         if unknown and board.truth:
-            raise BoardError(
+            raise NoSuchGpu(
                 f"no such GPU: {', '.join(map(str, unknown))} "
                 f"(this machine has {', '.join(map(str, sorted(known)))})"
             )
@@ -1912,7 +2011,14 @@ def claim_gpus(
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    board = Board()
+    gpus, unanswered = None, None
+    try:
+        gpus = sample_gpus()
+    except NvidiaSmiError as e:
+        # Who holds what, and what was asked for, matters most on a busy
+        # machine: show the claims and messages, and say what is missing.
+        unanswered = e
+    board = Board(gpus=gpus)
     messages = read_messages(board.dir, board.now - parse_duration(args.since))
     board.dir.raise_alerts()
     published = published_version(board.dir)
@@ -1924,6 +2030,8 @@ def cmd_status(args: argparse.Namespace) -> int:
                 "protocol": PROTOCOL,
                 "published_version": published,
                 "now": board.now,
+                # False: the GPU states below come from claims only.
+                "nvidia_smi": board.truth,
                 "gpus": [v.to_json() for v in board.views],
                 "free": [v.gpu.index for v in board.views if v.available("free")],
                 "claims": [asdict(c) for c in board.claims if c.live(board.now)],
@@ -1965,6 +2073,9 @@ def cmd_status(args: argparse.Namespace) -> int:
                 f"note: a newer gpu_board.py ({published}) has been published; update "
                 "your Helion checkout or fetch it from GitHub (never run the board's copy)"
             )
+    if unanswered is not None:
+        print(f"gpu_board: {unanswered}", file=sys.stderr)
+        return 1
     return 0
 
 

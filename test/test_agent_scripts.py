@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import replace
+import errno
 import fcntl
 import importlib.util
 import json
@@ -2643,6 +2644,240 @@ def test_cpu_lane_does_not_discover_or_claim_gpus(tmp_path, monkeypatch):
     monkeypatch.setattr(run_tests, "summarize", lambda *args: ("mocked CPU run", 0))
     assert run_tests.main(["--backend", "cute", "--lane", "cpu"]) == 0
     assert assignments == [(["cute"], "cpu", {"cute": []})]
+
+
+def test_nvidia_smi_is_asked_again_when_it_does_not_answer(monkeypatch):
+    # It answers in a fraction of a second, but took 20 while a thousand
+    # test workers started; a call that times out says nothing about the GPUs.
+    calls = []
+    pauses = []
+    monkeypatch.setattr(gpu_board.time, "sleep", pauses.append)
+
+    def answers_at_last(argv, **kwargs):
+        calls.append(argv)
+        if len(calls) < gpu_board.NVIDIA_SMI_ATTEMPTS:
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        return subprocess.CompletedProcess(argv, 0, stdout=GPU_CSV)
+
+    monkeypatch.setattr(subprocess, "run", answers_at_last)
+    assert gpu_board._nvidia_smi("--query-gpu=index") == GPU_CSV
+    assert len(calls) == gpu_board.NVIDIA_SMI_ATTEMPTS
+    assert pauses == []  # a timeout has waited long enough
+
+    # Never answering, or failing, leaves the GPUs' state unknown ... Only
+    # what load does is a busy machine, to try again later: a timeout, no
+    # process to start nvidia-smi with, nvidia-smi killed. Without the NVML
+    # library (12) nvidia-smi sees nothing, but CUDA may be using the GPUs.
+    failed = subprocess.CalledProcessError
+    for error, said, busy, paused in (
+        (subprocess.TimeoutExpired("nvidia-smi", 20), "did not answer", True, 0),
+        (
+            BlockingIOError(errno.EAGAIN, os.strerror(errno.EAGAIN)),
+            "not run",
+            True,
+            2,
+        ),
+        (failed(-signal.SIGKILL, "nvidia-smi"), "status -9", True, 2),
+        # A crash is a fault, not load.
+        (failed(-signal.SIGSEGV, "nvidia-smi"), "status -11", False, 2),
+        (
+            failed(255, "nvidia-smi", stderr="NVML: mismatch\nmore"),
+            "255 (NVML: mismatch)",
+            False,
+            2,
+        ),
+        (failed(12, "nvidia-smi"), "status 12", False, 2),
+        (PermissionError(13, "Permission denied"), "could not run", False, 2),
+    ):
+        pauses.clear()
+        monkeypatch.setattr(subprocess, "run", raises(error))
+        with pytest.raises(gpu_board.NvidiaSmiError) as info:
+            gpu_board.sample_gpus()
+        assert said in str(info.value)
+        assert ("a busy machine? try again" in str(info.value)) == busy
+        assert ("to see why" in str(info.value)) != busy
+        # A call that failed at once is given a moment before the next one.
+        assert pauses == [gpu_board.NVIDIA_SMI_RETRY_SECONDS] * paused
+
+    # ... while no nvidia-smi, or one that finds no devices (6) or no driver
+    # (9), is a machine without GPUs.
+    for error in (
+        FileNotFoundError("nvidia-smi"),
+        subprocess.CalledProcessError(6, "nvidia-smi"),
+        subprocess.CalledProcessError(9, "nvidia-smi"),
+    ):
+        monkeypatch.setattr(subprocess, "run", raises(error))
+        assert gpu_board.sample_gpus() is None
+
+
+def raises(error):
+    """A function (subprocess.run, sample_gpus) that fails with ``error``."""
+
+    def fails(*args, **kwargs):
+        raise error
+
+    return fails
+
+
+def no_answer():
+    """A sample_gpus on a machine whose nvidia-smi does not answer."""
+    return raises(gpu_board.NvidiaSmiError("nvidia-smi did not answer"))
+
+
+def test_nvidia_smi_reports_every_kind_of_failure(monkeypatch):
+    # The busy-machine advice (wait and try again) only when every attempt
+    # timed out: a fault must not hide behind one timeout.
+    monkeypatch.setattr(gpu_board.time, "sleep", lambda seconds: None)
+    errors = [
+        subprocess.CalledProcessError(255, "nvidia-smi"),
+        subprocess.CalledProcessError(255, "nvidia-smi"),
+        subprocess.TimeoutExpired("nvidia-smi", 20),
+    ]
+
+    def run(argv, **kwargs):
+        raise errors.pop(0)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises(gpu_board.NvidiaSmiError) as info:
+        gpu_board._nvidia_smi("--query-gpu=index")
+    message = str(info.value)
+    assert "exited with status 255, then did not answer within" in message
+    assert "busy machine" not in message
+    assert "run `nvidia-smi --query-gpu=index` to see why" in message
+
+
+def test_gpus_that_answered_never_become_a_machine_without(monkeypatch):
+    # A later reading that finds no GPUs is not "no GPUs": with claims only,
+    # explicit GPUs would be claimed unchecked.
+    answered = []
+
+    def once_then_none(argv, **kwargs):
+        if answered:
+            raise subprocess.CalledProcessError(9, argv)
+        answered.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout=GPU_CSV)
+
+    monkeypatch.setattr(subprocess, "run", once_then_none)
+    with pytest.raises(gpu_board.NvidiaSmiError, match="then found none"):
+        gpu_board.sample_gpus(samples=2, interval=0)
+
+
+@pytest.mark.parametrize("status", [None, 4, 6, 9])
+def test_a_process_query_that_fails_does_not_empty_the_gpus(monkeypatch, status):
+    # Without their processes, busy GPUs would look free: once the GPUs have
+    # answered, no failure of the process query means "no GPUs".
+    monkeypatch.setattr(gpu_board.time, "sleep", lambda seconds: None)
+    listed = [GPU_CSV]
+
+    def gpus_then_failure(argv, **kwargs):
+        if any(arg.startswith("--query-gpu") for arg in argv):
+            return subprocess.CompletedProcess(argv, 0, stdout=listed[0])
+        if status is None:
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        raise subprocess.CalledProcessError(status, argv)
+
+    monkeypatch.setattr(subprocess, "run", gpus_then_failure)
+    with pytest.raises(gpu_board.NvidiaSmiError, match="state is unknown"):
+        gpu_board.sample_gpus()
+    # One GPU is not shared, so its process list decides nothing: a machine
+    # where that query never works still runs its tests.
+    listed[0] = GPU_CSV.splitlines()[0] + "\n"
+    (gpu,) = gpu_board.sample_gpus()
+    assert gpu.processes == {}
+
+
+def test_acquire_gpus_names_what_nvidia_smi_ran_into(board, monkeypatch):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+
+    def stopped(argv):
+        with contextlib.ExitStack() as stack, pytest.raises(SystemExit) as info:
+            run_tests.acquire_gpus(run_tests.parse_args(argv), "t", stack)
+        message = str(info.value)
+        assert "discovery failed" in message and "nvidia-smi did not answer" in message
+        assert "no tests started" in message and "--no-board" not in message
+        assert gpu_board.load_claims(gpu_board.BoardDir(board)) == []
+
+    # The board's reading under its lock can fail after run_tests's own
+    # answered: the same message, not "GPU board unavailable".
+    with monkeypatch.context() as patched:
+        patched.setattr(gpu_board, "pick_and_claim", no_answer())
+        stopped(["-n", "2"])
+    monkeypatch.setattr(gpu_board, "sample_gpus", no_answer())
+    for argv in ([], ["-n", "2"], ["--gpus", "0"]):
+        stopped(argv)
+
+
+def test_acquire_gpus_refuses_a_gpu_the_machine_does_not_have(board, monkeypatch):
+    # CUDA stops reading CUDA_VISIBLE_DEVICES at an index that does not
+    # exist, so "1,9" would run on GPU 1, busy here, without a check.
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    with contextlib.ExitStack() as stack, pytest.raises(SystemExit) as info:
+        run_tests.acquire_gpus(run_tests.parse_args(["--gpus", "1,9"]), "t", stack)
+    assert "no such GPU: 9" in str(info.value)
+    assert gpu_board.load_claims(gpu_board.BoardDir(board)) == []
+
+
+def test_claims_and_messages_work_while_nvidia_smi_does_not_answer(
+    board, monkeypatch, capsys
+):
+    # Releasing a GPU or asking for one matters most on a busy machine.
+    gpu_board.pick_and_claim(1, False, [], "t", 60, samples=1)
+
+    monkeypatch.setattr(gpu_board, "sample_gpus", no_answer())
+    assert gpu_board.main(["renew"]) == 0
+    assert gpu_board.main(["say", "need", "a", "GPU"]) == 0
+    assert gpu_board.main(["release", "--all"]) == 0
+    assert gpu_board.load_claims(gpu_board.BoardDir(board)) == []
+    # The command that chooses GPUs says why it cannot.
+    capsys.readouterr()
+    assert gpu_board.main(["pick"]) == 1
+    assert "nvidia-smi did not answer" in capsys.readouterr().err
+
+
+def test_status_shows_claims_and_messages_while_nvidia_smi_does_not_answer(
+    board, monkeypatch, capsys
+):
+    claim_file(board, "vasiliy", [1], time.time() + 600, purpose="bench")
+    gpu_board.main(["say", "need", "a", "GPU"])
+
+    monkeypatch.setattr(gpu_board, "sample_gpus", no_answer())
+    capsys.readouterr()
+    assert gpu_board.main(["status"]) == 1  # not a status to act on
+    shown = capsys.readouterr()
+    assert "the GPU states below come from claims only" in shown.out
+    assert "vasiliy (bench" in shown.out
+    assert "need a GPU" in shown.out
+    assert "nvidia-smi did not answer" in shown.err
+    assert gpu_board.main(["status", "--json"]) == 1
+    shown = capsys.readouterr()
+    status = json.loads(shown.out)
+    assert [c["user"] for c in status["claims"]] == ["vasiliy"]
+    assert status["nvidia_smi"] is False  # GPU states from claims only
+    assert "nvidia-smi did not answer" in shown.err
+
+
+def test_gpus_are_read_before_the_board_lock_is_taken(board, monkeypatch):
+    # nvidia-smi can take a minute on a busy machine, and every account's
+    # commands wait for the lock.
+    monkeypatch.setattr(gpu_board, "LOCK_TIMEOUT_SECONDS", 0.5)
+    readings = []
+
+    def sample(*args, **kwargs):
+        with gpu_board.BoardDir(board).lock():  # times out if the caller holds it
+            readings.append(args)
+        return _gpus()
+
+    monkeypatch.setattr(gpu_board, "sample_gpus", sample)
+    gpu_board.pick_and_claim(1, False, [], "t", 60, samples=1)
+    gpu_board.claim_gpus([1], "t", 60)
+    assert len(readings) == 2
+
+    # run_tests.py reads the GPUs once for the GPUs it is given: the reading
+    # that showed a shared machine is the one the claim checks.
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    with contextlib.ExitStack() as stack:
+        run_tests.acquire_gpus(run_tests.parse_args(["--gpus", "4"]), "t", stack)
+    assert len(readings) == 3
 
 
 def test_acquire_gpus_respects_other_sessions_of_this_account(board, monkeypatch):
