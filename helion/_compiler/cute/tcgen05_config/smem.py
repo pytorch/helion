@@ -738,6 +738,96 @@ def c_stages_fits(
     return ab_bytes + c_bytes <= constraints.per_cta_smem_budget_bytes
 
 
+def output_edge_tma_store_smem_fits(
+    state: CuteTcgen05Config,
+    config: dict[str, object],
+    *,
+    bm: int,
+    bn: int,
+    bk: int,
+    cluster_m: int,
+    ab_stages: int,
+    c_stages: int,
+) -> bool:
+    """Whether an output-edge kernel's TMA-store C ring fits beside its AB ring.
+
+    ``c_stages_fits`` charges the C ring against the AB-gate budget, which
+    already holds back ``TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES`` for
+    the C ring and barriers, so it counts the ring twice and refuses
+    arenas that fit: 1000x4096x2880 bf16 at 2x1 256x256x64 ab=6 (192 KiB
+    AB + 32 KiB (128, 64) C ring + 172 B of barriers = 229 548 B of the
+    232 448 B opt-in) fell back to the SIMT epilogue and lost to ab=5,
+    while the hand-kept TMA store at ab=6 compiled and ran 2.8% faster.
+    This judges the measured arena model (``default_layout_smem_fits``)
+    at the C subtile the output-edge plan renders: edge tiles never take
+    the plain (128, 32) narrow subtile (it needs static full tiles), so
+    the ring is charged at CuTe's with-source subtile, or at a configured
+    explicit tile when that is wider. Fails closed like the model.
+    """
+    facts = state.rowvec_aux_facts
+    if facts is None or cluster_m not in (1, 2):
+        return False
+    if _store_lowering_stages_rows(config) and facts.rows:
+        # This route does not admit ``pre_acc_wait`` rows (the hybrid
+        # store's edge tiles read them from global memory beside the full
+        # tiles' staged row); the two-stage route,
+        # ``TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES``, and
+        # ``c_stages_fits`` still take the hybrid store for them.
+        return False
+    out_bits = facts.output_itemsize * 8
+    _subtile_m, subtile_n = tcgen05_default_epilogue_tile_size(
+        bm, bn, elem_width_d=out_bits, elem_width_c=out_bits
+    )
+    for configured in (
+        epi_subtile_n_knob(config),
+        layout_overrides_from_config(config).epi_tile_n,
+    ):
+        if configured is not None:
+            subtile_n = max(subtile_n, configured)
+    return _config_arena_fits(
+        state,
+        config,
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        cluster_m=cluster_m,
+        ab_stages=ab_stages,
+        c_stages=c_stages,
+        epi_subtile_n=subtile_n,
+    )
+
+
+def _config_arena_fits(
+    state: CuteTcgen05Config,
+    config: dict[str, object],
+    *,
+    bm: int,
+    bn: int,
+    bk: int,
+    cluster_m: int,
+    ab_stages: int,
+    c_stages: int,
+    epi_subtile_n: int | None,
+) -> bool:
+    """``default_layout_smem_fits`` with every other input read from ``config``."""
+    return default_layout_smem_fits(
+        state,
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        cluster_m=cluster_m,
+        ab_stages=ab_stages,
+        c_stages=c_stages,
+        stage_rows=_store_lowering_stages_rows(config),
+        epi_warps=epi_warps_knob(config),
+        acc_stages=acc_stages_knob(config),
+        aux_load_mode=aux_load_mode_knob(config),
+        aux_stages=aux_stages_knob(config),
+        epi_subtile_n=epi_subtile_n,
+        epi_warp_groups=epi_warp_groups_knob(config),
+    )
+
+
 def _grouped_dynamic_deep_config_matches(config: dict[str, object]) -> bool:
     block_sizes = config.get("block_sizes")
     defaults: dict[str, object] = {

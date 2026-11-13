@@ -64,8 +64,9 @@ RAGGED_BATCHED_MIN_BLOCK_N = 32
 # That same family is validated only at this K/stage point. The output-edge
 # full-tile TMA-store epilogue needs an extra SMEM tile, so the edge seed must
 # stay within ``TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES``. Larger explicit
-# AB-stage configs remain legal only through the SIMT-store fallback when they
-# otherwise fit.
+# AB-stage configs keep the TMA store where the arena model fits its C ring
+# (``smem.output_edge_tma_store_smem_fits``) and take the SIMT store
+# otherwise.
 TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K = 128
 TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES = 2
 TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES = 1

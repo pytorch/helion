@@ -1992,13 +1992,12 @@ def _m_pair_deep_seed_configs(state: CuteTcgen05Config) -> list[Config]:
 
 
 def _plain_edge_deep_ab_stages(state: CuteTcgen05Config, bk: int) -> int:
-    """Deepest AB pipeline that leaves room for the TMA-store epilogue's
-    C ring on the 256x256 cluster_m=2 tile.
-
-    Overflowing the C ring silently demotes the kernel to the much slower
-    all-SIMT store (ab=6 fits bare AB at bk=64 but not AB + C, and
-    measures far below ab=5 + TMA store), so walk down from the bare-AB
-    maximum until AB + C fits.
+    """Deepest AB pipeline whose TMA-store C ring the AB-gate budget also
+    holds (``c_stages_fits``) on the 256x256 cluster_m=2 tile: the measured
+    seed depth (bf16 5000^3: ab=5 with the TMA store, against the all-SIMT
+    store an overflowing C ring took). The arena model
+    (``output_edge_tma_store_smem_fits``) admits the TMA store one stage
+    deeper on some of these shapes; the seed keeps the measured depth.
     """
     ab_stages = smem.max_ab_stages_that_fit(
         state,

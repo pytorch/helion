@@ -1035,8 +1035,6 @@ def _helion__matmul(a, b, out, tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_
             tcgen05_tma_store_role_tile = tcgen05_tma_store_role_tile + cutlass.Int32(1)
             tcgen05_role_local_2_tile_sched.advance_to_next_work()
             tcgen05_role_local_2_work_tile = tcgen05_role_local_2_tile_sched.get_current_work()
-    if tcgen05_warp_idx == cutlass.Int32(0):
-        tcgen05_c_pipeline.producer_tail()
     if tcgen05_tma_warp:
         tcgen05_ab_pipeline.producer_tail(tcgen05_ab_producer_state)
     if tcgen05_exec_active:
@@ -1050,6 +1048,8 @@ def _helion__matmul(a, b, out, tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_
         tcgen05_tmem_alloc_barrier.arrive_and_wait()
     if tcgen05_epi_active:
         tcgen05_tmem_allocator.free(tcgen05_epi_acc_tmem_ptr)
+    if tcgen05_warp_idx == cutlass.Int32(0):
+        tcgen05_c_pipeline.producer_tail()
 _helion__matmul._helion_cute_wrapper_plans = [{'kind': 'tcgen05_ab_tma', 'bm': 256, 'bn': 256, 'bk': 128, 'cluster_m': 2, 'cluster_n': 1, 'ab_stage_count': 2, 'input_dtype': 'cutlass.BFloat16', 'acc_dtype': 'cutlass.Float32', 'm_size': 4096, 'n_size': 4096, 'k_total_size': 1024, 'kernel_args': ['tma_atom_a', 'tma_tensor_a', 'tma_atom_b', 'tma_tensor_b'], 'use_pdl': True, 'lhs_idx': 0, 'rhs_idx': 1}, {'kind': 'tcgen05_d_tma', 'bm': 256, 'bn': 256, 'c_stage_count': 2, 'output_dtype': 'cutlass.BFloat16', 'kernel_args': ['tcgen05_tma_store_atom', 'tcgen05_tma_store_tensor'], 'epi_tile_m': 128, 'epi_tile_n': 32, 'd_store_box_n': 32, 'd_idx': 2}]
 _helion__matmul._helion_cute_cluster_shape = (2, 1, 1)
 
@@ -1758,8 +1758,6 @@ def _helion__residual_matmul(a, b, residual, out, tcgen05_aux_tma_atom_0, tcgen0
             tcgen05_sched_pipeline.producer_commit(tcgen05_sched_pipeline_producer_state)
         tcgen05_sched_pipeline_producer_state.advance()
         cute.arch.sync_warp()
-    if tcgen05_warp_idx == cutlass.Int32(7):
-        tcgen05_c_pipeline.producer_tail()
     if tcgen05_tma_warp:
         tcgen05_ab_pipeline.producer_tail(tcgen05_ab_producer_state)
     if tcgen05_exec_active:
@@ -1773,6 +1771,8 @@ def _helion__residual_matmul(a, b, residual, out, tcgen05_aux_tma_atom_0, tcgen0
         tcgen05_tmem_alloc_barrier.arrive_and_wait()
     if tcgen05_epi_active:
         tcgen05_tmem_allocator.free(tcgen05_epi_acc_tmem_ptr)
+    if tcgen05_warp_idx == cutlass.Int32(7):
+        tcgen05_c_pipeline.producer_tail()
 _helion__residual_matmul._helion_cute_wrapper_plans = [{'kind': 'tcgen05_aux_tma', 'bm': 256, 'bn': 256, 'stage_count': 2, 'input_dtype': 'cutlass.BFloat16', 'kernel_args': ['tcgen05_aux_tma_atom_0', 'tcgen05_aux_tma_tensor_0'], 'c_idx': 2}, {'kind': 'tcgen05_ab_tma', 'bm': 256, 'bn': 256, 'bk': 128, 'cluster_m': 2, 'cluster_n': 1, 'ab_stage_count': 2, 'input_dtype': 'cutlass.BFloat16', 'acc_dtype': 'cutlass.Float32', 'm_size': 4096, 'n_size': 4096, 'k_total_size': 1024, 'kernel_args': ['tma_atom_a', 'tma_tensor_a', 'tma_atom_b', 'tma_tensor_b'], 'use_pdl': True, 'lhs_idx': 0, 'rhs_idx': 1}, {'kind': 'tcgen05_d_tma', 'bm': 256, 'bn': 256, 'c_stage_count': 4, 'output_dtype': 'cutlass.BFloat16', 'kernel_args': ['tcgen05_tma_store_atom', 'tcgen05_tma_store_tensor'], 'd_idx': 3}]
 _helion__residual_matmul._helion_cute_cluster_shape = (2, 1, 1)
 
@@ -2170,8 +2170,6 @@ def _helion__residual_matmul(a, b, out, residual, tma_atom_a, tma_tensor_a, tma_
         tcgen05_sched_pipeline.consumer_release(tcgen05_sched_pipeline_consumer_state)
         tcgen05_sched_pipeline_consumer_state.advance()
         cute.arch.sync_warp()
-    if tcgen05_warp_idx == cutlass.Int32(0):
-        tcgen05_c_pipeline.producer_tail()
     if tcgen05_tma_warp:
         tcgen05_ab_pipeline.producer_tail(tcgen05_ab_producer_state)
     if tcgen05_exec_active:
@@ -2185,6 +2183,8 @@ def _helion__residual_matmul(a, b, out, residual, tma_atom_a, tma_tensor_a, tma_
         tcgen05_tmem_alloc_barrier.arrive_and_wait()
     if tcgen05_epi_active:
         tcgen05_tmem_allocator.free(tcgen05_epi_acc_tmem_ptr)
+    if tcgen05_warp_idx == cutlass.Int32(0):
+        tcgen05_c_pipeline.producer_tail()
 _helion__residual_matmul._helion_cute_wrapper_plans = [{'kind': 'tcgen05_ab_tma', 'bm': 256, 'bn': 256, 'bk': 128, 'cluster_m': 2, 'cluster_n': 1, 'ab_stage_count': 2, 'input_dtype': 'cutlass.BFloat16', 'acc_dtype': 'cutlass.Float32', 'm_size': 4096, 'n_size': 4096, 'k_total_size': 1024, 'kernel_args': ['tma_atom_a', 'tma_tensor_a', 'tma_atom_b', 'tma_tensor_b'], 'use_pdl': True, 'lhs_idx': 0, 'rhs_idx': 1}, {'kind': 'tcgen05_d_tma', 'bm': 256, 'bn': 256, 'c_stage_count': 2, 'output_dtype': 'cutlass.BFloat16', 'kernel_args': ['tcgen05_tma_store_atom', 'tcgen05_tma_store_tensor'], 'd_idx': 2}]
 _helion__residual_matmul._helion_cute_cluster_shape = (2, 1, 1)
 
@@ -2580,8 +2580,6 @@ def _helion__residual_matmul(a, b, residual, out, tcgen05_aux_tma_atom_0, tcgen0
         tcgen05_sched_pipeline_consumer_state.advance()
         cute.arch.sync_warp()
         tcgen05_aux_pipeline.producer_tail(tcgen05_aux_pipeline_producer_state)
-    if tcgen05_warp_idx == cutlass.Int32(0):
-        tcgen05_c_pipeline.producer_tail()
     if tcgen05_tma_warp:
         tcgen05_ab_pipeline.producer_tail(tcgen05_ab_producer_state)
     if tcgen05_exec_active:
@@ -2595,6 +2593,8 @@ def _helion__residual_matmul(a, b, residual, out, tcgen05_aux_tma_atom_0, tcgen0
         tcgen05_tmem_alloc_barrier.arrive_and_wait()
     if tcgen05_epi_active:
         tcgen05_tmem_allocator.free(tcgen05_epi_acc_tmem_ptr)
+    if tcgen05_warp_idx == cutlass.Int32(0):
+        tcgen05_c_pipeline.producer_tail()
 _helion__residual_matmul._helion_cute_use_pdl = True
 _helion__residual_matmul._helion_cute_wrapper_plans = [{'kind': 'tcgen05_aux_tma', 'bm': 256, 'bn': 256, 'stage_count': 2, 'input_dtype': 'cutlass.BFloat16', 'kernel_args': ['tcgen05_aux_tma_atom_0', 'tcgen05_aux_tma_tensor_0'], 'c_idx': 2}, {'kind': 'tcgen05_ab_tma', 'bm': 256, 'bn': 256, 'bk': 128, 'cluster_m': 2, 'cluster_n': 1, 'ab_stage_count': 2, 'input_dtype': 'cutlass.BFloat16', 'acc_dtype': 'cutlass.Float32', 'm_size': 4096, 'n_size': 4096, 'k_total_size': 1024, 'kernel_args': ['tma_atom_a', 'tma_tensor_a', 'tma_atom_b', 'tma_tensor_b'], 'use_pdl': True, 'lhs_idx': 0, 'rhs_idx': 1}, {'kind': 'tcgen05_d_tma', 'bm': 256, 'bn': 256, 'c_stage_count': 2, 'output_dtype': 'cutlass.BFloat16', 'kernel_args': ['tcgen05_tma_store_atom', 'tcgen05_tma_store_tensor'], 'd_idx': 3}]
 _helion__residual_matmul._helion_cute_cluster_shape = (2, 1, 1)
@@ -3246,8 +3246,6 @@ def _helion__residual_matmul(a, b, out, residual, tma_atom_a, tma_tensor_a, tma_
         tcgen05_sched_pipeline.consumer_release(tcgen05_sched_pipeline_consumer_state)
         tcgen05_sched_pipeline_consumer_state.advance()
         cute.arch.sync_warp()
-    if tcgen05_warp_idx == cutlass.Int32(0):
-        tcgen05_c_pipeline.producer_tail()
     if tcgen05_tma_warp:
         tcgen05_ab_pipeline.producer_tail(tcgen05_ab_producer_state)
     if tcgen05_exec_active:
@@ -3261,6 +3259,8 @@ def _helion__residual_matmul(a, b, out, residual, tma_atom_a, tma_tensor_a, tma_
         tcgen05_tmem_alloc_barrier.arrive_and_wait()
     if tcgen05_epi_active:
         tcgen05_tmem_allocator.free(tcgen05_epi_acc_tmem_ptr)
+    if tcgen05_warp_idx == cutlass.Int32(0):
+        tcgen05_c_pipeline.producer_tail()
 _helion__residual_matmul._helion_cute_use_pdl = True
 _helion__residual_matmul._helion_cute_wrapper_plans = [{'kind': 'tcgen05_ab_tma', 'bm': 256, 'bn': 256, 'bk': 128, 'cluster_m': 2, 'cluster_n': 1, 'ab_stage_count': 2, 'input_dtype': 'cutlass.BFloat16', 'acc_dtype': 'cutlass.Float32', 'm_size': 5000, 'n_size': 5000, 'k_total_size': 512, 'kernel_args': ['tma_atom_a', 'tma_tensor_a', 'tma_atom_b', 'tma_tensor_b'], 'use_pdl': True, 'lhs_idx': 0, 'rhs_idx': 1}, {'kind': 'tcgen05_d_tma', 'bm': 256, 'bn': 256, 'c_stage_count': 2, 'output_dtype': 'cutlass.BFloat16', 'kernel_args': ['tcgen05_tma_store_atom', 'tcgen05_tma_store_tensor'], 'd_idx': 2}]
 _helion__residual_matmul._helion_cute_cluster_shape = (2, 1, 1)
@@ -3977,8 +3977,6 @@ def _helion__matmul(a, b, out, tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_
         tcgen05_sched_pipeline_producer_state.advance()
         tcgen05_sched_pipeline.producer_tail(tcgen05_sched_pipeline_producer_state)
         cute.arch.sync_warp()
-    if tcgen05_warp_idx == cutlass.Int32(0):
-        tcgen05_c_pipeline.producer_tail()
     if tcgen05_tma_warp:
         tcgen05_ab_pipeline.producer_tail(tcgen05_ab_producer_state)
     if tcgen05_exec_active:
@@ -3992,6 +3990,8 @@ def _helion__matmul(a, b, out, tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_
         tcgen05_tmem_alloc_barrier.arrive_and_wait()
     if tcgen05_epi_active:
         tcgen05_tmem_allocator.free(tcgen05_epi_acc_tmem_ptr)
+    if tcgen05_warp_idx == cutlass.Int32(0):
+        tcgen05_c_pipeline.producer_tail()
 _helion__matmul._helion_cute_wrapper_plans = [{'kind': 'tcgen05_ab_tma', 'bm': 256, 'bn': 256, 'bk': 128, 'cluster_m': 2, 'cluster_n': 1, 'ab_stage_count': 2, 'input_dtype': 'cutlass.BFloat16', 'acc_dtype': 'cutlass.Float32', 'm_size': 4096, 'n_size': 4096, 'k_total_size': 1024, 'kernel_args': ['tma_atom_a', 'tma_tensor_a', 'tma_atom_b', 'tma_tensor_b'], 'use_pdl': True, 'lhs_idx': 0, 'rhs_idx': 1}, {'kind': 'tcgen05_d_tma', 'bm': 256, 'bn': 256, 'c_stage_count': 2, 'output_dtype': 'cutlass.BFloat16', 'kernel_args': ['tcgen05_tma_store_atom', 'tcgen05_tma_store_tensor'], 'epi_tile_m': 128, 'epi_tile_n': 32, 'd_store_box_n': 32, 'd_idx': 2}]
 _helion__matmul._helion_cute_cluster_shape = (2, 1, 1)
 
@@ -4354,8 +4354,6 @@ def _helion__matmul(a, b, out, tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_
         tcgen05_sched_pipeline_producer_state.advance()
         tcgen05_sched_pipeline.producer_tail(tcgen05_sched_pipeline_producer_state)
         cute.arch.sync_warp()
-    if tcgen05_warp_idx == cutlass.Int32(0):
-        tcgen05_c_pipeline.producer_tail()
     if tcgen05_tma_warp:
         tcgen05_ab_pipeline.producer_tail(tcgen05_ab_producer_state)
     if tcgen05_exec_active:
@@ -4369,6 +4367,8 @@ def _helion__matmul(a, b, out, tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_
         tcgen05_tmem_alloc_barrier.arrive_and_wait()
     if tcgen05_epi_active:
         tcgen05_tmem_allocator.free(tcgen05_epi_acc_tmem_ptr)
+    if tcgen05_warp_idx == cutlass.Int32(0):
+        tcgen05_c_pipeline.producer_tail()
 _helion__matmul._helion_cute_wrapper_plans = [{'kind': 'tcgen05_ab_tma', 'bm': 256, 'bn': 256, 'bk': 128, 'cluster_m': 2, 'cluster_n': 2, 'ab_stage_count': 2, 'input_dtype': 'cutlass.BFloat16', 'acc_dtype': 'cutlass.Float32', 'm_size': 4096, 'n_size': 4096, 'k_total_size': 1024, 'kernel_args': ['tma_atom_a', 'tma_tensor_a', 'tma_atom_b', 'tma_tensor_b'], 'use_pdl': True, 'lhs_idx': 0, 'rhs_idx': 1}, {'kind': 'tcgen05_d_tma', 'bm': 256, 'bn': 256, 'c_stage_count': 2, 'output_dtype': 'cutlass.BFloat16', 'kernel_args': ['tcgen05_tma_store_atom', 'tcgen05_tma_store_tensor'], 'epi_tile_m': 128, 'epi_tile_n': 32, 'd_store_box_n': 32, 'd_idx': 2}]
 _helion__matmul._helion_cute_cluster_shape = (2, 2, 1)
 

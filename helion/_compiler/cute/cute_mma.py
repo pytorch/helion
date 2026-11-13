@@ -9470,7 +9470,9 @@ def plan_tcgen05_pipeline(
     # (128, 32) tile whose ring fits comfortably next to a 3-stage AB
     # pipeline, and a deeper AB pipeline is worth ~15-25% on edge shapes.
     # ``c_stages_fits`` fails CLOSED (False without a recorded budget), so
-    # keep the legacy cap as the fallback admission.
+    # keep the legacy cap as the fallback admission. The measured arena model
+    # (``output_edge_tma_store_smem_fits``) admits the deepest rings that
+    # really fit, e.g. ab=6 beside a (128, 64) C ring on 256x256x64.
     tcgen05_output_edge_tma_store_fits_smem = (
         tcgen05_ab_stage_count_value <= TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
         or smem.c_stages_fits(
@@ -9482,6 +9484,16 @@ def plan_tcgen05_pipeline(
             ab_stages=tcgen05_ab_stage_count_value,
             c_stages=tcgen05_c_stage_count_value,
             has_source_c=True,
+        )
+        or smem.output_edge_tma_store_smem_fits(
+            env.config_spec._cute_tcgen05_config,
+            df.config.config,
+            bm=tcgen05_source_bm,
+            bn=tcgen05_source_bn,
+            bk=bk,
+            cluster_m=tcgen05_cluster_m,
+            ab_stages=tcgen05_ab_stage_count_value,
+            c_stages=tcgen05_c_stage_count_value,
         )
     )
     # ``tcgen05_is_two_cta`` below gates only the hybrid output-store protocol,
@@ -16632,8 +16644,6 @@ def _emit_mma_pipeline(
             tmem_allocator_warp=tcgen05_tmem_allocator_warp,
             free_tmem_in_epilogue=tcgen05_free_tmem_in_epilogue,
             pdl_release=plan.tcgen05_pdl and plan.tcgen05_use_role_local_mma_exec,
-            drain_after_dealloc=plan.tcgen05_is_two_cta
-            and plan.row_union_plan is not None,
             mma_warp_frees_tmem=tcgen05_mma_warp_frees_tmem,
             exec_acc_tmem_ptr=plan.tcgen05_exec_acc_tmem_ptr,
         )
