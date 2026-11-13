@@ -58,8 +58,8 @@ def get_needed_import_lines(root: ast.AST) -> list[str]:
     """Return the list of import statements needed by the given AST.
 
     Unlike ``get_needed_imports``, this returns individual import strings
-    without ``from __future__`` or surrounding whitespace, suitable for
-    passing to ``wrapper.add_import_once`` in the Inductor fusion path.
+    without ``from __future__`` or surrounding whitespace, one per line of
+    the header a kernel's source starts with.
     """
     imports = _active_library_imports()
     rw = ReadWrites.from_ast(root)
