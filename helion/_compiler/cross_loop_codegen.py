@@ -877,6 +877,9 @@ _PURE_TL_CALLS = frozenset(
         "zeros",
     }
 )
+# Exact compiler-owned fill helper: scalar conversion and tensor materialization
+# have no memory, synchronization or publication effects.
+_PURE_HELION_FILL_CALLS = frozenset({"integer_full"})
 # Hoisting these from a persistent task loop saves memory traffic or a reduction.
 _HOIST_ANCHOR_CALLS = frozenset(
     {"associative_scan", "cumsum", "load", "max", "min", "reduce", "sum"}
@@ -913,6 +916,10 @@ def _is_pure_call(node: ast.Call) -> bool:
     return isinstance(func.value, ast.Name) and (
         func.value.id in ("libdevice", "tl_math")
         or (func.value.id == "tl" and func.attr in _PURE_TL_CALLS)
+        or (
+            func.value.id == "helion_triton_helpers"
+            and func.attr in _PURE_HELION_FILL_CALLS
+        )
     )
 
 
@@ -1204,8 +1211,10 @@ _DRY_PASS_PURE_HELPERS = frozenset(
         *("welford", "welford_reduce", "welford_combine"),
     }
 )
-# Helion's own Triton helpers that only reduce; ``triton_wait_signal`` spins.
-_DRY_PASS_PURE_HELION_HELPERS = frozenset({"max_propagate_nan", "min_propagate_nan"})
+# Helion's pure fills/reductions; ``triton_wait_signal`` still spins.
+_DRY_PASS_PURE_HELION_HELPERS = _PURE_HELION_FILL_CALLS | frozenset(
+    {"max_propagate_nan", "min_propagate_nan"}
+)
 # Tensor methods; descriptor methods such as ``load`` and ``store`` are skipped.
 _DRY_PASS_PURE_METHODS = frozenset(
     {"to", "reshape", "view", "trans", "permute", "broadcast_to", "expand_dims"}

@@ -245,7 +245,10 @@ These exceptions occur when Helion language functions are used incorrectly with 
 
 .. autoclass:: ConfigSpecFragmentWithSymInt
 
-   Raised for ConfigSpecFragment with SymInt.
+   Legacy exception retained for import compatibility; it is no longer raised.
+   Symbolic fragment domains instead emit a ``FutureWarning``. Legacy fixed
+   configurations remain supported when the selected/default scalar can be typed;
+   autotuning may still fail while evaluating a symbolic domain.
 
 .. autoclass:: AutotuningDisallowedInEnvironment
 

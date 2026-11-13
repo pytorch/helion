@@ -35,6 +35,7 @@ from .._compiler.cute.flash_facts import FlashSurfaceFacts
 from .._utils import indexing_uses_tensor_descriptor
 from .._utils import prev_power_of_2
 from ..exc import InvalidConfig
+from ..runtime.config import _copy_config_structure
 from ..runtime.triton.launcher import get_num_xcd
 from .block_id_sequence import BlockIdSequence
 from .block_id_sequence import _BlockIdItem
@@ -135,17 +136,6 @@ def _record_restriction(
 
 
 _TARGET_DEVICE_CAPABILITY_UNSET = object()
-
-
-def _copy_config_structure(value: object) -> object:
-    """Copy built-in config containers while preserving opaque leaf objects."""
-    if type(value) is dict:
-        return {key: _copy_config_structure(item) for key, item in value.items()}
-    if type(value) is list:
-        return [_copy_config_structure(item) for item in value]
-    if type(value) is tuple:
-        return tuple(_copy_config_structure(item) for item in value)
-    return value
 
 
 class TensorNumelConstraint(NamedTuple):
@@ -2229,6 +2219,9 @@ class ConfigSpec:
                 config["host_tensor_descriptors"] = False
         for key, fragment in self.backend_tunable_fragments.items():
             config.setdefault(key, fragment.default())
+        for key, fragment in self.user_defined_tunables.items():
+            if key not in config:
+                config[key] = fragment.default()
         self._normalize_amd_mfma(config, fix_invalid=_fix_invalid)
         surface.normalize_after_defaults(self, config, fix_invalid=_fix_invalid)
         cross_loop_pipeline_fragment = self.cross_loop_pipeline

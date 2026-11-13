@@ -12,11 +12,13 @@ import operator
 import re
 import textwrap
 import threading
+import types
 from typing import TYPE_CHECKING
 from typing import Callable
 from typing import Iterator
 from typing import NamedTuple
 from typing import Protocol
+from typing import TypeAlias
 from typing import cast
 from unittest.mock import patch
 
@@ -33,6 +35,8 @@ from torch.utils import _pytree as pytree
 from .. import Config
 from .. import exc
 from .. import language as hl
+from ..autotuner.config_fragment import _BUILTIN_TUNABLE_FRAGMENTS
+from ..autotuner.config_fragment import ConfigSpecFragment
 from ..autotuner.config_spec import FULL_EXTENT_CATEGORIES
 from ..autotuner.config_spec import SIZED_REDUCTION_CATEGORIES
 from ..autotuner.config_spec import VALID_CROSS_LOOP_PIPELINES
@@ -45,6 +49,7 @@ from ..language import _tracing_ops
 from ..language._decorators import _TENSOR_METHOD_REPLACEMENTS
 from ..language._decorators import args_to_proxies
 from ..language._decorators import get_device_func_replacement
+from ..language._decorators import is_api_func
 from ..language._tracing_ops import _new_var
 from ..language.tile_proxy import Tile
 from ..language.tile_proxy import _CheckForIndexCalls
@@ -59,6 +64,10 @@ from .aten_lowering import resolve_reduction_sizes
 from .backend import DeviceIRStage
 from .compile_environment import CompileEnvironment
 from .compile_environment import warning
+from .container_identity import compare_container_identity
+from .container_identity import record_opaque_container_result
+from .fragment_call import guard_fragment_call_input
+from .fragment_comparison import guard_fragment_comparison
 from .host_function import HostFunction
 from .host_function import SymbolOrigin
 from .inductor_lowering import APIFuncLowering
@@ -74,8 +83,10 @@ from .node_masking import defer_pallas_load_masks
 from .node_masking import remove_unnecessary_masking
 from .roll_reduction import ReductionRoller
 from .source_location import current_location
+from .tuple_constants import TupleConstants
 from .type_info import CallableType
 from .type_info import ClassType
+from .type_info import ConfigFragmentType
 from .type_info import DictType
 from .type_info import GridIndexType
 from .type_info import IterType
@@ -94,6 +105,10 @@ from .type_info import _eval_compare
 from .type_info import _eval_unary
 from .type_info import tensor_may_have_many_elements
 from .type_info import tile_spanned_by_slice
+from .variable_origin import AttributeOrigin
+from .variable_origin import DeviceOrigin
+from .variable_origin import GetItemOrigin
+from .variable_origin import Origin
 from .variable_origin import TensorStrideOrigin
 
 if TYPE_CHECKING:
@@ -112,7 +127,6 @@ if TYPE_CHECKING:
     from .device_ir_analysis import DeviceIRAnalysis
     from .tile_dependency import TaskFamily
     from .tile_dependency import TileDependencyGraph
-    from .variable_origin import Origin
 
     class _TLS(Protocol):
         device_irs: list[DeviceIR]
@@ -1544,6 +1558,10 @@ class DeviceIR:
 
         temp = copy.copy(self)
         temp.graphs = [g.copy() for g in self.graphs]
+        if self.host_function is not None:
+            from .selected_tunable_types import specialize_selected_tunable_types
+
+            specialize_selected_tunable_types(self.host_function, temp.graphs, config)
         if roll_reductions:
             temp._apply_rolling(config)
         temp._apply_epilogue_subtiling(config)
@@ -1728,16 +1746,66 @@ def _is_static_slice_bound(bound: object) -> bool:
     return False
 
 
+@dataclasses.dataclass
+class _SequenceOrigin:
+    """Element paths and allocation provenance, shared by static aliases."""
+
+    items: list[_StaticOrigin]
+    constructed: bool = False
+    captured: bool = False
+
+
+@dataclasses.dataclass
+class _MappingOrigin:
+    """Paths of constructed dictionary values, including nested mappings."""
+
+    items: dict[object, _StaticOrigin]
+    constructed: bool = False
+
+
+_StaticOrigin: TypeAlias = Origin | _SequenceOrigin | _MappingOrigin | None
+
+
+def _item_origin(origin: _StaticOrigin, index: int | str) -> _StaticOrigin:
+    if isinstance(origin, _SequenceOrigin):
+        assert isinstance(index, int)
+        return origin.items[index]
+    if isinstance(origin, _MappingOrigin):
+        return origin.items[index]
+    return GetItemOrigin(origin, index) if origin is not None else None
+
+
 class WalkDeviceAST(NodeVisitor):
     def __init__(self, device_ir: DeviceIR) -> None:
         super().__init__()
         self.device_ir = device_ir
+        hf = device_ir.host_function
+        self.tuple_constants = (
+            TupleConstants(hf.fn.__code__) if hf is not None else None
+        )
         self.scope: dict[str, object] = {}
+        # Static unrolling changes values without changing the shared AST types.
+        # Preserve their actual input paths for folded comparison guards.
+        self.scope_origins: dict[str, _StaticOrigin] = {}
+        self.expression_origins: dict[ast.AST, _StaticOrigin] = {}
+
+    def _value_origin(self, node: ast.AST) -> _StaticOrigin:
+        if isinstance(node, ast.Name) and node.id in self.scope_origins:
+            return self.scope_origins[node.id]
+        if node in self.expression_origins:
+            return self.expression_origins[node]
+        assert isinstance(node, ExtendedAST)
+        return node._type_info.origin if node._type_info is not None else None
+
+    def _index_origin(self, node: ast.AST, index: int | str) -> _StaticOrigin:
+        return _item_origin(self._value_origin(node), index)
 
     def generic_visit(self, node: ast.AST) -> None:
         raise exc.StatementNotSupported(type(node).__name__)
 
-    def _assign(self, target: ast.AST, value: object) -> None:
+    def _assign(
+        self, target: ast.AST, value: object, origin: _StaticOrigin = None
+    ) -> None:
         if isinstance(target, ast.Name):
             if isinstance(
                 value, torch.SymFloat
@@ -1759,13 +1827,18 @@ class WalkDeviceAST(NodeVisitor):
                             target.id, None
                         )
             self.scope[target.id] = value
+            self.scope_origins[target.id] = origin
         elif isinstance(target, (ast.Tuple, ast.List)):
             for i, n in enumerate(target.elts):
                 if isinstance(n, ast.Starred):
                     raise exc.StarredArgsNotSupportedOnDevice
 
-                # pyrefly: ignore [bad-index]
-                self._assign(n, value[i])
+                self._assign(
+                    n,
+                    # pyrefly: ignore [bad-index]
+                    value[i],
+                    _item_origin(origin, i),
+                )
         elif isinstance(target, ast.Subscript):
             dst = self.visit(target.value)
             assert isinstance(value, torch.Tensor)
@@ -1839,6 +1912,7 @@ class WalkDeviceAST(NodeVisitor):
             nonlocal outputs_holder
             subgraph_walker = WalkDeviceAST(self.device_ir)
             subgraph_walker.scope.update(self._static_scope())
+            subgraph_walker.scope_origins.update(self.scope_origins)
             subgraph_walker.scope.update(
                 inputs.replace_graph_args(args, copy_tensors=copy_tensor_args)
             )
@@ -1897,15 +1971,101 @@ class WalkDeviceAST(NodeVisitor):
         return _eval_unary(ast.Not(), operand)
 
     def visit_Compare(self, node: ast.Compare) -> object:
-        lhs = self.visit(node.left)
+        lhs_node = node.left
+        lhs = self.visit(lhs_node)
         results = []
-        for op, rhs in zip(node.ops, node.comparators, strict=True):
-            rhs = self.visit(rhs)
-            results.append(result := _eval_compare(op, lhs, rhs))
+        for op, rhs_node in zip(node.ops, node.comparators, strict=True):
+            rhs = self.visit(rhs_node)
+            if isinstance(op, (ast.Is, ast.IsNot)) and (
+                type(lhs) in (tuple, list, dict) or type(rhs) in (tuple, list, dict)
+            ):
+                left_origin = self._value_origin(lhs_node)
+                right_origin = self._value_origin(rhs_node)
+                result = compare_container_identity(
+                    op,
+                    lhs,
+                    left_origin if isinstance(left_origin, Origin) else None,
+                    rhs,
+                    right_origin if isinstance(right_origin, Origin) else None,
+                    left_constructed=isinstance(
+                        left_origin, (_SequenceOrigin, _MappingOrigin)
+                    )
+                    and left_origin.constructed,
+                    right_constructed=isinstance(
+                        right_origin, (_SequenceOrigin, _MappingOrigin)
+                    )
+                    and right_origin.constructed,
+                    left_captured=isinstance(left_origin, _SequenceOrigin)
+                    and left_origin.captured,
+                    right_captured=isinstance(right_origin, _SequenceOrigin)
+                    and right_origin.captured,
+                )
+            else:
+                result = _eval_compare(op, lhs, rhs)
+            results.append(result)
+            assert isinstance(lhs_node, ExtendedAST)
+            assert isinstance(rhs_node, ExtendedAST)
+            left_type, right_type = lhs_node._type_info, rhs_node._type_info
+            if (
+                isinstance(op, ast.Eq)
+                and isinstance(left_type, SequenceType)
+                and isinstance(right_type, SequenceType)
+            ):
+                self._guard_sequence_equality(
+                    lhs, self._value_origin(lhs_node), rhs, self._value_origin(rhs_node)
+                )
+            if (
+                isinstance(left_type, LiteralType)
+                and isinstance(right_type, LiteralType)
+                and (
+                    isinstance(lhs, ConfigSpecFragment)
+                    or isinstance(rhs, ConfigSpecFragment)
+                )
+            ):
+                left_origin = self._value_origin(lhs_node)
+                right_origin = self._value_origin(rhs_node)
+                if isinstance(left_origin, Origin) and isinstance(right_origin, Origin):
+                    guard_fragment_comparison(
+                        op,
+                        LiteralType(left_origin, lhs),
+                        LiteralType(right_origin, rhs),
+                        result,
+                    )
             if not isinstance(result, _tracing_ops._symbolic_types) and not result:
                 break
             lhs = rhs
+            lhs_node = rhs_node
         return functools.reduce(_tracing_ops._and, results)
+
+    def _guard_sequence_equality(
+        self,
+        left: object,
+        left_origin: _StaticOrigin,
+        right: object,
+        right_origin: _StaticOrigin,
+    ) -> None:
+        if isinstance(left, (tuple, list)) and isinstance(right, (tuple, list)):
+            for index, (a, b) in enumerate(zip(left, right, strict=False)):
+                self._guard_sequence_equality(
+                    a,
+                    _item_origin(left_origin, index),
+                    b,
+                    _item_origin(right_origin, index),
+                )
+        elif (
+            isinstance(left_origin, Origin)
+            and isinstance(right_origin, Origin)
+            and (
+                isinstance(left, ConfigSpecFragment)
+                or isinstance(right, ConfigSpecFragment)
+            )
+        ):
+            guard_fragment_comparison(
+                ast.Eq(),
+                LiteralType(left_origin, left),
+                LiteralType(right_origin, right),
+                _eval_compare(ast.Eq(), left, right),
+            )
 
     def visit_BoolOp(self, node: ast.BoolOp) -> object:
         if isinstance(node.op, ast.And):
@@ -2013,23 +2173,26 @@ class WalkDeviceAST(NodeVisitor):
         )
 
         results = []
-        for element_value in sequence_value:
+        for index, element_value in enumerate(sequence_value):
+            element_origin = self._index_origin(sequence_iter, index)
             if preserve_scope:
                 # For loops: don't create new scope, allow state to persist
-                self._assign(target, element_value)
+                self._assign(target, element_value, element_origin)
                 result = element_processor()
                 if result is not None:
                     results.append(result)
             else:
                 # For comprehensions: create isolated scope for each iteration
                 old_scope = self.scope.copy()
+                old_origins = self.scope_origins.copy()
                 try:
-                    self._assign(target, element_value)
+                    self._assign(target, element_value, element_origin)
                     result = element_processor()
                     if result is not None:
                         results.append(result)
                 finally:
                     self.scope = old_scope
+                    self.scope_origins = old_origins
 
         return results
 
@@ -2471,10 +2634,36 @@ class WalkDeviceAST(NodeVisitor):
         return [result]
 
     def visit_Tuple(self, node: ast.Tuple) -> tuple[object, ...]:
-        return tuple([self.visit(x) for x in node.elts])
+        values = tuple([self.visit(x) for x in node.elts])
+        if (
+            self.tuple_constants is not None
+            and (constant := self.tuple_constants.resolve(node, values)) is not None
+        ):
+            self.expression_origins[node] = self._constant_tuple_origin(constant)
+            return constant
+        self.expression_origins[node] = _SequenceOrigin(
+            [self._value_origin(x) for x in node.elts], constructed=True
+        )
+        return values
+
+    @staticmethod
+    def _constant_tuple_origin(value: tuple[object, ...]) -> _SequenceOrigin:
+        return _SequenceOrigin(
+            [
+                WalkDeviceAST._constant_tuple_origin(item)
+                if type(item) is tuple
+                else None
+                for item in value
+            ],
+            captured=True,
+        )
 
     def visit_List(self, node: ast.List) -> list[object]:
-        return [self.visit(x) for x in node.elts]
+        values: list[object] = [self.visit(x) for x in node.elts]
+        self.expression_origins[node] = _SequenceOrigin(
+            [self._value_origin(x) for x in node.elts], constructed=True
+        )
+        return values
 
     def _visit_comprehension(
         self, node: ast.ListComp | ast.GeneratorExp, name: str
@@ -2492,7 +2681,7 @@ class WalkDeviceAST(NodeVisitor):
 
         # Check if we're iterating over a sequence (similar to tuple unrolling)
         if isinstance(iter_type, SequenceType):
-            return self._handle_comprehension_unrolling(node.elt, generator)
+            return self._handle_comprehension_unrolling(node, generator)
 
         # For non-sequence iterables, we could extend this later
         raise exc.StatementNotSupported(
@@ -2506,13 +2695,16 @@ class WalkDeviceAST(NodeVisitor):
         return self._visit_comprehension(node, "generator expression")
 
     def _handle_comprehension_unrolling(
-        self, elt: ast.expr, generator: ast.comprehension
+        self, node: ast.ListComp | ast.GeneratorExp, generator: ast.comprehension
     ) -> tuple[object, ...]:
         """Handle unrolling of comprehensions (list comp or generator exp) over sequences."""
+        elt = node.elt
+        origins = []
 
         def evaluate_expression() -> object:
             # Evaluate the comprehension expression
             result = self.visit(elt)
+            origins.append(self._value_origin(elt))
             # If the result is a SymInt that can be evaluated to a concrete value, do so
             if isinstance(result, torch.SymInt):
                 try:
@@ -2524,6 +2716,7 @@ class WalkDeviceAST(NodeVisitor):
         results = self._handle_sequence_unrolling(
             generator.iter, generator.target, evaluate_expression, preserve_scope=False
         )
+        self.expression_origins[node] = _SequenceOrigin(origins)
         # Return as tuple to match the expected type for tuple unrolling
         return tuple(results)
 
@@ -2546,20 +2739,33 @@ class WalkDeviceAST(NodeVisitor):
             )
 
         result: dict[object, object] = {}
+        origins: dict[object, _StaticOrigin] = {}
 
         def evaluate_key_value() -> None:
             key = self.visit(node.key)
             value = self.visit(node.value)
             result[key] = value
+            origins[key] = self._value_origin(node.value)
 
         self._handle_sequence_unrolling(
             generator.iter, generator.target, evaluate_key_value, preserve_scope=False
         )
+        self.expression_origins[node] = _MappingOrigin(origins)
         return result
 
     def visit_Dict(self, node: ast.Dict) -> dict[object, object]:
         keys = [self.visit(key) if key is not None else None for key in node.keys]
         values = [self.visit(value) for value in node.values]
+        self.expression_origins[node] = _MappingOrigin(
+            dict(
+                zip(
+                    keys,
+                    (self._value_origin(value) for value in node.values),
+                    strict=True,
+                )
+            ),
+            constructed=True,
+        )
         return dict(zip(keys, values, strict=False))
 
     def visit_Slice(self, node: ast.Slice) -> slice | torch.Tensor | torch.SymInt:
@@ -2606,7 +2812,7 @@ class WalkDeviceAST(NodeVisitor):
                 and not isinstance(value, Tile)
             ):
                 value = _new_var(value)
-            self._assign(target, value)
+            self._assign(target, value, self._value_origin(node.value))
             return None
         if isinstance(target, ast.Tuple):
             # Handle tuple unpacking
@@ -2615,9 +2821,9 @@ class WalkDeviceAST(NodeVisitor):
                 raise exc.InvalidAssignment
             if len(target.elts) != len(value):
                 raise exc.InvalidAssignment
-            for t, v in zip(target.elts, value, strict=True):
+            for index, (t, v) in enumerate(zip(target.elts, value, strict=True)):
                 if isinstance(t, ast.Name):
-                    self._assign(t, v)
+                    self._assign(t, v, self._index_origin(node.value, index))
                 elif isinstance(t, ast.Subscript):
                     # Handle subscript targets in tuple unpacking (e.g., a[i], b[j] = tuple)
                     self._assign_subscript(t, v)
@@ -2638,6 +2844,9 @@ class WalkDeviceAST(NodeVisitor):
             base_list = self.visit(target.value)
             assert isinstance(base_list, list)
             base_list[index_value] = val
+            origin = self._value_origin(target.value)
+            if isinstance(origin, _SequenceOrigin):
+                origin.items[index_value] = self._value_origin(node.value)
             return None
         assert isinstance(node.value, ExtendedAST)
         rhs_type = node.value._type_info
@@ -2709,6 +2918,7 @@ class WalkDeviceAST(NodeVisitor):
         self._assign(
             node.target,
             _eval_binary(node.op, self.visit(node.target), self.visit(node.value)),
+            DeviceOrigin(current_location()),
         )
 
     def visit_Subscript(self, node: ast.Subscript) -> object:
@@ -2718,8 +2928,10 @@ class WalkDeviceAST(NodeVisitor):
         if isinstance(type_info, SequenceType):
             index_value = self.visit(node.slice)
             if isinstance(index_value, int):
+                sequence = self.visit(value)
+                self.expression_origins[node] = self._index_origin(value, index_value)
                 # pyrefly: ignore [bad-index]
-                return self.visit(value)[index_value]
+                return sequence[index_value]
             raise exc.InvalidSequenceSubscription(node.slice)
         # Check StackTensorType before DictType since StackTensorType inherits from DictType
         if isinstance(type_info, StackTensorType):
@@ -2728,8 +2940,10 @@ class WalkDeviceAST(NodeVisitor):
         if isinstance(type_info, DictType):
             key_value = self.visit(node.slice)
             if isinstance(key_value, (str, int)):
+                mapping = self.visit(value)
+                self.expression_origins[node] = self._index_origin(value, key_value)
                 # pyrefly: ignore [bad-index]
-                return self.visit(value)[key_value]
+                return mapping[key_value]
             raise exc.TypeInferenceError(
                 f"Dict subscript must be a literal str or int, got {type(key_value).__name__}"
             )
@@ -2740,31 +2954,66 @@ class WalkDeviceAST(NodeVisitor):
         return hl.subscript(self.visit(value), self._subscript_slice_proxy(node.slice))
 
     def visit_Call(self, node: ast.Call) -> object:
-        args = []
-        kwargs = {}
-        for arg in node.args:
-            if isinstance(arg, ast.Starred):
-                # pyrefly: ignore [bad-argument-type]
-                args.extend(self.visit(arg.value))
-            else:
-                args.append(self.visit(arg))
-        for kwarg in node.keywords:
-            if kwarg.arg is None:
-                # pyrefly: ignore [no-matching-overload]
-                kwargs.update(self.visit(kwarg.value))
-            else:
-                kwargs[kwarg.arg] = self.visit(kwarg.value)
-
+        assert isinstance(node, ExtendedAST)
         # pyrefly: ignore [missing-attribute]
         func_type_info = node.func._type_info
+        builtin_fragment_constructor = isinstance(func_type_info, CallableType) and any(
+            func_type_info.value is cls for cls in _BUILTIN_TUNABLE_FRAGMENTS
+        )
+        if (
+            isinstance(node._type_info, ConfigFragmentType)
+            and builtin_fragment_constructor
+        ):
+            # Type propagation already constructed and validated this metadata,
+            # including recovery of recorded global literals. Custom constructors
+            # and helpers must still evaluate each iteration's actual values.
+            return node._type_info.as_literal()
+        args = []
+        arg_origins = []
+        kwargs = {}
+        kwarg_origins = {}
+        for arg in node.args:
+            if isinstance(arg, ast.Starred):
+                start = len(args)
+                # pyrefly: ignore [bad-argument-type]
+                args.extend(self.visit(arg.value))
+                arg_origins.extend(
+                    self._index_origin(arg.value, index)
+                    for index in range(len(args) - start)
+                )
+            else:
+                args.append(self.visit(arg))
+                arg_origins.append(self._value_origin(arg))
+        for kwarg in node.keywords:
+            if kwarg.arg is None:
+                mapping = self.visit(kwarg.value)
+                assert isinstance(mapping, dict)
+                kwargs.update(mapping)
+                kwarg_origins.update(
+                    (key, self._index_origin(kwarg.value, key)) for key in mapping
+                )
+            else:
+                kwargs[kwarg.arg] = self.visit(kwarg.value)
+                kwarg_origins[kwarg.arg] = self._value_origin(kwarg.value)
+
         if isinstance(func_type_info, NestedFunctionType):
-            return self._call_nested_function(func_type_info, args, kwargs)
+            return self._call_nested_function(
+                func_type_info, args, kwargs, arg_origins, node
+            )
         if isinstance(func_type_info, CallableType) and (
             replacement := get_device_func_replacement(func_type_info.value)
         ):
             func = replacement
+            opaque_call = False
         else:
             func = self.visit(node.func)
+            # Tensor methods have dedicated type propagation and operate on
+            # tracing proxies; they do not inspect opaque fragment state.
+            opaque_call = (
+                not builtin_fragment_constructor
+                and not isinstance(func_type_info, TensorAttributeType)
+                and not is_api_func(func)
+            )
         if (
             isinstance(func_type_info, TensorAttributeType)
             and func_type_info.attr() == "stride"
@@ -2777,17 +3026,63 @@ class WalkDeviceAST(NodeVisitor):
                 # Re-evaluate the actual receiver and dimension. The raw fake
                 # stride can be a size expression or lack a host symbol origin.
                 func = functools.partial(_host_tensor_stride, tensor, origin, source)
+
         # pyrefly: ignore [bad-argument-type]
-        return _CheckForIndexCalls.retry_call(func, args, kwargs)
+        result = _CheckForIndexCalls.retry_call(func, args, kwargs)
+        if (
+            func is tuple
+            and len(args) == 1
+            and not kwargs
+            and type(result) is tuple
+            and result is args[0]
+        ):
+            self.expression_origins[node] = arg_origins[0]
+        if opaque_call:
+            if not any(func is fn for fn in (tuple, list, dict)):
+                record_opaque_container_result(result)
+            callee_origin = self._value_origin(node.func)
+            if isinstance(callee_origin, Origin):
+                guard_fragment_call_input(callee_origin)
+            for arg, origin in zip(args, arg_origins, strict=True):
+                self._guard_fragment_call_inputs(arg, origin)
+            for key, arg in kwargs.items():
+                self._guard_fragment_call_inputs(arg, kwarg_origins[key])
+        return result
+
+    def _guard_fragment_call_inputs(self, value: object, origin: _StaticOrigin) -> None:
+        if isinstance(
+            value, (ConfigSpecFragment, types.FunctionType, types.MethodType)
+        ):
+            if isinstance(origin, Origin):
+                guard_fragment_call_input(origin)
+        elif isinstance(value, (tuple, list)):
+            for index, item in enumerate(value):
+                self._guard_fragment_call_inputs(item, _item_origin(origin, index))
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                self._guard_fragment_call_inputs(item, _item_origin(origin, key))
 
     def visit_Attribute(self, node: ast.Attribute) -> object:
         value = self.visit(node.value)
         # Apply the replacement here so saved bound methods use it too.
         assert isinstance(node, ExtendedAST)
         assert isinstance(node.value, ExtendedAST)
-        if isinstance(node.value._type_info, ClassType) and isinstance(value, dict):
-            # ClassType represents dataclass and namedtuple fields as a mapping.
-            return value[node.attr]
+        if isinstance(node.value._type_info, ClassType):
+            origin = self._value_origin(node.value)
+            if isinstance(origin, _SequenceOrigin):
+                # Constructed field values retain their individual input paths.
+                index = list(node.value._type_info.element_types).index(node.attr)
+                field_origin = _item_origin(origin, index)
+            else:
+                field_origin = (
+                    AttributeOrigin(origin, node.attr)
+                    if isinstance(origin, Origin)
+                    else None
+                )
+            self.expression_origins[node] = field_origin
+            if isinstance(value, dict):
+                # ClassType models dataclass/namedtuple fields as a mapping.
+                return value[node.attr]
         if (
             isinstance(node._type_info, TensorAttributeType)
             and node.attr in _TENSOR_METHOD_REPLACEMENTS
@@ -2808,6 +3103,8 @@ class WalkDeviceAST(NodeVisitor):
         func: NestedFunctionType,
         args: list[object],
         kwargs: dict[str, object],
+        arg_origins: list[_StaticOrigin],
+        call_node: ast.Call,
     ) -> object:
         func_node = func.func_node
         params = func_node.args
@@ -2818,15 +3115,22 @@ class WalkDeviceAST(NodeVisitor):
             )
         func.find_effective_return()
         old_scope = self.scope.copy()
-        for param, arg_val in zip(params.args, args, strict=True):
+        old_origins = self.scope_origins.copy()
+        for param, arg_val, origin in zip(params.args, args, arg_origins, strict=True):
             self.scope[param.arg] = arg_val
+            self.scope_origins[param.arg] = origin
         try:
             for stmt in func_node.body:
                 if isinstance(stmt, ast.Return):
-                    return self.visit(stmt.value) if stmt.value is not None else None
+                    if stmt.value is None:
+                        return None
+                    value = self.visit(stmt.value)
+                    self.expression_origins[call_node] = self._value_origin(stmt.value)
+                    return value
                 self.visit(stmt)
         finally:
             self.scope = old_scope
+            self.scope_origins = old_origins
         return None
 
     def visit_Expr(self, node: ast.Expr) -> object:

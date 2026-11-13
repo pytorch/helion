@@ -269,6 +269,7 @@ class _RuntimeBoundKernel:
             backend=backend,
             device=torch.device("cuda", 0),
             process_group_name=None,
+            requires_fresh_binding=False,
         )
         self.compile_config = Mock()
         self.set_config = Mock()

@@ -1341,11 +1341,14 @@ class BaseSearch(BaseAutotuner):
         seeds under forced autotuning, which forces a fresh search rather than
         discarding prior measurements.
         """
+        from .base_cache import _requires_uncached_tuning
         from .base_cache import should_skip_cache
 
         if (
-            self._skip_cache and self.config_spec.cute_flash_search_enabled
-        ) or should_skip_cache():
+            _requires_uncached_tuning(self.kernel, self.args)
+            or (self._skip_cache and self.config_spec.cute_flash_search_enabled)
+            or should_skip_cache()
+        ):
             return []
 
         from .local_cache import get_helion_cache_dir

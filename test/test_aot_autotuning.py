@@ -12,6 +12,7 @@ import importlib.util
 import inspect
 import json
 import os
+import struct
 import sys
 import threading
 import time
@@ -26,9 +27,13 @@ import numpy as np
 import pytest
 import torch
 
+import helion
 from helion import exc
 from helion._hardware import HardwareInfo
+from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
+from helion.autotuner import BooleanFragment
+from helion.autotuner import EnumFragment
 import helion.autotuner.aot_cache as aot_cache_module
 from helion.autotuner.aot_cache import AOTAutotuneCache
 from helion.autotuner.aot_cache import ShapeKey
@@ -45,7 +50,9 @@ from helion.autotuner.heuristic_generator import PerformanceTarget
 from helion.autotuner.heuristic_generator import ShapeConfigData
 from helion.autotuner.heuristic_generator import compute_validity_partitions
 from helion.autotuner.heuristic_generator import select_config_subset
+import helion.language as hl
 from helion.runtime.config import Config
+from helion.runtime.kernel import _constexpr_key
 
 pytestmark = pytest.mark.cpu_only
 
@@ -106,6 +113,72 @@ class TestShapeKey:
 
         key3 = ShapeKey("k", (1, 2, 4), "hw")
         assert key1.stable_hash() != key3.stable_hash()
+
+    @pytest.mark.parametrize("kind", ["float", "fragment", "fragment_set"])
+    def test_typed_constexpr_shape_key_round_trip(self, kind) -> None:
+        @helion.kernel()
+        def kernel(x, value: hl.constexpr):
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.numel()):
+                out[tile] = x[tile] + 1
+            return out
+
+        tensor = torch.empty(3)
+        payloads = (
+            "0000000000000000",
+            "8000000000000000",
+            "7ff8000000000001",
+            "fff8000000000002",
+        )
+        hashes = []
+        for index, payload in enumerate(payloads):
+            scalar = struct.unpack("!d", bytes.fromhex(payload))[0]
+            value = scalar if kind == "float" else EnumFragment((scalar,))
+            if kind == "fragment_set":
+                # Equal declarations are distinct set members under their
+                # public identity equality; serialization must keep the count.
+                value = frozenset(BooleanFragment() for _ in range(index + 1))
+            args = (tensor, value)
+            with cpu_render_target():
+                if kind != "fragment_set":
+                    kernel.bind(args)
+                # Frozensets have specialization keys even though they are
+                # not accepted frontend arguments; cover that key codec too.
+                key = ShapeKey("typed", kernel.specialization_key(args), "cpu")
+            original_hash = key.stable_hash()
+            restored = ShapeKey.from_dict(json.loads(json.dumps(key.to_dict())))
+            assert restored.specialization_key == key.specialization_key
+            assert restored.stable_hash() == original_hash
+            assert ShapeKey.from_dict(restored.to_dict()).stable_hash() == original_hash
+            hashes.append(original_hash)
+        assert len(set(hashes)) == len(payloads)
+
+    def test_boolean_constexpr_shape_keys_remain_distinct_after_json(self) -> None:
+        hashes = []
+        for value in (True, 1, False, 0):
+            # Exercise the same recursive key used by real constexpr bindings,
+            # including frozensets (keyable but not frontend arguments).
+            signature = (_constexpr_key(((value,), frozenset((value,)))),)
+            key = ShapeKey("boolean", signature, "cpu")
+            restored = ShapeKey.from_dict(json.loads(json.dumps(key.to_dict())))
+            assert restored.specialization_key == signature
+            assert restored.stable_hash() == key.stable_hash()
+            hashes.append(restored.stable_hash())
+        assert len(set(hashes)) == 4
+
+    def test_nested_finite_float_shape_keys_remain_distinct_after_json(self) -> None:
+        hashes = []
+        keys = []
+        for value in (1, 1.0, -2, -2.0):
+            signature = (_constexpr_key(((value,), frozenset((value,)))),)
+            key = ShapeKey("nested-finite", signature, "cpu")
+            restored = ShapeKey.from_dict(json.loads(json.dumps(key.to_dict())))
+            assert restored.specialization_key == signature
+            assert restored.stable_hash() == key.stable_hash()
+            hashes.append(restored.stable_hash())
+            keys.append(restored.specialization_key)
+        assert len(set(hashes)) == 4
+        assert len(set(keys)) == 4
 
     def test_search_policy_is_structural_and_legacy_serialization_is_unchanged(
         self,

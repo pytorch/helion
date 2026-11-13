@@ -18,6 +18,7 @@ from torch._dynamo.source import TensorProperty
 from torch._dynamo.source import TensorPropertySource
 from torch.fx.experimental import proxy_tensor
 from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils._pytree import tree_leaves
 from torch.utils._pytree import tree_map_only
 from torch.utils._sympy.functions import FloatTrueDiv
 from torch.utils._sympy.functions import FloorDiv
@@ -25,7 +26,10 @@ from torch.utils._sympy.functions import IntTrueDiv
 from torch.utils._sympy.functions import ToFloat
 
 from .. import exc
+from ..autotuner.config_fragment import _BUILTIN_TUNABLE_FRAGMENTS
+from ..autotuner.config_fragment import _FRAGMENT_CHANGED_MESSAGE
 from ..autotuner.config_fragment import ConfigSpecFragment
+from ..autotuner.config_fragment import _plain_builtin_fragment_key
 from ..autotuner.config_fragment import _same_scalar
 from ..autotuner.config_spec import BlockSizeSpec
 from ..autotuner.config_spec import NumThreadsSpec
@@ -42,9 +46,13 @@ from .compile_environment import ConfigValueExpression
 from .compile_environment import FixedBlockSizeSource
 from .compile_environment import LoopSpecBlockSizeSource
 from .compile_environment import RuntimeInputSpecialization
+from .compile_environment import _ContainerIdentity
 from .compile_environment import _symint_expr
+from .compile_environment import _symint_free_symbols
 from .compile_environment import warning
+from .container_identity import record_opaque_container_result
 from .device_function import contains_only_block_size_symbols
+from .fragment_call import guard_fragment_call_input
 from .host_function import HostFunction
 from .host_function import NoCurrentFunction
 from .host_function import SymbolOrigin
@@ -75,6 +83,12 @@ regexp_allowed_host_ops: re.Pattern[str] = re.compile(
     r"like|new|broadcast|promote|view|reshape|expand|permute|strided|"
     r"transpose|contiguous|unsqueeze|squeeze|zero|rand|full|fill"
 )
+
+
+def _is_symbolic_numeric(value: object) -> bool:
+    return isinstance(value, (torch.SymInt, torch.SymFloat, torch.SymBool)) and bool(
+        value._sympy_().free_symbols
+    )
 
 
 def tile_spanned_by_slice(lower: object, upper: object) -> torch.SymInt | None:
@@ -148,12 +162,17 @@ class TypeInfo:
             return CallableType(origin, value)
         if type(value) is list:
             # TODO(jansel): track specializations
-            return SequenceType(origin, cls._unpack_example(enumerate(value), origin))
+            return SequenceType(
+                origin,
+                cls._unpack_example(enumerate(value), origin),
+                original_value=value,
+            )
         if type(value) is tuple:
             # TODO(jansel): track specializations
             return SequenceType(
                 origin,
                 tuple(cls._unpack_example(enumerate(value), origin)),
+                original_value=value,
             )
         if type(value) is torch.Size:
             return cls.from_example(tuple(value), origin)
@@ -169,6 +188,7 @@ class TypeInfo:
                 dict(
                     zip(value.keys(), cls._unpack_example(items, origin), strict=False)
                 ),
+                original_value=value,
             )
         if isinstance(value, tuple) and hasattr(type(value), "__match_args__"):
             # namedtuple or torch.return_types structseq (e.g., sort, topk)
@@ -190,6 +210,7 @@ class TypeInfo:
                         strict=False,
                     )
                 ),
+                original_value=value,
             )
         if isinstance(value, ConfigSpecFragment):
             return ConfigFragmentType(origin, value)
@@ -208,6 +229,7 @@ class TypeInfo:
                         strict=False,
                     )
                 ),
+                original_value=value,
             )
         if isinstance(value, zip):
             # Handle zip objects by converting to tuple of tuples
@@ -830,6 +852,22 @@ class LiteralType(TypeInfo):
             return self
         if isinstance(other, (LiteralType, NumericType)):
             if NumericType.known_equal(other.value, self.value):
+                if isinstance(other, NumericType):
+                    captured = CompileEnvironment.current().resolve_fragment_global(
+                        other.value
+                    )
+                    if (
+                        captured is None
+                        and other.python_type is float
+                        or captured is not None
+                        and not _same_scalar(captured, self.value)
+                    ):
+                        # A symbolic float can have rounded differently from
+                        # its simplified expression. Do not let a literal arm
+                        # certify the other runtime branch's domain value.
+                        return NumericType.subtype(other.python_type).new_unbacked(
+                            self.origin
+                        )
                 return self
             if self.python_type == other.python_type and self.python_type in (
                 int,
@@ -905,6 +943,56 @@ class ConfigFragmentType(LiteralType):
     def __init__(self, origin: Origin, fragment: ConfigSpecFragment) -> None:
         assert isinstance(fragment, ConfigSpecFragment)
         super().__init__(origin, fragment)
+        self._captured_domain = self._revisit_domain()
+
+    def propagate_attribute(self, attr: str, origin: AttributeOrigin) -> TypeInfo:
+        value = getattr(self.value, attr)
+        if (
+            self.origin.is_global()
+            and dataclasses.is_dataclass(self.value)
+            and any(field.name == attr for field in dataclasses.fields(self.value))
+        ):
+            # A captured declaration is literal metadata, but ordinary reads of
+            # its dataclass fields retain the original runtime scalar behavior.
+            value = CompileEnvironment.current().to_fake(value, origin)
+        return TypeInfo.from_example(value, origin)
+
+    def _revisit_domain(self) -> tuple[object, ...] | None:
+        # These two built-ins compare by identity, but their complete domain
+        # can be snapshotted immutably. The original fields remain mutable and
+        # are rechecked on merge. Exclude subclasses and opaque search state.
+        value = self.value
+
+        def resolve(field: object) -> object:
+            if isinstance(field, torch.SymInt):
+                # A helper can store a traced literal global before registration
+                # normalizes its snapshot. Use the same exact recorded value for
+                # this private key, without mutating the original or using hints.
+                return CompileEnvironment.current().resolve_fragment_global(field)
+            return field
+
+        key = _plain_builtin_fragment_key(
+            value, resolve=resolve, for_identity_equality=True
+        )
+        return (type(value), key) if key is not None else None
+
+    def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
+        for value in (self, other):
+            if (
+                isinstance(value, ConfigFragmentType)
+                and value._captured_domain is not None
+                and value._captured_domain != value._revisit_domain()
+            ):
+                # An identical object may have changed since the first visit.
+                # LiteralType's identity/equality fallback must not erase that.
+                raise exc.TypeInferenceError(_FRAGMENT_CHANGED_MESSAGE)
+        if (
+            isinstance(other, ConfigFragmentType)
+            and self._captured_domain is not None
+            and self._captured_domain == other._captured_domain
+        ):
+            return self
+        return super().merge(other, var_name=var_name)
 
 
 def _starts_symmetric_allocation(values: Sequence[object]) -> bool:
@@ -1040,12 +1128,23 @@ class CallableType(LiteralType):
             ):
                 warning(exc.WrongDevice(self.value, arg.fake_value.device, env.device))
 
+        fragment_constructor = isinstance(self.value, type) and issubclass(
+            self.value, ConfigSpecFragment
+        )
+
         def to_proxy(arg: TypeInfo) -> object:
             if isinstance(arg, TensorType):
                 nonlocal input_contains_tensor
                 input_contains_tensor = True
                 warn_wrong_device(arg)
-            return _to_proxy(arg)
+            value = _to_proxy(arg)
+            if fragment_constructor and isinstance(
+                value, (torch.SymInt, torch.SymFloat, torch.SymBool)
+            ):
+                literal = env.resolve_fragment_global(value)
+                if literal is not None:
+                    return literal
+            return value
 
         input_contains_tensor: bool = False
         env: CompileEnvironment = CompileEnvironment.current()
@@ -1065,10 +1164,15 @@ class CallableType(LiteralType):
                 torch.sym_int(cast("torch.SymFloat", proxy_args[0])), origin
             )
 
+        if fragment_constructor and any(
+            _is_symbolic_numeric(value)
+            for value in tree_leaves((proxy_args, proxy_kwargs))
+        ):
+            env.warn_symbolic_fragment_domain()
+
         # special handling for symint arguments
         if any(
-            (isinstance(x, torch.SymInt) and not isinstance(x._sympy_(), sympy.Integer))
-            for x in proxy_args
+            isinstance(x, torch.SymInt) and _is_symbolic_numeric(x) for x in proxy_args
         ):
             if self.value in self._new_symint_on_host_fns() and origin.is_host():
                 result = SymIntType.new_unbacked(origin)
@@ -1098,11 +1202,6 @@ class CallableType(LiteralType):
                             ConfigValueExpression(operation, tuple(derived_args))
                         )
                 return result
-            if isinstance(self.value, type) and issubclass(
-                self.value, ConfigFragmentType
-            ):
-                raise exc.ConfigSpecFragmentWithSymInt(args)
-
         try:
             with (
                 patch.object(torch.SymInt, "__index__", _raise_shape_specializing),
@@ -1120,7 +1219,30 @@ class CallableType(LiteralType):
                         proxy_kwargs,
                         result,
                     )
-                output_type = TypeInfo.from_example(result, origin)
+                output_origin = origin
+                if (
+                    self.value is tuple
+                    and len(proxy_args) == 1
+                    and not proxy_kwargs
+                    and type(result) is tuple
+                    and result is proxy_args[0]
+                ):
+                    # tuple(exact_tuple) preserves the operand's identity and
+                    # provenance, including a capture aliased by this input.
+                    output_origin = args[0].origin
+                output_type = TypeInfo.from_example(result, output_origin)
+                if not any(self.value is cls for cls in _BUILTIN_TUNABLE_FRAGMENTS):
+                    if not any(self.value is fn for fn in (tuple, list, dict)):
+                        record_opaque_container_result(result)
+                    guard_fragment_call_input(self.origin)
+
+                    def guard_input(arg: TypeInfo) -> TypeInfo:
+                        if isinstance(arg, (ConfigFragmentType, CallableType)):
+                            guard_fragment_call_input(arg.origin)
+                        return arg
+
+                    for arg in (*args, *kwargs.values()):
+                        arg.tree_map(guard_input)
             output_type.tree_map(warn_wrong_device)
             if (
                 origin.is_host()
@@ -1242,6 +1364,18 @@ class NumericType(TypeInfo):
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if isinstance(other, (LiteralType, NumericType)):
             if NumericType.known_equal(self.value, other.value):
+                env = CompileEnvironment.current()
+                left = env.resolve_fragment_global(self.value)
+                right = (
+                    env.resolve_fragment_global(other.value)
+                    if isinstance(other, NumericType)
+                    else other.value
+                )
+                if left is not None and not _same_scalar(left, right):
+                    # Equal simplified symbols do not prove equal captured
+                    # values across a runtime branch (notably -0 versus +0).
+                    # Keep the ordinary symbolic type but drop domain proof.
+                    return self.new_unbacked(self.origin)
                 return self
             if self.python_type == other.python_type:
                 return self.new_unbacked(self.origin)
@@ -1635,6 +1769,10 @@ class CollectionType(TypeInfo):
         list[TypeInfo] | tuple[TypeInfo, ...] | dict[str | int, TypeInfo] | slice
     )
 
+    def membership_container(self) -> object:
+        """Return literal membership operands only when contents are proved."""
+        raise NotImplementedError
+
     def __init__(
         self,
         origin: Origin,
@@ -1642,9 +1780,34 @@ class CollectionType(TypeInfo):
         | tuple[TypeInfo, ...]
         | dict[str | int, TypeInfo]
         | slice,
+        *,
+        original_value: object = None,
     ) -> None:
         super().__init__(origin)
         self.element_types = element_types
+        self._original_identity = (
+            original_value
+            if isinstance(original_value, _ContainerIdentity)
+            else CompileEnvironment.current().container_identity_witness(original_value)
+            if original_value is not None
+            else None
+        )
+
+    def _preserve_identity(self, proxy: _T) -> _T:
+        # Output-spec consumers reconstruct proxies after binding has left its
+        # environment. The identity side table is only needed during tracing.
+        if self._original_identity is not None and CompileEnvironment.has_current():
+            CompileEnvironment.current().record_container_proxy(
+                proxy, self._original_identity
+            )
+        return proxy
+
+    def _merged_original(self, other: CollectionType) -> object:
+        return (
+            self._original_identity
+            if self._original_identity is other._original_identity
+            else None
+        )
 
     @property
     def python_type(self) -> type[object]:
@@ -1700,6 +1863,9 @@ class SequenceType(CollectionType):
     # pyrefly: ignore [bad-override]
     element_types: list[TypeInfo] | tuple[TypeInfo, ...]
 
+    def membership_container(self) -> object:
+        return self.as_literal()
+
     def __str__(self) -> str:
         start, *_, end = repr(self.element_types)
         if len(self.element_types) == 1 and self.python_type is tuple:
@@ -1713,10 +1879,14 @@ class SequenceType(CollectionType):
         return x
 
     def proxy(self) -> list[object] | tuple[object, ...]:
-        return self._maybe_tuple([x.proxy() for x in self.element_types])
+        return self._preserve_identity(
+            self._maybe_tuple([x.proxy() for x in self.element_types])
+        )
 
     def as_literal(self) -> list[object] | tuple[object, ...]:
-        return self._maybe_tuple([x.as_literal() for x in self.element_types])
+        return self._preserve_identity(
+            self._maybe_tuple([x.as_literal() for x in self.element_types])
+        )
 
     def unpack(self) -> list[TypeInfo]:
         return [*self.element_types]
@@ -1728,6 +1898,14 @@ class SequenceType(CollectionType):
     def propagate_getitem(self, key: TypeInfo, origin: Origin) -> TypeInfo:
         # Tuple/List indexing with non-literal indices (e.g., from hl.static_range)
         if self.python_type in (tuple, list) and isinstance(key, SymIntType):
+            env = CompileEnvironment.current()
+            if _symint_free_symbols(key.value) <= env.specialized_vars:
+                # hl.specialize already guards these symbols. Retain the actual
+                # selected element's value, identity and origin rather than the
+                # representative type used for a genuinely dynamic index.
+                return super().propagate_getitem(
+                    LiteralType(key.origin, int(key.value)), origin
+                )
             if not self.element_types:
                 raise exc.TypeInferenceError("Cannot index empty sequence")
             first_type = self.element_types[0]
@@ -1746,7 +1924,11 @@ class SequenceType(CollectionType):
             if not self.element_types:
                 raise exc.TypeInferenceError("Cannot index empty sequence")
             new_elements = [elem.merge(value) for elem in self.element_types]
-            return SequenceType(origin=origin, element_types=new_elements)
+            return SequenceType(
+                origin=origin,
+                element_types=new_elements,
+                original_value=self._original_identity,
+            )
         return super().propagate_setitem(key, value, origin)
 
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
@@ -1756,6 +1938,7 @@ class SequenceType(CollectionType):
             if len(self_elements) == len(other_elements):
                 return SequenceType(
                     origin=other.origin,
+                    original_value=self._merged_original(other),
                     element_types=self._maybe_tuple(
                         [
                             self_elements[i].merge(other_elements[i], var_name=var_name)
@@ -1768,22 +1951,31 @@ class SequenceType(CollectionType):
     def tree_map(
         self, fn: Callable[[TypeInfo], object]
     ) -> list[object] | tuple[object, ...]:
-        return self._maybe_tuple([x.tree_map(fn) for x in self.element_types])
+        return self._preserve_identity(
+            self._maybe_tuple([x.tree_map(fn) for x in self.element_types])
+        )
 
 
 class DictType(CollectionType):
     # pyrefly: ignore [bad-override]
     element_types: dict[str | int, TypeInfo]
 
+    def membership_container(self) -> object:
+        return self.element_types.keys()
+
     def __str__(self) -> str:
         items = ", ".join(f"{k!r}: {v!s}" for k, v in self.element_types.items())
         return f"{type(self).__name__}({{{items}}})"
 
     def proxy(self) -> dict[str | int, object]:
-        return {k: v.proxy() for k, v in self.element_types.items()}
+        return self._preserve_identity(
+            {k: v.proxy() for k, v in self.element_types.items()}
+        )
 
     def as_literal(self) -> dict[str | int, object]:
-        return {k: v.as_literal() for k, v in self.element_types.items()}
+        return self._preserve_identity(
+            {k: v.as_literal() for k, v in self.element_types.items()}
+        )
 
     def unpack(self) -> list[TypeInfo]:
         return [TypeInfo.from_example(k, self.origin) for k in self.element_types]
@@ -1800,6 +1992,7 @@ class DictType(CollectionType):
             if set(self_elements.keys()) == set(other_elements.keys()):
                 return type(self)(
                     origin=other.origin,
+                    original_value=self._merged_original(other),
                     element_types={
                         key: self_elements[key].merge(
                             other_elements[key], var_name=var_name
@@ -1810,10 +2003,32 @@ class DictType(CollectionType):
         return super().merge(other, var_name=var_name)
 
     def tree_map(self, fn: Callable[[TypeInfo], object]) -> dict[str | int, object]:
-        return {k: v.tree_map(fn) for k, v in self.element_types.items()}
+        return self._preserve_identity(
+            {k: v.tree_map(fn) for k, v in self.element_types.items()}
+        )
 
 
 class ClassType(DictType):
+    def membership_container(self) -> object:
+        # Record fields are not membership keys. Only default tuple containment
+        # over the same proved positional values can be evaluated here.
+        identity = self._original_identity
+        original = identity.value if identity is not None else None
+        if (
+            not isinstance(original, tuple)
+            or type(original).__contains__ is not tuple.__contains__
+        ):
+            raise NotImplementedError
+        values = tuple(value.as_literal() for value in self.element_types.values())
+        if len(values) != tuple.__len__(original) or any(
+            value is not item
+            for value, item in zip(values, tuple.__iter__(original), strict=True)
+        ):
+            # Custom field layouts or reconstructed contents do not establish
+            # the tuple's actual positional values or their equality behavior.
+            raise NotImplementedError
+        return values
+
     def populate_symbol_origins(self, origin: Origin) -> None:
         for key, subtype in self.element_types.items():
             assert isinstance(key, str)
@@ -2105,7 +2320,12 @@ def _preserve_host_float_operation(
 
 def _eval_unary(op: ast.unaryop, value: object) -> object:
     result = _eval_unary_impl(op, value)
-    return _preserve_host_float_operation(result, op, (value,))
+    result = _preserve_host_float_operation(result, op, (value,))
+    if CompileEnvironment.has_current():
+        return CompileEnvironment.current().record_fragment_global_operation(
+            result, _eval_unary_impl, op, (value,)
+        )
+    return result
 
 
 def _eval_unary_impl(op: ast.unaryop, value: object) -> object:
@@ -2130,7 +2350,12 @@ def _eval_unary_impl(op: ast.unaryop, value: object) -> object:
 
 def _eval_binary(op: ast.operator, left: object, right: object) -> object:
     result = _eval_binary_impl(op, left, right)
-    return _preserve_host_float_operation(result, op, (left, right))
+    result = _preserve_host_float_operation(result, op, (left, right))
+    if CompileEnvironment.has_current():
+        return CompileEnvironment.current().record_fragment_global_operation(
+            result, _eval_binary_impl, op, (left, right)
+        )
+    return result
 
 
 def _eval_binary_impl(op: ast.operator, left: object, right: object) -> object:
@@ -2177,6 +2402,17 @@ def _eval_binary_impl(op: ast.operator, left: object, right: object) -> object:
 
 
 def _eval_compare(op: ast.cmpop, left: object, right: object) -> object:
+    result = _eval_compare_impl(op, left, right)
+    if CompileEnvironment.has_current() and isinstance(
+        op, (ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE)
+    ):
+        return CompileEnvironment.current().record_fragment_global_operation(
+            result, _eval_compare_impl, op, (left, right)
+        )
+    return result
+
+
+def _eval_compare_impl(op: ast.cmpop, left: object, right: object) -> object:
     if isinstance(op, ast.Eq):
         return left == right
     if isinstance(op, ast.NotEq):

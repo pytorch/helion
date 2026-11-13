@@ -14,6 +14,7 @@ from typing import Callable
 from typing import Sequence
 
 import torch
+from torch._inductor.codegen.simd import constant_repr
 
 from .. import exc
 from .ast_extension import expr_from_string
@@ -1446,6 +1447,10 @@ class Backend(abc.ABC):
         ``None`` emits no join (CuTe joins in its own if codegen).
         """
         return None
+
+    def scalar_literal_expr(self, value: float | bool) -> str:
+        """Emit a scalar literal for device code, preserving its value and sign."""
+        return constant_repr(value)
 
     def scalar_float_operand_ast(
         self, x: ast.AST, value: torch.SymFloat, *, computes_in_float64: bool

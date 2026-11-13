@@ -45,6 +45,19 @@ def should_skip_cache() -> bool:
     }
 
 
+def _requires_uncached_tuning(kernel: object, args: object = None) -> bool:
+    # Import after runtime.kernel initialization; that module imports autotuners.
+    from ..runtime.kernel import BoundKernel
+
+    return isinstance(kernel, BoundKernel) and (
+        kernel.env.requires_fresh_binding
+        or (
+            isinstance(args, _MultiShapeAutotuneArgs)
+            and any(bound.env.requires_fresh_binding for bound, _ in args.cases)
+        )
+    )
+
+
 class AutotuneCacheMeta(abc.ABCMeta):
     """Metaclass that enables the Cache[Search] syntax for autotuner cache classes."""
 
@@ -61,15 +74,19 @@ class AutotuneCacheMeta(abc.ABCMeta):
         """
 
         def factory(kernel: BoundKernel, args: Sequence[Any]) -> BaseAutotuner:
+            def autotuner_factory() -> BaseSearch:
+                return search_cls(kernel, args)
+
+            if _requires_uncached_tuning(kernel, args):
+                return _UncachedAutotuneCache(
+                    autotuner_factory(), autotuner_factory=autotuner_factory
+                )
             if not kernel.is_cacheable():
                 raise TypeError(
                     f"Autotune caches require a cacheable kernel "
                     f"(e.g. BoundKernel); got {type(kernel).__name__}. "
                     f"External kernels are not cacheable."
                 )
-
-            def autotuner_factory() -> BaseSearch:
-                return search_cls(kernel, args)
 
             return cls(autotuner_factory(), autotuner_factory=autotuner_factory)  # type: ignore[misc]
 
@@ -215,10 +232,13 @@ class StrictAutotuneCacheKey(LooseAutotuneCacheKey):
 
 class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
     """
+
     Abstract base class that all autotune caches need to implement.
     Any user defined cache will need to extend this class, and
     provide implementations for get and put methods.
     """
+
+    _supports_fresh_bindings = False
 
     def __init__(
         self,
@@ -238,7 +258,15 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         self.autotuner = autotuner
         self._autotuner_factory = autotuner_factory
         kernel = self.autotuner.kernel
-        if not kernel.is_cacheable():
+        fresh = _requires_uncached_tuning(kernel, autotuner.args)
+        if fresh:
+            if not self._supports_fresh_bindings:
+                raise TypeError(
+                    "This binding requires a fresh trace and cannot use an explicit "
+                    "cache constructor; use Cache[Search] or the default autotuner "
+                    "to preserve search without persistent cache I/O."
+                )
+        elif not kernel.is_cacheable():
             raise TypeError(
                 f"Autotune caches require a cacheable kernel "
                 f"(e.g. BoundKernel); got {type(kernel).__name__}. "
@@ -310,6 +338,18 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         skip_cache_env = should_skip_cache()
         search_policy_cacheable = self._search_policy_allows_cache_io()
         skip_read = skip_cache or skip_cache_env or not search_policy_cacheable
+        if (
+            self._supports_fresh_bindings
+            and not skip_cache
+            and not skip_cache_env
+            and os.environ.get("HELION_ASSERT_CACHE_HIT") == "1"
+        ):
+            # There is intentionally no persistent key to print or enumerate.
+            log.error(
+                "Fresh binding for %s cannot read an autotune cache",
+                self.kernel.kernel.name,
+            )
+            raise exc.CacheAssertionError(self.kernel.kernel.name)
 
         if not skip_read:
             if (config := self.get()) is not None:
@@ -648,3 +688,24 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         finally:
             rebench_autotuner.benchmark_provider.cleanup()
         return [r.perf for r in results]
+
+
+class _UncachedAutotuneCache(AutotuneCacheBase):
+    """Keep trial orchestration for bindings that cannot persist tuning results."""
+
+    _supports_fresh_bindings = True
+
+    def _search_policy_allows_cache_io(self) -> bool:
+        return False
+
+    def get(self) -> Config | None:
+        raise AssertionError("uncached tuning must not read a cache")
+
+    def put(self, config: Config) -> None:
+        raise AssertionError("uncached tuning must not write a cache")
+
+    def _get_cache_key(self) -> CacheKeyBase:
+        raise AssertionError("uncached tuning must not construct a cache key")
+
+    def _list_cache_entries(self) -> Sequence[tuple[str, CacheKeyBase]]:
+        raise AssertionError("uncached tuning must not list cache entries")

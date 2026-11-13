@@ -10,8 +10,16 @@ from helion.autotuner import EnumFragment
 from helion.autotuner import IntegerFragment
 from helion.autotuner import PowerOfTwoFragment
 from helion.autotuner.config_fragment import NumThreadsFragment
+from helion.autotuner.config_fragment import _scalar_fragment_key
 
 pytestmark = pytest.mark.cpu_only
+
+
+def test_non_nan_scalar_domain_keys_keep_their_legacy_encoding():
+    for value in (0.0, -0.0, 1.5, -2.5, 1e308, 5e-324, float("inf"), -float("inf")):
+        assert _scalar_fragment_key(value) == (float, value.hex())
+    assert _scalar_fragment_key(1) == (int, 1)
+    assert _scalar_fragment_key(True) == (bool, True)
 
 
 @pytest.mark.parametrize(

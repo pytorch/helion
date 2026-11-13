@@ -2241,6 +2241,9 @@ class TestForcedAutotuneSeedCachePolicy(unittest.TestCase):
     @staticmethod
     def _search(*, cute_flash: bool) -> BaseSearch:
         search = BaseSearch.__new__(BaseSearch)
+        # Model an external autotunable kernel, without a bound Helion environment.
+        search.kernel = Mock(spec=[])
+        search.args = ()
         search._skip_cache = True
         search.config_spec = SimpleNamespace(
             cute_flash_search_enabled=cute_flash,

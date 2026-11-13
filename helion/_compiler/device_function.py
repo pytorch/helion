@@ -800,6 +800,11 @@ class DeviceFunction:
         with contextlib.suppress(Exception):
             expr = env.shape_env.simplify(expr)
         expr = env.specialize_expr(expr)
+        host = HostFunction.current()
+        resolved = host.resolve_tunable_expr(expr, self.config)
+        if isinstance(resolved, (int, float, bool)):
+            return env.backend.scalar_literal_expr(resolved)
+        expr = resolved
         if not expr.free_symbols:
             return env.backend.sympy_printer_expr(expr)
         if expr in self.expr_to_var_info:
@@ -817,15 +822,27 @@ class DeviceFunction:
         replacements = {}
         for sym in sorted(expr.free_symbols, key=lambda x: x.name):
             assert isinstance(sym, sympy.Symbol)
-            if sym in self.expr_to_var_info:
+            selected = (
+                host.resolve_tunable_expr(sym, self.config)
+                if sym not in expr_to_origin
+                else sym
+            )
+            if isinstance(selected, (int, float, bool)):
+                # A selected constant cannot depend on an inner-loop alias:
+                # lift_symnode may hoist this expression outside that loop.
+                replacements[sym] = sympy.Symbol(
+                    f"({env.backend.scalar_literal_expr(selected)})"
+                )
+            elif sym in self.expr_to_var_info:
                 replacements[sym] = sympy.Symbol(
                     self.expr_to_var_info[sym].name, integer=True
                 )
-            else:
-                assert sym in expr_to_origin, f"no origin found for {sym.name}"
+            elif sym in expr_to_origin:
                 replacements[sym] = sympy.Symbol(
                     self._lift_sympy_arg(sym), integer=True
                 )
+            else:
+                raise AssertionError(f"no origin found for {sym.name}")
         # pyrefly: ignore [bad-argument-type]
         return env.backend.sympy_printer_expr(expr.xreplace(replacements))
 
@@ -1204,9 +1221,9 @@ class DeviceFunction:
 
         # Handle sympy expressions
         if isinstance(value, sympy.Expr):
-            return HostFunction.current().sympy_expr(value)
+            return HostFunction.current().sympy_expr(value, self.config)
 
-        return HostFunction.current().literal_expr(value)
+        return HostFunction.current().literal_expr(value, self.config)
 
     def _tensor_property(
         self,
