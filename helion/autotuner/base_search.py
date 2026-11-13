@@ -36,6 +36,12 @@ from torch.utils._pytree import tree_flatten
 from .. import exc
 from .._compat import extract_device
 from .._compat import get_device_name
+from ..runtime.config import _config_key
+from ..runtime.config import _config_value_key
+from ..runtime.config import _copy_config_structure
+from ..runtime.config_cache import ConfigCache
+from ..runtime.config_cache import ConfigSet
+from ..runtime.config_cache import _stored_config
 from ..runtime.settings import _env_get_int
 from ..runtime.settings import _env_get_optional_int
 from ..runtime.structural_policy import StructuralConfig
@@ -66,6 +72,10 @@ from .benchmarking import final_selection_second_regime
 from .benchmarking import final_selection_target_regime
 from .benchmarking import interleaved_bench
 from .benchmarking import mirrored_bench_generic
+from .compiler_refinement import MAX_REFINEMENT_TRIALS
+from .compiler_refinement import compiler_refinement_candidates
+from .compiler_refinement import compiler_refinement_policy
+from .compiler_refinement import same_refinement_value
 from .effort_profile import get_effort_profile
 from .handoff import _observe_handoff
 from .handoff import _refresh_handoff
@@ -86,6 +96,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
     from collections.abc import Iterator
     from collections.abc import Mapping
+    from collections.abc import MutableMapping
+    from collections.abc import MutableSet
     from collections.abc import Sequence
     from typing_extensions import Self
 
@@ -521,15 +533,19 @@ class BaseSearch(BaseAutotuner):
         self._prepared = False
         self._skip_cache = False
         self._autotune_budget_start: float | None = None
-        self._benchmarked_members: dict[Config, PopulationMember] = {}
-        self._pinned_finalist_configs: set[Config] = set()
-        self._pinned_finalist_members: dict[Config, PopulationMember] = {}
+        self._benchmarked_members: MutableMapping[Config, PopulationMember] = (
+            ConfigCache()
+        )
+        self._pinned_finalist_configs = ConfigSet()
+        self._pinned_finalist_members: MutableMapping[Config, PopulationMember] = (
+            ConfigCache()
+        )
         # Configs excluded from fallback after an unkillable worker: the
         # kernel that may have hung and earlier conclusive selection failures.
-        self._fallback_excluded_configs: set[Config] = set()
+        self._fallback_excluded_configs = ConfigSet()
         self._search_space_tracker: SearchSpaceTracker | None = None
         self._uncacheable_search_policy_nonce: str | None = None
-        self._search_policy_cacheable = True
+        self._search_policy_cacheable = benchmark_provider_cls is LocalBenchmarkProvider
 
     def _algorithm_cache_policy(self) -> dict[str, object] | None:
         """Return explicit behavior-affecting state for a built-in search."""
@@ -541,13 +557,16 @@ class BaseSearch(BaseAutotuner):
     def cache_policy(self) -> dict[str, object] | None:
         """Return the effective search policy used by CuTe-flash cache keys.
 
-        Unknown search subclasses and arbitrary callbacks fail closed: callers
-        give them a one-shot cache key instead of risking reuse across different
-        candidate sets or benchmark objectives.
+        Unknown search subclasses, benchmark providers and arbitrary callbacks
+        fail closed: callers give them a one-shot cache key instead of risking
+        reuse across different candidate sets, validation or benchmark objectives.
         """
         from . import search_algorithms
 
-        if type(self) not in search_algorithms.values():
+        if (
+            type(self) not in search_algorithms.values()
+            or self._benchmark_provider_cls is not LocalBenchmarkProvider
+        ):
             return None
         algorithm = self._algorithm_cache_policy()
         settings = self.settings
@@ -1482,11 +1501,11 @@ class BaseSearch(BaseAutotuner):
             ),
         )
 
-    def _search_config_roles(self) -> dict[Config, str]:
+    def _search_config_roles(self) -> MutableMapping[Config, str]:
         """The configs this search benchmarks for a reason of their own, by
         role (see :meth:`BenchmarkProvider.set_config_roles`); a search over
         user-given configs has none."""
-        return {}
+        return ConfigCache()
 
     def set_generation(self, generation: int) -> None:
         self._autotune_metrics.num_generations = generation
@@ -1547,7 +1566,7 @@ class BaseSearch(BaseAutotuner):
                     *getattr(self, "_pinned_finalist_members", {}).values(),
                 ]
                 for member in retained_members:
-                    if member.config != best_config:
+                    if _config_key(member.config) != _config_key(best_config):
                         continue
                     source_hash = self.config_spec.backend.generated_source_hash(
                         member.fn
@@ -1912,6 +1931,7 @@ class PopulationBasedSearch(BaseSearch):
     # rather than a search-algorithm knob, so it is not a constructor
     # argument and ``_final_rebenchmark_cache_policy`` carries it.
     final_selection: FinalSelectionConfig | None = None
+    _compiler_refinement_keys: tuple[str, ...] = ()
 
     # The first compile error of the last benchmarked batch (None when every
     # config compiled), for the initial population's summary line.
@@ -1948,23 +1968,40 @@ class PopulationBasedSearch(BaseSearch):
         self._compiler_seed_members: list[PopulationMember] = []
         self._best_available_seed_configs: list[Config] = []
         self._selected_member: PopulationMember | None = None
-        self._terminal_refinement_members: dict[Config, PopulationMember] | None = None
+        self._terminal_refinement_members: (
+            MutableMapping[Config, PopulationMember] | None
+        ) = None
         self.config_gen: ConfigGeneration = self.config_spec.create_config_generation(
             overrides=self.settings.autotune_config_overrides or None,
             advanced_controls_files=self.settings.autotune_search_acf or None,
             process_group_name=kernel.env.process_group_name,
             compiler_coverage_enabled=not self.settings.disable_autotuner_heuristics,
         )
+        self._compiler_refinement_keys = (
+            self.config_spec.search_surface.compiler_refinement_keys
+        )
+
+    def _prepare(self) -> None:
+        super()._prepare()
+        if (
+            self._terminal_refinement_members is None
+            and self._compiler_refinement_enabled()
+        ):
+            # Reuse measured successes and remember failed trials, including
+            # configurations pruned from the final-selection shortlist.
+            # The provider and effective verification policy are available now.
+            # Leave any independent terminal-refinement registry intact.
+            self._terminal_refinement_members = ConfigCache()
 
     def _generation_invalid_config_count(self) -> int:
         return self.config_gen.invalid_config_count
 
-    def _search_config_roles(self) -> dict[Config, str]:
+    def _search_config_roles(self) -> MutableMapping[Config, str]:
         # The normalized forms the population builders benchmark: the user's
         # seeds, the compiler's seeds and the fragment default (which differs
         # from the execution default whenever a seed is promoted or a knob is
         # overridden). The default's role wins when a seed coincides with it.
-        roles: dict[Config, str] = {}
+        roles: MutableMapping[Config, str] = ConfigCache()
         for _flat, config in self.config_gen.user_seed_flat_config_pairs(
             self._autotune_seed_configs()
         ):
@@ -1981,7 +2018,7 @@ class PopulationBasedSearch(BaseSearch):
         return roles
 
     def _final_rebenchmark_cache_policy(self) -> dict[str, object]:
-        return {
+        policy: dict[str, object] = {
             "enabled": True,
             # 2: the non-isolated finalist shootout uses paired interleaved
             # timing instead of sequential steady windows.
@@ -2010,6 +2047,11 @@ class PopulationBasedSearch(BaseSearch):
                 else dataclasses.asdict(self.final_selection)
             ),
         }
+        if self._compiler_refinement_keys:
+            policy["compiler_refinement"] = compiler_refinement_policy(
+                self._compiler_refinement_keys
+            )
+        return policy
 
     @staticmethod
     def _final_selection_from_profile(
@@ -2325,7 +2367,7 @@ class PopulationBasedSearch(BaseSearch):
         """Pad an initial population with normalized, unique random configs."""
         generation = self.config_gen if generation is None else generation
         result: list[FlatConfig] = []
-        seen: set[Config] = set()
+        seen: MutableSet[Config] = ConfigSet()
         invalid = 0
         duplicate = 0
 
@@ -2410,9 +2452,9 @@ class PopulationBasedSearch(BaseSearch):
         generation = self.config_gen if generation is None else generation
         max_configs = self.settings.autotune_best_available_max_configs
 
-        seen: set[Config] = set()
+        seen: MutableSet[Config] = ConfigSet()
         result: list[FlatConfig] = []
-        pinned_configs: set[Config] = set()
+        pinned_configs: MutableSet[Config] = ConfigSet()
 
         # User seed configs are explicit requests, so try them before compiler-owned
         # seeds, the raw default, and cached configs while still deduplicating
@@ -2452,9 +2494,7 @@ class PopulationBasedSearch(BaseSearch):
             seen.add(default_config)
             pinned_configs.add(default_config)
             result.append(default_flat)
-        self._pinned_finalist_configs.update(
-            copy.deepcopy(config) for config in pinned_configs
-        )
+        self._pinned_finalist_configs.update(pinned_configs)
         self.log("Starting with seed/default configs")
 
         cached_entries = (
@@ -2726,7 +2766,7 @@ class PopulationBasedSearch(BaseSearch):
         *,
         desc: str,
         raise_if_no_viable_config: bool,
-        visited: set[Config] | None,
+        visited: MutableSet[Config] | None,
     ) -> None:
         """Benchmark one batch of the initial population under its budget share.
 
@@ -2769,7 +2809,7 @@ class PopulationBasedSearch(BaseSearch):
         members: list[PopulationMember],
         *,
         random_fallback_target: int | None = None,
-        visited: set[Config] | None = None,
+        visited: MutableSet[Config] | None = None,
         desc: str = "Initial population",
     ) -> list[PopulationMember]:
         """Benchmark the initial population, recovering from an all-failing seed set.
@@ -2805,7 +2845,11 @@ class PopulationBasedSearch(BaseSearch):
         ):
             return members
         compile_error = self.benchmark_provider.take_no_viable_config_error()
-        seen = {member.config for member in members} if visited is None else visited
+        seen = (
+            ConfigSet(member.config for member in members)
+            if visited is None
+            else visited
+        )
         fallback: list[PopulationMember] = []
         # The padding helper re-adds the seeds first, so pad past them.
         for flat in self._pad_initial_population_with_unique_random(
@@ -2838,7 +2882,7 @@ class PopulationBasedSearch(BaseSearch):
 
     def _apply_effective_source_repairs(
         self,
-        repairs: dict[Config, BenchmarkResult],
+        repairs: MutableMapping[Config, BenchmarkResult],
         current_members: Sequence[PopulationMember],
     ) -> None:
         """Repair failed members after a later config proves the same source."""
@@ -2891,7 +2935,7 @@ class PopulationBasedSearch(BaseSearch):
 
     def _record_terminal_refinement_member(
         self,
-        target: dict[Config, PopulationMember],
+        target: MutableMapping[Config, PopulationMember],
         member: PopulationMember,
     ) -> None:
         """Refresh terminal history without replacing a reusable result by failure."""
@@ -2916,7 +2960,7 @@ class PopulationBasedSearch(BaseSearch):
 
     def _record_best_member_for_config(
         self,
-        target: dict[Config, PopulationMember],
+        target: MutableMapping[Config, PopulationMember],
         config: Config,
         member: PopulationMember,
         *,
@@ -2934,18 +2978,17 @@ class PopulationBasedSearch(BaseSearch):
             or member_perf < existing_perf
             or (replace_ties and member_perf == existing_perf)
         ):
-            # Config is mutable and hashes on its contents, and the autotuner
-            # mutates configs in place (normalize / neighbor generation). Store
-            # a private snapshot so a later mutation of the original config
-            # cannot change this key's hash (-> KeyError on prune / orphaned
-            # entries) or the config recompiled during final verification. The
-            # performance list is mutable too, so do not let later rebenchmarks
-            # silently alter a supposedly historical snapshot.
-            snapshot = copy.deepcopy(config)
+            # Own the built-in containers the search mutates, while preserving
+            # opaque selections' identity. Match ConfigCache snapshots without
+            # invoking arbitrary copy hooks or changing the compiled selection.
+            # Performance history remains independent of later rebenchmarks.
+            snapshot = _stored_config(config.config)
             target[snapshot] = dataclasses.replace(
                 member,
                 perfs=copy.deepcopy(member.perfs),
-                flat_values=copy.deepcopy(member.flat_values),
+                flat_values=cast(
+                    "FlatConfig", _copy_config_structure(member.flat_values)
+                ),
                 config=snapshot,
             )
 
@@ -2995,8 +3038,8 @@ class PopulationBasedSearch(BaseSearch):
 
         use_verified_history = self._uses_verified_finalist_history()
         top_k = self._final_rebenchmark_top_k()
-        refreshed_configs: dict[Config, None] = {}
-        finite_members: dict[Config, PopulationMember] = {}
+        refreshed_configs: MutableMapping[Config, None] = ConfigCache()
+        finite_members: MutableMapping[Config, PopulationMember] = ConfigCache()
         for member in members:
             if not member.perfs:
                 continue
@@ -3066,7 +3109,7 @@ class PopulationBasedSearch(BaseSearch):
         """Always include a seed/default config in final verification if benchmarked."""
         # Snapshot: configs are mutated in place after being added (see
         # _record_best_member_for_config), which would corrupt this set.
-        self._pinned_finalist_configs.add(copy.deepcopy(config))
+        self._pinned_finalist_configs.add(config)
 
     def pin_finalist_configs(self, configs: Sequence[Config]) -> None:
         for config in configs:
@@ -3245,8 +3288,8 @@ class PopulationBasedSearch(BaseSearch):
         from .._compiler.backend_registry import get_backend_class
 
         hook = get_backend_class(self.settings.backend).finalist_preference
-        sources: dict[Config, str] = {}
-        ranks: dict[Config, int] = {}
+        sources: MutableMapping[Config, str] = ConfigCache()
+        ranks: MutableMapping[Config, int] = ConfigCache()
 
         def preference(member: PopulationMember) -> int:
             config = member.config
@@ -3331,7 +3374,7 @@ class PopulationBasedSearch(BaseSearch):
         member and perform one apples-to-apples final verification over the best
         unique configs observed during the run.
         """
-        by_config: dict[Config, PopulationMember] = {}
+        by_config: MutableMapping[Config, PopulationMember] = ConfigCache()
         candidates = [
             *self._pinned_finalist_members.values(),
             *self._benchmarked_members.values(),
@@ -3375,7 +3418,7 @@ class PopulationBasedSearch(BaseSearch):
             for config, member in by_config.items()
             if config in self._pinned_finalist_configs
         ]
-        pinned_configs = {member.config for member in pinned}
+        pinned_configs = ConfigSet(member.config for member in pinned)
         remaining = [
             member
             for member in by_config.values()
@@ -3471,7 +3514,7 @@ class PopulationBasedSearch(BaseSearch):
                 live_finalists,
                 pinned_configs,
             )
-        if after.config != before.config:
+        if _config_key(after.config) != _config_key(before.config):
             self.log(
                 "Final verification selected a different config: "
                 f"{self.format_performance(before.perf)} -> "
@@ -3501,17 +3544,20 @@ class PopulationBasedSearch(BaseSearch):
         quota = policy.family_finalists
         if not keys or quota <= 0 or not candidates or not math.isfinite(best):
             return []
-        families = {_config_family(config, keys) for config in represented}
+        families = {
+            _config_value_key(_config_family(config, keys)) for config in represented
+        }
         admitted: list[_T] = []
         notes: list[str] = []
         for item, config, reading in candidates:
             family = _config_family(config, keys)
-            if family in families:
+            family_key = _config_value_key(family)
+            if family_key in families:
                 continue
             if not math.isfinite(reading) or reading > best * policy.family_spread:
                 # the candidates are ranked, so no later one is closer
                 break
-            families.add(family)
+            families.add(family_key)
             admitted.append(item)
             notes.append(
                 f"{_family_label(family)} at {self.format_performance(reading)} "
@@ -3533,7 +3579,7 @@ class PopulationBasedSearch(BaseSearch):
         self,
         after: PopulationMember,
         live: Sequence[PopulationMember],
-        pinned_configs: set[Config],
+        pinned_configs: MutableSet[Config],
         key: Callable[[PopulationMember], float] = performance,
     ) -> PopulationMember:
         """A pinned seed within the tolerance of the best finalist wins the
@@ -3635,7 +3681,7 @@ class PopulationBasedSearch(BaseSearch):
     def _run_final_selection(
         self,
         finalists: list[PopulationMember],
-        pinned_configs: set[Config],
+        pinned_configs: MutableSet[Config],
         incumbent: PopulationMember,
         policy: FinalSelectionConfig,
     ) -> PopulationMember:
@@ -4171,7 +4217,7 @@ class PopulationBasedSearch(BaseSearch):
         after: PopulationMember,
         members: Sequence[PopulationMember],
         second_by_position: dict[int, float],
-        pinned_configs: set[Config],
+        pinned_configs: MutableSet[Config],
         policy: FinalSelectionConfig,
     ) -> PopulationMember:
         """Among the finalists tied in the ranking regime, the fastest in the
@@ -4216,7 +4262,7 @@ class PopulationBasedSearch(BaseSearch):
         readings: Sequence[Sequence[float]],
         results: Sequence[IsolatedBenchmarkTiming],
         selected: PopulationMember | None,
-        pinned_configs: set[Config],
+        pinned_configs: MutableSet[Config],
         policy: FinalSelectionConfig,
         *,
         wall_s: float,
@@ -5042,11 +5088,11 @@ class PopulationBasedSearch(BaseSearch):
             return [], set()
 
         backend = self.config_spec.backend
-        failed_config_statuses = {
-            member.config: status
+        failed_config_statuses = ConfigCache(
+            (member.config, status)
             for member, status in zip(members, failure_statuses, strict=True)
             if status is not None
-        }
+        )
         failed_source_statuses: dict[str, Literal["error", "timeout"]] = {}
         for member, status in zip(members, failure_statuses, strict=True):
             if status is None:
@@ -5096,7 +5142,7 @@ class PopulationBasedSearch(BaseSearch):
         for source_hash in source_hashes:
             self.benchmark_provider.invalidate_effective_source_hash(source_hash)
         invalidated = []
-        invalidated_configs = set()
+        invalidated_configs = ConfigSet()
         for member, status in targets:
             member.perfs[:] = [inf]
             member.status = status
@@ -5110,7 +5156,7 @@ class PopulationBasedSearch(BaseSearch):
 
     def _invalidate_rebenchmark_training_targets(
         self,
-        failed_configs: set[Config],
+        failed_configs: MutableSet[Config],
         failed_source_hashes: set[str],
     ) -> None:
         """Let surrogate searches discard targets for quarantined CuTe sources."""
@@ -5235,13 +5281,17 @@ class PopulationBasedSearch(BaseSearch):
 
             # Generate candidates by resetting each parameter to its default
             for i in range(len(current.flat_values)):
-                if current.flat_values[i] != default_flat[i]:
+                if _config_value_key(current.flat_values[i]) != _config_value_key(
+                    default_flat[i]
+                ):
                     # Create a new config with this parameter reset to default
                     new_flat = [*current.flat_values]
                     new_flat[i] = default_flat[i]
                     candidate = self.make_unbenchmarked(new_flat)
                     # Only add if valid and produces a different config
-                    if candidate is not None and candidate.config != current.config:
+                    if candidate is not None and _config_key(
+                        candidate.config
+                    ) != _config_key(current.config):
                         candidates.append(candidate)
 
             if len(candidates) <= 1:
@@ -5284,10 +5334,14 @@ class PopulationBasedSearch(BaseSearch):
                 combined_flat = [*current.flat_values]
                 for c in good_candidates:
                     for i in range(len(combined_flat)):
-                        if c.flat_values[i] != current.flat_values[i]:
+                        if _config_value_key(c.flat_values[i]) != _config_value_key(
+                            current.flat_values[i]
+                        ):
                             combined_flat[i] = c.flat_values[i]
                 combined = self.make_unbenchmarked(combined_flat)
-                if combined is not None and combined.config != current.config:
+                if combined is not None and _config_key(combined.config) != _config_key(
+                    current.config
+                ):
                     self.benchmark_population(
                         [combined],
                         desc=f"Finishing round {round_num}: combined",
@@ -5425,6 +5479,7 @@ class PopulationBasedSearch(BaseSearch):
                 # are done.
                 best = self.run_finishing_phase(best, self.finishing_rounds)
                 best = self.run_terminal_refinement(best)
+                best = self.run_compiler_refinement(best)
                 self._budget_reserve_released = True
                 best = self.final_rebenchmark_best(best)
                 self._selected_member = best
@@ -5459,6 +5514,135 @@ class PopulationBasedSearch(BaseSearch):
     def run_terminal_refinement(self, best: PopulationMember) -> PopulationMember:
         """Run an optional backend/search-specific post-search refinement."""
         return best
+
+    def _compiler_refinement_enabled(self) -> bool:
+        return bool(
+            self._compiler_refinement_keys
+            and self._final_selection_enabled()
+            and self._final_rebenchmark_top_k() > 1
+            and not self.settings.disable_autotuner_heuristics
+            # Rank-local histories need not agree. Do not introduce collective
+            # benchmark calls until the parent/candidate plan is synchronized.
+            and self.kernel.env.process_group_name is None
+        )
+
+    def run_compiler_refinement(self, best: PopulationMember) -> PopulationMember:
+        """Cross compiler options with the best measured structures, then verify.
+
+        This phase spends the search budget; it never opens the final-selection
+        reserve or records per-candidate checks as population generations. Its
+        short-window winner still enters the ordinary shootout.
+        """
+        if not self._compiler_refinement_enabled():
+            return best
+        registry = self._terminal_refinement_members
+        assert registry is not None
+
+        def reusable(member: PopulationMember) -> bool:
+            return (
+                member.status in {"ok", "deduplicated"}
+                and bool(member.perfs)
+                and math.isfinite(member.perf)
+                and member.config not in self._fallback_excluded_configs
+            )
+
+        def prior_outcome(
+            config: Config,
+        ) -> tuple[PopulationMember | None, str | None]:
+            """Check prior results and current admission limits for one trial."""
+            member = registry.get(config)
+            if member is not None:
+                return member, "reused" if reusable(member) else "prior_failure"
+            if config in self._fallback_excluded_configs:
+                return None, "quarantined"
+            if self._autotune_budget_exceeded():
+                return None, "budget_exhausted"
+            if not self._backend_config_is_viable(config):
+                return None, "invalid"
+            return None, None
+
+        trials: list[dict[str, object]] = []
+        transcript: dict[str, object] = {
+            **compiler_refinement_policy(self._compiler_refinement_keys),
+            "initial_config_id": canonical_config_id(best.config),
+            "trials": trials,
+            "new_trials": 0,
+            "budget_exhausted": False,
+            "completed": False,
+        }
+        self._autotune_metrics.compiler_refinement = transcript
+        try:
+            history = sorted(
+                (member for member in registry.values() if reusable(member)),
+                key=performance,
+            )
+            # A lucky earlier sample must not displace the actual incumbent.
+            # Rank other parents by the same latest timing used below to pick.
+            parents = [best, *history] if reusable(best) else history
+            candidates = compiler_refinement_candidates(
+                self.config_gen,
+                [member.config for member in parents],
+                self._compiler_refinement_keys,
+            )
+            new_trials = 0
+            for candidate in candidates:
+                trial: dict[str, object] = {
+                    "parent_config_id": canonical_config_id(candidate.parent),
+                    "config_id": canonical_config_id(candidate.config),
+                    "config": _copy_config_structure(candidate.config.config),
+                }
+                trials.append(trial)
+                member, outcome = prior_outcome(candidate.config)
+                if outcome is not None:
+                    trial["outcome"] = outcome
+                    if outcome == "budget_exhausted":
+                        transcript["budget_exhausted"] = True
+                    if member is None:
+                        continue
+                elif new_trials >= MAX_REFINEMENT_TRIALS:
+                    trial["outcome"] = "trial_limit"
+                    continue
+                elif self._autotune_budget_exceeded():
+                    trial["outcome"] = "budget_exhausted"
+                    transcript["budget_exhausted"] = True
+                    continue
+                else:
+                    # Admit one trial at a time: its compile/measurement spends
+                    # the search budget before the next admission check, and
+                    # an unkillable worker must stop all subsequent work.
+                    member = self.make_unbenchmarked(candidate.flat_values)
+                    if member is None or not same_refinement_value(
+                        member.config.config, candidate.config.config
+                    ):
+                        trial["outcome"] = "invalid"
+                        continue
+                    if self._autotune_budget_exceeded():
+                        trial["outcome"] = "budget_exhausted"
+                        transcript["budget_exhausted"] = True
+                        continue
+                    new_trials += 1
+                    transcript["new_trials"] = new_trials
+                    trial["outcome"] = "benchmarking"
+                    try:
+                        self.benchmark_population(
+                            [member],
+                            desc="Compiler-option refinement",
+                            raise_if_no_viable_config=False,
+                        )
+                    except BenchmarkWorkerUnkillable as error:
+                        self._record_unkillable([member], error)
+                        trial["outcome"] = "unkillable_worker"
+                        raise
+                    trial["outcome"] = member.status
+                if reusable(member):
+                    trial["perf"] = member.perf
+                    if member.perf < best.perf:
+                        best = member
+            transcript["completed"] = True
+            transcript["selected_config_id"] = canonical_config_id(best.config)
+            return best
+        finally:
+            self.log.record_compiler_refinement(transcript)
 
     def _resolve_device_micros_paired_bench(
         self,

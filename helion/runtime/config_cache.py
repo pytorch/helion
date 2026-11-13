@@ -5,10 +5,13 @@ from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import Mapping
 from collections.abc import MutableMapping
+from collections.abc import MutableSet
+from collections.abc import Set as AbstractSet
 from collections.abc import ValuesView
 from typing import Hashable
 from typing import TypeVar
 from typing import cast
+from typing_extensions import Self
 
 from .config import Config
 from .config import _config_key
@@ -96,3 +99,67 @@ class _ConfigValues(ValuesView[_T]):
     def __iter__(self) -> Iterator[_T]:
         for _, value in self._cache._entries.values():
             yield value
+
+
+class ConfigSet(MutableSet[Config]):
+    """Search membership with the same typed snapshots as compiled caches."""
+
+    def __init__(self, configs: Iterable[Config] = ()) -> None:
+        self._cache: ConfigCache[None] = ConfigCache()
+        self.update(configs)
+
+    def __contains__(self, config: object) -> bool:
+        return isinstance(config, Config) and config in self._cache
+
+    def __iter__(self) -> Iterator[Config]:
+        return iter(self._cache)
+
+    def __len__(self) -> int:
+        return len(self._cache)
+
+    def add(self, config: Config) -> None:
+        self._cache[config] = None
+
+    def discard(self, config: Config) -> None:
+        self._cache.pop(config, None)
+
+    def clear(self) -> None:
+        self._cache.clear()
+
+    def pop(self) -> Config:
+        config, _ = self._cache.popitem()
+        return config
+
+    def update(self, *others: Iterable[Config]) -> None:
+        for other in others:
+            if isinstance(other, ConfigSet):
+                # Preserve already captured keys, including opaque leaves.
+                self._cache._entries.update(other._cache._entries)
+            else:
+                for config in other:
+                    self.add(config)
+
+    def difference_update(self, *others: Iterable[Config]) -> None:
+        for other in others:
+            if other is self:
+                self.clear()
+            else:
+                excluded = other if isinstance(other, ConfigSet) else ConfigSet(other)
+                for key in excluded._cache._entries:
+                    self._cache._entries.pop(key, None)
+
+    def copy(self) -> ConfigSet:
+        return ConfigSet(self)
+
+    def __sub__(self, other: AbstractSet[Config]) -> ConfigSet:
+        result = self.copy()
+        result.difference_update(other)
+        return result
+
+    def __isub__(self, other: Iterable[Config]) -> Self:
+        self.difference_update(other)
+        return self
+
+    def __ior__(self, other: Iterable[Config]) -> Self:
+        self.update(other)
+        return self

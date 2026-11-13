@@ -50,6 +50,7 @@ from helion.autotuner.llm_search import LLMGuidedSearch
 from helion.autotuner.logger import AutotuningLogger
 from helion.autotuner.metrics import AutotuneMetrics
 from helion.autotuner.search_space_logger import canonical_config_id
+from helion.autotuner.search_surface import BackendSearchSurface
 import helion.language as hl
 from helion.runtime.settings import Settings
 
@@ -295,6 +296,7 @@ def _family_search(
 def _mock_kernel(settings: Settings) -> SimpleNamespace:
     config_spec = SimpleNamespace(
         default_config=lambda: helion.Config(block_sizes=[1]),
+        search_surface=BackendSearchSurface(),
         cute_flash_search_enabled=False,
         compiler_seed_timeout_retry_repetitions=None,
         create_config_generation=lambda **kwargs: SimpleNamespace(
@@ -2966,6 +2968,11 @@ class TestFinalSelection(TestCase):
             released.append(search._budget_reserve_released)
             return refined
 
+        def compiler(best: PopulationMember) -> PopulationMember:
+            order.append("compiler")
+            released.append(search._budget_reserve_released)
+            return best
+
         def final(best: PopulationMember) -> PopulationMember:
             order.append("final")
             released.append(search._budget_reserve_released)
@@ -2974,9 +2981,9 @@ class TestFinalSelection(TestCase):
         for policy, expected_order, expected, expected_released in (
             (
                 FinalSelectionConfig(),
-                ["finishing", "terminal", "final"],
+                ["finishing", "terminal", "compiler", "final"],
                 verified,
-                [False, False, True],
+                [False, False, False, True],
             ),
             (None, ["final", "finishing", "terminal"], refined, [True, True, True]),
         ):
@@ -2987,6 +2994,7 @@ class TestFinalSelection(TestCase):
             with (
                 patch.object(search, "run_finishing_phase", side_effect=finishing),
                 patch.object(search, "run_terminal_refinement", side_effect=terminal),
+                patch.object(search, "run_compiler_refinement", side_effect=compiler),
                 patch.object(search, "final_rebenchmark_best", side_effect=final),
                 patch.object(search, "_final_pick_supported", return_value=False),
             ):

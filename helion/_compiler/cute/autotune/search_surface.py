@@ -20,6 +20,7 @@ import torch
 
 from ...._compat import target_device_capability as get_target_device_capability
 from ...._utils import prev_power_of_2
+from ....autotuner.compiler_refinement import compiler_refinement_policy
 from ....autotuner.config_fragment import BooleanFragment
 from ....autotuner.config_fragment import ConfigSpecFragment
 from ....autotuner.config_fragment import EnumFragment
@@ -3908,6 +3909,14 @@ class CuteSearchSurface(BackendSearchSurface):
     config_keys = CUTE_CONFIG_KEYS
     debug_keys = CUTE_DEBUG_KEYS
     implicit_default_keys = CUTE_IMPLICIT_DEFAULT_KEYS
+    # Retirement and V lookbehind change the lifetime seen by the compiler
+    # pipeline. Their joint choices can win when individual changes lose;
+    # strict decoding keeps these coordinates active only on paired schedules.
+    compiler_refinement_keys = (
+        CUTE_COMPILER_PIPELINE_KEY,
+        MMA_DAG_EARLY_TMEM_RETIREMENT_KEY,
+        MMA_DAG_V_LAG_KEY,
+    )
 
     def explain_unavailable_key(self, key: str, config_spec: ConfigSpec) -> str | None:
         if key == "num_threads" and not config_spec.target_device_capability:
@@ -4042,7 +4051,12 @@ class CuteSearchSurface(BackendSearchSurface):
         prepare_flat_config(config_spec, config)
 
     def fingerprint_extra(self, config_spec: ConfigSpec) -> object | None:
-        return fingerprint_extra(config_spec)
+        return {
+            "target_policy": fingerprint_extra(config_spec),
+            "compiler_refinement": compiler_refinement_policy(
+                self.compiler_refinement_keys
+            ),
+        }
 
     def l2_evict_last_store_policy_supported(self, config_spec: ConfigSpec) -> bool:
         return fixed_l2_evict_last_store_policy_supported(

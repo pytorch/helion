@@ -66,6 +66,9 @@ class BackendSearchSurface:
     config_keys: frozenset[str] = frozenset()
     debug_keys: frozenset[str] = frozenset()
     implicit_default_keys: frozenset[str] = frozenset()
+    # Scalar compiler and schedule choices worth crossing with discovered layouts
+    # before full-effort final selection. Empty for backends without this phase.
+    compiler_refinement_keys: tuple[str, ...] = ()
 
     def supports_key(self, key: str) -> bool:
         """Whether this surface accepts a backend-specific config key."""

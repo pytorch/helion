@@ -319,13 +319,17 @@ The default autotuner and `Cache[Search]` factories retain search and best-of-K
 selection without cache I/O. Direct construction of the exact built-in
 `LocalAutotuneCache` and `StrictLocalAutotuneCache` classes also returns this
 uncached wrapper, rather than an instance of the requested cache class.
-Direct `RemoteAutotuneCache`, `StrictRemoteAutotuneCache` and `AOTAutotuneCache`
-construction rejects these bindings before initializing their caches. Custom
-cache subclasses retain their constructor contract and are not automatically
-replaced. Use the factory form so Helion can select the appropriate wrapper.
-For a custom cache subclass, `Cache[Search]` uses Helion's uncached wrapper
-instead of constructing that subclass, so its custom cache behavior is bypassed.
-The supplied `Search` class still controls the search.
+Direct `RemoteAutotuneCache`, `StrictRemoteAutotuneCache` and custom cache
+constructors without fresh-binding support reject these bindings before cache
+initialization. The factory form substitutes Helion's uncached wrapper for
+unsupported cache classes, preserving the supplied `Search` class.
+
+`AOTAutotuneCache` supports fresh bindings through both direct construction and
+`AOTAutotuneCache[Search]`. Explicit `evaluate` and `compile` modes select the
+AOT heuristic or default without starting autotuning. `collect` runs the search
+and records its artifacts, but does not reuse an automatic winner for a fresh
+binding. Custom subclasses declaring fresh-binding support retain their own
+constructor behavior.
 `HELION_ASSERT_CACHE_HIT=1` rejects a search that cannot read a cache, unless
 cache reads were explicitly bypassed by force or `HELION_SKIP_CACHE`.
 

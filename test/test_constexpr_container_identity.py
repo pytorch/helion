@@ -22,7 +22,6 @@ from helion._testing.binding_observation import observe_compiled_binding
 from helion.autotuner import BooleanFragment
 from helion.autotuner import LocalAutotuneCache
 from helion.autotuner import StrictLocalAutotuneCache
-from helion.autotuner.aot_cache import AOTAutotuneCache
 from helion.autotuner.base_cache import _UncachedAutotuneCache
 from helion.autotuner.remote_cache import RemoteAutotuneCache
 from helion.autotuner.remote_cache import StrictRemoteAutotuneCache
@@ -872,10 +871,8 @@ def test_local_cache_constructor_preserves_ordinary_and_custom_initializers():
         assert calls == [marker, marker]
 
 
-@pytest.mark.parametrize(
-    "cache_cls", (RemoteAutotuneCache, StrictRemoteAutotuneCache, AOTAutotuneCache)
-)
-def test_fresh_remote_and_aot_caches_require_factory_before_cache_initialization(
+@pytest.mark.parametrize("cache_cls", (RemoteAutotuneCache, StrictRemoteAutotuneCache))
+def test_fresh_remote_caches_require_factory_before_cache_initialization(
     cache_cls,
 ):
     class Search:
@@ -891,10 +888,6 @@ def test_fresh_remote_and_aot_caches_require_factory_before_cache_initialization
         patch(
             "helion.autotuner.remote_cache._load_remote_backend",
             side_effect=AssertionError("remote cache initialized"),
-        ),
-        patch(
-            "helion.autotuner.aot_cache.get_hardware_info",
-            side_effect=AssertionError("AOT cache initialized"),
         ),
     ):
         bound = helion.kernel(_captured_result_identity.fn).bind(args)

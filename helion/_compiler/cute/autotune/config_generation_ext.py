@@ -37,6 +37,7 @@ from ....autotuner.config_fragment import EnumFragment
 from ....autotuner.search_surface import ConfigGenerationExtension
 from ....exc import AutotuneError
 from ....exc import InvalidConfig
+from ....runtime.config_cache import ConfigSet
 from ..cute_flash import FLASH_DERIVED_CONFIG_KEYS
 from ..cute_flash import FLASH_EXP2_PACKET_KEY
 from ..cute_flash import FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS
@@ -59,6 +60,7 @@ from ..pdl_release import CUTE_PDL_SPREAD_KEY
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Mapping
+    from collections.abc import MutableSet
     from collections.abc import Sequence
 
     from ....autotuner.config_fragment import ConfigSpecFragment
@@ -884,7 +886,7 @@ class CuteConfigGenerationExtension(ConfigGenerationExtension):
         """
         self.validate_flash_structural_coverage()
         result: list[Config] = []
-        seen: set[Config] = set()
+        seen: MutableSet[Config] = ConfigSet()
         for flat in self._flash_deterministic_coverage_flats():
             try:
                 config = self.generation.unflatten(flat)
@@ -934,7 +936,7 @@ class CuteConfigGenerationExtension(ConfigGenerationExtension):
             axes[key] = (index, tuple(choices))
 
         result: list[Config] = []
-        seen: set[Config] = set()
+        seen: MutableSet[Config] = ConfigSet()
         base = self.generation._fragment_default_flat()
         for family, packet, softmax_disc in itertools.product(
             axes[FLASH_PIPELINE_FAMILY_KEY][1],
@@ -1066,7 +1068,7 @@ class CuteConfigGenerationExtension(ConfigGenerationExtension):
             products.append(value_sets)
 
         result: list[Config] = []
-        seen: set[Config] = set()
+        seen: MutableSet[Config] = ConfigSet()
         for value_sets in products:
             for values in itertools.product(*value_sets):
                 try:
@@ -1148,7 +1150,7 @@ class CuteConfigGenerationExtension(ConfigGenerationExtension):
         default_flat = self.generation.default_flat()
         self.validate_flash_structural_coverage()
         result: list[FlatConfig] = []
-        seen: set[Config] = set()
+        seen: MutableSet[Config] = ConfigSet()
 
         def append_valid(config: Config, *, required: bool = False) -> bool:
             if config in seen or (not required and len(result) >= n):

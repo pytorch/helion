@@ -2497,6 +2497,7 @@ class TestFp8UlpAccuracy(unittest.TestCase):
             helion.Settings(autotune_fp8_accuracy="exact")
 
 
+@pytest.mark.cpu_only
 class TestAccuracyCheck(unittest.TestCase):
     """``AccuracyCheck`` on CPU tensors (no kernel involved)."""
 
@@ -2676,7 +2677,10 @@ class TestAccuracyCheck(unittest.TestCase):
                 autotune_accuracy_check=enabled,
             )
             return _search_policy_hash(
-                SimpleNamespace(settings=settings),  # type: ignore[arg-type]
+                SimpleNamespace(  # type: ignore[arg-type]
+                    settings=settings,
+                    _benchmark_provider_cls=LocalBenchmarkProvider,
+                ),
                 cute_flash_search_enabled=False,
             )
 

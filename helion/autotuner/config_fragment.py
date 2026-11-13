@@ -13,6 +13,7 @@ from typing import TypeGuard
 from typing import cast
 
 from ..exc import InvalidConfig
+from ..runtime.config import _config_value_key
 
 if TYPE_CHECKING:
     from collections.abc import Hashable
@@ -22,6 +23,11 @@ if TYPE_CHECKING:
 
 
 FragmentFingerprint: TypeAlias = tuple[str | int, ...]
+
+
+def _same_search_value(left: object, right: object) -> bool:
+    """Search choices follow compiled identity, not Python numeric equality."""
+    return _config_value_key(left) == _config_value_key(right)
 
 
 def integer_power_of_two(n: object) -> TypeGuard[int]:
@@ -366,19 +372,26 @@ class EnumFragment(ConfigSpecFragment):
         # the knob to a value off the searched surface (e.g. cute tcgen05
         # knobs on configs that opt out of tcgen05); every searched choice is
         # then a neighbor so the search can step back onto the surface.
-        return [choice for choice in self._active_choices() if choice != current]
+        return [
+            choice
+            for choice in self._active_choices()
+            if not _same_search_value(choice, current)
+        ]
 
     def differential_mutation(self, a: object, b: object, c: object) -> object:
         active_choices = self._active_choices()
-        if b == c:
-            if a not in active_choices:
+        if _same_search_value(b, c):
+            if not any(_same_search_value(a, choice) for choice in active_choices):
                 return self.random()
             return a
-        choices = [choice for choice in (b, c) if choice in active_choices]
+        choices = [
+            choice
+            for choice in (b, c)
+            if any(_same_search_value(choice, active) for active in active_choices)
+        ]
         if not choices:
             return self.random()
-        if a in choices:
-            choices.remove(a)
+        choices = [choice for choice in choices if not _same_search_value(a, choice)]
         if not choices:
             return self.random()
         return random.choice(choices)
@@ -413,10 +426,14 @@ class EnumFragment(ConfigSpecFragment):
         the searched surface (e.g. cute tcgen05 knobs on configs that opt
         out of tcgen05), and this encoding only feeds surrogate models.
         """
-        try:
-            choice_idx = self.choices.index(value)
-        except ValueError:
-            choice_idx = -1
+        choice_idx = next(
+            (
+                i
+                for i, choice in enumerate(self.choices)
+                if _same_search_value(choice, value)
+            ),
+            -1,
+        )
         return [1.0 if i == choice_idx else 0.0 for i in range(len(self.choices))]
 
 
@@ -572,11 +589,13 @@ class ListOf(ConfigSpecFragment):
                 self.inner.default(),
                 *self.inner.pattern_neighbors(self.inner.default(), radius),
             ]:
-                if value not in values:
+                if not any(_same_search_value(value, prior) for prior in values):
                     values.append(value)
             for value in values:
                 uniform = [value] * self.length
-                if uniform != current and uniform not in neighbors:
+                if not _same_search_value(uniform, current) and not any(
+                    _same_search_value(uniform, prior) for prior in neighbors
+                ):
                     neighbors.append(uniform)
         return neighbors
 

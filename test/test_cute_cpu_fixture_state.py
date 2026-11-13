@@ -1,18 +1,14 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
 from contextlib import nullcontext
 import inspect
-from typing import Any
-from typing import cast
 from unittest.mock import patch
 
 import pytest
 import torch
 
-from test import test_cute_epilogue_fanout as fanout
-
 from helion._testing.cute_codegen import cpu_target
+from helion._testing.cute_codegen import cuda_metadata_trace
 
 pytestmark = pytest.mark.cpu_only
 
@@ -69,10 +65,9 @@ def test_cpu_metadata_fixture_preserves_entry_state_and_threads(
     initialized: bool, body_fails: bool
 ) -> None:
     threads = torch.get_num_threads()
-    fixture = contextmanager(cast("Any", fanout.cuda_trace).__wrapped__)
     with patch.object(torch.cuda, "is_initialized", return_value=initialized):
         try:
-            with fixture():
+            with cuda_metadata_trace():
                 assert torch.get_num_threads() == 1
                 assert torch.cuda.is_initialized() is initialized
                 with pytest.raises(AssertionError, match="GPU forbidden"):
@@ -90,11 +85,10 @@ def test_cpu_metadata_fixture_preserves_entry_state_and_threads(
 def test_cpu_metadata_fixture_rejects_a_new_initialization() -> None:
     threads = torch.get_num_threads()
     state = [False]
-    fixture = contextmanager(cast("Any", fanout.cuda_trace).__wrapped__)
     with (
         patch.object(torch.cuda, "is_initialized", side_effect=lambda: state[0]),
         pytest.raises(AssertionError),
-        fixture(),
+        cuda_metadata_trace(),
     ):
         state[0] = True
     assert torch.get_num_threads() == threads

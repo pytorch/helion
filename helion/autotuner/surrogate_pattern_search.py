@@ -10,6 +10,10 @@ from typing import TYPE_CHECKING
 from typing import cast
 
 from .. import exc
+from ..runtime.config import _config_key
+from ..runtime.config import _config_value_key
+from ..runtime.config_cache import ConfigCache
+from ..runtime.config_cache import ConfigSet
 from .base_search import BenchmarkResult
 from .base_search import PopulationBasedSearch
 from .base_search import PopulationMember
@@ -44,6 +48,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
     from collections.abc import Mapping
+    from collections.abc import MutableMapping
+    from collections.abc import MutableSet
     from collections.abc import Sequence
 
     from .._compiler.cute.autotune.config_generation_ext import (
@@ -277,7 +283,7 @@ class LFBOPatternSearch(PatternSearch):
                 and self.settings.autotune_benchmark_fn is None
                 and not isinstance(self.args, _MultiShapeAutotuneArgs)
             ):
-                self._terminal_refinement_members = {}
+                self._terminal_refinement_members = ConfigCache()
             self._flash_promoted_path_limit = (
                 self._flash_generation().flash_structural_starting_path_limit(
                     minimum=max(self.copies, flash_structural_search.starting_paths),
@@ -416,7 +422,7 @@ class LFBOPatternSearch(PatternSearch):
 
     def _apply_effective_source_repairs(
         self,
-        repairs: dict[Config, BenchmarkResult],
+        repairs: MutableMapping[Config, BenchmarkResult],
         current_members: Sequence[PopulationMember],
     ) -> None:
         super()._apply_effective_source_repairs(repairs, current_members)
@@ -438,7 +444,7 @@ class LFBOPatternSearch(PatternSearch):
 
     def _invalidate_rebenchmark_training_targets(
         self,
-        failed_configs: set[Config],
+        failed_configs: MutableSet[Config],
         failed_source_hashes: set[str],
     ) -> None:
         if self.train_configs is None:
@@ -649,7 +655,7 @@ class LFBOPatternSearch(PatternSearch):
             f" max_generations={self.max_generations},"
             f" similarity_penalty={self.similarity_penalty}"
         )
-        visited: set[Config] = set()
+        visited: MutableSet[Config] = ConfigSet()
         self.population = []
         for flat_config in self._generate_initial_population_flat():
             member = self.make_unbenchmarked(flat_config)
@@ -867,7 +873,7 @@ class LFBOPatternSearch(PatternSearch):
         # Final verification, finishing phase, and (TPU-only) final-pick re-rank.
         return self._finalize()
 
-    def _polish_descent(self, visited: set[Config]) -> None:
+    def _polish_descent(self, visited: MutableSet[Config]) -> None:
         """Full-neighborhood descent after the surrogate-guided main loop.
 
         Run plain pattern-search descent from the incumbent: benchmark the
@@ -1314,7 +1320,7 @@ class LFBOPatternSearch(PatternSearch):
 
     def _run_flash_structural_qualification(
         self,
-        visited: set[Config],
+        visited: MutableSet[Config],
         *,
         initial_population: Sequence[PopulationMember] | None = None,
     ) -> int:
@@ -1544,7 +1550,8 @@ class LFBOPatternSearch(PatternSearch):
                     (member, leaf, lane)
                     for leaf in alternate_leaf_order
                     for member, lane in retained_by_leaf[leaf]
-                    if member.config != best_member.config and lane is not None
+                    if _config_key(member.config) != _config_key(best_member.config)
+                    and lane is not None
                 ),
                 None,
             )
@@ -1573,10 +1580,10 @@ class LFBOPatternSearch(PatternSearch):
                 if len(selected_leaf_paths) >= constrained_limit:
                     break
                 selected_leaf_paths.append((member, leaf, False, None))
-            selected_configs = {
+            selected_configs = ConfigSet(
                 member.config
                 for member, _leaf, _unrestricted, _lane in selected_leaf_paths
-            }
+            )
             selected_leaves = {
                 leaf for _member, leaf, _unrestricted, _lane in selected_leaf_paths
             }
@@ -1632,7 +1639,7 @@ class LFBOPatternSearch(PatternSearch):
                 leaf.pipeline_family
                 for member, leaf, _unrestricted, _lane in selected_leaf_paths
                 if leaf.compound_exp2_packet is None
-                and member.config != by_leaf[leaf][0].config
+                and _config_key(member.config) != _config_key(by_leaf[leaf][0].config)
             }
             for family in retained_parent_families:
                 if (
@@ -1645,7 +1652,8 @@ class LFBOPatternSearch(PatternSearch):
                         (member, leaf, lane)
                         for member, leaf, lane in family_queues[family]
                         if leaf.compound_exp2_packet is None
-                        and member.config != by_leaf[leaf][0].config
+                        and _config_key(member.config)
+                        != _config_key(by_leaf[leaf][0].config)
                         and member.config not in selected_configs
                     ),
                     None,
@@ -1770,7 +1778,7 @@ class LFBOPatternSearch(PatternSearch):
             return paths
 
         selected: list[tuple[PopulationMember, tuple[tuple[str, object], ...]]] = []
-        selected_configs: set[Config] = set()
+        selected_configs: MutableSet[Config] = ConfigSet()
         if eligible:
             selected.append((eligible[0], ()))
             selected_configs.add(eligible[0].config)
@@ -1917,7 +1925,7 @@ class LFBOPatternSearch(PatternSearch):
             if proposal_callback is not None:
                 proposal_callback(new_flat)
             # Only add if it's different from the base
-            if new_flat != base:
+            if _config_value_key(new_flat) != _config_value_key(base):
                 neighbors.append(new_flat)
 
         return self.shrink_neighbors(neighbors)
@@ -2109,7 +2117,7 @@ class LFBOPatternSearch(PatternSearch):
 
         registry = getattr(self, "_terminal_refinement_members", None)
         if registry is None:
-            registry = {}
+            registry = ConfigCache()
             self._terminal_refinement_members = registry
         self._record_best_member_for_config(
             registry,
@@ -2120,7 +2128,7 @@ class LFBOPatternSearch(PatternSearch):
         preterminal_registry_config_ids = sorted(
             canonical_config_id(config) for config in registry
         )
-        preterminal_configs = set(registry)
+        preterminal_configs = ConfigSet(registry)
         transcript["preterminal_registry_config_count"] = len(
             preterminal_registry_config_ids
         )
@@ -2157,7 +2165,7 @@ class LFBOPatternSearch(PatternSearch):
                 raise AssertionError(
                     "terminal refinement changed LFBO generation count"
                 )
-            if current.config != best.config:
+            if _config_key(current.config) != _config_key(best.config):
                 self.log(
                     "Terminal coordinate refinement selected "
                     f"{current.config} ({self.format_performance(current.perf)})"
@@ -2185,7 +2193,7 @@ class LFBOPatternSearch(PatternSearch):
         beam = [best]
         final_beam = [best]
         accepted_round_winners: list[PopulationMember] = []
-        accepted_configs: set[Config] = set()
+        accepted_configs: MutableSet[Config] = ConfigSet()
         round_metrics = transcript["rounds"]
         assert isinstance(round_metrics, list)
         termination_reason = "round_limit"
@@ -2195,11 +2203,13 @@ class LFBOPatternSearch(PatternSearch):
             parent_ids = [canonical_config_id(parent.config) for parent in beam]
             projection_parent_count += len(parent_ids)
             transcript["projection_parent_count"] = projection_parent_count
-            parent_configs = {parent.config for parent in beam}
+            parent_configs = ConfigSet(parent.config for parent in beam)
             parent_projections: list[dict[str, object]] = []
-            candidate_member_by_config: dict[Config, PopulationMember] = {}
+            candidate_member_by_config: MutableMapping[Config, PopulationMember] = (
+                ConfigCache()
+            )
             candidate_configs: list[Config] = []
-            round_seen_configs: set[Config] = set()
+            round_seen_configs: MutableSet[Config] = ConfigSet()
             newly_unbenchmarked: list[PopulationMember] = []
             round_new_ids: list[str] = []
             round_reused_ids: list[str] = []
@@ -2288,7 +2298,7 @@ class LFBOPatternSearch(PatternSearch):
                 )
 
             measured: list[PopulationMember] = []
-            measured_configs: set[Config] = set()
+            measured_configs: MutableSet[Config] = ConfigSet()
             for member in (*beam, *candidate_member_by_config.values()):
                 if (
                     self._flash_member_succeeded(member)
@@ -2370,7 +2380,7 @@ class LFBOPatternSearch(PatternSearch):
                 else 0.0
             )
             accepted = bool(
-                round_best.config != incumbent.config
+                _config_key(round_best.config) != _config_key(incumbent.config)
                 and improvement >= self.min_improvement_delta
             )
             if accepted:
@@ -2386,7 +2396,7 @@ class LFBOPatternSearch(PatternSearch):
             ranked = sorted(complete, key=self._flash_member_rank_key)
             next_beam = [incumbent]
             for member in ranked:
-                if member.config in {item.config for item in next_beam}:
+                if member.config in ConfigSet(item.config for item in next_beam):
                     continue
                 next_beam.append(member)
                 if len(next_beam) >= policy.terminal_coordinate_beam_width:
@@ -2407,7 +2417,7 @@ class LFBOPatternSearch(PatternSearch):
         transcript["termination_reason"] = termination_reason
         transcript["refined_config_id"] = canonical_config_id(incumbent.config)
         confirmation_members: list[PopulationMember] = []
-        confirmation_configs: set[Config] = set()
+        confirmation_configs: MutableSet[Config] = ConfigSet()
         for member in (best, *accepted_round_winners, *final_beam):
             if member.config in confirmation_configs:
                 continue
@@ -2440,7 +2450,7 @@ class LFBOPatternSearch(PatternSearch):
                 else 0.0
             )
             confirmation_accepted = bool(
-                confirmed_best.config != best.config
+                _config_key(confirmed_best.config) != _config_key(best.config)
                 and confirmation_improvement >= self.min_improvement_delta
             )
             if confirmation_accepted:
@@ -2475,7 +2485,7 @@ class LFBOPatternSearch(PatternSearch):
         members: Sequence[PopulationMember],
         leaf: FlashStructuralLeaf,
         constraints: tuple[tuple[str, object], ...],
-        known_configs: set[Config],
+        known_configs: MutableSet[Config],
         neighbor_limit: int,
     ) -> tuple[PopulationMember | None, list[PopulationMember], dict[str, object]]:
         """Find one conditional child within a shared ranked-parent budget.
@@ -2519,7 +2529,7 @@ class LFBOPatternSearch(PatternSearch):
             ).flash_owned_coordinate_indices(parent_config)
             proposals: list[dict[str, object]] = []
             candidates: list[PopulationMember] = []
-            proposed_configs: set[Config] = set()
+            proposed_configs: MutableSet[Config] = ConfigSet()
 
             def record_proposal(
                 raw: FlatConfig,
@@ -2528,7 +2538,7 @@ class LFBOPatternSearch(PatternSearch):
                 generation: ConfigGeneration = generation,
                 proposals: list[dict[str, object]] = proposals,
                 candidates: list[PopulationMember] = candidates,
-                proposed_configs: set[Config] = proposed_configs,
+                proposed_configs: MutableSet[Config] = proposed_configs,
             ) -> None:
                 record: dict[str, object] = {
                     "kind": kind,
@@ -2601,7 +2611,11 @@ class LFBOPatternSearch(PatternSearch):
             if not candidates:
                 continue
             selected = self._surrogate_select([parent, *candidates], 2)
-            child = next(item for item in selected if item.config != parent.config)
+            child = next(
+                item
+                for item in selected
+                if _config_key(item.config) != _config_key(parent.config)
+            )
             ledger["selected_parent_config_id"] = canonical_config_id(parent.config)
             ledger["selected_child_config_id"] = canonical_config_id(child.config)
             return parent, [child], ledger
@@ -2628,7 +2642,7 @@ class LFBOPatternSearch(PatternSearch):
             num_neighbors=neighbor_limit,
         )
         result: list[FlatConfig] = []
-        seen: set[Config] = set()
+        seen: MutableSet[Config] = ConfigSet()
         for child_flat in child_neighbors:
             try:
                 _child_flat, config = config_gen.canonicalize_flat(child_flat)
@@ -2661,7 +2675,7 @@ class LFBOPatternSearch(PatternSearch):
         self,
         copy_idx: int,
         current: PopulationMember,
-        visited: set[Config],
+        visited: MutableSet[Config],
         constraints: tuple[tuple[str, object], ...] = (),
         selected_limit: int | None = None,
         required_leaf: FlashStructuralLeaf | None = None,
@@ -2693,7 +2707,7 @@ class LFBOPatternSearch(PatternSearch):
                 fixed_flat_values[index] = current.flat_values[index]
         for _ in range(self.max_generations):
             candidates: list[PopulationMember] = [current]
-            generated_configs: set[Config] = set()
+            generated_configs: MutableSet[Config] = ConfigSet()
             with sync_seed(process_group_name=self.kernel.env.process_group_name):
                 if required_leaf is not None and conditional_surface:
                     all_neighbors = self._generate_flash_leaf_neighbors(
@@ -2749,10 +2763,13 @@ class LFBOPatternSearch(PatternSearch):
                 n_sorted = min(n_sorted, selected_limit)
             candidates = self._surrogate_select(candidates, n_sorted)
             selected_neighbors = [
-                member for member in candidates if member.config != current.config
+                member
+                for member in candidates
+                if _config_key(member.config) != _config_key(current.config)
             ]
             candidates = [current, *selected_neighbors[: max(0, n_sorted - 1)]]
-            visited.update(member.config for member in candidates)
+            for member in candidates:
+                visited.add(member.config)
 
             if len(candidates) <= 1:
                 self.log(f"Copy {copy_idx} finish because of no candidates")
@@ -3033,7 +3050,7 @@ class LFBOTreeSearch(LFBOPatternSearch):
                         current_flat, raw, frozen_indices=frozen_indices
                     )
                     candidate_flats.append(candidate)
-                    if candidate == raw:
+                    if _config_value_key(candidate) == _config_value_key(raw):
                         candidate_encoded[i, enc_start:enc_end] = spec.encode(val)
                     else:
                         candidate_encoded[i] = config_gen.encode_config(candidate)
@@ -3050,7 +3067,7 @@ class LFBOTreeSearch(LFBOPatternSearch):
                 current_encoded = candidate_encoded[chosen_idx].copy()
 
             # Only keep if different from base
-            if current_flat != base_list:
+            if _config_value_key(current_flat) != _config_value_key(base_list):
                 all_results.append(list(current_flat))
 
         return self.shrink_neighbors(all_results)
