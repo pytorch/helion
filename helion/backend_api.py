@@ -37,6 +37,7 @@ from ._compiler.backend_registry import (
 from ._compiler.compile_environment import CompileEnvironment as CompileEnvironment
 from ._compiler.compile_environment import _symint_sympy_expr as symint_sympy_expr
 from ._compiler.device_function import Argument as Argument
+from ._compiler.device_function import DeviceBodyContext as DeviceBodyContext
 from ._compiler.device_function import DeviceFunction as DeviceFunction
 from ._compiler.device_ir import DeviceIR as DeviceIR
 from ._compiler.device_ir import ForLoopGraphInfo as ForLoopGraphInfo
@@ -87,6 +88,7 @@ __all__ = [
     "Config",
     "ConfigSpec",
     "ConfigSpecFragment",
+    "DeviceBodyContext",
     "DeviceFunction",
     "DeviceGridState",
     "DeviceIR",
