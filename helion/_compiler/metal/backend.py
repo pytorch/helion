@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import ClassVar
 from typing import Sequence
+from typing import cast
 
 import sympy
 import torch
@@ -290,6 +291,46 @@ def _config_fixed_scalars() -> set[str]:
     }
 
 
+def _loop_bounds(device_ir: DeviceIR) -> dict[int, tuple[object, object]]:
+    """Each device loop block's ``(begin, end)`` as the kernel's ``_for_loop``
+    calls pass them: an int, a node or an expression for a value known only
+    at runtime.  An end ``hl.specialize`` pins is its value.  A block two calls loop
+    over with different bounds has none."""
+    # Local imports: language, compile_environment and device_ir import
+    # this module (through the backends) as they load.
+    from ...language import _tracing_ops
+    from ..compile_environment import CompileEnvironment
+    from ..device_ir import ForLoopGraphInfo
+
+    env = CompileEnvironment.current()
+    loops = {
+        info.graph_id: info
+        for info in device_ir.graphs
+        if isinstance(info, ForLoopGraphInfo)
+    }
+    bounds: dict[int, tuple[object, object]] = {}
+    ambiguous: set[int] = set()
+    for info in device_ir.graphs:
+        for node in info.graph.nodes:
+            if node.op != "call_function" or node.target not in (
+                _tracing_ops._for_loop,
+                _tracing_ops._for_loop_step,
+            ):
+                continue
+            begins, ends = node.args[1], node.args[2]
+            assert isinstance(begins, list) and isinstance(ends, list)
+            for block, begin, end in zip(
+                loops[node.args[0]].block_ids, begins, ends, strict=True
+            ):
+                if isinstance(begin, torch.SymInt):
+                    begin = begin._sympy_()
+                if isinstance(end, torch.SymInt):
+                    end = env.specialize_expr(cast("sympy.Expr", end._sympy_()))
+                if bounds.setdefault(block, (begin, end)) != (begin, end):
+                    ambiguous.add(block)
+    return {block: b for block, b in bounds.items() if block not in ambiguous}
+
+
 class MetalBackend(Backend):
     """Metal Shading Language (MSL) code generation backend for macOS."""
 
@@ -327,6 +368,7 @@ class MetalBackend(Backend):
             "reduction_fusion",
             "pid_type",
             "num_sm_multiplier",
+            "range_num_stages",
         }
     )
 
@@ -571,18 +613,26 @@ class MetalBackend(Backend):
         ``metal_matmul`` to the search): the planner's fragment trial on
         copies of the graphs, with no block spread over threads.  Then the
         sizes of the tables its fragment elements would read
-        (``metal_tabulate_max_entries``)."""
+        (``metal_tabulate_max_entries``), and a ``range_num_stages`` slot per
+        K loop, for loading its runs' operands a tile ahead."""
         from ..compile_environment import CompileEnvironment
         from ..compile_environment import FixedBlockSizeSource
         from ..device_ir import ForLoopGraphInfo
         from ..host_function import HostFunction
         from .fragment_mma import FRAGMENT_LOWERING
+        from .fragment_mma import loads_ahead
         from .free_arange import free_arange_blocks
         from .mpp_matmul import has_matmuls
         from .mpp_matmul import plan_mpp_matmuls
+        from .search_surface import FragmentNumStagesSpec
         from .search_surface import MetalKernelFacts
         from .tabulate import table_sizes
 
+        # Metal reads range_num_stages on fragment K loops only, so it keeps
+        # their slots alone (Triton's ``tl.range`` hook adds one per loop when
+        # triton imports).
+        stages = config_spec.range_num_stages
+        stages.clear()
         if not has_matmuls(device_ir.graphs):
             return
         # The planner reads the kernel's roots and grids through its
@@ -669,6 +719,13 @@ class MetalBackend(Backend):
                 fragment_matmuls=True,
                 table_sizes=frozenset(table_sizes(inputs)),
             )
+            # A slot per K loop that can load a tile ahead: known bounds it
+            # runs between (``fragment_mma.loads_ahead``, which codegen
+            # checks under the slot).
+            bounds = _loop_bounds(device_ir)
+            for block in blocks:
+                if block in bounds and loads_ahead(*bounds[block]):
+                    stages.append(FragmentNumStagesSpec([block]))
 
     def default_num_sm_multiplier(self) -> int:
         # A threadgroup doesn't fill an Apple GPU core.  On an M4 Pro (16

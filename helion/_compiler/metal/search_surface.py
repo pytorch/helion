@@ -10,6 +10,7 @@ import math
 from typing import TYPE_CHECKING
 
 from ...autotuner.config_fragment import EnumFragment
+from ...autotuner.config_spec import RangeNumStagesSpec
 from ...autotuner.search_surface import BackendSearchSurface
 from ...exc import InvalidConfig
 from ...runtime.config import Config
@@ -100,6 +101,47 @@ def _table_choices(config_spec: ConfigSpec) -> tuple[int, ...]:
         if any(choices[-1] < size <= cap for size in sizes):
             choices.append(cap)
     return tuple(choices)
+
+
+#: The ``range_num_stages`` a loop over fragment runs takes: 0 and 1 load
+#: each K tile's operands in its iteration, 2 one tile ahead
+#: (``fragment_mma.prefetch_loads``).
+FRAGMENT_STAGES = (0, 1, 2)
+
+
+class FragmentNumStagesSpec(RangeNumStagesSpec):
+    """``range_num_stages`` of a K loop over fragment runs, with Triton's
+    meaning: 2 stages issue the next tile's loads before this tile's work.
+    The search tries 0 and 2 (1 is 0's code).  Registered after
+    ``CompileEnvironment._pin_range_num_stages_for_aliasing``, it is never
+    pinned: a fragment run never loads a tensor the kernel writes from a view
+    (the planner stages such a view, and ``check_fragment_group`` refuses a
+    staged operand's loads of one), so no load it moves can alias a store."""
+
+    # An enum where Triton's slot is an integer range: 1 would repeat 0.
+    # pyrefly: ignore [bad-override]
+    def _fragment(self, base: ConfigSpec) -> EnumFragment:
+        return EnumFragment((0, 2))
+
+    def _normalize(self, name: str, value: object) -> int:
+        value = super()._normalize(name, value)
+        if value not in FRAGMENT_STAGES:
+            raise InvalidConfig(
+                f"{name} must be one of {FRAGMENT_STAGES} on a Metal fragment "
+                f"K loop, got {value!r}"
+            )
+        return value
+
+
+def fragment_stages(
+    config_spec: ConfigSpec, config: Mapping[str, object], block: int
+) -> int:
+    """The config's ``range_num_stages`` for the loop over ``block``."""
+    values = config.get("range_num_stages", [])
+    assert isinstance(values, list)
+    stages = config_spec.range_num_stages.config_get(values, block, 0)
+    assert isinstance(stages, int)
+    return stages
 
 
 def fit_threads(config_spec: ConfigSpec, config: dict[str, object]) -> None:
@@ -210,27 +252,37 @@ class MetalSearchSurface(BackendSearchSurface):
         return fields
 
     def trim_reference_config(self, config_spec: ConfigSpec, config: Config) -> None:
-        """The default config leaves ``metal_matmul`` and
-        ``metal_tabulate_max_entries`` out, as before they were searched: a
-        config without them means MPP and no tables."""
+        """The default config leaves ``metal_matmul``,
+        ``metal_tabulate_max_entries`` and unstaged ``range_num_stages`` out,
+        as before they were searched: a config without them means MPP, no
+        tables and no prefetch."""
         if metal_matmul(config.config) == METAL_MATMUL_CHOICES[0]:
             config.config.pop(METAL_MATMUL, None)
         if metal_tabulate_max_entries(config.config) == 0:
             config.config.pop(METAL_TABULATE, None)
+        stages = config.config.get("range_num_stages", [])
+        assert isinstance(stages, list)
+        if not any(stages):
+            config.config.pop("range_num_stages", None)
 
     def seed_configs(self, config_spec: ConfigSpec) -> list[Config]:
         """Both lowerings in the initial population: the default is MPP's, so
         seed fragment configs (one SIMD group per threadgroup, which the
         fragment run takes), one per table cap that changes the code (the key
-        left out at 0)."""
+        left out at 0), each with and without loading its K loops' operands a
+        tile ahead where it can (``range_num_stages`` slots)."""
         if not lowers_on_fragments(config_spec):
             return []
+        slots = len(config_spec.range_num_stages)
         seeds = []
         for cap in _table_choices(config_spec):
-            seed = Config(metal_matmul="fragment", num_warps=1)
-            if cap:
-                seed.config[METAL_TABULATE] = cap
-            seeds.append(seed)
+            for stages in (0, 2) if slots else (0,):
+                seed = Config(metal_matmul="fragment", num_warps=1)
+                if cap:
+                    seed.config[METAL_TABULATE] = cap
+                if stages:
+                    seed.config["range_num_stages"] = [stages] * slots
+                seeds.append(seed)
         return seeds
 
     def normalize_knobs(
@@ -266,6 +318,33 @@ class MetalSearchSurface(BackendSearchSurface):
             # the SIMD groups of a threadgroup would lift the limit.
             config["num_warps"] = 1
 
+    def normalize_before_sequences(
+        self, config_spec: ConfigSpec, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        """Metal reads ``range_num_stages`` on fragment runs only, one entry
+        per K loop that can load a tile ahead.  Before it took the key, a
+        Metal config's ``range_num_stages`` (a Triton config's per-loop
+        stages, pasted or cached) was dropped as a key of another backend; a
+        config that doesn't lower on fragments still drops it, so it keeps
+        loading whatever its length and values.  A fragment config, new with
+        the key, must give one entry per such loop: the search's repairs
+        drop a wrong length, and a user's config is refused."""
+        stages = config.get("range_num_stages")
+        if stages is None:
+            return
+        if metal_matmul(config) != "fragment":
+            del config["range_num_stages"]
+            return
+        slots = len(config_spec.range_num_stages)
+        if isinstance(stages, list) and len(stages) == slots:
+            return
+        if not fix_invalid:
+            raise InvalidConfig(
+                f"range_num_stages must have one entry per Metal fragment K loop "
+                f"that can load a tile ahead ({slots}), got {stages!r}"
+            )
+        del config["range_num_stages"]
+
     def normalize_finalize(
         self,
         config_spec: ConfigSpec,
@@ -274,6 +353,11 @@ class MetalSearchSurface(BackendSearchSurface):
         fix_invalid: bool,
         provided_keys: set[str],
     ) -> None:
+        if not config_spec.range_num_stages:
+            # A kernel without fragment K loops keeps its configs as they
+            # were before Metal took the key: the sequence pass gives it an
+            # empty range_num_stages, which this drops.
+            config.pop("range_num_stages", None)
         if fix_invalid and kernel_facts(config_spec).thread_loops:
             fit_threads(config_spec, config)
 

@@ -26,6 +26,7 @@ from helion._testing import skipUnlessBackends
 from helion._testing.metal import run_with_msl
 from helion._testing.metal_fragment import e4m3
 from helion._testing.metal_fragment import fp8_rows
+from helion._testing.metal_fragment import k_from_16
 from helion._testing.metal_fragment import nvfp4_rows
 from helion._testing.metal_fragment import views_epilogue
 from helion.autotuner.config_generation import ConfigGeneration
@@ -302,14 +303,22 @@ class TestFragmentMma(unittest.TestCase):
                 out, msl = _run(dequant_rows, args, config)
                 self._close(out, ref)
                 self._assert_fragments(msl, transposed=True)
-        # Bound to static shapes, of its decode, ``(q - 8) * scale``, the
-        # code's conversion is a 16-entry lookup and the scale per group stays
+        # Bound to static shapes, its unmasked words and scales load a K tile
+        # early under 2 stages; of its decode, ``(q - 8) * scale``, the code's
+        # conversion is a 16-entry lookup and the scale per group stays
         # computed.
         static = helion.kernel(dequant_rows.fn, backend="metal", static_shapes=True)
         args, ref = _quantized("int4", 8, 64, 256)
-        config = _frag([16, 16, 64], [1, 1, 512], metal_tabulate_max_entries=16)
+        config = _frag(
+            [16, 16, 64],
+            [1, 1, 512],
+            range_num_stages=[2],
+            metal_tabulate_max_entries=16,
+        )
         out, msl = _run(static, args, config)
         self._close(out, ref)
+        self.assertRegex(msl, r"auto _early_\d+_next = wq\[")
+        self.assertRegex(msl, r"auto _early_\d+_next = s\[")
         self.assertIn("constant float _helion_table_0[16] = {", msl)
         self.assertNotIn("_helion_table_1", msl)
 
@@ -323,7 +332,8 @@ class TestFragmentMma(unittest.TestCase):
         # The row's block of 1 grows to the B fragment's 8 columns, which the
         # element loops skip past the block.
         self.assertIn("if (_e_m < 1 && _e_n < 16) {", msl)
-        config = _frag([16, 16, 64], [1, 1, 512], metal_tabulate_max_entries=16)
+        knobs = {"metal_tabulate_max_entries": 16, "range_num_stages": [2]}
+        config = _frag([16, 16, 64], [1, 1, 512], **knobs)
         out, msl = _run(nvfp4_rows, (x, wq, s), config)
         self._close(out, ref)
         self._assert_fragments(msl, transposed=True)
@@ -339,19 +349,28 @@ class TestFragmentMma(unittest.TestCase):
             {"(_fn + (o / 8))", "((_fn + (o / 8)) + 1)"},
         )
         self.assertEqual(msl.count("c10::metal::floor_divide"), 2)
-        # The weights' word and scale loads are in the operand loop, re-run
-        # per element at the element's K, and x is loaded unmasked: every
-        # tile of M and K lies inside its extent.
-        self.assertRegex(
-            msl,
-            r"\bx\[\(\(\(offset_\d+ \+ _e_m\) \* 256\) \+ \(offset_\d+ \+ _e_k\)\)\]",
-        )
         # The code's decode, from its nibble, is a lookup in a 16-entry table
         # (metal_tabulate_max_entries=16; none without it).
         self.assertIn("constant float _helion_table_0[16] = {", msl)
         self.assertRegex(msl, r"= _helion_table_0\[v_\d+\];")
+        # With 2 stages the K loop loads each word, scale and x element a
+        # tile early: for the first tile before the loop, for the next at
+        # its top.
+        self.assertRegex(msl, r"auto _early_0_next = wq\[")
+        self.assertRegex(msl, r"if \(offset_\d+ \+ 64 < 256\) \{")
+        self.assertRegex(msl, r"auto words = _early_\d+;")
+        # x is loaded unmasked, so a tile early too: every tile of M and K
+        # lies inside its extent.
+        self.assertRegex(msl, r"_early_\d+_next = x\[_fm \* 8 \+ _fn \* 256 \+")
+        # Without the keys the loads stay in the operand loop, re-run per
+        # element at the element's K, and there is no table.
         _, msl = _run(nvfp4_rows, (x, wq, s), _frag([16, 16, 64], [1, 1, 512]))
+        self.assertNotIn("_early", msl)
         self.assertNotIn("_helion_table", msl)
+        self.assertRegex(
+            msl,
+            r"\bx\[\(\(\(offset_\d+ \+ _e_m\) \* 256\) \+ \(offset_\d+ \+ _e_k\)\)\]",
+        )
 
     def test_fp8(self) -> None:
         """mxfp8 codes and E8M0 scales through hl.dot; a K tail (K = 224 in
@@ -372,6 +391,23 @@ class TestFragmentMma(unittest.TestCase):
                 out, msl = _run(fp8_rows, args, config)
                 self._close(out, ref)
                 self.assertEqual("constant float _helion_table_0[256]" in msl, table)
+        # Under 2 stages the K tail's loads, all masked, stay in their tile.
+        out, msl = _run(fp8_rows, args, _frag([16, 16, 64], range_num_stages=[2]))
+        self._close(out, ref)
+        self.assertNotIn("_early", msl)
+        # Without a tail the words, scales and x load a tile early, beside a
+        # 256-entry table: neither mechanism keys on one format.
+        args, ref = _quantized("fp8", 8, 48, 256)
+        config = _frag(
+            [16, 16, 64],
+            [1, 1, 512],
+            range_num_stages=[2],
+            metal_tabulate_max_entries=256,
+        )
+        out, msl = _run(fp8_rows, args, config)
+        self._close(out, ref)
+        self.assertRegex(msl, r"auto _early_\d+_next = wq\[")
+        self.assertIn("constant float _helion_table_0[256]", msl)
         out, msl = _run(fp8_rows, args, _frag([16, 16, 16]))
         self._close(out, ref)
         self.assertRegex(
@@ -476,9 +512,38 @@ class TestFragmentMma(unittest.TestCase):
         self._close(b, xd @ z.cpu().double())
         self._assert_fragments(msl, transposed=False)
         self.assertEqual(msl.count("constexpr short _fs = 0;"), 2)
+        # Under 2 stages both runs load ahead, under one test for a next tile.
+        config = _frag([16, 16, 16], range_num_stages=[2])
+        out, _, msl = run_with_msl(two_groups, (x, y, z), config)
+        a, b = cast("tuple[torch.Tensor, torch.Tensor]", out)
+        self._close(a, xd @ y.cpu().double())
+        self._close(b, xd @ z.cpu().double())
+        self.assertIn("_early_0_next = ", msl)
+        self.assertEqual(len(re.findall(r"if \(offset_\d+ \+ 16 < 48\) \{", msl)), 1)
         message = "13 8x8 fragments live (max 9, 4 of them the K loop's other"
         with self.assertRaisesRegex(exc.BackendUnsupported, re.escape(message)):
             _run(two_groups, (x, y, z), _frag([16, 32, 16]))
+
+    def test_k_from_16(self) -> None:
+        """A K loop from 16 under 2 stages loads its first tile, K 16 to 48,
+        before the loop, and the next at the top of the iteration before:
+        the result is x[:, 16:] @ y[16:]."""
+        x = torch.randn(16, 80, device=DEVICE)
+        y = torch.randn(80, 16, device=DEVICE)
+        a, b = x.half().cpu().double(), y.half().cpu().double()
+        config = _frag([16, 16, 32], [1, 1, 32], range_num_stages=[2])
+        out, msl = _run(k_from_16, (x, y), config)
+        self._close(out, a[:, 16:] @ b[16:])
+        # The first tile's loads, before the loop, read from K = 16: column
+        # 16 of x's row, row 16 of y (16 * 16 elements in).
+        self.assertRegex(
+            msl,
+            r"auto _early_0_next = x\[_fm \* 80 \+ _fn \* 4 \+ offset_\d+ \* 80 \+ 16\];",
+        )
+        self.assertRegex(
+            msl, r"auto _early_\d+_next = y\[_fm \* 64 \+ _fn \+ offset_\d+ \+ 256\];"
+        )
+        self.assertRegex(msl, r"for \(int offset_\d+ = 16;")
 
 
 def _seeds(spec: ConfigSpec) -> list[helion.Config]:
