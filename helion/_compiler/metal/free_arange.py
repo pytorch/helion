@@ -683,12 +683,12 @@ def check_free_lanes(
     if not laned:
         return
     from .mpp_matmul import _mpp_coop
-    from .mpp_matmul import _operands
+    from .mpp_matmul import matmul_operands
 
     owned: set[Node] = set()
     staged: set[int] = set()
     for group in mpp_plan.by_matmul.values():
-        _acc, lhs, rhs = _operands(group.matmul)
+        _acc, lhs, rhs = matmul_operands(group.matmul)
         for node, operand, blocks in (
             (lhs, group.lhs, (group.m_block, group.k_block)),
             (rhs, group.rhs, (group.k_block, group.n_block)),
@@ -734,12 +734,12 @@ def _scalar_reader(
     code evaluates (named), or None.  Iotas, loads and pure element-wise
     nodes count only through their users: one used only by MPP-owned nodes,
     shape reads or loop plumbing is never evaluated."""
+    from .mpp_matmul import Graphs
     from .mpp_matmul import _carry
-    from .mpp_matmul import _Graphs
     from .mpp_matmul import _pointwise
 
     env = CompileEnvironment.current()
-    g = _Graphs(graphs)
+    g = Graphs(graphs)
 
     def holds(node: Node) -> bool:
         val = node.meta.get("val")

@@ -30,10 +30,15 @@ import dataclasses
 from typing import Iterator
 
 from ... import exc
+from .fragment_mma import emit_fragment_acc
+from .fragment_mma import emit_fragment_run
+from .fragment_mma import fragment_elements
+from .fragment_mma import is_fragment_acc
 from .lane_fold import LANE_PUT
 from .lane_fold import load_mask_other
 from .lane_fold import tl_load
 from .mpp_matmul import ACC_SEED
+from .mpp_matmul import FRAG_RUN
 from .msl_expr import GLOBAL_SCOPE
 from .msl_expr import TEMPLATE_CALLS
 from .msl_reduction import REDUCTION_NAMESPACE
@@ -63,6 +68,15 @@ class EmitState:
     coop_tile: dict[str, tuple[int, int]] = dataclasses.field(default_factory=dict)
     #: The cooperative roots whose descriptor rounds a size-1 dim up.
     coop_rounded: set[str] = dataclasses.field(default_factory=set)
+    #: Each fragment group's accumulator root to its fragment grid ``(rows,
+    #: cols, transposed)`` (``fragment_mma``).
+    fragments: dict[str, tuple[int, int, int]] = dataclasses.field(default_factory=dict)
+    #: The kernel's names that are integer constants, which a fragment run
+    #: folds its elements' index arithmetic over (``fragment_mma``'s
+    #: ``kernel_constants``).
+    constants: dict[str, int] = dataclasses.field(default_factory=dict)
+    #: The element an element loop's ``_helion_mpp_put`` writes.
+    put: str = "*_it"
 
     def is_declared(self, name: str) -> bool:
         return name in self.declared or any(name in s for s in self._enclosing)
@@ -212,7 +226,7 @@ def _emit_stmts(
                 # _helion_mpp_update).
                 assert isinstance(call, ast.Call)
                 parts.append(
-                    f"{pad}*_it = {_ast_expr_to_msl(call.args[0], subs=subs)};"
+                    f"{pad}{state.put} = {_ast_expr_to_msl(call.args[0], subs=subs)};"
                 )
             elif _is_call_to(call, "_helion_mpp_fence"):
                 parts.append(
@@ -277,8 +291,12 @@ def _emit_coop_acc(
 
     The op's scope is every SIMD group the launch dispatches, built from the
     launch's own constants; ``check_mpp_launch`` rejects launches that are not
-    whole SIMD groups.
+    whole SIMD groups.  A fragment group's accumulator is
+    ``fragment_mma``'s.
     """
+    if is_fragment_acc(call):
+        emit_fragment_acc(name, call, parts, pad, state)
+        return
     gid, tm, tn, tk, dtypes, lhs_t, rhs_t, fill = (
         ast.literal_eval(a) for a in call.args[:8]
     )
@@ -543,7 +561,10 @@ def _emit_for(
     - ``_helion_mpp_elements(coop, ...)``
       → MPP cooperative_tensor iteration ``for (auto _it = coop.begin();
       _it != coop.end(); _it++)`` with the tensor's names substituted by
-      ``(*_it)`` in the body.
+      ``(*_it)`` in the body, or a fragment group's unrolled loop over the
+      elements each lane holds (``fragment_mma.fragment_elements``)
+    - ``_helion_mpp_fragments(acc, steps, facts)`` → a fragment group's op
+      over one K tile (``fragment_mma.emit_fragment_run``)
     """
     pad = " " * indent
     it = stmt.iter
@@ -552,39 +573,62 @@ def _emit_for(
 
     func = it.func
 
+    # --- A fragment group's op over one K tile (fragment_mma.fragment_run) ---
+    if isinstance(func, ast.Name) and func.id == FRAG_RUN:
+        emit_fragment_run(
+            stmt,
+            parts,
+            indent,
+            state,
+            lambda body, out, ind, st: _emit_stmts(body, out, indent=ind, state=st),
+        )
+        return
+
     # --- MPP element loop over a cooperative tensor (mpp_matmul.elementize) ---
     if isinstance(func, ast.Name) and func.id == "_helion_mpp_elements":
         assert isinstance(it.args[0], ast.Name)
         coop = it.args[0].id
         root = state.coop[coop]
+        # A fragment element is read once, as ``_fv``, and written through
+        # ``state.put``.
+        element = "_fv" if root in state.fragments else "(*_it)"
         element_subs = {
             **(subs or {}),
-            **{name: "(*_it)" for name, r in state.coop.items() if r == root},
+            **{name: element for name, r in state.coop.items() if r == root},
         }
         fenced = len(it.args) > 1 and ast.literal_eval(it.args[1])
         if fenced:
             # The loop reads a staged vector's tile: after its staging writes.
             parts.append(f"{pad}threadgroup_barrier(mem_flags::mem_threadgroup);")
-        # A cooperative tensor's multidimensional index is (column, row).
-        parts.extend(
-            (
-                f"{pad}for (auto _it = {coop}.begin(); _it != {coop}.end(); _it++) {{",
-                f"{pad}    if (!{coop}.is_valid_element(_it)) continue;",
-                f"{pad}    auto _md = {coop}.get_multidimensional_index(_it);",
-                f"{pad}    int _e_n = (int)_md[0];",
-                f"{pad}    int _e_m = (int)_md[1];",
+
+        def body(ind: int) -> list[str]:
+            lines: list[str] = []
+            with state.isolated_scope():
+                _emit_stmts(
+                    stmt.body, lines, indent=ind, state=state, subs=element_subs
+                )
+            return lines
+
+        if root in state.fragments:
+            parts.extend(fragment_elements(coop, root, pad, state, body))
+        else:
+            # A cooperative tensor's multidimensional index is (column, row).
+            parts.extend(
+                (
+                    f"{pad}for (auto _it = {coop}.begin(); _it != {coop}.end(); _it++) {{",
+                    f"{pad}    if (!{coop}.is_valid_element(_it)) continue;",
+                    f"{pad}    auto _md = {coop}.get_multidimensional_index(_it);",
+                    f"{pad}    int _e_n = (int)_md[0];",
+                    f"{pad}    int _e_m = (int)_md[1];",
+                )
             )
-        )
-        if root in state.coop_rounded:
-            block_m, block_n = state.coop_tile[root]
-            parts.append(
-                f"{pad}    if (_e_m >= {block_m} || _e_n >= {block_n}) continue;"
-            )
-        with state.isolated_scope():
-            _emit_stmts(
-                stmt.body, parts, indent=indent + 4, state=state, subs=element_subs
-            )
-        parts.append(f"{pad}}}")
+            if root in state.coop_rounded:
+                block_m, block_n = state.coop_tile[root]
+                parts.append(
+                    f"{pad}    if (_e_m >= {block_m} || _e_n >= {block_n}) continue;"
+                )
+            parts.extend(body(indent + 4))
+            parts.append(f"{pad}}}")
         if fenced:
             # Every element has read the tile before its next writes.
             parts.append(f"{pad}threadgroup_barrier(mem_flags::mem_threadgroup);")

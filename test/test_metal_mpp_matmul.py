@@ -19,6 +19,7 @@ import subprocess
 import sys
 import textwrap
 from typing import TYPE_CHECKING
+from typing import cast
 import unittest
 from unittest.mock import patch
 
@@ -30,6 +31,7 @@ from helion import exc
 from helion._compiler.metal import mpp_matmul
 from helion._compiler.metal import tile_sharing
 from helion._testing import import_example
+from helion._testing.metal import run_with_msl
 import helion.language as hl
 
 attention = import_example("attention").attention
@@ -94,24 +96,9 @@ def _run(
     """Compile and run ``kernel`` at ``config`` (None: its default config);
     return its output, its generated Python and the MSL it compiled.  A new
     *module_key* loads a fresh module, whose MSL is generated anew."""
-    from torch._inductor.codecache import PyCodeCache
-
-    from helion._compiler.metal.metal_jit import _MetalKernel
-
-    # Raw generated entrypoints require explicit nonportable defaults, including
-    # matmul's lambda epilogue. Bind and execute the same captured arguments.
-    args = kernel.normalize_args(*args)
-    bound = kernel.bind(args)
-    code = bound.to_code(config or bound.config_spec.default_config())
-    module = PyCodeCache.load(code, module_key)
-    out = getattr(module, kernel.fn.__name__)(*args)
-    torch.mps.synchronize()
-    (msl,) = [
-        obj.msl_source
-        for obj in vars(module).values()
-        if isinstance(obj, _MetalKernel) and obj.msl_source is not None
-    ]
-    return out, code, msl
+    config = config or kernel.bind(args).config_spec.default_config()
+    out, code, msl = run_with_msl(kernel, args, config, module_key)
+    return cast("torch.Tensor", out), code, msl
 
 
 def _element_loops(msl: str) -> str:
@@ -6230,7 +6217,7 @@ class TestMppConversionRejects(_MppCase):
         with patch.object(mpp_matmul, "_inputs_kept", return_value=True):
             self._rejects(mixed_prune, (self.x, y, s), ROWS[0], msg)
         with patch.object(
-            mpp_matmul._Recomputable, "_updated_in_place", return_value=False
+            mpp_matmul.Recomputable, "_updated_in_place", return_value=False
         ):
             self._rejects(stale_seed, (self.x, self.y), TILE16, msg)
 
