@@ -57,6 +57,7 @@ COVERED_BACKEND_HOOKS: tuple[str, ...] = (
     "scalar_load_expr",
     "inline_constexpr",
     "scalar_arg_preamble",
+    "finalize_device_body",
     "cast_expr",
     "cast_scalar_ast",
     "where_expr",

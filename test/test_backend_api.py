@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import importlib
 import inspect
 import os
@@ -46,6 +47,7 @@ _EXPECTED_ALL = [
     "Config",
     "ConfigSpec",
     "ConfigSpecFragment",
+    "DeviceBodyContext",
     "DeviceFunction",
     "DeviceGridState",
     "DeviceIR",
@@ -103,6 +105,7 @@ _BACKEND_HOOKS = {
     "scalar_load_expr": "(self, tensor_name: 'str', index_expr: 'str | None' = None) -> 'str'",
     "inline_constexpr": "(self, name: 'str', value: 'str') -> 'str'",
     "scalar_arg_preamble": "(self, arg: 'Argument') -> 'list[ast.AST]'",
+    "finalize_device_body": "(self, body: 'list[ast.stmt]', ctx: 'DeviceBodyContext') -> 'tuple[list[ast.stmt], list[ast.arg]]'",
     "cast_expr": "(self, expr_str: 'str', dtype_str: 'str') -> 'str'",
     "cast_scalar_ast": "(self, x: 'ast.AST', target_dtype: 'torch.dtype') -> 'ast.AST'",
     "where_expr": "(self, mask: 'str', true_val: 'str', false_val: 'str') -> 'str'",
@@ -211,6 +214,11 @@ class TestBackendApiSurface(unittest.TestCase):
         self.assertEqual(
             list(backend_api.COVERED_STRATEGY_METHODS), list(_STRATEGY_HOOKS)
         )
+
+    def test_device_body_context_covered_fields(self) -> None:
+        # The DeviceBodyContext fields finalize_device_body's docs cover.
+        fields = {f.name for f in dataclasses.fields(backend_api.DeviceBodyContext)}
+        self.assertLessEqual({"device_function", "args", "body_start"}, fields)
 
     def test_abstract_members(self) -> None:
         # Making a covered hook abstract breaks every out-of-tree subclass at

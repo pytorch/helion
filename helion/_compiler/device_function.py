@@ -121,7 +121,8 @@ class DeviceBodyContext:
     integer value of every constexpr name) to the post-rename stage, and
     ``pass_context`` the backend's frozen facts (opaque to core).
     ``body_start`` is the index of the first statement of the traced device
-    body; the statements before it are the argument preambles.
+    body; the statements before it are the ``scalar_arg_preamble`` statements,
+    then the device function's own preamble (e.g. persistent program-id setup).
     """
 
     device_function: DeviceFunction

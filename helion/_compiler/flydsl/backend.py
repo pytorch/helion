@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from ...runtime.config import Config
     from ...runtime.kernel import BoundKernel
     from ..compile_environment import CompileEnvironment
-    from ..device_function import Argument
+    from ..device_function import DeviceBodyContext
     from ..device_ir import GraphInfo
     from ..tile_dispatch import TileStrategyDispatch
 
@@ -108,13 +108,10 @@ class FlyDSLBackend(Backend):
         # cross-wave smem block reduce. Set per-compile by pre_codegen.
         self._flydsl_warps_per_row: int = 1
         self._tensor_use_buffer: dict[int, bool] = {}
-        # Both reset each compile by pre_codegen. ``_needs_warp_helpers`` is set
-        # by reduction_expr when a reduction is generated, so the warp-reduce
-        # helper defs are emitted (from scalar_arg_preamble, which runs after the
-        # body) only for kernels that actually reduce -- not every kernel.
-        # ``_helpers_emitted`` then guards against emitting them more than once.
+        # Reset each compile by pre_codegen. Set by reduction_expr when a
+        # reduction is generated, so finalize_device_body (which runs after the
+        # body) emits the warp-reduce helper defs only for kernels that reduce.
         self._flydsl_needs_warp_helpers: bool = False
-        self._flydsl_helpers_emitted: bool = False
 
     @property
     def name(self) -> str:
@@ -510,7 +507,6 @@ class FlyDSLBackend(Backend):
 
         # Reset per-compilation state so helpers are re-emitted on each compile.
         self._flydsl_needs_warp_helpers = False
-        self._flydsl_helpers_emitted = False
         from ..host_function import HostFunction
         from .memory_ops import ROWS_ONLY_HINT
 
@@ -835,17 +831,22 @@ class FlyDSLBackend(Backend):
 
         return FlyDSLOpOverrides()
 
-    def scalar_arg_preamble(self, arg: Argument) -> list[ast.AST]:
+    def finalize_device_body(
+        self, body: list[ast.stmt], ctx: DeviceBodyContext
+    ) -> tuple[list[ast.stmt], list[ast.arg]]:
+        # Runs once per device function after its body is generated, so
+        # reduction_expr has already set _needs_warp_helpers. The helper defs
+        # go right before the traced body.
+        helpers = self._warp_helper_stmts()
+        at = ctx.body_start
+        return [*body[:at], *helpers, *body[at:]], []
+
+    def _warp_helper_stmts(self) -> list[ast.stmt]:
         from ..ast_extension import statement_from_string
 
-        # Emit the warp-reduce helper defs once, and only for kernels that
-        # actually reduce (reduction_expr sets _needs_warp_helpers). This hook
-        # runs per scalar arg after the kernel body is generated, so the flag is
-        # already set by the time we get here; a pure-elementwise kernel leaves
-        # it False and emits nothing.
-        if self._flydsl_helpers_emitted or not self._flydsl_needs_warp_helpers:
+        # Only kernels that reduce need them; a pure-elementwise kernel gets none.
+        if not self._flydsl_needs_warp_helpers:
             return []
-        self._flydsl_helpers_emitted = True
 
         # Intra-warp fold: one warp per row -> warp shuffle covers 64 lanes, no
         # smem. The 6 XOR-shuffle folds (log2 64) are unrolled here rather than
@@ -861,7 +862,7 @@ class FlyDSLBackend(Backend):
         _wsum_body = _fold(
             "w.addf(w.shuffle_xor({off}, 64), fastmath=arith.FastMathFlags.fast)"
         )
-        stmts: list[ast.AST] = [
+        stmts: list[ast.stmt] = [
             statement_from_string(h)
             for h in [
                 f"def _flydsl_wmax(w):\n{_wmax_body}\n    return w",
@@ -976,7 +977,7 @@ class _FlyDSLRedBuf:
         dtype: torch.dtype | None = None,
     ) -> str:
         # The _flydsl_{w,b}{sum,max,min} helper defs these calls reference are
-        # emitted by scalar_arg_preamble (which runs after this body is
+        # emitted by finalize_device_body (which runs after this body is
         # generated); flag that they are needed so they are emitted only for
         # reducing kernels.
         if reduction_type not in ("sum", "max", "min"):

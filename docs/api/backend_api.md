@@ -33,7 +33,13 @@ other attributes of the classes listed here, may change without notice.
    `program_id_expr`, `grid_index_expr`, `loop_index_expr`, `arange_expr`,
    `range_str`, `lane_index_expr`, `lane_offset_expr`,
    `thread_in_tile_mask_expr`, `scalar_load_expr`, `inline_constexpr`,
-   `scalar_arg_preamble`;
+   `scalar_arg_preamble`, `finalize_device_body` (called once per device
+   function after its body is generated and before variable renaming;
+   returns the body and the kernel parameters to append. Of its
+   `DeviceBodyContext`, `device_function`, `args` and `body_start` (the index
+   of the first traced-body statement; the statements before it are the
+   `scalar_arg_preamble` statements, then the device function's own preamble,
+   e.g. persistent program-id setup) are covered);
    `cast_expr`, `cast_scalar_ast`;
    `where_expr`, `minimum_expr`, `zeros_expr`, `full_expr`, `reshape_expr`,
    `broadcast_to_expr`, `expands_broadcast_dims`;
