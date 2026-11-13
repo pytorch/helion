@@ -673,6 +673,14 @@ class InbandPoll:
     # Untagged: the word offset to the previous launch's slot, re-armed (zeroed)
     # once the poll holds this launch's words (PeerState.rearm).
     rearm: str | None = None
+    # What the poll reads of which source, and the statement list it was lifted
+    # in: a later poll of the same reads from another source addresses its slot
+    # as ``base`` (an earlier poll's address) plus ``delta`` bytes.
+    reads: tuple[object, ...] | None = None
+    source: int | None = None
+    scope: int = 0
+    base: str | None = None
+    delta: int = 0
 
     def load(self, epoch: str) -> ast.stmt:
         # A plain volatile load vectorizes; masked lanes read as current (and
@@ -1590,12 +1598,44 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
                 f" >> (tl.cast({element} % {lanes}, tl.uint64) * {8 * dtype.itemsize})"
             )
             offset = expr_from_string(f"{element} // {lanes}")
-        address = state.codegen.lift(
-            expr_from_string(f"{peer.state} + ({slot}) + {{offset}}", offset=offset),
-            dce=True,
-            prefix="inband_address",
-        )
         mask_text = ast.unparse(indexing.mask_expr) if indexing.has_mask() else None
+        reads = (access.allocation_id, element_text, mask_text)
+        statements = getattr(state.codegen, "statements_stack", None)
+        scope = id(statements[-1]) if statements else 0
+        # The polls of one tile from several sources differ only in their slot:
+        # address the later ones off the first, so their loads and spins take
+        # one address register and immediate offsets.
+        first = next(
+            (
+                poll
+                for poll in device_function.inband_polls
+                if poll.reads == reads
+                and poll.scope == scope
+                and poll.source is not None
+                and access.owner_rank is not None
+            ),
+            None,
+        )
+        base, delta = None, 0
+        if first is not None:
+            assert first.source is not None and access.owner_rank is not None
+            base = first.base or first.address
+            delta = first.delta + 8 * peer.mailboxes[access.allocation_id].words * (
+                access.owner_rank - first.source
+            )
+            address = state.codegen.lift(
+                expr_from_string(f"{base} + {delta // 8}"),
+                dce=True,
+                prefix="inband_address",
+            )
+        else:
+            address = state.codegen.lift(
+                expr_from_string(
+                    f"{peer.state} + ({slot}) + {{offset}}", offset=offset
+                ),
+                dce=True,
+                prefix="inband_address",
+            )
         mask = None
         if indexing.has_mask():
             mask_expr = indexing.mask_expr
@@ -1681,6 +1721,11 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
                 rearm=None
                 if box.lane_bits is None
                 else peer.rearm(access.allocation_id),
+                reads=reads,
+                source=access.owner_rank,
+                scope=scope,
+                base=base,
+                delta=delta,
             )
         )
         device_function.inband_access_ids.update(ids)
@@ -1708,20 +1753,31 @@ def _scatter_key(scatter: Scatter, element: str) -> str:
     return " + ".join(terms) or "0"
 
 
-def _poll_asm(polls: int, pack: int, lane_bits: int | None) -> tuple[str, str]:
+def _poll_asm(
+    polls: int, pack: int, lane_bits: int | None, deltas: list[int] | None = None
+) -> tuple[str, str]:
     """Reload only the stale words of a first load until all are current: a
     tagged word while its epoch differs from the tag, an untagged one while a
     lane is zero.
 
-    Operands: words, first-load words, addresses, then the tag.
+    Operands: words, first-load words, addresses, then the tag. With
+    ``deltas``, one address per lane: poll i reads it plus ``deltas[i]`` bytes.
     """
     count = polls * pack
+    addresses = count if deltas is None else pack
+    tag = 2 * count + addresses
+
+    def address(word: int) -> str:
+        if deltas is None:
+            return f"[${2 * count + word}]"
+        delta = deltas[word // pack]
+        return f"[${2 * count + word % pack}{f'+{delta}' if delta else ''}]"
 
     def stale(word: int) -> str:
         if lane_bits is None:
             return (
                 f"mov.b64 {{lo, hi}}, ${word}; "
-                f"setp.ne.b32 p, hi, ${3 * count + word % pack};"
+                f"setp.ne.b32 p, hi, ${tag + word % pack};"
             )
         ones = _lane_ones(lane_bits)
         return (
@@ -1731,7 +1787,7 @@ def _poll_asm(polls: int, pack: int, lane_bits: int | None) -> tuple[str, str]:
         )
 
     check = [
-        f"{stale(word)} @p ld.volatile.global.b64 ${word}, [${2 * count + word}]; "
+        f"{stale(word)} @p ld.volatile.global.b64 ${word}, {address(word)}; "
         "@p mov.u32 stale, 1;"
         for word in range(count)
     ]
@@ -1745,7 +1801,7 @@ def _poll_asm(polls: int, pack: int, lane_bits: int | None) -> tuple[str, str]:
             "setp.ne.u32 p, stale, 0; @p bra SPIN${:uid}; }",
         ]
     )
-    return asm, ",".join(["=l"] * count + ["l"] * 2 * count + ["r"] * pack)
+    return asm, ",".join(["=l"] * count + ["l"] * (count + addresses) + ["r"] * pack)
 
 
 def _stale(peer_epoch: str, polls: list[InbandPoll]) -> str:
@@ -1998,7 +2054,13 @@ def _scatter_fallback(
         cover.extend(_scatter_cover_calls(cg, peer, ready, chunk, threads))
     families: dict[tuple[object, ...], list[InbandPoll]] = {}
     for poll, fallback in zip(scattered, fallbacks, strict=True):
-        key = (fallback.allocation_id, fallback.shape, fallback.lanes, fallback.bits)
+        key = (
+            fallback.allocation_id,
+            fallback.shape,
+            fallback.lanes,
+            fallback.bits,
+            poll.scope,
+        )
         families.setdefault(key, []).append(poll)
     synthesize: list[ast.stmt] = []
     for family in families.values():
@@ -2074,7 +2136,14 @@ def flush_inband_polls(cg: CodegenInterface, node: torch.fx.Node) -> None:
         words = [poll.word for poll in group]
         for word in words:
             device_function.sync_roles[word] = SyncRole("poll")
-        asm, constraints = _poll_asm(len(words), group[0].pack, group[0].lane_bits)
+        bases = {poll.base or poll.address for poll in group}
+        shared = len(group) > 1 and len(bases) == 1
+        asm, constraints = _poll_asm(
+            len(words),
+            group[0].pack,
+            group[0].lane_bits,
+            [poll.delta for poll in group] if shared else None,
+        )
         cg.add_statement(
             _inline_asm(
                 ", ".join(words),
@@ -2082,7 +2151,7 @@ def flush_inband_polls(cg: CodegenInterface, node: torch.fx.Node) -> None:
                 constraints,
                 [
                     *words,
-                    *(poll.address for poll in group),
+                    *([*bases] if shared else (poll.address for poll in group)),
                     f"tl.cast({peer.epoch}, tl.uint32)",
                 ],
                 "tl.uint64" if len(group) == 1 else f"({'tl.uint64, ' * len(group)})",

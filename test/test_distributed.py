@@ -2379,6 +2379,10 @@ class TestDistributedTileDependencies(TestCase):
         self.assertEqual(code.count("inband_uncovered = "), 1)
         self.assertIn("tl.pointer_type(tl.uint32)) + inband_offset_", code)
         self.assertIn("tl.store(inband_address_0 + inband_peer * ", code)
+        # Each peer's poll of the tile is the first one's address plus its slot
+        # stride, so the spin asm takes one address and immediate offsets.
+        self.assertIn("inband_address_1 = inband_address_0 + ", code)
+        self.assertRegex(code, r"ld\.volatile\.global\.b64 \$\d+, \[\$\d+\+\d+\]")
         self.assertIn("_hold_after_fallback(tile_dependency_peer_state", code)
         # The record key must index the row block the reader computes.
         self.assertIn("% 64 // 32 * 1 + inband_offset_1 // 64 * 2", code)
