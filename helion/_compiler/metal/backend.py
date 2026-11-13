@@ -3,6 +3,7 @@ helion/_compiler/backend.py."""
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from typing import TYPE_CHECKING
 from typing import Any
@@ -36,6 +37,7 @@ if TYPE_CHECKING:
     from torch._inductor.ops_handler import OpsHandler
 
     from ...autotuner.config_spec import ConfigSpec
+    from ...autotuner.search_surface import BackendSearchSurface
     from ...runtime.config import Config
     from ...runtime.kernel import BoundKernel
     from ..autotuner_heuristics.registry import AutotunerHeuristicType
@@ -547,7 +549,112 @@ class MetalBackend(Backend):
         return f"min({a}, {b})"
 
     def supports_config_key(self, key: str) -> bool:
-        return key in self._SUPPORTED_CONFIG_KEYS
+        """The shared keys Metal implements, and its search surface's own."""
+        return key in self._SUPPORTED_CONFIG_KEYS or (
+            self.config_spec_extension().supports_key(key)
+        )
+
+    def config_spec_extension(self) -> BackendSearchSurface:
+        from .search_surface import METAL_SEARCH_SURFACE
+
+        return METAL_SEARCH_SURFACE
+
+    def register_search_surface(
+        self, device_ir: DeviceIR, config_spec: ConfigSpec
+    ) -> None:
+        """Record the tiles' device loops when the kernel's matmuls lower on
+        MPP or fragments (``MetalKernelFacts.thread_loops``: the search fits
+        its configs' threads to whole SIMD groups,
+        ``search_surface.fit_threads``), from the planner's trials, and
+        whether every one of its K-loop matmuls lowers on fragments too
+        (``search_surface.lowers_on_fragments``, which exposes
+        ``metal_matmul`` to the search): the planner's fragment trial on
+        copies of the graphs, with no block spread over threads."""
+        from ..compile_environment import CompileEnvironment
+        from ..compile_environment import FixedBlockSizeSource
+        from ..device_ir import ForLoopGraphInfo
+        from ..host_function import HostFunction
+        from .fragment_mma import FRAGMENT_LOWERING
+        from .free_arange import free_arange_blocks
+        from .mpp_matmul import has_matmuls
+        from .mpp_matmul import plan_mpp_matmuls
+        from .search_surface import MetalKernelFacts
+
+        if not has_matmuls(device_ir.graphs):
+            return
+        # The planner reads the kernel's roots and grids through its
+        # HostFunction, which ``lower_to_device_ir`` gives this DeviceIR when
+        # it returns: lend it for the trial only, so a lowering that fails
+        # later leaves the HostFunction without a half-built IR.
+        with HostFunction.current().lent_device_ir(device_ir):
+            try:
+                mpp = plan_mpp_matmuls([i.copy() for i in device_ir.graphs], set())
+            except exc.BackendUnsupported:
+                mpp = None
+            try:
+                plan = plan_mpp_matmuls(
+                    [i.copy() for i in device_ir.graphs], set(), FRAGMENT_LOWERING
+                )
+            except exc.BackendUnsupported:
+                plan = None
+            free = free_arange_blocks()
+        launch_facts = MetalKernelFacts()
+        reductions = any(
+            info.reduction for info in CompileEnvironment.current().block_sizes
+        )
+        lowered = [p for p in (mpp, plan) if p is not None and p.by_matmul]
+        if lowered and not (free or reductions):
+            # The launch's SIMD groups run the matmuls: the search fits its
+            # configs' threads to them (``search_surface.fit_threads``).  Only
+            # where the tiles take their threads by ``thread_counts`` alone:
+            # reduction and free hl.arange axes reserve threads first
+            # (``_config_with_reduction_thread_budget``).
+            tunable = set(config_spec.num_threads.valid_block_ids())
+
+            def literal(block_ids: Sequence[int]) -> int:
+                # Literal-size tiles take one thread per element
+                # (``_config_with_auto_threads_shrunk``'s ``fixed``).
+                env = CompileEnvironment.current()
+                sizes = [
+                    static_extent(source.value)
+                    for b in block_ids
+                    if b not in tunable
+                    and isinstance(
+                        source := env.block_sizes[b].block_size_source,
+                        FixedBlockSizeSource,
+                    )
+                ]
+                return math.prod(size for size in sizes if size is not None)
+
+            grid_ids = [b for ids in device_ir.grid_block_ids for b in ids]
+            loops = [tuple(b for b in grid_ids if b in tunable)]
+            literals = [literal(grid_ids)]
+            for info in device_ir.graphs:
+                if isinstance(info, ForLoopGraphInfo):
+                    loop = tuple(b for b in info.block_ids if b in tunable)
+                    if loop and loop not in loops:
+                        loops.append(loop)
+                        literals.append(literal(info.block_ids))
+            # launch_threads multiplies the loops' threads together, as one
+            # nest: the grid and one device loop in it.  A kernel's roots are
+            # cases of one launch, each with its own tiles, and sibling loops
+            # don't nest, so those kernels get no fit (follow-up).
+            if any(loops) and len(device_ir.grid_block_ids) == 1 and len(loops) <= 2:
+                launch_facts = MetalKernelFacts(
+                    thread_loops=tuple(loops),
+                    literal_threads=tuple(literals),
+                    reduced_after_loop=frozenset(
+                        blocks_reduced_after_loop(device_ir) & tunable
+                    ),
+                )
+                config_spec.backend_facts = launch_facts
+        if plan is None:
+            return
+        blocks = tuple(sorted({group.k_block for group in plan.by_matmul.values()}))
+        if blocks:
+            config_spec.backend_facts = dataclasses.replace(
+                launch_facts, fragment_matmuls=True
+            )
 
     def default_num_sm_multiplier(self) -> int:
         # A threadgroup doesn't fill an Apple GPU core.  On an M4 Pro (16
@@ -609,6 +716,7 @@ class MetalBackend(Backend):
         tile_strategy: TileStrategyDispatch,
     ) -> None:
         from ..compile_environment import CompileEnvironment
+        from .fragment_mma import FRAGMENT_LOWERING
         from .free_arange import check_free_lanes
         from .free_arange import plan_free_aranges
         from .literal_dims import reject_literal_dims
@@ -616,6 +724,7 @@ class MetalBackend(Backend):
         from .positional_rebind import reject_positional_rebinds
         from .reduction import plan_reduced_tile_axes
         from .repeated_blocks import plan_repeated_blocks
+        from .search_surface import metal_matmul
 
         reject_positional_rebinds(graphs)
         reject_literal_dims(graphs, config)
@@ -628,7 +737,11 @@ class MetalBackend(Backend):
             for block in range(len(CompileEnvironment.current().block_sizes))
             if (tile_strategy.thread_extent_for_block_id(block) or 1) > 1
         }
-        self.mpp_plan = plan_mpp_matmuls(graphs, threaded)
+        self.mpp_plan = plan_mpp_matmuls(
+            graphs,
+            threaded,
+            FRAGMENT_LOWERING if metal_matmul(config) == "fragment" else None,
+        )
         check_free_lanes(self.free_arange_plan, self.mpp_plan, graphs)
         self._uniform_extent = self._uniform_thread_extent(tile_strategy)
 

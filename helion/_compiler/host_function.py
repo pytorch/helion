@@ -33,6 +33,7 @@ from .variable_origin import NameOrigin
 from .variable_origin import Origin
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     import inspect
     import types
 
@@ -273,6 +274,19 @@ class HostFunction:
     @device_ir.setter
     def device_ir(self, value: DeviceIR) -> None:
         self._device_ir = value
+
+    @contextlib.contextmanager
+    def lent_device_ir(self, device_ir: DeviceIR) -> Iterator[None]:
+        """Read ``device_ir`` as this function's IR inside the block only, and
+        restore the one it had, possibly none, however the block exits: a
+        backend's trial on an IR ``lower_to_device_ir`` hasn't returned yet
+        (``Backend.register_search_surface``)."""
+        previous = self._device_ir
+        self._device_ir = device_ir
+        try:
+            yield
+        finally:
+            self._device_ir = previous
 
     @property
     def expr_to_origin(self) -> dict[sympy.Basic, SymbolOrigin]:

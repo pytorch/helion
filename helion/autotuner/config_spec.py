@@ -930,6 +930,10 @@ class ConfigSpec:
         # dimensions that have no ReductionLoopSpec.  DeviceIR fills this
         # before configs are normalized.
         self.reduction_block_ids: set[int] = set()
+        # What the backend's ``register_search_surface`` found in the kernel,
+        # for its search surface's fields and normalization: an object of the
+        # backend's own type, or None when it recorded nothing.
+        self.backend_facts: object | None = None
         self.cute_indexed_reduction_block_ids: set[int] = set()
         # Non-reduction tiles that execute simultaneously. Sibling loops and
         # separate roots reuse physical axes during CuTe launch planning.
@@ -3008,6 +3012,7 @@ class ConfigSpec:
             fields["epilogue_subtile"] = EnumFragment(
                 choices=self.epilogue_subtile_autotune_choices
             )
+        fields.update(self.search_surface.extra_fields(self))
         # Add tunable parameters
         fields.update(self.user_defined_tunables)
         return fields

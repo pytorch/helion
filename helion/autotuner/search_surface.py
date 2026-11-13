@@ -3,9 +3,11 @@
 A backend contributes config keys, flat fields, normalization phases and
 compiler seeds to the backend-neutral ``ConfigSpec`` through one stateless
 object returned by ``Backend.config_spec_extension()``.  Every method of
-:class:`BackendSearchSurface` is the no-op default (Triton, Pallas and Metal
-add nothing beyond their ``tunable_fragments``); the CuTe implementation lives
-in ``helion/_compiler/cute/autotune/search_surface.py``.
+:class:`BackendSearchSurface` is the no-op default (Triton and Pallas add
+nothing beyond their ``tunable_fragments``); the CuTe implementation lives in
+``helion/_compiler/cute/autotune/search_surface.py``, and Metal's, whose
+keys and fields apply to some kernels only, in
+``helion/_compiler/metal/search_surface.py``.
 
 The surface also hands every ``ConfigGeneration`` one
 :class:`ConfigGenerationExtension` (``config_generation_extension``, stored
@@ -172,6 +174,12 @@ class BackendSearchSurface:
     def seed_configs(self, config_spec: ConfigSpec) -> list[Config]:
         """The ordered compiler seeds of the spec's enabled families."""
         return []
+
+    def extra_fields(self, config_spec: ConfigSpec) -> dict[str, ConfigSpecFragment]:
+        """Flat fields appended to the generic table (when ``fields`` returns
+        None), before the user's tunables: the backend's knobs that apply to
+        this kernel (``ConfigSpec.backend_facts``).  Default: none."""
+        return {}
 
     def prepare_config_generation_overrides(
         self, config_spec: ConfigSpec, overrides: Mapping[str, object] | None
