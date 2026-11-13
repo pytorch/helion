@@ -58,7 +58,6 @@ from ..compile_environment import tensor_input_sources
 from ..generate_ast import generate_ast
 from ..indexing_strategy import SubscriptIndexing
 from ..output_header import _active_library_imports
-from ..output_header import get_needed_import_lines
 from helion._compat import torch_uses_template_producer_fusion
 from helion.runtime.config import Config
 from helion.runtime.config_cache import ConfigCache
@@ -515,11 +514,12 @@ class HelionTemplateBuffer(TemplateBuffer):
         call_preamble, call_args = self._build_call_args(
             call_order, constant_repr, self._prologue_source_buffers, self._extra_params
         )
-        imports = get_needed_import_lines(root)
 
         return FinalizeCodegenResult(
             source=source,
-            imports=imports,
+            # generate_ast already put the backend's imports at the top of
+            # the source, which Inductor splices into the wrapper whole.
+            imports=[],
             call_preamble=call_preamble,
             call_args=call_args,
         )

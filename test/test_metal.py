@@ -14,6 +14,9 @@ from unittest.mock import patch
 import pytest
 import torch
 from torch._inductor.codecache import PyCodeCache
+import torch._inductor.codegen.mps as inductor_mps
+from torch._inductor.utils import fresh_cache
+from torch._inductor.utils import run_and_get_code
 import torch.nn.functional as F
 
 import helion
@@ -15799,6 +15802,88 @@ class TestMetalIntTrueDiv(unittest.TestCase):
         code = int_arg_truediv.bind((x, 4)).to_code(helion.Config(block_sizes=[16, 16]))
         quotient = code.index("truediv = static_cast(float, n) / 3")
         self.assertLess(quotient, code.index("for lane_0 in range("))
+
+
+# ---------------------------------------------------------------------------
+# Tests – torch.compile
+# ---------------------------------------------------------------------------
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def compiled_add_one(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] + 1
+    return out
+
+
+# Only ever called under torch.compile, so its config is chosen while Inductor
+# lowers it.
+@helion.kernel(
+    backend="metal",
+    configs=[
+        helion.Config(block_sizes=[16, 64], num_warps=2),
+        helion.Config(block_sizes=[32, 32], num_warps=4),
+    ],
+)
+def compiled_scale_rows(x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    m, n = x.size()
+    out = torch.empty_like(x)
+    for tm, tn in hl.tile([m, n]):
+        out[tm, tn] = x[tm, tn] * s[tm, None]
+    return out
+
+
+# Without the emit_kernel_override hook, Inductor parses every MPS template's
+# source as its own Metal kernel, which a Helion kernel's is not.  The check
+# looks for a call of the hook anywhere in the MPS codegen module's source, so
+# it holds wherever in that module PyTorch calls it.  The PyTorch change that
+# adds the call has not landed, so there is no version to check yet; once it
+# lands, its version replaces this check, which would miss a call made from
+# another module.
+@_requires_darwin
+@unittest.skipUnless(
+    re.search(r"\.emit_kernel_override\(", inspect.getsource(inductor_mps)) is not None,
+    "this PyTorch's MPS Inductor cannot emit Helion templates (its MPS codegen "
+    "never calls emit_kernel_override)",
+)
+class TestMetalTorchCompile(unittest.TestCase):
+    """Helion Metal kernels called from inside a torch.compile'd function."""
+
+    def setUp(self) -> None:
+        torch._dynamo.reset()
+        # Earlier calls must not leave a bound kernel with a config behind.
+        compiled_add_one.reset()
+        compiled_scale_rows.reset()
+
+    def test_kernel_runs_inside_compiled_function(self) -> None:
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            return compiled_add_one(x * 2) - 3
+
+        x = torch.randn(4096, device=DEVICE)
+        with fresh_cache():
+            result, (code,) = run_and_get_code(torch.compile(fn, fullgraph=True), x)
+        torch.testing.assert_close(result, x * 2 + 1 - 3)
+        self.assertIn("@metal_jit", code)
+        # The module imports what the Metal backend needs, not Triton's table.
+        self.assertNotRegex(code, r"(?m)^import triton\b")
+
+    def test_config_is_chosen_while_compiling(self) -> None:
+        def fn(x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+            return compiled_scale_rows(torch.sin(x), s) + 1
+
+        # Which binding gets the config is the point, not the search, so the
+        # search is stubbed to pick the first config.
+        def first_config(backend, bound_kernel, args, *, force=True, **kwargs):
+            return bound_kernel.kernel.configs[0]
+
+        x = torch.randn(256, 512, device=DEVICE)
+        s = torch.randn(256, device=DEVICE)
+        with fresh_cache(), patch.object(MetalBackend, "autotune", first_config):
+            result = torch.compile(fn, fullgraph=True)(x, s)
+        torch.testing.assert_close(result, torch.sin(x) * s[:, None] + 1)
+        (bound,) = compiled_scale_rows._bound_kernels.values()
+        self.assertIsNotNone(bound._config)
 
 
 if __name__ == "__main__":

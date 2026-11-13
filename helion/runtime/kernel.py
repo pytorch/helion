@@ -4302,7 +4302,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         """
         normalized_args = self.kernel.normalize_args(*args)
         selection_key = self._fresh_selection_key
-        if self._cache_managed:
+        # Hand the search to the cached bound these args specialize to. Not while
+        # compiling: bind() then returns an isolated bound, and tuning that one
+        # would leave this bound, which Inductor's lowering holds, without a config.
+        if self._cache_managed and not torch.compiler.is_compiling():
             rebound = self.kernel.bind(normalized_args)
             if rebound is not self:
                 return rebound.autotune(
