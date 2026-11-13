@@ -30,6 +30,7 @@ import weakref
 
 import sympy
 import torch
+from torch._dynamo.source import AttrSource
 from torch._dynamo.source import GetItemSource
 from torch._dynamo.source import LocalSource
 from torch._dynamo.source import TensorProperty
@@ -141,6 +142,35 @@ def _td_guard_active_for_config(
 
 _R = TypeVar("_R")
 CompiledConfig = Callable[..., _R]
+
+
+def _with_evaluated_defaults(
+    function: types.FunctionType, signature: inspect.Signature
+) -> types.FunctionType:
+    """Attach public defaults without mutating a shared PyCodeCache function."""
+    defaults: list[object] = []
+    for name in function.__code__.co_varnames[: function.__code__.co_argcount]:
+        parameter = signature.parameters.get(name)
+        if parameter is None or parameter.default is inspect.Parameter.empty:
+            defaults.clear()
+        else:
+            defaults.append(parameter.default)
+    if not defaults:
+        return function
+    result = types.FunctionType(
+        function.__code__,
+        function.__globals__,
+        function.__name__,
+        tuple(defaults),
+        function.__closure__,
+    )
+    result.__kwdefaults__ = function.__kwdefaults__
+    result.__annotations__ = function.__annotations__
+    result.__dict__.update(function.__dict__)
+    result.__module__ = function.__module__
+    result.__qualname__ = function.__qualname__
+    return result
+
 
 # Opt-in: auto-capture Pallas kernels under torch.compile (see
 # pallas._tpu_compile_capture).
@@ -3261,6 +3291,13 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 ``None`` keeps the default behavior.
             emit_repro_caller: Emits a main function to call the kernel with example inputs.
 
+        Generated source preserves already-evaluated literal parameter defaults,
+        including complex numbers and recursively immutable tuples.
+        Other defaults, such as mutable objects, functions and config fragments,
+        must be passed explicitly when calling a raw generated or standalone
+        entrypoint. Their original default expressions are never re-executed.
+        :meth:`compile_config` retains all original evaluated defaults.
+
         Returns:
             str: The generated code as a string.
         """
@@ -3382,6 +3419,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
         Returns:
             CompiledConfig: A callable object representing the compiled kernel.
+                Its omitted arguments use the original evaluated parameter
+                defaults, including their object identities.
         """
         if config is None:
             config = self._require_implicit_config()
@@ -3462,7 +3501,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 log.info("Output code: \n%s", triton_code)
                 print(f"# Output code written to: {module.__file__}", file=sys.stderr)
                 print(triton_code, file=sys.stderr)
-        rv = getattr(module, self.kernel.name)
+        rv = _with_evaluated_defaults(
+            getattr(module, self.kernel.name), self.kernel.signature
+        )
         self._compile_cache[config] = rv
         self._cache_path_map[config] = module.__file__
         self.env.backend.after_compile(self, config)
@@ -3790,11 +3831,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                         _index: int = index,
                     ) -> Hashable:
                         result = _inner(args)
-                        # Handle list of tensors: return tuple of sizes for all tensors
-                        if isinstance(result, (list, tuple)):
-                            return tuple(
-                                cast("torch.Tensor", t).size(_index) for t in result
-                            )
                         return cast("torch.Tensor", result).size(_index)
 
                     return size_extractor
@@ -3806,15 +3842,23 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                         _index: int = index,
                     ) -> Hashable:
                         result = _inner(args)
-                        # Handle list of tensors: return tuple of strides for all tensors
-                        if isinstance(result, (list, tuple)):
-                            return tuple(
-                                cast("torch.Tensor", t).stride(_index) for t in result
-                            )
                         return cast("torch.Tensor", result).stride(_index)
 
                     return stride_extractor
                 raise exc.SpecializeArgType(v)
+            if isinstance(v, AttrSource):
+                if not _is_supported_tensor_input_source(v):
+                    raise exc.SpecializeArgType(v)
+                inner = make_extractor(v.base)
+
+                def attribute_extractor(
+                    args: Sequence[object],
+                    _inner: Callable[[Sequence[object]], Hashable] = inner,
+                    _member: str = v.member,
+                ) -> Hashable:
+                    return getattr(_inner(args), _member)
+
+                return attribute_extractor
             if isinstance(v, GetItemSource):
                 if not isinstance(v.index, (int, str)) or v.index_is_slice:
                     raise exc.SpecializeArgType(v)
@@ -3826,10 +3870,6 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     _index: int | str = v.index,
                 ) -> Hashable:
                     result: Any = _inner(args)
-                    if isinstance(result, dict):
-                        return result[_index]
-                    if isinstance(_index, str):
-                        return getattr(result, _index)
                     return result[_index]
 
                 return getitem_extractor
@@ -4037,23 +4077,21 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         if self.settings.static_shapes:
             return []
         shape_env = self.env.shape_env
-        # Container elements share their container's source, so only direct
-        # tensor arguments replay; descriptor guards on elements are keyed by
-        # the descriptor layout extractor.
-        tensor_params = {
-            name
-            for name, fake in zip(
-                self.kernel.signature.parameters, self.fake_args, strict=False
-            )
-            if isinstance(fake, torch.Tensor)
-        }
+        # Item and field projections identify individual tensor leaves. Replay
+        # their shape guards just like those on direct tensor parameters.
+        fake_by_name = dict(
+            zip(self.kernel.signature.parameters, self.fake_args, strict=False)
+        )
         sources: dict[sympy.Symbol, TensorPropertySource] = {}
         for symbol, symbol_sources in shape_env.var_to_sources.items():
             for source in symbol_sources:
                 if (
                     isinstance(source, TensorPropertySource)
-                    and isinstance(source.base, LocalSource)
-                    and source.base.local_name in tensor_params
+                    and _is_supported_tensor_input_source(source.base)
+                    and isinstance(
+                        _replay_tensor_input_source(source.base, fake_by_name),
+                        torch.Tensor,
+                    )
                 ):
                     sources[symbol] = source
                     break
@@ -5015,7 +5053,12 @@ _specialization_extractors: dict[
     # pyrefly: ignore [missing-attribute]
     "namedtuple": lambda fn, x: _mapping_key(fn, x._asdict(), type(x)),
     # pyrefly: ignore [no-matching-overload, bad-argument-type]
-    "dataclass": lambda fn, x: _mapping_key(fn, dataclasses.asdict(x), type(x)),
+    "dataclass": lambda fn, x: _mapping_key(
+        fn,
+        # pyrefly: ignore [bad-argument-type]
+        {f.name: getattr(x, f.name) for f in dataclasses.fields(x)},
+        type(x),
+    ),
     types.FunctionType: _function_key,
     types.BuiltinFunctionType: lambda fn, x: x,
     torch.fx.GraphModule: _graph_module_key,

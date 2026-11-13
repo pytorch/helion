@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import dataclasses
 from typing import TYPE_CHECKING
 
@@ -290,6 +291,42 @@ class ClosureOrigin(WrappedOrigin):
         return AttrSource(
             GetItemSource(AttrSource(self.value.to_source(), "__closure__"), self.key),
             "cell_contents",
+        )
+
+
+@dataclasses.dataclass
+class ScalarArithmeticOrigin(HostOrigin):
+    """An ordered, non-raising float operation over existing host scalars."""
+
+    op: type[ast.operator | ast.unaryop]
+    operands: tuple[Origin | int | float | bool, ...]
+
+    def host_str(self) -> str:
+        from .host_function import HostFunction
+
+        args = [
+            ast.parse(value.host_str(), mode="eval").body
+            if isinstance(value, Origin)
+            else ast.parse(
+                HostFunction.current()._float_literal_expr(value), mode="eval"
+            ).body
+            if type(value) is float
+            else ast.Constant(value=value)
+            for value in self.operands
+        ]
+        if issubclass(self.op, ast.unaryop):
+            expr = ast.UnaryOp(op=self.op(), operand=args[0])
+        else:
+            expr = ast.BinOp(left=args[0], op=self.op(), right=args[1])
+        return ast.unparse(expr)
+
+    def suggest_var_name(self) -> str:
+        return "host_float"
+
+    def depth(self) -> int:
+        return 1 + max(
+            (value.depth() for value in self.operands if isinstance(value, Origin)),
+            default=0,
         )
 
 

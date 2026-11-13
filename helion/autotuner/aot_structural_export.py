@@ -13,6 +13,7 @@ import types
 from typing import TYPE_CHECKING
 
 import torch
+from torch._dynamo.source import AttrSource
 from torch._dynamo.source import GetItemSource
 from torch._dynamo.source import LocalSource
 
@@ -58,6 +59,9 @@ def export_runtime_guards(
     def projection(source: object) -> tuple[int, tuple[int | str, ...]]:
         if isinstance(source, LocalSource) and source.local_name in indices:
             return indices[source.local_name], ()
+        if isinstance(source, AttrSource):
+            index, path = projection(source.base)
+            return index, (*path, source.member)
         if (
             isinstance(source, GetItemSource)
             and isinstance(source.index, (int, str))

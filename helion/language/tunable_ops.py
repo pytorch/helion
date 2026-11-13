@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from typing import cast
+from typing import overload
 
 import sympy
 import torch
@@ -18,7 +20,9 @@ from .._compiler.type_info import TileIndexType
 from .._compiler.type_info import TypeInfo
 from .._compiler.type_info import _to_proxy
 from ..autotuner.config_fragment import BaseIntegerFragment
+from ..autotuner.config_fragment import BooleanFragment
 from ..autotuner.config_fragment import ConfigSpecFragment
+from ..autotuner.config_fragment import NumThreadsFragment
 from ..autotuner.config_fragment import assert_integer_power_of_two
 from ..autotuner.config_spec import valid_keys
 from ..exc import NotInsideKernel
@@ -137,20 +141,39 @@ def _(state: CodegenState) -> ast.AST:
     return expr_from_string(constant_repr(block_size))
 
 
+@overload
+def register_tunable(
+    name: str, fragment: BaseIntegerFragment | NumThreadsFragment
+) -> int: ...
+
+
+@overload
+def register_tunable(name: str, fragment: BooleanFragment) -> bool: ...
+
+
+@overload
+def register_tunable(name: str, fragment: ConfigSpecFragment) -> int | float | bool: ...
+
+
 @_decorators.api(is_device_only=False)
-def register_tunable(name: str, fragment: ConfigSpecFragment) -> int:
+def register_tunable(name: str, fragment: ConfigSpecFragment) -> int | float | bool:
     """
     Register a tunable parameter for autotuning.
 
     This function allows you to define parameters that can be automatically tuned
     during the autotuning process. The fragment defines the search space and default value.
 
+    Integer and thread-count fragments return ``int`` and Boolean fragments
+    return ``bool``. Enum and custom fragments return ``int | float | bool``;
+    callers that previously relied on their ``int`` annotation may need to narrow
+    the result's type.
+
     Args:
         name: The key for the tunable parameter in the Config().
         fragment: A ConfigSpecFragment that defines the search space (e.g., PowerOfTwoFragment)
 
     Returns:
-        int: The value assigned to this tunable parameter in the current configuration.
+        int | float | bool: The value assigned to this tunable parameter in the current configuration.
     """
     raise NotInsideKernel
 
@@ -219,7 +242,7 @@ def _register_tunable_codegen(state: CodegenState) -> ast.AST:
 
 
 @_decorators.ref(register_tunable)
-def _(name: str, fragment: ConfigSpecFragment) -> int:
+def _(name: str, fragment: ConfigSpecFragment) -> int | float | bool:
     """Reference implementation of register_tunable."""
     from ..runtime.ref_mode import RefModeContext
 
@@ -235,15 +258,16 @@ def _(name: str, fragment: ConfigSpecFragment) -> int:
     else:
         value = fragment.default()
 
+    # Match the compiler's exact scalar types before an integer clamp can
+    # accidentally turn a subclass into a supported plain int.
+    if type(value) not in (int, float, bool):
+        raise exc.TunableTypeNotSupported(type(value))
+
     # For BaseIntegerFragment subclasses (IntegerFragment, PowerOfTwoFragment), apply clamp
     # This ensures the value is within valid bounds
     if isinstance(fragment, BaseIntegerFragment) and isinstance(value, (int, bool)):
         value = fragment.clamp(int(value))
 
-    # Convert to int if needed
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, int):
-        return value
-    # For other types (like float), convert to int
-    return int(value)  # type: ignore[arg-type]
+    if type(value) not in (int, float, bool):
+        raise exc.TunableTypeNotSupported(type(value))
+    return cast("int | float | bool", value)

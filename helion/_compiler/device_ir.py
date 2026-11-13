@@ -22,6 +22,8 @@ from unittest.mock import patch
 
 import torch
 from torch._dynamo.convert_frame import compile_lock
+from torch._dynamo.source import TensorProperty
+from torch._dynamo.source import TensorPropertySource
 from torch._inductor.decomposition import select_decomp_table
 from torch.fx._lazy_graph_module import _LazyGraphModule
 from torch.fx.experimental import proxy_tensor
@@ -58,6 +60,7 @@ from .backend import DeviceIRStage
 from .compile_environment import CompileEnvironment
 from .compile_environment import warning
 from .host_function import HostFunction
+from .host_function import SymbolOrigin
 from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
@@ -72,6 +75,7 @@ from .node_masking import remove_unnecessary_masking
 from .roll_reduction import ReductionRoller
 from .source_location import current_location
 from .type_info import CallableType
+from .type_info import ClassType
 from .type_info import DictType
 from .type_info import GridIndexType
 from .type_info import IterType
@@ -90,12 +94,16 @@ from .type_info import _eval_compare
 from .type_info import _eval_unary
 from .type_info import tensor_may_have_many_elements
 from .type_info import tile_spanned_by_slice
+from .variable_origin import TensorStrideOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterable
     from collections.abc import Mapping
     from collections.abc import Sequence
+    from types import BuiltinMethodType
+
+    from torch._guards import Source
 
     from ..autotuner.config_spec import AccumulatorFact
     from ..autotuner.config_spec import MemoryOpFact
@@ -104,6 +112,7 @@ if TYPE_CHECKING:
     from .device_ir_analysis import DeviceIRAnalysis
     from .tile_dependency import TaskFamily
     from .tile_dependency import TileDependencyGraph
+    from .variable_origin import Origin
 
     class _TLS(Protocol):
         device_irs: list[DeviceIR]
@@ -122,6 +131,37 @@ def _lerp_scalar_decomp(
     # args as unbacked symfloats, so that comparison raises
     # GuardOnDataDependentSymNode.  Use the simple algebraic form instead.
     return start + weight * (end - start)
+
+
+def _host_tensor_stride(
+    tensor: torch.Tensor, origin: Origin, source: Source | None, dim: int | None = None
+) -> int | torch.SymInt | tuple[int | torch.SymInt, ...]:
+    host = HostFunction.current()
+    env = CompileEnvironment.current()
+
+    def symbolic(value: int | torch.SymInt, axis: int) -> int | torch.SymInt:
+        stride_origin = TensorStrideOrigin(origin, axis)
+        result = (
+            env.input_symint(
+                value, TensorPropertySource(source, TensorProperty.STRIDE, axis)
+            )
+            if source is not None
+            else env.cached_create_unbacked_symint(
+                ("host_tensor_stride", id(tensor), axis), env.size_hint(value)
+            )
+        )
+        if isinstance(result, torch.SymInt):
+            host.expr_to_origin[result._sympy_()] = SymbolOrigin(
+                stride_origin, fake_value=tensor
+            )
+        return result
+
+    if dim is None:
+        return tuple(
+            symbolic(value, axis) for axis, value in enumerate(tensor.stride())
+        )
+    value = tensor.stride(dim)
+    return symbolic(value, dim % tensor.ndim)
 
 
 def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., object]]:
@@ -1699,6 +1739,13 @@ class WalkDeviceAST(NodeVisitor):
 
     def _assign(self, target: ast.AST, value: object) -> None:
         if isinstance(target, ast.Name):
+            if isinstance(
+                value, torch.SymFloat
+            ) and HostFunction.current().is_host_scalar_expr(value.node.expr):
+                # A host expression may be a kernel argument. Loop/branch phi
+                # outputs can overwrite their input's generated name, so each
+                # device binding needs its own SSA value at the assignment.
+                value = _new_var(value)
             if isinstance(value, torch.Tensor):
                 # rename the node to match the variable name
                 mode = proxy_tensor.get_proxy_mode()
@@ -1740,8 +1787,8 @@ class WalkDeviceAST(NodeVisitor):
     def _static_scope(self) -> dict[str, object]:
         return {k: v for k, v in self.scope.items() if not self.should_become_arg(v)}
 
-    def _lift_inputs(self, names: Iterable[str]) -> LiftTensorArgs:
-        return LiftTensorArgs(
+    def _lift_inputs(self, names: Iterable[str]) -> LiftGraphArgs:
+        return LiftGraphArgs(
             {
                 name: self.scope[name]
                 for name in names
@@ -1754,8 +1801,8 @@ class WalkDeviceAST(NodeVisitor):
         subgraph_scope: dict[str, object],
         writes: dict[str, int],
         include_new: bool = False,
-    ) -> LiftTensorArgs:
-        return LiftTensorArgs(
+    ) -> LiftGraphArgs:
+        return LiftGraphArgs(
             {
                 k: v
                 for k, v in subgraph_scope.items()
@@ -1779,21 +1826,21 @@ class WalkDeviceAST(NodeVisitor):
 
     def _trace_graph(
         self,
-        inputs: LiftTensorArgs,
-        build_fn: Callable[[WalkDeviceAST], tuple[object, LiftTensorArgs]],
+        inputs: LiftGraphArgs,
+        build_fn: Callable[[WalkDeviceAST], tuple[object, LiftGraphArgs]],
         *,
         graph_info_cls: type[NodeArgsGraphInfo],
         copy_tensor_args: bool = True,
         **graph_kwargs: object,
-    ) -> tuple[int, LiftTensorArgs]:
-        outputs_holder: LiftTensorArgs | None = None
+    ) -> tuple[int, LiftGraphArgs]:
+        outputs_holder: LiftGraphArgs | None = None
 
         def runner(*args: object) -> object:
             nonlocal outputs_holder
             subgraph_walker = WalkDeviceAST(self.device_ir)
             subgraph_walker.scope.update(self._static_scope())
             subgraph_walker.scope.update(
-                inputs.replace_tensor_args(args, copy_tensors=copy_tensor_args)
+                inputs.replace_graph_args(args, copy_tensors=copy_tensor_args)
             )
             result, outputs_holder = build_fn(subgraph_walker)
             return result
@@ -1801,7 +1848,7 @@ class WalkDeviceAST(NodeVisitor):
         with self.disable_tracing() as tracer:
             graph = proxy_tensor.make_fx(
                 runner, decomposition_table=_get_custom_decomp_table()
-            )(*inputs.get_tensor_args()).graph
+            )(*inputs.get_graph_args()).graph
             graph_id = self.device_ir.add_graph(
                 graph,
                 graph_info_cls=graph_info_cls,
@@ -2067,11 +2114,11 @@ class WalkDeviceAST(NodeVisitor):
 
             def build_subgraph(
                 subgraph_walker: WalkDeviceAST,
-            ) -> tuple[list[object], LiftTensorArgs]:
+            ) -> tuple[list[object], LiftGraphArgs]:
                 subgraph_walker._assign(node.target, inner_type.proxy())
                 subgraph_walker._body(node.body)
                 loop_outputs = self._collect_outputs(subgraph_walker.scope, rw.writes)
-                return loop_outputs.get_tensor_args(), loop_outputs
+                return loop_outputs.get_graph_args(), loop_outputs
 
             block_ids: list[int] = []
             for var in iter_vars:
@@ -2103,7 +2150,7 @@ class WalkDeviceAST(NodeVisitor):
                     graph_idx,
                     begin,
                     end,
-                    inputs.get_tensor_args(),
+                    inputs.get_graph_args(),
                 )
                 loop_target = _tracing_ops._for_loop
             else:
@@ -2111,7 +2158,7 @@ class WalkDeviceAST(NodeVisitor):
                     graph_idx,
                     begin,
                     end,
-                    inputs.get_tensor_args(),
+                    inputs.get_graph_args(),
                     step_list,
                 )
                 loop_target = _tracing_ops._for_loop_step
@@ -2125,7 +2172,7 @@ class WalkDeviceAST(NodeVisitor):
                 *args_to_proxies(tracer, args),
             )
             proxy_tensor.track_tensor_tree(
-                outputs.get_tensor_args(),
+                outputs.get_graph_args(),
                 proxy_out,
                 constant=None,
                 tracer=tracer,
@@ -2159,9 +2206,9 @@ class WalkDeviceAST(NodeVisitor):
 
         def build_condition(
             subgraph_walker: WalkDeviceAST,
-        ) -> tuple[list[object], LiftTensorArgs]:
+        ) -> tuple[list[object], LiftGraphArgs]:
             result = subgraph_walker.visit(node.test)
-            return [result], LiftTensorArgs({})
+            return [result], LiftGraphArgs({})
 
         cond_graph_id, _ = self._trace_graph(
             inputs,
@@ -2172,10 +2219,10 @@ class WalkDeviceAST(NodeVisitor):
 
         def build_body(
             subgraph_walker: WalkDeviceAST,
-        ) -> tuple[list[object], LiftTensorArgs]:
+        ) -> tuple[list[object], LiftGraphArgs]:
             subgraph_walker._body(node.body)
             loop_outputs = self._collect_outputs(subgraph_walker.scope, body_rw.writes)
-            return loop_outputs.get_tensor_args(), loop_outputs
+            return loop_outputs.get_graph_args(), loop_outputs
 
         body_graph_id, outputs = self._trace_graph(
             inputs,
@@ -2188,7 +2235,7 @@ class WalkDeviceAST(NodeVisitor):
         args = (
             cond_graph_id,
             body_graph_id,
-            inputs.get_tensor_args(),
+            inputs.get_graph_args(),
             None,
         )
         mode = proxy_tensor.get_proxy_mode()
@@ -2201,7 +2248,7 @@ class WalkDeviceAST(NodeVisitor):
             *args_to_proxies(tracer, args),
         )
         proxy_tensor.track_tensor_tree(
-            outputs.get_tensor_args(),
+            outputs.get_graph_args(),
             proxy_out,
             constant=None,
             tracer=tracer,
@@ -2268,12 +2315,12 @@ class WalkDeviceAST(NodeVisitor):
             subgraph_walker: WalkDeviceAST,
             stmts: list[ast.stmt],
             rw: ReadWrites,
-        ) -> tuple[list[object], LiftTensorArgs]:
+        ) -> tuple[list[object], LiftGraphArgs]:
             subgraph_walker._body(stmts)
             outputs_local = self._collect_outputs(
                 subgraph_walker.scope, rw.writes, include_new=True
             )
-            return outputs_local.get_tensor_args(), outputs_local
+            return outputs_local.get_graph_args(), outputs_local
 
         else_graph_idx, else_outputs = self._trace_graph(
             else_branch_inputs,
@@ -2291,9 +2338,9 @@ class WalkDeviceAST(NodeVisitor):
         if_graph = cast("IfGraphInfo", self.device_ir.graphs[if_graph_idx])
 
         def get_arg_values_and_names(
-            inputs: LiftTensorArgs,
+            inputs: LiftGraphArgs,
         ) -> tuple[list[object], list[str]]:
-            input_tensor_arg_values = inputs.get_tensor_args()
+            input_tensor_arg_values = inputs.get_graph_args()
 
             def is_tensor_arg_value(v: object) -> bool:
                 return any(v is t for t in input_tensor_arg_values)
@@ -2555,7 +2602,8 @@ class WalkDeviceAST(NodeVisitor):
             # For simple variable assignments like `a = b`, we need to create a new
             # variable to avoid phi node issues when the source variable gets mutated
             if isinstance(node.value, ast.Name) and (
-                isinstance(value, torch.Tensor) and not isinstance(value, Tile)
+                isinstance(value, (torch.Tensor, torch.SymFloat))
+                and not isinstance(value, Tile)
             ):
                 value = _new_var(value)
             self._assign(target, value)
@@ -2717,6 +2765,18 @@ class WalkDeviceAST(NodeVisitor):
             func = replacement
         else:
             func = self.visit(node.func)
+        if (
+            isinstance(func_type_info, TensorAttributeType)
+            and func_type_info.attr() == "stride"
+            and not CompileEnvironment.current().settings.static_shapes
+        ):
+            tensor = cast("torch.Tensor", cast("BuiltinMethodType", func).__self__)
+            origin = HostFunction.current().tensor_to_origin.get(tensor)
+            source = CompileEnvironment.current().tensor_stride_input_source(tensor)
+            if origin is not None and origin.is_host():
+                # Re-evaluate the actual receiver and dimension. The raw fake
+                # stride can be a size expression or lack a host symbol origin.
+                func = functools.partial(_host_tensor_stride, tensor, origin, source)
         # pyrefly: ignore [bad-argument-type]
         return _CheckForIndexCalls.retry_call(func, args, kwargs)
 
@@ -2724,6 +2784,10 @@ class WalkDeviceAST(NodeVisitor):
         value = self.visit(node.value)
         # Apply the replacement here so saved bound methods use it too.
         assert isinstance(node, ExtendedAST)
+        assert isinstance(node.value, ExtendedAST)
+        if isinstance(node.value._type_info, ClassType) and isinstance(value, dict):
+            # ClassType represents dataclass and namedtuple fields as a mapping.
+            return value[node.attr]
         if (
             isinstance(node._type_info, TensorAttributeType)
             and node.attr in _TENSOR_METHOD_REPLACEMENTS
@@ -2772,40 +2836,42 @@ class WalkDeviceAST(NodeVisitor):
         return node.value
 
 
-class LiftTensorArgs:
+class LiftGraphArgs:
     values: dict[str, object]
     flat_values: list[object]
     spec: pytree.TreeSpec
-    tensor_indices: list[int]
+    graph_indices: list[int]
 
     def __init__(self, values: dict[str, object]) -> None:
         self.values = values
         self.flat_values, self.spec = pytree.tree_flatten(values)
-        self.tensor_indices = [
+        # Host float expressions crossing a device branch need scalar SSA
+        # inputs/outputs, even though they do not have tensor metadata.
+        self.graph_indices = [
             i
             for i, v in enumerate(self.flat_values)
-            if isinstance(v, torch.Tensor) and not isinstance(v, Tile)
+            if isinstance(v, (torch.Tensor, torch.SymFloat)) and not isinstance(v, Tile)
         ]
 
     def unflatten(self) -> dict[str, object]:
         return pytree.tree_unflatten(self.flat_values, self.spec)
 
-    def replace_tensor_args(
+    def replace_graph_args(
         self, args: Sequence[object], *, copy_tensors: bool = True
     ) -> dict[str, object]:
         flat_values = [*self.flat_values]
-        assert len(self.tensor_indices) == len(args)
-        for i, v in zip(self.tensor_indices, args, strict=False):
+        assert len(self.graph_indices) == len(args)
+        for i, v in zip(self.graph_indices, args, strict=False):
             flat_values[i] = _new_var(v) if copy_tensors else v
         return pytree.tree_unflatten(flat_values, self.spec)
 
-    def get_tensor_args(self) -> list[object]:
-        return [self.flat_values[i] for i in self.tensor_indices]
+    def get_graph_args(self) -> list[object]:
+        return [self.flat_values[i] for i in self.graph_indices]
 
     def get_node_args(
         self, tracer: proxy_tensor.PythonKeyTracer
     ) -> list[torch.fx.Node]:
-        proxy_args = args_to_proxies(tracer, self.get_tensor_args())[0]
+        proxy_args = args_to_proxies(tracer, self.get_graph_args())[0]
         result = []
         for proxy in proxy_args:
             assert isinstance(proxy, torch.fx.Proxy)
@@ -3459,8 +3525,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 config_spec.enable_cross_loop_pipeline(choices=choices)
         config_spec.multi_phase = len(device_ir.phases) > 1
         if config_spec.supports_config_key("pallas_load_buffer_count"):
-            config_spec.pallas_load_buffer_count.length = len(
-                LiftTensorArgs(dict(func.params.arguments)).get_tensor_args()
+            config_spec.pallas_load_buffer_count.length = sum(
+                isinstance(arg, torch.Tensor)
+                for arg in LiftGraphArgs(dict(func.params.arguments)).get_graph_args()
             )
         if config_spec.supports_config_key("pallas_indirect_access_mode"):
             from .pallas.tensorcore_plan import indirect_access_modes

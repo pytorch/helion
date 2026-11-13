@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 from typing import NoReturn
 from typing import Protocol
 
+import sympy
 import torch
 from torch._dispatch.python import enable_python_dispatcher
 from torch._dynamo.convert_frame import compile_lock
@@ -43,12 +44,14 @@ from .type_info import SliceType
 from .type_info import StackTensorType
 from .type_info import StringType
 from .type_info import SymBoolType
+from .type_info import SymFloatType
 from .type_info import SymIntType
 from .type_info import TensorType
 from .type_info import TileIndexType
 from .type_info import TypeInfo
 from .type_info import _eval_binary
 from .type_info import _eval_compare
+from .type_info import _is_size_backed_float
 from .variable_origin import ArgumentOrigin
 from .variable_origin import AttributeOrigin
 from .variable_origin import BuiltinOrigin
@@ -434,6 +437,26 @@ class TypePropagation(ast.NodeVisitor):
             f"{type(op).__name__} not supported on {left!s} and {right!s}"
         )
 
+    def _preserve_host_float(
+        self, value: TypeInfo, operands: tuple[object, ...] | None = None
+    ) -> TypeInfo:
+        if (
+            self.device_loop_depth == 0
+            and isinstance(value, SymFloatType)
+            and not isinstance(value.to_sympy(), sympy.Symbol)
+            and not _is_size_backed_float(value.value)
+        ):
+            # Preserve each host operation before a parent can algebraically
+            # cancel its dependencies. Codegen still evaluates the original
+            # Python expression in order; the fresh symbol describes its value.
+            env = CompileEnvironment.current()
+            previous = value.value
+            value = value.new_unbacked(value.origin)
+            env.preserve_tunable_float_provenance(
+                value.value, operands if operands is not None else (previous,)
+            )
+        return value
+
     def _assign(self, lhs: ast.AST, rhs: TypeInfo) -> None:
         if isinstance(lhs, ast.Name):
             # Check if we're trying to modify a host variable inside a device loop
@@ -443,6 +466,7 @@ class TypePropagation(ast.NodeVisitor):
                 and rhs.origin.is_device()
             ):
                 raise exc.CannotModifyHostVariableOnDevice(lhs.id) from None
+            rhs = self._preserve_host_float(rhs)
             if isinstance(rhs, TileIndexType):
                 CompileEnvironment.current().block_sizes[rhs.block_id].add_debug_name(
                     lhs.id
@@ -513,11 +537,20 @@ class TypePropagation(ast.NodeVisitor):
             lhs_base_type = self.visit(lhs.value)
             if isinstance(lhs_base_type, (TensorType, StackTensorType)):
                 self.visit(lhs)  # need to populate shape info
-            lhs_base_type = lhs_base_type.propagate_setitem(
+            updated_type = lhs_base_type.propagate_setitem(
                 self.visit(lhs.slice), rhs, self.origin()
             )
+            if (
+                isinstance(lhs.value, ast.Attribute)
+                and isinstance(lhs_base_type, (TensorType, StackTensorType))
+                and updated_type is lhs_base_type
+            ):
+                # Tensor storage changed, not the record field or its type.
+                # Keep the indexing/RHS validation above without assigning the
+                # attribute itself (which is not a supported assignment target).
+                return None
             # update the stored type for the container
-            return self._assign(lhs.value, lhs_base_type)
+            return self._assign(lhs.value, updated_type)
         raise AssertionError(f"unhandled lhs in assignment {type(lhs).__name__}")
 
     ################################################################
@@ -665,9 +698,12 @@ class TypePropagation(ast.NodeVisitor):
                         self.origin(),
                     )
 
-                return TypeInfo.from_example(
-                    _eval_binary(node.op, left_example, right_example),
-                    self.origin(),
+                return self._preserve_host_float(
+                    TypeInfo.from_example(
+                        _eval_binary(node.op, left_example, right_example),
+                        self.origin(),
+                    ),
+                    (left_example, right_example),
                 )
             except exc.Base:
                 raise

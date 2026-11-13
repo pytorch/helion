@@ -14,13 +14,19 @@ from unittest.mock import patch
 
 import sympy
 import torch
+from torch._dynamo.source import TensorProperty
+from torch._dynamo.source import TensorPropertySource
 from torch.fx.experimental import proxy_tensor
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_map_only
+from torch.utils._sympy.functions import FloatTrueDiv
 from torch.utils._sympy.functions import FloorDiv
+from torch.utils._sympy.functions import IntTrueDiv
+from torch.utils._sympy.functions import ToFloat
 
 from .. import exc
 from ..autotuner.config_fragment import ConfigSpecFragment
+from ..autotuner.config_fragment import _same_scalar
 from ..autotuner.config_spec import BlockSizeSpec
 from ..autotuner.config_spec import NumThreadsSpec
 from ..language._decorators import _TENSOR_METHOD_REPLACEMENTS
@@ -40,12 +46,14 @@ from .compile_environment import _symint_expr
 from .compile_environment import warning
 from .device_function import contains_only_block_size_symbols
 from .host_function import HostFunction
+from .host_function import NoCurrentFunction
 from .host_function import SymbolOrigin
 from .utils import compute_slice_size
 from .variable_origin import AttributeOrigin
 from .variable_origin import GetItemOrigin
 from .variable_origin import GridOrigin
 from .variable_origin import Origin
+from .variable_origin import ScalarArithmeticOrigin
 from .variable_origin import TensorSizeOrigin
 from .variable_origin import TensorStrideOrigin
 from .variable_origin import TileBeginOrigin
@@ -177,6 +185,7 @@ class TypeInfo:
                         cls._unpack_example(
                             [(name, getattr(value, name)) for name in field_names],
                             origin,
+                            attributes=True,
                         ),
                         strict=False,
                     )
@@ -185,7 +194,7 @@ class TypeInfo:
         if isinstance(value, ConfigSpecFragment):
             return ConfigFragmentType(origin, value)
         if dataclasses.is_dataclass(value):
-            keys = value.__dataclass_fields__.keys()
+            keys = [field.name for field in dataclasses.fields(value)]
             return ClassType(
                 origin,
                 dict(
@@ -194,6 +203,7 @@ class TypeInfo:
                         cls._unpack_example(
                             tuple((k, getattr(value, k)) for k in keys),
                             origin,
+                            attributes=True,
                         ),
                         strict=False,
                     )
@@ -234,11 +244,18 @@ class TypeInfo:
     def _unpack_example(
         values: Sequence[tuple[int | str, object]] | enumerate[object],
         origin: Origin,
+        *,
+        attributes: bool = False,
     ) -> list[TypeInfo]:
-        return [
-            TypeInfo.from_example(value, GetItemOrigin(origin, key))
-            for key, value in values
-        ]
+        result = []
+        for key, value in values:
+            if attributes:
+                assert isinstance(key, str)
+                item_origin = AttributeOrigin(origin, key)
+            else:
+                item_origin = GetItemOrigin(origin, key)
+            result.append(TypeInfo.from_example(value, item_origin))
+        return result
 
     def __str__(self) -> str:
         return type(self).__name__
@@ -686,6 +703,26 @@ class TensorAttributeType(TypeInfo):
                     f"Tensor.{attr}() args must be literals"
                 ) from None
             if attr == "stride":
+
+                def stride_type(value: int | torch.SymInt, dim: int) -> TypeInfo:
+                    stride_origin = TensorStrideOrigin(self.tensor.origin, dim)
+                    if not CompileEnvironment.current().settings.static_shapes:
+                        try:
+                            source = stride_origin.to_source()
+                        except NotImplementedError:
+                            # Host-created layouts can also vary between
+                            # calls. Their stride is replayed by the host,
+                            # rather than extracted from a kernel argument.
+                            value = CompileEnvironment.current().cached_create_unbacked_symint(
+                                ("host_tensor_stride", id(self.tensor.fake_value), dim),
+                                CompileEnvironment.current().size_hint(value),
+                            )
+                        else:
+                            value = CompileEnvironment.current().input_symint(
+                                value, source
+                            )
+                    return TypeInfo.from_example(value, stride_origin)
+
                 if literal_args or literal_kwargs:
                     dim = cast(
                         "int",
@@ -693,33 +730,11 @@ class TensorAttributeType(TypeInfo):
                     )
                     if dim < 0:
                         dim += self.tensor.fake_value.ndim
-                    stride_origin = TensorStrideOrigin(self.tensor.origin, dim)
-                    if (
-                        isinstance(result, (int, torch.SymInt))
-                        and not CompileEnvironment.current().settings.static_shapes
-                    ):
-                        result = CompileEnvironment.current().input_symint(
-                            result,
-                            stride_origin.to_source(),
-                        )
-                    return TypeInfo.from_example(
-                        result,
-                        stride_origin,
-                    )
+                    return stride_type(result, dim)
                 return SequenceType(
                     origin,
                     tuple(
-                        TypeInfo.from_example(
-                            CompileEnvironment.current().input_symint(
-                                stride,
-                                TensorStrideOrigin(self.tensor.origin, dim).to_source(),
-                            )
-                            if isinstance(stride, (int, torch.SymInt))
-                            and not CompileEnvironment.current().settings.static_shapes
-                            else stride,
-                            TensorStrideOrigin(self.tensor.origin, dim),
-                        )
-                        for dim, stride in enumerate(cast("tuple[int, ...]", result))
+                        stride_type(stride, dim) for dim, stride in enumerate(result)
                     ),
                 )
             return TypeInfo.from_example(result, origin)
@@ -802,6 +817,16 @@ class LiteralType(TypeInfo):
 
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if type(other) is type(self) and self.value == other.value:
+            if (
+                type(self.value) in (bool, int, float)
+                and type(other.value) in (bool, int, float)
+                and not _same_scalar(self.value, other.value)
+            ):
+                # Python equality alone cannot prove a declared domain across
+                # branches: zero signs and equal int/float/bool values differ.
+                # Keep the runtime branch valid without certifying either arm.
+                kind = float if float in (self.python_type, other.python_type) else int
+                return NumericType.subtype(kind).new_unbacked(self.origin)
             return self
         if isinstance(other, (LiteralType, NumericType)):
             if NumericType.known_equal(other.value, self.value):
@@ -1026,6 +1051,19 @@ class CallableType(LiteralType):
         env: CompileEnvironment = CompileEnvironment.current()
         proxy_args = [x.tree_map(to_proxy) for x in args]
         proxy_kwargs = {k: v.tree_map(to_proxy) for k, v in kwargs.items()}
+
+        if (
+            origin.is_host()
+            and self.value is int
+            and len(proxy_args) == 1
+            and not proxy_kwargs
+            and _is_size_backed_float(proxy_args[0])
+        ):
+            # Python int(SymFloat) guards and specializes its current hint.
+            # Keep truncation symbolic so a reused binding computes its size.
+            return TypeInfo.from_example(
+                torch.sym_int(cast("torch.SymFloat", proxy_args[0])), origin
+            )
 
         # special handling for symint arguments
         if any(
@@ -1776,6 +1814,11 @@ class DictType(CollectionType):
 
 
 class ClassType(DictType):
+    def populate_symbol_origins(self, origin: Origin) -> None:
+        for key, subtype in self.element_types.items():
+            assert isinstance(key, str)
+            subtype.populate_symbol_origins(AttributeOrigin(origin, key))
+
     def unpack(self) -> list[TypeInfo]:
         """Unpack a ClassType into its values (not field name strings).
 
@@ -1989,7 +2032,83 @@ def tensor_may_have_many_elements(tensor: torch.Tensor) -> bool:
     return not all(env.known_equal(size, 1) for size in tensor.shape)
 
 
+def _is_size_backed_float(value: object) -> bool:
+    """Retain shape expressions without treating runtime float data as a size."""
+    if not isinstance(value, torch.SymFloat) or not CompileEnvironment.has_current():
+        return False
+    expression = value._sympy_()
+    # These nodes preserve Python conversion/division instead of algebraically
+    # simplifying ordered IEEE arithmetic. Add/Sub/Mul must retain their host
+    # value: even size-derived floats can round before cancellation.
+    if not isinstance(expression, (ToFloat, IntTrueDiv, FloatTrueDiv)):
+        return False
+    symbols = expression.free_symbols
+    sources = CompileEnvironment.current().shape_env.var_to_sources
+    return bool(symbols) and all(
+        isinstance(symbol, sympy.Symbol)
+        and any(
+            isinstance(source, TensorPropertySource)
+            and source.prop is TensorProperty.SIZE
+            for source in sources.get(symbol, ())
+        )
+        for symbol in symbols
+    )
+
+
+def _preserve_host_float_operation(
+    result: object, op: ast.AST, operands: tuple[object, ...]
+) -> object:
+    # These operations cannot raise for exact float operands. Integer literals
+    # also need a finite float conversion; symbolic integers have no such proof.
+    # Do not hoist division/powers out of a potentially untaken device branch.
+    operator = next(
+        (
+            kind
+            for kind in (ast.Add, ast.Sub, ast.Mult, ast.UAdd, ast.USub)
+            if isinstance(op, kind)
+        ),
+        None,
+    )
+    if (
+        operator is None
+        or _is_size_backed_float(result)
+        or not any(isinstance(value, torch.SymFloat) for value in operands)
+        or not CompileEnvironment.has_current()
+    ):
+        return result
+    try:
+        host = HostFunction.current()
+    except NoCurrentFunction:
+        return result
+    origins: list[Origin | int | float | bool] = []
+    for value in operands:
+        if isinstance(value, torch.SymFloat):
+            info = host.expr_to_origin.get(value._sympy_())
+            if info is None or not info.origin.is_host():
+                return result
+            origins.append(info.origin)
+        elif type(value) in (float, int, bool):
+            if type(value) is int:
+                try:
+                    float(value)
+                except OverflowError:
+                    return result
+            origins.append(cast("int | float | bool", value))
+        else:
+            return result
+    origin = ScalarArithmeticOrigin(operator, tuple(origins))
+    result = SymFloatType.new_unbacked(origin).value
+    CompileEnvironment.current().preserve_tunable_float_provenance(result, operands)
+    host.expr_to_origin[result._sympy_()] = SymbolOrigin(origin)
+    return result
+
+
 def _eval_unary(op: ast.unaryop, value: object) -> object:
+    result = _eval_unary_impl(op, value)
+    return _preserve_host_float_operation(result, op, (value,))
+
+
+def _eval_unary_impl(op: ast.unaryop, value: object) -> object:
     if isinstance(op, ast.Not):
         # ``not`` would call bool() and guard a symbolic value on its hint.
         if isinstance(value, torch.SymBool):
@@ -2010,6 +2129,11 @@ def _eval_unary(op: ast.unaryop, value: object) -> object:
 
 
 def _eval_binary(op: ast.operator, left: object, right: object) -> object:
+    result = _eval_binary_impl(op, left, right)
+    return _preserve_host_float_operation(result, op, (left, right))
+
+
+def _eval_binary_impl(op: ast.operator, left: object, right: object) -> object:
     if isinstance(op, ast.Add):
         # pyrefly: ignore [unsupported-operation]
         return left + right

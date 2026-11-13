@@ -77,6 +77,9 @@ def lift_closures(func: FunctionType, origin: Origin) -> FunctionType:
                 argdefs=func.__defaults__,
                 closure=closure,
             )
+            # FunctionType only accepts positional defaults. Keep keyword-only
+            # defaults by reference too, including shared mutable default objects.
+            new_func.__kwdefaults__ = func.__kwdefaults__
         result = new_func(*args, **kwargs)
         if closure_contents:
             for cell, expected, varname in zip(

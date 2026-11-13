@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import itertools
 from types import SimpleNamespace
 from typing import Callable
@@ -7,10 +8,78 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
+import helion
 from helion._compiler.cute import cute_epilogue
+from helion._testing.cute_codegen import cpu_bind
+import helion.language as hl
+from helion.language import memory_ops
 
 pytestmark = pytest.mark.cpu_only
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _matmul_with_scalar_store(
+    x: torch.Tensor, y: torch.Tensor, scale: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out = torch.empty_like(x)
+    scalar_out = torch.empty_like(x)
+    for row, col in hl.tile(x.shape):
+        acc = hl.zeros([row, col], dtype=torch.float32)
+        for inner in hl.tile(x.size(1)):
+            acc = hl.dot(x[row, inner], y[inner, col], acc=acc)
+        out[row, col] = acc
+        scalar = scale
+        scalar_out[row, col] = scalar
+    return out, scalar_out
+
+
+def test_scalar_store_beside_matmul_keeps_scalar_codegen() -> None:
+    x = torch.empty((128, 128), dtype=torch.bfloat16)
+    bound = cpu_bind(_matmul_with_scalar_store, (x, x.clone(), 0.25))
+    source = bound.to_code(bound.config_spec.autotune_reference_config())
+    ast.parse(source)
+    assert "scalar_out" in source
+    assert bound.host_function is not None
+    stores = [
+        node
+        for graph in bound.host_function.device_ir.graphs
+        for node in graph.graph.nodes
+        if node.target is memory_ops.store and isinstance(node.args[2], torch.fx.Node)
+    ]
+    assert len(stores) == 2
+    values = [node.args[2].meta.get("val") for node in stores]
+    assert sum(isinstance(value, torch.SymFloat) for value in values) == 1
+    assert sum(isinstance(value, torch.Tensor) for value in values) == 1
+
+
+def test_carrier_shape_requires_tensor_metadata() -> None:
+    env = ShapeEnv()
+    graph = torch.fx.Graph()
+    scalar = graph.placeholder("scalar")
+    anchor = graph.placeholder("unrelated_matmul")
+    scalar.meta["val"] = env.create_unbacked_symfloat()
+    assert (
+        cute_epilogue.analyze_tcgen05_unary_epilogue_chain(
+            None, scalar, target_fx_nodes={anchor}, inner_outputs_by_graph_id={}
+        )
+        is None
+    )
+    for value in (
+        None,
+        env.create_unbacked_symint(),
+        env.create_unbacked_symbool(),
+        1,
+        1.5,
+        True,
+        SimpleNamespace(shape=(4, 16)),
+    ):
+        scalar.meta["val"] = value
+        assert cute_epilogue._carrier_tile_shape(scalar) is None
+    for shape in ((), (4, 16)):
+        scalar.meta["val"] = torch.empty(shape)
+        assert cute_epilogue._carrier_tile_shape(scalar) == shape
 
 
 def _call(

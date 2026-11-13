@@ -4853,7 +4853,7 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
     schedule while using Python ``range`` so JAX traces a straight-line program.
     """
     from ..device_ir import ForLoopGraphInfo
-    from ..device_ir import LiftTensorArgs
+    from ..device_ir import LiftGraphArgs
     from ..generate_ast import GenerateAST
     from ..inductor_lowering import codegen_call_with_graph
     from ..tile_strategy import ForiLoopState
@@ -5000,10 +5000,14 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
         "unroll",
     )
 
-    input_tensors = cast(
-        "list[torch.Tensor]",
-        LiftTensorArgs(dict(HostFunction.current().params.arguments)).get_tensor_args(),
-    )
+    # Buffer-count slots index tensor inputs, not lifted runtime scalar inputs.
+    input_tensors = [
+        arg
+        for arg in LiftGraphArgs(
+            dict(HostFunction.current().params.arguments)
+        ).get_graph_args()
+        if isinstance(arg, torch.Tensor)
+    ]
     input_slots_by_id: dict[int, list[int]] = {}
     input_slots_by_storage: dict[int, list[int]] = {}
     for input_slot, input_tensor in enumerate(input_tensors):

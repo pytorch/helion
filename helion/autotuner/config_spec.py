@@ -41,6 +41,7 @@ from .block_id_sequence import _BlockIdItem
 from .block_id_sequence import _PowerOfTwoBlockIdItem
 from .compiler_coverage import CompilerCoverageGroup
 from .compiler_coverage import coverage_policy
+from .config_fragment import BaseIntegerFragment
 from .config_fragment import BlockSizeFragment
 from .config_fragment import BooleanFragment
 from .config_fragment import ConfigSpecFragment
@@ -51,6 +52,7 @@ from .config_fragment import NumThreadsFragment
 from .config_fragment import NumWarpsFragment
 from .config_fragment import PermutationFragment
 from .config_fragment import PowerOfTwoFragment
+from .config_fragment import _fragment_domain_fields
 from .config_fragment import assert_integer_power_of_two
 import helion
 
@@ -3042,8 +3044,9 @@ class ConfigSpec:
 
         Target lowering policy also affects generated code even when its
         promoted seed is unchanged, so include its stable identity.  Generic
-        targets with no compiler default or seed retain the historical
-        structural hash verbatim.
+        targets with no compiler default, seed, or user-declared built-in domain
+        retain the historical structural hash verbatim. Declared domains affect
+        persistent reuse but not the flat layout shared across shapes.
         """
         structural_hash = self.structural_fingerprint_hash(
             advanced_controls_files=advanced_controls_files
@@ -3065,7 +3068,7 @@ class ConfigSpec:
         self, *, advanced_controls_files: list[str] | None = None
     ) -> str:
         """Identity of the old layout, used only by initial warm-base decoding."""
-        owned = {group.key for group in self.compiler_coverage_groups}
+        owned = frozenset(group.key for group in self.compiler_coverage_groups)
         fingerprint = tuple(
             row
             for row in self.structural_fingerprint(
@@ -3074,9 +3077,37 @@ class ConfigSpec:
             if row[0] not in owned
         )
         structural_hash = hashlib.sha256(repr(fingerprint).encode("utf-8")).hexdigest()
-        return self._cache_fingerprint_from_structural_hash(structural_hash)
+        return self._cache_fingerprint_from_structural_hash(
+            structural_hash, excluded_tunables=owned
+        )
 
-    def _cache_fingerprint_from_structural_hash(self, structural_hash: str) -> str:
+    def _cache_fingerprint_from_structural_hash(
+        self,
+        structural_hash: str,
+        *,
+        excluded_tunables: frozenset[str] = frozenset(),
+    ) -> str:
+        declared_domains = tuple(
+            (
+                name,
+                type(fragment).__module__,
+                type(fragment).__qualname__,
+                _fragment_domain_fields(fragment),
+            )
+            for name, fragment in sorted(self.user_defined_tunables.items())
+            if name not in excluded_tunables
+            # Enum domains already participate in structural_fingerprint();
+            # BooleanFragment has no variable domain. Preserve their old keys.
+            and isinstance(fragment, (BaseIntegerFragment, NumThreadsFragment))
+        )
+        if declared_domains:
+            # The projected warm-base layout still decodes these user slots.
+            # Both persistent keys must distinguish their declared domains.
+            structural_hash = hashlib.sha256(
+                repr(
+                    (structural_hash, "user_tunable_domains:v1", declared_domains)
+                ).encode("utf-8")
+            ).hexdigest()
         target_policy_identity = self.search_surface.fingerprint_extra(self)
         if (
             self.compiler_default_config is None

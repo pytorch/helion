@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 import importlib
+import logging
 from types import SimpleNamespace
 import unittest
 from unittest.mock import ANY
@@ -14,11 +15,86 @@ import torch
 
 from helion._argument_device import _find_argument_device
 from helion._utils import triton_is_available
+from helion.autotuner.logger import SUPPRESSED_TRITON_CODE_MSG
+from helion.autotuner.logger import AutotuningLogger
+from helion.autotuner.precompile_future import PrecompileContext
+from helion.autotuner.precompile_future import PrecompileFuture
 from helion.runtime.config import Config
 from helion.runtime.precompile_shim import _device_probe_values
 from helion.runtime.precompile_shim import make_precompiler
+from helion.runtime.settings import Settings
 
 pytestmark = pytest.mark.cpu_only
+
+
+def test_precompile_warning_formats_message_and_preserves_exception(capsys) -> None:
+    decorator = "@helion.kernel(config=Config(block_sizes=[32]))"
+    settings = Settings(autotune_precompile="fork")
+    kernel = Mock()
+    kernel.format_kernel_decorator.return_value = decorator
+    context = PrecompileContext(settings, AutotuningLogger(settings), kernel, (), 1)
+    with (
+        patch("helion.autotuner.precompile_future.maybe_dump_triton_failure"),
+        patch("helion.autotuner.precompile_future.log_generated_triton_code_debug"),
+        pytest.raises(RuntimeError, match="precompile failed"),
+    ):
+        PrecompileFuture.create(
+            context,
+            Config(),
+            Mock(side_effect=RuntimeError("precompile failed")),
+            (),
+            "unused-result",
+            None,
+        )
+    output = capsys.readouterr().err
+    assert (
+        f"Helion autotuner precompile error for {decorator}. "
+        f"{SUPPRESSED_TRITON_CODE_MSG}\n"
+    ) in output
+    assert "%s" not in output
+    assert "Traceback (most recent call last):" in output
+    assert "RuntimeError: precompile failed" in output
+
+
+@pytest.mark.parametrize(
+    "error,ignore,level,visible",
+    [
+        (
+            torch.cuda.OutOfMemoryError("allocation failed"),
+            False,
+            logging.WARNING,
+            False,
+        ),
+        (torch.cuda.OutOfMemoryError("allocation failed"), False, logging.DEBUG, True),
+        (RuntimeError("PassManager::run failed"), False, logging.WARNING, True),
+        (RuntimeError("unexpected compiler bug"), True, logging.DEBUG, False),
+        (torch.cuda.OutOfMemoryError("allocation failed"), True, logging.DEBUG, False),
+    ],
+)
+def test_precompile_diagnostics_follow_error_policy(
+    capsys, error, ignore, level, visible
+) -> None:
+    settings = Settings(
+        autotune_precompile="fork",
+        autotune_ignore_errors=ignore,
+        autotune_log_level=level,
+    )
+    kernel = Mock()
+    kernel.format_kernel_decorator.return_value = "@helion.kernel()"
+    context = PrecompileContext(settings, AutotuningLogger(settings), kernel, (), 1)
+    with (
+        patch("helion.autotuner.precompile_future.maybe_dump_triton_failure"),
+        patch("helion.autotuner.precompile_future.log_generated_triton_code_debug"),
+    ):
+        future = PrecompileFuture.create(
+            context, Config(), Mock(side_effect=error), (), "unused-result", None
+        )
+    assert future.ok is False and future.process is None
+    output = capsys.readouterr().err
+    assert ("Helion autotuner precompile error" in output) is visible
+    assert ("Traceback (most recent call last):" in output) is visible
+    if visible:
+        assert str(error) in output
 
 
 @unittest.skipUnless(triton_is_available(), "requires Triton")

@@ -490,7 +490,8 @@ class TestAutotuneBudget(TestCase):
             cute_flash_search_enabled=False,
             compiler_seed_timeout_retry_repetitions=None,
             backend=SimpleNamespace(
-                should_deduplicate_generated_sources=lambda config_spec: False
+                classify_autotune_exception=lambda error: None,
+                should_deduplicate_generated_sources=lambda config_spec: False,
             ),
         )
         provider.args = ()
@@ -628,6 +629,7 @@ class TestAutotuneBudget(TestCase):
             cute_flash_search_enabled=True,
             compiler_seed_timeout_retry_repetitions=None,
             backend=SimpleNamespace(
+                classify_autotune_exception=lambda error: None,
                 generated_source_hash=lambda fn: fn.source_hash,
                 should_deduplicate_generated_sources=lambda config_spec: True,
             ),
@@ -725,6 +727,7 @@ class TestAutotuneBudget(TestCase):
             cute_flash_search_enabled=True,
             compiler_seed_timeout_retry_repetitions=None,
             backend=SimpleNamespace(
+                classify_autotune_exception=lambda error: None,
                 generated_source_hash=lambda fn: fn.source_hash,
                 should_deduplicate_generated_sources=lambda config_spec: True,
             ),
@@ -805,6 +808,7 @@ class TestAutotuneBudget(TestCase):
             cute_flash_search_enabled=True,
             compiler_seed_timeout_retry_repetitions=None,
             backend=SimpleNamespace(
+                classify_autotune_exception=lambda error: None,
                 generated_source_hash=lambda fn: fn.source_hash,
                 should_deduplicate_generated_sources=lambda config_spec: True,
             ),

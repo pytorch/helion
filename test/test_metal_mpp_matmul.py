@@ -98,6 +98,9 @@ def _run(
 
     from helion._compiler.metal.metal_jit import _MetalKernel
 
+    # Raw generated entrypoints require explicit nonportable defaults, including
+    # matmul's lambda epilogue. Bind and execute the same captured arguments.
+    args = kernel.normalize_args(*args)
     bound = kernel.bind(args)
     code = bound.to_code(config or bound.config_spec.default_config())
     module = PyCodeCache.load(code, module_key)

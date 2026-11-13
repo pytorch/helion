@@ -13,6 +13,7 @@ from collections import OrderedDict
 import ctypes
 from dataclasses import dataclass
 from dataclasses import field
+import hashlib
 import importlib
 import linecache
 import logging
@@ -528,7 +529,17 @@ def _create_cute_wrapper(
     except BaseException:
         linecache.cache.pop(filename, None)
         raise
-    return namespace[func_name]
+    jit_func = namespace[func_name]
+    # The SDK's default mangler includes runtime values such as "1e+16",
+    # which are not valid in its unquoted TVM FFI symbols. Generic Pointer
+    # annotations omit dtype and alignment, so include the full schema along
+    # with the source's kernel identity and launch geometry.
+    symbol_key = repr((source, schema_key)).encode()
+    jit_func.set_name_prefix(
+        f"_helion_cute_launch_{hashlib.sha256(symbol_key).hexdigest()}",
+        keep_mangled_name=False,
+    )
+    return jit_func
 
 
 _CUTE_NUM_SM_CACHE: dict[tuple[str, int | None], int] = {}

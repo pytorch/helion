@@ -48,6 +48,7 @@ from .variable_origin import BlockSizeOrigin
 from .variable_origin import GridOrigin
 from .variable_origin import Origin
 from .variable_origin import TensorSizeOrigin
+from .variable_origin import TensorStrideOrigin
 from .variable_origin import TileBeginOrigin
 from .variable_origin import TileExtentOrigin
 
@@ -838,6 +839,11 @@ class DeviceFunction:
                 origin.origin.key,
             )
             return arg.name
+        if (
+            isinstance(origin.origin, TensorStrideOrigin)
+            and origin.fake_value is not None
+        ):
+            return self.tensor_stride(origin.fake_value, origin.origin.key).name
         if isinstance(origin.origin, BlockSizeOrigin):
             result = self.block_size_var(env.canonical_block_id(origin.origin.block_id))
             assert result is not None

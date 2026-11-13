@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from torch._dynamo.source import GetItemSource
 from torch._inductor.codecache import PyCodeCache
 from torch.utils._pytree import tree_leaves
 
@@ -540,8 +541,6 @@ def test_compile_deduplication_includes_original_source_bytes(tmp_path: Path) ->
 def test_unrelocatable_bound_guard_cannot_replace_an_existing_export(
     kind: str, tmp_path: Path
 ) -> None:
-    from torch._dynamo.source import AttrSource
-
     function = _function(tmp_path)
     policy = CuteStructuralPolicy()
     kernel = helion.aot_kernel(
@@ -567,7 +566,8 @@ def test_unrelocatable_bound_guard_cannot_replace_an_existing_export(
         invalid = dataclasses.replace(specialization, classifier=lambda values: None)
     elif kind == "projection":
         invalid = dataclasses.replace(
-            specialization, sources=(AttrSource(specialization.sources[0], "data"),)
+            specialization,
+            sources=(GetItemSource(specialization.sources[0], slice(None)),),
         )
     else:
         args[0].set_(torch.empty(38)[1:])
