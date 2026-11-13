@@ -23,6 +23,7 @@ from ..runtime.kernel import Kernel
 from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import create
+from .ast_read_writes import definitely_does_not_have_side_effects
 from .compile_environment import CompileEnvironment
 from .compile_environment import _constrain_unify
 from .compile_environment import warning
@@ -33,7 +34,9 @@ from .type_info import BarrierResultType
 from .type_info import CallableType
 from .type_info import CollectionType
 from .type_info import DictType
+from .type_info import GeneratorType
 from .type_info import LiteralType
+from .type_info import MixedSequenceType
 from .type_info import NestedFunctionType
 from .type_info import NoType
 from .type_info import NumericType
@@ -60,6 +63,7 @@ from .variable_origin import SourceOrigin
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
+    from collections.abc import Sequence
 
     from .host_function import HostFunction
 
@@ -210,6 +214,7 @@ class TypePropagation(ast.NodeVisitor):
         self.scope = scope
         self.device_loop_depth = 0
         self.device_loop_count = 0
+        self._filtered_comprehension_loop = False
         # Names bound inside device code; they never exist on the host.
         self.device_names: set[str] = set()
 
@@ -402,7 +407,15 @@ class TypePropagation(ast.NodeVisitor):
             and isinstance(right, SequenceType)
             and isinstance(op, ast.Eq)
         ):
-            if len(left.element_types) != len(right.element_types):
+            if isinstance(left, GeneratorType) or isinstance(right, GeneratorType):
+                raise exc.StatementNotSupported("Generator equality comparisons")
+            if isinstance(left, MixedSequenceType) or isinstance(
+                right, MixedSequenceType
+            ):
+                return SymBoolType.new_unbacked(self.origin())
+            if left.python_type is not right.python_type or len(
+                left.element_types
+            ) != len(right.element_types):
                 return LiteralType(origin=self.origin(), value=False)
 
             can_determine_statically = True
@@ -434,11 +447,12 @@ class TypePropagation(ast.NodeVisitor):
             f"{type(op).__name__} not supported on {left!s} and {right!s}"
         )
 
-    def _assign(self, lhs: ast.AST, rhs: TypeInfo) -> None:
+    def _assign(self, lhs: ast.AST, rhs: TypeInfo, *, local: bool = False) -> None:
         if isinstance(lhs, ast.Name):
             # Check if we're trying to modify a host variable inside a device loop
             if (
-                (existing_type := self.scope.maybe_get(lhs.id)) is not None
+                not local
+                and (existing_type := self.scope.maybe_get(lhs.id)) is not None
                 and existing_type.origin.is_host()
                 and rhs.origin.is_device()
             ):
@@ -466,7 +480,7 @@ class TypePropagation(ast.NodeVisitor):
                             f"jagged_tile alone cannot be used without its parent in assignment {lhs.id}"
                         )
 
-            if self.device_loop_depth > 0:
+            if self.device_loop_depth > 0 and not local:
                 self.device_names.add(lhs.id)
             return self.scope.set(lhs.id, rhs)
         if isinstance(lhs, ast.Starred):
@@ -476,7 +490,7 @@ class TypePropagation(ast.NodeVisitor):
                 raise exc.TypeInferenceError(
                     f"Failed to unpack starred assignment: {rhs!s}"
                 ) from None
-            return self._assign(lhs.value, unpacked)
+            return self._assign(lhs.value, unpacked, local=local)
         if isinstance(lhs, (ast.Tuple, ast.List)):
             # pyrefly: ignore [bad-assignment]
             lhs = lhs.elts
@@ -501,10 +515,11 @@ class TypePropagation(ast.NodeVisitor):
                     self._assign(
                         elt.value,
                         SequenceType(self.origin(), elements[idx : idx + star_len]),
+                        local=local,
                     )
                     idx += star_len
                 else:
-                    self._assign(elt, elements[idx])
+                    self._assign(elt, elements[idx], local=local)
                     idx += 1
             assert idx == len(elements), "wrong number of elements to unpack"
             return None
@@ -965,7 +980,7 @@ class TypePropagation(ast.NodeVisitor):
         return NoType(origin=self.origin())
 
     def visit_Assign(self, node: ast.Assign) -> TypeInfo:
-        type_info = self.visit(node.value)
+        type_info = self._assignment_value(node.value)
         for target in node.targets:
             self._assign(target, type_info)
         return NoType(origin=self.origin())
@@ -973,9 +988,18 @@ class TypePropagation(ast.NodeVisitor):
     def visit_AnnAssign(self, node: ast.AnnAssign) -> TypeInfo:
         # TODO(jansel): handle constexpr in annotation
         if node.value is not None:
-            type_info = self.visit(node.value)
+            type_info = self._assignment_value(node.value)
             self._assign(node.target, type_info)
         return NoType(origin=self.origin())
+
+    def _assignment_value(self, value: ast.expr) -> TypeInfo:
+        # Loop bodies are analyzed more than once. Keep the current value for
+        # constant filters while retaining merged annotations for later passes.
+        if self._filtered_comprehension_loop and definitely_does_not_have_side_effects(
+            value
+        ):
+            return self._visit_comprehension_iteration(value)
+        return self.visit(value)
 
     def visit_AugAssign(self, node: ast.AugAssign) -> TypeInfo:
         assert isinstance(node.target, ExtendedAST)
@@ -1063,13 +1087,29 @@ class TypePropagation(ast.NodeVisitor):
             self.visit(stmt)
         return self.pop_scope()
 
+    @staticmethod
+    def _contains_filtered_comprehension(nodes: Sequence[ast.AST]) -> bool:
+        return any(
+            isinstance(child, ast.ListComp)
+            and any(generator.ifs for generator in child.generators)
+            for node in nodes
+            for child in ast.walk(node)
+        )
+
     def _loop_body(self, stmts: list[ast.stmt]) -> LocalScope:
         self.push_scope()
         exit_scopes = [self.scope]
-        for stmt in stmts:
-            self.visit(stmt)
-            if isinstance(stmt, (ast.Break, ast.Continue)):
-                exit_scopes.append(self.scope.clone())
+        previous = self._filtered_comprehension_loop
+        self._filtered_comprehension_loop |= (
+            self.device_loop_depth > 0 and self._contains_filtered_comprehension(stmts)
+        )
+        try:
+            for stmt in stmts:
+                self.visit(stmt)
+                if isinstance(stmt, (ast.Break, ast.Continue)):
+                    exit_scopes.append(self.scope.clone())
+        finally:
+            self._filtered_comprehension_loop = previous
         self.pop_scope()
         return functools.reduce(lambda x, y: x.merge(y), exit_scopes)
 
@@ -1077,6 +1117,31 @@ class TypePropagation(ast.NodeVisitor):
         parent_scope = self.scope
         self.push_scope()
         iter_type = self.visit(node.iter)
+        has_filtered_comprehension = self.device_loop_depth > 0 and (
+            self._contains_filtered_comprehension(node.body)
+        )
+        if has_filtered_comprehension and self._expression_contains_generator(
+            node.iter, iter_type
+        ):
+            raise exc.StatementNotSupported(
+                "Generator values in loops containing filtered comprehensions"
+            )
+        if (
+            self.device_loop_depth > 0
+            and isinstance(iter_type, SequenceType)
+            and not node.orelse
+            and (not iter_type.element_types or has_filtered_comprehension)
+        ):
+            assert isinstance(node, ExtendedAST)
+            node._loop_type = LoopType.DEVICE
+            if not iter_type.element_types:
+                self.pop_scope()
+                return NoType(origin=self.origin())
+            # Filters can depend on the concrete value of each unrolled iteration.
+            for element in iter_type.unpack():
+                self._assign(node.target, element)
+                self.scope.overwrite(self._loop_body(node.body))
+            return NoType(origin=self.origin())
         self._assign(node.target, iter_type.propagate_iter(self.origin()))
         device_loop = (
             isinstance(call_node := node.iter, ast.Call)
@@ -1175,12 +1240,178 @@ class TypePropagation(ast.NodeVisitor):
     def _not_supported(self, node: ast.AST) -> TypeInfo:
         raise exc.StatementNotSupported(type(node).__name__)
 
+    def _visit_comprehension_iteration(self, node: ast.AST) -> TypeInfo:
+        # Return this iteration's type while retaining merged AST annotations.
+        nodes = [n for n in ast.walk(node) if isinstance(n, ExtendedAST)]
+        previous = [n._type_info for n in nodes]
+        for n in nodes:
+            n._type_info = None
+        try:
+            result = self.visit(node)
+        except BaseException:
+            for n, old in zip(nodes, previous, strict=True):
+                n._type_info = old
+            raise
+        for n, old in zip(nodes, previous, strict=True):
+            if old is None:
+                continue
+            if n is node and isinstance(n, ast.Name) and n.id in self.scope.variables:
+                # Tracing uses the current value; retain tensor provenance for analysis.
+                if isinstance(old, TensorType):
+                    n._type_info = old
+            else:
+                n._type_info = old if n._type_info is None else old.merge(n._type_info)
+        return result
+
+    def _comprehension_filter(self, node: ast.expr) -> bool:
+        return self._constant_comprehension_truth(self._comprehension_value(node))
+
+    def _comprehension_value(self, node: ast.expr) -> TypeInfo:
+        if isinstance(node, ast.BoolOp):
+            short_circuit_on = isinstance(node.op, ast.Or)
+            for value in node.values[:-1]:
+                result = self._comprehension_value(value)
+                if self._constant_comprehension_truth(result) == short_circuit_on:
+                    return result
+            return self._comprehension_value(node.values[-1])
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            return LiteralType(
+                self.origin(), not self._comprehension_filter(node.operand)
+            )
+        if isinstance(node, ast.IfExp):
+            branch = node.body if self._comprehension_filter(node.test) else node.orelse
+            return self._comprehension_value(branch)
+        if any(isinstance(n, (ast.Call, ast.NamedExpr)) for n in ast.walk(node)):
+            raise exc.StatementNotSupported(
+                "Calls and assignment expressions in comprehension filters"
+            )
+        if isinstance(node, ast.Compare):
+            left = self._comprehension_value(node.left)
+            for op, comparator in zip(node.ops, node.comparators, strict=True):
+                right = self._comprehension_value(comparator)
+                if left.is_literal() and right.is_literal():
+                    left_value = left.as_literal()
+                    right_value = right.as_literal()
+                    if (
+                        isinstance(op, (ast.Is, ast.IsNot))
+                        and left_value is not None
+                        and right_value is not None
+                        and type(left_value) is not bool
+                        and type(right_value) is not bool
+                    ):
+                        raise exc.StatementNotSupported(
+                            "Identity comparisons in comprehension filters except with None or bool"
+                        )
+                    result = LiteralType(
+                        self.origin(),
+                        _eval_compare(op, left_value, right_value),
+                    )
+                else:
+                    if isinstance(op, (ast.In, ast.NotIn)):
+                        raise exc.StatementNotSupported(
+                            "Comprehension filters must be compile-time constant expressions"
+                        )
+                    result = self._compare(op, left, right)
+                if not self._constant_comprehension_truth(result):
+                    return LiteralType(self.origin(), False)
+                left = right
+            return LiteralType(self.origin(), True)
+        if any(isinstance(n, (ast.BoolOp, ast.IfExp)) for n in ast.walk(node)):
+            raise exc.StatementNotSupported(
+                "Short-circuit expressions inside this comprehension filter"
+            )
+        return self._visit_filtered_comprehension_expression(node)
+
+    def _visit_filtered_comprehension_expression(self, node: ast.AST) -> TypeInfo:
+        result = self._visit_comprehension_iteration(node)
+        if self._expression_contains_generator(node, result):
+            raise exc.StatementNotSupported(
+                "Generator values in filtered comprehensions"
+            )
+        return result
+
+    @staticmethod
+    def _expression_contains_generator(node: ast.AST, result: TypeInfo) -> bool:
+        return TypePropagation._contains_generator_value(result) or any(
+            isinstance(child, ExtendedAST)
+            and TypePropagation._contains_generator_value(child._type_info)
+            for child in ast.walk(node)
+        )
+
+    @staticmethod
+    def _contains_generator_value(result: TypeInfo | None) -> bool:
+        if isinstance(result, GeneratorType):
+            return True
+        if isinstance(result, SequenceType):
+            return any(
+                TypePropagation._contains_generator_value(x)
+                for x in result.element_types
+            )
+        if isinstance(result, DictType):
+            return any(
+                TypePropagation._contains_generator_value(x)
+                for x in result.element_types.values()
+            )
+        return False
+
+    @staticmethod
+    def _constant_comprehension_truth(result: TypeInfo) -> bool:
+        if isinstance(result, (SequenceType, DictType)):
+            return bool(result.element_types)
+        if not isinstance(result, LiteralType) or type(result.value) not in (
+            bool,
+            int,
+            float,
+            str,
+            type(None),
+        ):
+            raise exc.StatementNotSupported(
+                "Comprehension filters must be compile-time constant expressions"
+            )
+        return bool(result.value)
+
+    def _evaluate_filtered_comprehension(
+        self, generator: ast.comprehension, expression: ast.AST
+    ) -> SequenceType:
+        iterable = self._visit_filtered_comprehension_expression(generator.iter)
+        if not isinstance(iterable, SequenceType):
+            raise exc.StatementNotSupported(
+                "Filtered comprehensions require a fixed sequence"
+            )
+        results = []
+        for element in iterable.unpack():
+            self.push_scope()
+            try:
+                self._assign(generator.target, element, local=True)
+                if all(self._comprehension_filter(cond) for cond in generator.ifs):
+                    results.append(
+                        self._visit_filtered_comprehension_expression(expression)
+                    )
+            finally:
+                self.pop_scope()
+        return SequenceType(self.origin(), results)
+
+    def _check_enclosing_comprehension_iterable(
+        self, iterable: ast.AST, iter_type: TypeInfo, expressions: Sequence[ast.AST]
+    ) -> None:
+        if (
+            self.device_loop_depth > 0
+            and self._contains_filtered_comprehension(expressions)
+            and self._expression_contains_generator(iterable, iter_type)
+        ):
+            raise exc.StatementNotSupported(
+                "Generator values in comprehensions containing filtered lists"
+            )
+
     def _evaluate_comprehension(
         self, generator: ast.comprehension, expression: ast.AST
     ) -> TypeInfo:
         """Helper method to evaluate comprehension type propagation."""
         # Visit the iterable to get its type
         iter_type = self.visit(generator.iter)
+        self._check_enclosing_comprehension_iterable(
+            generator.iter, iter_type, [expression]
+        )
 
         # Get element type and evaluate expression in scope
         self.push_scope()
@@ -1230,7 +1461,27 @@ class TypePropagation(ast.NodeVisitor):
             raise exc.StatementNotSupported(
                 f"{name.capitalize()}s with multiple generators are not supported"
             )
-        return self._evaluate_comprehension(node.generators[0], node.elt)
+        generator = node.generators[0]
+        if self.device_loop_depth and generator.ifs:
+            if isinstance(node, ast.GeneratorExp):
+                raise exc.StatementNotSupported(
+                    "Filtered generator expressions inside device loops"
+                )
+            result = self._evaluate_filtered_comprehension(generator, node.elt)
+            assert isinstance(node, ExtendedAST)
+            previous = node._type_info
+            if isinstance(previous, SequenceType) and len(
+                previous.element_types
+            ) != len(result.element_types):
+                raise exc.StatementNotSupported(
+                    "Filtered comprehensions with changing lengths in an unrolled loop"
+                )
+        else:
+            result = self._evaluate_comprehension(generator, node.elt)
+        if isinstance(node, ast.GeneratorExp):
+            assert isinstance(result, SequenceType)
+            return GeneratorType(result.origin, result.element_types)
+        return result
 
     def visit_ListComp(self, node: ast.ListComp) -> TypeInfo:
         return self._visit_comprehension(node, "list comprehension")
@@ -1247,6 +1498,9 @@ class TypePropagation(ast.NodeVisitor):
 
         generator = node.generators[0]
         iter_type = self.visit(generator.iter)
+        self._check_enclosing_comprehension_iterable(
+            generator.iter, iter_type, [node.key, node.value]
+        )
 
         # Try to unpack the iterable
         try:

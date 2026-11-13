@@ -1716,7 +1716,17 @@ class SequenceType(CollectionType):
             self_elements = self.element_types
             other_elements = other.element_types
             if len(self_elements) == len(other_elements):
-                return SequenceType(
+                if isinstance(self, GeneratorType) or isinstance(other, GeneratorType):
+                    sequence_type = GeneratorType
+                elif (
+                    isinstance(self, MixedSequenceType)
+                    or isinstance(other, MixedSequenceType)
+                    or self.python_type is not other.python_type
+                ):
+                    sequence_type = MixedSequenceType
+                else:
+                    sequence_type = SequenceType
+                return sequence_type(
                     origin=other.origin,
                     element_types=self._maybe_tuple(
                         [
@@ -1731,6 +1741,17 @@ class SequenceType(CollectionType):
         self, fn: Callable[[TypeInfo], object]
     ) -> list[object] | tuple[object, ...]:
         return self._maybe_tuple([x.tree_map(fn) for x in self.element_types])
+
+
+class MixedSequenceType(SequenceType):
+    """A sequence whose runtime container can be either a list or a tuple."""
+
+    def as_literal(self) -> list[object] | tuple[object, ...]:
+        raise NotImplementedError
+
+
+class GeneratorType(SequenceType):
+    """A generator expression, tracked separately from reusable sequences."""
 
 
 class DictType(CollectionType):

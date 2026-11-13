@@ -112,6 +112,7 @@ if TYPE_CHECKING:
 tls: _TLS = cast("_TLS", threading.local())
 
 log = logging.getLogger(__name__)
+_SKIP_UNROLLED_RESULT = object()
 
 
 def _lerp_scalar_decomp(
@@ -1955,7 +1956,7 @@ class WalkDeviceAST(NodeVisitor):
         self,
         sequence_iter: ast.AST,
         target: ast.AST,
-        element_processor: Callable[[], object | None],
+        element_processor: Callable[[], object],
         preserve_scope: bool = False,
     ) -> list[object]:
         """Common logic for unrolling sequences in both loops and comprehensions."""
@@ -1971,18 +1972,16 @@ class WalkDeviceAST(NodeVisitor):
                 # For loops: don't create new scope, allow state to persist
                 self._assign(target, element_value)
                 result = element_processor()
-                if result is not None:
-                    results.append(result)
             else:
                 # For comprehensions: create isolated scope for each iteration
                 old_scope = self.scope.copy()
                 try:
                     self._assign(target, element_value)
                     result = element_processor()
-                    if result is not None:
-                        results.append(result)
                 finally:
                     self.scope = old_scope
+            if result is not _SKIP_UNROLLED_RESULT:
+                results.append(result)
 
         return results
 
@@ -1992,9 +1991,9 @@ class WalkDeviceAST(NodeVisitor):
     ) -> None:
         """Handle unrolling of loops that iterate over tuples of tensors."""
 
-        def execute_body() -> None:
+        def execute_body() -> object:
             self._body(node.body)
-            return None  # No result to collect for loops
+            return _SKIP_UNROLLED_RESULT
 
         self._handle_sequence_unrolling(
             node.iter, node.target, execute_body, preserve_scope=True
@@ -2431,12 +2430,11 @@ class WalkDeviceAST(NodeVisitor):
 
     def _visit_comprehension(
         self, node: ast.ListComp | ast.GeneratorExp, name: str
-    ) -> tuple[object, ...]:
+    ) -> list[object]:
         """Handle list comprehension or generator expression unrolling."""
         assert isinstance(node, ExtendedAST)
 
-        # Only handle simple cases with single generator and no if conditions
-        if len(node.generators) != 1 or node.generators[0].ifs:
+        if len(node.generators) != 1:
             raise exc.StatementNotSupported(f"Complex {name}s are not supported")
 
         generator = node.generators[0]
@@ -2452,18 +2450,26 @@ class WalkDeviceAST(NodeVisitor):
             f"{name.capitalize()}s over non-sequence types are not supported"
         )
 
-    def visit_ListComp(self, node: ast.ListComp) -> tuple[object, ...]:
+    def visit_ListComp(self, node: ast.ListComp) -> list[object]:
         return self._visit_comprehension(node, "list comprehension")
 
     def visit_GeneratorExp(self, node: ast.GeneratorExp) -> tuple[object, ...]:
-        return self._visit_comprehension(node, "generator expression")
+        return tuple(self._visit_comprehension(node, "generator expression"))
 
     def _handle_comprehension_unrolling(
         self, elt: ast.expr, generator: ast.comprehension
-    ) -> tuple[object, ...]:
+    ) -> list[object]:
         """Handle unrolling of comprehensions (list comp or generator exp) over sequences."""
 
         def evaluate_expression() -> object:
+            for condition in generator.ifs:
+                value = self.visit(condition)
+                if isinstance(value, _tracing_ops._symbolic_types):
+                    raise exc.StatementNotSupported(
+                        "Comprehension filters must be compile-time constant expressions"
+                    )
+                if not value:
+                    return _SKIP_UNROLLED_RESULT
             # Evaluate the comprehension expression
             result = self.visit(elt)
             # If the result is a SymInt that can be evaluated to a concrete value, do so
@@ -2474,11 +2480,9 @@ class WalkDeviceAST(NodeVisitor):
                     return result
             return result
 
-        results = self._handle_sequence_unrolling(
+        return self._handle_sequence_unrolling(
             generator.iter, generator.target, evaluate_expression, preserve_scope=False
         )
-        # Return as tuple to match the expected type for tuple unrolling
-        return tuple(results)
 
     def visit_DictComp(self, node: ast.DictComp) -> dict[object, object]:
         """Handle dict comprehension unrolling."""
@@ -2500,10 +2504,11 @@ class WalkDeviceAST(NodeVisitor):
 
         result: dict[object, object] = {}
 
-        def evaluate_key_value() -> None:
+        def evaluate_key_value() -> object:
             key = self.visit(node.key)
             value = self.visit(node.value)
             result[key] = value
+            return _SKIP_UNROLLED_RESULT
 
         self._handle_sequence_unrolling(
             generator.iter, generator.target, evaluate_key_value, preserve_scope=False
@@ -2563,7 +2568,7 @@ class WalkDeviceAST(NodeVisitor):
         if isinstance(target, ast.Tuple):
             # Handle tuple unpacking
             value = self.visit(node.value)
-            if not isinstance(value, tuple):
+            if not isinstance(value, (tuple, list)):
                 raise exc.InvalidAssignment
             if len(target.elts) != len(value):
                 raise exc.InvalidAssignment
