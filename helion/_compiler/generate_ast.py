@@ -996,6 +996,17 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         # pyrefly: ignore[bad-return, bad-argument-type]
         return node.new(fields)
 
+    @staticmethod
+    def _wrap_root_body(
+        grid_state: DeviceGridState, body: list[ast.AST]
+    ) -> list[ast.AST]:
+        """``body`` wrapped in the grid's lane loops, then given to the grid's
+        body finalizers."""
+        wrapped = grid_state.wrap_body(body)
+        for finalize in grid_state.body_finalizers:
+            finalize(wrapped)
+        return wrapped
+
     def visit_For(self, node: ast.For) -> ast.AST | None:
         assert isinstance(node, ExtendedAST)
         if node._loop_type == LoopType.GRID:
@@ -1110,7 +1121,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                                     self.statements_stack[-1].extend(wrapped_body)
                                 else:
                                     self.statements_stack[-1].extend(
-                                        grid_state.wrap_body(wrapped_body)
+                                        self._wrap_root_body(grid_state, wrapped_body)
                                     )
                                 self.statements_stack[-1].extend(
                                     grid_state.outer_suffix
@@ -1122,7 +1133,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                                     grid_state.outer_prefix
                                 )
                                 self.statements_stack[-1].extend(
-                                    grid_state.wrap_body(wrapped_body)
+                                    self._wrap_root_body(grid_state, wrapped_body)
                                 )
                                 self.statements_stack[-1].extend(
                                     grid_state.outer_suffix
