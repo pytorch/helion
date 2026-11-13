@@ -10,8 +10,10 @@ with no ``matmul2d`` and no threadgroup tile.
 from __future__ import annotations
 
 import functools
+import math
 import re
 import sys
+from typing import TYPE_CHECKING
 from typing import cast
 import unittest
 
@@ -26,7 +28,14 @@ from helion._testing.metal_fragment import e4m3
 from helion._testing.metal_fragment import fp8_rows
 from helion._testing.metal_fragment import nvfp4_rows
 from helion._testing.metal_fragment import views_epilogue
+from helion.autotuner.config_generation import ConfigGeneration
+from helion.autotuner.finite_search import FiniteSearch
 import helion.language as hl
+
+if TYPE_CHECKING:
+    from helion.autotuner.benchmark_provider import BenchmarkResult
+    from helion.autotuner.config_spec import ConfigSpec
+    from helion.runtime.kernel import BoundKernel
 
 DEVICE = "mps"
 F32 = torch.float32
@@ -45,10 +54,10 @@ _requires_mps = unittest.skipUnless(
 
 
 def _frag(
-    block_sizes: list[int], num_threads: list[int] | None = None
+    block_sizes: list[int], num_threads: list[int] | None = None, **knobs: object
 ) -> helion.Config:
     extra = {} if num_threads is None else {"num_threads": num_threads}
-    return helion.Config(block_sizes=block_sizes, **extra, **FRAG)
+    return helion.Config(block_sizes=block_sizes, **extra, **knobs, **FRAG)
 
 
 def _run(
@@ -293,6 +302,16 @@ class TestFragmentMma(unittest.TestCase):
                 out, msl = _run(dequant_rows, args, config)
                 self._close(out, ref)
                 self._assert_fragments(msl, transposed=True)
+        # Bound to static shapes, of its decode, ``(q - 8) * scale``, the
+        # code's conversion is a 16-entry lookup and the scale per group stays
+        # computed.
+        static = helion.kernel(dequant_rows.fn, backend="metal", static_shapes=True)
+        args, ref = _quantized("int4", 8, 64, 256)
+        config = _frag([16, 16, 64], [1, 1, 512], metal_tabulate_max_entries=16)
+        out, msl = _run(static, args, config)
+        self._close(out, ref)
+        self.assertIn("constant float _helion_table_0[16] = {", msl)
+        self.assertNotIn("_helion_table_1", msl)
 
     def test_nvfp4(self) -> None:
         """nvfp4 codes through half bits and a bitcast (view(dtype)), E4M3
@@ -304,7 +323,8 @@ class TestFragmentMma(unittest.TestCase):
         # The row's block of 1 grows to the B fragment's 8 columns, which the
         # element loops skip past the block.
         self.assertIn("if (_e_m < 1 && _e_n < 16) {", msl)
-        out, msl = _run(nvfp4_rows, (x, wq, s), _frag([16, 16, 64], [1, 1, 512]))
+        config = _frag([16, 16, 64], [1, 1, 512], metal_tabulate_max_entries=16)
+        out, msl = _run(nvfp4_rows, (x, wq, s), config)
         self._close(out, ref)
         self._assert_fragments(msl, transposed=True)
         # The steps are unrolled and each element's word and scale indices
@@ -326,6 +346,12 @@ class TestFragmentMma(unittest.TestCase):
             msl,
             r"\bx\[\(\(\(offset_\d+ \+ _e_m\) \* 256\) \+ \(offset_\d+ \+ _e_k\)\)\]",
         )
+        # The code's decode, from its nibble, is a lookup in a 16-entry table
+        # (metal_tabulate_max_entries=16; none without it).
+        self.assertIn("constant float _helion_table_0[16] = {", msl)
+        self.assertRegex(msl, r"= _helion_table_0\[v_\d+\];")
+        _, msl = _run(nvfp4_rows, (x, wq, s), _frag([16, 16, 64], [1, 1, 512]))
+        self.assertNotIn("_helion_table", msl)
 
     def test_fp8(self) -> None:
         """mxfp8 codes and E8M0 scales through hl.dot; a K tail (K = 224 in
@@ -338,6 +364,14 @@ class TestFragmentMma(unittest.TestCase):
         self._close(out, ref)
         self._assert_fragments(msl, transposed=True)
         self.assertRegex(msl, r"_e_k < \(end_\d+ - offset_\d+\)\) \? ")
+        self.assertNotIn("_helion_table", msl)
+        # A byte's decode takes a 256-entry table, and a 16-entry cap keeps it.
+        for cap, table in ((16, False), (256, True)):
+            with self.subTest(cap=cap):
+                config = _frag([16, 16, 64], metal_tabulate_max_entries=cap)
+                out, msl = _run(fp8_rows, args, config)
+                self._close(out, ref)
+                self.assertEqual("constant float _helion_table_0[256]" in msl, table)
         out, msl = _run(fp8_rows, args, _frag([16, 16, 16]))
         self._close(out, ref)
         self.assertRegex(
@@ -445,6 +479,79 @@ class TestFragmentMma(unittest.TestCase):
         message = "13 8x8 fragments live (max 9, 4 of them the K loop's other"
         with self.assertRaisesRegex(exc.BackendUnsupported, re.escape(message)):
             _run(two_groups, (x, y, z), _frag([16, 32, 16]))
+
+
+def _seeds(spec: ConfigSpec) -> list[helion.Config]:
+    """The spec's compiler seeds completed from the defaults, as the
+    search benchmarks them."""
+    return [config for _, config in ConfigGeneration(spec).seed_flat_config_pairs()]
+
+
+class _TimedSearch(FiniteSearch):
+    """A finite search that keeps its own measurements."""
+
+    def benchmark_batch(
+        self,
+        configs: list[helion.Config],
+        *,
+        desc: str = "Benchmarking",
+        raise_if_no_viable_config: bool = True,
+    ) -> list[BenchmarkResult]:
+        results = super().benchmark_batch(
+            configs, desc=desc, raise_if_no_viable_config=raise_if_no_viable_config
+        )
+        self.timings = {r.config: r.perf for r in results}
+        return results
+
+
+@_requires_mps
+class TestFragmentAutotune(unittest.TestCase):
+    def _search(
+        self,
+        bound: BoundKernel,
+        args: tuple[torch.Tensor, ...],
+        configs: list[helion.Config],
+    ) -> None:
+        """The autotuner over ``configs`` times every one, both lowerings
+        among them, and picks the fastest by its own measurements; which one
+        wins is the GPU's call, not the test's."""
+        search = _TimedSearch(bound, args, configs)
+        picked = search.autotune()
+        timings = search.timings
+        self.assertEqual(len(timings), len(configs))
+        self.assertTrue(all(math.isfinite(t) for t in timings.values()), timings)
+        lowerings = {c.config.get("metal_matmul", "mpp") for c in timings}
+        self.assertEqual(lowerings, {"mpp", "fragment"})
+        self.assertEqual(picked, min(timings, key=timings.__getitem__))
+
+    @pytest.mark.slow
+    def test_autotune_picks(self) -> None:
+        """A few-row nvfp4 matmul over the MPP default and the spec's seeds
+        (fragments with and without tables), and a large square one over MPP
+        tiles and the fragment seeds."""
+        (x, wq, s), _ = _quantized("nvfp4", 8, 4096, 4096)
+        bound = nvfp4_rows.bind((x, wq, s))
+        spec = bound.config_spec
+        configs = [spec.default_config(), *_seeds(spec)]
+        self.assertEqual(
+            {bool(c.config.get("metal_tabulate_max_entries")) for c in configs},
+            {False, True},
+        )
+        self._search(bound, (x, wq, s), configs)
+
+        a = torch.randn(4096, 4096, device=DEVICE, dtype=torch.float16)
+        b = torch.randn(4096, 4096, device=DEVICE, dtype=torch.float16)
+        bias = torch.randn(4096, device=DEVICE)
+        bound = views_epilogue.bind((a, b, bias))
+        base = bound.config_spec.default_config()
+        # The search reaches MPP's larger tiles by mutating block sizes; give
+        # them here, beside the default and the fragment seeds.
+        tiles = [base.config["block_sizes"], [32, 32, 32], [64, 64, 32]]
+        configs = [
+            *(helion.Config(**{**base.config, "block_sizes": t}) for t in tiles),
+            *_seeds(bound.config_spec),
+        ]
+        self._search(bound, (a, b, bias), configs)
 
 
 if __name__ == "__main__":

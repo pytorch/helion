@@ -31,6 +31,14 @@ METAL_MATMUL = "metal_matmul"
 METAL_MATMUL_CHOICES = ("mpp", "fragment")
 
 
+#: The most entries of a ``constant`` table a fragment element reads a value
+#: computed from a small bit field from (``tabulate``), 0 for none: the
+#: default.  A table replaces the field's decode with a load, which pays for
+#: a 4-bit field's decode but not always for a byte's.
+METAL_TABULATE = "metal_tabulate_max_entries"
+METAL_TABULATE_CHOICES = (0, 16, 256)
+
+
 @dataclasses.dataclass(frozen=True)
 class MetalKernelFacts:
     """What ``MetalBackend.register_search_surface`` found in the kernel
@@ -39,6 +47,9 @@ class MetalKernelFacts:
     #: Whether the kernel has K-loop matmuls and every one of them lowers on
     #: fragments (``fragment_mma``'s ``check_fragment_group``).
     fragment_matmuls: bool = False
+    #: The sizes of the tables those matmuls' fragment elements would read
+    #: (``tabulate.table_sizes``).
+    table_sizes: frozenset[int] = frozenset()
     #: The tunable tiles of each device loop, the grid's first (empty when it
     #: has none), when the kernel's matmuls lower on MPP's cooperative ops or
     #: on fragments, whose launches take whole SIMD groups (:func:`fit_threads`),
@@ -63,6 +74,13 @@ def kernel_facts(config_spec: ConfigSpec) -> MetalKernelFacts:
     return facts
 
 
+def metal_tabulate_max_entries(config: Mapping[str, object]) -> int:
+    """The config's ``metal_tabulate_max_entries``, 0 when it has none."""
+    value = config.get(METAL_TABULATE, METAL_TABULATE_CHOICES[0])
+    assert isinstance(value, int)
+    return value
+
+
 def metal_matmul(config: Mapping[str, object]) -> object:
     """The config's ``metal_matmul``, ``"mpp"`` when it has none."""
     return config.get(METAL_MATMUL, METAL_MATMUL_CHOICES[0])
@@ -71,6 +89,17 @@ def metal_matmul(config: Mapping[str, object]) -> object:
 def lowers_on_fragments(config_spec: ConfigSpec) -> bool:
     """Whether the kernel's K-loop matmuls all lower on fragments."""
     return kernel_facts(config_spec).fragment_matmuls
+
+
+def _table_choices(config_spec: ConfigSpec) -> tuple[int, ...]:
+    """The ``metal_tabulate_max_entries`` that generate different code for
+    the kernel: 0, and each cap that admits a table a smaller one doesn't."""
+    sizes = kernel_facts(config_spec).table_sizes
+    choices = [0]
+    for cap in METAL_TABULATE_CHOICES[1:]:
+        if any(choices[-1] < size <= cap for size in sizes):
+            choices.append(cap)
+    return tuple(choices)
 
 
 def fit_threads(config_spec: ConfigSpec, config: dict[str, object]) -> None:
@@ -165,39 +194,66 @@ def fit_threads(config_spec: ConfigSpec, config: dict[str, object]) -> None:
 
 
 class MetalSearchSurface(BackendSearchSurface):
-    config_keys = frozenset({METAL_MATMUL})
+    config_keys = frozenset({METAL_MATMUL, METAL_TABULATE})
 
     def extra_fields(self, config_spec: ConfigSpec) -> dict[str, ConfigSpecFragment]:
         """``metal_matmul`` where both lowerings apply: a kernel whose K-loop
-        matmuls all lower on fragments too."""
+        matmuls all lower on fragments too; ``metal_tabulate_max_entries``
+        where its fragment elements would read a table."""
         if not lowers_on_fragments(config_spec):
             return {}
-        return {METAL_MATMUL: EnumFragment(METAL_MATMUL_CHOICES)}
+        fields: dict[str, ConfigSpecFragment] = {
+            METAL_MATMUL: EnumFragment(METAL_MATMUL_CHOICES)
+        }
+        if len(tables := _table_choices(config_spec)) > 1:
+            fields[METAL_TABULATE] = EnumFragment(tables)
+        return fields
 
     def trim_reference_config(self, config_spec: ConfigSpec, config: Config) -> None:
-        """The default config leaves ``metal_matmul`` out, as before it was
-        searched: a config without it means MPP."""
+        """The default config leaves ``metal_matmul`` and
+        ``metal_tabulate_max_entries`` out, as before they were searched: a
+        config without them means MPP and no tables."""
         if metal_matmul(config.config) == METAL_MATMUL_CHOICES[0]:
             config.config.pop(METAL_MATMUL, None)
+        if metal_tabulate_max_entries(config.config) == 0:
+            config.config.pop(METAL_TABULATE, None)
 
     def seed_configs(self, config_spec: ConfigSpec) -> list[Config]:
         """Both lowerings in the initial population: the default is MPP's, so
-        seed a fragment config (one SIMD group per threadgroup, which the
-        fragment run takes)."""
+        seed fragment configs (one SIMD group per threadgroup, which the
+        fragment run takes), one per table cap that changes the code (the key
+        left out at 0)."""
         if not lowers_on_fragments(config_spec):
             return []
-        return [Config(metal_matmul="fragment", num_warps=1)]
+        seeds = []
+        for cap in _table_choices(config_spec):
+            seed = Config(metal_matmul="fragment", num_warps=1)
+            if cap:
+                seed.config[METAL_TABULATE] = cap
+            seeds.append(seed)
+        return seeds
 
     def normalize_knobs(
         self, config_spec: ConfigSpec, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
-        if metal_matmul(config) not in METAL_MATMUL_CHOICES:
+        for key, choices in (
+            (METAL_MATMUL, METAL_MATMUL_CHOICES),
+            (METAL_TABULATE, METAL_TABULATE_CHOICES),
+        ):
+            if key not in config:
+                continue
+            value = config[key]
+            # By type too: 16.0 == 16, and False == 0.
+            if value in choices and type(value) is type(choices[0]):
+                continue
             if not fix_invalid:
                 raise InvalidConfig(
-                    f"{METAL_MATMUL} must be one of {METAL_MATMUL_CHOICES}, got "
-                    f"{config[METAL_MATMUL]!r}"
+                    f"{key} must be one of {choices}, got {config[key]!r}"
                 )
-            del config[METAL_MATMUL]
+            del config[key]
+        if metal_matmul(config) != "fragment":
+            # Tables are read by fragment elements only.
+            config.pop(METAL_TABULATE, None)
         if metal_matmul(config) == "fragment" and (
             fix_invalid or "num_warps" not in config
         ):

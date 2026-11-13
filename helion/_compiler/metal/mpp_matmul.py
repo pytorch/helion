@@ -3550,7 +3550,7 @@ def names_read(node: ast.AST) -> set[str]:
         defs: set[str] = set()
         for s in node.body:
             inner |= names_read(s)
-            if (t := _target(s)) is not None:
+            if (t := assign_target(s)) is not None:
                 defs.add(t)
             elif isinstance(s, ast.Expr) and isinstance(s.value, ast.Call):
                 if call_name(s.value) == BIND:
@@ -3568,7 +3568,7 @@ def names_read(node: ast.AST) -> set[str]:
     }
 
 
-def _target(stmt: ast.stmt) -> str | None:
+def assign_target(stmt: ast.stmt) -> str | None:
     assigned = _assigned(stmt)
     return assigned[0] if assigned is not None else None
 
@@ -3675,7 +3675,7 @@ class _Copies:
             for t in a.targets:
                 if isinstance(t, ast.Name):
                     writes[t.id] = writes.get(t.id, 0) + 1
-            if (t := _target(a)) is not None:
+            if (t := assign_target(a)) is not None:
                 self.defs.setdefault(t, []).append(a)
             if isinstance(a.value, ast.Call) and call_name(a.value) == RUN:
                 anchors |= {name for _, name in _anchors(a.value) if name is not None}
@@ -3695,7 +3695,7 @@ class _Copies:
         while changed:
             changed = False
             for a in assigns:
-                t = _target(a)
+                t = assign_target(a)
                 if (
                     t is not None
                     and t not in self.recomputed
@@ -3725,7 +3725,7 @@ class _Copies:
 
     def take(self, s: ast.stmt) -> list[ast.stmt]:
         """The copies to emit before ``s``, which is rewritten to read them."""
-        t = _target(s)
+        t = assign_target(s)
         if t is None or t not in self.chain or t in self.reassigned or t in self.leaves:
             return []
         assert isinstance(s, ast.Assign)
@@ -3832,7 +3832,7 @@ def _materialized(body: list[ast.stmt], tg_buffers: frozenset[str]) -> set[str]:
     while changed:
         changed = False
         for a in assigns:
-            t = _target(a)
+            t = assign_target(a)
             if t is None or t in out:
                 continue
             reads = names_read(a.value)
@@ -3897,7 +3897,7 @@ def elementize(
     vec_reads = {
         t
         for a in _assigns(body)
-        if (t := _target(a)) and names_read(a.value) & vec_bufs
+        if (t := assign_target(a)) and names_read(a.value) & vec_bufs
     }
     leaves = _collectives(body, tg_buffers) - set(alias)
     per_thread = _materialized(body, tg_buffers)
@@ -4010,7 +4010,7 @@ def elementize(
         in body order, the recomputed statements of ``seen`` that the names
         ``reads`` depend on, and those statements.  None of them, nor any
         node of ``checked``, may exchange data between threads."""
-        defs = {t: s for s in seen if (t := _target(s)) is not None}
+        defs = {t: s for s in seen if (t := assign_target(s)) is not None}
         chosen: dict[int, ast.stmt] = {}
 
         def need(name: str) -> None:
@@ -4157,7 +4157,7 @@ def _prune(stmts: list[ast.stmt], live: set[str]) -> list[ast.stmt] | None:
     out: list[ast.stmt] = []
     changed = False
     for s in stmts:
-        t = _target(s)
+        t = assign_target(s)
         if t is not None and t not in live:
             assert isinstance(s, ast.Assign)
             if call_name(s.value) not in (ACC, RUN):
@@ -4233,7 +4233,10 @@ def _split_schedulable(loop: ast.For, coop: set[str]) -> bool:
             and call_name(s.value) in (STAGE, FENCE)
         )
         if not (
-            _is_run(s) or is_stage or _target(s) is not None or _is_coop_stmt(s, coop)
+            _is_run(s)
+            or is_stage
+            or assign_target(s) is not None
+            or _is_coop_stmt(s, coop)
         ):
             return False
     return not _vec_staged_after_op(loop)
@@ -4291,7 +4294,7 @@ def _split_lane_loop(loop: ast.For, lane: str, coop: set[str]) -> list[ast.stmt]
     for s in others:
         reads = names_read(s)
         read |= reads
-        if (t := _target(s)) is not None and reads & variant_names:
+        if (t := assign_target(s)) is not None and reads & variant_names:
             if t in read:
                 raise metal_unsupported(
                     f"a lane loop around an MPP op carries {t} across lanes, which "
@@ -4429,7 +4432,7 @@ def _distribute_lane_loop(
 
     def close() -> bool:
         nonlocal run, deferred
-        effects = [s for s in run if _target(s) not in pure]
+        effects = [s for s in run if assign_target(s) not in pure]
         if effects:
             have = set().union(*map(_defines, run))
             prefix: list[ast.stmt] = []
@@ -4567,7 +4570,7 @@ def _loads_first(
     budget = LaneArrayBudget(lanes)
     defs: dict[str, int] = {}
     for i, s in enumerate(body):
-        if (t := _target(s)) is not None:
+        if (t := assign_target(s)) is not None:
             assert t not in defs, t
             defs[t] = i
     moved: dict[int, str] = {}

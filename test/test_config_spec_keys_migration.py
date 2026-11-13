@@ -154,7 +154,7 @@ _BASE_VALID_KEYS = """
     cute_warp_fp32_redux cute_wide_packet_hints cute_warp_mma_warps epilogue_subtile flatten_loops
     host_tensor_descriptors indexing l2_groupings load_cache_modifiers
     load_eviction_policies loop_orders matrix_instr_nonkdim maxnreg metal_matmul
-    num_ctas num_sm_multiplier num_stages num_threads num_warps occupancy
+    metal_tabulate_max_entries num_ctas num_sm_multiplier num_stages num_threads num_warps occupancy
     pallas_emit_pipeline_group_size pallas_fold_dot_lhs_cast
     pallas_indirect_access_mode pallas_internal_scratch pallas_load_buffer_count
     pallas_loop_type pallas_pre_broadcast pallas_use_low_level_scheduler
@@ -312,8 +312,8 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_topk_value_mode cute_topk_vector_width cute_vector_packet_unroll
     cute_vector_widths cute_vloop_sink cute_warp_aggregated_atomics
     cute_warp_fp32_redux cute_wide_packet_hints cute_warp_mma_warps host_tensor_descriptors
-    load_cache_modifiers matrix_instr_nonkdim metal_matmul num_ctas num_threads
-    occupancy
+    load_cache_modifiers matrix_instr_nonkdim metal_matmul
+    metal_tabulate_max_entries num_ctas num_threads occupancy
     pallas_emit_pipeline_group_size pallas_fold_dot_lhs_cast
     pallas_indirect_access_mode pallas_load_buffer_count pallas_loop_type
     pallas_pre_broadcast pallas_use_low_level_scheduler pallas_worklist_grouping

@@ -82,6 +82,8 @@ from .mpp_matmul import static_tile
 from .mpp_matmul import storage_key
 from .mpp_matmul import view_args
 from .mpp_matmul import virtual_thread
+from .search_surface import metal_tabulate_max_entries
+from .tabulate import tabulate
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -352,9 +354,10 @@ def codegen_fragment_run(
     ``(_e_m or _e_n, _e_k)`` of a computed operand and ``wide`` marks a view
     whose indices may pass 2**31.  ``steps`` is the K tile's MMA steps,
     ``k_live`` its live length, which masks a computed operand's K tail
-    (None when every tile is whole), and ``facts`` the tile offsets'
-    ``(offset, multiple, least)`` (:func:`_offset_fact`), over which the run
-    folds its elements' index arithmetic."""
+    (None when every tile is whole), ``facts`` the tile offsets' ``(offset,
+    multiple, least)`` (:func:`_offset_fact`), over which the run folds its
+    elements' index arithmetic, and ``tables`` the config's
+    ``metal_tabulate_max_entries``."""
     backend = CompileEnvironment.current().backend
     m, n, k = static_tile(cg, (group.m_block, group.n_block, group.k_block))
     op = dict(zip((group.m_block, group.n_block), op_dims(group, m, n), strict=True))
@@ -408,7 +411,9 @@ def codegen_fragment_run(
     return expr_from_string(
         f"{RUN}({acc.id}, {group.gid}, {', '.join(parts)}, "
         f"anchors=[{anchor_list}], outer=[{', '.join(outers)}], steps={k // 8}, "
-        f"k_live={k_live}, facts={facts!r}, fragment=[{', '.join(sides)}])"
+        f"k_live={k_live}, facts={facts!r}, "
+        f"tables={metal_tabulate_max_entries(cg.device_function.config)}, "
+        f"fragment=[{', '.join(sides)}])"
     )
 
 
@@ -516,10 +521,12 @@ def fragment_run(
     its bindings, and is 0 past the K tile's live length; a view's is a
     masked load (:func:`_view_element`)."""
     grid = _keyword(acc_call, "fragment")
-    steps, k_live, facts, sides = (
-        _keyword(call, name) for name in ("steps", "k_live", "facts", "fragment")
+    steps, k_live, facts, tables, sides = (
+        _keyword(call, name)
+        for name in ("steps", "k_live", "facts", "tables", "fragment")
     )
     assert grid is not None and steps is not None and facts is not None
+    assert tables is not None
     assert isinstance(sides, ast.List)
     _, _, flipped = ast.literal_eval(grid)
     outer = run_outer(call)
@@ -561,7 +568,11 @@ def fragment_run(
     ]
     loop = ast.For(
         ast.Name("_it", ast.Store()),
-        ast.Call(ast.Name(FRAG_RUN, ast.Load()), [call.args[0], steps, facts], []),
+        ast.Call(
+            ast.Name(FRAG_RUN, ast.Load()),
+            [call.args[0], steps, facts, tables],
+            [],
+        ),
         body,
         [],
     )
@@ -676,12 +687,13 @@ def emit_fragment_acc(
 
 def _run_setup(
     stmt: ast.For, state: EmitState, root: str
-) -> tuple[int, list[tuple[ast.For, str, int, tuple[str, str]]], dict[str, Fact]]:
+) -> tuple[int, list[tuple[ast.For, str, int, tuple[str, str]]], dict[str, Fact], int]:
     """A fragment run's step count, its sides ``(loop, fragment array,
-    fragments, position declarations)`` and the facts its elements fold
-    over; ``root`` is its accumulator's."""
+    fragments, position declarations)``, the facts its elements fold
+    over and its table cap (``metal_tabulate_max_entries``); ``root`` is its
+    accumulator's."""
     assert isinstance(stmt.iter, ast.Call)
-    _, steps, facts_arg = stmt.iter.args
+    _, steps, facts_arg, tables = stmt.iter.args
     rows, cols, flipped = _grid(state, root)
     row, col = _element_names(flipped)
     a_loop, b_loop = stmt.body
@@ -710,7 +722,7 @@ def _run_setup(
             ),
         ),
     ]
-    return n_steps, sides, facts
+    return n_steps, sides, facts, ast.literal_eval(tables)
 
 
 def _element_body(
@@ -719,17 +731,22 @@ def _element_body(
     step: int,
     i: int,
     facts: dict[str, Fact],
+    tables: int,
     state: EmitState,
 ) -> list[ast.stmt]:
     """Element ``i`` of step ``step``'s statements, its position bound and
-    folded (``affine_fold``) over the run's facts and the kernel's
-    constants."""
+    folded (``affine_fold``) over the run's facts and the kernel's integer
+    constants, and its decodes tabulated (``tabulate``) under the cap
+    ``tables``."""
     env: dict[str, object] = {
-        name: Affine.of(value) for name, value in state.constants.items()
+        name: Affine.of(value)
+        for name, value in state.constants.items()
+        if isinstance(value, int)
     }
     env |= {"_fs": Affine.of(step), "_fi": Affine.of(i)}
     positions = ast.parse("\n".join(decls)).body
-    return fold([*positions, *loop.body], env, facts)[len(positions) :]
+    body = fold([*positions, *loop.body], env, facts)[len(positions) :]
+    return tabulate(body, state.constants, state.tables, tables)
 
 
 def emit_fragment_run(
@@ -757,14 +774,16 @@ def emit_fragment_run(
     lane's facts, the tile offsets' (codegen's ``facts``) and the kernel's
     integer constants: elements that read one word of packed codes, or one
     scale, then read it through one expression, whose loads the compiler
-    shares."""
+    shares.  Under a table cap (``metal_tabulate_max_entries``) each folded
+    element's chains from a low-bit field read their tables
+    (``tabulate``)."""
     pad = " " * indent
     inner = pad + "    "
     assert isinstance(stmt.iter, ast.Call)
     acc = stmt.iter.args[0]
     assert isinstance(acc, ast.Name)
     rows, cols, _ = _grid(state, state.coop[acc.id])
-    n_steps, sides, facts = _run_setup(stmt, state, state.coop[acc.id])
+    n_steps, sides, facts, tables = _run_setup(stmt, state, state.coop[acc.id])
     saved = state.put
     for step in range(n_steps):
         parts += [
@@ -781,7 +800,7 @@ def emit_fragment_run(
                     f"{inner}    constexpr short _fi = {i};",
                     *(f"{inner}    int {decl};" for decl in decls),
                 ]
-                body = _element_body(loop, decls, step, i, facts, state)
+                body = _element_body(loop, decls, step, i, facts, tables, state)
                 with state.isolated_scope():
                     emit_body(body, lines, indent + 8, state)
                 parts += [*lines, f"{inner}}}"]
@@ -795,14 +814,14 @@ def emit_fragment_run(
     state.put = saved
 
 
-def kernel_constants(body: list[ast.stmt]) -> dict[str, int]:
-    """The kernel's integer constants a fragment run folds over: names
-    assigned once in the whole kernel, an integer literal.  A name assigned
+def kernel_constants(body: list[ast.stmt]) -> dict[str, int | float]:
+    """The kernel's constants a fragment run folds over: names assigned
+    once in the whole kernel, an integer or float literal.  A name assigned
     anywhere else too (``mpp_matmul.assigned_names``) is not one, whatever
     the control flow; a fragment run's own statements are folded per element
     instead."""
     counts: collections.Counter[str] = collections.Counter()
-    literals: dict[str, int] = {}
+    literals: dict[str, int | float] = {}
     stack: list[ast.AST] = list(body)
     while stack:
         node = stack.pop()
@@ -813,7 +832,8 @@ def kernel_constants(body: list[ast.stmt]) -> dict[str, int]:
             and len(node.targets) == 1
             and isinstance(node.targets[0], ast.Name)
             and isinstance(node.value, ast.Constant)
-            and type(node.value.value) is int
+            and isinstance(node.value.value, (int, float))
+            and not isinstance(node.value.value, bool)
         ):
             literals[node.targets[0].id] = node.value.value
         counts.update(assigned_names(node))
