@@ -76,10 +76,11 @@ for trivial fixes and run it once over the finished stack
 (`scripts/autoreview.py origin/main..HEAD`) before handing a larger project
 back. Address every finding or explain why it does not apply. When it passes,
 add the `autoreview passed: ...` line it prints as the last line of each commit
-it covered (above any `stack-info:` line; AGENTS.md, Recording the review). If the review
-itself fails, stop and report it; do not substitute your own review. If it
-warns that only one reviewer (Claude or Codex) is installed, say so to the
-user.
+it covered (above any `stack-info:` line; AGENTS.md, Recording the
+review). If the review itself fails (a non-zero exit other than 3), stop and
+report it; do not substitute your own review. Exit status 3 means the tree
+changed during the review: restore it and review again. If it warns that only
+one reviewer (Claude or Codex) is installed, say so to the user.
 
 ## 6. Report
 
