@@ -31,6 +31,8 @@ from torch._inductor.utils import triton_type
 from torch._inductor.virtualized import OpsValue
 from torch._inductor.virtualized import V
 from torch._ops import OpOverload
+from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND
+from torch._prims_common import elementwise_dtypes
 from torch.fx._lazy_graph_module import _LazyGraphModule
 from torch.fx.experimental import proxy_tensor
 from torch.fx.experimental.sym_node import SymNode
@@ -1357,6 +1359,61 @@ def _is_plain_true_division(node: torch.fx.Node) -> bool:
     return False
 
 
+# Quotient dtypes the GPU backends divide in fp32 (16-bit operands widened).
+_FP32_DIVIDED_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+
+
+def rounds_its_quotient(node: torch.fx.Node) -> bool:
+    """Whether ``node`` divides and then truncates or floors the quotient:
+    ``div`` with a rounding mode, which ``//`` and ``floor_divide`` decompose
+    to.  One wrong last bit in such a quotient is a whole unit in the result
+    (an approximate 33 / 33 truncates to 0), so it needs the correctly
+    rounded division."""
+    return node.target in _MODE_DIVISION_TARGETS and not _is_plain_true_division(node)
+
+
+def rounds_before_truncating(
+    node: torch.fx.Node, dtype: torch.dtype, device: torch.device
+) -> bool:
+    """Whether eager on ``device`` rounds the quotient of ``node``, a
+    truncating division computed in ``dtype``, to that dtype before it
+    truncates it.  Its tensor-by-tensor kernel divides in the dtype, so a
+    16-bit quotient of 2.9998 is 3 by then; with a host scalar for a divisor
+    it multiplies by the scalar's fp32 reciprocal and truncates that product.
+    XPU's fp16 kernel truncates the unrounded quotient (2144 / 65 is 32
+    there and 33 on CUDA); its bf16 kernel rounds first."""
+    if dtype == torch.float16 and device.type == "xpu":
+        return False
+    divisor = node.args[1]
+    return (
+        dtype in (torch.float16, torch.bfloat16)
+        and isinstance(divisor, torch.fx.Node)
+        and isinstance(divisor.meta["val"], torch.Tensor)
+    )
+
+
+def division_dtype(node: torch.fx.Node) -> torch.dtype | None:
+    """The dtype ``node`` divides in: its result dtype, or the wider one its
+    tensor operands promote to.  ``x.div_(y)`` with a float32 ``x`` and a
+    float64 ``y`` lowers as ``aten.div`` on operands Inductor has promoted to
+    float64, and only the result is cast back to the dtype of ``x``
+    (``prepare_node_lowering``).  None when the result is not a tensor."""
+    result = node.meta.get("val")
+    if not isinstance(result, torch.Tensor):
+        return None
+    operands = [
+        value
+        for source in _value_input_occurrences(node)
+        if isinstance(value := source.meta["val"], torch.Tensor)
+    ]
+    if not operands:
+        return result.dtype
+    _, promoted = elementwise_dtypes(
+        *operands, type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT
+    )
+    return torch.promote_types(result.dtype, promoted)
+
+
 class GenerateASTFromInductor(DefaultHandler):
     def __init__(
         self,
@@ -1491,35 +1548,84 @@ class GenerateASTFromInductor(DefaultHandler):
             result = self._maybe_cast_to_expected_dtype(result)
         return self._lift(result)
 
+    def _division_dtype(self) -> torch.dtype | None:
+        """The dtype the current FX node divides in (``division_dtype``)."""
+        node = V.current_node
+        return None if node is None else division_dtype(node)
+
+    def _div_rn(self, a: object, b: object) -> str | None:
+        """The correctly rounded fp32 quotient of a division computed in fp32
+        (32-bit and 16-bit floats) where the backend's ``/`` is not one
+        (``HandlerOpOverrides.div_rn``), else None."""
+        if self._division_dtype() not in _FP32_DIVIDED_DTYPES:
+            return None
+        return self.handler_overrides.div_rn(self, a, b)
+
+    def div_rn(self, a: object, b: object) -> str:  # type: ignore[override]
+        """The round-to-nearest quotient a lowering asks for (floor division,
+        ``addcdiv``).
+
+        Inductor's Triton ``div_rn`` picks ``tl.div_rn`` by the dtype its
+        operands carry, and the names this handler passes carry none, so it
+        fell back to ``/``: floor division then floored the approximate
+        quotient (``div.full`` gives 33 / 33 just below 1, so ``33 // 33``
+        was 0).
+
+        ``addcdiv`` asks so that its quotient rounds as eager's, not because
+        an integer comes out of it: under ``fast_math`` it keeps ``/``.
+        """
+        node = V.current_node
+        if (
+            CompileEnvironment.current().settings.fast_math
+            and node is not None
+            and not rounds_its_quotient(node)
+        ):
+            return self._default("div_rn", (a, b), {})
+        exact = self._div_rn(a, b)
+        return self._default("div_rn", (a, b), {}) if exact is None else exact
+
     def truediv(self, a: object, b: object) -> str:  # type: ignore[override]
         """Divide; under ``fast_math`` the Triton backend takes the approximate divide.
 
-        Triton's ``/`` on fp32 is ``div.full.f32`` (2 ulp over the full range).
-        ``fast_dividef`` is ``div.approx.ftz.f32``: cheaper at the same 2 ulp,
-        but a subnormal divisor gives +-inf, a subnormal quotient flushes to
-        zero and a divisor above 2**126 gives 0, so it is only emitted when the
+        Triton's ``/`` on fp32 is ``div.full.f32`` (2 ulp over the full range,
+        a reciprocal and a multiply).  ``fast_dividef`` is
+        ``div.approx.ftz.f32``: cheaper at the same 2 ulp, but a subnormal
+        divisor gives +-inf, a subnormal quotient flushes to zero and a
+        divisor above 2**126 gives 0, so it is only emitted when the
         ``fast_math`` setting opts the kernel into approximations -- the same
         contract the CuTe backend follows (IEEE divide by default, approximate
-        reciprocal multiply under the setting).  It is emitted only for the
-        plain true divisions (``aten.div`` without a rounding mode); a quotient
-        that feeds ``trunc``/``floor`` in the same node must be exact, so the
-        rounding-mode divisions, ``floor_divide`` and ``remainder`` keep the
-        default.  Like Triton's ``/``, the result stays fp32 (half-precision
-        and integer operands are promoted to fp32 first); the consumer casts.
-        TileIR shares the Triton codegen but has no libdevice ``fast_dividef``,
-        so it keeps the exact divide under the setting.
+        reciprocal multiply under the setting).  Like Triton's ``/``, the
+        result stays fp32 (half-precision and integer operands are promoted
+        to fp32 first); the consumer casts.  TileIR shares the Triton codegen
+        but has no libdevice ``fast_dividef``, so it keeps ``/`` under the
+        setting.
+
+        A quotient its node truncates (``div`` with ``rounding_mode="trunc"``;
+        the floor mode's comes through ``div_rn``) is the correctly rounded
+        one where the backend has it (``HandlerOpOverrides.div_rn``),
+        with or without ``fast_math``: one wrong last bit there is a whole
+        unit in the result.  Inductor's lowering truncates ``/``, which gave
+        ``torch.div(33., 33., rounding_mode="trunc")`` as 0.  That quotient
+        is then rounded to a 16-bit dtype where eager's is
+        (``rounds_before_truncating``) and widened again, for a backend's
+        ``trunc`` that takes no 16-bit value.
         """
         env = CompileEnvironment.current()
+        node = V.current_node
+        if node is not None and rounds_its_quotient(node):
+            exact = self._div_rn(a, b)
+            if exact is None:
+                return self._default("truediv", (a, b), {})
+            dtype = division_dtype(node)
+            if dtype is not None and rounds_before_truncating(node, dtype, env.device):
+                rounded = self._cast_ast(self._to_ast(exact), dtype)
+                return self._lift(self._cast_ast(rounded, torch.float32))
+            return exact
         if env.backend.name != "triton" or not env.settings.fast_math:
             return self._default("truediv", (a, b), {})
-        node = V.current_node
         if node is None or not _is_plain_true_division(node):
             return self._default("truediv", (a, b), {})
-        if self._expected_tensor_dtype() not in (
-            torch.float32,
-            torch.float16,
-            torch.bfloat16,
-        ):
+        if self._division_dtype() not in _FP32_DIVIDED_DTYPES:
             return self._default("truediv", (a, b), {})
         return self._lift(
             expr_from_string(
