@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
+import re
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -193,3 +194,45 @@ def _broadcast_model(code: str, x: torch.Tensor) -> torch.Tensor:
         namespace["tgid"] = (row, 0, 0)
         namespace[device.name](_Pointer(x), _Pointer(out))
     return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def grid_lane_argmax(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.size()
+    out = torch.empty([m], dtype=torch.int64, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n], block_size=[1, None]):
+        out[tile_m] = torch.argmax(x[tile_m, tile_n], -1)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def grid_lane_sum_in_branch(x: torch.Tensor, flag: int) -> torch.Tensor:
+    m, n = x.size()
+    out = torch.zeros([m], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n], block_size=[1, None]):
+        if flag > 0:
+            out[tile_m] = x[tile_m, tile_n].sum(-1)
+    return out
+
+
+@pytest.mark.parametrize(
+    ("kernel", "args", "op"),
+    [
+        (grid_lane_argmax, (), "argmax"),
+        (grid_lane_sum_in_branch, (1,), "sum"),
+    ],
+    ids=["argmax", "sum_in_branch"],
+)
+def test_grid_lane_loop_reduction_rejected(
+    kernel: helion.Kernel, args: tuple[object, ...], op: str
+) -> None:
+    """A root tile's lane loop is split around its reductions
+    (``GridLaneSplit``) except where no split applies: argmax has no lane
+    fold, and a reduction in a branch is not a top-level statement of the
+    lane loop."""
+    bound = cpu_bind(kernel, (torch.randn(4, 64), *args))
+    with pytest.raises(
+        exc.BackendUnsupported,
+        match=re.escape(f"{op} reduction over an axis strided by a tile lane loop"),
+    ):
+        bound.to_code(helion.Config(block_sizes=[64], num_threads=[16]))

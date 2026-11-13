@@ -1,14 +1,17 @@
-"""Reductions over a tile block that its own device loop walks in a lane loop.
+"""Reductions over a tile block that its own loop walks in a lane loop.
 
-A tile block wider than its threads is walked by a lane loop that its
-``DeviceLoopState`` wraps around the whole loop body, on one thread or on each
-of several.  Every consumer of a reduction over that block needs all of its
-lanes, so the lane loop is split into passes, as CuTe's
-``split_lane_loop_reductions`` does for CuTe DSL:
+A tile block wider than its threads is walked by a lane loop, on one thread
+or on each of several.  A device loop's ``DeviceLoopState`` wraps its lane
+loop around the whole loop body; a root tile's ``DeviceGridState`` wraps its
+lane loop around the whole root body.  Every consumer of a reduction over
+that block needs all of its lanes, so the lane loop is split into passes, as
+CuTe's ``split_lane_loop_reductions`` does for CuTe DSL:
 
 - each reduction emits a marker ``r = _metal_lane_reduce(x)`` at the top
-  level of the lane body (:meth:`LaneSplit.emit_marker`), and the device loop
-  gets the :class:`LaneSplit` as a body finalizer;
+  level of the lane body (:meth:`_LaneReductions.emit_marker`), and the loop
+  gets the split as a body finalizer: a :class:`LaneSplit` for a device loop,
+  a :class:`GridLaneSplit` for a root tile, which runs on the statements
+  ``DeviceGridState.wrap_body`` returns;
 - once the body is complete, each statement is lane-variant (it reads the
   lane, transitively) or lane-invariant, a marker's result being invariant.
   A marker's stage is one more than its input's, any other statement's the
@@ -20,8 +23,8 @@ lanes, so the lane loop is split into passes, as CuTe's
 - a fold over a block that also has threads folds each thread's lanes into a
   partial, and one collective after the pass combines the threads.  The
   collective runs outside every lane loop, at the top level of the device
-  loop body, so every thread of the threadgroup reaches it in the same
-  iteration.
+  loop body (or of the root body), so every thread of the threadgroup
+  reaches it in the same iteration.
 
 A narrow load that several passes recompute is read once: the first pass
 keeps each lane's value in a per-thread array that the later passes read, as
@@ -65,6 +68,7 @@ from ..ast_read_writes import ReadWrites
 from ..compile_environment import CompileEnvironment
 from ..device_function import TensorArg
 from ..reduction_strategy import reduction_acc_dtype
+from ..tile_strategy import DeviceGridState
 from ..tile_strategy import DeviceLoopState
 from ..tile_strategy import _clone_lane_loop_with_body
 from ..tile_strategy import _current_rename_groups
@@ -87,6 +91,7 @@ if TYPE_CHECKING:
     from ..device_function import DeviceFunction
     from ..generate_ast import GenerateAST
     from ..inductor_lowering import CodegenState
+    from ..tile_strategy import DeviceLoopOrGridState
 
 MARKER = "_metal_lane_reduce"
 
@@ -142,13 +147,20 @@ class LaneBody:
 
 
 @dataclasses.dataclass
-class LaneSplit:
-    """The lane reductions of one device loop, split once its body is done."""
+class _LaneReductions:
+    """The lane reductions over one lane loop's block: their markers, and the
+    lane folds that replace them when the lane loop stays whole."""
 
     fn: DeviceFunction
-    loop: DeviceLoopState
     lane_var: str
-    reductions: dict[str, LaneReduction] = dataclasses.field(default_factory=dict)
+    reductions: dict[str, LaneReduction] = dataclasses.field(
+        default_factory=dict, kw_only=True
+    )
+
+    @property
+    def owner(self) -> DeviceLoopOrGridState:
+        """The device loop or grid whose block the lane loop walks."""
+        raise NotImplementedError
 
     def emit_marker(
         self,
@@ -181,10 +193,11 @@ class LaneSplit:
         state.add_statement(statement_from_string(f"{result} = {MARKER}({input_name})"))
         return result
 
-    def __call__(self) -> None:
-        loop = self.loop
-        parent, lane_loop = _find_lane_loop(loop, self.lane_var)
-        groups = _merge_carried_names(_current_rename_groups(), loop.carried_names)
+    def split(
+        self, parent: list[ast.AST], lane_loop: ast.For, groups: dict[str, str]
+    ) -> None:
+        """Replace ``lane_loop``, an element of ``parent``, by its passes, or
+        fold its markers in place when it holds a cooperative MPP op."""
         statements: list[ast.AST] = [*lane_loop.body]
         body = _lane_body(statements, self, groups)
         if any(map(_is_mpp_effect, statements)):
@@ -194,9 +207,6 @@ class LaneSplit:
         check_schedule(body, schedule)
         position = next(i for i, stmt in enumerate(parent) if stmt is lane_loop)
         parent[position : position + 1] = _emit(body, schedule, lane_loop, self.fn)
-        # The passes now hold the body; statements added to the loop later go
-        # beside them.
-        loop.inner_statements = parent
 
     def _folded(self, lane_loop: ast.For) -> list[ast.stmt]:
         """The lane body with each marker turned into a lane fold, followed
@@ -223,6 +233,97 @@ class LaneSplit:
                     statement_from_string(f"{r.result} = {r.thread_combine}")
                 )
         return statements
+
+
+@dataclasses.dataclass
+class LaneSplit(_LaneReductions):
+    """The lane reductions of one device loop, split once its body is done."""
+
+    loop: DeviceLoopState
+
+    @property
+    def owner(self) -> DeviceLoopState:
+        return self.loop
+
+    def __call__(self) -> None:
+        loop = self.loop
+        parent, lane_loop = _find_lane_loop(loop, self.lane_var)
+        groups = _merge_carried_names(_current_rename_groups(), loop.carried_names)
+        self.split(parent, lane_loop, groups)
+        # The passes now hold the body; statements added to the loop later go
+        # beside them.
+        loop.inner_statements = parent
+
+
+@dataclasses.dataclass
+class GridLaneSplit(_LaneReductions):
+    """The lane reductions over a root tile block that the grid's lane loop
+    walks, split once the root body is wrapped in that loop.
+
+    The grid's lane loop wraps the whole root body, carry initializations
+    included, so no value is carried across its lanes from outside; the root
+    body's statements outside every lane loop run once per thread, and each
+    collective combining the threads' partials sits among them, where every
+    thread of the threadgroup reaches it.
+    """
+
+    grid: DeviceGridState
+
+    @property
+    def owner(self) -> DeviceGridState:
+        return self.grid
+
+    def __call__(self, body: list[ast.AST]) -> None:
+        groups = _current_rename_groups()
+        lane_loops = [
+            stmt
+            for stmt in body
+            if isinstance(stmt, ast.For)
+            and getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None) == self.lane_var
+            and any(_marker_result(inner) is not None for inner in stmt.body)
+        ]
+        placed = {
+            result
+            for lane_loop in lane_loops
+            for inner in lane_loop.body
+            if (result := _marker_result(inner)) is not None
+        }
+        if placed != self.reductions.keys():
+            raise _unsupported(
+                "lane reduction over a root tile block: the reduction is not a "
+                "top-level statement of the grid's lane loop"
+            )
+        for lane_loop in lane_loops:
+            self.split(body, lane_loop, groups)
+
+
+def grid_lane_split_for(
+    state: CodegenState, fn: DeviceFunction, block_id: int, reduction_type: str
+) -> GridLaneSplit | None:
+    """The split for a reduction over root tile block ``block_id`` when the
+    grid's only lane loop walks the block, on one thread or on each of
+    several threads, and the reduction is a top-level statement of the root
+    body, outside every device loop; None for any other layout."""
+    codegen = state.codegen
+    grid = codegen.current_grid_state
+    if (
+        not isinstance(grid, DeviceGridState)
+        or block_id not in grid.lane_loop_blocks
+        or len(grid.lane_loops) != 1
+        or grid.vec_lane_wrappers
+        or reduction_type not in SUPPORTED_REDUCTIONS
+        # The root body renders into a list pushed above the grid's parent.
+        or codegen.statements_stack[-2] is not grid.hoist_parent_statements
+    ):
+        return None
+    split = next(
+        (f for f in grid.body_finalizers if isinstance(f, GridLaneSplit)), None
+    )
+    if split is None:
+        ((lane_var, _),) = grid.lane_loops
+        split = GridLaneSplit(fn, lane_var, grid)
+        grid.body_finalizers.append(split)
+    return split
 
 
 def lane_split_for(
@@ -253,7 +354,7 @@ def lane_split_for(
     split = next((f for f in loop.body_finalizers if isinstance(f, LaneSplit)), None)
     if split is None:
         (lane_var, _) = loop.lane_loops[0]
-        split = LaneSplit(fn, loop, lane_var)
+        split = LaneSplit(fn, lane_var, loop)
         loop.body_finalizers.append(split)
     return split
 
@@ -343,12 +444,12 @@ def _is_name_assign(stmt: ast.AST) -> bool:
 
 
 def _lane_body(
-    statements: list[ast.AST], split: LaneSplit, groups: dict[str, str]
+    statements: list[ast.AST], lanes: _LaneReductions, groups: dict[str, str]
 ) -> LaneBody:
     def canonical(names: Iterable[str]) -> set[str]:
         return {groups.get(name, name) for name in names}
 
-    tensors = {arg.name for arg in split.fn.arguments if isinstance(arg, TensorArg)}
+    tensors = {arg.name for arg in lanes.fn.arguments if isinstance(arg, TensorArg)}
 
     def tensors_in(pointer: ast.expr) -> set[str]:
         names = {node.id for node in ast.walk(pointer) if isinstance(node, ast.Name)}
@@ -357,7 +458,7 @@ def _lane_body(
     reductions: dict[int, LaneReduction] = {}
     for index, stmt in enumerate(statements):
         if (result := _marker_result(stmt)) is not None:
-            reductions[index] = split.reductions[result]
+            reductions[index] = lanes.reductions[result]
         elif not (_is_store(stmt) or _is_name_assign(stmt) or _is_mpp_effect(stmt)):
             raise _unsupported(
                 "lane reduction beside a statement the split cannot schedule: "
@@ -385,7 +486,7 @@ def _lane_body(
         )
     # Kernel arguments may share memory at any call (``kernel(x, out=x)``),
     # which fake tensors don't show.
-    disjoint = split.fn.proven_disjoint_tensor_pairs()
+    disjoint = lanes.fn.proven_disjoint_tensor_pairs()
     for tensor, other in itertools.product(sorted(stored), sorted(stored | loaded)):
         if tensor != other and frozenset((tensor, other)) not in disjoint:
             raise _unsupported(

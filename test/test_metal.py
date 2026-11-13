@@ -7067,6 +7067,112 @@ class TestMetalLaneLoopReductions(unittest.TestCase):
 
 
 @helion.kernel(backend="metal", static_shapes=True)
+def grid_lane_row_norm(x: torch.Tensor) -> torch.Tensor:
+    """Per row, x / |x| + max(x): two reductions over the root tile block,
+    then a store that needs both."""
+    m, n = x.size()
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile([m, n], block_size=[1, None]):
+        v = x[tile_m, tile_n].to(torch.float32)
+        sum_sq = torch.sum(v * v, -1)
+        hi = torch.amax(v, -1)
+        out[tile_m, tile_n] = (v * torch.rsqrt(sum_sq)[:, None] + hi[:, None]).to(
+            x.dtype
+        )
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def grid_lane_softmax(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.size()
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile([m, n], block_size=[1, None]):
+        v = x[tile_m, tile_n]
+        e = torch.exp(v - torch.amax(v, -1, keepdim=True))
+        out[tile_m, tile_n] = e / torch.sum(e, -1, keepdim=True)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def grid_lane_row_sums(x: torch.Tensor) -> torch.Tensor:
+    """Several rows per tile: the reduced block's threads combine per row,
+    and the store of the sum runs once per thread, after the pass."""
+    m, n = x.size()
+    out = torch.empty([m], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        out[tile_m] = x[tile_m, tile_n].sum(-1)
+    return out
+
+
+@_requires_darwin
+class TestMetalGridLaneLoopReductions(unittest.TestCase):
+    """A reduction over a root tile block that the grid's lane loop walks
+    splits that lane loop into passes, as a device loop's lane loop is split
+    (``TestMetalLaneLoopReductions``); a block on several threads combines
+    their partials once per pass, outside the lane loops."""
+
+    def _run(
+        self, kernel: helion.Kernel, config: helion.Config, *args: object
+    ) -> tuple[object, str]:
+        bound = kernel.bind(args)
+        code = bound.to_code(config)
+        self.assertNotIn(lane_reduction.MARKER, code)
+        return bound.compile_config(config)(*args), code
+
+    def test_two_reductions_then_a_store(self) -> None:
+        """Both folds share the first pass; the store gets the second.  The
+        root block on threads x lanes, on lanes alone, and with a tail
+        (200 of a 256 block); bf16 lanes kept in a lane array for the store
+        pass."""
+        cases = [
+            (128, 32, torch.float32),
+            (128, 1, torch.float32),
+            (200, 64, torch.bfloat16),
+        ]
+        for (n, threads, dtype), static_shapes in itertools.product(
+            cases, (True, False)
+        ):
+            with self.subTest(
+                n=n, threads=threads, dtype=dtype, static_shapes=static_shapes
+            ):
+                x = torch.randn(6, n, device=DEVICE, dtype=dtype)
+                block = 1 << (n - 1).bit_length()
+                config = helion.Config(block_sizes=[block], num_threads=[threads])
+                kernel = helion.kernel(
+                    grid_lane_row_norm.fn,
+                    backend="metal",
+                    static_shapes=static_shapes,
+                )
+                out, code = self._run(kernel, config, x)
+                xf = x.float()
+                expected = xf * xf.square().sum(-1, keepdim=True).rsqrt()
+                expected = (expected + xf.amax(-1, keepdim=True)).to(dtype)
+                torch.testing.assert_close(out, expected)
+                self.assertEqual(code.count("for lane_"), 2)
+                self.assertEqual(code.count("helion_red.group_"), 2 * (threads > 1))
+                self.assertEqual(
+                    "_lanes = _metal_lane_array" in code, dtype == torch.bfloat16
+                )
+
+    def test_dependent_reductions(self) -> None:
+        """The sum needs the max: three passes."""
+        x = torch.randn(5, 512, device=DEVICE)
+        config = helion.Config(block_sizes=[512], num_threads=[128])
+        out, code = self._run(grid_lane_softmax, config, x)
+        torch.testing.assert_close(out, x.softmax(-1))
+        self.assertEqual(code.count("for lane_"), 3)
+
+    def test_rows_on_threads(self) -> None:
+        """Four rows per tile, each on its own threads: 4 x 32 threads, each
+        with 8 lanes of its row (a 200 tail of a 256 block)."""
+        x = torch.randn(10, 200, device=DEVICE)
+        config = helion.Config(block_sizes=[4, 256], num_threads=[4, 32])
+        out, code = self._run(grid_lane_row_sums, config, x)
+        torch.testing.assert_close(out, x.sum(-1), rtol=1e-5, atol=1e-5)
+        self.assertEqual(code.count("for lane_"), 1)
+
+
+@helion.kernel(backend="metal", static_shapes=True)
 def lane_product_m2(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     m, n = x.size()
     out = torch.empty([m], dtype=torch.float32, device=x.device)
