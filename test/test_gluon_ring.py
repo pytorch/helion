@@ -24,6 +24,7 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessGluon
 import helion.language as hl
 from helion.runtime import timeline
+from helion.runtime.triton.launcher import get_cluster_capacity
 
 RING = {
     "indexing": "tensor_descriptor",
@@ -458,6 +459,93 @@ def scale_by_last_row(x: torch.Tensor) -> torch.Tensor:
         for tile_n in hl.tile(x.size(1)):
             last = x[x.size(0) - 1, tile_n]
             out[tile_m, tile_n] = x[tile_m, tile_n] * last[None, :]
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def split_k_parts(
+    x: torch.Tensor, w4: torch.Tensor, part: torch.Tensor
+) -> torch.Tensor:
+    """Split K: the tasks of one block of 64 rows write their parts
+    (``part``), the next root sums them.  ``w4``: [n / 64, k / 128, 64, 128]."""
+    t, k = x.size()
+    blocks, steps, rows, block_k = w4.size()
+    splits = part.size(0)
+    out = torch.empty([t, blocks * rows], dtype=torch.float32, device=x.device)
+    out3 = out.view(t, blocks, rows)
+    part4 = part.view(splits, t, blocks, rows)
+    x3 = x.view(t, steps, block_k)
+    k_len = k // splits
+    for tile_s, tile_b in hl.tile([splits, blocks], block_size=[1, 1]):
+        acc = hl.zeros([rows, t], dtype=torch.float32)
+        for tile_k in hl.tile(k_len, block_size=block_k):
+            kb = (tile_s.begin * k_len + tile_k.begin) // block_k
+            w_k = hl.load(
+                w4,
+                [
+                    tile_b.id + hl.zeros([], dtype=torch.int32),
+                    kb + hl.zeros([], dtype=torch.int32),
+                    slice(None),
+                    slice(None),
+                ],
+            )
+            acc = hl.dot(w_k, x3[:, kb, :].permute(1, 0), acc=acc)
+        part4[tile_s.begin, :, tile_b.begin, :] = acc.permute(1, 0)
+    for tile_c in hl.tile(blocks, block_size=1):
+        out3[:, tile_c.begin, :] = torch.sum(part4[:, :, tile_c.begin, :], dim=0)
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def split_k_parts_each_step(
+    x: torch.Tensor, w4: torch.Tensor, part: torch.Tensor
+) -> torch.Tensor:
+    """``split_k_parts`` storing its parts at every K step."""
+    t, k = x.size()
+    blocks, steps, rows, block_k = w4.size()
+    splits = part.size(0)
+    out = torch.empty([t, blocks * rows], dtype=torch.float32, device=x.device)
+    out3 = out.view(t, blocks, rows)
+    part4 = part.view(splits, t, blocks, rows)
+    x3 = x.view(t, steps, block_k)
+    k_len = k // splits
+    for tile_s, tile_b in hl.tile([splits, blocks], block_size=[1, 1]):
+        acc = hl.zeros([rows, t], dtype=torch.float32)
+        for tile_k in hl.tile(k_len, block_size=block_k):
+            kb = (tile_s.begin * k_len + tile_k.begin) // block_k
+            w_k = hl.load(
+                w4,
+                [
+                    tile_b.id + hl.zeros([], dtype=torch.int32),
+                    kb + hl.zeros([], dtype=torch.int32),
+                    slice(None),
+                    slice(None),
+                ],
+            )
+            acc = hl.dot(w_k, x3[:, kb, :].permute(1, 0), acc=acc)
+            part4[tile_s.begin, :, tile_b.begin, :] = acc.permute(1, 0)
+    for tile_c in hl.tile(blocks, block_size=1):
+        out3[:, tile_c.begin, :] = torch.sum(part4[:, :, tile_c.begin, :], dim=0)
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def split_k_tiles(x: torch.Tensor, w: torch.Tensor, part: torch.Tensor) -> torch.Tensor:
+    """Split K over tiles of the output, the split the slower task axis."""
+    t, k = x.size()
+    n = w.size(0)
+    splits = part.size(0)
+    out = torch.empty([t, n], dtype=torch.float32, device=x.device)
+    k_len = k // splits
+    for tile_n, tile_s in hl.tile([n, splits], block_size=[64, 1]):
+        acc = hl.zeros([tile_n, t], dtype=torch.float32)
+        for tile_k in hl.tile(
+            tile_s.begin * k_len, tile_s.begin * k_len + k_len, block_size=128
+        ):
+            acc = hl.dot(w[tile_n, tile_k], x[:, tile_k].permute(1, 0), acc=acc)
+        part[tile_s.begin, :, tile_n] = acc.permute(1, 0)
+    for tile_c in hl.tile(n, block_size=64):
+        out[:, tile_c] = part[:, :, tile_c].sum(0)
     return out
 
 
@@ -1265,6 +1353,117 @@ class TestGluonRing(TestCase):
         _, references = code_and_output(scale_then_nested_wx, (x, w, v), **nested_ring)
         for got, expected in zip(outs, references, strict=True):
             torch.testing.assert_close(got, expected, atol=0, rtol=0)
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_cluster_edge(self) -> None:
+        """A split and combine pair's parts travel in clusters of two CTAs
+        (``cross_loop_cluster_edges``): a block's two K splits run on the CTAs
+        of one cluster, which send them into rank 0's shared memory, and its
+        sum on rank 0, which reads them there."""
+        x = torch.randn([16, 1024], device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16)
+        w4 = w.view(16, 64, 8, 128).permute(0, 2, 1, 3).contiguous()
+        part = torch.zeros([2, 16, 1024], device=DEVICE, dtype=torch.float32)
+        args = (x, w4, part)
+        bound = split_k_parts.bind(args)
+        self.assertEqual(bound.config_spec.cross_loop_cluster_edges.length, 1)
+        ring = {**RING, "num_warps": 4, "cross_loop_pipeline": "static"}
+        code, out = code_and_output(
+            split_k_parts, args, **ring, cross_loop_cluster_edges=[True]
+        )
+        plain, reference = code_and_output(split_k_parts, args, **ring)
+        torch.testing.assert_close(out, reference, atol=0, rtol=0)
+        self.assertNotIn("cluster_send", plain)
+        self.assertIn("_cluster_size=2", code)
+        body = _functions(code)["_helion_split_k_parts_body"]
+        self.assertEqual(body.count("cluster_send("), 1)
+        self.assertEqual(body.count("cluster_recv("), 1)
+        # One slab of 2 x 16 x 64 fp32 parts after the 128-byte header.
+        self.assertIn("cluster_entry(9216, '8192')", code)
+        # Launches back to back on changing inputs match the counter edge's.
+        run = bound.compile_config(
+            helion.Config(**ring, cross_loop_cluster_edges=[True])
+        )
+        run_reference = bound.compile_config(helion.Config(**ring))
+        for launch in range(3):
+            x_launch = x + launch
+            torch.testing.assert_close(
+                run(x_launch, w4, part),
+                run_reference(x_launch, w4, part),
+                atol=0,
+                rtol=0,
+            )
+        # Four splits a block: clusters of four, of workers that all fit at
+        # once in clusters of four.
+        device = torch.device(DEVICE)
+        reserved = torch.cuda.get_device_properties(
+            device
+        ).multi_processor_count - get_cluster_capacity(device, 4)
+        part4 = torch.zeros([4, 16, 1024], device=DEVICE, dtype=torch.float32)
+        code4, out4 = code_and_output(
+            helion.kernel(
+                static_shapes=True, backend="gluon", persistent_reserved_sms=reserved
+            )(split_k_parts.fn),
+            (x, w4, part4),
+            **ring,
+            cross_loop_cluster_edges=[True],
+        )
+        self.assertIn("_cluster_size=4", code4)
+        torch.testing.assert_close(
+            out4, (w.float() @ x.float().T).T, atol=1e-3, rtol=1e-3
+        )
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_cluster_edge_falls_back(self) -> None:
+        """An edge the schedule or the accesses cannot carry regenerates the
+        kernel with its entry off: phase loops (``cross_loop_pipeline``
+        barrier) have no task lanes, and parts stored at every K step would
+        send each task's slab more than once (rule C1)."""
+        x = torch.randn([16, 1024], device=DEVICE, dtype=torch.bfloat16)
+        w4 = torch.randn([16, 8, 64, 128], device=DEVICE, dtype=torch.bfloat16)
+        part = torch.zeros([2, 16, 1024], device=DEVICE, dtype=torch.float32)
+        for kernel, config in (
+            (split_k_parts, {"num_warps": 4}),
+            (
+                split_k_parts_each_step,
+                {**RING, "num_warps": 4, "cross_loop_pipeline": "static"},
+            ),
+        ):
+            with self.subTest(kernel=kernel.fn.__name__):
+                code = kernel.bind((x, w4, part)).to_triton_code(
+                    helion.Config(**config, cross_loop_cluster_edges=[True])
+                )
+                self.assertNotIn("cluster_send", code)
+                self.assertNotIn("_cluster_size", code)
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_cluster_edge_needs_consecutive_splits(self) -> None:
+        """With the split the slower task axis, a tile's splits are no
+        consecutive tasks (rule C2): the kernel regenerates with the entry
+        off.  ``loop_orders`` putting the split first carries the parts."""
+        x = torch.randn([16, 1024], device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn([1024, 1024], device=DEVICE, dtype=torch.bfloat16)
+        part = torch.zeros([2, 16, 1024], device=DEVICE, dtype=torch.float32)
+        config = {
+            "pid_type": "persistent_blocked",
+            "num_sm_multiplier": 1,
+            "num_warps": 4,
+            "cross_loop_pipeline": "static",
+            "cross_loop_cluster_edges": [True],
+        }
+        slow, out = code_and_output(split_k_tiles, (x, w, part), **config)
+        self.assertNotIn("cluster_send", slow)
+        torch.testing.assert_close(
+            out, (w.float() @ x.float().T).T, atol=1e-3, rtol=1e-3
+        )
+        fast, out_fast = code_and_output(
+            split_k_tiles, (x, w, part), **config, loop_orders=[[1, 0]]
+        )
+        self.assertIn("cluster_send", fast)
+        torch.testing.assert_close(out_fast, out, atol=0, rtol=0)
 
     @skipIfRefEager("checks generated code")
     @skipUnlessGluon()

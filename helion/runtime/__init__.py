@@ -60,6 +60,7 @@ def default_launcher(
     _persistent_state_rank_shares: tuple[int, ...] = (),
     _timeline: tuple[int, TimelineMeta] | None = None,
     _minimum_resident_programs: int = 0,
+    _cluster_size: int = 1,
     ptx_options: str | None = None,
     launch_cooperative_grid: bool = False,
     **kwargs: dict,
@@ -91,6 +92,7 @@ def default_launcher(
             if _timeline is None
             else _timeline_register(_timeline[1]),
             _minimum_resident_programs=_minimum_resident_programs,
+            _cluster_size=_cluster_size,
             ptx_options=ptx_options,
             launch_cooperative_grid=launch_cooperative_grid,
             **kwargs,

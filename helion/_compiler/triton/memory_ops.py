@@ -24,6 +24,8 @@ from ..compile_environment import CompileEnvironment
 from ..cross_loop_codegen import TaggedPeerFallback
 from ..indexing_strategy import SubscriptIndexing
 from ..indexing_strategy import _resolve_codegen_block_id
+from .cluster_edges import cluster_load_codegen
+from .cluster_edges import cluster_store_codegen
 from .distributed_ops import inband_load_codegen
 from .distributed_ops import inband_store_codegen
 from .distributed_ops import tagged_access
@@ -77,8 +79,11 @@ def _(state: CodegenState) -> ast.AST:
             if modifier_idx < len(modifiers) and modifiers[modifier_idx]:
                 cache_modifier = ast.Constant(value=modifiers[modifier_idx])
 
-        codegen_store = tagged_store_codegen(
-            state, inband_store_codegen(state, strategy.codegen_store)
+        codegen_store = cluster_store_codegen(
+            state,
+            tagged_store_codegen(
+                state, inband_store_codegen(state, strategy.codegen_store)
+            ),
         )
         if state.codegen.store_transform is not None:
             return state.codegen.store_transform(
@@ -180,7 +185,9 @@ def _(state: CodegenState) -> ast.AST | SharedValue:
         device_fn.device_memory_op_index += 1
         strategy = device_fn.get_indexing_strategy(indexing_idx)
 
-        codegen_load = inband_load_codegen(state, strategy.codegen_load)
+        codegen_load = cluster_load_codegen(
+            state, inband_load_codegen(state, strategy.codegen_load)
+        )
         # A ring slot replaces a plain load (not an in-band poll or a fusion).
         if (
             device_fn.ring is not None

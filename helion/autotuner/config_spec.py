@@ -788,6 +788,7 @@ _BACKEND_GATED_GENERIC_KEYS: frozenset[str] = frozenset(
     {
         "cross_loop_pipeline",
         "cross_loop_tmem_prefetch",
+        "cross_loop_cluster_edges",
         "load_cache_modifiers",
         "store_cache_modifiers",
         "host_tensor_descriptors",
@@ -1045,6 +1046,9 @@ class ConfigSpec:
         self.cross_loop_tmem_prefetch: BlockIdSequence[CrossLoopTmemPrefetchSpec] = (
             BlockIdSequence()
         )
+        # One entry per allocation a launch cluster may carry between roots
+        # (TileDependencyGraph.cluster_candidate_ids, sorted); True carries it so.
+        self.cross_loop_cluster_edges = ListOf(BooleanFragment(), length=0)
 
         self.allowed_pid_types: tuple[PidTypeLiteral, ...] = tuple(VALID_PID_TYPES)
         # Why each disabled pid_type was removed, for search-space logging.
@@ -2175,6 +2179,7 @@ class ConfigSpec:
             "range_flattens",
             "static_ranges",
             "cross_loop_tmem_prefetch",
+            "cross_loop_cluster_edges",
             "load_eviction_policies",
             "load_cache_modifiers",
             "store_cache_modifiers",
@@ -2194,6 +2199,7 @@ class ConfigSpec:
             "load_eviction_policies",
             "load_cache_modifiers",
             "store_cache_modifiers",
+            "cross_loop_cluster_edges",
             "indexing",
             "atomic_indexing",
             "pallas_load_buffer_count",
@@ -2246,6 +2252,29 @@ class ConfigSpec:
             config.setdefault(
                 "store_cache_modifiers", self.store_cache_modifiers.default()
             )
+        if (
+            self.supports_config_key("cross_loop_cluster_edges")
+            and self.cross_loop_cluster_edges.length > 0
+        ):
+            values = config.setdefault(
+                "cross_loop_cluster_edges", self.cross_loop_cluster_edges.default()
+            )
+            expected = self.cross_loop_cluster_edges.length
+            if (
+                not isinstance(values, list)
+                or len(values) != expected
+                or any(type(value) is not bool for value in values)
+            ):
+                if not _fix_invalid:
+                    raise InvalidConfig(
+                        "cross_loop_cluster_edges must be a list of one bool per "
+                        f"cluster candidate (expected {expected}, got {values!r})"
+                    )
+                config["cross_loop_cluster_edges"] = (
+                    self.cross_loop_cluster_edges.default()
+                )
+        else:
+            config.pop("cross_loop_cluster_edges", None)
         if self.supports_config_key("indexing"):
             config.setdefault("indexing", self.indexing.default())
         if self.supports_config_key("atomic_indexing"):
@@ -2980,6 +3009,11 @@ class ConfigSpec:
             and self.store_cache_modifiers.length > 0
         ):
             fields["store_cache_modifiers"] = self.store_cache_modifiers
+        if (
+            self.supports_config_key("cross_loop_cluster_edges")
+            and self.cross_loop_cluster_edges.length > 0
+        ):
+            fields["cross_loop_cluster_edges"] = self.cross_loop_cluster_edges
         if self.supports_config_key("num_threads"):
             fields["num_threads"] = self.num_threads
         if is_tileir:
@@ -3267,6 +3301,7 @@ class ConfigSpec:
             "range_flattens",
             "static_ranges",
             "cross_loop_tmem_prefetch",
+            "cross_loop_cluster_edges",
             "load_eviction_policies",
             "load_cache_modifiers",
             "store_cache_modifiers",

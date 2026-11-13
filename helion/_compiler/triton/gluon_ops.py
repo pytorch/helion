@@ -60,6 +60,7 @@ from ..ast_extension import create
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
+from ..cross_loop_cluster import cluster_layout
 from ..cross_loop_codegen import _is_load
 from ..cross_loop_codegen import _is_tl_call
 from ..device_function import DeviceFunction
@@ -605,6 +606,204 @@ def _tl(name: str) -> object:
 # The generated code's ``tl`` (``GluonBackend.library_imports``).
 tl_namespace = types.ModuleType("helion_gluon_tl")
 tl_namespace.__getattr__ = _tl  # pyrefly: ignore [missing-attribute]
+
+
+# ---- cluster edges (``cross_loop_cluster``) --------------------------------------
+# Rank 0 of each launch cluster holds every edge's barrier and slab in
+# ``CLUSTER_SMEM`` (``cluster_entry``).  A producer task polls rank 0's flag for
+# this launch's value (``cluster_ready``), then sends its tile with st.async,
+# whose bytes complete rank 0's barrier (``cluster_send``); the consumer task on
+# rank 0 waits for phase 0 and reads the slab (``cluster_recv``).  Offsets are
+# bytes into ``CLUSTER_SMEM``; a tile moves ``VEC`` contiguous 32-bit elements
+# at once from a layout with no element on two threads.
+#
+# The flag's value is the launch epoch in its low word and bits 4..35 of the
+# kernel's launch-state address in its high word: shared memory is not cleared
+# between kernels, so a word another kernel (another state) or an earlier
+# launch (an earlier epoch) left behind never reads as this launch's.
+# (The hardware cluster barrier would need every thread, which a
+# warp-specialized kernel's padding warps never are.)
+CLUSTER_SMEM = "helion_cluster_smem"
+_CLUSTER_VALUE = (
+    "cvt.u64.u32 v, $1; shl.b64 s, $2, 28; and.b64 s, s, 0xffffffff00000000; "
+    "or.b64 v, v, s; "
+)
+_CLUSTER_FLAG = gl.constexpr(
+    "{ .reg .pred p; .reg .b32 t, a; .reg .b64 v, s; mov.u32 t, %tid.x; "
+    "setp.eq.u32 p, t, 0; "
+    + _CLUSTER_VALUE
+    + f"mov.u32 a, {CLUSTER_SMEM}; @p st.release.cluster.shared::cta.u64 [a], v; "
+    "mov.u32 $0, 0; }"
+)
+_CLUSTER_READY = gl.constexpr(
+    "{ .reg .pred q; .reg .b32 a; .reg .b64 v, s, f; "
+    + _CLUSTER_VALUE
+    + f"mov.u32 a, {CLUSTER_SMEM}; mapa.shared::cluster.u32 a, a, 0; "
+    "HCLR${:uid}: ld.acquire.cluster.shared::cluster.u64 f, [a]; "
+    "setp.ne.u64 q, f, v; @q bra HCLR${:uid}; mov.u32 $0, 0; }"
+)
+
+
+@gluon.constexpr_function
+def _cluster_entry_asm(area, expects):
+    expects = [int(n) for n in str(expects).split(",")]
+    barriers = [8 + 8 * i for i in range(len(expects))]
+    return (
+        f".shared .align 1024 .b8 {CLUSTER_SMEM}[{area}]; "
+        "{ .reg .pred p; .reg .b32 t, b; mov.u32 t, %tid.x; setp.eq.u32 p, t, 0; "
+        f"mov.u32 b, {CLUSTER_SMEM}; "
+        + "".join(f"@p mbarrier.init.shared::cta.b64 [b+{o}], 1; " for o in barriers)
+        + "@p fence.mbarrier_init.release.cluster; "
+        + "".join(
+            f"@p mbarrier.arrive.expect_tx.shared::cta.b64 _, [b+{o}], {n}; "
+            for o, n in zip(barriers, expects, strict=True)
+        )
+        + "} mov.u32 $0, $1;"
+    )
+
+
+@gluon.jit
+def cluster_entry(AREA: gl.constexpr, EXPECTS: gl.constexpr):
+    """Declare ``CLUSTER_SMEM`` (``AREA`` bytes) and arm its barriers, one
+    arrival and the bytes of ``EXPECTS`` (comma separated) each (thread 0, at
+    kernel entry)."""
+    gl.inline_asm_elementwise(
+        # pyrefly: ignore [bad-argument-type]
+        _cluster_entry_asm(AREA, EXPECTS),
+        "=r,r",
+        [gl.program_id(0)],
+        dtype=gl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@gluon.jit
+def cluster_flag(epoch, state):
+    """Raise the flag to this launch's value (``epoch``, of the launch state at
+    ``state``) once the barriers are armed (thread 0, which armed them)."""
+    return gl.inline_asm_elementwise(
+        # pyrefly: ignore [bad-argument-type]
+        _CLUSTER_FLAG,
+        "=r,r,l",
+        [epoch.to(gl.int32, bitcast=True), state],
+        dtype=gl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@gluon.jit
+def cluster_ready(epoch, state):
+    """Wait until rank 0's flag holds this launch's value; returns the token a
+    send depends on."""
+    return gl.inline_asm_elementwise(
+        # pyrefly: ignore [bad-argument-type]
+        _CLUSTER_READY,
+        "=r,r,l",
+        [epoch.to(gl.int32, bitcast=True), state],
+        dtype=gl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+# The dimensions ``cluster_edges`` checks the tiles against.
+_cluster_layout_dims = gluon.constexpr_function(cluster_layout)
+
+
+@gluon.constexpr_function
+def _cluster_layout(shape, vec, num_warps):
+    dims = _cluster_layout_dims([int(d) for d in shape], vec, num_warps)
+    if dims is None:
+        raise ValueError(
+            f"a cluster edge cannot move a {shape} tile without duplicates"
+        )
+    per, lanes, warps = dims
+    return gl.BlockedLayout(per, lanes, warps, list(reversed(range(len(shape)))))
+
+
+@gluon.constexpr_function
+def _cluster_send_asm(vec, bar):
+    vals = ", ".join(f"${vec + i}" for i in range(vec))
+    return (
+        f"{{ .reg .b32 a, m; mov.u32 a, {CLUSTER_SMEM}; add.u32 a, a, ${2 * vec}; "
+        f"mapa.shared::cluster.u32 a, a, 0; mov.u32 m, {CLUSTER_SMEM}; "
+        f"add.u32 m, m, {bar}; mapa.shared::cluster.u32 m, m, 0; "
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes"
+        + (
+            f".v{vec}.b32 [a], {{{vals}}}, [m]; "
+            if vec > 1
+            else f".b32 [a], {vals}, [m]; "
+        )
+        + " ".join(f"mov.u32 ${i}, 0;" for i in range(vec))
+        + " }"
+    )
+
+
+@gluon.constexpr_function
+def _cluster_recv_asm(vec, bar):
+    vals = ", ".join(f"${i}" for i in range(vec))
+    return (
+        f"{{ .reg .pred w; .reg .b32 a, b; mov.u32 b, {CLUSTER_SMEM}; add.u32 b, b, {bar}; "
+        "HCLW${:uid}: mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 w, [b], 0; "
+        f"@!w bra HCLW${{:uid}}; mov.u32 a, {CLUSTER_SMEM}; add.u32 a, a, ${vec}; "
+        + (
+            f"ld.shared.v{vec}.b32 {{{vals}}}, [a]; }}"
+            if vec > 1
+            else f"ld.shared.b32 {vals}, [a]; }}"
+        )
+    )
+
+
+@gluon.constexpr_function
+def _cluster_constraints(vec, inputs):
+    return ",".join(["=r"] * vec + ["r"] * (vec * inputs))
+
+
+@gluon.jit
+def cluster_send(value, offsets, ready, BAR: gl.constexpr, VEC: gl.constexpr):
+    """Send ``value`` (32-bit elements) to rank 0's ``CLUSTER_SMEM`` at byte
+    ``offsets``, completing rank 0's barrier at byte ``BAR`` (``ready``:
+    ``cluster_ready``'s token)."""
+    layout: gl.constexpr = _cluster_layout(  # pyrefly: ignore [bad-assignment]
+        value.shape, VEC, gl.num_warps()
+    )
+    words = gl.convert_layout(value, layout).to(gl.int32, bitcast=True)
+    at = gl.convert_layout(offsets, layout)
+    return gl.inline_asm_elementwise(
+        # pyrefly: ignore [bad-argument-type]
+        _cluster_send_asm(VEC, BAR),
+        # pyrefly: ignore [bad-argument-type]
+        _cluster_constraints(VEC, 3),
+        [words, at, at * 0 + ready],
+        dtype=gl.int32,
+        is_pure=False,
+        # pyrefly: ignore [bad-argument-type]
+        pack=VEC,
+    )
+
+
+@gluon.jit
+def cluster_recv(offsets, DTYPE: gl.constexpr, BAR: gl.constexpr, VEC: gl.constexpr):
+    """Rank 0's slab at byte ``offsets`` once its barrier at byte ``BAR`` has
+    completed phase 0, in ``offsets``' layout."""
+    layout: gl.constexpr = _cluster_layout(  # pyrefly: ignore [bad-assignment]
+        offsets.shape, VEC, gl.num_warps()
+    )
+    words = gl.inline_asm_elementwise(
+        # pyrefly: ignore [bad-argument-type]
+        _cluster_recv_asm(VEC, BAR),
+        # pyrefly: ignore [bad-argument-type]
+        _cluster_constraints(VEC, 1),
+        [gl.convert_layout(offsets, layout)],
+        dtype=gl.int32,
+        is_pure=False,
+        # pyrefly: ignore [bad-argument-type]
+        pack=VEC,
+    )
+    # pyrefly: ignore [bad-argument-type]
+    return gl.convert_layout(words.to(DTYPE, bitcast=True), offsets.type.layout)
 
 
 # ---- single ops ----------------------------------------------------------------

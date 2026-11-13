@@ -17,6 +17,7 @@ import logging
 import math
 import operator
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import cast
 
 import torch
@@ -37,6 +38,7 @@ from ...autotuner.config_spec import ring_depth
 from ...language import memory_ops
 from ...language._tracing_ops import _for_loop
 from ...language.matmul_ops import dot_scaled
+from ...runtime.config import Config
 from ..ast_extension import clone_ast
 from ..ast_extension import create
 from ..ast_extension import create_arg
@@ -47,6 +49,8 @@ from ..ast_read_writes import dead_assignment_elimination
 from ..autotuner_heuristics.triton import TritonB200FormulaMatmulHeuristic as _B200
 from ..compile_environment import CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
 from ..compile_environment import CompileEnvironment
+from ..cross_loop_cluster import ClusterEdgeFallback
+from ..cross_loop_cluster import cluster_entry
 from ..cross_loop_codegen import TaggedPeerFallback
 from ..cross_loop_codegen import _access_allocations
 from ..cross_loop_codegen import _all_names
@@ -83,7 +87,6 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
     from collections.abc import Iterator
 
-    from ...runtime.config import Config
     from ..device_function import DeviceBodyContext
     from ..device_function import DeviceFunction
     from ..device_function import SyncRole
@@ -1592,6 +1595,22 @@ class RingLowering:
                     fn.body.insert(0, statement_from_string(read))
                 else:
                     fn.body[at] = statement_from_string(read)
+            # The cluster flag (``cross_loop_cluster``) follows the body's read
+            # of the epoch it raises.
+            flags = [
+                st
+                for st in body.body
+                if isinstance(st, ast.Assign)
+                and _stored_names([st]) <= df.sync_names("cluster")
+            ]
+            if flags:
+                body.body = [st for st in body.body if st not in flags]
+                at = next(
+                    i
+                    for i, st in enumerate(body.body)
+                    if _stored_names([st]) & set(launch_names)
+                )
+                body.body[at + 1 : at + 1] = flags
             # The body hands the state it read to the kernel's rewrite.
             body.body.append(
                 statement_from_string(f"return {', '.join(launch_names)},")
@@ -1690,6 +1709,8 @@ class RingLowering:
         specialize = (
             f"gl.warp_specialize([{tasks}], [{warps}], [{', '.join(map(str, regs))}])"
         )
+        if df.cluster_edges:
+            setup.append(ast.unparse(cluster_entry(df.cluster_edges)))
         if launch_state is None:
             setup.append(specialize)
         else:
@@ -2735,7 +2756,11 @@ class GluonRegeneration(RetryPolicy):
     what raised it).
     """
 
-    signals: tuple[type[BaseException], ...] = (TaggedPeerFallback, RingFallback)
+    signals: tuple[type[BaseException], ...] = (
+        TaggedPeerFallback,
+        RingFallback,
+        ClusterEdgeFallback,
+    )
 
     @contextlib.contextmanager
     def scope(self) -> Iterator[None]:
@@ -2750,6 +2775,17 @@ class GluonRegeneration(RetryPolicy):
         self, signal: BaseException, config: Config, *, caller_graphs: bool
     ) -> Config | None:
         env = CompileEnvironment.current()
+        if isinstance(signal, ClusterEdgeFallback):
+            # The entry that raised goes off (each at most once).
+            log.info("%s", signal.report())
+            edges = list(cast("list[bool]", config.get("cross_loop_cluster_edges", [])))
+            edges[signal.index] = False
+            return Config(
+                **cast(
+                    "dict[str, Any]",
+                    {**config.config, "cross_loop_cluster_edges": edges},
+                )
+            )
         ring = isinstance(signal, RingFallback)
         flag = "ring_disabled" if ring else "tagged_peer_disabled"
         if getattr(env, flag):
