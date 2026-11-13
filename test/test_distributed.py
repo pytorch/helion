@@ -2371,10 +2371,14 @@ class TestDistributedTileDependencies(TestCase):
         self.assertIn("tl.cast(tl.sum(inband_record), tl.uint64)", code)
         self.assertIn("tile_dependency_peer_epoch << 32 | 4294967295", code)
         # After a long spin, readers scan each source's records and done words and
-        # copy rows no task wrote from the peer's buffer into the mailbox.
-        self.assertEqual(code.count("_scatter_cover("), world)
+        # copy rows no task wrote from the peer's buffer into the mailbox, both in
+        # one loop over the sources, so the code does not grow with the world.
+        self.assertEqual(code.count("_scatter_cover("), 1)
+        self.assertIn(f"for inband_entry in tl.range({world}, num_stages=1):", code)
+        self.assertIn(f"for inband_peer in tl.range({world}, num_stages=1):", code)
+        self.assertEqual(code.count("inband_uncovered = "), 1)
         self.assertIn("tl.pointer_type(tl.uint32)) + inband_offset_", code)
-        self.assertIn("tl.store(inband_address_", code)
+        self.assertIn("tl.store(inband_address_0 + inband_peer * ", code)
         self.assertIn("_hold_after_fallback(tile_dependency_peer_state", code)
         # The record key must index the row block the reader computes.
         self.assertIn("% 64 // 32 * 1 + inband_offset_1 // 64 * 2", code)

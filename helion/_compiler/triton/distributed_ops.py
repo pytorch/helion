@@ -625,10 +625,30 @@ class ScatterPoll:
     """How a poll of an inband scatter reads a row no task of ``source`` wrote."""
 
     allocation_id: int
-    source: str
+    source: int
     key: str
-    # The tagged word, every lane of it, in the peer's own buffer.
-    word: str
+    # The flat element offset and mask the poll reads, as variables, and as the
+    # expressions they hold (``shape``), which match across the polls of one
+    # tile from different sources, so the fallback handles those in one loop.
+    element: str
+    mask: str | None
+    shape: tuple[str, str | None]
+    # The peer's own buffer, its lanes per mailbox word and its element bits.
+    tensor: str
+    lanes: int
+    bits: str
+
+    def word(self, epoch: str, tensor: str) -> str:
+        """The tagged word, every lane of it, in ``tensor`` (the peer's buffer)."""
+        other = "" if self.mask is None else f", mask={self.mask}, other=0"
+        bits = (
+            f"tl.load({tensor}.to(tl.pointer_type(tl.uint32)) + {self.element} // "
+            f"{self.lanes}{other}, volatile=True)"
+            if self.lanes > 1
+            else f"tl.cast(tl.load({tensor} + {self.element}{other}, volatile=True), "
+            f"{self.bits}, bitcast=True)"
+        )
+        return f"({epoch} << 32) | tl.cast({bits}, tl.uint64)"
 
 
 @dataclass(frozen=True)
@@ -1557,6 +1577,8 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
             )
         shift = ""
         element = ""
+        # What the poll reads, independent of the variables lifted below.
+        element_text = f"{ast.unparse(offset)}, words={words is not None}"
         if words is not None:
             offset = expr_from_string(words[0])
         elif lanes > 1 or scatter is not None:
@@ -1573,6 +1595,7 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
             dce=True,
             prefix="inband_address",
         )
+        mask_text = ast.unparse(indexing.mask_expr) if indexing.has_mask() else None
         mask = None
         if indexing.has_mask():
             mask_expr = indexing.mask_expr
@@ -1627,20 +1650,17 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
             group = f"{group} untagged {box.lane_bits}"  # one wait test per asm
         fallback = None
         if scatter is not None:
-            other = "" if mask is None else f", mask={mask}, other=0"
-            tensor = device_function.tensor_arg(fake_tensor).name
-            bits = (
-                f"tl.load({tensor}.to(tl.pointer_type(tl.uint32)) + {element} // {lanes}"
-                f"{other}, volatile=True)"
-                if lanes > 1
-                else f"tl.cast(tl.load({tensor} + {element}{other}, volatile=True), "
-                f"{_bits(dtype)}, bitcast=True)"
-            )
+            assert access.owner_rank is not None
             fallback = ScatterPoll(
                 allocation_id=access.allocation_id,
-                source=f"({access.owner_rank})",
+                source=access.owner_rank,
                 key=_scatter_key(scatter, element),
-                word=f"({peer.epoch} << 32) | tl.cast({bits}, tl.uint64)",
+                element=element,
+                mask=mask,
+                shape=(element_text, mask_text),
+                tensor=device_function.tensor_arg(fake_tensor).name,
+                lanes=lanes,
+                bits=_bits(dtype),
             )
         value = device_function.new_var("inband_value", dce=True)
         device_function.inband_polls.append(
@@ -1755,6 +1775,192 @@ def _stale(peer_epoch: str, polls: list[InbandPoll]) -> str:
     )
 
 
+def _select(index: str, values: list[int]) -> str:
+    """``values[index]`` for a runtime ``index``: a constant, an affine term or
+    a chain of selects."""
+    first = values[0]
+    step = values[1] - first if len(values) > 1 else 0
+    if all(value == first + step * i for i, value in enumerate(values)):
+        term = index if step == 1 else f"{step} * {index}"
+        return (
+            str(first) if step == 0 else term if first == 0 else f"({first} + {term})"
+        )
+    expr = str(first)
+    for i, value in enumerate(values[1:], 1):
+        expr = f"tl.where({index} == {i}, {value}, {expr})"
+    return expr
+
+
+# Cover entries one ready word holds, a bit each.
+_READY_BITS = 31
+
+
+def _scatter_cover_calls(
+    cg: CodegenInterface,
+    peer: PeerState,
+    ready: str,
+    entries: list[tuple[int, int]],
+    threads: int,
+) -> list[ast.stmt]:
+    """Set bit ``i`` of ``ready`` once ``entries[i]`` (allocation, source) has
+    covered every key its tasks wrote: one ``_scatter_cover`` in a loop over the
+    entries, so the code does not grow with the peers read."""
+    fields: list[list[int]] = []
+    for allocation_id, source in entries:
+        scatter = peer.scatters[allocation_id]
+        root = peer.scatter_roots[scatter.root]
+        fields.append(
+            [
+                source,
+                scatter.records,
+                root.done,
+                scatter.cover,
+                root.tasks,
+                scatter.lanes,
+                scatter.keys,
+            ]
+        )
+    if len(entries) == 1:
+        index = "0"
+        args = [str(value) for value in fields[0]]
+    else:
+        index = cg.device_function.new_var("inband_entry", dce=False)
+        allocations = list(dict.fromkeys(a for a, _ in entries))
+        sources = [s for a, s in entries if a == allocations[0]]
+        if entries == [(a, s) for a in allocations for s in sources]:
+            # Allocation-major over one source list: select each field on its axis.
+            per_allocation = len(sources)
+            allocation = f"({index} // {per_allocation})"
+            source = f"({index} % {per_allocation})" if len(allocations) > 1 else index
+            args = [_select(source, sources)] + [
+                _select(
+                    allocation,
+                    [
+                        fields[i * per_allocation][field]
+                        for i in range(len(allocations))
+                    ],
+                )
+                for field in range(1, 7)
+            ]
+        else:
+            args = [
+                _select(index, [entry[field] for entry in fields]) for field in range(7)
+            ]
+    source, records, done, cover, tasks, lanes, keys = args
+    call = (
+        f"helion_dist_utils._scatter_cover({peer.state}, {peer.ptrs}, {source}, "
+        f"{peer.epoch}, {records}, {done}, {cover}, {peer.votes}, {tasks}, "
+        f"{lanes}, {keys}, {len(peer.bases)}, {threads})"
+    )
+    if len(entries) == 1:
+        return [statement_from_string(f"{ready} = {call}")]
+    # Not pipelined: the loop's loads poll, and its helper syncs the CTA.
+    loop = statement_from_string(
+        f"for {index} in tl.range({len(entries)}, num_stages=1): pass"
+    )
+    assert isinstance(loop, ast.For)
+    loop.body = [statement_from_string(f"{ready} = {ready} | ({call} << {index})")]
+    return [statement_from_string(f"{ready} = 0"), loop]
+
+
+def _scatter_copy(
+    cg: CodegenInterface,
+    peer: PeerState,
+    poll: InbandPoll,
+    ready: str,
+    bit: str,
+    source: str,
+    tensor: str,
+    address: str,
+) -> list[ast.stmt]:
+    """Copy the rows of ``poll`` that no task of ``source`` wrote (its cover
+    entry is bit ``bit`` of ``ready``) from ``tensor``, the source's own
+    buffer, to ``address`` in this rank's mailbox."""
+    fallback = poll.scatter
+    assert fallback is not None
+    scatter = peer.scatters[fallback.allocation_id]
+    mask = "" if poll.mask is None else f", mask={poll.mask}, other=0"
+    uncovered = cg.device_function.new_var("inband_uncovered", dce=False)
+    return [
+        statement_from_string(
+            f"{uncovered} = ((({ready} >> ({bit})) & 1) != 0)"
+            f" & (tl.load({peer.state} + {scatter.cover} + {source} * "
+            f"{scatter.keys} + {fallback.key}{mask}, volatile=True) != {peer.epoch})"
+            + ("" if poll.mask is None else f" & {poll.mask}")
+        ),
+        statement_from_string(
+            f"tl.store({address}, {fallback.word(peer.epoch, tensor)}, "
+            f"mask={uncovered})"
+        ),
+        statement_from_string(
+            f"tl.store({peer.state} + {peer.flag} + ({fallback.key}) * 0, "
+            f"{peer.epoch} + 1, mask={uncovered} & ({source} == {peer.rank}))"
+        ),
+    ]
+
+
+def _scatter_synthesize(
+    cg: CodegenInterface,
+    peer: PeerState,
+    family: list[InbandPoll],
+    bits: dict[tuple[int, int], tuple[str, int]],
+) -> list[ast.stmt]:
+    """Copy the rows of ``family`` (polls of one tile, by source) no task wrote
+    from each source's own buffer into this rank's mailbox, once
+    ``_scatter_cover`` has marked every written key. Polls from consecutive
+    sources share one loop over them."""
+    fallbacks = [cast("ScatterPoll", poll.scatter) for poll in family]
+    first = fallbacks[0]
+    ready, bit = bits[first.allocation_id, first.source]
+    rolled = len(family) > 1 and all(
+        fallback.source == first.source + i
+        and bits[first.allocation_id, fallback.source] == (ready, bit + i)
+        for i, fallback in enumerate(fallbacks)
+    )
+    if not rolled:
+        result: list[ast.stmt] = []
+        for poll, fallback in zip(family, fallbacks, strict=True):
+            ready, bit = bits[fallback.allocation_id, fallback.source]
+            result.extend(
+                _scatter_copy(
+                    cg,
+                    peer,
+                    poll,
+                    ready,
+                    str(bit),
+                    f"({fallback.source})",
+                    fallback.tensor,
+                    poll.address,
+                )
+            )
+        return result
+    device_function = cg.device_function
+    index = device_function.new_var("inband_peer", dce=False)
+    tensor = device_function.new_var("inband_tensor", dce=False)
+    select = first.tensor
+    for i, fallback in enumerate(fallbacks[1:], 1):
+        select = f"tl.where({index} == {i}, {fallback.tensor}, {select})"
+    words = peer.mailboxes[first.allocation_id].words
+    loop = statement_from_string(
+        f"for {index} in tl.range({len(family)}, num_stages=1): pass"
+    )
+    assert isinstance(loop, ast.For)
+    loop.body = [
+        statement_from_string(f"{tensor} = {select}"),
+        *_scatter_copy(
+            cg,
+            peer,
+            family[0],
+            ready,
+            f"{bit} + {index}" if bit else index,
+            f"({first.source} + {index})" if first.source else index,
+            tensor,
+            f"{family[0].address} + {index} * {words}",
+        ),
+    ]
+    return [loop]
+
+
 def _scatter_fallback(
     cg: CodegenInterface, peer: PeerState, scattered: list[InbandPoll]
 ) -> list[ast.stmt]:
@@ -1763,53 +1969,41 @@ def _scatter_fallback(
     A source's records and skip marks cover every key it wrote once ``ready``.
     The copy lands in this rank's mailbox, so the loop's words keep one layout;
     a consumer on the source flags the next launch to hold for every rank.
+    Both steps loop over the sources read, so this rarely run path stays one
+    copy of code however many peers a root reads.
     """
     if not scattered:
         return []
     device_function = cg.device_function
     spins = device_function.new_var("inband_spins", dce=False)
     cg.add_statement(statement_from_string(f"{spins} = 0"))
-    ready: dict[tuple[int, str], str] = {}
-    cover: list[ast.stmt] = []
-    synthesize: list[ast.stmt] = []
-    for poll in scattered:
-        assert poll.scatter is not None
-        scatter = peer.scatters[poll.scatter.allocation_id]
-        source = poll.scatter.source
-        if (poll.scatter.allocation_id, source) not in ready:
-            flag = device_function.new_var("inband_ready", dce=False)
-            ready[poll.scatter.allocation_id, source] = flag
-            cg.add_statement(statement_from_string(f"{flag} = 0"))
-            root = peer.scatter_roots[scatter.root]
-            cover.append(
-                statement_from_string(
-                    f"{flag} = helion_dist_utils._scatter_cover({peer.state}, "
-                    f"{peer.ptrs}, {source}, {peer.epoch}, {scatter.records}, "
-                    f"{root.done}, {scatter.cover}, {peer.votes}, {root.tasks}, "
-                    f"{scatter.lanes}, {scatter.keys}, {len(peer.bases)}, "
-                    f"{poll.threads})"
-                )
-            )
-        key = poll.scatter.key
-        mask = "" if poll.mask is None else f", mask={poll.mask}, other=0"
-        uncovered = device_function.new_var("inband_uncovered", dce=False)
-        synthesize.extend(
-            [
-                statement_from_string(
-                    f"{uncovered} = ({ready[poll.scatter.allocation_id, source]} != 0)"
-                    f" & (tl.load({peer.state} + {scatter.cover} + {source} * "
-                    f"{scatter.keys} + {key}{mask}, volatile=True) != {peer.epoch})"
-                    + ("" if poll.mask is None else f" & {poll.mask}")
-                ),
-                statement_from_string(
-                    f"tl.store({poll.address}, {poll.scatter.word}, mask={uncovered})"
-                ),
-                statement_from_string(
-                    f"tl.store({peer.state} + {peer.flag} + ({key}) * 0, "
-                    f"{peer.epoch} + 1, mask={uncovered} & ({source} == {peer.rank}))"
-                ),
-            ]
+    fallbacks = [cast("ScatterPoll", poll.scatter) for poll in scattered]
+    allocations = list(dict.fromkeys(f.allocation_id for f in fallbacks))
+    entries = [
+        (allocation_id, source)
+        for allocation_id in allocations
+        for source in sorted(
+            {f.source for f in fallbacks if f.allocation_id == allocation_id}
         )
+    ]
+    threads = scattered[0].threads
+    assert threads is not None and all(p.threads == threads for p in scattered)
+    bits: dict[tuple[int, int], tuple[str, int]] = {}
+    cover: list[ast.stmt] = []
+    for start in range(0, len(entries), _READY_BITS):
+        chunk = entries[start : start + _READY_BITS]
+        ready = device_function.new_var("inband_ready", dce=False)
+        cg.add_statement(statement_from_string(f"{ready} = 0"))
+        bits.update({entry: (ready, i) for i, entry in enumerate(chunk)})
+        cover.extend(_scatter_cover_calls(cg, peer, ready, chunk, threads))
+    families: dict[tuple[object, ...], list[InbandPoll]] = {}
+    for poll, fallback in zip(scattered, fallbacks, strict=True):
+        key = (fallback.allocation_id, fallback.shape, fallback.lanes, fallback.bits)
+        families.setdefault(key, []).append(poll)
+    synthesize: list[ast.stmt] = []
+    for family in families.values():
+        family.sort(key=lambda poll: cast("ScatterPoll", poll.scatter).source)
+        synthesize.extend(_scatter_synthesize(cg, peer, family, bits))
     check = statement_from_string(f"if {spins} % {_SCATTER_SPINS} == 0: pass")
     fallback = statement_from_string(f"if {spins} >= {_SCATTER_SPINS}: pass")
     assert isinstance(check, ast.If) and isinstance(fallback, ast.If)
