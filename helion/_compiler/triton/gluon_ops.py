@@ -617,6 +617,12 @@ tl_namespace.__getattr__ = _tl  # pyrefly: ignore [missing-attribute]
 # bytes into ``CLUSTER_SMEM``; a tile moves ``VEC`` contiguous 32-bit elements
 # at once from a layout with no element on two threads.
 #
+# The flag is a relaxed store: ``cluster_entry``'s fence.mbarrier_init orders
+# the barriers' init before it, and a send that lands before rank 0 arms its
+# barrier only takes the tx-count negative (the arrival still pending keeps the
+# phase open); a release store would be a GPU-wide fence behind every bulk copy
+# in flight.
+#
 # The flag's value is the launch epoch in its low word and bits 4..35 of the
 # kernel's launch-state address in its high word: shared memory is not cleared
 # between kernels, so a word another kernel (another state) or an earlier
@@ -632,7 +638,7 @@ _CLUSTER_FLAG = gl.constexpr(
     "{ .reg .pred p; .reg .b32 t, a; .reg .b64 v, s; mov.u32 t, %tid.x; "
     "setp.eq.u32 p, t, 0; "
     + _CLUSTER_VALUE
-    + f"mov.u32 a, {CLUSTER_SMEM}; @p st.release.cluster.shared::cta.u64 [a], v; "
+    + f"mov.u32 a, {CLUSTER_SMEM}; @p st.relaxed.cluster.shared::cta.u64 [a], v; "
     "mov.u32 $0, 0; }"
 )
 _CLUSTER_READY = gl.constexpr(
