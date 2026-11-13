@@ -4627,6 +4627,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         config_spec.cross_loop_tmem_prefetch.append(
                             CrossLoopTmemPrefetchSpec(block_ids)
                         )
+                if config_spec.supports_config_key("cross_loop_cluster_edges"):
+                    config_spec.cross_loop_cluster_edges.length = len(
+                        graph.cluster_candidate_ids
+                    )
         config_spec.multi_phase = len(device_ir.phases) > 1
         if config_spec.supports_config_key("pallas_load_buffer_count"):
             config_spec.pallas_load_buffer_count.length = sum(

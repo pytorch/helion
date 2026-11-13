@@ -201,6 +201,7 @@ _BASE_VALID_KEYS = """
     xcd_remap
     cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_flash_gated_row_warps cute_pdl_spread cute_split_k_atomic_epilogue tcgen05_epi_round_subtiles cute_privatize_atomics
     cross_loop_tmem_prefetch
+    cross_loop_cluster_edges
 """
 
 # ``BACKEND_SPECIFIC_KEYS``.
@@ -363,6 +364,7 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     xcd_remap
     cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_flash_gated_row_warps cute_pdl_spread cute_split_k_atomic_epilogue tcgen05_epi_round_subtiles cute_privatize_atomics
     cross_loop_tmem_prefetch
+    cross_loop_cluster_edges
 """
 
 # ``_CUTE_IMPLICIT_DEFAULT_KEYS``.

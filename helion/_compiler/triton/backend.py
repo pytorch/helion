@@ -798,6 +798,9 @@ class TritonBackend(Backend):
                 "_minimum_resident_programs="
                 f"{device_fn.triton_minimum_resident_programs}"
             )
+        if device_fn.cluster_edges:
+            size = next(iter(device_fn.cluster_edges.values())).size
+            out.append(f"_cluster_size={size}")
         out.extend(self.launcher_keyword_args(config, has_barrier=has_barrier))
         return out
 
@@ -840,7 +843,7 @@ class GluonBackend(TritonBackend):
     _IGNORED_KEYS = frozenset(["maxnreg", "range_flattens", "range_multi_buffers"])
 
     def supports_config_key(self, key: str) -> bool:
-        if key == "cross_loop_tmem_prefetch":
+        if key in ("cross_loop_tmem_prefetch", "cross_loop_cluster_edges"):
             return True
         return key not in self._IGNORED_KEYS and super().supports_config_key(key)
 
@@ -886,10 +889,13 @@ class GluonBackend(TritonBackend):
         prefix: list[ast.stmt],
         ctx: DeviceBodyContext,
     ) -> list[ast.stmt]:
+        from ..cross_loop_cluster import cluster_entry
         from .gluon_ring import finalize_ring
 
         trailing = super().finalize_kernel_def(fn_def, prefix, ctx)
         statements = finalize_ring(fn_def, ctx)
+        if ctx.device_function.cluster_edges and ctx.device_function.ring is None:
+            fn_def.body.insert(0, cluster_entry(ctx.device_function.cluster_edges))
         fn_def.body = self.pipeline_loops(fn_def.body, ctx.device_function)
         return [*statements, *trailing]
 

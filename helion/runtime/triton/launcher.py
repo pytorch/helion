@@ -21,6 +21,8 @@ CPU/TPU cases of :func:`get_num_sm`) lives in thin wrappers in
 from __future__ import annotations
 
 import contextvars
+import functools
+import importlib
 import math
 from typing import TYPE_CHECKING
 from typing import cast
@@ -194,6 +196,7 @@ def default_launcher(
     _timeline: tuple[int, object] | None = None,
     _timeline_register: Callable[[torch.Tensor], object] | None = None,
     _minimum_resident_programs: int = 0,
+    _cluster_size: int = 1,
     ptx_options: str | None = None,
     launch_cooperative_grid: bool = False,
     **kwargs: dict,
@@ -295,7 +298,7 @@ def default_launcher(
     }
     if ptx_options is not None:
         run_kwargs["ptx_options"] = ptx_options
-    if _minimum_resident_programs:
+    if _minimum_resident_programs or _cluster_size > 1:
         # ``triton_kernel`` is a JITFunction.  Resource information belongs to
         # its exact compiled specialization, so compile (but do not launch)
         # that specialization before asking CUDA for its occupancy.
@@ -303,15 +306,126 @@ def default_launcher(
             *args,
             **{**run_kwargs, "warmup": True},
         )
-        _validate_resident_program_capacity(
-            compiled_kernel,
-            args,
-            required_programs=_minimum_resident_programs,
-        )
+        metadata = compiled_kernel.packed_metadata  # type: ignore[union-attr]
+        try:
+            if _cluster_size > 1:
+                run_kwargs["grid"] = _cluster_grid(compiled_kernel, grid, _cluster_size)
+            if _minimum_resident_programs:
+                _validate_resident_program_capacity(
+                    compiled_kernel,
+                    args,
+                    required_programs=_minimum_resident_programs,
+                    cluster_size=_cluster_size,
+                )
+            return triton_kernel.run(  # type: ignore[union-attr]
+                *args,
+                **run_kwargs,
+            )
+        finally:
+            # Only this launch is in clusters (Triton reads the metadata as it
+            # launches).
+            compiled_kernel.packed_metadata = metadata  # type: ignore[union-attr]
     return triton_kernel.run(  # type: ignore[union-attr]
         *args,
         **run_kwargs,
     )
+
+
+def _cluster_grid(
+    compiled_kernel: object, grid: tuple[int, ...], cluster_size: int
+) -> tuple[int, ...]:
+    """The grid of clusters launching ``grid`` programs in clusters of
+    ``cluster_size`` along x.  Triton's launcher takes the cluster size from the
+    compiled kernel's packed metadata (``num_ctas``); a single-CTA module keeps
+    its program ids (``blockIdx.x``) and only gains co-scheduled cluster peers."""
+    if grid[0] % cluster_size:
+        raise RuntimeError(
+            f"Cross-loop scheduling requires a grid divisible by the cluster size "
+            f"{cluster_size}, got {grid}"
+        )
+    num_warps, num_ctas, shared = compiled_kernel.packed_metadata  # type: ignore[attr-defined]
+    if num_ctas not in (1, cluster_size):
+        raise RuntimeError(
+            f"a {num_ctas}-CTA kernel cannot launch in clusters of {cluster_size}"
+        )
+    metadata = compiled_kernel.metadata  # type: ignore[attr-defined]
+    if getattr(metadata, "global_scratch_size", 0) or getattr(
+        metadata, "profile_scratch_size", 0
+    ):
+        # Triton sizes per-CTA scratch by the grid it launches (of clusters).
+        raise RuntimeError("a kernel with scratch memory cannot launch in clusters")
+    # Triton opts in to more than the default dynamic shared memory only past
+    # 48 KB of it, not counting a cluster edge's static slab beside it.
+    cuda_driver = importlib.import_module("cuda.bindings.driver")
+    _run = compiled_kernel.run  # type: ignore[attr-defined]
+    (error,) = cuda_driver.cuFuncSetAttribute(
+        cuda_driver.CUfunction(int(compiled_kernel.function)),  # type: ignore[attr-defined]
+        cuda_driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        shared,
+    )
+    if error != cuda_driver.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(
+            f"{shared} bytes of dynamic shared memory beside a cluster edge's "
+            f"slab exceed the SM's: {error}"
+        )
+    compiled_kernel.packed_metadata = (num_warps, cluster_size, shared)  # type: ignore[attr-defined]
+    return (grid[0] // cluster_size, *grid[1:])
+
+
+# A kernel that does nothing, for asking CUDA where clusters fit.
+_EMPTY_PTX = b""".version 7.8
+.target sm_90
+.address_size 64
+.visible .entry helion_empty() { ret; }
+\0"""
+
+
+@functools.cache
+def get_cluster_capacity(device: torch.device, cluster_size: int) -> int:
+    """How many CTAs of one an SM fit at once in clusters of ``cluster_size``
+    (a GPC's SMs left over by its clusters stay idle)."""
+    cuda_driver = importlib.import_module("cuda.bindings.driver")
+    with torch.cuda.device(device):
+        torch.cuda.init()
+        error, module = cuda_driver.cuModuleLoadData(_EMPTY_PTX)
+        if error != cuda_driver.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f"unable to load a probe kernel: {error}")
+        try:
+            _, function = cuda_driver.cuModuleGetFunction(module, b"helion_empty")
+            # All the shared memory a CTA may opt in to: one CTA an SM.
+            properties = torch.cuda.get_device_properties(device)
+            shared = properties.shared_memory_per_block_optin  # pyrefly: ignore [missing-attribute]
+            cuda_driver.cuFuncSetAttribute(
+                function,
+                cuda_driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                shared,
+            )
+            error, clusters = cuda_driver.cuOccupancyMaxActiveClusters(
+                function, _cluster_launch_config(cuda_driver, cluster_size, 128, shared)
+            )
+            if error != cuda_driver.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(f"CUDA cluster occupancy query failed: {error}")
+        finally:
+            cuda_driver.cuModuleUnload(module)
+    return int(clusters) * cluster_size
+
+
+def _cluster_launch_config(
+    cuda_driver: object, cluster_size: int, threads: int, shared: int
+) -> object:
+    """A launch configuration of one cluster of ``cluster_size`` CTAs."""
+    config = cuda_driver.CUlaunchConfig()  # pyrefly: ignore [missing-attribute]
+    config.gridDimX, config.gridDimY, config.gridDimZ = cluster_size, 1, 1
+    config.blockDimX, config.blockDimY, config.blockDimZ = threads, 1, 1
+    config.sharedMemBytes = shared
+    attribute = cuda_driver.CUlaunchAttribute()  # pyrefly: ignore [missing-attribute]
+    attribute.id = cuda_driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION  # pyrefly: ignore [missing-attribute]
+    attribute.value.clusterDim.x = cluster_size
+    attribute.value.clusterDim.y = 1
+    attribute.value.clusterDim.z = 1
+    config.attrs = [attribute]
+    config.numAttrs = 1
+    return config
 
 
 def compile_only_launch_args(
@@ -575,10 +689,11 @@ def _validate_resident_program_capacity(
     args: tuple[object, ...],
     *,
     required_programs: int,
+    cluster_size: int = 1,
 ) -> None:
-    """Reject a polling schedule whose required CTA cohort cannot be resident."""
-    import importlib
-
+    """Reject a polling schedule whose required CTA cohort cannot be resident
+    (in clusters of ``cluster_size``: a GPC's SMs left over by its clusters do
+    not count)."""
     tensor = next((arg for arg in args if isinstance(arg, torch.Tensor)), None)
     if tensor is None or tensor.device.type != "cuda":
         raise RuntimeError("cross-loop residency checks require a CUDA tensor")
@@ -603,10 +718,26 @@ def _validate_resident_program_capacity(
     cache = vars(compiled_kernel).setdefault(
         "_helion_resident_program_capacity_cache", {}
     )
-    key = (device, num_warps, shared)
+    key = (device, num_warps, shared, cluster_size)
     capacity = cache.get(key)
+    cuda_driver = importlib.import_module("cuda.bindings.driver")
+    if capacity is None and cluster_size > 1:
+        with torch.cuda.device(device):
+            error, clusters = cuda_driver.cuOccupancyMaxActiveClusters(
+                cuda_driver.CUfunction(int(function)),
+                _cluster_launch_config(
+                    cuda_driver, cluster_size, num_warps * 32, shared
+                ),
+            )
+        if error != cuda_driver.CUresult.CUDA_SUCCESS:
+            # E.g. the dynamic shared memory beside the static (a cluster
+            # edge's slab) exceeds the SM's.
+            raise RuntimeError(
+                f"CUDA cluster occupancy query failed for cross-loop kernel: {error}"
+            )
+        capacity = int(clusters) * cluster_size
+        cache[key] = capacity
     if capacity is None:
-        cuda_driver = importlib.import_module("cuda.bindings.driver")
         with torch.cuda.device(device):
             error, blocks_per_sm = (
                 cuda_driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(

@@ -54,6 +54,7 @@ from .variable_origin import TileExtentOrigin
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
+    from .cross_loop_cluster import ClusterEdge
     from .cross_loop_codegen import PeerState
     from .cross_loop_timeline import Timeline
     from .cute.bounded_cache_codegen import BoundedCacheRequest
@@ -323,7 +324,9 @@ class SyncRole:
     # launch: per-launch state read at entry and rewritten at exit; claim: a
     # claimed task loop's claim; poll: in-band mailbox reads and their vote,
     # which order only the reads of the mailbox they return; stamp: a
-    # megakernel_timeline stamp, which orders nothing.
+    # megakernel_timeline stamp, which orders nothing; cluster: a cluster edge's
+    # exchange (``cross_loop_cluster``: shared memory and DSMEM only), which
+    # orders no global memory either.
     kind: str
     # A wait's covered obligations: the allocations whose reads it orders
     # (None: every read).
@@ -549,6 +552,9 @@ class DeviceFunction:
         self.triton_outlined_helper_constexprs: dict[str, int] = {}
         # The scheduler's synchronization statements, by the names they assign.
         self.sync_roles: dict[str, SyncRole] = {}
+        # The allocations this config carries in launch clusters, by allocation
+        # (``cross_loop_cluster.cluster_edges``; None until first asked).
+        self.cluster_edges: dict[int, ClusterEdge] | None = None
         # The scheduler's end-of-launch rewrites of the launch state it reads
         # (the "launch" sync roles), in program order.
         self.launch_writes: list[ast.stmt] = []
