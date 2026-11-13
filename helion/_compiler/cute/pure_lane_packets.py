@@ -151,7 +151,9 @@ def is_pure_scalar_assembly(asm: object, constraints: object, is_pure: object) -
     # neither adds an effect, and the opcode allowlist still gates every
     # instruction inside.
     text = asm.strip().removeprefix("{").removesuffix("}").strip()
-    if not re.fullmatch(r"[A-Za-z0-9_$.,+;{}\s-]*", text):
+    # Double-colon opcode qualifiers do not add effects. Single colons remain
+    # excluded, so labels are not admitted by this scalar arithmetic proof.
+    if not re.fullmatch(r"(?:[A-Za-z0-9_$.,+;{}\s-]|::)*", text):
         return False
     for instruction in text.split(";"):
         instruction = instruction.strip().lstrip("{").strip()
@@ -159,7 +161,8 @@ def is_pure_scalar_assembly(asm: object, constraints: object, is_pure: object) -
             continue
         if instruction.startswith(".reg "):
             if re.fullmatch(
-                r"\.reg\s+\.[busf](8|16|32|64)\s+[A-Za-z_][\w, ]*", instruction
+                r"\.reg\s+\.(?:[busf](?:8|16|32|64)|pred)\s+[A-Za-z_][\w, ]*",
+                instruction,
             ):
                 continue
             return False

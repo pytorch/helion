@@ -65,6 +65,7 @@ from .full_reduction_owner import fragment_store_destinations
 from .full_reduction_owner import requires_full_reduction_owner
 from .local_atomic import local_atomic_allocations
 from .local_atomic import prove_local_atomics
+from .native_s2f6_contract import native_s2f6_asm_matches
 from .pure_producer_regions import pure_producer_plan
 from .reduction_coordinates import captured_reduction_coordinates
 from .reduction_coordinates import free_iota_reductions
@@ -874,7 +875,14 @@ class FragmentCompiler(
                     "is_pure=True)"
                 )
 
-            if node in self.lazy_opaque_producers:
+            # This exact compiler decoder reads only its two scalar inputs;
+            # unlike arbitrary "pure" ASM it cannot observe the executing lane.
+            # Keep it pointwise like the integer recipe it replaces, rather
+            # than adding a shared-memory publication that may exceed capacity.
+            native_decode = native_s2f6_asm_matches(
+                asm, constraints, dtype, _is_pure, _pack, len(fragments)
+            ) and all(operand.dtype is torch.int32 for operand in fragments)
+            if native_decode or node in self.lazy_opaque_producers:
                 return Fragment(
                     self.shape(fake.shape),
                     fake.dtype,

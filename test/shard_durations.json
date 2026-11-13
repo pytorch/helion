@@ -134,6 +134,7 @@
  "test/test_cute_ftz_safe_exp.py": 1.1,
  "test/test_cute_full_slice_matmul_threads.py": 2.1,
  "test/test_cute_full_tile_bounds.py": 5.0,
+ "test/test_cute_fuse_native_s2f6_gpu.py": 1.6,
  "test/test_cute_fuse_two_pass_loads.py": 1.8,
  "test/test_cute_gdn_recurrence.py": 68.2,
  "test/test_cute_graph_cse.py": 6.4,
