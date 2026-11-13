@@ -2654,7 +2654,7 @@ class Backend(abc.ABC):
         return triton_precision_by_dot_precision.get(precision, "")
 
 
-def _largest_divisor_at_most(size: int, limit: int) -> int:
+def largest_divisor_at_most(size: int, limit: int) -> int:
     for divisor in range(limit, 0, -1):
         if size % divisor == 0:
             return divisor
