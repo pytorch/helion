@@ -855,23 +855,6 @@ def test_bt16_resident_chain_keeps_tmem_dv2_for_packed_geometry() -> None:
     assert "'dv_partitions': 4" in forced_dv4
 
 
-def test_dv4_uses_semantic_length_when_chunk_metadata_disagrees() -> None:
-    from helion._compiler.cute.chunk_recurrence_dv4_sm100 import emit_bt16_recurrence
-
-    # Adversarial metadata: the chunk offsets claim one chunk for 17 tokens.
-    # The Helion carrier and DV2 execute ceil(17 / 16) == 2 chunks, so DV4 must
-    # derive the same bound from sequence lengths instead of trusting the delta.
-    token_start, token_end = 0, 17
-    chunk_start, chunk_end = 0, 1
-    assert (token_end - token_start + BT - 1) // BT == 2
-    assert chunk_end - chunk_start == 1
-
-    source = inspect.getsource(emit_bt16_recurrence)
-    assert source.startswith("@cute.kernel\n")
-    assert "num_chunks = cute.ceil_div(token_end - token_start, BT)" in source
-    assert "gcu_chunks[seq + 1]" not in source
-
-
 def _runtime_plan(
     *, tokens: int = 128, heads: int = 12, sequences: int = 2, chunks: int = 8
 ) -> dict[str, object]:

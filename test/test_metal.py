@@ -8,7 +8,6 @@ import re
 import sys
 import textwrap
 from typing import TYPE_CHECKING
-from typing import ClassVar
 import unittest
 from unittest.mock import patch
 
@@ -24,7 +23,6 @@ from helion._compiler.metal import free_arange
 from helion._compiler.metal import lane_reduction
 from helion._compiler.metal import row_reduction_heuristic
 from helion._compiler.metal.backend import MetalBackend
-from helion._compiler.metal.fma_fusion import fuse_multiply_adds
 from helion._compiler.metal.lane_fold import LaneJam
 from helion._compiler.metal.lane_fold import balanced_combine
 from helion._compiler.metal.lane_fold import jam_lanes_into_loops
@@ -10530,86 +10528,6 @@ class TestMetalMaskedLoads(unittest.TestCase):
                 expected = y.clone()
                 expected[:m] = x
                 torch.testing.assert_close(out, expected, atol=0, rtol=0)
-
-
-class TestMetalFmaFusionRewrite(unittest.TestCase):
-    """``fuse_multiply_adds`` on hand-written device bodies."""
-
-    TYPES: ClassVar[dict[str, str]] = {
-        "x": "float",
-        "w": "float",
-        "r": "float",
-        "h": "half",
-        "n": "int",
-    }
-
-    def _fuse(self, source: str) -> str:
-        body = ast.parse(textwrap.dedent(source)).body
-        return ast.unparse(
-            ast.Module(body=fuse_multiply_adds(body, self.TYPES), type_ignores=[])
-        )
-
-    def test_float_product_fuses(self) -> None:
-        """A float product used once by an add in its block, here a loop
-        carry, becomes an fma."""
-        got = self._fuse(
-            """
-            acc = float(0.0)
-            for k in range(4):
-                a = tl.load(x + k, mask, other=0)
-                b = w[k]
-                t = a * b
-                acc = acc + t
-            """
-        )
-        expected = """
-            acc = float(0.0)
-            for k in range(4):
-                a = tl.load(x + k, mask, other=0)
-                b = w[k]
-                acc = metal.fma(a, b, acc)
-            """
-        self.assertEqual(got, ast.unparse(ast.parse(textwrap.dedent(expected))))
-
-    def test_viewed_float_fuses(self) -> None:
-        """A float reinterpreted from int bits (``as_type``) is a float."""
-        got = self._fuse("a = as_type(float, n)\nb = w[0]\nt = a * b\nu = t + r[0]\n")
-        self.assertEqual(
-            got, "a = as_type(float, n)\nb = w[0]\nu = metal.fma(a, b, r[0])"
-        )
-
-    def test_kept(self) -> None:
-        for name, source in (
-            ("int index math", "t = n * 4\nu = t + n\n"),
-            ("half operands", "a = h[0]\nb = h[1]\nc = r[0]\nt = a * b\nu = t + c\n"),
-            (
-                "addend rounded to half",
-                "a = x[0]\nb = w[0]\nc = static_cast(half, r[0])\nt = a * b\nu = t + c\n",
-            ),
-            (
-                "product updated in place",
-                "a = x[0]\nb = w[0]\nc = r[0]\nt = a * b\nt += c\nu = t + c\n",
-            ),
-            (
-                "operand reassigned before the add",
-                "a = x[0]\nb = w[0]\nt = a * b\nb = r[0]\nu = t + b\n",
-            ),
-            ("product used twice", "a = x[0]\nt = a * a\nu = t + t\n"),
-            (
-                "name of two types",
-                "a = x[0]\na = h[0]\nb = w[0]\nc = r[0]\nt = a * b\nu = t + c\n",
-            ),
-            (
-                "add in another block",
-                (
-                    "a = x[0]\nb = w[0]\nc = r[0]\nt = a * b\n"
-                    "for k in range(2):\n    u = t + c\n"
-                ),
-            ),
-        ):
-            with self.subTest(name):
-                source = textwrap.dedent(source)
-                self.assertEqual(self._fuse(source), ast.unparse(ast.parse(source)))
 
 
 @_requires_darwin

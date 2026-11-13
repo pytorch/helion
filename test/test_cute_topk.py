@@ -191,6 +191,8 @@ def _pairwise_cases(
     return [(*row[:-1], *row[-1]) for row in pairwise(**axes, cases=cases)]
 
 
+@pytest.mark.cpu_only
+@pytest.mark.slow
 def test_topk_collection_without_cute(tmp_path: Path) -> None:
     """A Triton-only installation keeps portable tests and leaves out CuTe tests."""
     script = textwrap.dedent(
@@ -246,7 +248,10 @@ def test_topk_collection_without_cute(tmp_path: Path) -> None:
     probe.write_text(script)
     root = Path(__file__).resolve().parents[1]
     env = {**os.environ, "CUDA_VISIBLE_DEVICES": "", "HELION_BACKEND": "triton"}
-    env["PYTHONPATH"] = str(root)
+    # Keep test dependencies while the child explicitly blocks CuTe imports.
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(root), *filter(None, os.environ.get("PYTHONPATH", "").split(os.pathsep))]
+    )
     result = subprocess.run(
         [sys.executable, str(probe)],
         cwd=root,

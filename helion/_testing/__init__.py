@@ -659,7 +659,10 @@ def patch_target_facts(
       ``helion._compiler.cute.thread_budget.shared_memory_budget_bytes``
     * ``hardware`` -> ``helion._hardware.get_hardware_info`` (a ``HardwareInfo``
       is returned as is, a callable replaces the probe); ``facts`` with a
-      ``hardware_name`` contributes ``facts.hardware_info()``
+      ``hardware_name`` contributes ``facts.hardware_info()``. A concrete CUDA/ROCm
+      record and explicit ``is_hip`` also model the matching ``torch.version``
+      runtime and clear the other runtime, independently of the installed wheel.
+      Inconsistent CUDA/ROCm records and ``is_hip`` values are rejected.
     * ``is_hip`` -> ``helion._compat._is_hip``
     """
     from .._hardware import HardwareInfo
@@ -724,6 +727,17 @@ def patch_target_facts(
             stack.enter_context(
                 patch("helion._hardware.get_hardware_info", new=_constant_probe(probe))
             )
+            hip = values["is_hip"]
+            if probe.device_kind in ("cuda", "rocm") and isinstance(hip, bool):
+                assert hip == (probe.device_kind == "rocm"), (
+                    "is_hip must match hardware.device_kind"
+                )
+                stack.enter_context(
+                    patch("torch.version.cuda", None if hip else probe.runtime_version)
+                )
+                stack.enter_context(
+                    patch("torch.version.hip", probe.runtime_version if hip else None)
+                )
         elif not isinstance(probe, _Unset):
             stack.enter_context(patch("helion._hardware.get_hardware_info", new=probe))
         yield

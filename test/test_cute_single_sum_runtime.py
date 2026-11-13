@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from unittest.mock import patch
 
@@ -191,6 +192,17 @@ def test_singleton_cancellation_domain_retains_original_sum_and_cast(
 def test_half_header_identity_unknown_build_and_no_repeated_file_reads(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Unknown nightly headers deliberately retain the original ATen sum/cast.
+    # Exercise the known/unknown identity and cache contract independently of
+    # which optional fast path the installed Torch build admits.
+    monkeypatch.setattr(torch, "__file__", str(tmp_path / "__init__.py"))
+    header = tmp_path / "include" / single_sum._ATEN_HALF_HEADER
+    header.parent.mkdir(parents=True)
+    known_header = b"known half header fixture\n"
+    header.write_bytes(known_header)
+    monkeypatch.setattr(
+        single_sum, "_ATEN_HALF_SHA256", hashlib.sha256(known_header).hexdigest()
+    )
     single_sum._compatible_aten_half_cast.cache_clear()
     try:
         with patch.object(
@@ -199,11 +211,9 @@ def test_half_header_identity_unknown_build_and_no_repeated_file_reads(
             assert single_sum._compatible_aten_half_cast()
             assert single_sum._compatible_aten_half_cast()
             assert read.call_count == 1
-        monkeypatch.setattr(torch, "__file__", str(tmp_path / "__init__.py"))
+        header.unlink()
         single_sum._compatible_aten_half_cast.cache_clear()
         assert not single_sum._compatible_aten_half_cast()
-        header = tmp_path / "include" / single_sum._ATEN_HALF_HEADER
-        header.parent.mkdir(parents=True)
         header.write_text("unknown half conversion")
         single_sum._compatible_aten_half_cast.cache_clear()
         assert not single_sum._compatible_aten_half_cast()

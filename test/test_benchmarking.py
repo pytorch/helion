@@ -1600,6 +1600,7 @@ def test_attention_source_copy_cannot_inherit_parent_git_provenance(
         compare_attention_backends._validate_helion_source_checkout(provenance)
 
 
+@pytest.mark.slow
 def test_attention_direct_script_pins_helion_to_benchmark_checkout(tmp_path):
     foreign_package = tmp_path / "helion"
     foreign_package.mkdir()
@@ -1625,7 +1626,11 @@ def test_attention_direct_script_pins_helion_to_benchmark_checkout(tmp_path):
         f"pathlib.Path({str(result_path)!r}).write_text(payload, encoding='utf-8')"
     )
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(tmp_path)
+    # Keep dependency overlays while the foreign checkout remains first.
+    paths = [str(tmp_path)]
+    if inherited := env.get("PYTHONPATH"):
+        paths.append(inherited)
+    env["PYTHONPATH"] = os.pathsep.join(paths)
 
     subprocess.run(
         [sys.executable, "-c", child_code],

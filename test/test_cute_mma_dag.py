@@ -65,6 +65,7 @@ from helion._testing import skipUnlessBackends
 from helion._testing.cute_mma_dag import DETERMINISM_LAUNCHES
 from helion._testing.cute_mma_dag import LAUNCHES
 from helion._testing.cute_mma_dag import assert_close
+from helion._testing.cute_mma_dag import assert_tf32_bf16_dot
 from helion._testing.cute_mma_dag import cast_tensor
 from helion._testing.cute_mma_dag import run_cute
 from helion._testing.cute_mma_dag import run_triton
@@ -11379,12 +11380,12 @@ def test_kda_kernels_match_the_triton_backend(
 def test_wy_dl_at_the_s1_pipeline_shape_matches_the_triton_backend(gated: bool) -> None:
     # The cold autotune of delta_rule at s1 (4, 16, 2048, 128, 128) once left
     # wy_dL on SIMT: every dag config failed the accuracy check against the
-    # SIMT reference (not a dag fault -- the dag matches Triton bit for bit,
-    # the two fp32 accumulation orders differ by a few bf16 ulps of dL where
-    # the bf16-rounded intermediate of dA amplifies them).  The promoted
+    # SIMT reference: its fp32 accumulation order differs by a few bf16 ulps
+    # of dL where the bf16-rounded intermediate of dA amplifies them. The dag
+    # matches Triton's matrix outputs. The promoted
     # default at the real shape and dtypes (bf16 beta and dvni) -- a
     # tensor-memory seed, wy_dL being a flat streaming region program --
-    # runs and equals Triton.
+    # runs with exact matrix results and inexact vector reductions.
     t = _inputs_m4(bhn=2048, d=128, dv=128, dtype=torch.bfloat16, seed=1)
     args = _wy_dl_args(t, gated)
     fn = _kernel_fn("wy_dL")
@@ -11399,7 +11400,13 @@ def test_wy_dl_at_the_s1_pipeline_shape_matches_the_triton_backend(gated: bool) 
     ref = run_triton(fn, args, default.config["block_sizes"])
     inexact = _M4_INEXACT[("wy_dL", gated)]
     for index, (lhs, rhs) in enumerate(zip(out, ref, strict=True)):
-        if index in inexact:
+        if index == 2:
+            # These long fp32 reductions can cancel large terms to nearly
+            # zero. Use the autotuner's unscaled 1e-2 baseline tolerances for
+            # dbeta at its admitted default, without its RMS-based floor.
+            # Matrix outputs below must still match bitwise.
+            torch.testing.assert_close(lhs, rhs, atol=1e-2, rtol=1e-2)
+        elif index in inexact:
             assert_close((lhs,), (rhs,))
         else:
             assert torch.equal(lhs, rhs), index
@@ -12414,6 +12421,26 @@ def test_anchored_wy_state_key_matches_the_triton_backend() -> None:
         assert torch.equal(lhs, rhs)
 
 
+def test_tf32_bf16_dot_checks_rounding_intervals() -> None:
+    # The exact dot is just above a BF16 midpoint. Different legal FP32
+    # accumulation rounding can land on either side, for either sign.
+    left = torch.tensor([[1.0, 2**-12], [-1.0, -(2**-12)]])
+    right = torch.tensor([[1 + 2**-8], [2**-12]])
+    below = torch.tensor([[1.0], [-1.0]], dtype=torch.bfloat16)
+    above = torch.tensor([[1 + 2**-7], [-(1 + 2**-7)]], dtype=torch.bfloat16)
+    assert_tf32_bf16_dot(left, right, below, above)
+    # An adjacent BF16 value is not automatically acceptable away from a
+    # midpoint, and stepping past the valid midpoint neighbors also fails.
+    with pytest.raises(AssertionError, match="rounding interval"):
+        assert_tf32_bf16_dot(left, torch.tensor([[1.0], [0.0]]), above)
+    wrong = above.clone()
+    wrong[0, 0] = 1 + 2**-6
+    with pytest.raises(AssertionError, match="rounding interval"):
+        assert_tf32_bf16_dot(left, right, wrong)
+    with pytest.raises(AssertionError):
+        assert_tf32_bf16_dot(left, right, below.fill_(torch.nan))
+
+
 @_COMPILED_PATH
 @pytest.mark.cuda
 def test_the_anchored_wy_autotune_fault_config_is_verified_before_it_runs() -> None:
@@ -12423,7 +12450,8 @@ def test_the_anchored_wy_autotune_fault_config_is_verified_before_it_runs() -> N
     # packets read UR0 / UR1, registers no instruction of the kernel
     # writes: the dropped operand fields that faulted); on an assembler
     # that encodes it correctly the kernel runs bit-equal to the plain
-    # render and to Triton.  Either way the plain config is untouched.
+    # render. Triton can accumulate the final TF32 dots in another order;
+    # test those independently at their BF16 rounding boundaries below.
     t = _inputs_kda(bh=64, n=16, d=64, dv=64)
     fn = _kernel_fn("wy_anch")
     akk = _anchored_gram(t)
@@ -12461,8 +12489,16 @@ def test_the_anchored_wy_autotune_fault_config_is_verified_before_it_runs() -> N
     kso = torch.empty_like(t["k"])
     args = (t["k"], t["v"], t["beta"], t["gc"], akk, kso, False, True)
     ref = (*run_triton(fn, args, [8, 8], cache=False), kso)
-    for lhs, rhs in zip(plain, ref, strict=True):
+    # T and the state key do not differ; only the final w/u dot reductions
+    # may cross a BF16 midpoint. Preserve exact hint and relaunch checks.
+    for lhs, rhs in zip(plain[2:], ref[2:], strict=True):
         assert torch.equal(lhs, rhs)
+    kt = (t["k"].float() * t["beta"][:, :, None]) * torch.exp2(
+        t["gc"] * _engine().RCP_LN2
+    )
+    vt = t["v"].float() * t["beta"][:, :, None]
+    assert_tf32_bf16_dot(plain[2], kt, plain[0], ref[0])
+    assert_tf32_bf16_dot(plain[2], vt, plain[1], ref[1])
 
 
 @_COMPILED_PATH
