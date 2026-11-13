@@ -35,6 +35,7 @@ from helion.autotuner.handoff_inputs import _save_inputs
 import helion.language as hl
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Sequence
 
 
@@ -397,6 +398,92 @@ def test_native_source_handoff(backend: str, multi_shape: bool, tmp_path: Path) 
                 reference_fn=lambda x, scale: torch.zeros_like(x),
                 repetitions=1,
             )
+
+
+def _leaky(x: torch.Tensor) -> torch.Tensor:
+    return torch.where(x > 0, x, x * 0.5)
+
+
+@pytest.mark.slow
+@pytest.mark.timeout(300)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@skipIfRefEager("Native handoff requires compilation")
+@skipUnlessBackends(["cute"])
+@skipUnlessCuteAvailable("Native CuTe handoff requires the supported CuTe DSL")
+def test_cute_handoff_with_callable_bool_and_float_arguments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Callables (score/mask mods) are compiled into the kernel, so the exported
+    entry point omits them; with ``HELION_CUTE_EXPORT_HARDCODE_SCALARS=1`` a
+    bool or float the host code branches on is exported as the constant of
+    the case, passed (``check``) or left at its default (``scale``), even when
+    the bound kernel was bound with another value (bools and floats key bound
+    kernels by type), and a float only passed to the launch stays a runtime
+    scalar."""
+    monkeypatch.setenv("HELION_CUTE_EXPORT_HARDCODE_SCALARS", "1")
+
+    @helion.kernel(
+        backend="cute",
+        static_shapes=True,
+        autotune_precompile=None,
+        autotune_benchmark_subprocess=False,
+    )
+    def mapped_add(
+        x: torch.Tensor,
+        fn: Callable[[torch.Tensor], torch.Tensor],
+        y: torch.Tensor,
+        check: bool = False,
+        scale: float = 1.0,
+        shift: float = 0.0,
+    ) -> torch.Tensor:
+        if check:
+            assert x.size(0) == y.size(0)
+        assert scale > 0
+        out = torch.empty_like(x)
+        for tile in hl.tile(x.size()):
+            out[tile] = fn(x[tile]) * scale + y[tile] + shift
+        return out
+
+    x = torch.randn(256, device=DEVICE)
+    y = torch.randn(256, device=DEVICE)
+    unchecked = mapped_add.bind((x, _leaky, y, False, 2.0, 1.0))
+    args = (x, _leaky, y, True)
+    assert mapped_add.bind(args) is unchecked
+    search = FiniteSearch(
+        unchecked,
+        args,
+        [helion.Config(block_sizes=[64]), helion.Config(block_sizes=[128])],
+    )
+    point = find_handoff(search, HandoffPolicy())
+    torch.testing.assert_close(point.fn(*args), torch.where(x > 0, x, x * 0.5) + y)
+    bundle = build_handoff(search, point, tmp_path / "bundle", repetitions=1)
+    assert bundle.manifest["baseline_evaluation"]["ok"]
+    assert len(bundle.manifest["cases"][0]["input_metadata"]) == 3
+    source = bundle.sources["case_0/kernel.py"]
+    entry = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "mapped_add"
+    )
+    assert [arg.arg for arg in entry.args.args] == [
+        "x",
+        "y",
+        "check",
+        "scale",
+        "shift",
+    ]
+    # The hard-coded scalars default to the case's values.
+    assert "check: bool=True, scale: float=1.0, shift: float=0.0" in ast.unparse(
+        entry.args
+    )
+    validate = ast.unparse(entry.body[0])
+    assert validate.startswith("_standalone_validate_args((x, y, check, scale, shift),")
+    assert validate.endswith(
+        "('constant', True), ('constant', 1.0), ('scalar', 'float')))"
+    )
+    assert "_source_module" not in source
+    result = bundle.run_agent(lambda workspace: dict(workspace.sources), repetitions=1)
+    assert result.ok, result
 
 
 # The Triton lane's one unmarked fresh-process replay (see _LANE_BACKENDS).

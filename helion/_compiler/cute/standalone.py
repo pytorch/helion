@@ -9,7 +9,9 @@ from graphlib import TopologicalSorter
 import importlib
 import importlib.util
 import inspect
+from itertools import starmap
 import math
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
@@ -20,11 +22,14 @@ from torch._dynamo.source import GetItemSource
 from torch._dynamo.source import LocalSource
 from torch._inductor.codecache import PyCodeCache
 from torch._inductor.codegen.simd import constant_repr
+from torch.fx.experimental.symbolic_shapes import GuardOnDataDependentSymNode
 from torch.utils._pytree import tree_leaves
 
 from ...runtime.cute.arg_signature import normalize_scalar
+from ...runtime.cute.launch_descriptor import STAGED_OPERAND_ALIGNMENT
 from ...runtime.cute.launcher import _create_cute_wrapper
 from ...runtime.cute.launcher import _cute_kernel_param_is_constexpr
+from ...runtime.cute.launcher import _cute_staged_plan_operands
 from ..compile_environment import _replay_tensor_input_source
 from ..output_code_utils import _check_kernel_name_not_shadowed
 from ..output_code_utils import _GlobalToNonlocal
@@ -32,6 +37,7 @@ from ..runtime_tensor_guards import _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
 from .memory_ops import _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Sequence
 
     from torch._guards import Source
@@ -475,12 +481,23 @@ def _mma_dag_alias_spec(
     return tuple(indices), tuple(stored)
 
 
+# Opts standalone export into hard-coding the bool and float arguments whose
+# values capture needs (see :func:`_concretize_needed_scalars`).
+HARDCODE_SCALARS_ENV = "HELION_CUTE_EXPORT_HARDCODE_SCALARS"
+
+
 def _capture_launches(
     bound: BoundKernel[Any],
     source: str,
     pointer_residues: dict[torch.UntypedStorage, int],
-) -> tuple[list[ast.stmt], dict[str, tuple[Any, ...]]]:
-    """Run the host on FakeTensors to build native wrappers for its launches."""
+    scalars: dict[str, bool | float],
+) -> tuple[list[ast.stmt], dict[str, tuple[Any, ...]], dict[str, bool | float]]:
+    """Run the host on FakeTensors to build native wrappers for its launches.
+
+    Also returns the ``scalars`` (from :func:`_scalar_values`) the host code
+    needed concrete (:func:`_concretize_needed_scalars`), with
+    ``HELION_CUTE_EXPORT_HARDCODE_SCALARS=1``; without it the host code runs
+    with every scalar symbolic, and none is concrete."""
     module = PyCodeCache.load(source)
     entrypoint = getattr(module, bound.kernel.name)
     wrappers: list[ast.stmt] = []
@@ -509,6 +526,10 @@ def _capture_launches(
             plan.get("kind")
             not in (
                 "helion_flash",
+                # The fused flash backward's plan only selects its launch
+                # path; like the forward's, its one host preparation, the
+                # staging of under-aligned operands, is refused below.
+                "helion_flash_bwd",
                 "helion_small_biased_attention",
                 # Launch-time argument metadata: the exported launcher runs
                 # the alias check from the launch table (no host preparation).
@@ -529,6 +550,7 @@ def _capture_launches(
                 schema.append(("scalar_constexpr", kind, value, value))
             else:
                 schema.append(_argument_schema(arg, pointer_residues))
+        _check_staged_operand_alignment(_cute_staged_plan_operands(kernel), schema)
         kernel_name = cast("Any", kernel).__name__
         options = kwargs.get("cute_compile_options")
         alias = _mma_dag_alias_spec(plans, schema)
@@ -564,13 +586,193 @@ def _capture_launches(
             alias,
         )
 
-    with bound.env:
-        entrypoint(*bound.fake_args, _launcher=capture)
+    fakes = dict(zip(bound.kernel.signature.parameters, bound.fake_args, strict=True))
+
+    def run(values: dict[str, bool | float]) -> None:
+        wrappers.clear()
+        launch_specs.clear()
+        with bound.env:
+            entrypoint(*starmap(values.get, fakes.items()), _launcher=capture)
+
+    if os.environ.get(HARDCODE_SCALARS_ENV, "") == "1":
+        concrete = _concretize_needed_scalars(run, scalars, fakes)
+    else:
+        # Off by default: a host branch on a bool or float argument raises
+        # GuardOnDataDependentSymNode, as export always did.
+        run({})
+        concrete = {}
     if not launch_specs:
         raise NotImplementedError(
             "No CuTe launches were captured for standalone export"
         )
-    return wrappers, launch_specs
+    return wrappers, launch_specs, concrete
+
+
+def _concretize_needed_scalars(
+    run: Callable[[dict[str, bool | float]], None],
+    scalars: dict[str, bool | float],
+    fakes: dict[str, object],
+) -> dict[str, bool | float]:
+    """Run the host code (``run``, given the concrete values) with the bool
+    and float arguments symbolic, making concrete only those whose values it
+    needs, and return them.
+
+    These arguments trace as unbacked symbols that carry no value, so a host
+    branch on one, or a launch that needs it as a constexpr, raises
+    GuardOnDataDependentSymNode; its condition names the symbols it read, and
+    the run repeats with those arguments set to their ``scalars`` values. A
+    scalar the host code only computes with or passes on stays symbolic, a
+    runtime argument of the export."""
+    names = {
+        symbol: name
+        for name, fake in fakes.items()
+        if name in scalars and isinstance(fake, (torch.SymBool, torch.SymFloat))
+        for symbol in fake._sympy_().free_symbols
+    }
+    concrete: dict[str, bool | float] = {}
+    while True:
+        try:
+            run(concrete)
+        except GuardOnDataDependentSymNode as error:
+            needed = {
+                names[symbol] for symbol in error.cond.free_symbols if symbol in names
+            } - concrete.keys()
+            if not needed:
+                raise NotImplementedError(
+                    "Standalone CuTe export cannot run host code that branches on "
+                    "a value other than a top-level bool or float argument"
+                ) from error
+            concrete.update((name, scalars[name]) for name in needed)
+        else:
+            return concrete
+
+
+def _check_staged_operand_alignment(
+    staged: Sequence[tuple[int, bool]], schema: Sequence[tuple[Any, ...]]
+) -> None:
+    """Refuse a launch whose staged operands (``STAGED_PLAN_OPERANDS``) are
+    under-aligned. ``default_cute_launcher`` copies such an operand to a
+    16-byte-aligned buffer before the launch; the exported launcher has no
+    such step, and a TMA descriptor over the under-aligned pointer would read
+    and write the wrong bytes without faulting. An aligned export is safe:
+    its tensor schema rejects under-aligned calls."""
+    for index, _ in staged:
+        entry = schema[index]
+        if entry[0] == "tensor" and entry[-1] < STAGED_OPERAND_ALIGNMENT:
+            raise NotImplementedError(
+                "Standalone CuTe export cannot stage an under-aligned operand; "
+                "export with 16-byte-aligned tensors"
+            )
+
+
+def _scalar_values(bound: BoundKernel[Any]) -> dict[str, bool | float]:
+    """Values of the kernel's bool and float arguments: the call's being
+    exported (the environment's runtime argument values), else the bound
+    kernel's own. These key a bound kernel by type, so one serves every
+    value."""
+    runtime = bound.env.runtime_arg_values_by_name
+    return {
+        name: value
+        if isinstance(value := runtime.get(name), (bool, float))
+        and type(value) is type(default)
+        else default
+        for name, default in bound._runtime_scalar_args_by_name.items()
+    }
+
+
+def omitted_parameters(bound: BoundKernel[Any]) -> set[str]:
+    """The parameters the standalone entry point omits: callable arguments
+    (score/mask mods) only shape tracing, and their effect is compiled into
+    the kernel. Decided on the fake arguments, for the export and for the
+    inputs hand-off saves alike."""
+    return {
+        name
+        for name, fake in zip(
+            bound.kernel.signature.parameters, bound.fake_args, strict=True
+        )
+        if callable(fake) and not isinstance(fake, type)
+    }
+
+
+def _drop_parameters(function: ast.FunctionDef, names: set[str]) -> None:
+    """Remove ``names`` from a function signature, keeping defaults aligned."""
+    arguments = function.args
+    positional = [*arguments.posonlyargs, *arguments.args]
+    defaults = [None] * (len(positional) - len(arguments.defaults)) + list(
+        arguments.defaults
+    )
+    kept = [
+        (arg, default)
+        for arg, default in zip(positional, defaults, strict=True)
+        if arg.arg not in names
+    ]
+    posonly = sum(arg.arg not in names for arg in arguments.posonlyargs)
+    arguments.posonlyargs = [arg for arg, _ in kept[:posonly]]
+    arguments.args = [arg for arg, _ in kept[posonly:]]
+    # Defaulted parameters are a suffix, so the kept defaults still are.
+    arguments.defaults = [default for _, default in kept if default is not None]
+    kwonly = [
+        (arg, default)
+        for arg, default in zip(
+            arguments.kwonlyargs, arguments.kw_defaults, strict=True
+        )
+        if arg.arg not in names
+    ]
+    arguments.kwonlyargs = [arg for arg, _ in kwonly]
+    arguments.kw_defaults = [default for _, default in kwonly]
+
+
+def _constant_expr(value: bool | float) -> ast.expr:
+    """The expression of a pinned scalar's value (``float("inf")`` and the
+    like for non-finite floats)."""
+    return ast.parse(_schema_repr(value), mode="eval").body
+
+
+def _pin_defaults(function: ast.FunctionDef, pinned: dict[str, bool | float]) -> None:
+    """Make the default of each hard-coded parameter its pinned value: the
+    source default could only fail the constant check. Kernel parameters are
+    positional (``Kernel`` rejects keyword-only ones)."""
+    arguments = function.args
+    positional = [*arguments.posonlyargs, *arguments.args]
+    offset = len(positional) - len(arguments.defaults)
+    for index in range(len(arguments.defaults)):
+        if (name := positional[offset + index].arg) in pinned:
+            arguments.defaults[index] = _constant_expr(pinned[name])
+
+
+def _fit_repro_call(
+    call: ast.FunctionDef,
+    kernel_name: str,
+    dropped: set[str],
+    pinned: dict[str, bool | float],
+) -> None:
+    """Fit the repro caller (``emit_repro_caller``) to the entry point: drop
+    the arguments it omits and pass the hard-coded scalars their values
+    instead of placeholders."""
+    body: list[ast.stmt] = []
+    for statement in call.body:
+        if (
+            isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(target := statement.targets[0], ast.Name)
+        ):
+            if target.id in dropped:
+                continue
+            if target.id in pinned:
+                statement.value = _constant_expr(pinned[target.id])
+        elif (
+            isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Call)
+            and isinstance(statement.value.func, ast.Name)
+            and statement.value.func.id == kernel_name
+        ):
+            statement.value.args = [
+                arg
+                for arg in statement.value.args
+                if not (isinstance(arg, ast.Name) and arg.id in dropped)
+            ]
+        body.append(statement)
+    call.body = body
 
 
 def build_standalone_code(
@@ -579,6 +781,25 @@ def build_standalone_code(
     """Capture static launch schemas and embed readable native CuTe wrappers."""
     if not bound.settings.static_shapes:
         raise NotImplementedError("Standalone CuTe export requires static_shapes=True")
+    # Callable arguments are compiled into the kernel and the entry point
+    # omits them, so host code must not use one; refuse before capture runs
+    # the host code with their fake stand-ins.
+    dropped = omitted_parameters(bound)
+    host_source = next(
+        statement
+        for statement in body_root.body
+        if isinstance(statement, ast.FunctionDef)
+        and statement.name == bound.kernel.name
+    )
+    if any(
+        isinstance(node, ast.Name) and node.id in dropped
+        for statement in host_source.body
+        for node in ast.walk(statement)
+    ):
+        raise NotImplementedError(
+            "Standalone CuTe export cannot omit a callable argument the host code "
+            "uses (calls, or reads the closure or attributes of)"
+        )
     pointer_residues, guards = _input_specializations(bound)
     source = (
         "from __future__ import annotations\n"
@@ -586,7 +807,9 @@ def build_standalone_code(
         + "\n"
         + ast.unparse(body_root)
     )
-    wrappers, launch_specs = _capture_launches(bound, source, pointer_residues)
+    wrappers, launch_specs, pinned = _capture_launches(
+        bound, source, pointer_residues, _scalar_values(bound)
+    )
     helpers = _Helpers()
     tree = ast.parse(source)
     statements = []
@@ -624,16 +847,37 @@ def build_standalone_code(
         if isinstance(statement, ast.FunctionDef)
         and statement.name == bound.kernel.name
     )
+    names = list(bound.kernel.signature.parameters)
+    kept = [
+        (name, arg)
+        for name, arg in zip(names, bound.fake_args, strict=True)
+        if name not in dropped
+    ]
+    _drop_parameters(host, dropped)
+    _pin_defaults(host, pinned)
+    # Capture made the ``pinned`` bool and float arguments concrete because
+    # their values were needed (a host branch, a constexpr launch parameter),
+    # so the export hard-codes them as constants every call must match. The
+    # others stay runtime scalars.
+    for statement in body:
+        if (
+            isinstance(statement, ast.FunctionDef)
+            and statement.name == "call"
+            and statement is not host
+        ):
+            _fit_repro_call(statement, bound.kernel.name, dropped, pinned)
     argument_specs = tuple(
-        _argument_schema(
+        ("constant", pinned[name])
+        if name in pinned
+        else _argument_schema(
             arg, pointer_residues, specialized_vars=bound.env.specialized_vars
         )
-        for arg in bound.fake_args
+        for name, arg in kept
     )
-    names = list(bound.kernel.signature.parameters)
     host.body[:0] = [
         *ast.parse(
-            f"_standalone_validate_args(({', '.join(names)},), {_schema_repr(argument_specs)})"
+            f"_standalone_validate_args(({', '.join(name for name, _ in kept)},), "
+            f"{_schema_repr(argument_specs)})"
         ).body,
         *guards,
     ]

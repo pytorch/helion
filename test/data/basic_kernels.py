@@ -81,6 +81,10 @@ def add_global_float(x, tile) -> torch.Tensor:
     return x + global_float
 
 
+def sigmoid_with_torch(x, tile) -> torch.Tensor:
+    return torch.sigmoid(x)
+
+
 @helion.kernel
 def inplace_mul(x, c):
     (x,) = torch.broadcast_tensors(x)

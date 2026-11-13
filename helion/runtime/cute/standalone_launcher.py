@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import types
 from typing import TYPE_CHECKING
 from typing import Any
@@ -69,13 +68,20 @@ def _standalone_validate(arg: object, entry: tuple[Any, ...]) -> None:
             raise ValueError("Argument does not match the exported CuTe tensor layout")
     elif kind in ("constant", "scalar_constexpr"):
         expected = entry[-1]
-        if arg != expected and not (
-            isinstance(arg, float)
-            and isinstance(expected, float)
-            and math.isnan(arg)
-            and math.isnan(expected)
-        ):
-            raise ValueError("Argument does not match the exported CuTe constant")
+        # Bools and floats match exactly, type included, like the launcher's
+        # constexpr keys: floats by ``hex``, to the sign of zero, with every
+        # NaN equal to every NaN.
+        if type(expected) is float:
+            mismatch = type(arg) is not float or arg.hex() != expected.hex()
+        elif type(expected) is bool:
+            mismatch = type(arg) is not bool or arg != expected
+        else:
+            mismatch = arg != expected
+        if mismatch:
+            raise ValueError(
+                f"Argument {arg!r} does not match the exported CuTe constant "
+                f"{expected!r}"
+            )
     elif kind == "device":
         if not isinstance(arg, torch.device) or str(arg) != entry[1]:
             raise ValueError("Argument does not match the exported CuTe device")

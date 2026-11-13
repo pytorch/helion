@@ -104,16 +104,21 @@ def assert_no_conflicts(fn: FunctionType) -> None:
             raise exc.NamingConflict(name)
     for name in fn.__code__.co_names:
         if name in library_imports and name in fn.__globals__:
-            user_val = fn.__globals__[name]
-            scope = {}
-            exec(library_imports[name], scope)
-            our_val = scope[name]
-            if user_val is not our_val:
+            if fn.__globals__[name] is not library_import_value(name):
                 raise exc.NamingConflict(name)
         if name in disallowed_names:
             raise exc.NamingConflict(name)
     if fn.__code__.co_freevars:
         raise exc.ClosuresNotSupported(fn.__code__.co_freevars)
+
+
+def library_import_value(
+    name: str, imports: dict[str, str] = library_imports
+) -> object:
+    """The value ``imports[name]`` binds ``name`` to."""
+    scope: dict[str, object] = {}
+    exec(imports[name], scope)
+    return scope[name]
 
 
 def reserved_names() -> list[str]:

@@ -340,9 +340,21 @@ def build_handoff(
         case_timing = timing or default_timing
         case_dir = directory / f"case_{index}"
         case_dir.mkdir()
-        source = bound.to_code(
-            config, options=OutputCodeOptions(allow_helion_deps=False)
-        )
+        # Export for this case's arguments, defaults it omits included: bools
+        # and floats key one bound kernel for every value, and the export
+        # follows the case's.
+        with bound.env.use_runtime_arg_values(
+            dict(
+                zip(
+                    bound.kernel.signature.parameters,
+                    bound.kernel.normalize_args(*args),
+                    strict=False,
+                )
+            )
+        ):
+            source = bound.to_code(
+                config, options=OutputCodeOptions(allow_helion_deps=False)
+            )
         (case_dir / "kernel.py").write_text(source)
         (case_dir / "original.py").write_text(source)
         inputs = tuple(
@@ -353,24 +365,28 @@ def build_handoff(
             )
         )
         inputs = _clone_inputs(inputs)
-        _save_inputs(inputs, case_dir / "inputs.pt")
+        # Save and compare only the arguments the standalone entry point takes;
+        # it may omit ones the backend compiles in (CuTe: score/mask mods).
+        entry_inputs = bound.env.backend.standalone_entry_args(bound, inputs)
+        _save_inputs(entry_inputs, case_dir / "inputs.pt")
         reference = reference_fn or bound.settings.autotune_baseline_fn
         reference_kind = (
             "reference_fn" if reference_fn is not None else "autotune_baseline_fn"
         )
         post_args = _clone_inputs(inputs)
+        entry_post_args = bound.env.backend.standalone_entry_args(bound, post_args)
         with _device_context(inputs), torch.no_grad():
             output = bound.compile_config(config)(*post_args)
             synchronize_device()
-            alias_signature = _alias_signature((output, post_args))
+            alias_signature = _alias_signature((output, entry_post_args))
             if reference is None:
                 reference_kind = "confirmed_original"
             else:
                 reference_args = _clone_inputs(inputs)
                 output = reference(*reference_args)
                 synchronize_device()
-        _save_inputs((output, post_args), case_dir / "reference.pt")
-        atol, rtol = _tolerances(bound.settings, output, inputs, post_args)
+        _save_inputs((output, entry_post_args), case_dir / "reference.pt")
+        atol, rtol = _tolerances(bound.settings, output, entry_inputs, entry_post_args)
         case_metadata.append(
             {
                 "source": f"case_{index}/kernel.py",
@@ -384,7 +400,7 @@ def build_handoff(
                         "runtime_version": torch.__version__,
                     }
                 ),
-                "input_metadata": _input_metadata(inputs),
+                "input_metadata": _input_metadata(entry_inputs),
                 "dependencies": _dependencies(source),
                 "static_shapes": bound.settings.static_shapes,
                 "reference_kind": reference_kind,

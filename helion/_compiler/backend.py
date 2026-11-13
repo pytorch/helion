@@ -1571,6 +1571,13 @@ class Backend(abc.ABC):
         """Optionally specialize standalone launch code for the bound workload."""
         return None
 
+    def standalone_entry_args(
+        self, bound: BoundKernel[Any], args: Sequence[object]
+    ) -> tuple[object, ...]:
+        """The arguments of a call of ``bound`` (``args``) that the entry point
+        of its standalone export takes. Default: all of them."""
+        return tuple(args)
+
     def capture_jax_launch_metadata(
         self, bound: BoundKernel[Any], config: Config | dict[str, object]
     ) -> object:

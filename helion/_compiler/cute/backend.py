@@ -1482,6 +1482,20 @@ class CuteBackend(Backend):
 
         return build_standalone_code(bound, import_lines, body_root)
 
+    def standalone_entry_args(
+        self, bound: BoundKernel[Any], args: Sequence[object]
+    ) -> tuple[object, ...]:
+        """Callable arguments (score/mask mods) are compiled into the kernel,
+        so the standalone entry point omits them (:func:`omitted_parameters`)."""
+        from .standalone import omitted_parameters
+
+        omitted = omitted_parameters(bound)
+        return tuple(
+            arg
+            for name, arg in zip(bound.kernel.signature.parameters, args, strict=False)
+            if name not in omitted
+        )
+
     def collective_owns_tile(self, fn: DeviceFunction, block_id: int) -> bool:
         from ..compile_environment import CompileEnvironment
         from .grouped_row_union import physical_schedule
