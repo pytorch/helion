@@ -65,6 +65,7 @@ from .benchmarking import final_selection_target_regime
 from .benchmarking import interleaved_bench
 from .benchmarking import mirrored_bench_generic
 from .effort_profile import get_effort_profile
+from .handoff import _HandoffStop
 from .handoff import _observe_handoff
 from .handoff import _refresh_handoff
 from .logger import AutotuneLogEntry
@@ -1133,6 +1134,8 @@ class BaseSearch(BaseAutotuner):
         start = time.perf_counter()
         exit_stack = contextlib.ExitStack()
         best: Config | None = None
+        outcome = "failed"
+        error_type: str | None = None
         try:
             with exit_stack:
                 exit_stack.enter_context(_searching_candidates())
@@ -1183,6 +1186,7 @@ class BaseSearch(BaseAutotuner):
                     raise exc.NoConfigFound(f": {cascade}") from error
                 finally:
                     self._finalize_autotune_metrics(best)
+            outcome = "ok"
         except BenchmarkWorkerUnkillable as error:
             if best is None or best in self._unkillable_configs:
                 raise
@@ -1193,6 +1197,20 @@ class BaseSearch(BaseAutotuner):
             self.log.warning(
                 "Keeping the selected config although a benchmark worker could "
                 f"not be reaped after the search finished: {error}"
+            )
+            outcome = "ok"
+        except _HandoffStop:
+            # A find_handoff early stop is a controlled exit, not a failure.
+            outcome = "handoff"
+            raise
+        except Exception as error:
+            # Tag the failure for the report; the exception propagates unchanged.
+            error_type = type(error).__name__
+            raise
+        finally:
+            # Failed searches report their coverage too.
+            self._log_search_space_report(
+                time.perf_counter() - start, outcome=outcome, error_type=error_type
             )
         assert best is not None
         end = time.perf_counter()
@@ -1235,58 +1253,6 @@ class BaseSearch(BaseAutotuner):
                 f"{self._autotune_metrics.num_configs_tested} configs failed in "
                 "isolated benchmark workers."
             )
-        # Log search space analysis. This is purely diagnostic; any failure
-        # here (analysis, logging, or writing report files) must never block or
-        # crash autotuning, so the whole block is best-effort.
-        if (
-            self.settings.autotune_log_search_space
-            or self.settings.autotune_log_search_space_verbose
-        ):
-            try:
-                from .local_cache import stable_autotune_hash
-                from .search_space_logger import log_search_space_comparison
-
-                tracker = self._search_space_tracker
-                if tracker is None:
-                    from .search_space_logger import SearchSpaceTracker
-                    from .search_space_logger import analyze_search_space
-
-                    hardware_spec, specialization_key = (
-                        self._get_current_hardware_and_specialization()
-                    )
-                    tracker = SearchSpaceTracker(
-                        analyze_search_space(
-                            self.config_spec,
-                            kernel_name=self._autotune_metrics.kernel_name,
-                            specialization_key=specialization_key,
-                            hardware=hardware_spec,
-                            config_overrides=(
-                                self.settings.autotune_config_overrides or None
-                            ),
-                            advanced_controls_files=(
-                                self.settings.autotune_search_acf or None
-                            ),
-                        )
-                    )
-                tracker.record_invalid(self._generation_invalid_config_count())
-                report = tracker.finish(
-                    search_algorithm=type(self).__name__,
-                    elapsed_seconds=end - start,
-                )
-                log_search_space_comparison(self.log._logger, report)
-                if self.settings.autotune_log_search_space_path:
-                    saved_path = report.save(
-                        self.settings.autotune_log_search_space_path,
-                        stable_autotune_hash(self),
-                    )
-                    if saved_path:
-                        self.log(f"Search space analysis saved to: {saved_path}")
-            except Exception:
-                self.log.warning(
-                    "Search space logging failed; the end-of-run summary was not "
-                    "emitted (autotuning result is unaffected)",
-                    exc_info=True,
-                )
         cached_path = self.kernel.get_cached_path(best)
         if cached_path is not None and is_master_rank():
             self.log(f"Code of selected kernel: {cached_path}")
@@ -1296,6 +1262,71 @@ class BaseSearch(BaseAutotuner):
             if triton_code is not None:
                 print(triton_code, file=sys.stderr)
         return best
+
+    def _log_search_space_report(
+        self,
+        elapsed_seconds: float,
+        *,
+        outcome: str,
+        error_type: str | None = None,
+    ) -> None:
+        """Log and save the end-of-run search space report (best-effort).
+
+        Called from a ``finally`` so failed searches report too; nothing
+        here, including the settings check, may mask an in-flight exception.
+        """
+        try:
+            if not (
+                self.settings.autotune_log_search_space
+                or self.settings.autotune_log_search_space_verbose
+            ):
+                return
+            from .local_cache import stable_autotune_hash
+            from .search_space_logger import log_search_space_comparison
+
+            tracker = self._search_space_tracker
+            if tracker is None:
+                from .search_space_logger import SearchSpaceTracker
+                from .search_space_logger import analyze_search_space
+
+                hardware_spec, specialization_key = (
+                    self._get_current_hardware_and_specialization()
+                )
+                tracker = SearchSpaceTracker(
+                    analyze_search_space(
+                        self.config_spec,
+                        kernel_name=self._autotune_metrics.kernel_name,
+                        specialization_key=specialization_key,
+                        hardware=hardware_spec,
+                        config_overrides=(
+                            self.settings.autotune_config_overrides or None
+                        ),
+                        advanced_controls_files=(
+                            self.settings.autotune_search_acf or None
+                        ),
+                    )
+                )
+            tracker.record_invalid(self._generation_invalid_config_count())
+            report = tracker.finish(
+                search_algorithm=type(self).__name__,
+                elapsed_seconds=elapsed_seconds,
+                outcome=outcome,
+                error_type=error_type,
+            )
+            log_search_space_comparison(self.log._logger, report)
+            if self.settings.autotune_log_search_space_path:
+                saved_path = report.save(
+                    self.settings.autotune_log_search_space_path,
+                    stable_autotune_hash(self),
+                )
+                if saved_path:
+                    self.log(f"Search space analysis saved to: {saved_path}")
+        except Exception:
+            self.log.warning(
+                "Search space logging failed; the end-of-run summary was not "
+                "emitted (autotuning result is unaffected)",
+                exc_info=True,
+            )
 
     def _get_current_hardware_and_specialization(
         self,

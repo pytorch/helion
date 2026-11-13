@@ -261,6 +261,12 @@ Helion can log a search space analysis after each autotune run (opt-in, disabled
 - **Coverage metrics** — How many configs were tested vs. total space
 - **Per-feature exploration** — Exactly how many options of each feature were tested (e.g., "pid_type: 2/8 options tested (25.0%)")
 
+The report is also emitted when autotuning fails (for example when no working
+config is found and ``NoConfigFound`` is raised): coverage up to the failure is
+often exactly what is needed to diagnose it. The saved JSON then carries
+``"outcome": "failed"`` and an ``"error_type"`` naming the exception; a
+``find_handoff`` early stop is reported as ``"outcome": "handoff"``.
+
 Two verbosity levels are available:
 
 - **Summary** (``autotune_log_search_space``) — the end-of-run report shown below.
@@ -328,6 +334,10 @@ export HELION_AUTOTUNE_LOG_SEARCH_SPACE_PATH=/tmp/analysis.json
 # Creates, per kernel/shape:
 #   /tmp/analysis.<kernel>.<hash>.json  (search space + exploration report)
 ```
+
+Best-of-K trials (``autotune_best_of_k > 1``) share one report file per
+kernel/shape — the cache hash does not include the per-trial seed — so the last
+trial's report is the one kept.
 
 Or via decorator:
 
