@@ -91,7 +91,7 @@
       "image": "nvidia/cuda:13.1.0-devel-ubuntu24.04",
       "runtime-version": "cu130",
       "container-options": "--gpus all",
-      "pytorch-version": "pytorch-2.13",
+      "pytorch-version": "pytorch-2.14",
       "alias": "b200",
       "backend": "triton"
     },
