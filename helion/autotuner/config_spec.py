@@ -3548,6 +3548,11 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
                 default = high
         return BlockSizeFragment(low, high, default)
 
+    def _fragment(self, base: ConfigSpec) -> BlockSizeFragment:
+        # cardinality() reaches items through _fragment; this item's fragment is
+        # the flat one, so expose it under both names.
+        return self._flat_fragment(base)
+
     def _flat_config(
         self, base: ConfigSpec, fn: Callable[[ConfigSpecFragment], object]
     ) -> int | None:
