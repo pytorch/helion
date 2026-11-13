@@ -4672,7 +4672,10 @@ class TestFragmentPredicatePreprocessingCPU(unittest.TestCase):
                     self.assertEqual(events, [0, 1])
         compiler = object.__new__(FragmentCompiler)
         compiler.emit = lambda source: self.fail("short mask must remain unchanged")
-        self.assertEqual(compiler.predicate(["a", "b", "c"]), "a and b and c")
+        self.assertEqual(
+            ast.dump(ast.parse(compiler.predicate(["a", "b", "c"]), mode="eval")),
+            ast.dump(ast.parse("a and b and c", mode="eval")),
+        )
 
     def test_actual_sdk_preprocesses_reservation_masks(self):
         import importlib.util
@@ -8520,13 +8523,13 @@ class TestFragmentBranchLocalAtomicsCPU(unittest.TestCase):
         original = FragmentCompiler.graph
         entries, exits = [], []
 
-        def graph(compiler, graph, values):
+        def graph(compiler, graph, values, *, output_indices=None):
             info = next(info for info in compiler.graphs if info.graph is graph)
             branch = isinstance(info, (IfGraphInfo, ElseGraphInfo))
             if branch:
                 entries.append(set(compiler.pending_local_atomics))
                 self.assertFalse(compiler.pending_local_atomics)
-            result = original(compiler, graph, values)
+            result = original(compiler, graph, values, output_indices=output_indices)
             if branch:
                 exits.append(set(compiler.pending_local_atomics))
             return result
@@ -9951,6 +9954,9 @@ for index in range(thread, 32, 32):
             "readonly[0] = 1\n" + text,
             "alias = hist\n" + text,
             "alias = readonly.iterator\n" + text,
+            "alias = readonly[None]\n" + text,
+            "alias = readonly[:]\n" + text,
+            "alias = readonly[...]\n" + text,
             text.replace("scope='cta'", "scope='gpu'"),
             text.replace("sem='relaxed'", "sem='release'"),
             text.replace("cute.arch.atomic_add", "previous = cute.arch.atomic_add"),
@@ -12482,12 +12488,12 @@ class TestFragmentUniformLocalBranchEpochsCPU(unittest.TestCase):
         original = FragmentCompiler.graph
         entries = []
 
-        def graph(compiler, graph, values):
+        def graph(compiler, graph, values, *, output_indices=None):
             info = next(info for info in compiler.graphs if info.graph is graph)
             if isinstance(info, (IfGraphInfo, ElseGraphInfo)):
                 self.assertFalse(compiler.pending_local_atomics)
                 entries.append(info.graph_id)
-            return original(compiler, graph, values)
+            return original(compiler, graph, values, output_indices=output_indices)
 
         x = (torch.arange(4 * 65).reshape(4, 65) % 7 - 3).to(torch.int32)
         lengths = torch.tensor([0, 3, 7, 65], dtype=torch.int32)

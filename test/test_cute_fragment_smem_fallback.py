@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -11,6 +12,8 @@ import helion
 from helion._testing import cpu_render_target
 from helion._testing import import_example
 from helion._testing.cute_codegen import cpu_bind
+
+pytestmark = pytest.mark.cpu_only
 
 layer_norm_bwd = import_example("layer_norm").layer_norm_bwd
 
@@ -23,7 +26,7 @@ if TYPE_CHECKING:
 @pytest.fixture(scope="module", autouse=True)
 def _cpu_only() -> Iterator[None]:
     # The CPU model has no device to query: pin the B200 CTA capacity.
-    with cpu_render_target(forbid_cuda_init=None):
+    with cpu_render_target(reduction_smem_budget_bytes=232448):
         yield
 
 
@@ -53,7 +56,11 @@ def test_wide_rows_fall_back_to_the_scalar_lowering() -> None:
     # every row tile. The default config used to raise InvalidConfig here,
     # failing the autotuning reference baseline and the whole search.
     bound = _bind(8192, 8192)
-    code = bound.to_code(bound.config_spec.default_config())
+    with patch(
+        "helion._compiler.cute.computed_fragment.plan_shared_arena",
+        side_effect=AssertionError("optional owner must retain scalar fallback"),
+    ):
+        code = bound.to_code(bound.config_spec.default_config())
     assert "fragment_smem" not in code
     assert "_cute_grouped_reduce_shared_two_stage" in code
     assert "_launcher(_helion_layer_norm_bwd" in code

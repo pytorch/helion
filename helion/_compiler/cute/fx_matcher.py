@@ -11,8 +11,6 @@ from typing import cast
 
 import torch
 
-from .analysis.match_common import is_full_slice
-
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Sequence
@@ -20,9 +18,6 @@ if TYPE_CHECKING:
     from ..device_function import DeviceFunction
     from ..device_ir import DeviceIR
     from ..generate_ast import GenerateAST
-
-
-_is_full_slice = is_full_slice
 
 
 @dataclasses.dataclass(frozen=True)

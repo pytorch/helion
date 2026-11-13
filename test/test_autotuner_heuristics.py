@@ -910,7 +910,16 @@ class TestAutotunerHeuristic(TestCase):
         ):
             compiler_seed_configs(env, MagicMock())
 
+    @onlyBackends(["cute"])
+    @pytest.mark.cpu_only
     def test_cute_flash_disable_heuristics_keeps_structural_coverage(self) -> None:
+        @helion.kernel(backend="cute", disable_autotuner_heuristics=True)
+        def pointwise(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + 1
+            return out
+
         spec = ConfigSpec(backend=CuteBackend())
         self.assertIsNone(spec.compiler_seed_timeout_retry_repetitions)
         for block_id, size_hint in enumerate((1, 128, 128)):
@@ -925,13 +934,13 @@ class TestAutotunerHeuristic(TestCase):
             is_causal=True,
         )
         self.assertIsNone(spec.compiler_seed_timeout_retry_repetitions)
-        env = MagicMock()
-        env.backend_name = "cute"
-        env.backend = CuteBackend()
-        env.config_spec = spec
-        env.settings = Settings(disable_autotuner_heuristics=True)
-
-        self.assertEqual(compiler_seed_configs(env, MagicMock()), [])
+        with mock_cuda_unavailable(), forbid_native_compile():
+            bound = cpu_bind(pointwise, (torch.empty(8),))
+            bound.env.config_spec = spec
+            with bound.env, bound.host_function:
+                self.assertEqual(
+                    compiler_seed_configs(bound.env, bound.host_function.device_ir), []
+                )
         self.assertIsNone(spec.compiler_seed_timeout_retry_repetitions)
         self.assertEqual(spec.compiler_seed_configs, [])
         self.assertEqual(spec.autotuner_heuristics, [])

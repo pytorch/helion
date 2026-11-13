@@ -975,10 +975,11 @@ def _normalize_cute_flash_bwd(
 
 def pdl_searched(config_spec: ConfigSpec) -> bool:
     """Automatic PDL is searchable on sm_90+ when explicit markers do not
-    already govern the kernel's launch protocol."""
+    already govern the kernel's launch protocol and its owner permits PDL."""
     return (
         config_spec.supports_config_key("cute_pdl")
         and not config_spec.has_explicit_pdl
+        and not config_spec.cute_dependent_phase_launches
         and config_spec.target_device_capability is not None
         and config_spec.target_device_capability >= (9, 0)
     )

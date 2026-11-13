@@ -14,6 +14,7 @@ from helion._testing.registered_reduction import partitioned_copy_sum
 from helion._testing.registered_reduction import registered_chunk_max
 
 
+# The Triton allowlist includes TileIR, which needs its own barrier skip.
 @skipUnlessBackends(["triton", "cute"])
 @skipIfRefEager("requires compiled configurations")
 @skipIfTileIR("TileIR does not support barrier operations")

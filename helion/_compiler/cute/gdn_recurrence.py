@@ -42,6 +42,7 @@ from ... import exc
 from ...language.matmul_ops import dot
 from ..compile_environment import CompileEnvironment
 from ..compile_environment import FixedBlockSizeSource
+from ..utils import is_full_slice
 from .autotune.config_keys import CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY
 from .autotune.config_keys import CUTE_GDN_RECURRENCE_MMA_M_KEY
 from .autotune.config_keys import CUTE_GDN_RECURRENCE_STAGES_KEY
@@ -52,7 +53,6 @@ from .fx_matcher import _binary_args
 from .fx_matcher import _canonical_root_axis_ids
 from .fx_matcher import _is_call
 from .fx_matcher import _is_convert
-from .fx_matcher import _is_full_slice
 from .fx_matcher import _linear_offsets_fit_i32
 from .fx_matcher import _load_ref
 from .fx_matcher import _memory_indices
@@ -177,7 +177,7 @@ def _indices_are(node: torch.fx.Node, expected: Sequence[object]) -> bool:
         return False
     for actual, wanted in zip(indices, expected, strict=True):
         if wanted == "full":
-            if not _is_full_slice(actual):
+            if not is_full_slice(actual):
                 return False
         elif actual is not wanted:
             return False
@@ -524,7 +524,7 @@ def _match_gdn_recurrence_graphs(
     batch_coord, w_chunk, head_coord, w_feature = w_indices
     if (
         w_chunk is not chunk_sym
-        or not _is_full_slice(w_feature)
+        or not is_full_slice(w_feature)
         or not _is_call(batch_coord, _get_symnode)
         or not _is_call(head_coord, _get_symnode)
         or batch_coord is head_coord

@@ -29,7 +29,9 @@ import sympy
 import torch
 
 from ...language import memory_ops
+from ..ast_extension import clone_ast
 from ..compile_environment import CompileEnvironment
+from ._ast_pass_utils import substitute_names
 from .cute_mma_dag import AXIS_LEAD
 from .cute_mma_dag import AXIS_LOOP
 from .cute_mma_dag import AXIS_RDIM
@@ -287,7 +289,17 @@ class _Evaluator:
         elif node in self.program.tile_index_loads:
             axis = self.program.tile_index_loads[node]
             coord = coords[cast("int", _tile_index_position(node))]
-            result = em.bind("md_v", f"cutlass.Int32({em.axis_base(axis)} + {coord})")
+            value = node.meta["val"]
+            assert isinstance(value, torch.Tensor)
+            if value.dtype == torch.int64:
+                result = em.bind(
+                    "md_v",
+                    f"cutlass.Int64({em.axis_base(axis)}) + cutlass.Int64({coord})",
+                )
+            else:
+                result = em.bind(
+                    "md_v", f"cutlass.Int32({em.axis_base(axis)} + {coord})"
+                )
         elif node.op == "call_function" and node.target is memory_ops.load:
             # (A uniform scalar read from a tensor -- a window's limit --
             # was loaded once with the bases.)
@@ -880,6 +892,47 @@ class _Evaluator:
     def _lowered(self, node: Node, coords: Coords) -> str:
         result, statements = self._lower_pointwise(node, coords)
         return self._emit_lowered(result, statements)
+
+
+class _IndexEvaluator(_Evaluator):
+    """Pure typed expressions with an explicit current/prefetch index mapping.
+
+    Do not share the fragment evaluator's (node, coords) memo: a future table
+    address must not reuse a scalar calculated for the current iteration.
+    No statements or loads are emitted ahead of the caller's guard.
+    """
+
+    def __init__(self, emitter: MmaDagEmitterBase, values: dict[int, str]) -> None:
+        super().__init__(emitter)
+        self.values = values
+
+    def evaluate(self, node: Node, coords: Coords) -> str:
+        node = self.program.resolve(node)
+        return self.emitter.uniform(self.program.index_exprs[node], self.values)
+
+    def expression(self, node: Node) -> str:
+        result, statements = self._lower_pointwise(node, ())
+        # Scalar lowering names its inputs and intermediates. Inline those
+        # pure assignments instead of executing a table read before the
+        # eventual guarded transfer. A control-flow lowering is not an index
+        # expression and must not be speculated here.
+        bindings: dict[str, ast.AST] = {}
+
+        def inline(value: ast.AST) -> ast.AST:
+            return substitute_names(
+                value, bindings, clone=lambda child: cast("ast.AST", clone_ast(child))
+            )
+
+        for statement in statements:
+            if (
+                not isinstance(statement, ast.Assign)
+                or len(statement.targets) != 1
+                or not isinstance(statement.targets[0], ast.Name)
+            ):
+                raise _decline(f"scalar index {node.name} requires control flow")
+            bindings[statement.targets[0].id] = inline(statement.value)
+        result = inline(result)
+        return self.emitter.typed(ast.unparse(result), node.meta["val"].dtype)
 
 
 def _load_args(address: str, pred: str | None, readonly: bool) -> str:
@@ -1680,7 +1733,12 @@ class MmaDagEmitterBase:
         replacements: dict[sympy.Symbol, sympy.Symbol] = {}
         for symbol in expr.free_symbols:
             symbol = cast("sympy.Symbol", symbol)
-            if symbol in self.program.index_loads:
+            if symbol in self.program.index_values:
+                value = _IndexEvaluator(self, values).expression(
+                    self.program.index_values[symbol]
+                )
+                replacements[symbol] = sympy.Symbol(f"({value})", integer=True)
+            elif symbol in self.program.index_loads:
                 access = self.program.index_loads[symbol]
                 address = self.iteration_base_expr(access, values)
                 suffix = "s32" if access.dtype == torch.int32 else "s64"
@@ -1739,6 +1797,17 @@ class MmaDagEmitterBase:
         offset = self.scalar_vars[window.offset.node]
         return f"({coord} < {limit} and {offset} + {coord} < {window.extent})"
 
+    def index_cast(self, value: str) -> str:
+        """Keep tile bases and intermediate products at the selected index width."""
+        dtype = "Int64" if self.env.index_dtype == torch.int64 else "Int32"
+        return f"cutlass.{dtype}({value})"
+
+    def axis_product(self, axis: Axis, index: str) -> str:
+        """Multiply a tile index by its step without narrowing an int64 index."""
+        if self.env.index_dtype == torch.int64:
+            index = self.index_cast(index)
+        return f"{index} * {self.plan.size(axis)}"
+
     def axis_base(self, axis: Axis) -> str:
         """The CTA's first index along ``axis`` (loop axes: per iteration)."""
         return f"md_a{axis.index}"
@@ -1754,7 +1823,7 @@ class MmaDagEmitterBase:
                 # The trailing grid dim indexes the cluster's CTAs: this
                 # CTA's slice of the split axis.
                 self.emit(
-                    f"{self.axis_base(axis)} = cutlass.Int32(cute.arch.block_idx()[1]) "
+                    f"{self.axis_base(axis)} = {self.index_cast('cute.arch.block_idx()[1]')} "
                     f"* {self.plan.size(axis)}"
                 )
                 continue
@@ -1762,7 +1831,7 @@ class MmaDagEmitterBase:
                 continue
             self.define(
                 self.axis_base(axis),
-                f"cutlass.Int32({self.cg.tile_begin_var(axis.block_id)})",
+                self.index_cast(self.cg.tile_begin_var(axis.block_id)),
             )
         self.define_trip_counts()
 
@@ -1854,10 +1923,25 @@ class MmaDagEmitterBase:
                     if expr is not None:
                         for symbol in sorted(expr.free_symbols, key=str):
                             assert isinstance(symbol, sympy.Symbol)
-                            dependency = self.program.index_loads.get(symbol)
-                            if dependency is not None:
-                                visit(dependency)
+                            visit_index(symbol)
             ordered.append(access)
+
+        seen_indices: set[sympy.Symbol] = set()
+
+        def visit_index(symbol: sympy.Symbol) -> None:
+            if symbol in seen_indices:
+                return
+            seen_indices.add(symbol)
+            dependency = self.program.index_loads.get(symbol)
+            if dependency is not None:
+                visit(dependency)
+            value = self.program.index_values.get(symbol)
+            if value is not None:
+                for node in _node_inputs(value):
+                    node = self.program.resolve(node)
+                    for child in self.program.index_exprs[node].free_symbols:
+                        assert isinstance(child, sympy.Symbol)
+                        visit_index(child)
 
         for access in sorted(
             self.program.accesses, key=lambda access: access.node not in scalar_nodes
@@ -2553,14 +2637,14 @@ class MmaDagEmitterBase:
             (axis,) = loop.axes
             size = self.plan.size(axis)
             self.emit(
-                f"{self.end_var(loop)} = cutlass.Int32({self.render_bound(loop.tile_end)})"
+                f"{self.end_var(loop)} = {self.index_cast(self.render_bound(loop.tile_end))}"
             )
             lo, hi, _aligned = loop_trip_range(
                 loop.tile_end, self.program.axes, self.plan.sizes, axis.index
             )
             if lo != hi:
                 self.emit(
-                    f"{self.trip_var(loop)} = cutlass.Int32(({self.end_var(loop)} + {size - 1}) // {size})"
+                    f"{self.trip_var(loop)} = {self.index_cast(f'({self.end_var(loop)} + {size - 1}) // {size}')}"
                 )
 
     def axis_offset(self, axis: Axis, value: str) -> str:

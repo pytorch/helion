@@ -36,6 +36,7 @@ from .register_snapshots import snapshot_logical_shape
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from .fragment_domain import OwnershipMask
     from .fragment_slab_loads import ScalarLoad
     from .fragment_slab_loads import SlabGroup
 
@@ -467,7 +468,7 @@ class FragmentMemoryEmitter(FragmentContext):
         def read(coords: tuple[str, ...]) -> str:
             result = self.df.new_var("fragment_local_load")
             self.emit(f"{result} = {self.cast('0', source.dtype)}")
-            domains = list(output_domain(coords))
+            domains: list[OwnershipMask] = list(output_domain(coords))
             if isinstance(index, Fragment):
                 domains.extend(index.broadcast_domain(coords))
             if isinstance(mask, Fragment):
@@ -609,7 +610,7 @@ class FragmentMemoryEmitter(FragmentContext):
 
         def address(coords: tuple[str, ...]) -> tuple[str, str]:
             tensor_indices: list[str] = []
-            masks: list[str] = []
+            masks: list[OwnershipMask] = []
             dim = 0
             for ordinal, index in enumerate(indices):
                 if index is None:
@@ -776,7 +777,7 @@ class FragmentMemoryEmitter(FragmentContext):
                         )
             dim += 1
 
-        def logical_domain(coords: tuple[str, ...]) -> tuple[str, ...]:
+        def logical_domain(coords: tuple[str, ...]) -> tuple[OwnershipMask, ...]:
             return (
                 *(
                     f"({selected_coordinates(ordinal, coords)[0]}) < ({bound})"

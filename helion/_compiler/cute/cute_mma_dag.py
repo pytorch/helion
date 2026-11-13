@@ -1409,6 +1409,10 @@ class MmaDagProgram:
     # the loops its own address depends on, so operand staging reads the
     # index for the same iteration (including a prefetched future one).
     index_loads: dict[sympy.Symbol, Access] = dataclasses.field(default_factory=dict)
+    # Typed scalar index expressions are separate from invariant bounds: their
+    # tensor nodes retain INT32/INT64 wrapping and may read a future iteration.
+    index_values: dict[sympy.Symbol, Node] = dataclasses.field(default_factory=dict)
+    index_exprs: dict[Node, sympy.Expr] = dataclasses.field(default_factory=dict)
     # Vector leaf -> the 2-D dim it is read along (``v[:, None]``: 0), where
     # the dim is positional (a slot over one axis, ``rows is cols``).
     vec_positions: dict[Node, int] = dataclasses.field(default_factory=dict)
@@ -4615,6 +4619,8 @@ class _Matcher:
         self.uniform_values: dict[Node, None] = {}
         self.aux_indices: dict[Node, sympy.Expr] = {}
         self.index_loads: dict[Node, tuple[sympy.Symbol, Access]] = {}
+        self.index_values: dict[Node, tuple[sympy.Symbol, tuple[int, ...]]] = {}
+        self.index_exprs: dict[Node, sympy.Expr] = {}
         # Loop-local loads and scalar recipes need a speculation proof before
         # moving to CTA entry: an empty loop must not dereference a body
         # lookup or evaluate potentially undefined integer arithmetic.
@@ -4707,7 +4713,7 @@ class _Matcher:
                 continue
             if not isinstance(origin, (TileIdOrigin, TileBeginOrigin)):
                 raise _NotMine
-            axis = self.axis_of_block(origin.block_id)
+            axis = self.bound_coordinate_axis(origin.block_id)
             if axis.kind == AXIS_LEAD:
                 largest[symbol] = sympy.Integer(axis.extent - 1)
                 placeholders[symbol] = bound_symbol(BOUND_ID, axis.index)
@@ -4825,6 +4831,14 @@ class _Matcher:
             raise _NotMine
         return True
 
+    def bound_coordinate_axis(self, block_id: int) -> Axis:
+        """Axis whose extent bounds its zero-based, unit-stride coordinates."""
+        if self.canonical(block_id) in self.noncanonical_coordinate_blocks:
+            # A trip count cannot bound shifted or strided coordinates. Such
+            # origins need a separate proof before unmasked transfer planning.
+            raise _NotMine
+        return self.axis_of_block(block_id)
+
     def uniform_expr(
         self, subscript: object, *, root_coordinates: bool = False
     ) -> tuple[sympy.Expr, tuple[int, ...]]:
@@ -4839,12 +4853,50 @@ class _Matcher:
             raise _NotMine
         val = subscript.meta.get("val")
         if isinstance(val, torch.Tensor):
-            return self.index_load(subscript)
+            # A Boolean subscript is a mask, not an integer 0/1 address.
+            if val.dtype == torch.bool:
+                raise _NotMine
+            return self.index_value(subscript)
         if isinstance(val, int) and not isinstance(val, bool):
             return sympy.Integer(val), ()
         if not isinstance(val, torch.SymInt):
             raise _NotMine
         return self.uniform_sym(val._sympy_(), root_coordinates=root_coordinates)
+
+    def index_value(self, node: Node) -> tuple[sympy.Expr, tuple[int, ...]]:
+        """A typed scalar integer recipe with Boolean comparison intermediates.
+
+        Never turn tensor arithmetic into unbounded SymPy algebra or move a
+        declaring-loop load outside its guard.
+        """
+        node = self.resolve(node)
+        val = node.meta.get("val")
+        if isinstance(val, (int, torch.SymInt)) and not isinstance(val, bool):
+            expr, loops = self.uniform_expr(node)
+        elif _plain_integer_scalar_load(node):
+            expr, loops = self.index_load(node)
+        else:
+            known = self.index_values.get(node)
+            if known is not None:
+                return known
+            if (
+                not isinstance(val, torch.Tensor)
+                or val.ndim != 0
+                or val.dtype not in (torch.int32, torch.int64, torch.bool)
+                or not _is_scalar_index_pointwise(node)
+            ):
+                raise _NotMine
+            dependencies: set[int] = set()
+            for value in _node_inputs(node):
+                _expr, value_loops = self.index_value(value)
+                dependencies.update(value_loops)
+            expr = sympy.Symbol(
+                f"_mma_dag_index_value_{len(self.index_values)}", integer=True
+            )
+            loops = tuple(sorted(dependencies))
+            self.index_values[node] = expr, loops
+        self.index_exprs[node] = expr
+        return expr, loops
 
     def index_load(self, node: Node) -> tuple[sympy.Symbol, tuple[int, ...]]:
         """A scalar integer table lookup used as a uniform tensor index."""
@@ -4880,6 +4932,7 @@ class _Matcher:
         Address callers retain the stricter leading-coordinate contract.
         """
         from ..host_function import HostFunction
+        from ..variable_origin import BlockSizeOrigin
         from ..variable_origin import GridOrigin
         from ..variable_origin import TensorSizeOrigin
         from ..variable_origin import TileBeginOrigin
@@ -4942,6 +4995,10 @@ class _Matcher:
                     loops.append(loop)
             elif type(origin) is GridOrigin:
                 raise _NotMine
+            elif isinstance(origin, BlockSizeOrigin):
+                # Every selected block size is uniform across the launch.
+                # The emitter resolves its symbol from the current config.
+                pass
             elif (
                 root_coordinates
                 and isinstance(origin, (TileBeginOrigin, TileIdOrigin))
@@ -4987,7 +5044,7 @@ class _Matcher:
                 raise _NotMine
             assert isinstance(origin, GridOrigin)
             highest[cast("sympy.Symbol", symbol)] = (
-                self.axis_of_block(origin.block_id).extent - 1
+                self.bound_coordinate_axis(origin.block_id).extent - 1
             )
         try:
             poly = sympy.Poly(expr, *symbols) if symbols else None
@@ -5010,13 +5067,14 @@ class _Matcher:
 
     def bound_varies(self, val: torch.SymInt) -> bool:
         """Whether a grid loop bound varies within the kernel: any symbol
-        that is not a host value (a tensor size, an int argument) or a lead
+        that is not a host/config value (size, int argument, block size) or a lead
         tile's id -- an enclosing grid loop's index, a device tile's
         position, a value minted in device code (``int or int`` on a loop
         index), or a symbol of unknown origin.  The emitter renders bounds
         with the host's symbols, and an enclosing loop evaluates a nested
         loop's bounds ahead of its iteration (the early ring prologue)."""
         from ..host_function import HostFunction
+        from ..variable_origin import BlockSizeOrigin
         from ..variable_origin import TileBeginOrigin
         from ..variable_origin import TileIdOrigin
 
@@ -5029,6 +5087,8 @@ class _Matcher:
             if isinstance(origin, (TileIdOrigin, TileBeginOrigin)):
                 if self.axis_of_block(origin.block_id).kind != AXIS_LEAD:
                     return True
+            elif isinstance(origin, BlockSizeOrigin):
+                continue
             elif not origin.is_host():
                 return True
         return False
@@ -5252,7 +5312,7 @@ class _Matcher:
             or extent is None
         ):
             return None
-        axis = self.axis_of_block(block_id)
+        axis = self.bound_coordinate_axis(block_id)
         iota = self.iota_extent(source)
         if iota is not None:
             if axis.kind != AXIS_RDIM or axis.extent != iota:
@@ -5374,7 +5434,9 @@ class _Matcher:
             if tile is not None and self.canonical(tile.block_id) in tile_blocks:
                 if not value_sizes:
                     raise _NotMine
-                axis = self.axis_of_block(tile.block_id)
+                # Both a bare tile and tile.index + offset require the tile's
+                # own coordinates to be bounded by its declared extent.
+                axis = self.bound_coordinate_axis(tile.block_id)
                 size = value_sizes.pop(0)
                 size_block = self.env.resolve_block_id(size)
                 if size_block is None or self.canonical(size_block) != axis.block_id:
@@ -5611,7 +5673,7 @@ class _Matcher:
                     and self.shape_axes(source) != (axis,)
                 )
                 or not isinstance(val, torch.Tensor)
-                or val.dtype != torch.int32
+                or val.dtype not in (torch.int32, torch.int64)
             ):
                 raise _NotMine
             self.tile_index_loads[node] = axis
@@ -6303,6 +6365,12 @@ class _Matcher:
         # environment and host function.
         self.env = CompileEnvironment.current()
         device_ir = HostFunction.current().device_ir
+        # Registered sizes may alias the raw IDs recorded for loop origins.
+        # Resolve once so every coordinate proof uses the same canonical set.
+        self.noncanonical_coordinate_blocks = frozenset(
+            self.canonical(block_id)
+            for block_id in device_ir.noncanonical_task_origin_block_ids
+        )
         # Contractions the tensor-core families already claim (tcgen05
         # collective / warp-MMA search, or a dot their operand analyzer
         # accepts) keep their search surface: this owner exists for the
@@ -6475,6 +6543,10 @@ class _Matcher:
             uniform_values=tuple(self.uniform_values),
             aux_indices=dict(self.aux_indices),
             index_loads=dict(self.index_loads.values()),
+            index_values={
+                symbol: node for node, (symbol, _loops) in self.index_values.items()
+            },
+            index_exprs=dict(self.index_exprs),
             aux_positions={
                 node: tuple(sorted(positions))
                 for node, positions in self.aux_positions.items()
@@ -7639,10 +7711,11 @@ def match_mma_dag(
     *,
     resolve_block_size: Callable[[int], int | torch.SymInt | None] | None = None,
 ) -> MmaDagProgram | None:
-    """Match the MMA dataflow program in ``graphs`` (config-free).
+    """Match the MMA dataflow program in ``graphs``.
 
     Needs the compile environment and host function to be current (the
     autotuner heuristic enters them; pre-codegen already runs inside them).
+    Heuristics omit the resolver; plan-time matching uses configured extents.
     """
     return _Matcher(graphs, resolve_block_size).match()
 
@@ -8387,9 +8460,7 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
         graphs = [graph for graph in graphs if graph.graph_id in region]
     program = match_mma_dag(
         graphs,
-        resolve_block_size=DeviceFunction.current().resolved_block_size
-        if CompileEnvironment.current().config_spec.cute_mma_dag_phase_index is not None
-        else None,
+        resolve_block_size=DeviceFunction.current().resolved_block_size,
     )
     if program is None:
         raise _decline("the kernel is not an MMA dataflow program the owner lowers")

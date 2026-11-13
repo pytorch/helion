@@ -32,7 +32,13 @@ def active_block_ids(
     *,
     include_literal_slices: bool = False,
 ) -> frozenset[int]:
-    """Keep shape/index symbols, explicit loops and actual reduction lowerings."""
+    """Keep shape/index symbols, explicit loops and actual reduction lowerings.
+
+    ``include_literal_slices`` also keeps logical memory-slice axes whose
+    extents no longer carry symbols. Projected stage codegen needs these axes;
+    other analyses retain their existing symbol-based admission policy. Memory
+    indices, rather than padded factory/result shapes, supply the extents.
+    """
     result = set(root_blocks)
 
     def visit(value: object) -> None:
@@ -56,7 +62,7 @@ def active_block_ids(
         for node in graph.graph.nodes:
             visit(node.meta.get("val"))
             if include_literal_slices:
-                # Full slices own logical axes even when their extents are
+                # Memory slices own logical axes even when their extents are
                 # literal. Read the memory operation's indices, not padded
                 # factory/result shapes that can equal an unrelated axis.
                 for extent in _memory_slice_extents(node):

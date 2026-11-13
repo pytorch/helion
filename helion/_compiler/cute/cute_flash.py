@@ -58,6 +58,7 @@ from ..compile_environment import CompileEnvironment
 from ..device_function import SymbolArgument
 from ..device_function import TensorArg
 from ..emitter_protocols import statements_adapter
+from ..utils import is_full_slice
 from .attention_plan import ALIBI_BIAS_KIND
 from .attention_plan import CAUSAL_MASK_KIND
 from .attention_plan import DENSE_SCORE_KIND
@@ -304,7 +305,6 @@ from .flash_template_runs import flash_ws_step_tail
 from .flash_tuning import FLASH_FLOAT16_MAX_LOG2
 from .flash_tuning import FlashPackedExp2Mode
 from .flash_tuning import FlashSoftmaxLowering
-from .fx_matcher import _is_full_slice
 from .state import cute_codegen_state
 
 _T = TypeVar("_T")
@@ -638,8 +638,8 @@ def _flash_unwrap_trailing_unit_axis(value: torch.fx.Node) -> torch.fx.Node:
             if (
                 isinstance(indices, (list, tuple))
                 and len(indices) == 3
-                and _is_full_slice(indices[0])
-                and _is_full_slice(indices[1])
+                and is_full_slice(indices[0])
+                and is_full_slice(indices[1])
                 and indices[2] is None
             ):
                 value = source
@@ -668,7 +668,7 @@ def _flash_store_value_lse_log_base(
     indices = node.args[1] if len(node.args) > 1 else None
     if not isinstance(indices, (list, tuple)) or len(indices) not in (1, 2, 3):
         return None
-    if len(indices) == 3 and not _is_full_slice(indices[2]):
+    if len(indices) == 3 and not is_full_slice(indices[2]):
         return None
     if len(node.args) < 3 or not isinstance(node.args[2], torch.fx.Node):
         return None
@@ -772,7 +772,7 @@ def _flash_root_loop_info(
             row_indices = tuple(indices[:-1])
             if not all(
                 isinstance(index, torch.fx.Node) for index in row_indices
-            ) or not _is_full_slice(indices[-1]):
+            ) or not is_full_slice(indices[-1]):
                 return None
             row_indices = cast("tuple[torch.fx.Node, ...]", row_indices)
             if root_block_ids is not None:
@@ -952,7 +952,7 @@ def _flash_store_has_canonical_indices(
         return False
     if len(node.args) > 3 and node.args[3] is not None:
         return False
-    return rank == len(row_indices) or _is_full_slice(indices[-1])
+    return rank == len(row_indices) or is_full_slice(indices[-1])
 
 
 def _flash_symint_expr(value: object) -> sympy.Expr | None:
@@ -1059,7 +1059,7 @@ def _flash_store_has_batch_heads_split_indices(
     if len(row_indices) != 2:
         return False
     batch_index, tile_m = row_indices
-    if indices[2] is not tile_m or not _is_full_slice(indices[3]):
+    if indices[2] is not tile_m or not is_full_slice(indices[3]):
         return False
     heads = _flash_symint_expr(value.shape[1])
     if heads is None or not _flash_value_is_contiguous(value):
@@ -1468,7 +1468,7 @@ def _flash_normalized_accumulator_node(
     indices = sum_view.args[1] if len(sum_view.args) > 1 else None
     if not isinstance(indices, (list, tuple)) or len(indices) not in (2, 3):
         return False
-    return indices[-1] is None and all(_is_full_slice(index) for index in indices[:-1])
+    return indices[-1] is None and all(is_full_slice(index) for index in indices[:-1])
 
 
 def _flash_row_epilogue_load_name(
@@ -1500,7 +1500,7 @@ def _flash_row_epilogue_load_name(
         for index, row_index in zip(indices[:2], row_indices, strict=True)
     ):
         return None
-    if not _is_full_slice(indices[2]):
+    if not is_full_slice(indices[2]):
         return None
     value = host_tensors.get(name)
     if (

@@ -38,7 +38,9 @@ from helion._compiler.cute.cute_warp_mma_gemm import _swizzled_chunk
 from helion._compiler.cute.cute_warp_mma_gemm import warp_mma_warp_layout
 from helion._compiler.cute.state import cute_env_state
 from helion._compiler.host_function import SymbolOrigin
+from helion._compiler.source_location import UnknownLocation
 from helion._compiler.variable_origin import BlockSizeOrigin
+from helion._compiler.variable_origin import DeviceOrigin
 from helion._testing.cute_mma_dag import CPU_DEVICE
 from helion._testing.cute_mma_dag import bind_cpu_gemm as _bind_gemm
 from helion.exc import BackendUnsupported
@@ -6282,9 +6284,9 @@ def test_a_nested_bound_naming_the_outer_index_is_not_mine() -> None:
     )
     program = dataclasses.replace(plan.program, loops=(outer, dependent))
     assert dataclasses.replace(plan, program=program).early_prologues() == {}
-    # A symbol that is no host value varies, whatever its origin -- one minted
-    # in device code (``int or int`` on a loop index) as much as a loop index;
-    # a host argument (the int trip count) does not.
+    # A symbol that is neither a host value nor a configured block size varies:
+    # one minted in device code (``int or int`` on a loop index) as much as a
+    # loop index. A host argument (the int trip count) stays uniform too.
     a, b = _nest_tensors(3)
     bound = _bind_fn(_grid_nest_steps, (a, b, 3))
     host = bound.host_function
@@ -6295,7 +6297,11 @@ def test_a_nested_bound_naming_the_outer_index_is_not_mine() -> None:
             if info.origin.is_host()
         )
         device_symbol = sympy.Symbol("u_device")
-        host.expr_to_origin[device_symbol] = SymbolOrigin(BlockSizeOrigin(0))
+        host.expr_to_origin[device_symbol] = SymbolOrigin(
+            DeviceOrigin(UnknownLocation())
+        )
+        block_symbol = sympy.Symbol("u_config_block")
+        host.expr_to_origin[block_symbol] = SymbolOrigin(BlockSizeOrigin(0))
         matcher = dag._Matcher.__new__(dag._Matcher)
         shape_env = ShapeEnv()
         assert matcher.bound_varies(
@@ -6303,6 +6309,9 @@ def test_a_nested_bound_naming_the_outer_index_is_not_mine() -> None:
         )
         assert not matcher.bound_varies(
             shape_env.create_symintnode(host_symbol + 1, hint=4)
+        )
+        assert not matcher.bound_varies(
+            shape_env.create_symintnode(block_symbol + 1, hint=4)
         )
 
 

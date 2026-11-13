@@ -13,9 +13,12 @@ import torch
 
 from helion._compiler.compile_environment import FixedBlockSizeSource
 from helion._compiler.cute.analysis import match_common
+from helion._compiler.utils import is_full_slice
 from helion.language import creation_ops
 from helion.language._tracing_ops import _host_tensor
 from helion.language._tracing_ops import _new_var
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _graph() -> torch.fx.Graph:
@@ -53,9 +56,9 @@ def test_call_and_slice_predicates() -> None:
     assert not match_common.is_call(item, operator.add)
     assert not match_common.is_call(x, operator.getitem)
     assert not match_common.is_call(None, operator.getitem)
-    assert match_common.is_full_slice(slice(None))
-    assert not match_common.is_full_slice(slice(None, 4))
-    assert not match_common.is_full_slice(None)
+    assert is_full_slice(slice(None))
+    assert not is_full_slice(slice(None, 4))
+    assert not is_full_slice(None)
 
 
 def test_new_var_and_host_tensor() -> None:

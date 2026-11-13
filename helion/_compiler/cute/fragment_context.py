@@ -44,6 +44,11 @@ from ..variable_origin import TileBeginOrigin
 from ..variable_origin import TileEndOrigin
 from ..variable_origin import TileIdOrigin
 from .dead_zero_atomics import dead_zero_atomic_results
+from .fragment_domain import OwnershipMask
+from .fragment_domain import OwnershipTerm
+from .fragment_domain import broadcast_ownership
+from .fragment_domain import ownership_terms
+from .fragment_domain import render_ownership
 from .fragment_storage import aligned_shared_bytes
 from .fragment_storage import configured_fragment_expr
 from .fragment_storage import metadata_guarded
@@ -63,11 +68,13 @@ if TYPE_CHECKING:
     from collections.abc import Generator
     from collections.abc import Iterable
     from collections.abc import Mapping
+    from collections.abc import Sequence
 
     from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
     from .atomic_consumer_fusion import AtomicConsumerRegion
     from .fragment_expression import FragmentExpression
+    from .fragment_shared_arena import SharedArenaPlan
     from .fragment_slab_loads import ScalarLoad
     from .fragment_slab_loads import SlabGroup
     from .scan_analysis import CompletedScan
@@ -108,7 +115,7 @@ class Fragment:
     resident: bool = False
     dependencies: tuple[Fragment, ...] = ()
     storage: str | None = None
-    logical_domain: Callable[[tuple[str, ...]], tuple[str, ...]] | None = None
+    logical_domain: Callable[[tuple[str, ...]], tuple[OwnershipMask, ...]] | None = None
 
     snapshot: SnapshotBinding | None = None
     # A leaf whose recipe reads no memory at all (``hl.arange``, a tile index,
@@ -137,28 +144,20 @@ class Fragment:
             )
         )
 
-    def domain(self, indices: tuple[str, ...]) -> tuple[str, ...]:
+    def domain(self, indices: tuple[str, ...]) -> tuple[OwnershipTerm, ...]:
         """Coordinate ownership, independent of a value or memory-load mask."""
-        return tuple(
-            dict.fromkeys(
-                (
-                    *(
-                        f"0 <= ({index}) and ({index}) < ({size})"
-                        for index, size in zip(indices, self.shape, strict=True)
-                    ),
-                    *(self.logical_domain(indices) if self.logical_domain else ()),
-                )
+        return ownership_terms(
+            (
+                *(
+                    f"0 <= ({index}) and ({index}) < ({size})"
+                    for index, size in zip(indices, self.shape, strict=True)
+                ),
+                *(self.logical_domain(indices) if self.logical_domain else ()),
             )
         )
 
-    def broadcast_domain(self, indices: tuple[str, ...]) -> tuple[str, ...]:
-        indices = indices[len(indices) - len(self.shape) :] if self.shape else ()
-        return self.domain(
-            tuple(
-                "0" if size == 1 else index
-                for size, index in zip(self.shape, indices, strict=True)
-            )
-        )
+    def broadcast_domain(self, indices: tuple[str, ...]) -> tuple[OwnershipTerm, ...]:
+        return broadcast_ownership(self.domain, self.shape, indices)
 
 
 @dataclass(frozen=True)
@@ -447,11 +446,18 @@ class FragmentContext:
     pending_barrier = False
     slab_plan: Mapping[Node, SlabGroup] = MappingProxyType({})
 
-    def graph(self, graph: torch.fx.Graph, values: dict[Node, object]) -> object:
+    def graph(
+        self,
+        graph: torch.fx.Graph,
+        values: dict[Node, object],
+        *,
+        output_indices: frozenset[int] | None = None,
+    ) -> object:
         """Walk a (nested) graph, binding every node's lowering into ``values``.
 
         The control-flow emitters call back into the walk for their bodies;
-        ``FragmentCompiler`` provides it.
+        ``FragmentCompiler`` provides it. A proved branch projection can retain
+        only selected return slots; it still emits every node and effect.
         """
         raise NotImplementedError
 
@@ -464,7 +470,11 @@ class FragmentContext:
         self.allocator = ""
         self.smem_bytes = 0
         self.buffers: list[tuple[str, torch.dtype, int]] = []
+        self.buffer_interference: set[frozenset[str]] = set()
+        self.shared_arena_plan: SharedArenaPlan | None = None
+        self.shared_arena_name = ""
         self.scopes: list[dict[Node, object]] = []
+        self.scope_uses: list[dict[Node, int]] = []
         self.held: list[object] = []
         self.threads = cast("int", self.df.config.get("cute_fragment_threads", 128))
         self.thread = ""
@@ -613,6 +623,28 @@ class FragmentContext:
             self.iteration_defined.clear()
 
     def allocations(self) -> list[ast.AST]:
+        if self.shared_arena_plan is not None:
+            plan = self.shared_arena_plan
+            arena = self.shared_arena_name
+            assert arena
+            views: list[ast.AST] = []
+            for view in plan.views:
+                dtype = self.dtype(view.dtype)
+                tensor = f"cute.make_tensor(cute.recast_ptr({arena}.iterator + {view.offset}, dtype={dtype}), cute.make_layout(({view.count},)))"
+                if view.dtype == torch.bool:
+                    # Boolean pointers use i8 storage. Recasting the tensor
+                    # retains the semantic dtype that make_tensor cannot infer.
+                    tensor = f"cute.recast_tensor({tensor}, {dtype})"
+                views.append(statement_from_string(f"{view.name} = {tensor}"))
+            return [
+                statement_from_string(
+                    f"{self.allocator} = cutlass.utils.SmemAllocator()"
+                ),
+                statement_from_string(
+                    f"{arena} = {self.allocator}.allocate_tensor(cutlass.Uint8, cute.make_layout(({plan.byte_size},)), byte_alignment=16)"
+                ),
+                *views,
+            ]
         return [
             statement_from_string(f"{self.allocator} = cutlass.utils.SmemAllocator()"),
             *[
@@ -817,7 +849,7 @@ class FragmentContext:
         if self.pending_local_atomics:
             self.synchronize()
 
-    def predicate(self, masks: list[str] | tuple[str, ...]) -> str:
+    def predicate(self, masks: Sequence[OwnershipMask]) -> str:
         """Bound SDK short-circuit AST expansion without changing mask order.
 
         The CuTe preprocessor repeats the accumulated left operand in each
@@ -826,7 +858,7 @@ class FragmentContext:
         this exact lexical body; each binary conjunction keeps Python/DSL
         short-circuit behavior, and no value is cached across a later mutation.
         """
-        source = " and ".join(masks) or "True"
+        source = " and ".join(f"({render_ownership(mask)})" for mask in masks) or "True"
         expression = expr_from_string(source)
         if not isinstance(expression, ast.BoolOp):
             return source
@@ -916,6 +948,34 @@ class FragmentContext:
             [*[value for scope in self.scopes for value in scope.values()], *self.held]
         )
 
+    @contextmanager
+    def retired_loop_initials(
+        self,
+        node: Node,
+        values: dict[Node, object],
+        copied: set[Node],
+        readonly: list[object],
+    ) -> Generator[None, None, None]:
+        """Retire last-use initial values after their synchronized carry copy.
+
+        Only a copied initial may leave the parent scope. Readonly captures
+        stay pinned across every backedge, including after their final use
+        within one iteration. Other parent aliases and later uses remain live.
+        """
+        assert self.scopes and self.scopes[-1] is values
+        assert len(self.scope_uses) == len(self.scopes)
+        uses = self.scope_uses[-1]
+        assert all(source in values and node in source.users for source in copied)
+        retired = {source: values[source] for source in copied if uses[source] == 1}
+        for source in retired:
+            values.pop(source)
+        self.held.append(readonly)
+        try:
+            yield
+        finally:
+            self.held.pop()
+            values.update(retired)
+
     def physical_shape(
         self, shape: tuple[int, ...], dtype: torch.dtype
     ) -> tuple[int, ...]:
@@ -962,6 +1022,13 @@ class FragmentContext:
                 self.smem_bytes += aligned_shared_bytes(
                     count, value.dtype
                 ) - aligned_shared_bytes(capacity, value.dtype)
+        self.buffer_interference.update(
+            # Existing live pairs were recorded when their later allocation
+            # became live. Record only the new lifetime against its peers.
+            frozenset((name, other))
+            for other in live
+            if other != name
+        )
         return Fragment(
             value.shape,
             value.dtype,

@@ -35,7 +35,8 @@ def test_projected_consumer_retains_static_memory_axes(tensor_indices):
         code = bound.to_code(helion.Config.from_dict(config))
     stages = stage_sources(code)
     assert len(stages) == 2
-    assert "thread_idx()[0]" in stages[1] and "thread_idx()[1]" in stages[1]
+    assert "thread_idx()[0]" in stages[1]
+    assert "thread_idx()[1]" in stages[1]
     expected_block = "(7, 11, 1)" if tensor_indices else "(8, 16, 1)"
     assert f"block={expected_block}" in stages[1]
 

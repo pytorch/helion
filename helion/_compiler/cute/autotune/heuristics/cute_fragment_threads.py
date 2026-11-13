@@ -10,6 +10,7 @@ from .....autotuner.compiler_coverage import CoverageWitness
 from .....exc import InvalidConfig
 from .....runtime.config import Config
 from ....autotuner_heuristics.registry import AutotunerHeuristic
+from ...full_reduction_owner import validate_required_full_reduction_owner
 from .cute_fragment_common import computed_fragment_discovery_supported
 from .cute_fragment_common import fragment_coverage_carrier
 from .cute_fragment_common import fragment_root_regions
@@ -37,11 +38,15 @@ class CuteFragmentThreadsHeuristic(AutotunerHeuristic):
         host = device_ir.host_function
         assert host is not None
         with host:
-            env.config_spec.cute_fragment_thread_root_ids = frozenset(
-                root
-                for root, graphs in fragment_root_regions(device_ir)
-                if computed_fragment_discovery_supported(env, graphs)
-            )
+            roots = set()
+            for root, graphs in fragment_root_regions(device_ir):
+                supported = computed_fragment_discovery_supported(env, graphs)
+                # Required bind-time admission, not an optional tuning hint:
+                # unowned full reductions must fail before config search.
+                validate_required_full_reduction_owner(env, graphs, supported=supported)
+                if supported:
+                    roots.add(root)
+            env.config_spec.cute_fragment_thread_root_ids = frozenset(roots)
         # Shape/stride assumptions of an admitted root must survive rebinding.
         return (
             frozenset({"input_tensor_metadata"})

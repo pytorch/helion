@@ -1015,7 +1015,10 @@ class ConfigSpec:
         self.static_ranges: BlockIdSequence[StaticRangeSpec] = BlockIdSequence()
 
         self.allowed_pid_types: tuple[PidTypeLiteral, ...] = tuple(VALID_PID_TYPES)
+        # Keep alternative pid types searchable when an ordered reference uses flat.
         self.cute_ordered_phase_pid_search: bool = False
+        # Confirmed dependent owners require ordinary ordered launches, not PDL.
+        self.cute_dependent_phase_launches: bool = False
         # Why each disabled pid_type was removed, for search-space logging.
         self.disallowed_pid_type_reasons: dict[str, str] = {}
         # All independent vetoes, including callers without a diagnostic reason.

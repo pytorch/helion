@@ -1645,6 +1645,13 @@ class CuteBackend(Backend):
     def requires_merged_reduction_dims(self) -> bool:
         return True
 
+    def defer_unmerged_reduction_chain(
+        self, result: torch.fx.Node, source: torch.fx.Node, dims: tuple[int, ...]
+    ) -> bool:
+        from .full_reduction_owner import defer_full_logical_reduction
+
+        return defer_full_logical_reduction(result, source, dims)
+
     @property
     def warns_fast_math_unused(self) -> bool:
         return True
@@ -1874,6 +1881,8 @@ class CuteBackend(Backend):
     def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
         from ..aten_lowering import sort_lowering
         from .aten_lowering import NumericExtremumLowering
+        from .static_indexing import StaticIndexLowering
+        from .static_indexing import static_tensor_index
         from .uniform_comparison import UniformComparisonLowering
         from .uniform_comparison import match_uniform_float_gt
 
@@ -1885,6 +1894,8 @@ class CuteBackend(Backend):
             return lowering
         if node.target in (torch.ops.aten.fmin.default, torch.ops.aten.fmax.default):
             return NumericExtremumLowering()
+        if static_tensor_index(node) is not None:
+            return StaticIndexLowering()
         if match_uniform_float_gt(node) is not None:
             return UniformComparisonLowering()
         return None
@@ -4926,6 +4937,13 @@ class CuteBackend(Backend):
 
     def roots_fissioned(self, env: CompileEnvironment) -> bool:
         return cute_env_state(env).fission_plan is not None
+
+    def lower_dependency_phases_as_ordered_launches(
+        self, host: HostFunction, ir: DeviceIR
+    ) -> bool:
+        from .dependent_phases import confirm_dependency_phases
+
+        return confirm_dependency_phases(host, ir)
 
     def split_persistent_post_loop(
         self, fn: DeviceFunction, body: list[ast.AST]

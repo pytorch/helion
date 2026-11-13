@@ -31,7 +31,13 @@ from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_native_compile
 from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion._testing.cute_codegen import tcgen05_target as _target
+from helion._testing.cute_fragment_arena import (
+    resident_while_recurrence as _resident_while_recurrence,
+)
+from helion._testing.cute_fragment_branch_lifetimes import branch_scans
 from helion._testing.cute_fragment_layout import _fragment_singleton_scan
+from helion._testing.cute_fragment_loop_captures import loop_tensor_bound
+from helion._testing.tunable_fragments import load_host_function
 import helion.language as hl
 from helion.runtime.ref_mode import RefMode
 
@@ -1243,6 +1249,9 @@ def _simulate_independent_fragment(source, inputs, outputs, blocks):
     return packets
 
 
+# Width pairs distinguish independent/equal reductions, row offsets exercise
+# scalar versus tensor launch arguments, and row blocks cover predicated tails.
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("widths", [(17, 65), (31, 19), (17, 17)])
 @pytest.mark.parametrize("row_offset", [False, True])
 @pytest.mark.parametrize("block_rows", [1, 4])
@@ -1276,9 +1285,28 @@ def test_independent_full_reduction_fragment_codegen_and_values(
         config.config["block_sizes"][:] = [block_columns, block_rows]
         config.config["reduction_loops"] = [None]
         source = bound.to_code(config)
+        device = next(
+            node
+            for node in ast.parse(source).body
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("_helion_")
+        )
+        launches = []
+
+        def capture_launch(kernel, grid, *args, **kwargs):
+            launches.append(
+                dict(zip((arg.arg for arg in device.args.args), args, strict=True))
+            )
+
+        # Observe the actual host allocation and launch ABI. Layout facts may
+        # conservatively require runtime strides even for a fresh allocation;
+        # the simulator must consume those emitted arguments too.
+        actual = load_host_function(bound, config, capture_launch)(*inputs)
     assert "fragment_max" in source and "fragment_sum" in source
     parts = (value_width + block_columns - 1) // block_columns
-    actual = torch.full((rows, parts), float("nan"))
+    assert actual.shape == (rows, parts)
+    (runtime_args,) = launches
+    assert runtime_args["out"] is actual
+    actual.fill_(float("nan"))
     threshold = stats.amax(-1) + offset
     filtered = torch.where(values >= threshold[:, None], values, 0.0)
     expected = torch.stack(
@@ -1290,8 +1318,8 @@ def test_independent_full_reduction_fragment_codegen_and_values(
     )
     _simulate_independent_fragment(
         source,
-        {"stats": stats, "values": values, "offset": offset},
-        {"out": actual},
+        runtime_args,
+        {},
         ((rows + block_rows - 1) // block_rows) * parts,
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -2810,6 +2838,7 @@ def _fragment_conditional_cross_branch_capture(x: torch.Tensor, flag: int):
     return out
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("flag", [-1, 1])
 def test_fragment_conditional_cross_branch_capture_preserves_branch_effects(flag):
     x = (torch.arange(3 * 17).reshape(3, 17) % 7).float()
@@ -2837,6 +2866,7 @@ def _fragment_conditional_capture_effects(x: torch.Tensor, flag: int):
     return out, effect
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("flag", [-1, 1])
 def test_fragment_conditional_capture_preserves_all_effects(flag):
     x = (torch.arange(3 * 17).reshape(3, 17) % 7).float()
@@ -2855,6 +2885,32 @@ def test_fragment_conditional_capture_preserves_all_effects(flag):
     torch.testing.assert_close(outputs["effect"], effect, rtol=0, atol=0)
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("escape", [False, True])
+def test_fragment_branch_return_lifetimes_preserve_stores_and_escape(escape):
+    x = (torch.arange(3 * 17).reshape(3, 17) % 7).float()
+    source = _tensor_index_source(branch_scans, (x, 1, escape))
+    for flag in (-1, 1):
+        outputs = {
+            name: torch.full_like(x, -999)
+            for name in ("out", "first_out", "second_out", "third_out")
+        }
+        _simulate_independent_fragment(source, {"x": x, "flag": flag}, outputs, 3)
+        for index, name in enumerate(("first_out", "second_out", "third_out"), 1):
+            expected = torch.cumsum(x + index, -1) if flag > 0 else -index * x
+            torch.testing.assert_close(outputs[name], expected, rtol=0, atol=0)
+        expected = (
+            torch.cumsum(x + 1, -1) + 3
+            if flag > 0 and escape
+            else x + (10 if flag > 0 or not escape else -7)
+        )
+        torch.testing.assert_close(outputs["out"], expected, rtol=0, atol=0)
+    # The capture stays live; branch-local loads/scans can recycle their slots.
+    # An escaping lazy result also retains its first scan until the merge.
+    assert source.count(".allocate_tensor(") <= (6 if escape else 5), source
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("kind", ["missing", "conflicting"])
 def test_fragment_conditional_outer_capture_proof_rejects_invalid_ir(kind):
     original = FragmentCompiler.conditional
@@ -4828,83 +4884,6 @@ def test_fragment_packet_shared_address_generated(width, layout, offset):
     torch.testing.assert_close(x, before, rtol=0, atol=0)
 
 
-def _packet_shared_proof_fixture():
-    from helion._compiler.cute.packet_loads import _published_dependencies
-
-    slot = Fragment((), torch.float32, lambda _: "slot[0]", True, storage="slot")
-    view = Fragment((), torch.float32, lambda _: "slot[0]", True, (slot,))
-    # A lazy view is not register-backed: it has transitive shared storage.
-    lazy = Fragment((), torch.float32, lambda _: "slot[0]", dependencies=(slot,))
-    compiler = object.__new__(FragmentCompiler)
-    compiler.thread = "thread"
-    compiler.threads = 128
-    compiler.buffers = [("slot", torch.float32, 1), ("unused", torch.float32, 1)]
-    compiler.scopes = [{"lazy": lazy}]
-    compiler.held = []
-    compiler.pending_local_atomics = set()
-    compiler.cg = SimpleNamespace(
-        statements_stack=[
-            ast.parse(
-                "for owner in range(thread, 1, 128):\n    slot[0] = cutlass.Float32(3)\ncute.arch.sync_threads()\n"
-            ).body
-        ]
-    )
-    return compiler, slot, view, lazy, _published_dependencies
-
-
-def test_fragment_packet_shared_publication_and_transitive_lifetime():
-    compiler, slot, view, lazy, proof = _packet_shared_proof_fixture()
-    assert proof(compiler, (lazy,)) == frozenset({"slot"})
-    assert proof(compiler, (view,)) == frozenset({"slot"})
-    result = Fragment((4,), torch.float32, lambda _: "0")
-    compiler.held.append((result, lazy))
-    compiler.scopes.clear()
-    compiler.smem_bytes = 0
-    selected = compiler.allocate(result)
-    assert selected.storage == "unused" and selected.storage != slot.storage
-    assert compiler.live_buffers() == {"slot"}
-
-
-@pytest.mark.parametrize(
-    "bad",
-    [
-        "pending",
-        "alias",
-        "later_write",
-        "multiple",
-        "missing_publication",
-        "unknown_storage",
-        "register",
-    ],
-)
-def test_fragment_packet_shared_publication_declines(bad):
-    compiler, slot, _view, lazy, proof = _packet_shared_proof_fixture()
-    dependencies = (lazy,)
-    body = compiler.cg.statements_stack[-1]
-    if bad == "pending":
-        compiler.pending_local_atomics.add("slot")
-    elif bad == "alias":
-        body.extend(ast.parse("alias = slot").body)
-    elif bad == "later_write":
-        body.extend(
-            ast.parse(
-                "for owner in range(thread, 1, 128):\n    slot[0] = cutlass.Float32(9)"
-            ).body
-        )
-    elif bad == "multiple":
-        body.extend(
-            ast.parse("slot[0] = cutlass.Float32(9)\ncute.arch.sync_threads()").body
-        )
-    elif bad == "missing_publication":
-        body.pop()
-    elif bad == "unknown_storage":
-        compiler.buffers.clear()
-    else:
-        register = Fragment((), torch.float32, lambda _: "private", True)
-        dependencies = (lazy, register)
-    assert not proof(compiler, dependencies)
-
-
 @pytest.mark.parametrize("index", ["0", "0 * 1", "2 - 2"])
 def test_fragment_packet_shared_slot_keeps_conditional_scope(index):
     from helion._compiler.cute.packet_loads import _load_assignment
@@ -5429,26 +5408,6 @@ def test_resident_while_plan_rejects_projection_phi_signature(value, change):
         resident_while_plan(call, graphs)
 
 
-@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def _resident_while_recurrence(x, limits, steps: hl.constexpr, capacity: hl.constexpr):
-    out = torch.empty_like(x)
-    counts = torch.empty((x.size(0),), device=x.device, dtype=torch.int32)
-    for row in hl.grid(x.size(0)):
-        lane = hl.arange(capacity)
-        left = hl.load(x, [row, lane], extra_mask=lane < x.size(1))
-        right = left + 1
-        iteration = hl.full([], 0, dtype=torch.int32)
-        limit = limits[row]
-        while iteration < limit:
-            left, right = left + right, left - right
-            for _packet in range(steps):
-                left = torch.gather(left + 1, 0, ((lane * 3 + 1) % x.size(1)).long())
-            iteration = iteration + 1
-        hl.store(out, [row, lane], left + right, extra_mask=lane < x.size(1))
-        counts[row] = iteration
-    return out, counts
-
-
 def _resident_while_codegen(x, limits, steps, threads):
     with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound = cpu_bind(
@@ -5466,6 +5425,7 @@ def _resident_while_codegen(x, limits, steps, threads):
     "width,steps,threads", [(1, 0, 128), (17, 2, 128), (32, 1, 128), (65, 2, 128)]
 )
 @pytest.mark.parametrize("dtype", [torch.int32, torch.float32])
+@pytest.mark.cpu_only
 def test_resident_while_emitted_shared_epochs(width, steps, threads, dtype):
     from test.test_atomic_ops import _simulate_register_load_program
 
@@ -5497,6 +5457,7 @@ def test_resident_while_emitted_shared_epochs(width, steps, threads, dtype):
         assert torch.equal(x, before[0]) and torch.equal(limits, before[1])
 
 
+@pytest.mark.cpu_only
 def test_resident_while_predicate_publication_and_reader_barriers():
     from test.test_atomic_ops import _simulate_register_load_program
 
@@ -7660,3 +7621,19 @@ def test_grid_row_loop_carries_native_values(block_sizes):
     torch.testing.assert_close(
         out, torch.logsumexp(x.float(), dim=-1), rtol=1e-4, atol=1e-4
     )
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+def test_mutable_tensor_bound_native_replay():
+    # One compiled shape replays zero, partial and full bounds in both orders.
+    x = (torch.arange(3 * 17, device=DEVICE).reshape(3, 17) % 5).float()
+    counts = torch.zeros(4, device=DEVICE, dtype=torch.int64)
+    for count in (0, 1, 5, 17, 5, 0):
+        counts[0] = count
+        expected = torch.cumsum(x, dim=-1)
+        for iteration, begin in enumerate(range(0, count, 4)):
+            increment = x[:, begin : min(begin + 4, count)].sum(-1, keepdim=True)
+            expected = torch.cumsum(expected + increment + count + iteration, dim=-1)
+        torch.testing.assert_close(
+            loop_tensor_bound(x, counts), expected, rtol=0, atol=0
+        )

@@ -926,6 +926,20 @@ class CompileEnvironment:
             expr = expr.xreplace(subs)
         return expr
 
+    def static_kernel_tensor_extent(self, size: int | torch.SymInt) -> int | None:
+        """Resolve a logical tensor extent without treating a tile as its full axis."""
+        if isinstance(size, int):
+            return size
+        expr = self.specialize_expr(self.shape_env.simplify(size._sympy_()))
+        block_id = self.resolve_block_id(size)
+        if not isinstance(expr, sympy.Integer) and block_id is not None:
+            block = self.block_sizes[block_id]
+            if block.reduction:
+                # Full-axis loads carry a reduction block symbol even when
+                # the logical extent is constant. Tiled axes do not.
+                expr = self.specialize_expr(self.shape_env.simplify(block.numel))
+        return int(expr) if isinstance(expr, sympy.Integer) else None
+
     def register_tensor_descriptor_layout_guard(
         self,
         fake_tensor: torch.Tensor,
@@ -3172,7 +3186,7 @@ class CompileEnvironment:
         return None
 
     def registered_extent_owner(self, block_id: int) -> int | None:
-        """Return the registered config axis behind an extent or its alias."""
+        """Return an untiled registered config axis behind an extent or its alias."""
         symbol = self.block_sizes[block_id].symbol()
         return next(
             (

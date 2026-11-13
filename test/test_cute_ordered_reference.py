@@ -7,10 +7,14 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import skipIfNotCUDA
+from helion._testing import skipUnlessCuteAvailable
 from helion._testing.cute_ordered_reference import local_histogram_phases
 from helion._testing.cute_ordered_reference import partitioned_dot_sum
 
 
+@skipIfNotCUDA()
+@skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.parametrize("splits", [1, 2, 4, 8])
 def test_partition_count_preserves_end_to_end_result(splits):
     x = (torch.arange(7 * 8, device=DEVICE).reshape(7, 8) % 4).to(torch.bfloat16)
@@ -29,6 +33,8 @@ def test_partition_count_preserves_end_to_end_result(splits):
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
+@skipIfNotCUDA()
+@skipUnlessCuteAvailable("requires CuTe DSL")
 def test_local_atomic_reference_preserves_fresh_histograms():
     x = torch.arange(3 * 11, device=DEVICE).reshape(3, 11).to(torch.int32)
     bound = local_histogram_phases.bind((x,))

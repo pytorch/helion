@@ -14,6 +14,7 @@ from ... import exc
 from ...autotuner import config_fragment
 from ...autotuner.config_fragment import ConfigSpecFragment
 from ...language import _tracing_ops
+from ...language.constexpr import specialize
 from ...language.tunable_ops import register_tunable
 from ..ast_extension import ExtendedAST
 from ..ast_extension import LoopType
@@ -26,6 +27,7 @@ from ..type_info import ConfigFragmentType
 from ..type_info import LiteralType
 from ..type_info import NumericType
 from ..type_info import SequenceType
+from ..type_info import SliceType
 from ..type_info import TensorAttributeType
 from ..type_info import TensorType
 from ..type_info import TypeInfo
@@ -35,6 +37,7 @@ from .materialized_fission_codegen import generate_materialized_fission
 from .promote_output_axis import _fresh_tensors
 from .promote_output_axis import _integer_metadata_call
 from .promote_output_axis import _pure_scalar_call
+from .promote_output_axis import _read_only_host_dsl
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -102,6 +105,42 @@ def _pure_fragment_binding(node: ExtendedAST) -> bool:
     )
 
 
+def _pure_metadata_slice(node: ast.Subscript, tensor_names: set[str]) -> bool:
+    """Slice a proved scalar sequence without admitting tensor/custom indexing."""
+    owner = node.value
+    key = node.slice
+    if not (
+        isinstance(owner, ExtendedAST)
+        and isinstance(sequence := owner._type_info, SequenceType)
+        and sequence.python_type in (tuple, list)
+        and sequence.contents_exact
+        and _pure_metadata_type(sequence)
+        and isinstance(key, ast.Slice)
+        and isinstance(key, ExtendedAST)
+        and isinstance(key._type_info, SliceType)
+        and key._type_info.contents_exact
+        and _pure_host_metadata(owner, tensor_names)
+    ):
+        return False
+    # Bounds have already been typed by ordinary Python slice propagation.
+    # Check their expressions too: a folded integer from an opaque call or
+    # mutable module attribute is not replay-safe metadata.
+    return all(
+        bound is None
+        or (
+            isinstance(bound, ExtendedAST)
+            and (
+                isinstance(info := bound._type_info, LiteralType)
+                and type(info.value) in (int, bool, type(None))
+                or isinstance(info, NumericType)
+                and info.python_type in (int, bool)
+            )
+            and _pure_host_metadata(bound, tensor_names)
+        )
+        for bound in (key.lower, key.upper, key.step)
+    )
+
+
 def _pure_host_metadata(
     node: ast.AST, tensor_names: set[str], *, allow_fragment: bool = False
 ) -> bool:
@@ -128,6 +167,8 @@ def _pure_host_metadata(
     if isinstance(node, (ast.Tuple, ast.List)):
         return all(_pure_host_metadata(item, tensor_names) for item in node.elts)
     if isinstance(node, ast.Subscript):
+        if isinstance(node.slice, ast.Slice):
+            return _pure_metadata_slice(node, tensor_names)
         return _pure_host_metadata(node.value, tensor_names) and _pure_host_metadata(
             node.slice, tensor_names
         )
@@ -325,6 +366,35 @@ def _capturable_host_view(node: ast.AST, tensor_names: set[str]) -> bool:
     return True
 
 
+def _specialized_argument_identity(statement: ast.Assign, host: HostFunction) -> bool:
+    """Retain an integer argument's guarded specialization, not a new value.
+
+    The original type propagation installs specialization guards, and ordinary
+    codegen emits their constant value in both the wrapper and each stage.
+    No arithmetic, different argument, opaque callable or storage rebind is an
+    identity under this proof.
+    """
+    return (
+        len(statement.targets) == 1
+        and isinstance(target := statement.targets[0], ast.Name)
+        and target.id in host.params.arguments
+        and type(host.params.arguments[target.id]) in (int, torch.SymInt)
+        and isinstance(call := statement.value, ast.Call)
+        and len(call.args) == 1
+        and not call.keywords
+        and isinstance(argument := call.args[0], ast.Name)
+        and argument.id == target.id
+        and isinstance(call.func, ExtendedAST)
+        and isinstance(callee := call.func._type_info, CallableType)
+        and callee.value is specialize
+        and _pure_callable_reference(call.func)
+        and _read_only_host_dsl(call, callee)
+        and isinstance(call, ExtendedAST)
+        and isinstance(call._type_info, NumericType)
+        and type(call._type_info.proxy()) in (int, torch.SymInt)
+    )
+
+
 def _ordered_phase_bundle(
     host: HostFunction, ir: DeviceIR
 ) -> tuple[HostFunction, MaterializedFissionPlan]:
@@ -351,6 +421,13 @@ def _ordered_phase_bundle(
         "each phase must contain one top-level grid loop",
     )
     roots = [phase.root_nodes[0] for phase in ir.phases]
+    return _capture_phase_bundle(host, ir, roots)
+
+
+def _capture_phase_bundle(
+    host: HostFunction, ir: DeviceIR, roots: list[ast.For]
+) -> tuple[HostFunction, MaterializedFissionPlan]:
+    """Capture once after a caller has proved its root/phase ordering."""
     _require(
         len(roots) == len(ir.root_ids)
         and all(
@@ -397,6 +474,7 @@ def _ordered_phase_bundle(
     bundle.device_ir.host_function = bundle
 
     bound_names = set(host.params.arguments)
+    specialized_arguments: set[str] = set()
     fresh = _fresh_tensors(bundle, integer_metadata_calls=True)
     captures = []
     for statement in prelude:
@@ -422,12 +500,17 @@ def _ordered_phase_bundle(
             for node in ast.walk(target)
             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
         ]
+        specializes_argument = _specialized_argument_identity(
+            statement, host
+        ) and not specialized_arguments.intersection(targets)
         _require(
             bool(targets)
             and len(set(targets)) == len(targets)
-            and not bound_names.intersection(targets),
+            and (not bound_names.intersection(targets) or specializes_argument),
             "rebound host metadata or allocation",
         )
+        if specializes_argument:
+            specialized_arguments.update(targets)
         bound_names.update(targets)
         assert isinstance(statement.value, ExtendedAST)
         value_type = statement.value._type_info
@@ -445,7 +528,8 @@ def _ordered_phase_bundle(
             tensor_names.update(targets)
         else:
             _require(
-                isinstance(value_type, BlockSizeType)
+                specializes_argument
+                or isinstance(value_type, BlockSizeType)
                 or _pure_host_metadata(
                     statement.value,
                     tensor_names,

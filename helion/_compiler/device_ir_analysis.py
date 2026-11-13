@@ -42,6 +42,7 @@ from .indexing_strategy import subscript_index_scale
 from .indexing_strategy import subscript_tile_info
 from .tile_dependency import TILE_ACCESS_META
 from .tile_dependency import _relation_product_is_within_budget
+from .utils import is_full_slice
 from .variable_origin import GridOrigin
 from .variable_origin import TileBeginOrigin
 from .variable_origin import TileIdOrigin
@@ -363,9 +364,7 @@ def _subscript_affine(
                 target is hl.subscript
                 and len(args) == 2
                 and isinstance(args[1], (list, tuple))
-                and all(
-                    item is None or _subscript_is_full_slice(item) for item in args[1]
-                )
+                and all(item is None or is_full_slice(item) for item in args[1])
             )
         ):
             node = args[0]
@@ -465,11 +464,6 @@ def _subscript_dense_span(
     ):
         return None
     return axis, int(coefficient), int(remainder)
-
-
-def _subscript_is_full_slice(subscript: object) -> bool:
-    """Return whether a tensor subscript covers its complete dimension."""
-    return isinstance(subscript, slice) and subscript == slice(None)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -589,7 +583,7 @@ def _broadcast_only_index_shape(
     for item in index:
         if item is None:
             result.append(1)
-        elif _subscript_is_full_slice(item) and source_dimension < len(source_shape):
+        elif is_full_slice(item) and source_dimension < len(source_shape):
             result.append(source_shape[source_dimension])
             source_dimension += 1
         else:
@@ -728,7 +722,7 @@ def _affine_subscript_ranges(
         elif target is view_ops.subscript and args:
             index = args[1] if len(args) >= 2 else None
             if isinstance(index, (list, tuple)) and all(
-                item is None or _subscript_is_full_slice(item) for item in index
+                item is None or is_full_slice(item) for item in index
             ):
                 base = evaluate(args[0])
                 if base is not None:
@@ -741,9 +735,7 @@ def _affine_subscript_ranges(
             if (
                 extra_mask is None
                 and isinstance(index, (list, tuple))
-                and all(
-                    item is None or _subscript_is_full_slice(item) for item in index
-                )
+                and all(item is None or is_full_slice(item) for item in index)
             ):
                 base = evaluate(args[0])
                 if base is not None:
@@ -1834,7 +1826,7 @@ class DeviceIRAnalysis:
                         subscript_offsets = tuple(item[2] for item in affine)
                         subscript_is_scalar = tuple(item[3] for item in affine)
                         subscript_is_full_slice = tuple(
-                            _subscript_is_full_slice(index_list[position])
+                            is_full_slice(index_list[position])
                             for position in subscript_dims
                         )
                         subscript_static_extents = tuple(
