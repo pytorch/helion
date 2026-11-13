@@ -22,6 +22,79 @@ if TYPE_CHECKING:
     from ..autotuner.search_surface import BackendSearchSurface
     from .backend import Backend
 
+# Version of the out-of-tree backend contract in ``helion.backend_api``; covers
+# only the names and hooks listed in docs/api/backend_api.md, bumped per the
+# version policy there.
+BACKEND_API_VERSION = 1
+
+# The Backend members and strategy methods whose names and signatures
+# BACKEND_API_VERSION covers; docs/api/backend_api.md describes them.
+COVERED_BACKEND_HOOKS: tuple[str, ...] = (
+    "name",
+    "dtype_str",
+    "acc_type",
+    "function_decorator",
+    "constexpr_type",
+    "default_launcher_name",
+    "library_imports",
+    "codegen_name",
+    "state",
+    "validate_environment",
+    "pre_inductor_lowering",
+    "inductor_op_overrides",
+    "customize_ast",
+    "pre_codegen",
+    "create_loop_strategy",
+    "create_reduction_strategy",
+    "program_id_expr",
+    "grid_index_expr",
+    "loop_index_expr",
+    "arange_expr",
+    "range_str",
+    "lane_index_expr",
+    "lane_offset_expr",
+    "thread_in_tile_mask_expr",
+    "scalar_load_expr",
+    "inline_constexpr",
+    "scalar_arg_preamble",
+    "cast_expr",
+    "cast_scalar_ast",
+    "where_expr",
+    "minimum_expr",
+    "zeros_expr",
+    "full_expr",
+    "reshape_expr",
+    "broadcast_to_expr",
+    "expands_broadcast_dims",
+    "reduction_expr",
+    "reduction_combine_expr",
+    "reduction_index_expr",
+    "reduction_index_zero_expr",
+    "wrap_reduction_accumulator",
+    "looped_reduction_thread_count",
+    "register_reduction_loop_config_slots",
+    "max_reduction_threads",
+    "max_reduction_loop",
+    "reduction_block_size_is_inlined_constexpr",
+    "launches_surplus_tile_threads",
+    "launcher_keyword_args",
+    "supports_config_key",
+    "tunable_fragments",
+    "supports_precompile",
+    "adjust_block_size_constraints",
+    "autotune",
+    "get_do_bench",
+    "get_interleaved_bench",
+)
+COVERED_STRATEGY_METHODS: tuple[str, ...] = (
+    "TileStrategy.user_size",
+    "TileStrategy.codegen_grid",
+    "TileStrategy.codegen_device_loop",
+    "TileStrategy.compact_shape",
+    "TileStrategy.codegen_preamble",
+    "ReductionStrategy.codegen_reduction",
+)
+
 _BUILTIN_BACKENDS: list[type[Backend]] = [
     TritonBackend,
     PallasBackend,
@@ -47,6 +120,14 @@ def register_compiler_backend(backend_class: type[Backend]) -> None:
     The backend's ``name`` property is used as the registry key.
     Built-in backends are registered at module load time below.
 
+    Registering the same class twice is a no-op, and a class with the same
+    module and qualified name (the one a reloaded module or a re-run factory
+    defines) replaces the old one.  Registering any other class under an
+    already-registered name (including built-in names) raises ``ValueError``,
+    so through ``helion.backend_api`` a name is owned by its first registering
+    class.  Helion-internal code that must
+    replace a backend calls :func:`unregister_compiler_backend` first.
+
     Args:
         backend_class: A :class:`Backend` subclass.
     """
@@ -54,10 +135,36 @@ def register_compiler_backend(backend_class: type[Backend]) -> None:
 
     backend = backend_class()
     with _CODEGEN_REPAIR_LOCK:
+        existing = _REGISTRY.get(backend.name)
+        if existing is backend_class:
+            return
+        if existing is not None and not _is_redefinition(existing, backend_class):
+            hint = (
+                " (the same class from a second copy of its module, e.g. run as "
+                "__main__ and also imported by name?)"
+                if existing.__qualname__ == backend_class.__qualname__
+                and "__main__" in (existing.__module__, backend_class.__module__)
+                else ""
+            )
+            raise ValueError(
+                f"Backend name {backend.name!r} is already registered to "
+                f"{existing.__module__}.{existing.__qualname__}; "
+                f"refusing to overwrite it with "
+                f"{backend_class.__module__}.{backend_class.__qualname__}{hint}"
+            )
         _REGISTRY[backend.name] = backend_class
         _GENERATION += 1
         codegen_names, _ = _codegen_repair_scope(backend.codegen_name)
         _REPAIRED_CODEGEN_NAMES = _REPAIRED_CODEGEN_NAMES.difference(codegen_names)
+
+
+def _is_redefinition(existing: type[Backend], backend_class: type[Backend]) -> bool:
+    # importlib.reload, or a factory run again, defines a new class object with
+    # the same module and qualified name; it replaces the old one.
+    return (existing.__module__, existing.__qualname__) == (
+        backend_class.__module__,
+        backend_class.__qualname__,
+    )
 
 
 def unregister_compiler_backend(name: str) -> None:
