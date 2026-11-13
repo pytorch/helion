@@ -27,8 +27,11 @@ def packet_kernel(
     transpose: cutlass.Constexpr[bool],
     columns: cutlass.Constexpr[int],
     scale_group: cutlass.Constexpr[int],
+    post_scale_log2: cutlass.Constexpr[int],
+    positive_zero: cutlass.Constexpr[bool] = False,
 ) -> None:
     assert not transpose or (columns == 128 and scale_group == 32)
+    assert not positive_zero or transpose
     row = cute.arch.thread_idx()[0]
     tile = cute.arch.block_idx()[0]
     raw_storage = cute.arch.alloc_smem(cutlass.Int8, 2 * 128 * 128, alignment=128)
@@ -68,11 +71,18 @@ def packet_kernel(
     base = cute.make_tensor(slot, cute.make_layout((1,)))[0]
     if cutlass.const_expr(transpose):
         stage_scaled_s8_transpose_to_tmem(
-            shared_raw, shared_scales, row // 32 * 32, row % 32, base, 128
+            shared_raw,
+            shared_scales,
+            row // 32 * 32,
+            row % 32,
+            base,
+            128,
+            post_scale_log2,
+            positive_zero=positive_zero,
         )
     else:
         stage_scaled_s8_rows_to_tmem(
-            shared_raw, shared_scales, row, base, columns, scale_group
+            shared_raw, shared_scales, row, base, columns, scale_group, post_scale_log2
         )
     prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
     prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
@@ -106,6 +116,8 @@ def launch(
     transpose: cutlass.Constexpr[bool] = True,
     columns: cutlass.Constexpr[int] = 128,
     scale_group: cutlass.Constexpr[int] = 32,
+    post_scale_log2: cutlass.Constexpr[int] = 0,
+    positive_zero: cutlass.Constexpr[bool] = False,
 ) -> None:
     packet_kernel(
         raw,
@@ -116,6 +128,8 @@ def launch(
         transpose,
         columns,
         scale_group,
+        post_scale_log2,
+        positive_zero,
     ).launch(grid=(cute.size(raw, mode=[0]), 1, 1), block=(128, 1, 1), stream=stream)
 
 

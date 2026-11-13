@@ -51,11 +51,19 @@ from ..cute_mma_dag import MMA_DAG_KEY
 from ..cute_mma_dag import MMA_DAG_KEYS
 from ..cute_mma_dag import MMA_DAG_LOADS_KEY
 from ..cute_mma_dag import MMA_DAG_LOOKAHEAD_KEY
+from ..cute_mma_dag import MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
 from ..cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
 from ..cute_mma_dag import MMA_DAG_PERSISTENT_KEY
+from ..cute_mma_dag import MMA_DAG_PROBABILITY_SCHEDULE_KEY
+from ..cute_mma_dag import MMA_DAG_QUERY_TMA_KEY
+from ..cute_mma_dag import MMA_DAG_SLEEP_WAITS_KEY
 from ..cute_mma_dag import MMA_DAG_SPLIT_KEY
 from ..cute_mma_dag import MMA_DAG_STAGES_KEY
 from ..cute_mma_dag import MMA_DAG_STORE_KEY
+from ..cute_mma_dag import MMA_DAG_TCGEN05
+from ..cute_mma_dag import MMA_DAG_V_LAG_KEY
+from ..cute_mma_dag import MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY
+from ..cute_mma_dag import MMA_DAG_VALUE_METADATA_SKIP_KEY
 from ..cute_mma_dag import MMA_DAG_WARPS_KEY
 from ..cute_register_subblocks import COLSIDE_KEY as RSB_COLSIDE_KEY
 from ..cute_register_subblocks import KEY as RSB_KEY
@@ -70,6 +78,7 @@ from ..direct_affine_plan import direct_affine_schedule_choices
 from ..fragment_mma_dot import FRAGMENT_MMA_K_THREADS
 from ..fragment_mma_dot import FRAGMENT_MMA_KEY
 from ..fragment_mma_dot import FRAGMENT_MMA_ROW_THREADS
+from ..pdl_release import CUTE_PDL_CAPTURE_RELEASE_CHOICES
 from ..pdl_release import CUTE_PDL_RELEASE_CHOICES
 from ..pdl_release import CUTE_PDL_RELEASE_DEFAULT
 from ..pdl_release import CUTE_PDL_SPREAD_KEY
@@ -163,6 +172,7 @@ from .flash_surface import prepare_config_generation_overrides
 from .flash_surface import prepare_override_normalization
 from .mma_dag_surface import _normalize_cute_mma_dag
 from .mma_dag_surface import _normalize_cute_register_subblocks
+from .mma_dag_surface import normalize_value_metadata_options
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -228,6 +238,7 @@ _CUTE_MXFP8_ROOT_LOWERING_KEYS = frozenset(
         RING_STAGES_KEY,
         RING_SPLIT_KEY,
         "cute_pdl",
+        "cute_pdl_capture_overlap",
         "cute_pdl_release",
         "cute_pdl_spread",
         "cute_min_blocks_per_mp",
@@ -1374,6 +1385,49 @@ def _normalize_cute_pdl(
         config.pop(CUTE_PDL_SPREAD_KEY, None)
 
 
+def _normalize_cute_pdl_capture_overlap(
+    config_spec: ConfigSpec, config: dict[str, object], *, fix_invalid: bool
+) -> None:
+    key = "cute_pdl_capture_overlap"
+    value = config.get(key, False)
+    if type(value) is not bool:
+        if not fix_invalid:
+            raise InvalidConfig(f"{key} must be a boolean")
+        value = False
+    eligible = (
+        config_spec.cute_pdl_capture_overlap_available
+        and not config_spec.has_explicit_pdl
+        and config.get("cute_pdl") is True
+        and not config.get(CUTE_PDL_SPREAD_KEY)
+        and config.get("cute_pdl_release", CUTE_PDL_RELEASE_DEFAULT)
+        in CUTE_PDL_CAPTURE_RELEASE_CHOICES
+        and config.get(MMA_DAG_KEY) == MMA_DAG_TCGEN05
+        and config.get(MMA_DAG_PASS_WARPS_KEY) == MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
+    )
+    if value and not eligible and not fix_invalid:
+        raise InvalidConfig(
+            f"{key}=True requires a supported paired attention kernel, "
+            "cute_pdl=True, cute_pdl_spread=False and automatic, entry or loader-tail release"
+        )
+    if config.get("cute_pdl_release") == "loader_tail" and not (eligible and value):
+        if not fix_invalid:
+            raise InvalidConfig(
+                "cute_pdl_release='loader_tail' requires eligible "
+                "cute_pdl_capture_overlap=True"
+            )
+        if config.get("cute_pdl") is True:
+            config["cute_pdl_release"] = CUTE_PDL_RELEASE_DEFAULT
+        else:
+            config.pop("cute_pdl_release", None)
+    if not eligible:
+        # Unsupported families keep their prior config/search identity; an
+        # explicit unused default must not leak into strict downstream plans.
+        config.pop(key, None)
+        return
+    if key in config or value:
+        config[key] = value
+
+
 def _normalize_cute_tiles_per_block(
     config_spec: ConfigSpec, config: dict[str, object], *, fix_invalid: bool
 ) -> None:
@@ -1977,6 +2031,7 @@ def _require_family_enabled(
 def normalize_family_gates(
     config_spec: ConfigSpec, config: dict[str, object], *, fix_invalid: bool
 ) -> None:
+    normalize_value_metadata_options(config_spec, config, fix_invalid=fix_invalid)
     for keys, enabled, reason in (
         (
             (CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY,),
@@ -2654,6 +2709,7 @@ def normalize_recurrence_families(
                 )
     if config_spec.cute_mma_dag is not None:
         _normalize_cute_mma_dag(config_spec, config, fix_invalid=fix_invalid)
+    _normalize_cute_pdl_capture_overlap(config_spec, config, fix_invalid=fix_invalid)
     if config_spec.cute_register_subblocks is not None:
         _normalize_cute_register_subblocks(config_spec, config, fix_invalid=fix_invalid)
     prepare_schedule_fragment = config_spec.cute_chunk_prepare_schedule
@@ -2758,7 +2814,10 @@ def pdl_fields(
     sequence pays for a non-releasing pick (mamba2_ssd backward: dqkg
     alone reads 3.66 us under every placement; the sequence reads 11.2 us
     per call with dqkg at ``none`` and 10.3 at ``entry``).  The explicit
-    values stay valid for pins, seeds and users.
+    values stay valid for pins, seeds and users. Capture overlap and its
+    ``loader_tail`` release require an explicit opt-in: their storage proof
+    assumes captured topology and parameter addresses remain immutable, which
+    ordinary autotuning cannot establish for the application's future graphs.
     """
     if not config_spec.supports_config_key("cute_pdl"):
         return
@@ -2766,8 +2825,13 @@ def pdl_fields(
     fields["cute_pdl"] = EnumFragment(
         (False, True), search_choices=(False, True) if searched else (False,)
     )
+    if config_spec.cute_pdl_capture_overlap_available:
+        fields["cute_pdl_capture_overlap"] = EnumFragment(
+            (False, True), search_choices=(False,)
+        )
     fields["cute_pdl_release"] = EnumFragment(
-        CUTE_PDL_RELEASE_CHOICES, search_choices=(CUTE_PDL_RELEASE_DEFAULT,)
+        CUTE_PDL_RELEASE_CHOICES,
+        search_choices=(CUTE_PDL_RELEASE_DEFAULT,),
     )
     # Pad the kernel's shared memory to one wave's density so an early
     # launch cannot pack its CTAs onto the SMs its primary left idle
@@ -3517,6 +3581,24 @@ def cute_flat_fields(
         fields[MMA_DAG_STORE_KEY] = config_spec.cute_mma_dag_store
         fields[MMA_DAG_EXCHANGE_KEY] = config_spec.cute_mma_dag_exchange
         fields[MMA_DAG_PASS_WARPS_KEY] = config_spec.cute_mma_dag_pass_warps
+        v_lag_fragment = config_spec.cute_mma_dag_v_lag
+        if v_lag_fragment is not None:
+            fields[MMA_DAG_V_LAG_KEY] = v_lag_fragment
+        sleep_fragment = config_spec.cute_mma_dag_sleep_waits
+        if sleep_fragment is not None:
+            fields[MMA_DAG_SLEEP_WAITS_KEY] = sleep_fragment
+        query_fragment = config_spec.cute_mma_dag_query_tma
+        if query_fragment is not None:
+            fields[MMA_DAG_QUERY_TMA_KEY] = query_fragment
+        metadata_fragment = config_spec.cute_mma_dag_value_metadata_skip
+        if metadata_fragment is not None:
+            fields[MMA_DAG_VALUE_METADATA_SKIP_KEY] = metadata_fragment
+        overlap_fragment = config_spec.cute_mma_dag_value_metadata_read_overlap
+        if overlap_fragment is not None:
+            fields[MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY] = overlap_fragment
+        probability_fragment = config_spec.cute_mma_dag_probability_schedule
+        if probability_fragment is not None:
+            fields[MMA_DAG_PROBABILITY_SCHEDULE_KEY] = probability_fragment
         fields[MMA_DAG_LOADS_KEY] = config_spec.cute_mma_dag_loads
         # (Locals: the type checker's attribute narrowing does not
         # reach this far into the function.)

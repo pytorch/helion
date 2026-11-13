@@ -145,6 +145,8 @@ def _store_probability_and_denominator(
     query_columns: cutlass.Constexpr,
     fast_math: cutlass.Constexpr,
     rescale_denominator: cutlass.Constexpr,
+    base2_scores: cutlass.Constexpr = False,
+    coefficients_capped: cutlass.Constexpr = False,
 ) -> None:
     # Each key lane writes eight adjacent queries with one aligned 16-byte
     # store. The complete eight-query groups follow the selected panel width.
@@ -158,7 +160,18 @@ def _store_probability_and_denominator(
                 if cutlass.const_expr(rescale_denominator):
                     if safe_maximum == float("-inf"):
                         safe_maximum = cutlass.Float32(0.0)
-                value = cute.math.exp(values[query] - safe_maximum, fastmath=fast_math)
+                if cutlass.const_expr(base2_scores):
+                    value = cute.math.exp2(
+                        values[query] - safe_maximum, fastmath=fast_math
+                    )
+                else:
+                    value = cute.math.exp(
+                        values[query] - safe_maximum, fastmath=fast_math
+                    )
+                if cutlass.const_expr(coefficients_capped):
+                    value = cute.math.min(
+                        value, cutlass.Float32(1.0), propagate_nan=True
+                    )
                 values_pair[element] = value
                 if cutlass.const_expr(rescale_denominator):
                     partials[query] = (
@@ -187,12 +200,15 @@ def online_softmax_per_key(
     group_size: cutlass.Constexpr,
     window: cutlass.Constexpr,
     score_scale: cutlass.Float32,
-    barrier_id: cutlass.Constexpr,
+    # Disjoint 128-thread groups may supply different warp-uniform IDs.
+    barrier_id: cutlass.Int32,
     partials: cute.Tensor,
     fast_math: cutlass.Constexpr,
     score_free: cute.Pointer,
     coordinate_dtype: cutlass.Constexpr,
     query_columns: cutlass.Constexpr = 40,
+    base2_scores: cutlass.Constexpr = False,
+    coefficients_capped: cutlass.Constexpr = False,
 ) -> cutlass.Boolean:
     """Four full warps consume S[key,query] and produce P[query,key].
 
@@ -265,9 +281,19 @@ def online_softmax_per_key(
             safe_maximum = maximum
             if maximum == float("-inf"):
                 safe_maximum = cutlass.Float32(0.0)
-            state[2, thread] = cute.math.exp(
-                cutlass.Float32(state[0, thread]) - safe_maximum, fastmath=fast_math
-            )
+            if cutlass.const_expr(base2_scores):
+                alpha = cute.math.exp2(
+                    cutlass.Float32(state[0, thread]) - safe_maximum,
+                    fastmath=fast_math,
+                )
+            else:
+                alpha = cute.math.exp(
+                    cutlass.Float32(state[0, thread]) - safe_maximum,
+                    fastmath=fast_math,
+                )
+            if cutlass.const_expr(coefficients_capped):
+                alpha = cute.math.min(alpha, cutlass.Float32(1.0), propagate_nan=True)
+            state[2, thread] = alpha
             state[0, thread] = maximum
         cute.arch.barrier(barrier_id=barrier_id, number_of_threads=128)
     # The uniform vote proves every maximum is finite and unchanged, so
@@ -282,6 +308,8 @@ def online_softmax_per_key(
             query_columns,
             fast_math,
             rescale_denominator=True,
+            base2_scores=base2_scores,
+            coefficients_capped=coefficients_capped,
         )
     else:
         _store_probability_and_denominator(
@@ -293,6 +321,8 @@ def online_softmax_per_key(
             query_columns,
             fast_math,
             rescale_denominator=False,
+            base2_scores=base2_scores,
+            coefficients_capped=coefficients_capped,
         )
     cute.arch.fence_proxy(kind="async.shared", space="cta")
     cute.arch.barrier(barrier_id=barrier_id, number_of_threads=128)

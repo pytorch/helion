@@ -14,7 +14,9 @@ import cutlass.experimental.primitives as prims
 
 from ._mma_dag_tcgen05_runtime import mbar_wait
 from ._paged_attention_compute import mma_128x64x128
+from ._paged_attention_compute import normalize_output
 from ._paged_attention_compute import online_softmax_128x64
+from ._paged_attention_compute import output_normalization_factor
 from ._paged_attention_runtime import _packed_scale_layout_supported
 from ._paged_attention_runtime import enqueue_paged_tma_operand
 from ._paged_attention_runtime import stage_scaled_s8_rows_to_tmem
@@ -43,7 +45,15 @@ def paged_attention_body(
     vmap: experimental_cuda.TensorMap,
     vsmap: experimental_cuda.TensorMap,
     coordinate_dtype: cutlass.Constexpr,
+    output_reciprocal: cutlass.Constexpr = False,
+    key_post_scale_log2: cutlass.Constexpr = 0,
+    value_post_scale_log2: cutlass.Constexpr = 0,
+    output_scale_log2: cutlass.Constexpr = 0,
+    tma_load_hints: cutlass.Constexpr = ("", "", "", ""),
+    value_positive_zero: cutlass.Constexpr = False,
 ) -> None:
+    # This body bypasses output_normalization_factor for the division source.
+    assert cutlass.const_expr(output_reciprocal or output_scale_log2 == 0)
     thread = cute.arch.thread_idx()[0]
     warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     lane = thread % 32
@@ -177,6 +187,14 @@ def paged_attention_body(
                     prims.tcgen05_commit(value_free, group=prims.CTAGroup.CTA_1)
             mbar_wait(pv_done, step & 1)
             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+        if cutlass.const_expr(output_reciprocal):
+            if thread < 64:
+                state[3, thread] = output_normalization_factor(
+                    cutlass.Float32(state[3, thread]),
+                    output_reciprocal,
+                    output_scale_log2=output_scale_log2,
+                )
+            cute.arch.barrier(barrier_id=1, number_of_threads=128)
         result = prims.tcgen05_ld(
             "32x32b", cutlass.inttoptr(output_address, 6, cutlass.Float32), num=64
         )
@@ -184,7 +202,7 @@ def paged_attention_body(
         for query in cutlass.range_constexpr(64):
             if cutlass.const_expr(query < query_rows):
                 output[tile, query, thread] = cutlass.BFloat16(
-                    result[query] / state[3, query]
+                    normalize_output(result[query], state[3, query], output_reciprocal)
                 )
         if cutlass.const_expr(lse is not None):
             assert lse is not None
@@ -214,6 +232,7 @@ def paged_attention_body(
                 base,
                 128,
                 32,
+                post_scale_log2=key_post_scale_log2,
             )
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
             prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
@@ -243,6 +262,8 @@ def paged_attention_body(
                 lane,
                 base + 64,
                 128,
+                post_scale_log2=value_post_scale_log2,
+                positive_zero=value_positive_zero,
             )
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
             prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
@@ -266,6 +287,7 @@ def paged_attention_body(
                     cutlass.Int32(0),
                     head,
                     128,
+                    l2_hints=tma_load_hints[:2],
                 )
                 enqueue_paged_tma_operand(
                     vmap,
@@ -277,6 +299,7 @@ def paged_attention_body(
                     cutlass.Int32(0),
                     head,
                     128,
+                    l2_hints=tma_load_hints[2:],
                 )
     cute.arch.barrier()
     if warp == 0:

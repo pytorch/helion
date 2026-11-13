@@ -16,9 +16,21 @@ from torch.utils._sympy.functions import FloorDiv
 from torch.utils._sympy.functions import PythonMod
 
 from . import target_facts
+from .analysis.paged_attention_pair import paired_attention_item_axis
 from .cute_mma_dag import MMA_DAG_ATTENTION_PASS_WARPS
+from .cute_mma_dag import MMA_DAG_L2_HINTS
+from .cute_mma_dag import MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
 from .cute_mma_dag import MMA_DAG_PASS_WARPS_ATTENTION_SCOPED
 from .cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
+from .cute_mma_dag import MMA_DAG_PROBABILITY_SCHEDULE_CHOICES
+from .cute_mma_dag import MMA_DAG_PROBABILITY_SCHEDULE_KEY
+from .cute_mma_dag import MMA_DAG_PROBABILITY_SCHEDULE_SERIAL
+from .cute_mma_dag import MMA_DAG_QUERY_TMA_KEY
+from .cute_mma_dag import MMA_DAG_SLEEP_WAITS_KEY
+from .cute_mma_dag import MMA_DAG_V_LAG_CHOICES
+from .cute_mma_dag import MMA_DAG_V_LAG_KEY
+from .cute_mma_dag import MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY
+from .cute_mma_dag import MMA_DAG_VALUE_METADATA_SKIP_KEY
 from .memory_ops import cute_tensor_base_is_aligned
 from .native_s2f6_contract import NATIVE_S2F6_TARGETS
 
@@ -56,6 +68,16 @@ class PagedAttentionDirectIO:
     query: tuple[int, ...]
     output: tuple[int, ...]
     lse: tuple[int, ...] | None
+    partial_statistics: tuple[tuple[int, ...], tuple[int, ...]] | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class PagedQueryTma:
+    """BF16 descriptor axes: dimension, row minor, row major, head, request."""
+
+    shape: tuple[int, ...]
+    strides: tuple[int, ...]
+    box: tuple[int, ...]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -87,16 +109,26 @@ class PagedAttentionScheduleFacts:
     query_block: int
     query_columns: int = 64
     denominator_per_key: bool = False
+    reference_scores: bool = False
+    paired_items: bool = False
+    partial_statistics: bool = False
+    query_tma_available: bool = False
+    value_metadata_skip_available: bool = False
     key_width: int = 128
     dimension: int = 128
     compute_warps: int = 4
     raw_stages: int = 2
     tmem_columns: int = 256
     smem_bytes: int = 106496
+    # Original policy slots of raw K, K scale, raw V and V scale.  None means
+    # the source load has no autotuned eviction-policy slot.
+    tma_load_slots: tuple[int | None, ...] = ()
 
     def min_blocks_per_mp_choices(
-        self, *, scoped_registers: bool = False
+        self, *, scoped_registers: bool = False, paired_items: bool = False
     ) -> tuple[int, ...]:
+        if paired_items:
+            return (1,)
         if scoped_registers:
             # At 384 threads and two CTAs, the launch budget is 80 registers
             # per thread. Only this budget makes 128/64/32 an inc/dec/dec split.
@@ -106,9 +138,12 @@ class PagedAttentionScheduleFacts:
 
 
 def paged_attention_launch_warps(
-    *, per_key: bool, scoped_registers: bool = False
+    *, per_key: bool, scoped_registers: bool = False, paired_items: bool = False
 ) -> int:
     """Physical role topology shared by planning and emitted-launch checks."""
+    if paired_items:
+        assert per_key and not scoped_registers
+        return 20
     if scoped_registers:
         assert per_key
         return 12
@@ -127,6 +162,14 @@ class PagedAttentionSchedule:
     fast_math: bool = False
     min_blocks_per_mp: int = 1
     scoped_registers: bool = False
+    paired_items: bool = False
+    v_lag: int = 0
+    sleep_waits: bool = False
+    probability_schedule: str = MMA_DAG_PROBABILITY_SCHEDULE_SERIAL
+    query_tma: PagedQueryTma | None = None
+    value_metadata_skip: bool = False
+    value_metadata_read_overlap: bool = False
+    tma_load_hints: tuple[str, ...] = ("", "", "", "")
 
 
 def plan_paged_attention_schedule(
@@ -140,6 +183,9 @@ def plan_paged_attention_schedule(
     if pass_warps not in MMA_DAG_ATTENTION_PASS_WARPS:
         return None
     scoped_registers = pass_warps == MMA_DAG_PASS_WARPS_ATTENTION_SCOPED
+    paired_items = pass_warps == MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
+    if semantic.partial_statistics is not None and not paired_items:
+        return None
     if scoped_registers and not semantic.denominator_per_key:
         return None
     transport = plan_paged_attention_transport(env, semantic)
@@ -148,8 +194,47 @@ def plan_paged_attention_schedule(
     facts = _paged_attention_schedule_facts(env, semantic, transport)
     if facts is None:
         return None
-    allowed_blocks = facts.min_blocks_per_mp_choices(scoped_registers=scoped_registers)
+    if paired_items and not facts.paired_items:
+        return None
+    allowed_blocks = facts.min_blocks_per_mp_choices(
+        scoped_registers=scoped_registers, paired_items=paired_items
+    )
     min_blocks = config.get("cute_min_blocks_per_mp", allowed_blocks[0])
+    v_lag = config.get(MMA_DAG_V_LAG_KEY, 0)
+    if type(v_lag) is not int or v_lag not in (
+        MMA_DAG_V_LAG_CHOICES if paired_items else (0,)
+    ):
+        return None
+    sleep_waits = config.get(MMA_DAG_SLEEP_WAITS_KEY, False)
+    if type(sleep_waits) is not bool or (sleep_waits and not paired_items):
+        return None
+    probability_schedule = config.get(
+        MMA_DAG_PROBABILITY_SCHEDULE_KEY, MMA_DAG_PROBABILITY_SCHEDULE_SERIAL
+    )
+    if type(probability_schedule) is not str or probability_schedule not in (
+        MMA_DAG_PROBABILITY_SCHEDULE_CHOICES
+        if paired_items and semantic.score_reference is not None
+        else (MMA_DAG_PROBABILITY_SCHEDULE_SERIAL,)
+    ):
+        return None
+    use_query_tma = config.get(MMA_DAG_QUERY_TMA_KEY, False)
+    if type(use_query_tma) is not bool or (
+        use_query_tma and (not paired_items or not facts.query_tma_available)
+    ):
+        return None
+    value_metadata_skip = config.get(MMA_DAG_VALUE_METADATA_SKIP_KEY, False)
+    if type(value_metadata_skip) is not bool or (
+        value_metadata_skip
+        and (not paired_items or not facts.value_metadata_skip_available)
+    ):
+        return None
+    value_metadata_read_overlap = config.get(
+        MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY, False
+    )
+    if type(value_metadata_read_overlap) is not bool or (
+        value_metadata_read_overlap and not value_metadata_skip
+    ):
+        return None
     query_axis, dimension_axis = semantic.query.tile_dims
     key_axis = semantic.key.raw.tile_dims[0]
     if (
@@ -160,7 +245,6 @@ def plan_paged_attention_schedule(
         or selected.persistent != 0
         or selected.epilogue != "row"
         or selected.loads != "tma"
-        or selected.load_hints
         or selected.aux_rings
         or selected.tma_stores
         or selected.mma_warp
@@ -178,11 +262,24 @@ def plan_paged_attention_schedule(
         transport,
         query_columns=facts.query_columns,
         launch_warps=paged_attention_launch_warps(
-            per_key=semantic.denominator_per_key, scoped_registers=scoped_registers
+            per_key=semantic.denominator_per_key,
+            scoped_registers=scoped_registers,
+            paired_items=paired_items,
         ),
+        tmem_columns=512 if paired_items else 256,
         fast_math=env.settings.fast_math,
         min_blocks_per_mp=min_blocks,
         scoped_registers=scoped_registers,
+        paired_items=paired_items,
+        v_lag=v_lag,
+        sleep_waits=sleep_waits,
+        probability_schedule=probability_schedule,
+        query_tma=paged_query_tma(transport, facts.query_columns)
+        if use_query_tma
+        else None,
+        value_metadata_skip=value_metadata_skip,
+        value_metadata_read_overlap=value_metadata_read_overlap,
+        tma_load_hints=paged_attention_load_hints(facts, config),
     )
 
 
@@ -214,9 +311,10 @@ def _paged_attention_schedule_facts(
     capacity = target_facts.per_cta_smem_capacity_bytes(env.device)
     # Include alignment and barriers in the conservative shared budget:
     # 104 KiB for the reduced form, 92 KiB for the widest (40-column)
-    # per-key panel. Each CTA
-    # owns 256 of SM100's 512 TMEM columns; only the per-key schedule exposes
-    # the two-block launch policy.
+    # per-key panel. These single-head CTAs own 256 of SM100's 512 TMEM
+    # columns; only the single-head per-key schedule exposes a two-block
+    # launch policy. Paired CTAs need all 512 columns and the separate
+    # 180 KiB shared-memory capacity check below.
     smem_bytes = 94208 if per_key else 106496
     if capacity and capacity < smem_bytes:
         return None
@@ -251,19 +349,147 @@ def _paged_attention_schedule_facts(
         or coords.query_dtype != coords.key_dtype
     ):
         return None
+    query_columns = (
+        (8 if transport.query_rows <= 8 else 32 if transport.query_rows <= 32 else 40)
+        if per_key
+        else 64
+    )
+    # Two heads double the resident raw/Q/P/state panels. The 180 KiB
+    # conservative aligned budget includes the optional query barrier and
+    # 48 bytes of value metadata flags/barriers. The largest (40-query)
+    # panel uses less than 180,000 bytes including both optional allocations.
+    paired_items = (not capacity or capacity >= 184320) and (
+        paired_attention_item_axis(env, transport) is not None
+    )
+    if semantic.partial_statistics is not None and not paired_items:
+        return None
     return PagedAttentionScheduleFacts(
         query_axis=semantic.query.tile_dims[0].index,
         query_rows=transport.query_rows,
         key_axis=semantic.key.raw.tile_dims[0].index,
         dimension_axis=semantic.query.tile_dims[1].index,
         query_block=1 << (transport.query_rows - 1).bit_length(),
-        query_columns=(
-            8 if transport.query_rows <= 8 else 32 if transport.query_rows <= 32 else 40
-        )
-        if per_key
-        else 64,
+        query_columns=query_columns,
         denominator_per_key=per_key,
+        reference_scores=semantic.score_reference is not None,
+        paired_items=paired_items,
+        partial_statistics=semantic.partial_statistics is not None,
+        query_tma_available=paired_items
+        and paged_query_tma(transport, query_columns) is not None,
+        value_metadata_skip_available=paired_items
+        and paged_value_metadata_skip_supported(transport),
         smem_bytes=smem_bytes,
+        tma_load_slots=tuple(
+            access.eviction_slot for access in paged_attention_tma_accesses(semantic)
+        ),
+    )
+
+
+def paged_value_metadata_skip_supported(transport: PagedAttentionTransport) -> bool:
+    """Prove the zero-scale shortcut and bounded synchronous metadata offsets.
+
+    The existing operand proof supplies a 16-byte-aligned view and a complete
+    128-word tile with unit key stride. Only the new synchronous load requires
+    its reachable byte span to fit signed Int64; do not restrict ordinary TMA.
+    With the written final BF16 +0, scale byte zero and postscale <= -14 map
+    every INT8 value to positive zero, including the -128 rounding boundary.
+    Requiring the source addition deliberately preserves the decoded V bits;
+    eligibility does not depend on how a later accumulator treats zero signs.
+    """
+    value = transport.semantic.value
+    return (
+        value.positive_zero
+        and -22 <= value.post_scale_log2 <= -14
+        and transport.key_width == 128
+        and transport.subpages == 1
+        and 3
+        + 4
+        * sum(
+            (extent - 1) * stride
+            for extent, stride in zip(
+                transport.value.scale_shape,
+                transport.value.scale_strides,
+                strict=True,
+            )
+        )
+        <= 2**63 - 1
+    )
+
+
+def paged_query_tma(
+    transport: PagedAttentionTransport, columns: int
+) -> PagedQueryTma | None:
+    """Prove four rectangular TMA boxes cover the paired SW128 Q panels.
+
+    Transport already proves BF16 storage, unit dimension stride and a
+    16-byte-aligned view base. The descriptor checks below repeat those
+    stride requirements for the packed view and also validate the direct-I/O
+    strides. Padded rows must lie outside the descriptor extent so hardware
+    zero-fill agrees with the scalar loader's mask.
+    """
+    semantic = transport.semantic
+    heads, items, rows = transport.heads, transport.items, transport.query_rows
+    if columns not in (8, 32, 40) or not 0 < rows <= columns:
+        return None
+    if transport.direct_io is None:
+        item_stride, row_stride, dim_stride = semantic.query.strides
+        shape = (128, rows, 1, heads, items // heads)
+        strides = (
+            dim_stride,
+            row_stride,
+            rows * row_stride,
+            item_stride,
+            heads * item_stride,
+        )
+        box = (64, columns, 1, 1, 1)
+    else:
+        group, query_len = semantic.coordinates.group, semantic.coordinates.query_len
+        if columns % group:
+            return None
+        batch_stride, query_stride, head_stride, dim_stride = transport.direct_io.query
+        shape = (128, group, query_len, heads, items // heads)
+        strides = (
+            dim_stride,
+            head_stride,
+            query_stride,
+            group * head_stride,
+            batch_stride,
+        )
+        box = (64, group, columns // group, 1, 1)
+    if strides[0] != 1 or any(
+        stride <= 0 or stride * 2 % 16 or stride * 2 >= 2**40 for stride in strides[1:]
+    ):
+        return None
+    if any(size <= 0 or size >= 2**32 for size in shape) or any(
+        not 0 < size <= 256 for size in box
+    ):
+        return None
+    return PagedQueryTma(shape, strides, box)
+
+
+def paged_attention_tma_accesses(
+    semantic: PagedAttentionPlan,
+) -> tuple[Access, Access, Access, Access]:
+    """Descriptor and cache-policy order: raw K, scale K, raw V, scale V."""
+    return (
+        semantic.key.raw,
+        semantic.key.scale,
+        semantic.value.raw,
+        semantic.value.scale,
+    )
+
+
+def paged_attention_load_hints(
+    facts: PagedAttentionScheduleFacts, config: Config
+) -> tuple[str, ...]:
+    """Selected TMA hints in raw-K, scale-K, raw-V, scale-V order."""
+    policies = config.get("load_eviction_policies", [])
+    assert isinstance(policies, list)
+    return tuple(
+        MMA_DAG_L2_HINTS.get(policies[slot], "")
+        if slot is not None and slot < len(policies)
+        else ""
+        for slot in facts.tma_load_slots
     )
 
 
@@ -370,19 +596,20 @@ def _direct_io(
 
     query_map = plan.query.index_map
     output_map = plan.output.index_map
-    lse_map = plan.lse.index_map if plan.lse is not None else None
     if (
         query_map is None
         or output_map is None
-        or (plan.lse is not None and lse_map is None)
+        or any(access.index_map is None for access in plan.row_outputs)
     ):
         return None
     # Only the per-key denominator body implements the io_layouts parameter.
     if not plan.denominator_per_key or len(plan.program.lead_axes) != 1:
         return None
-    expected_accesses = {plan.query.node, plan.output.node}
-    if plan.lse is not None:
-        expected_accesses.add(plan.lse.node)
+    expected_accesses = {
+        plan.query.node,
+        plan.output.node,
+        *(access.node for access in plan.row_outputs),
+    }
     if {
         access.node for access in plan.program.accesses if access.index_map is not None
     } != expected_accesses:
@@ -408,16 +635,26 @@ def _direct_io(
     output_layout = _direct_layout(output_map, item, heads, query_len, group, 128)
     if query_layout is None or output_layout is None:
         return None
-    lse_layout = None
-    if lse_map is not None:
-        lse_layout = _direct_layout(lse_map, item, heads, query_len, group, None)
-        if lse_layout is None:
+    row_layouts = []
+    for access in plan.row_outputs:
+        assert access.index_map is not None
+        layout = _direct_layout(access.index_map, item, heads, query_len, group, None)
+        if layout is None:
             return None
+        row_layouts.append(layout)
+    lse_layout = row_layouts[0] if plan.lse is not None else None
+    statistic_layouts = (
+        (row_layouts[0], row_layouts[1])
+        if plan.partial_statistics is not None
+        else None
+    )
     return (
         lead.extent,
         query_len * group,
         item,
-        PagedAttentionDirectIO(query_layout, output_layout, lse_layout),
+        PagedAttentionDirectIO(
+            query_layout, output_layout, lse_layout, statistic_layouts
+        ),
     )
 
 
@@ -448,6 +685,10 @@ def plan_paged_attention_transport(
     env: CompileEnvironment, plan: PagedAttentionPlan
 ) -> PagedAttentionTransport | None:
     """Prove the initial rank-5 page/subpage transport without changing math."""
+    # Existing panels implement the FP32 exp2/cast/postscale source contract.
+    # Native scale0/subnormal and canonical-NaN semantics need their own emitter.
+    if any(operand.decode_kind != "float_exp2" for operand in (plan.key, plan.value)):
+        return None
     capability = env.config_spec.target_device_capability
     if capability not in NATIVE_S2F6_TARGETS or plan.io_dtype != torch.bfloat16:
         return None
@@ -467,6 +708,10 @@ def plan_paged_attention_transport(
             return None
         items, rows, item, direct_io = direct
     else:
+        # Raw statistics currently require the separately proved folded row
+        # layouts. The packed normalized route remains unchanged.
+        if plan.partial_statistics is not None:
+            return None
         if query.fake.ndim != 3 or query.fake.shape[-1] != 128:
             return None
         items, rows, _ = (int(size) for size in query.fake.shape)
@@ -524,12 +769,10 @@ def plan_paged_attention_transport(
     if direct_io is None and (
         tuple(plan.output.fake.shape) != tuple(query.fake.shape)
         or plan.output.subscripts[0].expr != item
-        or (
-            plan.lse is not None
-            and (
-                tuple(plan.lse.fake.shape) != (items, rows)
-                or plan.lse.subscripts[0].expr != item
-            )
+        or any(
+            tuple(access.fake.shape) != (items, rows)
+            or access.subscripts[0].expr != item
+            for access in plan.row_outputs
         )
     ):
         return None

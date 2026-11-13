@@ -216,16 +216,56 @@ def test_folded_attention_exposes_only_implemented_mma_seeds() -> None:
     bound = _bound(5, "plain")
     facts = bound.config_spec.cute_mma_dag_facts
     assert facts is not None and facts.mapped_io
+    assert facts.attention is not None
     with bound.env, bound.host_function:
         seeds = MmaDagSeedPlanner(
             facts, bound.config_spec, occupancy_key="cute_min_blocks_per_mp"
         ).configs([])
         assert [
-            (seed.get("cute_mma_dag_pass_warps"), seed.get("cute_min_blocks_per_mp"))
+            (
+                seed.get("cute_mma_dag_pass_warps"),
+                seed.get("cute_min_blocks_per_mp"),
+                seed.get("cute_mma_dag_v_lag", 0),
+                seed.get("cute_mma_dag_sleep_waits", False),
+                seed.get("cute_mma_dag_query_tma", False),
+                tuple(
+                    seed.get("load_eviction_policies")[slot]
+                    for slot in facts.attention.tma_load_slots
+                ),
+                seed.get("cute_pdl", False),
+                seed.get("cute_pdl_capture_overlap", False),
+                seed.get("cute_pdl_release", "auto"),
+            )
             for seed in seeds
-        ] == [("attention", 1), ("attention", 2), ("attention_scoped", 2)]
+        ] == [
+            (*schedule, False, False, (policy,) * 4, False, False, "auto")
+            for schedule in [
+                ("attention", 1, 0),
+                ("attention", 2, 0),
+                ("attention_scoped", 2, 0),
+                *(("attention_paired", 1, lag) for lag in range(4)),
+            ]
+            for policy in ("", "streaming", "l2_last")
+        ] + [
+            ("attention_paired", 1, lag, True, False, ("",) * 4, False, False, "auto")
+            for lag in range(4)
+        ] + [
+            ("attention_paired", 1, lag, False, True, ("",) * 4, False, False, "auto")
+            for lag in range(4)
+        ]
         for seed in seeds:
             config = bound.config_spec.normalized_config(seed)
+            assert not seed.get("cute_pdl_capture_overlap", False)
+            assert config.get("cute_pdl_capture_overlap", False) is False
+            assert config.get("cute_pdl_release", "auto") == seed.get(
+                "cute_pdl_release", "auto"
+            )
+            assert config.get("cute_mma_dag_query_tma", False) == seed.get(
+                "cute_mma_dag_query_tma", False
+            )
+            assert config.get("cute_mma_dag_sleep_waits", False) == seed.get(
+                "cute_mma_dag_sleep_waits", False
+            )
             assert config.get("cute_mma_dag_pass_warps") == seed.get(
                 "cute_mma_dag_pass_warps"
             )

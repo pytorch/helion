@@ -1602,6 +1602,13 @@ class CuteBackend(Backend):
                 "tcgen05 GEMM pipeline, which this kernel did not take"
             )
         grid_multiplier = fn.cute_state.lanes.launch_grid_multiplier
+        item_group = fn.cute_state.lanes.attention_item_group
+        if item_group != 1:
+            assert item_group == 2 and grid_multiplier == 1
+            assert isinstance(grid_expr, ast.Tuple) and len(grid_expr.elts) == 1
+            grid_expr = expr_from_string(
+                f"(({{grid}}[0]) // {item_group},)", grid=grid_expr
+            )
         if grid_multiplier != 1:
             # A fused body running one CTA per (grid index, lane).
             assert isinstance(grid_expr, ast.Tuple) and len(grid_expr.elts) == 1
@@ -2425,7 +2432,10 @@ class CuteBackend(Backend):
         device_function.cute_state.root_plans.mma_dag_plan = plan_mma_dag(
             graphs, config
         )
-        if device_function.cute_state.root_plans.mma_dag_plan is not None:
+        mma_plan = device_function.cute_state.root_plans.mma_dag_plan
+        if mma_plan is not None:
+            if mma_plan.attention is not None and mma_plan.attention.paired_items:
+                device_function.cute_state.lanes.attention_item_group = 2
             return
         plan_single_token_rank1_recurrence(graphs, tile_strategy)
         if (
@@ -4790,7 +4800,19 @@ class CuteBackend(Backend):
     def tile_begin_expr(self, codegen: GenerateAST, block_idx: int) -> str | None:
         from .tile_ops import cute_tile_begin_expr
 
-        return cute_tile_begin_expr(codegen, block_idx)
+        result = cute_tile_begin_expr(codegen, block_idx)
+        plan = codegen.device_function.cute_state.root_plans.mma_dag_plan
+        item_group = codegen.device_function.cute_state.lanes.attention_item_group
+        if (
+            plan is not None
+            and plan.attention is not None
+            and item_group != 1
+            and block_idx == plan.program.lead_axes[0].block_id
+        ):
+            # All origins (tile.id/begin and uniform FX/SymInt expressions)
+            # see the first original item owned by this paired grid index.
+            return f"({result} * {item_group})"
+        return result
 
     def rewrite_lowered_root(
         self, codegen: GenerateAST, grid_state: DeviceGridState, body: list[ast.AST]

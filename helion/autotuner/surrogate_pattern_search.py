@@ -1857,6 +1857,7 @@ class LFBOPatternSearch(PatternSearch):
         frozen = set(config_gen.overridden_flat_indices)
         if fixed_flat_values:
             frozen.update(fixed_flat_values)
+        frozen_indices = tuple(frozen)
         eligible_block = [i for i in config_gen.block_size_indices if i not in frozen]
         warp_idx = config_gen.num_warps_index
         tune_warps = warp_idx >= 0 and warp_idx not in frozen
@@ -1910,6 +1911,9 @@ class LFBOPatternSearch(PatternSearch):
                     for idx, pattern_neighbors in indices_to_change:
                         new_flat[idx] = random.choice(pattern_neighbors)
 
+            new_flat = config_gen.conditional_neighbor(
+                base, new_flat, frozen_indices=frozen_indices
+            )
             if proposal_callback is not None:
                 proposal_callback(new_flat)
             # Only add if it's different from the base
@@ -2546,9 +2550,9 @@ class LFBOPatternSearch(PatternSearch):
                     frozen_indices=owned_indices,
                 )
                 for projection in projections:
-                    raw = copy.deepcopy(base)
-                    raw[projection.flat_index] = copy.deepcopy(projection.to_value)
-                    record_proposal(raw, "coordinate")
+                    # Ledger raw values include deterministic prerequisites,
+                    # before normalization; the catalog describes the trigger.
+                    record_proposal(projection.requested_flat_values, "coordinate")
                 remaining = limit - len(proposals)
                 random_state = random.getstate() if remaining else None
                 if remaining:
@@ -2946,6 +2950,7 @@ class LFBOTreeSearch(LFBOPatternSearch):
         frozen = set(config_gen.overridden_flat_indices)
         if fixed_flat_values:
             frozen.update(fixed_flat_values)
+        frozen_indices = tuple(frozen)
         eligible_block = [i for i in config_gen.block_size_indices if i not in frozen]
         warp_idx = config_gen.num_warps_index
         tune_warps = warp_idx >= 0 and warp_idx not in frozen
@@ -3000,8 +3005,18 @@ class LFBOTreeSearch(LFBOPatternSearch):
                 enc_start, enc_end, _ = mapping[flat_idx]
                 n_candidates = len(candidate_vals)
                 candidate_encoded = np.tile(current_encoded, (n_candidates, 1))
+                candidate_flats = []
                 for i, val in enumerate(candidate_vals):
-                    candidate_encoded[i, enc_start:enc_end] = spec.encode(val)
+                    raw = [*current_flat]
+                    raw[flat_idx] = val
+                    candidate = config_gen.conditional_neighbor(
+                        current_flat, raw, frozen_indices=frozen_indices
+                    )
+                    candidate_flats.append(candidate)
+                    if candidate == raw:
+                        candidate_encoded[i, enc_start:enc_end] = spec.encode(val)
+                    else:
+                        candidate_encoded[i] = config_gen.encode_config(candidate)
 
                 # Score with single tree (ties broken randomly)
                 probas = np.asarray(estimator.predict_proba(candidate_encoded))[:, 1]
@@ -3011,10 +3026,8 @@ class LFBOTreeSearch(LFBOPatternSearch):
                 top_indices = [i for i, p in enumerate(probas) if p == max_proba]
                 chosen_idx = random.choice(top_indices)
 
-                current_flat[flat_idx] = candidate_vals[chosen_idx]
-                current_encoded[enc_start:enc_end] = candidate_encoded[
-                    chosen_idx, enc_start:enc_end
-                ]
+                current_flat = candidate_flats[chosen_idx]
+                current_encoded = candidate_encoded[chosen_idx].copy()
 
             # Only keep if different from base
             if current_flat != base_list:

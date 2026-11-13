@@ -14,6 +14,7 @@ from unittest.mock import Mock
 from unittest.mock import call
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from test._autotuner_test_utils import AutotunerTestCase
@@ -95,6 +96,7 @@ _CACHE_POLICY_DYNAMIC_HELPER: object = None
 
 @onlyBackends(["cute"])
 class TestAutotunerCuteFlash(AutotunerTestCase):
+    @pytest.mark.cpu_only
     def test_lfbo_flash_terminal_coordinate_refinement_runs_two_rounds(self):
         def make_fn(source_id: int):
             def fn():
@@ -134,6 +136,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
                         outcome="candidate",
                         flat_values=[target],
                         config=projected,
+                        requested_flat_values=[target],
                     )
                 )
             return result
@@ -463,6 +466,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search.benchmark_population.assert_not_called()
         search.mirrored_rebenchmark.assert_not_called()
 
+    @pytest.mark.cpu_only
     def test_lfbo_flash_terminal_coordinate_refinement_crosses_beam_valley(self):
         def member(
             e2e_offset: int,
@@ -500,6 +504,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
                         "candidate",
                         [5, 12.0],
                         intermediate_config,
+                        [5, 12.0],
                     )
                 ]
             if flat == [5, 12.0]:
@@ -513,6 +518,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
                         "candidate",
                         [5, 4.0],
                         endpoint_config,
+                        [5, 4.0],
                     )
                 ]
             return []
@@ -5210,6 +5216,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
                     )
                 )
 
+    @pytest.mark.cpu_only
     def test_lfbo_flash_qualification_reserves_lanes_before_surrogate_pruning(
         self,
     ):
@@ -5325,6 +5332,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
                         "candidate",
                         child_flat,
                         by_flat[tuple(child_flat)].config,
+                        child_flat,
                     )
                     for child_flat in generate(parent, _leaf, constraints, limit)
                 ]

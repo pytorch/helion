@@ -11,9 +11,12 @@ import cutlass.cute as cute
 import cutlass.experimental.primitives as prims
 
 from ._flash_row_mma_runtime import pack_bf16x2
+from ._mma_dag_tcgen05_runtime import mbar_wait
+from ._mma_dag_tcgen05_runtime import mbar_wait_sleep
 from ._paged_attention_compute import logical_attention_mask
 from ._paged_attention_compute import logical_attention_tile_is_interior
 from ._paged_attention_partial_compute import load_query_panel
+from ._paged_attention_partial_compute import store_query_panel
 from .device.ptx import sts_v4_b32
 
 
@@ -28,9 +31,28 @@ def _store_reference_probability_and_denominator(
     fast_math: cutlass.Constexpr,
     rescale_denominator: cutlass.Constexpr,
     base2_scores: cutlass.Constexpr,
+    probability_schedule: cutlass.Constexpr = "serial",
+    denominator_address: cutlass.Int32 | None = None,
+    previous_pv: cute.Pointer | None = None,
+    previous_phase: cutlass.Int32 | cutlass.Int64 = cutlass.Int32(0),  # noqa: B008
+    have_previous: cutlass.Boolean = cutlass.Boolean(False),  # noqa: B008
+    previous_sleep: cutlass.Constexpr = False,
 ) -> None:
     # Each key lane writes eight adjacent queries with one aligned 16-byte
     # store. The complete eight-query groups follow the selected panel width.
+    if cutlass.const_expr(probability_schedule == "early_tmem"):
+        loaded_partials = load_query_panel(denominator_address, query_columns)
+        if cutlass.const_expr(query_columns == 40):
+            partials = loaded_partials
+        else:
+            # Power-of-two loads return an immutable Vector. The recurrence
+            # needs mutable registers while updating this page's denominator.
+            partials = cute.make_rmem_tensor((query_columns,), cutlass.Float32)
+            for query in cutlass.range_constexpr(query_columns):
+                partials[query] = loaded_partials[query]
+    # Initialize outside the constexpr branch for CuTe's variable analysis.
+    # The serial path never reads this tensor and eliminates the allocation.
+    packed_values = cute.make_rmem_tensor((query_columns // 2,), cutlass.Uint32)
     for group in cutlass.range_constexpr(query_columns // 8):
         packed = cute.make_rmem_tensor((4,), cutlass.Uint32)
         for pair in cutlass.range_constexpr(4):
@@ -69,10 +91,37 @@ def _store_reference_probability_and_denominator(
                 l0, l1 = cute.arch.add_packed_f32x2(old, (p0, p1))
             partials[query] = l0
             partials[query + 1] = l1
-            packed[pair] = pack_bf16x2(p0, p1)
-        offset = group * 1024 + thread * 8
-        address = cutlass.Int32((probability.iterator + offset).toint())
-        sts_v4_b32(address, packed[0], packed[1], packed[2], packed[3])
+            if cutlass.const_expr(probability_schedule == "serial"):
+                packed[pair] = pack_bf16x2(p0, p1)
+            else:
+                packed_values[group * 4 + pair] = pack_bf16x2(p0, p1)
+        if cutlass.const_expr(probability_schedule == "serial"):
+            offset = group * 1024 + thread * 8
+            address = cutlass.Int32((probability.iterator + offset).toint())
+            sts_v4_b32(address, packed[0], packed[1], packed[2], packed[3])
+    if cutlass.const_expr(probability_schedule == "early_tmem"):
+        store_query_panel(denominator_address, partials, query_columns)
+        prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+    if cutlass.const_expr(probability_schedule != "serial"):
+        # Previous PV owns shared P and TMEM O. Computing the next P in
+        # registers and updating its disjoint denominator may overlap it;
+        # every shared P overwrite and subsequent O rescale must wait here.
+        if have_previous:
+            if cutlass.const_expr(previous_sleep):
+                mbar_wait_sleep(previous_pv, previous_phase)
+            else:
+                mbar_wait(previous_pv, previous_phase)
+            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+        for group in cutlass.range_constexpr(query_columns // 8):
+            offset = group * 1024 + thread * 8
+            address = cutlass.Int32((probability.iterator + offset).toint())
+            sts_v4_b32(
+                address,
+                packed_values[group * 4],
+                packed_values[group * 4 + 1],
+                packed_values[group * 4 + 2],
+                packed_values[group * 4 + 3],
+            )
 
 
 @cute.jit
@@ -152,7 +201,8 @@ def online_softmax_reference(
     group_size: cutlass.Constexpr,
     window: cutlass.Constexpr,
     score_scale: cutlass.Float32,
-    barrier_id: cutlass.Constexpr,
+    # Disjoint 128-thread groups may supply different warp-uniform IDs.
+    barrier_id: cutlass.Int32,
     partials: cute.Tensor,
     maximum_invalid: cutlass.Boolean,
     fast_math: cutlass.Constexpr,
@@ -160,6 +210,14 @@ def online_softmax_reference(
     coordinate_dtype: cutlass.Constexpr,
     query_columns: cutlass.Constexpr = 40,
     base2_scores: cutlass.Constexpr = False,
+    convergent_branches: cutlass.Constexpr = False,
+    group_barrier: cutlass.Constexpr = True,
+    probability_schedule: cutlass.Constexpr = "serial",
+    denominator_address: cutlass.Int32 | None = None,
+    previous_pv: cute.Pointer | None = None,
+    previous_phase: cutlass.Int32 | cutlass.Int64 = cutlass.Int32(0),  # noqa: B008
+    have_previous: cutlass.Boolean = cutlass.Boolean(False),  # noqa: B008
+    previous_sleep: cutlass.Constexpr = False,
 ) -> tuple[cutlass.Boolean, cutlass.Boolean]:
     """Consume the separately proved reference-score recurrence.
 
@@ -169,6 +227,13 @@ def online_softmax_reference(
     The returned flags are uniform over the 128 participating compute threads.
     The invalid flag replaces repeated reference guards in every key lane;
     it is refreshed at the existing maximum-publication barrier.
+    convergent_branches keeps long uniform arms separate in the paired caller.
+    When group_barrier is False, the caller must publish every writer warp
+    before a consumer reads P. Serial callers wait before the next call;
+    early schedules pass previous_pv so this helper waits before rewriting P.
+    The next call's maximum vote barrier orders successive probability-ready
+    phases, and the maximum-publication barrier orders state/scratch reuse.
+    Caller writes to state after return require their own group synchronization.
     """
     assert cutlass.const_expr(query_columns % 8 == 0)
     warp = thread // 32
@@ -191,8 +256,14 @@ def online_softmax_reference(
         window,
         coordinate_dtype,
     )
+    # The paired arena caller opts into a convergence point in each uniform
+    # arm so NVVM preserves the branch instead of predicating both long score
+    # passes. A warp-uniform annotation alone did not prevent this if-conversion.
+    # Other callers keep their existing control flow.
     needs_update = cutlass.Boolean(False)
     if interior:
+        if cutlass.const_expr(convergent_branches):
+            cute.arch.sync_warp()
         needs_update = _reference_values(
             scores,
             state,
@@ -211,6 +282,8 @@ def online_softmax_reference(
             apply_mask=False,
         )
     else:
+        if cutlass.const_expr(convergent_branches):
+            cute.arch.sync_warp()
         needs_update = _reference_values(
             scores,
             state,
@@ -281,6 +354,12 @@ def online_softmax_reference(
             fast_math,
             rescale_denominator=True,
             base2_scores=base2_scores,
+            probability_schedule=probability_schedule,
+            denominator_address=denominator_address,
+            previous_pv=previous_pv,
+            previous_phase=previous_phase,
+            have_previous=have_previous,
+            previous_sleep=previous_sleep,
         )
     else:
         _store_reference_probability_and_denominator(
@@ -293,7 +372,14 @@ def online_softmax_reference(
             fast_math,
             rescale_denominator=False,
             base2_scores=base2_scores,
+            probability_schedule=probability_schedule,
+            denominator_address=denominator_address,
+            previous_pv=previous_pv,
+            previous_phase=previous_phase,
+            have_previous=have_previous,
+            previous_sleep=previous_sleep,
         )
     cute.arch.fence_proxy(kind="async.shared", space="cta")
-    cute.arch.barrier(barrier_id=barrier_id, number_of_threads=128)
+    if cutlass.const_expr(group_barrier):
+        cute.arch.barrier(barrier_id=barrier_id, number_of_threads=128)
     return maximum_changed, maximum_invalid

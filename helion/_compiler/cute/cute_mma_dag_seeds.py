@@ -47,12 +47,17 @@ from .cute_mma_dag import MMA_DAG_LOOKAHEAD_KEY
 from .cute_mma_dag import MMA_DAG_LOOKAHEAD_OFF
 from .cute_mma_dag import MMA_DAG_LOOKAHEAD_ON
 from .cute_mma_dag import MMA_DAG_PASS_WARP_STAGES
+from .cute_mma_dag import MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
 from .cute_mma_dag import MMA_DAG_PASS_WARPS_ATTENTION_SCOPED
 from .cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
 from .cute_mma_dag import MMA_DAG_PASS_WARPS_MMA
 from .cute_mma_dag import MMA_DAG_PASS_WARPS_OFF
 from .cute_mma_dag import MMA_DAG_PASS_WARPS_ON
 from .cute_mma_dag import MMA_DAG_PERSISTENT_KEY
+from .cute_mma_dag import MMA_DAG_PROBABILITY_SCHEDULE_KEY
+from .cute_mma_dag import MMA_DAG_PROBABILITY_SCHEDULE_SERIAL
+from .cute_mma_dag import MMA_DAG_QUERY_TMA_KEY
+from .cute_mma_dag import MMA_DAG_SLEEP_WAITS_KEY
 from .cute_mma_dag import MMA_DAG_SPLIT_CLUSTER
 from .cute_mma_dag import MMA_DAG_SPLIT_FIXUP
 from .cute_mma_dag import MMA_DAG_SPLIT_KEY
@@ -61,6 +66,9 @@ from .cute_mma_dag import MMA_DAG_STORE_DIRECT
 from .cute_mma_dag import MMA_DAG_STORE_KEY
 from .cute_mma_dag import MMA_DAG_STORE_STAGED
 from .cute_mma_dag import MMA_DAG_TCGEN05
+from .cute_mma_dag import MMA_DAG_V_LAG_KEY
+from .cute_mma_dag import MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY
+from .cute_mma_dag import MMA_DAG_VALUE_METADATA_SKIP_KEY
 from .cute_mma_dag import MMA_DAG_WARP
 from .cute_mma_dag import MMA_DAG_WARP_CHOICES
 from .cute_mma_dag import MMA_DAG_WARPS_KEY
@@ -72,6 +80,8 @@ from .cute_mma_dag import mma_dag_pass_warps_reason
 from .cute_mma_dag import mma_dag_seed_configs
 from .cute_mma_dag import mma_dag_seed_variants
 from .cute_mma_dag import paged_attention_pass_warp_choices
+from .cute_mma_dag import paged_attention_probability_choices
+from .cute_mma_dag import paged_attention_v_lag_choices
 from .cute_mma_dag_tcgen05 import tcgen05_corner_seeds
 from .cute_mma_dag_tcgen05 import tcgen05_lookahead_stages
 from .cute_mma_dag_tcgen05 import tcgen05_persistent_ctas
@@ -732,6 +742,12 @@ class MmaDagSeedPlanner:
             and MMA_DAG_EPILOGUE_STREAMED in spec.cute_mma_dag_epilogue.choices
         )
         seeds: list[Config] = []
+        sleeping: list[Config] = []
+        query_tma: list[Config] = []
+        value_metadata: list[Config] = []
+        value_metadata_policies: list[Config] = []
+        value_metadata_probability: list[Config] = []
+        probability_seeds: list[Config] = []
         for seed in ranked:
             block_sizes = list(default_sizes)
             for block_id, size in seed.sizes.items():
@@ -814,9 +830,32 @@ class MmaDagSeedPlanner:
                     block_sizes[spec.block_sizes.block_id_to_index(block_id)] = sizes[
                         block_id
                     ]
+            # The four TMA operands can tune independently. Seed both uniform
+            # L2 priorities alongside the unchanged default; no shape selects one.
+            priorities = (
+                ("", "streaming", "l2_last")
+                if any(slot is not None for slot in attention.tma_load_slots)
+                else ("",)
+            )
+
+            def policy_bundle(policy: str) -> list[str]:
+                policies = [""] * eviction_length
+                for slot in attention.tma_load_slots:
+                    if slot is not None:
+                        # The heuristic scatters phase-local seed policies
+                        # into the bundle once.
+                        policies[slot] = policy
+                return policies
+
             for pass_warps in paged_attention_pass_warp_choices(facts):
+                probability_choices = tuple(
+                    choice
+                    for choice in paged_attention_probability_choices(facts, pass_warps)
+                    if choice != MMA_DAG_PROBABILITY_SCHEDULE_SERIAL
+                )
                 occupancies = attention.min_blocks_per_mp_choices(
-                    scoped_registers=pass_warps == MMA_DAG_PASS_WARPS_ATTENTION_SCOPED
+                    scoped_registers=pass_warps == MMA_DAG_PASS_WARPS_ATTENTION_SCOPED,
+                    paired_items=pass_warps == MMA_DAG_PASS_WARPS_ATTENTION_PAIRED,
                 )
                 config = {
                     **paged_attention_required_knobs(facts),
@@ -840,7 +879,105 @@ class MmaDagSeedPlanner:
                     is None
                 ):
                     for occupancy in occupancies:
-                        seeds.append(
-                            Config.from_dict({**config, self.occupancy_key: occupancy})
+                        for v_lag in paged_attention_v_lag_choices(facts, pass_warps):
+                            seed = {**config, self.occupancy_key: occupancy}
+                            if pass_warps == MMA_DAG_PASS_WARPS_ATTENTION_PAIRED:
+                                seed[MMA_DAG_V_LAG_KEY] = v_lag
+                            for policy in priorities:
+                                seed_config = {
+                                    **seed,
+                                    "load_eviction_policies": policy_bundle(policy),
+                                }
+                                seeds.append(Config.from_dict(seed_config))
+                                if (
+                                    pass_warps == MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
+                                    and attention.value_metadata_skip_available
+                                ):
+                                    metadata_seeds = (
+                                        value_metadata
+                                        if policy == ""
+                                        else value_metadata_policies
+                                    )
+                                    metadata_seeds.append(
+                                        Config.from_dict(
+                                            {
+                                                **seed_config,
+                                                MMA_DAG_VALUE_METADATA_SKIP_KEY: True,
+                                            }
+                                        )
+                                    )
+                                if (
+                                    pass_warps == MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
+                                    and policy == ""
+                                ):
+                                    if attention.query_tma_available:
+                                        query_tma.append(
+                                            Config.from_dict(
+                                                {
+                                                    **seed_config,
+                                                    MMA_DAG_QUERY_TMA_KEY: True,
+                                                }
+                                            )
+                                        )
+                                    sleeping.append(
+                                        Config.from_dict(
+                                            {
+                                                **seed_config,
+                                                MMA_DAG_SLEEP_WAITS_KEY: True,
+                                            }
+                                        )
+                                    )
+                                    for probability_schedule in probability_choices:
+                                        probability_config = {
+                                            **seed_config,
+                                            MMA_DAG_PROBABILITY_SCHEDULE_KEY: probability_schedule,
+                                        }
+                                        if attention.query_tma_available:
+                                            probability_config[
+                                                MMA_DAG_QUERY_TMA_KEY
+                                            ] = True
+                                        probability_seeds.append(
+                                            Config.from_dict(probability_config)
+                                        )
+            if attention.value_metadata_skip_available:
+                for probability_seed in probability_seeds:
+                    for policy in priorities:
+                        value_metadata_probability.append(
+                            Config.from_dict(
+                                {
+                                    **probability_seed.config,
+                                    MMA_DAG_VALUE_METADATA_SKIP_KEY: True,
+                                    "load_eviction_policies": policy_bundle(policy),
+                                }
+                            )
                         )
+        # Keep existing seed order and cache-policy coverage. One sleeping
+        # seed per paired V lag explores the scheduling choice without making
+        # every topology/cache seed compile twice.
+        seeds.extend(sleeping)
+        # Probe query transport once per paired V lag, after the old prefix.
+        seeds.extend(query_tma)
+        # One seed per P schedule and V lag, bundled with available query TMA.
+        # Capture overlap requires the caller's immutable-graph opt-in, so no
+        # compiler seed enables it. Keep the topology/cache prefix independent.
+        seeds.extend(probability_seeds)
+        # Keep the original metadata/default-policy prefix. Seed metadata with
+        # the existing TMA policy ladder too: a default-policy metadata seed can
+        # lose its search path before a beneficial cache-policy neighbor is tried.
+        # Keep these serial anchors intact; joint P anchors follow below.
+        seeds.extend(value_metadata)
+        seeds.extend(value_metadata_policies)
+        # Preserve the prefix and offer both shared-slot wait placements for
+        # the existing metadata policy/lag anchors, without a schedule product.
+        seeds.extend(
+            Config.from_dict(
+                {**seed.config, MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY: True}
+            )
+            for seed in (*value_metadata, *value_metadata_policies)
+        )
+        # A profitable early-P schedule can require both metadata transport and
+        # a different TMA cache policy. Seed that combination directly instead
+        # of relying on two independently unprofitable neighbor moves. Preserve
+        # the old prefix and leave the other scheduling knobs uncrossed.
+        seeds.extend(value_metadata_probability)
         return seeds

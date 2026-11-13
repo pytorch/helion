@@ -1080,6 +1080,9 @@ class ConfigSpec:
         # Whether the kernel runs several phases in one persistent launch
         # (``hl.barrier()`` or an implicit cross-root dependency).
         self.multi_phase: bool = False
+        # Set only for a single native paired-attention root. The selected
+        # emitter also proves complete load/store effects before adding its ABI.
+        self.cute_pdl_capture_overlap_available: bool = False
         # Enabled only when the exact five-factor BT16 recurrence carrier is
         # detected. Choice ordering makes the geometry seed the no-autotune
         # default while leaving both legal schedules in cold/full search.
@@ -1121,6 +1124,12 @@ class ConfigSpec:
         self.cute_mma_dag_store: EnumFragment | None = None
         self.cute_mma_dag_exchange: EnumFragment | None = None
         self.cute_mma_dag_pass_warps: EnumFragment | None = None
+        self.cute_mma_dag_v_lag: EnumFragment | None = None
+        self.cute_mma_dag_sleep_waits: EnumFragment | None = None
+        self.cute_mma_dag_query_tma: EnumFragment | None = None
+        self.cute_mma_dag_value_metadata_skip: EnumFragment | None = None
+        self.cute_mma_dag_value_metadata_read_overlap: EnumFragment | None = None
+        self.cute_mma_dag_probability_schedule: EnumFragment | None = None
         self.cute_mma_dag_loads: EnumFragment | None = None
         self.cute_mma_dag_aux: EnumFragment | None = None
         # How a dot operand that is a pointwise chain over loaded tiles

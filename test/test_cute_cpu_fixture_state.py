@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextlib import nullcontext
+import inspect
 from typing import Any
 from typing import cast
 from unittest.mock import patch
@@ -10,7 +12,55 @@ import torch
 
 from test import test_cute_epilogue_fanout as fanout
 
+from helion._testing.cute_codegen import cpu_target
+
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize("cached_arch", [None, "sm_90a"])
+@pytest.mark.parametrize("body_fails", [False, True])
+def test_offline_target_preserves_sdk_architecture_without_probing(
+    monkeypatch, cached_arch: str | None, body_fails: bool
+) -> None:
+    from cutlass._mlir import ir
+    from cutlass.base_dsl.env_manager import EnvironmentVarManager
+    from cutlass.cutlass_dsl import CuTeDSL
+
+    dsl = CuTeDSL._get_dsl()
+    environment = dsl.envar
+    monkeypatch.setitem(vars(environment), "_arch", cached_arch)
+    before = vars(environment).copy()
+    descriptor = inspect.getattr_static(EnvironmentVarManager, "arch")
+    expected = (
+        pytest.raises(RuntimeError, match="context exit")
+        if body_fails
+        else nullcontext()
+    )
+    with (
+        ir.Context(),
+        ir.Location.unknown(),
+        patch(
+            "cutlass.base_dsl.env_manager.detect_gpu_arch",
+            side_effect=AssertionError("device probe forbidden"),
+        ) as probe,
+    ):
+        module = ir.Module.create()
+        original_key = dsl.get_module_hash(module, "offline_target_probe")
+        with expected, cpu_target(forbid_native=False):
+            assert environment.arch == "sm_100a"
+            assert vars(environment)["_arch"] == "sm_100a"
+            target_key = dsl.get_module_hash(module, "offline_target_probe")
+            assert target_key != original_key
+            with cpu_target(forbid_native=False):
+                assert environment.arch == "sm_100a"
+                assert dsl.get_module_hash(module, "offline_target_probe") == target_key
+            assert environment.arch == "sm_100a"
+            if body_fails:
+                raise RuntimeError("context exit")
+        assert dsl.get_module_hash(module, "offline_target_probe") == original_key
+        probe.assert_not_called()
+    assert vars(environment) == before
+    assert inspect.getattr_static(EnvironmentVarManager, "arch") is descriptor
 
 
 @pytest.mark.parametrize("initialized", [False, True])

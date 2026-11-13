@@ -126,7 +126,9 @@ CuteAffineScanScheduleLiteral = Literal[
     "direct_m16n16_v1",
 ]
 CuteHostPairedSumLiteral = Literal["off", "mapped", "narrow"]
-CutePdlReleaseLiteral = Literal["auto", "entry", "none", "exit", "last_wave"]
+CutePdlReleaseLiteral = Literal[
+    "auto", "entry", "none", "exit", "last_wave", "loader_tail"
+]
 NumSmMultiplierLiteral = int
 MaxnregLiteral = int | None
 
@@ -175,6 +177,7 @@ class Config(Mapping[str, object]):
         cute_lane_unroll: int | None = None,
         cute_wide_packet_hints: bool | None = None,
         cute_pdl: bool | None = None,
+        cute_pdl_capture_overlap: bool | None = None,
         cute_pdl_release: CutePdlReleaseLiteral | None = None,
         cute_pdl_spread: bool | None = None,
         cute_warp_aggregated_atomics: bool | None = None,
@@ -282,6 +285,26 @@ class Config(Mapping[str, object]):
                 with it, bodies with their own wait or release, the
                 materialized-fission producer) and pre-sm_90 targets generate
                 exactly the knob-off code.
+            cute_pdl_capture_overlap: During CUDA graph capture, permit a proved
+                paired attention kernel to read inputs before its PDL dependency
+                completes when none of its known pending ancestors can write
+                those storages. It still waits before every global write.
+                Requires ``cute_pdl=True`` and automatic, entry or loader-tail
+                release.
+                Unknown predecessors, aliases, unsupported wrappers and eager
+                calls retain the ordinary early wait. Default autotuning and
+                compiler seeds leave it off. An explicit Config, user seed, or
+                autotune_config_overrides may opt an eligible kernel in, with
+                ``cute_pdl=True`` and ``cute_pdl_spread=False``.
+                Eager benchmark timings cannot demonstrate this capture-only
+                overlap benefit; a selected configuration is not evidence of a
+                speedup for the application's captured graph.
+                With this policy enabled, captured topology and parameter
+                addresses must remain immutable; tensor contents may change
+                between replays. Recapture after rewiring a graph or replacing
+                its pointer arguments. Applications that edit captured graphs
+                must leave this policy off, including when supplying stored
+                configurations or user seeds that previously enabled it.
             cute_pdl_release: Where a ``cute_pdl`` kernel releases its own
                 dependents (``griddepcontrol.launch_dependents``), which is what
                 lets the next kernel of a sequence launch early too. ``entry``
@@ -300,8 +323,12 @@ class Config(Mapping[str, object]):
                 while the launch grid is known to fit in one wave of resident
                 CTAs (the SM count times the CTAs an SM holds, from the launch
                 block or ``cute_min_blocks_per_mp``) and ``last_wave`` past it
-                or when the grid is sized at runtime; the search leaves the
-                placement at ``auto``. Every placement reads the same data: a
+                or when the grid is sized at runtime. ``loader_tail`` requires
+                proved paired capture overlap: the loader releases with four
+                logical pages left to issue, or after a shorter/empty loop.
+                Its waits and ancestor-storage proof are unchanged. This choice
+                also requires explicit opt-in; default search leaves placement
+                at ``auto``. Every placement reads the same data: a
                 dependent's own wait blocks until this grid has completed and
                 flushed. On the tcgen05 GEMM kernels, whose lowering waits in
                 its warp roles and releases after the last MMA, ``entry`` and
@@ -422,6 +449,7 @@ class Config(Mapping[str, object]):
             "cute_lane_unroll": cute_lane_unroll,
             "cute_wide_packet_hints": cute_wide_packet_hints,
             "cute_pdl": cute_pdl,
+            "cute_pdl_capture_overlap": cute_pdl_capture_overlap,
             "cute_pdl_release": cute_pdl_release,
             "cute_pdl_spread": cute_pdl_spread,
             "cute_warp_aggregated_atomics": cute_warp_aggregated_atomics,

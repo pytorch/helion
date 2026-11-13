@@ -161,12 +161,12 @@ def forbid_native_compile() -> Generator[list[MagicMock], None, None]:
 
 
 @contextmanager
-def forbid_cuda_work() -> Generator[None, None, None]:
-    """Guard this test even when an earlier test initialized the CUDA context."""
+def forbid_cuda_work(*, forbid_native: bool = True) -> Generator[None, None, None]:
+    """Reject CUDA work; optionally allow device compilation without a JIT engine."""
     initialized = torch.cuda.is_initialized()
     with ExitStack() as stack:
         stack.enter_context(RejectNativeCuda())
-        guards = stack.enter_context(forbid_native_compile())
+        guards = stack.enter_context(forbid_native_compile()) if forbid_native else []
         guards.extend(
             stack.enter_context(
                 patch(target, side_effect=AssertionError("CUDA work forbidden"))
@@ -245,15 +245,27 @@ def cpu_target(*, forbid_native: bool = True) -> Generator[None, None, None]:
     the full 227 KiB opt-in SMEM as the AB budget: the B200 model's compute
     capability, SM count and HIP flag, ``mock_cuda_unavailable`` and the
     ``torch.cuda._lazy_init`` guard that fails the test if anything
-    initializes CUDA.  ``forbid_native=False`` keeps ``cute.compile`` callable
-    for a test that compiles its own CPU driver (the split-K workspace
-    protocol checks).
+    initializes CUDA. ``forbid_native=False`` permits offline device compilation
+    and selects the SDK's sm100a target without probing the physical device.
     """
-    with cpu_render_target(
-        mma_support=default_cute_mma_support(),
-        smem_budget_bytes=232448,
-        forbid_native=forbid_native,
-    ):
+    with ExitStack() as stack:
+        stack.enter_context(
+            cpu_render_target(
+                mma_support=default_cute_mma_support(),
+                smem_budget_bytes=232448,
+                forbid_native=forbid_native,
+            )
+        )
+        if not forbid_native:
+            from cutlass.cutlass_dsl import CuTeDSL
+
+            # The SDK caches its environment at import. Setting CUTE_DSL_ARCH
+            # later can still probe CUDA through its lazy architecture getter.
+            # Its module cache key includes this plain backing field, so change
+            # it without reading the getter and restore it on every exit.
+            stack.enter_context(
+                patch.object(CuTeDSL._get_dsl().envar, "_arch", "sm_100a")
+            )
         yield
 
 

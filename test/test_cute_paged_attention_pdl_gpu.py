@@ -21,12 +21,17 @@ from helion._testing.cute_pdl import produce
 
 @skipIfNotCUDA()
 @skipIfRefEager("PDL requires native launch attributes")
-@pytest.mark.parametrize("per_key", [False, True])
-def test_paged_attention_waits_for_delayed_lengths(per_key):
+@pytest.mark.parametrize(
+    "per_key,paired", [(False, False), (True, False), (True, True)]
+)
+def test_paged_attention_waits_for_delayed_lengths(per_key, paired):
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("the paged pipeline uses SM100 tensor memory")
     rows = 8 if per_key else 64
-    args = list(paged_attention_args(device=DEVICE, rows=rows))
+    # A paired launch has 300 logical items but only 150 physical CTAs:
+    # on a 148-SM target its last-wave release starts at CTA 2, not 152.
+    requests = 150 if paired else 2
+    args = list(paged_attention_args(device=DEVICE, rows=rows, requests=requests))
     args[-1] = -1
     args.extend((None, per_key))
     q, k, v, sk, sv, pages, lengths = (cast("torch.Tensor", arg) for arg in args[:7])
@@ -41,7 +46,7 @@ def test_paged_attention_waits_for_delayed_lengths(per_key):
         )
     )
     sources = [
-        torch.tensor(values, dtype=torch.int32, device=DEVICE)
+        torch.tensor(values * (requests // 2), dtype=torch.int32, device=DEVICE)
         for values in ([0, 257], [129, 0])
     ]
     lengths.copy_(sources[0])
@@ -53,13 +58,15 @@ def test_paged_attention_waits_for_delayed_lengths(per_key):
                 cute_mma_dag="tcgen05",
                 cute_mma_dag_warps=4,
                 cute_mma_dag_stages=2,
-                cute_mma_dag_pass_warps="attention",
+                cute_mma_dag_pass_warps="attention_paired" if paired else "attention",
                 cute_min_blocks_per_mp=1,
                 cute_pdl=True,
             )
         )
     assert config.get("cute_pdl") is True
-    assert config.get("cute_mma_dag_pass_warps") == "attention"
+    assert config.get("cute_mma_dag_pass_warps") == (
+        "attention_paired" if paired else "attention"
+    )
     source = bound.to_code(config)
     assert "._helion_cute_use_pdl = True" in source
     compiled = bound.compile_config(config)

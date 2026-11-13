@@ -698,8 +698,8 @@ l2_policy_evict_last = ptx_op(
     memory=False,
     doc=(
         "``createpolicy.fractional.L2::evict_last``: the cache-policy word of "
-        "the hinted operand packets (``cp_async_16_l2``), created once per "
-        "kernel."
+        "hinted operand packets (``cp_async_16_l2``) and TMA loads. Callers "
+        "may reuse the word across multiple issues."
     ),
 )
 
@@ -853,6 +853,16 @@ round_bf16_f32 = ptx_op(
         "``cvt.rn.bf16.f32`` the DSL's cast emits runs on the conversion "
         "unit (``F2F``, the MIO queue) and its widening is a shift behind it."
     ),
+)
+
+add_bf16x2 = ptx_op(
+    "add_bf16x2",
+    "add.rn.bf16x2 $0, $1, $2;",
+    (cutlass.Int32, cutlass.Int32),
+    (cutlass.Int32,),
+    side_effects=False,
+    memory=False,
+    doc="Packed BF16 add of two b32 registers, rounding each sum.",
 )
 
 mul_bf16x2 = ptx_op(

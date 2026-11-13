@@ -83,6 +83,7 @@ from .arg_signature import (
     schema_with_pointer_alignment as _cute_schema_with_pointer_alignment,
 )
 from .arg_signature import validate_launcher_tensor as _validate_cute_launcher_tensor
+from .capture_pdl_launch import prepare_capture_launch
 from .compile_cache import CompiledCuteLauncher as _CompiledCuteLauncher
 from .compile_cache import disk_cache_key as _cute_disk_cache_key
 from .compile_cache import function_globals
@@ -3718,6 +3719,19 @@ def _set_cute_last_launch_cache_entry(
 
 
 def default_cute_launcher(
+    cute_kernel: object,
+    grid: tuple[int, ...],
+    *args: object,
+    **kwargs: object,
+) -> object:
+    pending = prepare_capture_launch(cute_kernel, args, grid)
+    result = _default_cute_launcher_untracked(cute_kernel, grid, *args, **kwargs)
+    if pending is not None:
+        pending.finish()
+    return result
+
+
+def _default_cute_launcher_untracked(
     cute_kernel: object,
     grid: tuple[int, ...],
     *args: object,

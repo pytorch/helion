@@ -37,7 +37,7 @@ def test_reference_recurrence_and_replay(
         query_len,
         fast_math,
         lse,
-        scoped,
+        "attention_scoped" if scoped else "attention",
         occupancy,
         pdl,
         base2_scores=False,
