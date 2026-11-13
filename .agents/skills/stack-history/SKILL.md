@@ -51,9 +51,8 @@ for entry in sys.stdin.read().split("\0"):
 
 Each commit message ends with its `autoreview passed: ...` line, above any
 `stack-info:` trailer. Rewording keeps both. A rewrite that changes a commit's
-content (a squash, a split, a fold of anything but fixes for that commit's own
-review, a conflict resolution) makes the line stale: remove it and review the
-commit again (AGENTS.md, Recording the review).
+content can make the line stale: AGENTS.md (Recording the review) says when
+it does, and which folds and squashes keep it.
 
 Rewrite only with the recipes below. They keep each commit's message, and so
 its trailer, unless you edit it. Do not rebuild commits from saved copies of
@@ -101,7 +100,10 @@ GIT_SEQUENCE_EDITOR="cp $todo" git rebase -i <base>
 
 Then reword the survivor if its message should mention the folded work. Use
 `fixup` rather than `squash`: `squash` opens an editor for the combined
-message.
+message. Both recipes keep the older commit's review line. Drop it when the
+newer commit had none (unless that commit only holds fixes for the older
+one's own review) or when the two lines name no reviewer in common, and
+otherwise trim it to the reviewers both lines name.
 
 ## Reorder or drop commits
 
