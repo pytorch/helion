@@ -1513,10 +1513,13 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertTrue(
             surface.paired_pipeline_search_enabled(spec._cute_tcgen05_config)
         )
+        # The compact paired family's seeds (the aligned-N family, which
+        # seeds its own physical tile and raster -- here the 96-wide tile
+        # behind the 128 carrier -- is left out).
         seeds = [
             seed
             for seed in spec.compiler_seed_configs
-            if seed.get("tcgen05_cta_group") == "two"
+            if seed.get("tcgen05_cta_group") == "two" and not seed.get("tcgen05_tile_n")
         ]
         self.assertTrue(seeds)
         generation = spec.create_config_generation()
