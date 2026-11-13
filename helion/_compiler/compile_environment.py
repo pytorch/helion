@@ -2629,6 +2629,18 @@ class CompileEnvironment:
                 return origin_info.origin.block_id
         return None
 
+    def registered_extent_owner(self, block_id: int) -> int | None:
+        """Return the registered config axis behind an extent or its alias."""
+        symbol = self.block_sizes[block_id].symbol()
+        return next(
+            (
+                info.block_id
+                for info in self.block_sizes
+                if isinstance(info.size, AutoSize) and info.symbol() == symbol
+            ),
+            None,
+        )
+
     def resolve_block_id(self, size: object) -> int | None:
         """Resolve the block id carried by ``size``'s symbolic provenance."""
 
@@ -2969,7 +2981,9 @@ class LoopSpecBlockSizeSource(BlockSizeSource):
 
 @dataclasses.dataclass
 class ReductionLoopBlockSizeSource(BlockSizeSource):
-    def from_config(self, config: Config, block_size_info: BlockSizeInfo) -> int | None:
+    def from_config(
+        self, config: Config, block_size_info: BlockSizeInfo
+    ) -> int | torch.SymInt | None:
         # ``config.reduction_loops`` holds one entry per *registered* rollable
         # dim (``config_spec.reduction_loops``), so look the dim up by block id
         # as the strategy selection does: an unregistered earlier dim would
@@ -2979,6 +2993,12 @@ class ReductionLoopBlockSizeSource(BlockSizeSource):
             config.reduction_loops, block_size_info.block_id, None
         )
         if chunk is None:
+            # Registered extents use their selected count, never the tracing
+            # hint used to construct their symbolic full-slice reduction alias.
+            if (
+                owner := env.registered_extent_owner(block_size_info.block_id)
+            ) is not None:
+                return env.block_sizes[owner].from_config(config)
             size = max(1, block_size_info.size_hint())
             # Backends override static_rdim_size to control whether the
             # persistent-reduction extent is rounded up to a power of two

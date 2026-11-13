@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from contextlib import ExitStack
 from contextlib import contextmanager
 import importlib.util
@@ -29,6 +30,19 @@ if TYPE_CHECKING:
 
     from ..runtime.kernel import BoundKernel
     from ..runtime.kernel import Kernel
+
+
+def stage_sources(source: str) -> list[str]:
+    """Extract ordered stage modules embedded in a generated wrapper."""
+    return [
+        node.args[0].value
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "PyCodeCache.load"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+    ]
 
 
 def require_cute_codegen() -> None:

@@ -974,10 +974,12 @@ def _normalize_cute_flash_bwd(
 
 
 def pdl_searched(config_spec: ConfigSpec) -> bool:
-    """Whether the search flips ``cute_pdl``: ``griddepcontrol`` exists
-    on sm_90 and up."""
+    """Automatic PDL is searchable on sm_90+ when explicit markers do not
+    already govern the kernel's launch protocol."""
     return (
-        config_spec.target_device_capability is not None
+        config_spec.supports_config_key("cute_pdl")
+        and not config_spec.has_explicit_pdl
+        and config_spec.target_device_capability is not None
         and config_spec.target_device_capability >= (9, 0)
     )
 

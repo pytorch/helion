@@ -1439,6 +1439,8 @@ class CuteBackend(Backend):
     default in ``Backend``, never behind a backend-name comparison in core.
     """
 
+    _pre_inductor_squeeze = True
+
     @classmethod
     def finalist_preference(cls, config: Config, source: Callable[[], str]) -> int:
         """A kernel that renders the generic early release of its programmatic
@@ -1519,8 +1521,13 @@ class CuteBackend(Backend):
 
     def codegen_config(self, config: Config) -> Config:
         from ..compile_environment import CompileEnvironment
+        from .pdl_ops import has_explicit_pdl
         from .tcgen05_config import facts
 
+        if has_explicit_pdl():
+            # Explicit markers own the launch and release placement. Project
+            # away automatic PDL for every ordinary/specialized body renderer.
+            config = type(config).from_dict({**config.config, "cute_pdl": False})
         state = CompileEnvironment.current().config_spec._cute_tcgen05_config
         return facts.project_dense_aligned_n_codegen(
             state, facts.project_row_union_codegen(state, config)
@@ -1791,7 +1798,10 @@ class CuteBackend(Backend):
         from .cute_mma_dag import MMA_DAG_WARP
         from .cute_mma_dag import apply_mma_dag_cluster
         from .cute_mma_dag import mma_dag_config_reason
+        from .pdl_ops import config_conflicts_with_explicit_pdl
 
+        if config_spec.has_explicit_pdl and config_conflicts_with_explicit_pdl(config):
+            return False
         facts = config_spec.cute_mma_dag_facts
         mode = config.config.get(MMA_DAG_KEY)
         if facts is None or mode not in (MMA_DAG_WARP, MMA_DAG_TCGEN05):
@@ -1863,7 +1873,6 @@ class CuteBackend(Backend):
 
     def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
         from ..aten_lowering import sort_lowering
-        from ..aten_lowering import squeeze_lowering
         from .aten_lowering import NumericExtremumLowering
         from .uniform_comparison import UniformComparisonLowering
         from .uniform_comparison import match_uniform_float_gt
@@ -1872,11 +1881,8 @@ class CuteBackend(Backend):
             # CuTe's rank/fragment sorting already breaks ties by input index.
             # Keep other backends' existing Inductor stable-sort lowering.
             return sort_lowering
-        if node.target in (torch.ops.aten.squeeze.default, torch.ops.aten.squeeze.dims):
-            # These overloads have the same logical-view semantics as squeeze.dim.
-            # Register them before Inductor turns them into a ReinterpretView;
-            # the CuTe handler uses the traced output shape, not a scalar dim.
-            return squeeze_lowering
+        if (lowering := super().pre_inductor_lowering(node)) is not None:
+            return lowering
         if node.target in (torch.ops.aten.fmin.default, torch.ops.aten.fmax.default):
             return NumericExtremumLowering()
         if match_uniform_float_gt(node) is not None:
@@ -2412,6 +2418,15 @@ class CuteBackend(Backend):
         annotate_literal_dims(graphs, config)
         plan_execution(graphs, tile_strategy)
 
+    def pdl_capability(self, env: CompileEnvironment) -> tuple[int, int] | None:
+        return env.config_spec.target_device_capability
+
+    def pdl_instruction(self, operation: str) -> str:
+        return {
+            "wait": "cute.arch.griddepcontrol_wait()",
+            "launch_dependents": "cute.arch.griddepcontrol_launch_dependents()",
+        }[operation]
+
     def finalize_device_body(
         self, body: list[ast.stmt], ctx: DeviceBodyContext
     ) -> tuple[list[ast.stmt], list[ast.arg]]:
@@ -2439,10 +2454,12 @@ class CuteBackend(Backend):
         from .passes import launch_attributes
         from .passes import pdl
         from .passes.pipeline import run_kernel_def_passes
+        from .pdl_ops import validate_explicit_launch
 
         run_kernel_def_passes(fn_def, prefix, ctx)
         fn = ctx.device_function
         pdl.insert_spread_pad(fn, fn_def)
+        validate_explicit_launch(fn, fn_def)
         statements = launch_attributes.module_statements(fn)
         launch_attributes.project_launch_block(fn)
         return statements
@@ -2470,8 +2487,9 @@ class CuteBackend(Backend):
 
     def kernel_generators(self) -> tuple[KernelGenerator, ...]:
         from .kernel_generators import KERNEL_GENERATORS
+        from .pdl_ops import guard_kernel_generators
 
-        return KERNEL_GENERATORS
+        return guard_kernel_generators(KERNEL_GENERATORS)
 
     def retry_policy(self) -> RetryPolicy:
         from .kernel_generators import REGENERATION
@@ -2518,8 +2536,21 @@ class CuteBackend(Backend):
         self, env: CompileEnvironment, device_ir: DeviceIR, configs: list[Config]
     ) -> list[Config]:
         from .autotune.heuristics import postprocess_seed_configs
+        from .pdl_ops import config_conflicts_with_explicit_pdl
 
-        return postprocess_seed_configs(env, device_ir, configs)
+        configs = postprocess_seed_configs(env, device_ir, configs)
+        if env.config_spec.has_explicit_pdl:
+            # Promotion precedes this hook; the no-autotuning path consumes
+            # that default without calling autotune_config_is_viable.
+            default = env.config_spec.compiler_default_config
+            if default is not None and config_conflicts_with_explicit_pdl(default):
+                env.config_spec.compiler_default_config = None
+            configs = [
+                config
+                for config in configs
+                if not config_conflicts_with_explicit_pdl(config)
+            ]
+        return configs
 
     def register_coverage_groups(
         self, env: CompileEnvironment, device_ir: DeviceIR
@@ -3081,12 +3112,15 @@ class CuteBackend(Backend):
             def constant(value: bool | float, dtype: torch.dtype) -> str:
                 from ..inductor_lowering_extra import keeps_negative_nan_literal
 
-                # The DSL types a Python int as Int32, which widens 8- and
-                # 16-bit integer math so it never wraps, and takes a negative
-                # one as signed next to an unsigned value.  Eager converts the
-                # scalar to the tensor's dtype, wrapping it (x_uint8 % -7
-                # divides by 249).
-                if isinstance(value, int) and dtype in _NARROW_INTEGER_DTYPES:
+                # The DSL types a Python int as Int32, or Int64 outside that
+                # range. Eager first converts the scalar to the tensor dtype,
+                # wrapping it (x_uint8 % -7 divides by 249). Comparisons need
+                # this before promotion: int32(0) < 2**31 compares against
+                # -2**31, rather than widening both operands to Int64.
+                if isinstance(value, int) and (
+                    dtype in _NARROW_INTEGER_DTYPES
+                    or (dtype == torch.int32 and not -(2**31) <= value < 2**31)
+                ):
                     bits = torch.iinfo(dtype).bits
                     value &= (1 << bits) - 1
                     if dtype.is_signed and value >= 1 << (bits - 1):
@@ -4993,6 +5027,11 @@ class CuteBackend(Backend):
         from .lane_cluster_split import apply_cluster_split
 
         apply_cluster_split(strategy, CompileEnvironment.current(), state)
+
+    def lane_loop_semantic_reads(self, body: list[ast.AST]) -> set[str]:
+        from .lane_loops.markers import required_lane_reduce_owners
+
+        return required_lane_reduce_owners(body)
 
     def check_lane_loop_nest(self, state: DeviceLoopState) -> None:
         from .lane_loops.nest_check import check_lane_loop_nest

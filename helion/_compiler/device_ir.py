@@ -1182,7 +1182,13 @@ class DeviceIR:
                     can_roll_graphs = False
                     break
 
-            if ReductionRoller(self, rdim, {}).has_pinned_rdim():
+            roller = ReductionRoller(self, rdim, {})
+            # Registered aliases still load through their owner's symbol.
+            # Rolling just the alias would leave full-domain loads unsliced.
+            if roller.has_pinned_rdim() or (
+                isinstance(rdim.size, torch.SymInt)
+                and env.registered_extent_owner(rdim.block_id) is not None
+            ):
                 can_roll_graphs = False
 
             if not can_roll_graphs:

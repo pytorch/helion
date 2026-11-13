@@ -281,12 +281,15 @@ def _lane_reduce_axis(marker: _LaneReduceMarker) -> int | None:
     return None
 
 
-def _linear_thread_axis_strides(expr: str) -> dict[int, int] | None:
+def _linear_thread_axis_strides(expr: str | ast.expr) -> dict[int, int] | None:
     """Recover ``thread_idx`` coefficients from a flattened lane expression."""
-    try:
-        root = ast.parse(expr, mode="eval").body
-    except SyntaxError:
-        return None
+    if isinstance(expr, str):
+        try:
+            root = ast.parse(expr, mode="eval").body
+        except SyntaxError:
+            return None
+    else:
+        root = expr
 
     def merge(
         left: tuple[dict[int, int], int],

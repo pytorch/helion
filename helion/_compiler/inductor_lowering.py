@@ -198,8 +198,14 @@ def _rounded_result_dtype(node: Node) -> torch.dtype | None:
     if (dtype := opmath_scalar_dtype(node)) is not None:
         # The float32 scalar promoted the math to float32.
         return dtype
-    if node.target is torch.ops.aten.reciprocal.default:
-        # Lowered as 1.0 / x with a float32 1.0.
+    if node.target is torch.ops.aten.reciprocal.default or (
+        node.target in _OPMATH_SCALAR_TARGETS
+        and any(
+            isinstance(arg, (int, float)) for arg in (*node.args, *node.kwargs.values())
+        )
+    ):
+        # A literal can promote the backend's arithmetic to fp32, including
+        # reciprocal's 1.0 / x. Round the completed FX op, not its inner math.
         dtype = node.meta["val"].dtype
         if dtype in (torch.float16, torch.bfloat16):
             return dtype
@@ -1011,6 +1017,13 @@ class ReductionLowering(InductorLowering):
             if block_index is None:
                 # A bare symbol that is not a block size (e.g. a runtime int).
                 raise exc.ReductionOnNonTile(reduction_size)
+            # A registered extent is a config value, not a tile coordinate.
+            # Its reduction alias carries the full symbolic domain and can
+            # own lanes independently in a materialized consumer stage.
+            if env.registered_extent_owner(block_index) is not None:
+                block_index = env.allocate_reduction_dimension(
+                    to_symint(reduction_size)
+                ).block_id
         elif isinstance(reduction_size, (int, sympy.Integer)):
             # Allocate or find a reduction dimension matching this size.
             # Convert to a SymInt when needed.
@@ -1503,27 +1516,24 @@ class GenerateASTFromInductor(DefaultHandler):
         return self._default("minimum", (a, b), {})
 
     def mul(self, a: object, b: object) -> str:  # type: ignore[override]
-        # Triton promotes scalar*tensor results to float32, deviating from
-        # PyTorch semantics (e.g. x_bf16 * 0.1).  Emit an explicit cast back.
+        # Retain the legacy dtype correction for non-opmath Triton products.
+        # Opmath products round once at the FX node boundary instead, including
+        # fused inner math such as the scalar multiplication in add(alpha=...).
         if CompileEnvironment.current().backend.name != "triton":
             return self._default("mul", (a, b), {})
 
-        def has_scalar_operand() -> bool:
-            current_node = V.current_node
-            if current_node is None:
-                return False
-            return any(isinstance(arg, (int, float, bool)) for arg in current_node.args)
-
         result_expr = self._parse_op(self.parent_handler.mul(a, b))
 
-        # Only cast if we have a scalar operand and expected dtype is not float32.
-        # This is to handle cases like `x_bf16 * 0.1` where Triton would promote the result to float32,
-        # deviating from PyTorch semantics.
         expected_dtype = self._expected_tensor_dtype()
+        current_node = V.current_node
+        # Keep the legacy args-only scope; kwargs must not newly enable this
+        # inner-operation cast for unrelated FX operators.
         if (
-            has_scalar_operand()
+            current_node is not None
+            and any(isinstance(arg, (int, float, bool)) for arg in current_node.args)
             and expected_dtype is not None
             and expected_dtype != torch.float32
+            and _rounded_result_dtype(current_node) != expected_dtype
         ):
             result_expr = self._maybe_cast_to_expected_dtype(result_expr)
 

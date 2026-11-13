@@ -26,6 +26,7 @@ from helion._testing import skipUnlessChunkLowering
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
+from helion._testing.squeeze_overloads import squeeze_overloads
 import helion.language as hl
 from helion.runtime.settings import _get_backend
 
@@ -93,6 +94,16 @@ class TestViews(RefEagerTestBase, TestCase):
         torch.testing.assert_close(
             result, torch.nn.functional.softmax(x, dim=1), rtol=1e-2, atol=1e-1
         )
+
+    @skipIfPallas("Pallas has no pre-Inductor squeeze overload lowering")
+    def test_squeeze_default_and_dims(self):
+        x = torch.randn(19, 23, device=DEVICE)
+        for mode in range(4):
+            with self.subTest(mode=mode):
+                _code, actual = code_and_output(
+                    squeeze_overloads, (x, mode), block_sizes=[8, 16]
+                )
+                torch.testing.assert_close(actual, x.sin())
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_squeeze(self):

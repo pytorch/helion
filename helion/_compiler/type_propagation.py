@@ -1498,9 +1498,10 @@ def _place_pdl_ops(body: list[ast.stmt]) -> None:
         if seen_loop and op.value == "wait":
             raise exc.PdlPlacement
         # griddepcontrol needs sm_90; older targets run in plain stream order.
-        capability = env.ptx_capability
+        capability = env.backend.pdl_capability(env)
         if capability is not None and capability >= (9, 0):
             (env.pdl_exit if seen_loop else env.pdl_entry).append(op.value)
+            env.config_spec.has_explicit_pdl = True
 
 
 def propagate_types(func: HostFunction) -> None:

@@ -100,7 +100,18 @@ the launcher runs the module.  The CuTe backend plugs in at these points:
    `passes.pipeline.run_device_body_passes` (section 4),
    `passes.pdl.place_late_wait`; `finalize_kernel_def` ->
    `run_kernel_def_passes`, `pdl.insert_spread_pad`,
-   `launch_attributes.module_statements` and `project_launch_block`.
+   `pdl_ops.validate_explicit_launch`, `launch_attributes.module_statements`,
+   and `project_launch_block`. Core code then splices explicit
+   `hl.pdl_*` entry/exit markers after every body rewrite, preserving source
+   order. Explicit markers govern the launch protocol and disable automatic
+   `cute_pdl` placement and spread padding. Whole-kernel/native launch paths
+   that cannot preserve that protocol reject the configuration. Explicit
+   markers restrict tcgen05 search to single-CTA launches; clustered families
+   are conservatively screened, including promoted compiler defaults that
+   bypass autotuning. Some single-CTA members of those families are also
+   excluded until their native protocols can be distinguished. The
+   structural fission planners' pure-source gates reject marker-containing
+   programs, so enabling those settings retains the ordinary route.
 6. **Host launch** -- `transform_launch_grid`, `build_launcher_args`,
    `output_only_names`, and `launcher_keyword_args`, which still recovers the
    SIMT launch block from the rendered kernel text; `launch_shape.py` compares

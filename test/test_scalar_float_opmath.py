@@ -6,6 +6,9 @@ operand (``1.0 / n`` with dynamic shapes, or a float kernel argument) or a
 SymInt operand (``n``, or an int kernel argument) was rounded to the 16-bit
 dtype first, so these results differed from eager, and from a static-shape
 literal scalar, in many elements.
+
+Static literals and the ``alpha=`` keyword must also preserve the result's
+16-bit rounding before a later conversion to float32.
 """
 
 from __future__ import annotations
@@ -88,6 +91,24 @@ def reciprocal_then_mul(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(autotune_effort="none")
+def literal_arith_then_widen(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    out = torch.empty([9, m, n], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        v = x[tile_m, tile_n]
+        out[0, tile_m, tile_n] = (v * 3).to(torch.float32)
+        out[1, tile_m, tile_n] = (v * 0.0657).to(torch.float32)
+        out[2, tile_m, tile_n] = (v + 0.1).to(torch.float32)
+        out[3, tile_m, tile_n] = (0.1 - v).to(torch.float32)
+        out[4, tile_m, tile_n] = (v / 3).to(torch.float32)
+        out[5, tile_m, tile_n] = v.to(torch.float32) * 3
+        out[6, tile_m, tile_n] = v.to(torch.float32) + 0.1
+        out[7, tile_m, tile_n] = torch.add(v, v, alpha=3).to(torch.float32)
+        out[8, tile_m, tile_n] = torch.add(v, 0.1, alpha=2).to(torch.float32)
+    return out
+
+
 def _scalar_arith_reference(x: torch.Tensor, scale: float) -> torch.Tensor:
     n = x.shape[1]
     return torch.stack(
@@ -137,6 +158,32 @@ class TestScalarFloatOpmath(TestCase):
                 torch.testing.assert_close(
                     compiled(out, value), torch.full_like(out, value), rtol=0, atol=0
                 )
+
+    def test_literal_result_rounds_before_widening(self) -> None:
+        """Integer/float literals round the result, with explicit FP32 controls."""
+        torch.manual_seed(0)
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            x = torch.randn(8, 64, device=DEVICE, dtype=dtype)
+            with self.subTest(dtype=dtype):
+                _, out = code_and_output(literal_arith_then_widen, (x,))
+                values = [
+                    (x * 3).float(),
+                    (x * 0.0657).float(),
+                    (x + 0.1).float(),
+                    (0.1 - x).float(),
+                    (x / 3).float(),
+                    x.float() * 3,
+                    x.float() + 0.1,
+                    torch.add(x, x, alpha=3).float(),
+                ]
+                # Power-of-two scaling is exact in FP32, so the witness does
+                # not depend on FMA contraction. Its 0.2 inner product still
+                # cannot be rounded to half before adding the tensor value.
+                values.append(torch.add(x, 0.1, alpha=2).float())
+                expected = torch.stack(values)
+                torch.testing.assert_close(out, expected, rtol=0, atol=0)
+                if dtype != torch.float32:
+                    self.assertFalse(torch.equal(expected[0], expected[5]))
 
     def test_scalar_stays_float32_in_half_math(self) -> None:
         """Each op rounds only its result to the 16-bit dtype, bit for bit

@@ -2612,8 +2612,7 @@ class TestReductions(RefEagerTestBase, TestCase):
 
     @skipUnlessBackends(["triton", "cute"])
     @skipIfRefEager(
-        "checks the rolled loop's fp32 accumulator; ref mode has no rolled loop and"
-        " rounds the fp16 elementwise result as eager does"
+        "checks the rolled loop's fp32 accumulator; ref mode has no rolled loop"
     )
     def test_rolled_half_precision_prod(self):
         """A rolled fp16 prod keeps its fp32 loop-carried accumulator."""
@@ -2630,7 +2629,10 @@ class TestReductions(RefEagerTestBase, TestCase):
         _, result = code_and_output(
             row_prod, (x,), block_sizes=[1], reduction_loops=[64]
         )
-        expected = (1.0 + x.float() * 0.001).prod(-1).half()
+        # Eager rounds the two pointwise operations to half. Only the rolled
+        # product's accumulator stays float32 across reduction chunks.
+        values = 1.0 + x * 0.001
+        expected = values.float().prod(-1).half()
         torch.testing.assert_close(result, expected, rtol=2e-3, atol=0)
 
     @skipIfMetal("Metal gives only one reduction dimension per kernel a thread axis")

@@ -58,6 +58,7 @@ from helion._testing import TestCase
 from helion._testing import cpu_render_target
 from helion._testing import import_example
 from helion._testing import onlyBackends
+from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
 from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.benchmarking import _make_cudagraph_replay
@@ -1305,6 +1306,74 @@ def _stale_runs(
 @skipIfNotCUDA()
 @onlyBackends(["cute"])
 class TestCutePdl(TestCase):
+    @skipIfCudaCapabilityLessThan((9, 0), reason="PDL needs sm90")
+    def test_explicit_api_chain_eager_and_graph_replay(self) -> None:
+        @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+        def entry_release(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            hl.pdl_launch_dependents()
+            hl.pdl_wait()
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + 1
+            return out
+
+        @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+        def exit_release(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            hl.pdl_wait()
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + 1
+            hl.pdl_launch_dependents()
+            return out
+
+        x = torch.empty(1 << 18, dtype=torch.float32, device=DEVICE)
+        sources = [torch.full_like(x, value) for value in (3, 17)]
+        references = [source + 1 for source in sources]
+        bound, entry, code = _build(
+            entry_release, x, block_sizes=[256], num_threads=128
+        )
+        _bound, finish, _code = _build(
+            exit_release,
+            x,
+            block_sizes=[256],
+            num_threads=128,
+            cute_pdl=True,
+            cute_pdl_release="entry",
+        )
+        self.assertEqual(
+            _stale_runs(entry, x, sources, references, 8, delay=_CONTROL_DELAY), 0
+        )
+        standalone_code = bound.to_code(
+            helion.Config(block_sizes=[256], num_threads=128),
+            options=helion.OutputCodeOptions(allow_helion_deps=False),
+        )
+        self.assertIn("use_pdl=True", standalone_code)
+        standalone = PyCodeCache.load(standalone_code).entry_release
+        self.assertEqual(
+            _stale_runs(standalone, x, sources, references, 8, delay=_CONTROL_DELAY),
+            0,
+        )
+        # The same programmatic launch without its wait must see stale input:
+        # this proves the delayed producer exercises the dependency edge.
+        control = _attribute_only_control(bound, code)
+        self.assertGreater(
+            _stale_runs(control, x, sources, references, 8, delay=_CONTROL_DELAY), 0
+        )
+        side = torch.cuda.Stream()
+        with torch.cuda.stream(side):
+            _produce(sources[0], x, delay=_CONTROL_DELAY)
+            finish(standalone(x))
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            _produce(sources[0], x, delay=_CONTROL_DELAY)
+            out = finish(standalone(x))
+        for value in (5, 29, -11):
+            sources[0].fill_(value)
+            graph.replay()
+            torch.cuda.synchronize()
+            self.assertTrue(torch.equal(out, torch.full_like(out, value + 2)))
+
     def test_knob_on_matches_knob_off_behind_a_producer_that_releases_at_entry(
         self,
     ) -> None:
@@ -1399,7 +1468,7 @@ class TestCutePdl(TestCase):
         self,
     ) -> None:
         # One CTA sums 2^18 rows of zeros serially (hundreds of microseconds)
-        # on a machine with every other SM idle.  A dependent launched behind
+        # leaving room for a dependent kernel. A dependent launched behind
         # it with ``launch_pdl`` and no wait of its own writes ones over the
         # last rows the moment it is released: at ``entry`` that is while the
         # sum still has those rows ahead of it, so the sum reads them (the
@@ -1428,13 +1497,14 @@ class TestCutePdl(TestCase):
                     BLOCK=_BLOCK,
                     launch_pdl=True,
                 )
-                torch.cuda.synchronize()
                 return out
 
-            # The first call of either kernel compiles on the host, which can
-            # outlast the sum; count only warm launches.
-            run()
-            return sum(int(bool((run() != 0).any())) for _ in range(iterations))
+            # Even warm eager calls can be separated by CPU scheduling long
+            # enough for the reduction to finish before the dependent launches.
+            # Capture both launches so the GPU observes the release ordering
+            # without an intervening host launch gap.
+            replay = _make_cudagraph_replay(run)
+            return sum(int(bool((replay() != 0).any())) for _ in range(iterations))
 
         self.assertEqual(dirty_runs("none"), 0)
         self.assertEqual(dirty_runs("exit"), 0)
