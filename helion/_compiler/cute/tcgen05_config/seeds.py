@@ -59,6 +59,7 @@ from ..tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
 from ..tcgen05_constants import TCGEN05_AUX_PREFETCH_SUBTILES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_C_STORE_MODE_DIRECT
+from ..tcgen05_constants import TCGEN05_CLUSTER_N2_SEED_L2_GROUPING
 from ..tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_REGION_PID_TYPE_INHERIT
@@ -808,6 +809,29 @@ def _paired_pipeline_seed_configs(
                                         aux_mode
                                     )
                                 seeds.append(seed)
+                                if (
+                                    cluster_n == 2
+                                    and len(state.config_spec.l2_groupings) == 1
+                                ):
+                                    # The same twin on a grouped raster: the
+                                    # co-resident 2x2 wave then sweeps a band
+                                    # of pair rows across the cluster-N
+                                    # columns while those A rows are still
+                                    # in L2, instead of re-streaming A once
+                                    # per cluster-N column (bf16
+                                    # 16384x1024x4096: 0.91 -> 0.99 of
+                                    # cuBLAS, whose 2x2 nvjet tile it now
+                                    # matches).
+                                    seeds.append(
+                                        Config.from_dict(
+                                            {
+                                                **seed.config,
+                                                "l2_groupings": [
+                                                    TCGEN05_CLUSTER_N2_SEED_L2_GROUPING
+                                                ],
+                                            }
+                                        )
+                                    )
     return seeds
 
 
@@ -1544,8 +1568,9 @@ def full_tile_direct_entry_seed_eligible(state: CuteTcgen05Config) -> bool:
     """Structural eligibility for the generalized TVM-FFI direct-entry seed.
 
     The direct-entry codegen + runtime validator build their A/B/D TMA
-    descriptors from the runtime tensor shapes, so the fast launch path is
-    shape-general; the constraints are purely structural: a full-tile (NOT
+    descriptors from the runtime tensor shapes, but the seed runs whole
+    256x256 tiles only (an output edge's partial tiles take the pair search
+    instead); the other constraints are structural: a full-tile (NOT
     edge+K-tail) CtaGroup.TWO 16-bit (bf16/fp16) GEMM, the 256x256 CTA tile
     reachable, a direct-entry-valid ``bk``, and the ``(ab=3, c=2)`` stage
     tuple admitted
@@ -1591,6 +1616,12 @@ def full_tile_direct_entry_seed_eligible(state: CuteTcgen05Config) -> bool:
         return False
     bk = full_tile_direct_entry_seed_bk(state)
     if bk is None:
+        return False
+    # The flat-role coordinates and the FFI launch validator assume whole
+    # 256x256 tiles; output-edge shapes reach CtaGroup.TWO search too.
+    if not facts._static_full_tiles(
+        state, bm=TCGEN05_TWO_CTA_BLOCK_M, bn=TCGEN05_TWO_CTA_BLOCK_N, bk=bk
+    ):
         return False
     if not tcgen05_direct_entry_stage_tuple_allowed(
         bk=bk, ab_stage_count=3, c_stage_count=2
@@ -2504,7 +2535,7 @@ def autotune_seed_configs(state: CuteTcgen05Config) -> list[Config]:
             # 934 vs 898; fp16 16384^3 899 vs 881).
             clc_n2_seed_config: dict[str, Any] = dict(plain_clc_seed.config)
             clc_n2_seed_config["tcgen05_cluster_n"] = 2
-            clc_n2_seed_config["l2_groupings"] = [8]
+            clc_n2_seed_config["l2_groupings"] = [TCGEN05_CLUSTER_N2_SEED_L2_GROUPING]
             seeds.append(Config(**clc_n2_seed_config))
     # An expanded K ceiling must not evict earlier/default geometries'
     # pipeline/aux placement. Rebuild each family at each K tile so its
@@ -2519,7 +2550,7 @@ def autotune_seed_configs(state: CuteTcgen05Config) -> list[Config]:
             if alternate_n2 is not None:
                 clc_n2 = dict(alternate_clc.config)
                 clc_n2["tcgen05_cluster_n"] = 2
-                clc_n2["l2_groupings"] = [8]
+                clc_n2["l2_groupings"] = [TCGEN05_CLUSTER_N2_SEED_L2_GROUPING]
                 seeds.append(Config.from_dict(clc_n2))
     plain_m_pair_seed = _plain_m_pair_seed_config(state)
     if plain_m_pair_seed is not None:

@@ -224,6 +224,10 @@ class CuteTcgen05Config:
         self.fission_bundle: bool = False
         self.tcgen05_min_search_m: int = 64
         self.tcgen05_min_search_n: int = 8
+        # A 16-bit output-edge GEMM (ragged M or N, K whole) admitted to the
+        # persistent and CtaGroup.TWO schedules; persistent cluster_m=1 runs
+        # whole tiles only, so its partial-tile samples are flattened.
+        self.output_edge_persistent_admitted: bool = False
         # Block id of the leading passthrough (batch) axis, when any.
         self.matmul_leading_block_id: int | None = None
 

@@ -227,6 +227,7 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
 )
+from helion._compiler.cute.tcgen05_constants import TCGEN05_CLUSTER_N2_SEED_L2_GROUPING
 from helion._compiler.cute.tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
@@ -11502,22 +11503,23 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         assert facts is not None
         # The paired seeds are CTA pairs (cluster_n=1); the deepest bk=64
         # SIMT ring of every 256-row pair tile with whole N-tile pairs also
-        # carries a 2x2 multicast-cluster twin (cluster_n=2) that differs
-        # from its pair in nothing else.  fp16 4096^3 pairs every N tile
-        # width, so each of the three 256-row bk=64 tiles has one twin.
+        # carries 2x2 multicast-cluster twins (cluster_n=2) that differ from
+        # their pair in nothing else but the raster: one ungrouped, one on
+        # the grouped raster.  fp16 4096^3 pairs every N tile width, so each
+        # of the three 256-row bk=64 tiles has both twins.
         paired_by_tile: dict[tuple[int, ...], list[helion.Config]] = {}
         for config in paired_configs:
             paired_by_tile.setdefault(tuple(config.block_sizes), []).append(config)
         self.assertEqual(
             sorted(
-                tuple(config.block_sizes)
+                (tuple(config.block_sizes), config.get("l2_groupings", [1])[0])
                 for config in paired_configs
                 if config["tcgen05_cluster_n"] == 2
             ),
             [
-                (TCGEN05_TWO_CTA_BLOCK_M, 64, 64),
-                (TCGEN05_TWO_CTA_BLOCK_M, 128, 64),
-                (TCGEN05_TWO_CTA_BLOCK_M, 256, 64),
+                ((TCGEN05_TWO_CTA_BLOCK_M, bn, 64), grouping)
+                for bn in (64, 128, 256)
+                for grouping in (1, TCGEN05_CLUSTER_N2_SEED_L2_GROUPING)
             ],
         )
         for config in paired_configs:
@@ -11557,8 +11559,12 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                             **config.config,
                             "tcgen05_cluster_n": 1,
                             "tcgen05_persistent_grid_cap": "sm_pairs",
+                            "l2_groupings": pairs[0].config.get("l2_groupings", [1]),
                         },
-                        pairs[0].config,
+                        {
+                            **pairs[0].config,
+                            "l2_groupings": pairs[0].config.get("l2_groupings", [1]),
+                        },
                     )
                 self.assertLessEqual(
                     pipeline_smem_bytes(
