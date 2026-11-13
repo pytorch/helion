@@ -745,6 +745,10 @@ VALID_CROSS_LOOP_PIPELINES = ("barrier", "static", "dynamic")
 # for elementwise/reduction kernels a larger-than-dimension tile is pure waste.
 SMALL_DIM_BLOCK_SIZE_OVERSHOOT = 64
 
+# Programs per compute unit in the budget ``raise_grid_block_minimums`` gives
+# each root grid: programs beyond it only queue behind the first waves.
+GRID_PROGRAMS_PER_COMPUTE_UNIT = 64
+
 # Base backend tunable keys (public)
 _BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
     {
@@ -2645,7 +2649,7 @@ class ConfigSpec:
         if not self.grid_block_ids:
             return
 
-        budget = num_compute_units() * 64
+        budget = num_compute_units() * GRID_PROGRAMS_PER_COMPUTE_UNIT
         for grid in self._grid_floor_groups():
             specs: list[BlockSizeSpec] = []
             for grid_bid in grid:

@@ -16,8 +16,12 @@ which the search's neighbours never make.
 A pass reduced after its loop needs one element per thread
 (``MetalBlockReductionStrategy._needs_loop_carried_accumulator``), so it is
 seeded at ``V = 1`` across the whole thread budget instead, its row block at
-the grid floor.  Otherwise the row block fills a threadgroup of four SIMD
-groups (CuTe's ``rows_per_cta``), never below its grid floor.  Rows go on
+the occupancy floor.  Otherwise the row block fills a threadgroup of four SIMD
+groups (CuTe's ``rows_per_cta``), never below its occupancy floor.  The
+occupancy floor packs rows so the row grid launches at most
+``GRID_PROGRAMS_PER_COMPUTE_UNIT`` threadgroups per compute unit; the
+search itself may go below it (Metal leaves grid blocks unfloored and screens
+candidates on their work per threadgroup, ``grid_budget``).  Rows go on
 threads when ``rows * T`` fits the budget, else serially on one thread.
 """
 
@@ -25,6 +29,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from ..._compat import num_compute_units
+from ...autotuner.config_spec import GRID_PROGRAMS_PER_COMPUTE_UNIT
 from ...runtime.config import Config
 from ..autotuner_heuristics.registry import AutotunerHeuristic
 from ..cute.loop_nesting import sibling_row_loop_blocks
@@ -34,6 +40,7 @@ from ._constants import SIMD_WIDTH
 from .backend import MetalBackend
 
 if TYPE_CHECKING:
+    from ...autotuner.config_fragment import BlockSizeFragment
     from ..compile_environment import CompileEnvironment
     from ..device_ir import DeviceIR
 
@@ -42,6 +49,27 @@ _SIMD_GROUPS_PER_ROW = (1, 4)
 # Threadgroups of one SIMD group measured 6-10% slower than four rows of them
 # on 12672-wide fp16 rows.
 _SIMD_GROUPS_PER_THREADGROUP = 4
+
+
+def _occupancy_floor(rows: int, fragment: BlockSizeFragment) -> int:
+    """The fewest rows per threadgroup that keep the row grid within the
+    grid floor's budget (``GRID_PROGRAMS_PER_COMPUTE_UNIT`` threadgroups per
+    compute unit, as ``ConfigSpec.raise_grid_block_minimums`` floors a
+    one-axis grid, which Metal leaves unfloored): a power of two, at most the
+    fragment's default and maximum.
+
+    On MPS ``num_compute_units()`` returns its CUDA fallback of 128, not the
+    GPU's cores (``grid_budget.gpu_cores()``: 16 on an M4 Pro), so this bound
+    is 8x the one ``grid_budget.occupancy_budget()`` screens grids by.  It is
+    kept so the seeds stay as they were; fixing ``num_compute_units`` on MPS
+    (a follow-up) would change both."""
+    per = min(
+        rows // (num_compute_units() * GRID_PROGRAMS_PER_COMPUTE_UNIT),
+        fragment.default_val,
+    )
+    if per < 2:
+        return fragment.low
+    return max(fragment.low, min(1 << (per.bit_length() - 1), fragment.high))
 
 
 def _reduces_pass_after_loop(
@@ -123,7 +151,7 @@ class MetalRowReductionHeuristic(AutotunerHeuristic):
         reserved = backend._reserved_reduction_threads(full, device_ir=device_ir)
         budget = MAX_THREADS_PER_THREADGROUP // reserved
         row_fragment = blocks[row_block_id]._fragment(spec)
-        floor = row_fragment.low
+        floor = _occupancy_floor(blocks[row_block_id].size_hint, row_fragment)
         pass_fragments = [blocks[b]._fragment(spec) for b in pass_block_ids]
         pass_high = min(f.high for f in pass_fragments)
         if _reduces_pass_after_loop(device_ir, pass_block_ids):

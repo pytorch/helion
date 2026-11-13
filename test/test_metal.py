@@ -12760,7 +12760,7 @@ class TestMetalRowReductionHeuristic(unittest.TestCase):
             [([128, 4], [32, 0]), ([512, 1], [128, 0])],
         )
 
-    def test_grid_floor_bounds_the_row_block(self) -> None:
+    def test_occupancy_floor_bounds_the_row_block(self) -> None:
         self.assertEqual(
             self._seeds(row_pass_softmax, (65573, 300), dtype=torch.float16),
             [([8, 256], [0, 32]), ([8, 512], [0, 128])],
@@ -12859,7 +12859,7 @@ class TestMetalRowReductionHeuristic(unittest.TestCase):
         self.assertEqual(
             self._seeds(row_pass_jsd, (37, 300), (37, 300)), [([512, 1], [512, 0])]
         )
-        # The grid floor puts 8 rows in a threadgroup, 128 threads each.
+        # The occupancy floor puts 8 rows in a threadgroup, 128 threads each.
         self.assertEqual(
             self._seeds(row_pass_jsd, (65573, 300), (65573, 300)),
             [([128, 8], [128, 0])],

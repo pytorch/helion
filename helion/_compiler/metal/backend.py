@@ -14,8 +14,10 @@ import torch
 
 from ... import exc
 from ..ast_extension import convert
+from ..backend import AutotuneGridPolicy
 from ..backend import Backend
 from ..backend import BackendState
+from ..backend import DeviceIRStage
 from ..backend import _largest_divisor_at_most
 from ._constants import MAX_THREAD_AXES
 from ._constants import MAX_THREADS_PER_THREADGROUP
@@ -30,6 +32,7 @@ if TYPE_CHECKING:
 
     from torch._inductor.ops_handler import OpsHandler
 
+    from ...autotuner.config_spec import ConfigSpec
     from ...runtime.config import Config
     from ...runtime.kernel import BoundKernel
     from ..autotuner_heuristics.registry import AutotunerHeuristicType
@@ -39,11 +42,14 @@ if TYPE_CHECKING:
     from ..device_function import DeviceFunction
     from ..device_ir import DeviceIR
     from ..device_ir import GraphInfo
+    from ..device_ir_analysis import DeviceIRAnalysis
+    from ..host_function import HostFunction
     from ..inductor_lowering import CodegenState
     from ..reduction_strategy import BlockReductionStrategy
     from ..tile_dispatch import TileStrategyDispatch
     from ..tile_strategy import TileStrategy
     from .free_arange import FreeArangePlan
+    from .grid_budget import RootWork
     from .mpp_matmul import MppPlan
 
     InductorOpOverrides = OpsHandler[Any]
@@ -340,6 +346,9 @@ class MetalBackend(Backend):
         # Threads left for the current loop's literal-size tiles when the
         # kernel's tiles overflow the budget (_serialize_nested_auto_tiles).
         self._literal_tile_limit: int | None = None
+        # The kernel's root grids and their trips, for screening autotune
+        # candidates (``grid_budget``); recorded once the device IR is analysed.
+        self._grid_roots: tuple[RootWork, ...] = ()
 
     @property
     def name(self) -> str:
@@ -551,6 +560,44 @@ class MetalBackend(Backend):
 
     def max_reduction_threads(self) -> int | None:
         return MAX_THREADS_PER_THREADGROUP
+
+    def autotune_grid_policy(self, config_spec: ConfigSpec) -> AutotuneGridPolicy:
+        """Leave grid block sizes unfloored: candidates are screened on their
+        work per threadgroup instead (``autotune_config_is_viable``, see
+        ``metal/grid_budget.py``).
+
+        The shared per-axis floor caps a root grid's program count.  On Apple
+        GPUs few-row matmuls and GEMVs win at one or two output columns per
+        threadgroup, tens of thousands of threadgroups, where the floor
+        allowed no fewer than eight columns.
+        """
+        return AutotuneGridPolicy(raise_independent_axis_block_size_minimums=False)
+
+    def rewrite_device_ir(
+        self,
+        stage: DeviceIRStage,
+        func: HostFunction | None,
+        device_ir: DeviceIR,
+        analysis: DeviceIRAnalysis | None = None,
+    ) -> None:
+        if stage is DeviceIRStage.AFTER_ANALYSIS:
+            # Imported here: the backend registry imports this module while
+            # compile_environment loads, and grid_budget imports
+            # autotuner.config_spec, which reaches the registry again
+            # (autotuner -> runtime -> autotuner_heuristics).
+            from ..compile_environment import CompileEnvironment
+            from .grid_budget import root_trips
+
+            assert analysis is not None
+            env = CompileEnvironment.current()
+            self._grid_roots = root_trips(device_ir, analysis, env.config_spec, env)
+
+    def autotune_config_is_viable(
+        self, config_spec: ConfigSpec, config: Config
+    ) -> bool:
+        from .grid_budget import config_is_viable  # the cycle above
+
+        return config_is_viable(config_spec, config, self._grid_roots)
 
     def pre_codegen(
         self,
