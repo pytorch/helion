@@ -1512,7 +1512,7 @@ PURE_PRODUCER_REGIONS = FragmentKnob(
 HALF_MMA = FragmentKnob(
     "cute_fragment_half_mma",
     "half_mma",
-    90,
+    91,
     (_has_half_dot, discovery_supported),
 )
 
