@@ -89,6 +89,7 @@ if TYPE_CHECKING:
     from typing_extensions import Self
 
     from torch._ops import OpOverload
+    from torch._ops import OpOverloadPacket
 
     _T = TypeVar("_T")
 
@@ -277,21 +278,23 @@ def _is_known_host_call(
         return True
     if any(fn is split for split in _KNOWN_HOST_SPLITS):
         return bool(args) and type(args[0]) is FakeTensor
-    if type(fn) is _NATIVE_OP_PACKET:
-        if not _has_native_hooks(fn) or fn._has_torchbind_op_overload:
-            return False
-        # The overload the call dispatches to, by the same schema matching.
-        name = _RESOLVE_PACKET(fn._qualified_op_name, *args, **kwargs)
-        if not _is_native_operator_lookup(fn, name):
-            return False
-        fn = getattr(fn, name)
-    if type(fn) is _NATIVE_OP_OVERLOAD:
+    if type(fn) is _NATIVE_OP_PACKET or type(fn) is _NATIVE_OP_OVERLOAD:
         # An operator writes only the arguments its schema marks, which the
         # tracker checks like a native Tensor method's; a registered effect
         # reaches beyond them. The kernels registered for it (Python ones from
         # torch.library too) are trusted to honor the schema, as
         # functionalization and torch.compile trust them.
-        return _has_native_hooks(fn) and _get_effect(fn) is None
+        if not (_registry_unpatched(fn) and _dispatches_natively(fn)):
+            return False
+        if type(fn) is _NATIVE_OP_OVERLOAD:
+            return _get_effect(cast("OpOverload", fn)) is None
+        # A packet's dispatcher entry picks the overload by the same schema
+        # matching; effects are registered by overload name.
+        name = cast("OpOverloadPacket", fn)._qualified_op_name
+        overload = _RESOLVE_PACKET(name, *args, **kwargs)
+        return (
+            _get_effect(name if overload == "default" else f"{name}.{overload}") is None
+        )
     if type(fn) is types.MethodType:
         return fn.__func__ is _KNOWN_HOST_SPLITS[1] and type(fn.__self__) is FakeTensor
     if type(fn) is types.MethodDescriptorType:
@@ -323,23 +326,31 @@ def _is_known_host_call(
     )
 
 
-def _has_native_hooks(value: object) -> bool:
-    """Whether ``value`` is a ``torch.ops`` object whose class keeps the Python
-    hooks it had at import and that has no instance ``__getattr__``.
+def _registry_unpatched(value: object) -> bool:
+    """Whether every ``torch.ops`` class keeps the Python hooks it had at import
+    and ``value`` has no instance ``__getattr__``.
 
-    This guards the objects host code holds; torch's registry code behind those
-    hooks is trusted like any other torch call.
+    A lookup on one registry class constructs the next (namespace, packet,
+    overload), so all of them count. This guards the objects host code holds;
+    torch's registry code behind those hooks is trusted like any other torch
+    call.
     """
-    kind = type(value)
-    return any(
-        kind is native
-        and all(
-            getattr_static(kind, hook, None) is original
-            for hook, original in zip(_OPERATOR_HOOKS, hooks, strict=True)
-        )
-        and "__getattr__" not in vars(value)
-        for native, hooks in _NATIVE_OPERATOR_TYPES
+    return "__getattr__" not in vars(value) and all(
+        getattr_static(kind, hook, None) is original
+        for kind, hooks in _NATIVE_OPERATOR_TYPES
+        for hook, original in zip(_OPERATOR_HOOKS, hooks, strict=True)
     )
+
+
+def _dispatches_natively(op: OpOverload | OpOverloadPacket) -> bool:
+    """Whether calling a packet or overload enters the dispatcher directly: a
+    builtin entry, or the C++ callable torch.library operators dispatch
+    through (torch 2.14+)."""
+    target = op._op
+    if type(target) is types.BuiltinFunctionType:
+        return True
+    dispatcher = getattr(op, "_pyobj_dispatcher", None)
+    return dispatcher is not None and target is dispatcher.dispatch
 
 
 def _is_native_operator_lookup(value: object, attr: str) -> bool:
@@ -348,10 +359,11 @@ def _is_native_operator_lookup(value: object, attr: str) -> bool:
     # Without a class attribute of that name (descriptors come before the
     # instance dict), the lookup reads the cached entry or runs the class's
     # import-time __getattr__.
+    kind = type(value)
     return (
-        type(value) is not _NATIVE_OP_OVERLOAD
-        and _has_native_hooks(value)
-        and getattr_static(type(value), attr, _NO_ATTRIBUTE) is _NO_ATTRIBUTE
+        any(kind is native for native, _ in _NATIVE_OPERATOR_TYPES[:3])
+        and _registry_unpatched(value)
+        and getattr_static(kind, attr, _NO_ATTRIBUTE) is _NO_ATTRIBUTE
     )
 
 
