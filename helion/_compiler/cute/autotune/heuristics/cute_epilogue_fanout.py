@@ -43,6 +43,25 @@ if TYPE_CHECKING:
     from ...tcgen05_config import CuteTcgen05Config
 
 
+def coverage_seed_carriers(spec: ConfigSpec) -> list[Config]:
+    """The compiler seeds as coverage carriers: a promoted default may run a
+    coverage group's mode (a transcendental epilogue's two epilogue warp
+    groups, ``CuteTcgen05DefaultTileHeuristic``), and a carrier holds every
+    group it does not declare at its legacy mode, or the population step
+    refuses its witnesses; the epilogue warp groups' own coverage enumerates
+    the groups on these carriers."""
+    return [
+        Config.from_dict(
+            {
+                key: value
+                for key, value in deepcopy(seed.config).items()
+                if key != TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY
+            }
+        )
+        for seed in spec.compiler_seed_configs
+    ]
+
+
 def register_epilogue_fanout_coverage(
     env: CompileEnvironment, device_ir: DeviceIR
 ) -> None:
@@ -83,8 +102,7 @@ def register_epilogue_fanout_coverage(
     # depths are the existing memory/register tradeoff for this recipe.
     carriers: list[Config] = []
     ordinary: list[Config] = []
-    for seed in spec.compiler_seed_configs:
-        candidate = Config.from_dict(deepcopy(seed.config))
+    for candidate in coverage_seed_carriers(spec):
         try:
             spec.normalize(candidate)
         except InvalidConfig:
@@ -209,7 +227,7 @@ def _register_materialized_aux_coverage(env: CompileEnvironment) -> None:
         or not spec.compiler_seed_configs
     ):
         return
-    carrier = Config.from_dict(deepcopy(spec.compiler_seed_configs[0].config))
+    carrier = coverage_seed_carriers(spec)[0]
     blocks = carrier.block_sizes.copy()
     ab_stages = []
     c_stages = []
@@ -599,8 +617,7 @@ def register_aux_fragment_hoist_coverage(
             if carrier not in sources:
                 sources.append(carrier)
     else:
-        for seed in spec.compiler_seed_configs:
-            candidate = Config.from_dict(deepcopy(seed.config))
+        for candidate in coverage_seed_carriers(spec):
             try:
                 spec.normalize(candidate)
             except InvalidConfig:
@@ -687,16 +704,17 @@ def register_epi_warp_groups_coverage(
 
     ``tcgen05_epi_warp_groups`` splits the role-local TMA-store epilogue's
     subtile walk over two groups of four warps so one group's math hides the
-    other's TMEM-load, barrier and store latencies; it pays off where a heavy
-    epilogue (two outputs, an exact-shape auxiliary read) is exposed at few
-    tiles per CTA. Carriers: the widest CTA-pair fanout geometry at the
-    (128, 32) subtile (``tcgen05_epi_subtile_n``: on the 256-wide pair tile
-    the plan's (128, 64) subtile leaves no register room for either group's
-    auxiliary ring) with the deepest auxiliary prefetch ring both one and
-    two groups admit, and the fanout group's one-CTA carrier; each paired
-    with one and two groups so the search measures the split against the
-    same rings. The per-group whole-fragment hoist is one hoist flip away
-    from the two-group witness (the hoist's budget is the per-group share).
+    other's TMEM-load, barrier and store latencies; it pays off where a
+    heavy epilogue (two outputs, an exact-shape auxiliary read, a
+    transcendental step) is exposed at few tiles per CTA. Carriers: the
+    widest CTA-pair fanout geometry at the (128, 32) subtile
+    (``tcgen05_epi_subtile_n``: on the 256-wide pair tile the plan's (128,
+    64) subtile leaves no register room for either group's auxiliary ring)
+    with the deepest auxiliary prefetch ring both one and two groups admit,
+    and the fanout group's one-CTA carrier; each paired with one and two
+    groups so the search measures the split against the same rings. The
+    per-group whole-fragment hoist is one hoist flip away from the two-group
+    witness (the hoist's budget is the per-group share).
     """
     spec = env.config_spec
     state = spec._cute_tcgen05_config
@@ -723,8 +741,7 @@ def register_epi_warp_groups_coverage(
             if carrier not in sources:
                 sources.append(carrier)
     else:
-        for seed in spec.compiler_seed_configs:
-            candidate = Config.from_dict(deepcopy(seed.config))
+        for candidate in coverage_seed_carriers(spec):
             try:
                 spec.normalize(candidate)
             except InvalidConfig:

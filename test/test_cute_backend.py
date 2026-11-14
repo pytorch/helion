@@ -14698,7 +14698,7 @@ class TestCuteBackend(TestCase):
             # (64 KiB), so the plain kernel's ab=6 overflows at 256x256x64
             # (NVVM rejected the compiled kernel) and ab=5 is the deepest fit.
             with self.assertRaisesRegex(
-                InvalidConfig, "2 output stores keep one C ring each"
+                InvalidConfig, r"beside 2 C rings \(one per output store"
             ):
                 render(cute_matmul_mma_two_outputs, (x, y))
             code = render(cute_matmul_mma_two_outputs, (x, y), tcgen05_ab_stages=5)

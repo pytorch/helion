@@ -626,6 +626,9 @@ TCGEN05_SPLIT_K_BARRIER_ID = 7
 # last arriver reduces them into its TMEM accumulator before the epilogue.
 TCGEN05_SPLIT_K_CONFIG_KEY = "tcgen05_split_k"
 TCGEN05_SPLIT_K_SEARCH_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16)
+# K tiles each split-K slice keeps at least (the seeds and the default): a
+# shorter slice loses its AB pipeline.
+TCGEN05_SPLIT_K_MIN_SLICE_K_TILES = 4
 # The groups' named barriers: ids 6 .. 9, disjoint from the role-local
 # kernel's TMEM-alloc (1), one-group epilogue (2), pipeline-init (3),
 # row-union publication (4) and CLC throttle (5) barriers (``cute_mma``

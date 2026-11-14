@@ -753,8 +753,7 @@ def test_rows_past_the_arena_keep_the_split_store() -> None:
         (8192, 9536, 768),
         # 32 x 9: 4 per pair
         (8192, 2112, 768),
-        # 26 tiles per pair, two K tiles (once the staged row beside the
-        # hybrid store)
+        # 26 tiles per pair, two K tiles
         (4096, 30000, 128),
         # 6 tiles per pair, two K tiles
         (32768, 576, 128),
@@ -906,6 +905,26 @@ def test_partial_output_rows_load_one_tile_ahead() -> None:
     assert flat.config["pid_type"] == "flat"
     assert "row_lookahead" not in flat_code
     assert "cp_async" not in flat_code
+
+
+def test_long_n_sweep_defaults_group_by_32() -> None:
+    """A multi-wave pair default walks groups of 32 M tiles on a long N sweep
+    whatever grouping its seed carried (a plain output-edge GEMM's seed walks
+    groups of 4; the staged grouping has its own test,
+    ``test_staged_residual_long_sweep_groups_eight_m_tiles``)."""
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        plain = plain_mm_into._bind_isolated(
+            (
+                torch.empty((16384, 768), dtype=torch.bfloat16),
+                torch.empty((768, 30528), dtype=torch.bfloat16),
+                torch.empty((16384, 30528), dtype=torch.bfloat16),
+            )
+        ).config_spec.default_config()
+    assert plain.block_sizes == [256, 256, 64]
+    assert plain.config["l2_groupings"] == [32]
 
 
 def test_m_edge_without_a_reachable_pair_keeps_the_flat_search() -> None:
@@ -2200,6 +2219,77 @@ def test_narrow_batched_default_takes_the_one_cta_tile(
     assert config.config["tcgen05_cluster_m"] == 1
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _five_row_mm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    r0: torch.Tensor,
+    r1: torch.Tensor,
+    r2: torch.Tensor,
+    r3: torch.Tensor,
+    r4: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """``acc + r0[cols] + ... + r4[cols]``: five unpromoted bf16 rows."""
+    m, k = a.shape
+    n = b.shape[1]
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        out[rows, cols] = (
+            acc + r0[cols] + r1[cols] + r2[cols] + r3[cols] + r4[cols]
+        ).to(out.dtype)
+    return out
+
+
+def test_many_tile_bias_defaults_pick_the_row_placement() -> None:
+    """Many tiles per pair: static full 256x128 tiles stage a promoted bias
+    row before the accumulator wait (two K tiles: the epilogue bounds the
+    pair), and five unpromoted rows the partial-output store cannot hold
+    leave ``pre_acc_wait`` for the full tiles' TMA store (B200: promoted
+    bias 65536x1152x128 44.3 -> 42.0 us, five rows 16384x30528x768 3284 ->
+    2539 us)."""
+    bf16 = torch.bfloat16
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bias = promoted_bias_mm_into._bind_isolated(
+            (
+                torch.empty((65536, 128), dtype=bf16),
+                torch.empty((128, 1152), dtype=bf16),
+                torch.empty((1152,), dtype=bf16),
+                torch.empty((65536, 1152), dtype=bf16),
+            )
+        ).config_spec.default_config()
+        rows_spec = _five_row_mm._bind_isolated(
+            (
+                torch.empty((16384, 768), dtype=bf16),
+                torch.empty((768, 30528), dtype=bf16),
+                *(torch.empty((30528,), dtype=bf16) for _ in range(5)),
+                torch.empty((16384, 30528), dtype=bf16),
+            )
+        ).config_spec
+        rows = rows_spec.default_config()
+    assert bias.block_sizes == [256, 128, 64]
+    assert bias.config["tcgen05_aux_load_placement"] == "pre_acc_wait"
+    assert bias.config["tcgen05_ab_stages"] == 7
+    # the partial-output store does not hold the five rows: the full tiles'
+    # TMA store, the edge tiles' SIMT store
+    assert rows.config["tcgen05_aux_load_placement"] == "post_acc_wait"
+    assert not smem.simt_aux_partial_output_fits(
+        rows_spec._cute_tcgen05_config,
+        dict(rows.config),
+        bm=256,
+        bn=256,
+        bk=64,
+        cluster_m=2,
+        ab_stages=rows.config["tcgen05_ab_stages"],
+        c_stages=rows.config["tcgen05_c_stages"],
+    )
+
+
 def test_one_cta_n_edge_admission_needs_known_store_facts() -> None:
     """Two column-major outputs of a biased accumulator leave the search no
     store facts: their persistent one-CTA N-edge sample goes flat instead of
@@ -2643,6 +2733,159 @@ def test_small_grid_default_takes_the_fewest_waves(m: int, n: int, k: int) -> No
         bound.to_code(config)
     assert config.block_sizes[:2] == [128, 128]
     assert config.config["tcgen05_cluster_m"] == 2
+
+
+# Small grids no 128-row pair serves: a 64-row M (64x4096x4096), K tails
+# (K=1000, 16 k-blocks: unsplit, at three per-SM CTA counts), a K loop
+# past the pairs' 256 k-blocks, the 32 k-block minimum's edge (31 unsplit,
+# 32 in four slices) and three CTAs per SM capping 216 tiles at two slices.
+@pytest.mark.parametrize(
+    ("m", "n", "k", "split"),
+    (
+        (64, 4096, 4096, 4),
+        (32, 1280, 1000, 1),
+        (128, 4096, 1000, 1),
+        (320, 2048, 1000, 1),
+        (256, 512, 32768, 8),
+        (64, 4096, 1984, 1),
+        (64, 4096, 2048, 4),
+        (64, 13824, 2048, 2),
+    ),
+)
+def test_small_grid_without_a_pair_splits_k(m: int, n: int, k: int, split: int) -> None:
+    """The flat one-CTA 64x64x64 tile, not the flat 64x16 base tile, over a
+    K loop of 32 k-blocks or more splitting K into the most slices of at
+    least four k-blocks whose CTAs three per SM hold (64 tiles of
+    64x4096x4096: four slices, 256 CTAs); unsplit over 16 k-blocks."""
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound = plain_mm._bind_isolated(
+            (
+                torch.empty((m, k), dtype=torch.bfloat16),
+                torch.empty((k, n), dtype=torch.bfloat16),
+            )
+        )
+        config = bound.config_spec.default_config()
+        source = bound.to_code(config)
+    assert config.block_sizes == [64, 64, 64]
+    assert config.config["pid_type"] == "flat"
+    assert config.config["tcgen05_split_k"] == split
+    assert config.config["tcgen05_ab_stages"] == 4
+    assert "cute.gemm(" in source
+
+
+# Short K loops keep the 64x64 tile unsplit (under the 32 k-block minimum:
+# five k-blocks, three at three AB stages, and a 16 k-block K tail);
+# without the flat-edge TMA path a K tail stays unsplit too, and a sampled
+# split is dropped there.
+@pytest.mark.parametrize(
+    ("m", "n", "k", "ab_stages", "flat_edge_tma"),
+    (
+        (64, 4096, 320, 4, True),
+        (64, 4096, 192, 3, True),
+        (1280, 1600, 1000, 4, True),
+        (64, 4096, 4000, 4, False),
+    ),
+)
+def test_small_grid_split_k_default_edges(
+    m: int, n: int, k: int, ab_stages: int, flat_edge_tma: bool
+) -> None:
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound = helion.kernel(
+            plain_mm.fn,
+            backend="cute",
+            static_shapes=True,
+            autotune_effort="none",
+            cute_flat_edge_tma=flat_edge_tma,
+        )._bind_isolated(
+            (
+                torch.empty((m, k), dtype=torch.bfloat16),
+                torch.empty((k, n), dtype=torch.bfloat16),
+            )
+        )
+        config = bound.config_spec.default_config()
+        assert "cute.gemm(" in bound.to_code(config)
+        # a sampled split stays off a ragged grid without the flat-edge path
+        sample = {**config.config, "tcgen05_split_k": 4}
+        bound.config_spec.normalize(sample, _fix_invalid=True)
+        if not flat_edge_tma:
+            # and an explicit one is refused before codegen
+            with pytest.raises(exc.InvalidConfig, match="splits whole tiles only"):
+                bound.config_spec.normalize(
+                    helion.Config(**{**config.config, "tcgen05_split_k": 4})
+                )
+    assert config.block_sizes == [64, 64, 64]
+    assert config.config["pid_type"] == "flat"
+    assert config.config["tcgen05_split_k"] == 1
+    assert config.config["tcgen05_ab_stages"] == ab_stages
+    # (four slices need four k-blocks)
+    assert sample["tcgen05_split_k"] == (4 if flat_edge_tma and k >= 4 * 64 else 1)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _pinned_k_block_mm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    m, k = a.shape
+    n = b.shape[1]
+    block_k = hl.register_block_size(128, 128)
+    out = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k, block_size=block_k):
+            acc = hl.dot(a[rows, inner], b[inner, cols], acc=acc)
+        out[rows, cols] = acc.to(torch.bfloat16)
+    return out
+
+
+def test_split_k_default_counts_slices_on_the_tile_that_runs() -> None:
+    """A K block pinned to 128 runs 128-deep k-blocks: 4096 deep holds 32,
+    so eight slices of four (the 64-deep count would split in sixteen, two
+    128-deep k-blocks each)."""
+    m, n, k = 128, 512, 4096
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound = _pinned_k_block_mm._bind_isolated(
+            (
+                torch.empty((m, k), dtype=torch.bfloat16),
+                torch.empty((k, n), dtype=torch.bfloat16),
+            )
+        )
+        config = bound.config_spec.default_config()
+    # the registered K block comes first: K, M, N
+    assert config.block_sizes == [128, 64, 64]
+    assert config.config["tcgen05_split_k"] == 8
+
+
+# A batch of one: codegen splits no leading passthrough axis, so split-K is
+# off its search surface (and its default keeps the base default's tile).
+def test_batch_of_one_takes_no_split_k_search() -> None:
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound = _scaled_bmm._bind_isolated(
+            (
+                torch.empty((1, 64, 1000), dtype=torch.bfloat16),
+                torch.empty((1, 1000, 4096), dtype=torch.bfloat16),
+            )
+        )
+        state = bound.config_spec._cute_tcgen05_config
+        config = bound.config_spec.default_config()
+        # an explicit split is refused by the strict pass, not by codegen
+        explicit = helion.Config(
+            block_sizes=[1, 64, 64, 64], pid_type="flat", tcgen05_split_k=4
+        )
+        with pytest.raises(helion.exc.InvalidConfig, match="tcgen05_split_k=4"):
+            bound.config_spec.normalize(explicit)
+    assert state.matmul_has_leading_passthrough
+    assert surface.split_k_search_choices(state) == ()
+    assert config.config.get("tcgen05_split_k", 1) == 1
 
 
 def test_small_grid_default_loads_the_row_before_the_accumulator_wait() -> None:

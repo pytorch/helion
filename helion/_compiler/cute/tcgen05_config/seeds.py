@@ -65,13 +65,12 @@ from ..tcgen05_constants import TCGEN05_C_STORE_MODE_DIRECT
 from ..tcgen05_constants import TCGEN05_CLUSTER_N2_SEED_L2_GROUPING
 from ..tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
-from ..tcgen05_constants import TCGEN05_LONG_N_SWEEP_L2_GROUPING
-from ..tcgen05_constants import TCGEN05_LONG_N_SWEEP_MIN_TILES
 from ..tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_N
 from ..tcgen05_constants import TCGEN05_REGION_PID_TYPE_INHERIT
 from ..tcgen05_constants import TCGEN05_REGION_PID_TYPES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_SMALL_GRID_DIRECT_STORE_MAX_BN
 from ..tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
+from ..tcgen05_constants import TCGEN05_SPLIT_K_MIN_SLICE_K_TILES
 from ..tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from ..tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
@@ -94,6 +93,7 @@ from ..tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
 from ..tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_L2_GROUPING
 from ..tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE
 from ..tcgen05_constants import TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS
+from ..tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from ..tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
 from ..tcgen05_constants import tcgen05_direct_entry_stage_tuple_allowed
 from ..tcgen05_constants import tcgen05_rowvec_stage_smem_bytes
@@ -103,6 +103,7 @@ from . import facts
 from . import repair
 from . import smem
 from . import surface
+from .knobs import long_n_sweep_l2_grouping
 
 if TYPE_CHECKING:
     from ....autotuner.config_fragment import BlockSizeFragment
@@ -1027,18 +1028,26 @@ def _split_k_seed_configs(state: CuteTcgen05Config) -> list[Config]:
         if sm_count > 0 and tiles >= sm_count:
             continue
         for bk in (128, 64):
-            if not bk_fragment.low <= bk <= bk_fragment.high:
+            if not (
+                bk_fragment.low <= bk <= bk_fragment.high
+                and surface.split_k_tiles_supported(state, bm=bm, bn=bn, bk=bk)
+            ):
                 continue
             k_tiles = -(-k // bk)
             splits = [
                 split
                 for split in choices
-                if k_tiles // split >= 4 and tiles * split >= sm_count
+                if k_tiles // split >= TCGEN05_SPLIT_K_MIN_SLICE_K_TILES
+                and tiles * split >= sm_count
             ][:2]
             if not splits:
                 # No split reaches one wave with four tiles per split:
                 # the deepest split that keeps four tiles.
-                splits = [split for split in choices if k_tiles // split >= 4][-1:]
+                splits = [
+                    split
+                    for split in choices
+                    if k_tiles // split >= TCGEN05_SPLIT_K_MIN_SLICE_K_TILES
+                ][-1:]
             fit = smem.max_ab_stages_that_fit(state, bm=bm, bn=bn, bk=bk, cluster_m=1)
             block_sizes = facts._matmul_seed_block_sizes(state, bm=bm, bn=bn, bk=bk)
             assert block_sizes is not None
@@ -1752,17 +1761,15 @@ def full_tile_direct_entry_seed_eligible(state: CuteTcgen05Config) -> bool:
 
 
 def _direct_entry_l2_grouping(state: CuteTcgen05Config) -> int:
-    """The direct-entry pair's M-tile grouping: 2 (the measured
-    direct-entry default), or ``TCGEN05_LONG_N_SWEEP_L2_GROUPING`` on a
-    long N sweep, where grouping 2 re-reads B every two M tiles."""
+    """The direct-entry pair's M-tile grouping
+    (``long_n_sweep_l2_grouping``): 2 (the measured direct-entry
+    default), or ``TCGEN05_LONG_N_SWEEP_L2_GROUPING`` on a long N sweep,
+    where grouping 2 re-reads B every two M tiles."""
     extents = state.matmul_compile_time_static_extents
     n = extents[1] if extents is not None else None
-    if (
-        isinstance(n, int)
-        and -(-n // TCGEN05_TWO_CTA_BLOCK_N) >= TCGEN05_LONG_N_SWEEP_MIN_TILES
-    ):
-        return TCGEN05_LONG_N_SWEEP_L2_GROUPING
-    return 2
+    if not isinstance(n, int):
+        return 2
+    return long_n_sweep_l2_grouping(-(-n // TCGEN05_TWO_CTA_BLOCK_N), short=2)
 
 
 def full_tile_direct_entry_seed_config(
@@ -1969,7 +1976,7 @@ def _plain_clc_seed_config(
         # preserves the interleaved rasterization order it cancels into,
         # and l2_groupings=[1] costs ~13% at fp16 16384^3 (780 vs 899
         # TFLOP/s pinned) vs the measured-good [4].
-        "l2_groupings": [4],
+        "l2_groupings": [TCGEN05_TWO_CTA_SEED_L2_GROUPING],
         "tcgen05_cluster_m": 2,
         "tcgen05_num_epi_warps": 4,
         "tcgen05_ab_stages": ab_stages,
@@ -2019,7 +2026,7 @@ def _plain_m_pair_seed_config(state: CuteTcgen05Config) -> Config | None:
     seed_config: dict[str, Any] = {
         "block_sizes": [pair_bm, TCGEN05_TWO_CTA_BLOCK_N, bk],
         "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
-        "l2_groupings": [4],
+        "l2_groupings": [TCGEN05_TWO_CTA_SEED_L2_GROUPING],
         "tcgen05_cluster_m": 2,
         "tcgen05_cluster_n": 1,
         "tcgen05_num_epi_warps": 4,
@@ -2197,7 +2204,7 @@ def _plain_edge_seed_config(state: CuteTcgen05Config) -> Config | None:
             bk,
         ],
         "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
-        "l2_groupings": [4],
+        "l2_groupings": [TCGEN05_TWO_CTA_SEED_L2_GROUPING],
         "tcgen05_cluster_m": 2,
         "tcgen05_num_epi_warps": 4,
         "tcgen05_ab_stages": ab_stages,
@@ -2351,7 +2358,7 @@ def _plain_cluster_n2_seed_config(
             bk,
         ],
         "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
-        "l2_groupings": [4],
+        "l2_groupings": [TCGEN05_TWO_CTA_SEED_L2_GROUPING],
         "tcgen05_cluster_m": 2,
         "tcgen05_cluster_n": 2,
         "tcgen05_num_epi_warps": 4,

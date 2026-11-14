@@ -41,6 +41,7 @@ from ...runtime.kernel import PreparedMetadataSpecializationExtractor
 from ...runtime.kernel import evaluate_sympy_expr
 from ...runtime.kernel import maybe_skip_dtype_check_in_meta_registrations
 from ...runtime.kernel import tensor_property_value
+from ..compile_environment import CompileEnvironment
 from ..inductor_lowering_extra import patch_inductor_lowerings
 from . import grouped_static_tail
 from .aux_tensor import host_function_has_tcgen05_aux_kernel_pattern
@@ -58,7 +59,6 @@ if TYPE_CHECKING:
     from ...runtime.config import Config
     from ...runtime.kernel import BoundKernel
     from ...runtime.settings import Settings
-    from ..compile_environment import CompileEnvironment
     from ..host_function import HostFunction
 
 
@@ -119,6 +119,11 @@ def record_host_structural_facts(
     # that store.
     config_spec.tcgen05.split_k_plain_body = host_function_has_plain_store_body(
         host_function
+    )
+    # Split K's partial tiles store through the flat-edge TMA path only
+    # (``split_k_tiles_supported``).
+    config_spec.tcgen05.split_k_flat_edge_tma = (
+        CompileEnvironment.current().settings.cute_flat_edge_tma
     )
     # Codegen refuses an atomic beside the warp roles
     # (``reject_atomics_beside_warp_roles``); the seeds read this.
