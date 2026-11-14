@@ -25,6 +25,7 @@ from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
+from helion._testing.search_harness import mock_kernel
 from helion.autotuner import PatternSearch
 from helion.autotuner import search_algorithms
 import helion.autotuner.base_search as base_search_module
@@ -50,7 +51,6 @@ from helion.autotuner.llm_search import LLMGuidedSearch
 from helion.autotuner.logger import AutotuningLogger
 from helion.autotuner.metrics import AutotuneMetrics
 from helion.autotuner.search_space_logger import canonical_config_id
-from helion.autotuner.search_surface import BackendSearchSurface
 import helion.language as hl
 from helion.runtime.settings import Settings
 
@@ -291,35 +291,6 @@ def _family_search(
     )
     search.config_spec = SimpleNamespace(final_selection_family_keys=keys)  # type: ignore[misc]
     return search
-
-
-def _mock_kernel(settings: Settings) -> SimpleNamespace:
-    config_spec = SimpleNamespace(
-        default_config=lambda: helion.Config(block_sizes=[1]),
-        search_surface=BackendSearchSurface(),
-        cute_flash_search_enabled=False,
-        compiler_seed_timeout_retry_repetitions=None,
-        create_config_generation=lambda **kwargs: SimpleNamespace(
-            invalid_config_count=0
-        ),
-        backend=SimpleNamespace(
-            autotune_config_is_viable=lambda _config_spec, _config: True,
-            should_deduplicate_generated_sources=lambda config_spec: False,
-            get_do_bench=lambda: None,
-            classify_autotune_exception=lambda error: None,
-            probe_long_autotune_kernels=lambda _config_spec: False,
-            supports_precompile=lambda: True,
-        ),
-    )
-    return SimpleNamespace(
-        settings=settings,
-        config_spec=config_spec,
-        format_kernel_decorator=lambda config, s: "decorator",
-        to_triton_code=lambda config: "code",
-        maybe_log_repro=lambda log_func, args, config=None: None,
-        supports_subprocess_benchmark=lambda: False,
-        env=SimpleNamespace(process_group_name=None),
-    )
 
 
 @pytest.mark.cpu_only
@@ -2903,7 +2874,7 @@ class TestFinalSelection(TestCase):
             with patch.dict(os.environ):
                 # test/conftest.py keeps the suite on the single-pass path
                 os.environ.pop("HELION_AUTOTUNE_FINAL_SELECTION_ROUNDS", None)
-                search = DifferentialEvolutionSearch(_mock_kernel(settings), ())
+                search = DifferentialEvolutionSearch(mock_kernel(settings), ())
             self.assertEqual(search.final_selection, expected, effort)
             self.assertEqual(
                 search._final_rebenchmark_cache_policy()["final_selection"],

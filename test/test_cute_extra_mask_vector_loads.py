@@ -351,6 +351,7 @@ def _run(kernel: object, args: tuple[object, ...], **config: object) -> torch.Te
     return bound.compile_config(helion.Config.from_dict(config))(*args)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     ("n1", "n2", "dtype", "vec_width"),
@@ -380,6 +381,7 @@ def test_concat_masked_matches_torch_cat(
     torch.testing.assert_close(out, torch.cat([x, y], dim=1), rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_lane_varying_extra_mask_matches_reference() -> None:
     x = torch.randn((5, 1000), device=CUDA_DEVICE)
@@ -394,6 +396,7 @@ def test_lane_varying_extra_mask_matches_reference() -> None:
     torch.testing.assert_close(out, torch.where(keep, x, 0.0), rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("last", [511, 512])
 def test_inclusive_bound_matches_reference(last: int) -> None:
@@ -409,6 +412,7 @@ def test_inclusive_bound_matches_reference(last: int) -> None:
     torch.testing.assert_close(out, torch.where(keep, x, 0.0), rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_bitwise_and_mask_matches_reference() -> None:
     x = torch.randn((5, 1024), device=CUDA_DEVICE)
@@ -418,6 +422,7 @@ def test_bitwise_and_mask_matches_reference() -> None:
     torch.testing.assert_close(out, torch.where(keep, x, 0.0), rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_loaded_flag_mask_matches_reference() -> None:
     x = torch.randn((8, 1024), device=CUDA_DEVICE)
@@ -428,6 +433,7 @@ def test_loaded_flag_mask_matches_reference() -> None:
     torch.testing.assert_close(out, torch.where(keep, x, 0.0), rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_atomic_result_mask_matches_reference() -> None:
     x = torch.randn((8, 1024), device=CUDA_DEVICE)
@@ -438,6 +444,7 @@ def test_atomic_result_mask_matches_reference() -> None:
     assert bool((counter == 1).all())
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_device_loop_extra_mask_matches_reference() -> None:
     x = torch.randn((8, 1024), device=CUDA_DEVICE)

@@ -8,14 +8,14 @@ import torch
 
 from test.test_cute_collective_dot import _full_slice_dot
 from test.test_cute_collective_seeds import _independent_matmuls
-from test.test_cute_collective_tf32 import _config
-from test.test_cute_collective_tf32 import _jagged_inputs
-from test.test_cute_collective_tf32 import _kernel
 from test.test_cute_collective_warp_tf32 import _seeded_fp32
 
 import helion
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_collective import collective_config
+from helion._testing.cute_collective import collective_kernel
+from helion._testing.cute_collective import jagged_inputs
 
 pytestmark = [
     pytest.mark.cpu_render,
@@ -81,8 +81,8 @@ def test_packet_source_changes_only_the_two_operand_store_groups(
     compute: str, recipe: str, static_shapes: bool
 ) -> None:
     args = (torch.empty((3, 130, 64)), torch.empty((3, 64, 70)))
-    bound = cpu_bind(_kernel(batched=True, static_shapes=static_shapes), args)
-    config = _config(64, 32, 32, compute=compute)
+    bound = cpu_bind(collective_kernel(batched=True, static_shapes=static_shapes), args)
+    config = collective_config(64, 32, 32, compute=compute)
     control = bound.to_code(_packet_config(config, False, recipe=recipe))
     packet = bound.to_code(_packet_config(config, True, recipe=recipe))
     restored, count = _recover_scalar_stores(packet, control)
@@ -102,9 +102,9 @@ def test_packet_request_preserves_unsupported_scalar_or_copy_paths(mode: str) ->
     k = 64
     args = (torch.empty((3, 130, k), dtype=dtype), torch.empty((3, k, 64), dtype=dtype))
     bound = cpu_bind(
-        _kernel(batched=True, static_shapes=True, precision=precision), args
+        collective_kernel(batched=True, static_shapes=True, precision=precision), args
     )
-    config = _config(
+    config = collective_config(
         64,
         32,
         32,
@@ -123,8 +123,8 @@ def test_packet_request_preserves_unsupported_scalar_or_copy_paths(mode: str) ->
         )
     if mode == "async_ring":
         # A computed A cannot use an async ring, so use the direct jagged input.
-        args = _jagged_inputs(batch=3, rows=137, k=64, n=64)
-        bound = cpu_bind(_kernel(), args)
+        args = jagged_inputs(batch=3, rows=137, k=64, n=64)
+        bound = cpu_bind(collective_kernel(), args)
         config = helion.Config.from_dict(config.config | {"cute_collective_stages": 2})
     recipe = "scalar" if mode == "scalar_recipe" else "vector_unrolled"
     control = bound.to_code(_packet_config(config, False, recipe=recipe))
@@ -155,9 +155,9 @@ def test_packet_keeps_fp32_seed_writes_and_seed_before_mma(compute: str) -> None
 
 @pytest.mark.parametrize("value", [None, 0, 1, "true"])
 def test_packet_config_rejects_non_boolean_choices(value: object) -> None:
-    bound = cpu_bind(_kernel(), _jagged_inputs(batch=3, rows=65, k=64, n=64))
+    bound = cpu_bind(collective_kernel(), jagged_inputs(batch=3, rows=65, k=64, n=64))
     config = helion.Config.from_dict(
-        _config().config | {"cute_collective_operand_packets": value}
+        collective_config().config | {"cute_collective_operand_packets": value}
     )
     with pytest.raises(
         helion.exc.InvalidConfig, match="cute_collective_operand_packets"
@@ -167,11 +167,11 @@ def test_packet_config_rejects_non_boolean_choices(value: object) -> None:
 
 @pytest.mark.parametrize("value", [False, True])
 def test_packet_choice_survives_flattening(value: bool) -> None:
-    bound = cpu_bind(_kernel(), _jagged_inputs(batch=3, rows=65, k=64, n=64))
+    bound = cpu_bind(collective_kernel(), jagged_inputs(batch=3, rows=65, k=64, n=64))
     with bound.env:
         generation = bound.config_spec.create_config_generation()
         _flat, restored = generation.canonicalize_flat(
-            generation.flatten(_packet_config(_config(), value))
+            generation.flatten(_packet_config(collective_config(), value))
         )
     assert restored["cute_collective_operand_packets"] is value
 
@@ -182,8 +182,10 @@ def test_partial_global_k_masks_remain_inside_each_packet(
     compute: str, static_shapes: bool
 ) -> None:
     arguments = (torch.empty((3, 130, 78)), torch.empty((3, 78, 70)))
-    bound = cpu_bind(_kernel(batched=True, static_shapes=static_shapes), arguments)
-    config = _config(64, 32, 32, compute=compute)
+    bound = cpu_bind(
+        collective_kernel(batched=True, static_shapes=static_shapes), arguments
+    )
+    config = collective_config(64, 32, 32, compute=compute)
     control = bound.to_code(_packet_config(config, False))
     packet = bound.to_code(_packet_config(config, True))
     restored, count = _recover_scalar_stores(packet, control)

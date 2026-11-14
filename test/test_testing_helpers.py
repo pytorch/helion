@@ -25,6 +25,7 @@ from helion._testing import onlyBackends
 from helion._testing import pairwise
 from helion._testing import patch_target_facts
 from helion._testing import sharding
+from helion._testing.cute_codegen import CpuRefMode
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import tcgen05_target
 from helion._testing.sharding import MIN_WEIGHT
@@ -357,3 +358,24 @@ def test_shard_duration_script_uses_its_checkout(
     assert foreign_output.read_text() == foreign_contents
     if explicit_output:
         assert local_output.read_text() == local_contents
+
+
+def test_cpu_ref_mode_matmuls_follow_torch() -> None:
+    """``CpuRefMode`` multiplies in FP32 where CPU ``torch.mm`` has no
+    ``out_dtype`` (``hl.dot``'s reference path) and, as ``torch.addmm``,
+    ignores the bias under a zero ``beta``, NaN included."""
+    lhs = torch.randn(3, 5, dtype=torch.bfloat16)
+    rhs = torch.randn(5, 2, dtype=torch.bfloat16)
+    bias = torch.randn(3, 2)
+    nan = torch.full((3, 2), float("nan"))
+    product = lhs.float() @ rhs.float()
+    scaled = 2 * product + bias
+    with CpuRefMode():
+        dot = torch.mm(lhs, rhs, out_dtype=torch.float32)
+        plain = torch.mm(lhs, rhs)
+        ignored = torch.addmm(nan, lhs, rhs, beta=0)
+        added = torch.addmm(bias, lhs, rhs, alpha=2)
+    assert torch.equal(dot, product)
+    assert plain.dtype is torch.bfloat16
+    assert torch.equal(ignored, product)
+    assert torch.equal(added, scaled)

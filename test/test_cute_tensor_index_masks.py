@@ -220,6 +220,7 @@ def test_flattened_jagged_load_keeps_its_k_tail_mask() -> None:
 CUDA_DEVICE = "cuda"
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_scalar_jagged_reduction_tail_ignores_backing_storage() -> None:
     torch.manual_seed(20260912)

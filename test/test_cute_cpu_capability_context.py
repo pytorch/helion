@@ -143,6 +143,27 @@ def _check_codegen_cache_isolation(warm: bool) -> None:
         assert not torch.cuda.is_initialized()
 
 
+@skipUnlessBackends(["cute"])
+def test_cpu_codegen_preserves_process_caches() -> None:
+    # The in-process part of the cold-process check below: CuTe codegen under
+    # mock_cuda_unavailable() neither fills nor replaces the capability caches
+    # (a direct import of a cached probe would bypass the patch).
+    original = _cached_capabilities()
+    before = [function.cache_info() for function in original]
+    args = (torch.empty(64), torch.empty(64))
+    with mock_cuda_unavailable():
+        kernel = helion.kernel(_pointwise, backend="cute", autotune_effort="none")
+        code = cpu_bind(kernel, args).to_code(helion.Config(block_sizes=[32]))
+    assert "@cute.kernel" in code
+    assert all(a is b for a, b in zip(original, _cached_capabilities(), strict=True))
+    assert [function.cache_info() for function in original] == before
+
+
+# Each case starts an interpreter that imports torch, Triton and Helion, which
+# the Test Budget Rules put in the slow tier.  Only a cold process shows that
+# a later Triton codegen still reads the real capabilities (maxnreg, the SM
+# count); test_cpu_codegen_preserves_process_caches checks the caches on pull
+# requests.
 @pytest.mark.parametrize("warm", [False, True])
 @pytest.mark.slow
 @skipUnlessBackends(["cute"])

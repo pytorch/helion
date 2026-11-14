@@ -21,6 +21,7 @@ from helion._compiler.cute.scaled_sub_fusion import (
     contract_distributed_scale_subtractions,
 )
 from helion._testing import import_example
+from helion._testing import pairwise
 
 pytestmark = pytest.mark.cpu_only
 
@@ -327,10 +328,16 @@ def test_actual_masked_and_vector_sources_follow_the_same_fusion_policy(
     assert ("cute.arch.load(" in generated) is aligned
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("fast_math", [False, True])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("layout", ["dense", "unaligned"])
+@pytest.mark.parametrize(
+    ("fast_math", "dtype", "layout"),
+    pairwise(
+        fast_math=(False, True),
+        dtype=(torch.float16, torch.bfloat16, torch.float32),
+        layout=("dense", "unaligned"),
+    ),
+)
 def test_scaled_sub_fusion_exact_masked_and_vector_replays(fast_math, dtype, layout):
     case = CacheCase(
         f"scaled-fusion-{dtype}-{layout}-fast{int(fast_math)}",

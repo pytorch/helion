@@ -2737,18 +2737,23 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
             torch.randn([512, 512], device=DEVICE),
         )
         bound_kernel = matmul.bind(args)
-        bound_kernel.settings.autotune_benchmark_subprocess = True
-        bound_kernel.settings.autotune_benchmark_timeout = 60
-        bound_kernel.settings.autotune_precompile = None
-        # The autotuner reseeds `random` from this setting, so pinning it (not
-        # random.seed) is what makes the config sequence reproducible.
-        bound_kernel.settings.autotune_random_seed = 123
+        settings = bound_kernel.settings
 
         random.seed(123)
-        with patch.object(
-            LocalBenchmarkProvider,
-            "_benchmark_function_subprocess",
-            maybe_fail,
+        # The settings belong to the matmul example's kernel, which other tests
+        # share: restore them afterwards.  The autotuner reseeds `random` from
+        # autotune_random_seed, so pinning it (not random.seed) is what makes
+        # the config sequence reproducible.
+        with (
+            patch.object(settings, "autotune_benchmark_subprocess", True),
+            patch.object(settings, "autotune_benchmark_timeout", 60),
+            patch.object(settings, "autotune_precompile", None),
+            patch.object(settings, "autotune_random_seed", 123),
+            patch.object(
+                LocalBenchmarkProvider,
+                "_benchmark_function_subprocess",
+                maybe_fail,
+            ),
         ):
             search = RandomSearch(bound_kernel, args, 10)
             search.autotune()

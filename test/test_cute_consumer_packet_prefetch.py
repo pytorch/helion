@@ -827,6 +827,7 @@ def _exercise(width: int, dtype: torch.dtype, *, offset_weight: bool = False) ->
         assert tuple(tensor.data_ptr() for tensor in (x, weight, captured)) == pointers
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @skipUnlessCuteAvailable("requires the supported CuTe runtime")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
@@ -835,6 +836,7 @@ def test_consumer_packet_prefetch_graph(width: int, dtype: torch.dtype) -> None:
     _exercise(width, dtype)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @skipUnlessCuteAvailable("requires the supported CuTe runtime")
 def test_consumer_packet_prefetch_offset_weight_falls_back() -> None:

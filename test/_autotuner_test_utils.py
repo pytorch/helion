@@ -185,33 +185,25 @@ def _get_examples_matmul():
 
 
 def _pin_sm90(fn):
-    """Run ``fn`` with the hardware identity and SM count pinned to H100, and
-    evict the shared ``examples/matmul`` bound-kernel cache on entry and exit.
+    """Run ``fn`` with the hardware identity and SM count pinned to H100.
 
     The ``Kernel`` bind cache keys on the real device capability instead
-    (``_device_specialization_key``). Without the eviction, a config computed under
-    this pin (the sm90 budget-formula seed, e.g. ``block_sizes=[64, 64, 64],
-    num_stages=6``) is cached against the real-GPU key and then reused by a later
-    *un-pinned* test that actually compiles/executes it, which OOMs on a smaller GPU
-    (A10G's 99KB shared memory). Clearing on entry gives this test a clean compute;
-    clearing on exit guarantees no sm90-simulated config leaks into a test that runs
-    on the true hardware.
+    (``_device_specialization_key``), so a config computed under this pin (the
+    sm90 budget-formula seed, e.g. ``block_sizes=[64, 64, 64], num_stages=6``)
+    must not reach a later un-pinned test that compiles it, which OOMs on a
+    smaller GPU (A10G's 99KB shared memory): ``AutotunerTestCase`` drops the
+    shared kernels' binds around every test.
     """
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        matmul = _get_examples_matmul()
         with (
             patch.object(
                 _hardware, "get_hardware_info", lambda device=None: _SM90_HARDWARE
             ),
             patch("helion.runtime.get_num_sm", return_value=_SM90_NUM_SM),
         ):
-            matmul._bound_kernels.clear()
-            try:
-                return fn(*args, **kwargs)
-            finally:
-                matmul._bound_kernels.clear()
+            return fn(*args, **kwargs)
 
     return wrapper
 
@@ -246,6 +238,15 @@ class AutotunerTestCase(RefEagerTestDisabled, TestCase):
     def setUp(self):
         super().setUp()
         random.seed(112)
+        # Tests patch facts a config spec reads when a kernel binds (the
+        # hardware identity picks random_population's compiler seeds), but the
+        # bind cache keys on the arguments and the real device, so a bind made
+        # under one test's patches would reach the next test binding the same
+        # arguments.  Drop the shared kernels' binds before and after each
+        # test (only the binds: settings changed on a shared kernel stay).
+        for kernel in (basic_kernels.add, _get_examples_matmul()):
+            kernel.reset()
+            self.addCleanup(kernel.reset)
 
     @staticmethod
     def _scalar_override() -> tuple[str, int, int]:

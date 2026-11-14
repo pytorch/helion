@@ -805,6 +805,7 @@ class TestEpilogueSubtiling(TestCase):
         _assert_no_split_codegen(self, code)
 
     @skipIfXPU("epilogue_subtile_autotune check uses CUDA device properties")
+    @skipIfRefEager("ref eager mode builds no device IR to add epilogue_subtile")
     def test_autotune_field_enabled_for_large_k(self):
         args = (
             torch.randn([128, 1024], device=DEVICE, dtype=torch.float32),
@@ -830,6 +831,7 @@ class TestEpilogueSubtiling(TestCase):
         self.assertNotIn("epilogue_subtile", fields)
 
     @skipIfXPU("uses torch.cuda.get_device_capability() - Blackwell is CUDA-specific")
+    @skipIfRefEager("ref eager mode builds no device IR to add epilogue_subtile")
     def test_autotune_field_large_k_allows_s4_on_blackwell(self):
         args = (
             torch.randn([128, 16384], device=DEVICE, dtype=torch.float32),
@@ -844,10 +846,8 @@ class TestEpilogueSubtiling(TestCase):
         self.assertIn("epilogue_subtile", fields)
         fragment = fields["epilogue_subtile"]
         assert isinstance(fragment, EnumFragment)
-        expected_choices = (
-            (None, 2, 4) if torch.cuda.get_device_capability() >= (10, 0) else (None, 2)
-        )
-        self.assertEqual(fragment.choices, expected_choices)
+        # The early return leaves Blackwell (capability 10.0 or later).
+        self.assertEqual(fragment.choices, (None, 2, 4))
 
 
 if __name__ == "__main__":

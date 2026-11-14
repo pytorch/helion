@@ -15,21 +15,19 @@ import torch
 from torch._inductor.codecache import PyCodeCache
 
 from test._cute_grouped_gemm_split_sizes import _selected_config
-from test.cute_population_contracts import _cpu_target
 from test.cute_population_contracts import _target
-from test.test_cute_full_slice_matmul import _CpuRefMode
 
 import helion
-from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.cute_mma import analyze_tcgen05_grouped_worklist
 from helion._testing import import_example
+from helion._testing.cute_codegen import compile_reference
+from helion._testing.cute_codegen import reference_host_function
+from helion._testing.cute_codegen import run_cpu_reference
 from helion._testing.cute_structural_kernels import _offset_mm
 from helion.exc import BackendUnsupported
 import helion.language as hl
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
 from helion.runtime.cute.launcher import _validate_tcgen05_grouped_dynamic_ab_tensormaps
-from helion.runtime.ref_mode import RefMode
-from helion.runtime.ref_mode import RefModeContext
 
 _examples_grouped_gemm = import_example("grouped_gemm")
 grouped_gemm_jagged = _examples_grouped_gemm.grouped_gemm_jagged
@@ -168,12 +166,7 @@ def test_original_example_emits_shared_rank2_worklist(
 def _run_reference(
     bound: BoundKernel[Any], args: tuple[torch.Tensor, ...]
 ) -> torch.Tensor:
-    host = bound.host_function
-    assert host is not None
-    with bound.env, host:
-        definition = host.codegen_function_def(list(host.body))
-    definition = ast.parse(ast.unparse(ast.fix_missing_locations(definition))).body[0]
-    assert isinstance(definition, ast.FunctionDef)
+    definition = reference_host_function(bound)
     for node in ast.walk(definition):
         if isinstance(node, ast.For):
             assert isinstance(node.iter, ast.Call)
@@ -184,25 +177,8 @@ def _run_reference(
                 "[1, 8, 16]" if isinstance(node.target, ast.Tuple) else "8", mode="eval"
             ).body
             node.iter.keywords.append(ast.keyword(arg="block_size", value=value))
-    namespace = dict(bound.kernel.fn.__globals__)
-    namespace["_default_cute_launcher"] = None
-    exec(
-        compile(
-            ast.fix_missing_locations(ast.Module(body=[definition], type_ignores=[])),
-            "<segmented-reference>",
-            "exec",
-        ),
-        namespace,
-    )
-    with _cpu_target():
-        env = CompileEnvironment(
-            torch.device("cpu"),
-            dataclasses.replace(bound.settings, ref_mode=RefMode.EAGER),
-        )
-    context = RefModeContext(env, None)
-    context.func_mode = _CpuRefMode()
-    with context:
-        result = namespace[definition.name](*args)
+    reference = compile_reference(bound, definition, "<segmented-reference>")
+    result = run_cpu_reference(bound, reference, args)
     assert isinstance(result, torch.Tensor)
     return result
 

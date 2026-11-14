@@ -638,6 +638,10 @@ class TestMisc(RefEagerTestBase, TestCase):
                     x[:4] = torch.tensor([-1.5, 1.5, -2.0, 0.0])
                     y[:4] = torch.tensor([0.5, -0.5, 0.25, -1.0])
                     x, y = x.to(dtype), y.to(dtype)
+                    # About one float16 subtest in 2000 draws a divisor that
+                    # rounds to zero, whose NaNs the exact comparison below
+                    # counts as a mismatch.
+                    y[y == 0] = 1.0
                     _, result = code_and_output(modulus, (x, y, s))
                     expected = torch.stack(
                         [

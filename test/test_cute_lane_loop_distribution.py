@@ -6406,6 +6406,7 @@ def _run(kernel: object, args: tuple[object, ...], **config: object) -> torch.Te
     return bound.compile_config(helion.Config.from_dict(config))(*args)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     ("shape", "config"),
@@ -6469,6 +6470,7 @@ def test_concat_simple_matches_torch_cat(
     torch.testing.assert_close(out, torch.cat([x, y], dim=1), rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     ("kernel", "shapes", "config"),
@@ -6492,6 +6494,7 @@ def test_gathered_row_read_twice_matches_reference(
     torch.testing.assert_close(echo, idx, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     ("kernel", "shape", "config"),
@@ -6513,6 +6516,7 @@ def test_row_flag_reused_after_the_masked_load_matches_reference(
     torch.testing.assert_close(cnt, flags + 1, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     ("kernel", "shape", "axis", "config"),
@@ -6549,6 +6553,7 @@ _BYTE_DEVICE_CASES = [
 ]
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(("columns", "packet_flush"), _BYTE_DEVICE_CASES)
 def test_store_between_a_byte_conversion_and_its_flush_matches_reference(
@@ -6576,6 +6581,7 @@ def test_store_between_a_byte_conversion_and_its_flush_matches_reference(
     torch.testing.assert_close(out, packed.to(torch.bfloat16), rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("packet_flush", [False, True], ids=["values", "packet"])
 def test_store_after_a_per_lane_store_of_its_tensor_matches_reference(
@@ -6601,6 +6607,7 @@ def test_store_after_a_per_lane_store_of_its_tensor_matches_reference(
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_read_before_a_flushed_store_matches_reference() -> None:
     # ``first`` reads the zero-initialized output before the copy overwrites
@@ -6616,6 +6623,7 @@ def _small_integers(shape: tuple[int, ...]) -> torch.Tensor:
     return torch.randint(0, 5, shape, device=CUDA_DEVICE).float()
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "config", [_NESTED_CONFIG, _NESTED_SCALAR_CONFIG], ids=["vector", "scalar"]
@@ -6638,6 +6646,7 @@ def test_masked_tile_uniform_accesses_around_per_lane_stores_reject_the_config(
         _run(_zero_first_row_then_copy, (x, out), **config)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "config", [_NESTED_CONFIG, _NESTED_SCALAR_CONFIG], ids=["vector", "scalar"]
@@ -6653,6 +6662,7 @@ def test_masked_tile_uniform_store_after_per_lane_stores_matches_reference(
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_tile_uniform_store_in_an_inner_tile_loop_matches_reference() -> None:
     x = _small_integers((8, 512))
@@ -6672,6 +6682,7 @@ def test_tile_uniform_store_in_an_inner_tile_loop_matches_reference() -> None:
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 256), (6, 250)], ids=["full", "partial"])
 def test_placed_nest_repeating_a_tile_uniform_access_rejects_the_config_on_device(
@@ -6698,6 +6709,7 @@ def test_placed_nest_repeating_a_tile_uniform_access_rejects_the_config_on_devic
         _run(_first_row_increment_beside_copy, args, **_NESTED_CONFIG)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 256), (6, 250)], ids=["full", "partial"])
 def test_scaled_first_row_beside_a_copy_matches_reference(
@@ -6713,6 +6725,7 @@ def test_scaled_first_row_beside_a_copy_matches_reference(
     torch.testing.assert_close(y, x, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "config",
@@ -6752,6 +6765,7 @@ def _first_of_each_tile(extent: int, block: int) -> torch.Tensor:
     return (torch.arange(extent, device=CUDA_DEVICE) // block) * block
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "config",
@@ -6777,6 +6791,7 @@ def test_uniform_read_before_per_lane_stores_on_a_shared_axis_matches_reference(
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "config",
@@ -6793,6 +6808,7 @@ def test_uniform_read_on_a_thread_axis_without_a_lane_loop_matches_reference(
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     ("config", "block", "shapes"),
@@ -6815,6 +6831,7 @@ def test_uniform_read_hoisted_out_of_the_innermost_shared_loop_matches_reference
         torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "config", [_NESTED_CONFIG, _NESTED_SCALAR_CONFIG], ids=["vector", "scalar"]
@@ -6834,6 +6851,7 @@ def test_uniform_load_then_uniform_store_of_one_element_matches_reference(
     torch.testing.assert_close(result, x, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "config", [_NESTED_CONFIG, _NESTED_SCALAR_CONFIG], ids=["vector", "scalar"]
@@ -6848,6 +6866,7 @@ def test_uniform_store_before_per_lane_stores_matches_reference(
     torch.testing.assert_close(result, x + 1.0, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 256), (6, 250)], ids=["full", "partial"])
 def test_idempotent_uniform_stores_match_reference(shape: tuple[int, int]) -> None:
@@ -6865,6 +6884,7 @@ def test_idempotent_uniform_stores_match_reference(shape: tuple[int, int]) -> No
     torch.testing.assert_close(result, expected + x, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 256), (6, 250)], ids=["full", "partial"])
 def test_device_loop_body_with_a_thread_axis_matches_reference(
@@ -6878,6 +6898,7 @@ def test_device_loop_body_with_a_thread_axis_matches_reference(
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 256), (6, 250)], ids=["full", "partial"])
 def test_loop_invariant_read_in_a_device_loop_matches_reference(
@@ -6895,6 +6916,7 @@ def test_loop_invariant_read_in_a_device_loop_matches_reference(
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 256), (6, 250)], ids=["full", "partial"])
 def test_gathered_read_before_a_per_lane_store_matches_reference(
@@ -6930,6 +6952,7 @@ def _compiled(kernel: object, args: tuple[object, ...], **config: object) -> obj
 _RUNS = 5
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 257), (6, 251), (16, 1025)])
 def test_carry_from_the_previous_tile_matches_reference(
@@ -6950,6 +6973,7 @@ def test_carry_from_the_previous_tile_matches_reference(
         torch.testing.assert_close(run(x), expected, rtol=0, atol=0)  # pyrefly: ignore [not-callable]
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 257), (6, 251), (16, 1025)])
 def test_carry_to_the_next_tile_matches_reference(shape: tuple[int, int]) -> None:
@@ -6970,6 +6994,7 @@ def test_carry_to_the_next_tile_matches_reference(shape: tuple[int, int]) -> Non
         torch.testing.assert_close(run(x), expected, rtol=0, atol=0)  # pyrefly: ignore [not-callable]
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "config",
@@ -6995,6 +7020,7 @@ def test_repeated_inner_loop_matches_reference(
         torch.testing.assert_close(run(x), expected, rtol=0, atol=0)  # pyrefly: ignore [not-callable]
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 320), (6, 314), (16, 1088)])
 def test_two_loops_over_one_block_size_match_reference(shape: tuple[int, int]) -> None:
@@ -7033,6 +7059,7 @@ def test_two_loops_over_one_block_size_match_reference(shape: tuple[int, int]) -
         torch.testing.assert_close(x, updated, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 320), (6, 314)])
 def test_six_loops_over_one_block_size_match_reference(shape: tuple[int, int]) -> None:
@@ -7077,6 +7104,7 @@ def _backwards_reference(
     return out
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("kernel", _BACKWARDS_KERNELS)
 @pytest.mark.parametrize("shape", [(8, 4096), (16, 4096)])
@@ -7099,6 +7127,7 @@ def test_accesses_moving_backwards_match_reference(
         torch.testing.assert_close(run(x, out), expected, rtol=0, atol=0)  # pyrefly: ignore [not-callable]
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 256), (6, 250)], ids=["full", "partial"])
 def test_uniform_read_modify_write_in_a_device_loop_matches_reference(
@@ -7128,6 +7157,7 @@ def test_uniform_read_modify_write_in_a_device_loop_matches_reference(
         torch.testing.assert_close(x, expected_x, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_uniform_read_modify_write_in_a_repeated_device_loop_rejects_the_config_on_device() -> (
     None
@@ -7145,6 +7175,7 @@ def test_uniform_read_modify_write_in_a_repeated_device_loop_rejects_the_config_
         )
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     ("kernel", "config"),
@@ -7197,6 +7228,7 @@ _MAPPED_KERNELS_1D = [
 ]
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("kernel", _MAPPED_KERNELS_1D)
 def test_mapped_read_beside_the_store_matches_reference(kernel: object) -> None:
@@ -7220,6 +7252,7 @@ def test_mapped_read_beside_the_store_matches_reference(kernel: object) -> None:
         torch.testing.assert_close(x, expected_x, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("kernel", _MAPPED_KERNELS_1D)
 def test_mapped_read_in_a_lane_loop_rejects_the_config_on_device(
@@ -7239,6 +7272,7 @@ def test_mapped_read_in_a_lane_loop_rejects_the_config_on_device(
         )
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 64), (6, 60), (8, 128)])
 def test_next_column_read_beside_the_store_matches_reference(
@@ -7268,6 +7302,7 @@ def test_next_column_read_beside_the_store_matches_reference(
         )
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 2304), (32, 2304)])
 def test_short_sibling_loop_over_one_block_size_matches_reference(
@@ -7302,6 +7337,7 @@ def test_short_sibling_loop_over_one_block_size_matches_reference(
         assert not z[:, :128].any()
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(256,), (1024,)])
 def test_packet_store_beside_the_previous_elements_read_matches_reference(
@@ -7333,6 +7369,7 @@ def test_packet_store_beside_the_previous_elements_read_matches_reference(
         torch.testing.assert_close(x, v, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     ("kernel", "shape"),
@@ -7384,6 +7421,7 @@ def _repeated_device_loop_reference(
     return out, x
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(("kernel", "args"), _REPEATED_DEVICE_LOOP_KERNELS)
 @pytest.mark.parametrize("shape", [(8, 256), (6, 250)], ids=["full", "partial"])
@@ -7405,6 +7443,7 @@ def test_per_lane_accesses_mapped_differently_in_a_device_loop_match_reference(
         torch.testing.assert_close(inputs[0], expected_x, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(("kernel", "args"), _REPEATED_DEVICE_LOOP_KERNELS)
 def test_per_lane_accesses_mapped_differently_in_a_repeated_device_loop_reject_the_config_on_device(
@@ -7422,6 +7461,7 @@ def test_per_lane_accesses_mapped_differently_in_a_repeated_device_loop_reject_t
         )
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_previous_row_read_at_the_next_tiles_column_rejects_the_config_on_device() -> (
     None
@@ -7438,6 +7478,7 @@ def test_previous_row_read_at_the_next_tiles_column_rejects_the_config_on_device
         )
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 320), (6, 314)], ids=["full", "partial"])
 def test_previous_row_read_at_the_next_tiles_column_matches_reference(
@@ -7470,6 +7511,7 @@ def test_previous_row_read_at_the_next_tiles_column_matches_reference(
         torch.testing.assert_close(x, expected_x, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 256), (6, 250)], ids=["full", "partial"])
 def test_read_modify_write_in_a_vectorized_device_loop_matches_reference(
@@ -7490,6 +7532,7 @@ def test_read_modify_write_in_a_vectorized_device_loop_matches_reference(
         torch.testing.assert_close(x, v, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 2048), (32, 2048)])
 def test_update_under_a_loop_indexed_by_its_begin_matches_reference(
@@ -7523,6 +7566,7 @@ def _shifted_rows_reference(
     return expected
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_folding_store_in_a_repeated_device_loop_rejects_the_config_on_device() -> None:
     # Rows over two threads and a lane loop of two: lane 1's pass stores
@@ -7536,6 +7580,7 @@ def test_folding_store_in_a_repeated_device_loop_rejects_the_config_on_device() 
         )
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 256), (6, 250)], ids=["full", "partial"])
 def test_folding_store_per_thread_matches_reference(shape: tuple[int, int]) -> None:
@@ -7555,6 +7600,7 @@ def test_folding_store_per_thread_matches_reference(shape: tuple[int, int]) -> N
         torch.testing.assert_close(run(v, x), expected, rtol=0, atol=0)  # pyrefly: ignore [not-callable]
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "config",
@@ -7596,6 +7642,7 @@ def _overlapping_rows_reference(
     return expected
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_overlapping_flattened_store_rejects_the_config_on_device() -> None:
     # Rows over two threads and a lane loop of two: lane 1's pass stores
@@ -7609,6 +7656,7 @@ def test_overlapping_flattened_store_rejects_the_config_on_device() -> None:
         )
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 256), (6, 250)], ids=["full", "partial"])
 def test_overlapping_flattened_store_per_thread_matches_reference(
@@ -7629,6 +7677,7 @@ def test_overlapping_flattened_store_per_thread_matches_reference(
         torch.testing.assert_close(run(v, out), expected, rtol=0, atol=0)  # pyrefly: ignore [not-callable]
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_dynamic_overlapping_flattened_store_rejects_the_config_on_device() -> None:
     # The stride is a size argument: paired through it as a uniform value,
@@ -7642,6 +7691,7 @@ def test_dynamic_overlapping_flattened_store_rejects_the_config_on_device() -> N
         )
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 256), (6, 250)], ids=["full", "partial"])
 def test_dynamic_overlapping_flattened_store_per_thread_matches_reference(
@@ -7660,6 +7710,7 @@ def test_dynamic_overlapping_flattened_store_per_thread_matches_reference(
         torch.testing.assert_close(run(v, out), expected, rtol=0, atol=0)  # pyrefly: ignore [not-callable]
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_segment_rows_through_a_uniform_start_match_reference() -> None:
     # Three segments of eight rows, each updated in place by its block with
@@ -7678,7 +7729,12 @@ def test_segment_rows_through_a_uniform_start_match_reference() -> None:
         torch.testing.assert_close(run(offsets, v, x.clone()), expected, rtol=0, atol=0)  # pyrefly: ignore [not-callable]
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+# The full product: the store forms lower through different value paths (a
+# constant fill, a scalar argument, a loaded row vector, a select under a
+# per-row mask), and the placements below broke different forms (at d != dv
+# only the masked one).
 @pytest.mark.parametrize("variant", ["zeros", "ones", "scalar", "rowvec", "masked"])
 @pytest.mark.parametrize(
     ("shape", "d", "dv", "rolled"),
@@ -7750,6 +7806,7 @@ def test_full_slice_store_beside_a_row_reduction_matches_torch_and_triton(
     assert torch.equal(outputs["cute"], outputs["triton"])
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("variant", ["zeros", "masked"])
 @pytest.mark.parametrize("pid_type", ["persistent_blocked", "persistent_interleaved"])
@@ -7789,6 +7846,7 @@ def test_full_slice_store_beside_a_row_reduction_under_a_persistent_grid(
     assert torch.equal(outputs["cute"], outputs["triton"])
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(("d", "chunk"), [(128, 64), (64, 16)])
 def test_full_slice_stores_in_two_root_loops_match_torch_and_triton(
