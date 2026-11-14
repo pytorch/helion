@@ -1940,6 +1940,17 @@ class TestDistributedTileDependencies(TestCase):
         )
 
     @skipIfRefEager("tile dependencies are built only in compiled mode")
+    def test_root_levels_count_a_cross_rank_dependency_twice(self) -> None:
+        """Another rank's publication is a hop of its own: the static dry pass
+        anchor rule reads a root that waits on one as two levels deeper."""
+        symm, x = torch.zeros(2, 4000, device=DEVICE, dtype=torch.bfloat16)
+        group = self._world(4, pipelined_allreduce_kernel)
+        bound = pipelined_allreduce_kernel.bind((symm, x, group, "inband", 4))
+        graph = bound.host_function.device_ir.tile_dependency_graph
+        self.assertEqual(graph.root_producers, {1: frozenset({0})})
+        self.assertEqual(graph.root_levels, {0: 0, 1: 2})
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
     @parametrize("world", (2, 4, 8))
     def test_inband_pushes_and_polls_data(self, world: int) -> None:
         symm, x = torch.zeros(2, 4000, device=DEVICE, dtype=torch.bfloat16)

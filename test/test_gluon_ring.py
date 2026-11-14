@@ -680,6 +680,45 @@ def split_k_tiles(x: torch.Tensor, w: torch.Tensor, part: torch.Tensor) -> torch
     return out
 
 
+@helion.kernel(static_shapes=True, backend="gluon")
+def ring_mm_in_dry_loop(
+    x: torch.Tensor, xm: torch.Tensor, wm: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """A chain of narrow roots (p, q, then e after d) with a ring matmul root
+    between e's anchor and e on e's workers: e's dry-pass loop runs the matmul
+    (a ring root takes its ring step and accumulators from the kernel scope)."""
+    batch, width = x.size()
+    rows, k = xm.size()
+    n = wm.size(1)
+    a = torch.empty_like(x)
+    p = torch.empty((batch, 4), dtype=torch.float32, device=x.device)
+    q = torch.empty((batch, 4), dtype=torch.float32, device=x.device)
+    d = torch.empty_like(x)
+    m = torch.empty((rows, n), dtype=torch.float32, device=x.device)
+    side = torch.empty((batch, 8), dtype=torch.float32, device=x.device)
+    e = torch.empty((batch, 4), dtype=torch.float32, device=x.device)
+    for tile_batch, tile_width in hl.tile([batch, width]):
+        a[tile_batch, tile_width] = x[tile_batch, tile_width] + 1
+    for row, col in hl.tile([batch, 4], block_size=[1, 1]):
+        p[row, col] = torch.sum(a[row, :], dim=-1)[:, None]
+    for row, col in hl.tile([batch, 4], block_size=[1, 1]):
+        q[row, col] = torch.sum(p[row, :], dim=-1)[:, None]
+    for tile_batch, tile_width in hl.tile([batch, width]):
+        d[tile_batch, tile_width] = (
+            a[tile_batch, tile_width] * torch.sum(q[tile_batch, :], dim=-1)[:, None]
+        )
+    for tile_m, tile_n in hl.tile([rows, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(xm[tile_m, tile_k], wm[tile_k, tile_n], acc=acc)
+        m[tile_m, tile_n] = acc
+    for row, col in hl.tile([batch, 8], block_size=[1, 1]):
+        side[row, col] = torch.sum(a[row, :], dim=-1)[:, None]
+    for row, col in hl.tile([batch, 4], block_size=[1, 1]):
+        e[row, col] = torch.sum(d[row, :], dim=-1)[:, None]
+    return e, m, side
+
+
 def _replay(run: object, inputs: list[tuple[torch.Tensor, ...]]) -> list[object]:
     """``run`` on each input back to back in a CUDA graph, so that each launch
     overlaps the last (PDL)."""
@@ -1312,6 +1351,45 @@ class TestGluonRing(TestCase):
         self.assertIn("cp.async.bulk.prefetch.tensor.3d.L2.global.tile", code)
         self.assertNotIn("_RDIM_SIZE", code)
         self._assert_prefetch_in_body(code, "scale_idprefetch_mm")
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_static_dry_pass_runs_ring_roots_in_its_loop(self) -> None:
+        """Under the dynamic pipeline a ring kernel's workers claim tasks root
+        by root, so a waiting root can still take a dry pass (static
+        ``cross_loop_dry_passes``); a ring matmul on its workers between its
+        anchor and it runs in the dry-pass loop."""
+        workers = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+        x = torch.randn([2, 64 * workers], device=DEVICE, dtype=torch.float32)
+        xm = torch.randn([128 * workers, 64], device=DEVICE, dtype=torch.bfloat16)
+        wm = torch.randn([64, 64], device=DEVICE, dtype=torch.bfloat16)
+        a = x + 1
+        d = a * (16 * a.sum(-1, keepdim=True))
+        with self.assertLogs("helion._compiler.cross_loop_codegen", "INFO") as logs:
+            code, (e, m, side) = code_and_output(
+                ring_mm_in_dry_loop,
+                (x, xm, wm),
+                block_sizes=[1, 64, 1, 64, 128, 64, 64],
+                pid_type="persistent_blocked",
+                cross_loop_pipeline="dynamic",
+                num_sm_multiplier=1,
+                num_warps=4,
+                num_stages=2,
+                indexing="tensor_descriptor",
+                # Roots 5 and 6, after root 3 (producers two levels deep).
+                cross_loop_dry_passes=[False, True],
+            )
+        torch.testing.assert_close(
+            e, d.sum(-1, keepdim=True).expand(2, 4), rtol=1e-4, atol=1e-1
+        )
+        torch.testing.assert_close(m, xm.float() @ wm.float(), rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(side, a.sum(-1, keepdim=True).expand(2, 8))
+        messages = {line.split(":", 2)[2] for line in logs.output}
+        self.assertTrue(
+            any(message.startswith("Root 6 runs a dry pass") for message in messages),
+            messages,
+        )
+        self.assertIn("tile_dependency_dry_trip", code)
 
     @skipIfRefEager("checks generated code")
     @skipUnlessGluon()

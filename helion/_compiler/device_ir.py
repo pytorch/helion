@@ -4069,6 +4069,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     config_spec.cross_loop_cluster_edges.length = len(
                         graph.cluster_candidate_ids
                     )
+                if config_spec.supports_config_key("cross_loop_dry_passes"):
+                    config_spec.cross_loop_dry_passes.length = len(
+                        graph.dry_pass_candidate_roots
+                    )
         config_spec.multi_phase = len(device_ir.phases) > 1
         if config_spec.supports_config_key("pallas_load_buffer_count"):
             config_spec.pallas_load_buffer_count.length = sum(

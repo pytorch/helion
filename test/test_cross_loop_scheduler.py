@@ -126,6 +126,67 @@ def test_integer_fill_dry_pass_keeps_the_bound_available() -> None:
         assert not cross_loop_codegen._dry_pass_binds(result, guards, set())
 
 
+def test_dry_fold_keeps_only_blocks_a_later_root_shares_workers_with() -> None:
+    """A block among a fold's roots stays in its loop (first trip) only if it
+    shares workers with a later root or kept block; one sharing workers only
+    with an earlier root moves after the loop, behind that root's live run."""
+    members: dict[int, frozenset[int] | None] = {
+        0: frozenset({5}),
+        1: frozenset({2}),  # shares workers with root 4
+        2: frozenset({0, 1}),  # root
+        3: frozenset({0}),  # shares workers with root 2 only
+        4: frozenset({2, 3}),  # root
+    }
+    kept = cross_loop_codegen._dry_fold_kept(
+        [0, 1, 2, 3, 4], {2, 4}, members, frozenset(range(8))
+    )
+    assert kept == {1}
+    # A block without members runs on every worker.
+    members[0] = None
+    assert cross_loop_codegen._dry_fold_kept(
+        [0, 1, 2, 3, 4], {2, 4}, members, frozenset(range(8))
+    ) == {0, 1}
+
+
+def test_dry_fold_checks_each_block_a_dry_root_now_precedes() -> None:
+    """A dry root's bindings cross its fold when a block that now runs after
+    it, but ran before it, reads them: a kept block from the root's own anchor
+    on (first trip) or another root of the fold (its live run, second trip).
+    A store in an earlier block hides no such read, and kept blocks before
+    the root's anchor run before its dry pass."""
+    parse = lambda source: ast.parse(source).body  # noqa: E731
+    blocks = {
+        10: parse("x = 1\nv = u"),  # anchor of root 13, kept
+        11: parse("pass"),  # anchor of root 14, kept
+        12: parse("y = x"),  # kept, after root 14's anchor
+        13: parse("w = z"),  # root
+        14: parse("x = 99\nz = 5\nu = 7"),  # root
+    }
+    fold = cross_loop_codegen._DryFold(
+        live="live",
+        anchors={13: 10, 14: 11},
+        rewritten={13: blocks[13], 14: blocks[14]},
+        helper_bodies={},
+    )
+    region = [10, 11, 12, 13, 14]
+    first_trip = lambda body: ast.If(  # noqa: E731
+        test=ast.parse("trip == 0", mode="eval").body, body=body, orelse=[]
+    )
+    loop_body = [
+        *blocks[13],
+        first_trip(blocks[10]),
+        *blocks[14],
+        first_trip([*blocks[11], *blocks[12]]),
+    ]
+    crossing = cross_loop_codegen._dry_fold_crossing(
+        fold, region, {10, 11, 12}, blocks, loop_body, parse("u = 0"), [], {}
+    )
+    # x: block 12 reads it after root 14's anchor (block 10's store does not
+    # hide the read); z: root 13's live run reads it on the second trip; u:
+    # block 10 reads it before root 14's dry pass, so it does not cross.
+    assert crossing == {"x", "z"}
+
+
 def _domain(
     *axis_specs: tuple[Any, ...],
     kind: Literal[

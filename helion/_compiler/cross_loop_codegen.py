@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import functools
+import logging
 import math
 from typing import TYPE_CHECKING
 from typing import TypeGuard
@@ -75,6 +77,8 @@ if TYPE_CHECKING:
     from .program_id import ProgramIDs
     from .tile_dependency import TileAccess
     from .tile_dependency import TileDependencyGraph
+
+log = logging.getLogger(__name__)
 
 
 # Independent readiness counters occupy distinct cache lines so polling one
@@ -1608,16 +1612,23 @@ def _triton_root_requires_kernel_scope(
     """
     if target_device_capability is None or target_device_capability[0] < 10:
         return False
+    # Gluon ring sites (``gluon_ring`` / ``gluon_ops`` in generated code) carry
+    # the kernel's ring step and TMEM accumulators.
+    return _calls_module(
+        body,
+        {"tl": {"dot", "dot_scaled"}, "_helion_ring": None, "_helion_gluon": None},
+    )
+
+
+def _calls_module(body: list[ast.stmt], names: dict[str, set[str] | None]) -> bool:
+    """Whether ``body`` calls ``module.<name>`` for a module of ``names`` and one
+    of its names (any name when None)."""
     return any(
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and isinstance(node.func.value, ast.Name)
-        and (
-            (node.func.value.id == "tl" and node.func.attr in {"dot", "dot_scaled"})
-            # Gluon ring sites (``gluon_ring`` / ``gluon_ops`` in generated
-            # code) carry the kernel's ring step and TMEM accumulators.
-            or node.func.value.id in {"_helion_ring", "_helion_gluon"}
-        )
+        and node.func.value.id in names
+        and ((attrs := names[node.func.value.id]) is None or node.func.attr in attrs)
         for statement in body
         for node in ast.walk(statement)
     )
@@ -1966,6 +1977,17 @@ def _guarded_extent(
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class _DryFold:
+    """One two-trip loop of ``static_dry_passes``: its roots' anchors and dry
+    rewrites, and the helpers those rewrites reach."""
+
+    live: str
+    anchors: dict[int, int]
+    rewritten: dict[int, list[ast.stmt]]
+    helper_bodies: dict[str, list[ast.stmt]]
+
+
 class _Rename(ast.NodeTransformer):
     def __init__(self, names: dict[str, str]) -> None:
         self.names = names
@@ -2101,6 +2123,119 @@ def _read_and_stored(
             free |= loads(statement) - stored
             stored |= _stored_names([statement], renames)
     return free, frozenset(stored)
+
+
+def _dry_fold_kept(
+    region: Sequence[int],
+    roots: Collection[int],
+    members: Mapping[int, frozenset[int] | None],
+    every_worker: frozenset[int],
+) -> set[int]:
+    """The blocks of a ``static_dry_passes`` fold's ``region`` (its roots and
+    the blocks among them, in order) that its loop runs on the first trip,
+    ahead of the roots' live runs: those sharing workers with a later root or
+    kept block, which cannot move after the loop. The others move after it.
+    A block with no members runs on every worker."""
+    busy: set[int] = set()
+    kept: set[int] = set()
+    for block in reversed(region):
+        block_workers = members[block]
+        if block_workers is None:
+            block_workers = every_worker
+        if block in roots:
+            busy |= block_workers
+        elif block_workers & busy:
+            kept.add(block)
+            busy |= block_workers
+    return kept
+
+
+def _dry_fold_crossing(
+    fold: _DryFold,
+    region: Sequence[int],
+    kept: Collection[int],
+    blocks: Mapping[int, list[ast.stmt]],
+    loop_body: list[ast.stmt],
+    prefix: Sequence[ast.stmt],
+    suffix: Sequence[ast.stmt],
+    renames: Mapping[str, str],
+) -> set[str]:
+    """The names a ``static_dry_passes`` fold would move a value of across its
+    loop (empty if it may lower). ``region`` holds its roots and the blocks
+    among them in order; ``kept`` those the loop runs on its first trip (the
+    others move after it); ``loop_body`` the loop's statements; ``prefix`` and
+    ``suffix`` the statements around the fold; ``renames`` the emitted names
+    (``DeviceFunction.variable_renames``).
+
+    Nothing the loop binds may be read after it unless the loop carries it
+    (bound before it: a name the loop reads before storing); the moved blocks
+    and the loop read nothing the other binds (each loop block's reads on
+    their own: one bound by an earlier loop block may have read a moved
+    block's binding) and bind nothing both that is read after the loop; a dry
+    root reads nothing a kept block from its anchor on binds (blocks it now
+    precedes; a moved one's bindings are checked against the loop already), and
+    binds nothing read by a block that now runs after it but ran before it: a
+    kept block from the root's anchor on (first trip), or another root before
+    it (live, second trip). Each such block's reads count on their own, so a store in an
+    earlier block never hides one. Nor may a later statement of the loop read
+    what an ``if`` of the loop (a first-trip group, a guard) binds on some
+    paths only: Triton exports no name bound in one branch only unless it is
+    bound before the ``if``."""
+    free = functools.partial(_free_reads, renames=renames)
+    stored = functools.partial(_stored_names, renames=renames)
+    flow = functools.partial(_read_and_stored, renames=renames)
+    position = {block: index for index, block in enumerate(region)}
+    first = min(position[root] for root in fold.anchors)
+    moved_blocks = [
+        blocks[block]
+        for block in region
+        if block not in kept and block not in fold.anchors
+    ]
+    moved = [s for body in moved_blocks for s in body]
+    loop_blocks = [
+        *fold.rewritten.values(),
+        *(blocks[block] for block in region if block in kept),
+    ]
+    bound = flow(prefix, frozenset())[1]
+    carried = bound | free(loop_body)
+    in_loop = stored(loop_body)
+    crossing = (
+        (in_loop - carried) & free([*moved, *suffix])
+        | stored(moved) & {n for body in loop_blocks for n in free(body)}
+        | stored(moved) & in_loop & free(suffix)
+        | in_loop & {n for body in moved_blocks for n in free(body)}
+        | {
+            name
+            for root, body in fold.rewritten.items()
+            for name in free(body)
+            & stored(
+                [
+                    s
+                    for block in region
+                    if block in kept
+                    and position[fold.anchors[root]] <= position[block] < first
+                    for s in blocks[block]
+                ]
+            )
+        }
+        | {
+            name
+            for root, body in fold.rewritten.items()
+            for block in region
+            if position[block] < position[root]
+            and (
+                (block in fold.anchors and block != root)
+                or (block in kept and position[block] >= position[fold.anchors[root]])
+            )
+            for name in stored(body) & free(blocks[block])
+        }
+    )
+    for index, statement in enumerate(loop_body):
+        if isinstance(statement, ast.If):
+            before = flow(loop_body[:index], bound)[1]
+            always = flow([statement], before)[1]
+            crossing |= (stored([statement]) - always) & free(loop_body[index + 1 :])
+    return crossing
 
 
 def _all_names(nodes: Iterable[ast.AST]) -> set[str]:
@@ -2317,6 +2452,20 @@ def _dry_pass_rewrite(
             )
         result.append(statement)
     return result
+
+
+def _two_trip_loop(trip: str, start: str, live: str, body: list[ast.stmt]) -> ast.For:
+    """``body`` run twice, dry then live (``live`` true on the second trip),
+    in one code copy: ``start`` is 0 at run time but opaque to the compiler,
+    which unrolls constant bounds into two copies."""
+    return create(
+        ast.For,
+        target=create(ast.Name, id=trip, ctx=ast.Store()),
+        iter=expr_from_string(f"tl.range({start}, 2, 1, num_stages=1)"),
+        body=[statement_from_string(f"{live} = {trip} == 1"), *body],
+        orelse=[],
+        type_comment=None,
+    )
 
 
 def _dry_pass_binds(
@@ -3362,12 +3511,17 @@ def emit_cross_loop_schedule(
             or root in inband_consumer_roots
         )
 
-    def dry_pass_task(task_body: list[ast.stmt]) -> list[ast.stmt] | None:
-        """Run a waiting task once with memory masked and waits skipped.
+    # Helpers a dry pass gave the live predicate.  Every outlined region has a
+    # helper of its own, so no two dry passes reach one.
+    dry_pass_helpers: set[str] = set()
 
-        The dry pass warms the task's code while it would otherwise wait. Both
-        passes share one loop body; None if a skipped value would be read.
-        """
+    def dry_pass_rewrite(
+        task_body: list[ast.stmt], live: str
+    ) -> tuple[list[ast.stmt], dict[str, list[ast.stmt]]] | None:
+        """``task_body`` with memory masked and waits skipped unless ``live``,
+        and the bodies of the helpers it calls, likewise (they take ``live``;
+        ``commit_dry_pass`` installs them); None if a skipped value would be
+        read."""
         helpers = {
             name: (arguments, body)
             for name, arguments, body, _noinline in (
@@ -3386,7 +3540,6 @@ def emit_cross_loop_schedule(
                 ):
                     reachable.append(node.func.id)
                     pending.append(list(helpers[node.func.id][1]))
-        live = device_function.new_var("tile_dependency_live", dce=False)
 
         def rewrite(body: Iterable[ast.stmt], bound: set[str]) -> list[ast.stmt] | None:
             guards: list[ast.If] = []
@@ -3407,27 +3560,33 @@ def emit_cross_loop_schedule(
         branch_body = rewrite(task_body, set())
         if branch_body is None or None in helper_bodies.values():
             return None
+        return branch_body, cast("dict[str, list[ast.stmt]]", helper_bodies)
+
+    def commit_dry_pass(helper_bodies: dict[str, list[ast.stmt]], live: str) -> None:
+        """Install a dry pass's helper bodies (each takes ``live`` last)."""
+        taken = dry_pass_helpers.intersection(helper_bodies)
+        assert not taken, f"helpers {sorted(taken)} already take a live predicate"
         outlined = device_function.triton_outlined_helpers
         for index, (name, arguments, _body, noinline) in enumerate(outlined):
             if (helper_body := helper_bodies.get(name)) is not None:
                 outlined[index] = (name, (*arguments, live), (*helper_body,), noinline)
+        dry_pass_helpers.update(helper_bodies)
+
+    def dry_pass_task(task_body: list[ast.stmt]) -> list[ast.stmt] | None:
+        """Run a waiting task once with memory masked and waits skipped.
+
+        The dry pass warms the task's code while it would otherwise wait. Both
+        passes share one loop body; None if a skipped value would be read.
+        """
+        live = device_function.new_var("tile_dependency_live", dce=False)
+        planned = dry_pass_rewrite(task_body, live)
+        if planned is None:
+            return None
+        branch_body, helper_bodies = planned
+        commit_dry_pass(helper_bodies, live)
         dry_pass = device_function.new_var("tile_dependency_dry_pass", dce=False)
-        # A runtime zero start keeps ptxas from unrolling the two passes.
-        return [
-            create(
-                ast.For,
-                target=create(ast.Name, id=dry_pass, ctx=ast.Store()),
-                iter=expr_from_string(
-                    f"tl.range({dispatch_ticket} // {1 << 30}, 2, 1, num_stages=1)"
-                ),
-                body=[
-                    statement_from_string(f"{live} = {dry_pass} == 1"),
-                    *branch_body,
-                ],
-                orelse=[],
-                type_comment=None,
-            ),
-        ]
+        start = f"{dispatch_ticket} // {1 << 30}"
+        return [_two_trip_loop(dry_pass, start, live, branch_body)]
 
     def flat_task_coordinates(
         task: str,
@@ -4597,13 +4756,12 @@ def emit_cross_loop_schedule(
             )
         return rotated_lane(root, worker)
 
-    def rotated_lane(root: int, worker: str) -> str:
-        # A root begins mid-wave, where the earlier roots' live tasks end
-        # (without packing, only trailing roots): rotate workers onto its
-        # lanes. Waves and slots stay the plan's; only a lane's worker moves.
+    def skipped_lanes(root: int) -> list[str]:
+        """The earlier roots' skipped tasks that shift ``root``'s lanes (their
+        live counts are known only at run time)."""
         plan = static_pipeline_plan
         start = root_lane_origins[root]
-        skipped = [
+        return [
             f"({count} - tl.minimum({live}, {count}))"
             for earlier, (live, count) in resident_live_tasks.items()
             if (
@@ -4612,6 +4770,23 @@ def emit_cross_loop_schedule(
                 else plan.static_base(earlier) < start
             )
         ]
+
+    def active_workers(root: int) -> int:
+        """How many lanes (from 0) ``root``'s tasks occupy."""
+        task_count = static_pipeline_plan.execution_orders[root].task_count
+        return min(launch_worker_count, task_count)
+
+    def static_rotation(root: int) -> int:
+        """The worker shift ``rotated_lane`` applies when no earlier root's
+        live tasks move ``root``'s lanes."""
+        return -root_lane_origins[root] % launch_worker_count
+
+    def rotated_lane(root: int, worker: str) -> str:
+        # A root begins mid-wave, where the earlier roots' live tasks end
+        # (without packing, only trailing roots): rotate workers onto its
+        # lanes. Waves and slots stay the plan's; only a lane's worker moves.
+        start = root_lane_origins[root]
+        skipped = skipped_lanes(root)
         if skipped:
             # Whole waves keep the dividend nonnegative.
             waves = start // launch_worker_count + 1
@@ -4619,9 +4794,29 @@ def emit_cross_loop_schedule(
                 f"(({worker}) + {waves * launch_worker_count - start} + "
                 f"{' + '.join(skipped)}) % {launch_worker_count}"
             )
-        rotation = -start % launch_worker_count
+        rotation = static_rotation(root)
         return (
             f"(({worker}) + {rotation}) % {launch_worker_count}" if rotation else worker
+        )
+
+    def static_members(root: int) -> frozenset[int] | None:
+        """The workers ``root_lane`` gives ``root``'s tasks when that is static
+        (None: a cluster's lanes, a rotation by earlier roots' live tasks, or a
+        deferred release every worker publishes).  Valid once the earlier
+        resident roots are lowered."""
+        if (
+            root in cluster_producers
+            or root in cluster_consumers
+            or root in deferred_releases
+            or skipped_lanes(root)
+        ):
+            return None
+        active = active_workers(root)
+        rotation = static_rotation(root)
+        return frozenset(
+            w
+            for w in range(launch_worker_count)
+            if (w + rotation) % launch_worker_count < active
         )
 
     def guarded_live_tasks(extent: _GuardedExtent) -> tuple[list[ast.stmt], str]:
@@ -4779,7 +4974,7 @@ def emit_cross_loop_schedule(
     def static_root_body(root: int) -> list[ast.stmt]:
         """Lower one resident root from its scalar ownership fold."""
         task_count_value = static_pipeline_plan.execution_orders[root].task_count
-        active_worker_count = min(launch_worker_count, task_count_value)
+        active_worker_count = active_workers(root)
         segment_begin = static_pipeline_plan.static_base(root)
         segment_end = segment_begin + task_count_value
         lane = root_lane(root)
@@ -5065,9 +5260,278 @@ def emit_cross_loop_schedule(
             *trailer,
         ]
 
+    def static_dry_passes(
+        preamble: list[ast.stmt],
+        blocks: dict[int, list[ast.stmt]],
+        members: dict[int, frozenset[int] | None],
+    ) -> list[ast.stmt]:
+        """The resident roots' blocks, in order, with each root the config
+        selects (``cross_loop_dry_passes``) also run once dry in an earlier
+        idle window of its workers, one code copy per fold:
+
+            for trip in range(2):          # opaque start: one copy, two trips
+                live = trip == 1
+                <the root's block>         # before its anchor block
+                if trip == 0:
+                    <the blocks from the anchor on that share workers with the
+                     root, or with a later block kept here>
+            <the other blocks from the anchor on, in order>
+
+        Trip 0 runs the root dry (``dry_pass_rewrite``: memory masked, waits
+        and publications skipped) before its anchor, whose dependency wait
+        idles the root's workers; trip 1 runs it live where it ran before, so
+        every worker's task order is unchanged.  The anchor is the latest
+        block on all the root's workers whose producers lie at least two
+        dependency levels deeper than what each of those workers ran before it
+        (a block that waits, a cross-rank dependency counting two levels; the
+        latest keeps the warmed code closest to its live run).  A root
+        anchored at or before a fold's last root joins that fold if it still
+        lowers with it; one anchored after opens the next.  A root no fold can
+        carry keeps its block.  ``preamble`` is the code before the blocks."""
+        order = list(blocks)
+        selected = cast(
+            "list[bool]",
+            device_function.config.get("cross_loop_dry_passes", None) or [],
+        )
+        candidates = dependency_graph.dry_pass_candidate_roots
+        # A config without the key keeps today's code; normalize sizes the rest.
+        assert not selected or len(selected) == len(candidates)
+        chosen = {root for root, on in zip(candidates, selected, strict=False) if on}
+        wanted = [root for root in order if root in chosen]
+        levels = dependency_graph.root_levels
+        producers = dependency_graph.root_producers
+
+        def anchor(root: int) -> int | str:
+            """The root's anchor block, or why it has none."""
+            workers = members[root]
+            if (
+                not workers
+                or root in ws_roots
+                or root in kernel_scope_roots
+                or root in deferred_last_task
+                or root in deferred_releases
+                or static_pipeline_plan.execution_orders[root].task_count
+                > launch_worker_count
+            ):
+                return "not a single-wave body root on static workers"
+            if root in guarded_extents:
+                # The dry trip masks the loaded task count to zero: no task runs.
+                return "its task count is loaded (a guarded extent)"
+            if not waits_on_dependency(root):
+                return "waits on nothing"
+            found: int | str = "no earlier block on its workers waits on a deeper chain"
+            ran = dict.fromkeys(workers, 0)  # each worker's last block's level
+            for block in order[: order.index(root)]:
+                block_workers = members[block]
+                if block_workers is not None and workers <= block_workers:
+                    needs = max(
+                        (levels[p] for p in producers.get(block, ())), default=-1
+                    )
+                    if all(needs - ran[worker] >= 2 for worker in workers):
+                        found = block
+                for worker in (
+                    workers if block_workers is None else workers & block_workers
+                ):
+                    ran[worker] = levels[block]
+            return found
+
+        # The roots in block order, grouped into folds whose anchors follow the
+        # roots' order.  A fold takes a root only if it still lowers with it,
+        # so a root that cannot join never cancels the others' dry passes.
+        out: list[ast.stmt] = []
+        position = 0  # the blocks before it are in ``out``
+        fold: _DryFold | None = None
+        lowered: list[ast.stmt] = []
+
+        def statements(begin: int, end: int | None = None) -> list[ast.stmt]:
+            return [s for b in order[begin:end] for s in blocks[b]]
+
+        def span(dry: _DryFold) -> tuple[int, int]:
+            return (
+                order.index(min(dry.anchors.values(), key=order.index)),
+                order.index(max(dry.anchors, key=order.index)) + 1,
+            )
+
+        def lower(
+            dry: _DryFold, ahead: tuple[_DryFold, list[ast.stmt]] | None = None
+        ) -> list[ast.stmt] | str:
+            """``dry`` lowered after ``out``, and after ``ahead`` (an open fold
+            and its lowering) if given."""
+            begin, end = span(dry)
+            head = [*preamble, *out]
+            first = position
+            if ahead is not None:
+                ahead_begin, first = span(ahead[0])
+                head += [*statements(position, ahead_begin), *ahead[1]]
+            return fold_region(
+                dry,
+                order[begin:end],
+                [*head, *statements(first, begin)],
+                statements(end),
+                blocks,
+                members,
+            )
+
+        def finish(dry: _DryFold, emitted: list[ast.stmt]) -> None:
+            nonlocal position
+            begin, end = span(dry)
+            out.extend(statements(position, begin))
+            out.extend(emitted)
+            position = end
+            commit_dry_pass(dry.helper_bodies, dry.live)
+            for root, at in dry.anchors.items():
+                log.info("Root %d runs a dry pass before root %d", root, at)
+
+        for root in sorted(chosen - set(order)):
+            log.info("Root %d keeps no dry pass: it has no block of its own", root)
+        for root in wanted:
+            found = anchor(root)
+            if isinstance(found, str):
+                log.info("Root %d keeps no dry pass: %s", root, found)
+                continue
+            # A trip that updates state the blocks carry (a counter it reads
+            # before storing) would update it twice.
+            renames = device_function.variable_renames()
+            if _free_reads(blocks[root], renames=renames) & _stored_names(
+                blocks[root], renames
+            ):
+                log.info("Root %d keeps no dry pass: it updates carried state", root)
+                continue
+            # An anchor up to the fold's last root joins that fold.  One before
+            # the fold's latest anchor, or among blocks already emitted (a
+            # finished fold's), has no loop to join.
+            floor = position
+            if fold is not None:
+                floor = max(
+                    floor, order.index(max(fold.anchors.values(), key=order.index))
+                )
+            if order.index(found) < floor:
+                log.info(
+                    "Root %d keeps no dry pass: its anchor precedes another's or "
+                    "lies in an emitted loop",
+                    root,
+                )
+                continue
+            joined = fold
+            if fold is not None and order.index(found) >= span(fold)[1]:
+                joined = None
+            live = (
+                joined.live
+                if joined is not None
+                else device_function.new_var("tile_dependency_live", dce=False)
+            )
+            planned = dry_pass_rewrite(blocks[root], live)
+            if planned is None:
+                log.info("Root %d keeps no dry pass: its dry rewrite fails", root)
+                continue
+            if joined is not None:
+                grown = _DryFold(
+                    live,
+                    {**joined.anchors, root: found},
+                    {**joined.rewritten, root: planned[0]},
+                    {**joined.helper_bodies, **planned[1]},
+                )
+            else:
+                grown = _DryFold(live, {root: found}, {root: planned[0]}, planned[1])
+            # A new fold lowers after the open one, which stays open (and can
+            # still take later roots) if the new one fails.
+            ahead = None if joined is not None or fold is None else (fold, lowered)
+            attempt = lower(grown, ahead)
+            if isinstance(attempt, str):
+                log.info("Root %d keeps no dry pass: %s", root, attempt)
+                continue
+            if ahead is not None:
+                finish(*ahead)
+            fold, lowered = grown, attempt
+        if fold is not None:
+            finish(fold, lowered)
+        out.extend(statements(position))
+        return out
+
+    def fold_region(
+        fold: _DryFold,
+        region: list[int],
+        prefix: list[ast.stmt],
+        suffix: list[ast.stmt],
+        blocks: dict[int, list[ast.stmt]],
+        members: dict[int, frozenset[int] | None],
+    ) -> list[ast.stmt] | str:
+        """One fold of ``static_dry_passes`` over ``region``'s blocks, or why it
+        cannot carry them; ``prefix`` and ``suffix`` are the statements around
+        it."""
+        trip = device_function.new_var("tile_dependency_dry_trip", dce=False)
+        start = f"tl.program_id(0) // {1 << 29}"
+        order = list(blocks)
+        kept = _dry_fold_kept(
+            region, fold.anchors, members, frozenset(range(launch_worker_count))
+        )
+        # Like the packet path's dry passes, keep tl.dot roots out of the loop
+        # (tl.range fails to compile around their tensor memory); ring sites
+        # take their accumulators from the kernel scope.
+        for block in sorted(kept):
+            if block in ws_roots:
+                return f"root {block} would run in its loop and is warp-specialized"
+            if block in kernel_scope_roots and _calls_module(
+                blocks[block], {"tl": {"dot", "dot_scaled"}}
+            ):
+                return f"root {block} would run in its loop and uses tl.dot"
+        # Trip 0 runs every kept block before trip 1 runs the roots live: none
+        # may come after the first root.
+        first = min(order.index(root) for root in fold.anchors)
+        if any(order.index(block) > first for block in kept):
+            return f"a block after root {order[first]} shares its workers"
+        # The start is always 0, but its range [0, 3] leaves the trip count
+        # possibly <= 0: starts that pin it to 2 trips, or to at least 1, made
+        # ptxas spill.  Unlike an epoch-derived start it never wraps.
+        loop = _two_trip_loop(trip, start, fold.live, [])
+        loop_body = loop.body
+        once: list[ast.stmt] = []
+        hoisted_blocks: list[list[ast.stmt]] = []
+
+        def flush() -> None:
+            if once:
+                loop_body.append(
+                    create(
+                        ast.If,
+                        test=expr_from_string(f"{trip} == 0"),
+                        body=[*once],
+                        orelse=[],
+                    )
+                )
+                once.clear()
+
+        for block in region:
+            for root, at in fold.anchors.items():
+                if at == block:
+                    flush()
+                    loop_body.extend(fold.rewritten[root])
+            if block in fold.anchors:
+                continue
+            if block in kept:
+                once.extend(blocks[block])
+            else:
+                hoisted_blocks.append(blocks[block])
+        flush()
+        crossing = _dry_fold_crossing(
+            fold,
+            region,
+            kept,
+            blocks,
+            loop_body,
+            prefix,
+            suffix,
+            device_function.variable_renames(),
+        )
+        if crossing:
+            return f"values would cross its loop ({sorted(crossing)})"
+        return [loop, *(s for block_body in hoisted_blocks for s in block_body)]
+
     if not uses_packet_dispatch:
         assert state_arg is not None
+        blocks: dict[int, list[ast.stmt]] = {}
+        members: dict[int, frozenset[int] | None] = {}
         for root in static_pipeline_plan.resident_roots:
+            members[root] = static_members(root)
             body = static_root_body(root)
             # The gate precedes the first task loop, after its hoisted loads.
             first = next(
@@ -5078,9 +5542,10 @@ def emit_cross_loop_schedule(
                 ),
                 0,
             )
-            result.extend([*body[:first], *entry_gate, *body[first:]])
+            blocks[root] = [*body[:first], *entry_gate, *body[first:]]
             entry_gate = []
         assert not entry_gate, "inband scatters need a resident root"
+        result.extend(static_dry_passes(result, blocks, members))
         _reuse_guard_values(result, guard_statements)
         writes: list[ast.stmt] = [
             statement_from_string(f"tl.store({state_arg} + {worker}, {epoch_var})")

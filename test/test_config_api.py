@@ -92,6 +92,7 @@ from helion._compiler.cute.tcgen05_constants import (
 )
 from helion._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from helion._compiler.pallas.backend import PallasBackend
+from helion._compiler.triton.backend import GluonBackend
 from helion._compiler.triton.backend import TritonBackend
 from helion._testing import TestCase
 from helion._testing import onlyBackends
@@ -599,6 +600,34 @@ class TestConfigAPI(TestCase):
             ):
                 spec.normalize(
                     helion.Config.from_dict({"cross_loop_pipeline": "unknown"})
+                )
+
+    def test_dry_passes_reset_where_no_worker_owns_its_tasks(self) -> None:
+        """Only static workers, and dynamic ones on a Gluon ring (claimed
+        roots), read cross_loop_dry_passes: the barrier pipeline and dynamic
+        packet dispatch (no ring) reset it to one tune point."""
+        ring = {"num_stages": 2, "num_warps": 4, "indexing": "tensor_descriptor"}
+        with patch("helion._compat.is_hip", return_value=False):
+            for backend, pipeline, extra, kept in (
+                (TritonBackend(), "static", {}, True),
+                (TritonBackend(), "barrier", {}, False),
+                (TritonBackend(), "dynamic", ring, False),
+                (GluonBackend(), "dynamic", {}, False),
+                (GluonBackend(), "dynamic", ring, True),
+            ):
+                spec = ConfigSpec(backend=backend)
+                spec.enable_cross_loop_pipeline()
+                spec.cross_loop_dry_passes = ListOf(BooleanFragment(), length=2)
+                config = helion.Config(
+                    cross_loop_pipeline=pipeline,
+                    cross_loop_dry_passes=[False, True],
+                    **extra,
+                )
+                spec.normalize(config)
+                self.assertEqual(
+                    config["cross_loop_dry_passes"],
+                    [False, True] if kept else [False, False],
+                    (type(backend).__name__, pipeline, extra),
                 )
 
     def test_legacy_cross_loop_schedule_normalizes_to_pipeline(self) -> None:

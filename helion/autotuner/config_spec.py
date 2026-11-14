@@ -781,6 +781,7 @@ _BACKEND_GATED_GENERIC_KEYS: frozenset[str] = frozenset(
         "cross_loop_pipeline",
         "cross_loop_tmem_prefetch",
         "cross_loop_cluster_edges",
+        "cross_loop_dry_passes",
         "load_cache_modifiers",
         "store_cache_modifiers",
         "host_tensor_descriptors",
@@ -1044,6 +1045,13 @@ class ConfigSpec:
         # One entry per allocation a launch cluster may carry between roots
         # (TileDependencyGraph.cluster_candidate_ids, sorted); True carries it so.
         self.cross_loop_cluster_edges = ListOf(BooleanFragment(), length=0)
+        # One entry per root waiting on an earlier root after the first root
+        # whose producers lie two levels deep
+        # (TileDependencyGraph.dry_pass_candidate_roots); True runs that root's
+        # tasks once dry, earlier, in an idle window of its workers (workers
+        # that own their tasks: not the barrier pipeline nor packet dispatch;
+        # ``static_dry_passes`` in cross_loop_codegen).
+        self.cross_loop_dry_passes = ListOf(BooleanFragment(), length=0)
 
         self.allowed_pid_types: tuple[PidTypeLiteral, ...] = tuple(VALID_PID_TYPES)
         # Keep alternative pid types searchable when an ordered reference uses flat.
@@ -2207,6 +2215,7 @@ class ConfigSpec:
             "static_ranges",
             "cross_loop_tmem_prefetch",
             "cross_loop_cluster_edges",
+            "cross_loop_dry_passes",
             "load_eviction_policies",
             "load_cache_modifiers",
             "store_cache_modifiers",
@@ -2227,6 +2236,7 @@ class ConfigSpec:
             "load_cache_modifiers",
             "store_cache_modifiers",
             "cross_loop_cluster_edges",
+            "cross_loop_dry_passes",
             "indexing",
             "atomic_indexing",
             "pallas_load_buffer_count",
@@ -2279,29 +2289,29 @@ class ConfigSpec:
             config.setdefault(
                 "store_cache_modifiers", self.store_cache_modifiers.default()
             )
-        if (
-            self.supports_config_key("cross_loop_cluster_edges")
-            and self.cross_loop_cluster_edges.length > 0
+        for key, flags, entry in (
+            (
+                "cross_loop_cluster_edges",
+                self.cross_loop_cluster_edges,
+                "cluster candidate",
+            ),
+            ("cross_loop_dry_passes", self.cross_loop_dry_passes, "waiting root"),
         ):
-            values = config.setdefault(
-                "cross_loop_cluster_edges", self.cross_loop_cluster_edges.default()
-            )
-            expected = self.cross_loop_cluster_edges.length
+            if not (self.supports_config_key(key) and flags.length > 0):
+                config.pop(key, None)
+                continue
+            values = config.setdefault(key, flags.default())
             if (
                 not isinstance(values, list)
-                or len(values) != expected
+                or len(values) != flags.length
                 or any(type(value) is not bool for value in values)
             ):
                 if not _fix_invalid:
                     raise InvalidConfig(
-                        "cross_loop_cluster_edges must be a list of one bool per "
-                        f"cluster candidate (expected {expected}, got {values!r})"
+                        f"{key} must be a list of one bool per {entry} "
+                        f"(expected {flags.length}, got {values!r})"
                     )
-                config["cross_loop_cluster_edges"] = (
-                    self.cross_loop_cluster_edges.default()
-                )
-        else:
-            config.pop("cross_loop_cluster_edges", None)
+                config[key] = flags.default()
         if self.supports_config_key("indexing"):
             config.setdefault("indexing", self.indexing.default())
         if self.supports_config_key("atomic_indexing"):
@@ -2354,6 +2364,16 @@ class ConfigSpec:
                         "inband scatters need cross_loop_pipeline='static', or "
                         "'dynamic' with a ring (claimed roots)"
                     )
+            # Only workers that own their tasks read a dry pass entry: the
+            # barrier pipeline and dynamic packets (no ring) keep one tune point.
+            if "cross_loop_dry_passes" in config and (
+                config["cross_loop_pipeline"] == "barrier"
+                or (
+                    config["cross_loop_pipeline"] == "dynamic"
+                    and not ring_depth(config, self.backend_name)
+                )
+            ):
+                config["cross_loop_dry_passes"] = self.cross_loop_dry_passes.default()
         surface.normalize_recurrence_families(self, config, fix_invalid=_fix_invalid)
         surface.normalize_pre_pid_type(self, config, fix_invalid=_fix_invalid)
         indirect_modes = (
@@ -3039,11 +3059,14 @@ class ConfigSpec:
             and self.store_cache_modifiers.length > 0
         ):
             fields["store_cache_modifiers"] = self.store_cache_modifiers
-        if (
-            self.supports_config_key("cross_loop_cluster_edges")
-            and self.cross_loop_cluster_edges.length > 0
-        ):
-            fields["cross_loop_cluster_edges"] = self.cross_loop_cluster_edges
+        fields.update(
+            (key, flags)
+            for key, flags in (
+                ("cross_loop_cluster_edges", self.cross_loop_cluster_edges),
+                ("cross_loop_dry_passes", self.cross_loop_dry_passes),
+            )
+            if self.supports_config_key(key) and flags.length > 0
+        )
         if self.supports_config_key("num_threads"):
             fields["num_threads"] = self.num_threads
         if is_tileir:
@@ -3361,6 +3384,7 @@ class ConfigSpec:
             "static_ranges",
             "cross_loop_tmem_prefetch",
             "cross_loop_cluster_edges",
+            "cross_loop_dry_passes",
             "load_eviction_policies",
             "load_cache_modifiers",
             "store_cache_modifiers",

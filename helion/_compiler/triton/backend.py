@@ -179,7 +179,7 @@ class TritonBackend(Backend):
     def supports_config_key(self, key: str) -> bool:
         if key == "host_tensor_descriptors":
             return self.name == "triton" and _compat.supports_host_tensor_descriptor()
-        if key == "cross_loop_pipeline":
+        if key in ("cross_loop_pipeline", "cross_loop_dry_passes"):
             return self.uses_triton_compiler and not _compat.is_hip()
         if key in ("load_cache_modifiers", "store_cache_modifiers"):
             return True

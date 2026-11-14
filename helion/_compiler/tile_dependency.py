@@ -4890,6 +4890,63 @@ class TileDependencyGraph:
         return _scatter_position(self.inband_store(allocation_id))
 
     @property
+    def root_producers(self) -> dict[int, frozenset[int]]:
+        """The earlier roots each root waits on (roots without one omitted)."""
+        producers: dict[int, set[int]] = {}
+        for edge in self.edges:
+            if edge.producer_root < edge.consumer_root:
+                producers.setdefault(edge.consumer_root, set()).add(edge.producer_root)
+        return {root: frozenset(roots) for root, roots in producers.items()}
+
+    @property
+    def root_levels(self) -> dict[int, int]:
+        """Each root's depth in the root dependency DAG, a measure of how long
+        its dependency wait lasts: 0 without a producer root, else the deepest
+        producer's level plus one, or plus two over a dependency that crosses
+        ranks (another rank's publication is a hop of its own)."""
+        steps: dict[int, dict[int, int]] = {}
+        for edge in self.edges:
+            if edge.producer_root < edge.consumer_root:
+                crosses = any(
+                    self.transport(dependency) not in ("counter", "cluster")
+                    for dependency in edge.access_dependencies
+                )
+                into = steps.setdefault(edge.consumer_root, {})
+                into[edge.producer_root] = max(
+                    into.get(edge.producer_root, 1), 2 if crosses else 1
+                )
+        levels: dict[int, int] = {}
+        for root in range(len(self.task_families)):
+            levels[root] = max(
+                (levels[p] + step for p, step in steps.get(root, {}).items()),
+                default=0,
+            )
+        return levels
+
+    @property
+    def dry_pass_candidate_roots(self) -> tuple[int, ...]:
+        """Roots that wait on an earlier root of the launch and follow a root
+        whose producers lie at least two levels deep (one
+        ``cross_loop_dry_passes`` entry each, in this order): a dry pass runs
+        in the wait of an earlier block whose producers lie two levels deeper
+        than what its workers ran before it, so no root of a shallower graph
+        can take one. Only workers that own their tasks read the entries (the
+        static pipeline, and the dynamic one on a Gluon ring, whose workers
+        claim tasks root by root; not the barrier pipeline nor packet
+        dispatch), and only for single-wave roots on static workers; codegen
+        checks the rest for a config (``static_dry_passes``)."""
+        producers = self.root_producers
+        levels = self.root_levels
+        deep = [
+            root
+            for root, roots in producers.items()
+            if max(levels[p] for p in roots) >= 2
+        ]
+        if not deep:
+            return ()
+        return tuple(root for root in sorted(producers) if root > min(deep))
+
+    @property
     def cluster_candidate_ids(self) -> tuple[int, ...]:
         """Allocations a launch cluster may carry from one root to a later one
         (``cross_loop_cluster``; one ``cross_loop_cluster_edges`` entry each,
