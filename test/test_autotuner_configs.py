@@ -310,8 +310,8 @@ class TestAutotunerConfigs(AutotunerTestCase):
             def block_size_var(self, block_idx: int) -> str:
                 return f"_BLOCK_{block_idx}"
 
-            def compact_shape(self, shapes):
-                return shapes
+            def compacted_block_ids(self) -> list[int]:
+                return []
 
         dispatch = TileStrategyDispatch.__new__(TileStrategyDispatch)
         dispatch.strategies = [DummyStrategy()]

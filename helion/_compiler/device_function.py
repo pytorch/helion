@@ -875,6 +875,17 @@ class DeviceFunction:
         env = CompileEnvironment.current()
         origin = HostFunction.current().expr_to_origin[expr]
         if isinstance(origin.origin, TensorSizeOrigin):
+            # A size the config fixes (``out.size(1)`` of ``torch.empty([m,
+            # helion.next_power_of_2(foo)])``) is its value under the config:
+            # a shape needs a constant, which the size argument is not.
+            expression = env.config_value_expression(expr)
+            if expression is not None:
+                value = (
+                    expression
+                    if isinstance(expression, int)
+                    else expression.evaluate(self.config)
+                )
+                return env.backend.sympy_printer_expr(sympy.Integer(value))
             assert origin.fake_value is not None
             arg = self.tensor_size(
                 origin.fake_value,
@@ -1156,11 +1167,21 @@ class DeviceFunction:
 
     def expr_arg(self, sym: sympy.Expr, origin: Origin) -> NumericArgument:
         if sym not in self._expr_args:
-            # A tunable-only expression is constant for each compiled config.
+            env = CompileEnvironment.current()
+            # An expression over tunables, and over the values a host helper
+            # computes from them (config_value_expressions), is constant for
+            # each compiled config.
             arg_type = (
                 ConstExprArg
                 if sym in self._constexpr_exprs
-                or CompileEnvironment.current().is_tunable_expr(sym)
+                or (
+                    sym.free_symbols
+                    and all(
+                        symbol in env.tunable_symbols
+                        or symbol in env.config_value_expressions
+                        for symbol in sym.free_symbols
+                    )
+                )
                 else SymbolArgument
             )
             arg = arg_type(

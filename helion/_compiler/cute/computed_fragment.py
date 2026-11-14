@@ -65,6 +65,7 @@ from .full_reduction_owner import fragment_store_destinations
 from .full_reduction_owner import requires_full_reduction_owner
 from .local_atomic import local_atomic_allocations
 from .local_atomic import prove_local_atomics
+from .matmul_utils import cute_static_k_invariant_extent
 from .native_s2f6_contract import native_s2f6_asm_matches
 from .pure_producer_regions import pure_producer_plan
 from .reduction_coordinates import captured_reduction_coordinates
@@ -1572,6 +1573,12 @@ def computed_fragment_supported(
         static_k = isinstance(left.shape[-1], int) and left.shape[-1] > 1
         if bid is not None:
             static_k = env.block_sizes[bid].reduction
+        # No tile or full slice walks K: a plain static extent, or the kept
+        # extent of a range subscript that no full slice joined.
+        free_k = bid is None or (
+            bid in env.subscript_extent_block_ids
+            and bid not in env.subscript_extents_joined_by_slice
+        )
         return (
             left.dtype == right.dtype
             and left.dtype in (torch.float16, torch.bfloat16, torch.float32)
@@ -1601,6 +1608,16 @@ def computed_fragment_supported(
                         or left.ndim > 2
                         or right.ndim > 2
                     )
+                )
+                # A computed operand along such a K has no scalar recipe
+                # unless the pair is K-invariant: the fallback needs an
+                # active K tile or plain load views.  The extent a range
+                # subscript padded to could repeat another axis here, which
+                # gave the dot this owner only at such sizes.
+                or (
+                    free_k
+                    and (computed(lhs) or computed(rhs))
+                    and cute_static_k_invariant_extent(lhs, rhs) is None
                 )
             )
         )
@@ -1808,6 +1825,7 @@ def computed_fragment_supported(
                 "max",
                 "min",
                 "prod",
+                "any",
                 "argmin",
                 "argmax",
             ):

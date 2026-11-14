@@ -1263,6 +1263,14 @@ class Backend(abc.ABC):
         """Expression of a ``shape_dims`` tensor filled with ``value_expr`` in ``dtype``."""
         raise exc.BackendUnsupported(self.name, "full tensor creation")
 
+    def widen_reduction_acc_dtype(
+        self, reduction_type: str, dtype: torch.dtype
+    ) -> torch.dtype:
+        """The dtype a ``reduction_type`` reduction accumulates and combines in,
+        given ``dtype``, the computation dtype of its operands
+        (``reduction_strategy.reduction_acc_dtype``)."""
+        return dtype
+
     def reduction_acc_init_expr(
         self, shape_dims: list[str], value_expr: str, dtype: torch.dtype
     ) -> str:
@@ -1411,8 +1419,8 @@ class Backend(abc.ABC):
         """Generate the cross-thread reduction expression.
 
         ``dtype`` is the accumulation dtype (``reduction_acc_dtype``: the
-        output's computation dtype, the input's for argmin/argmax) when the
-        caller knows it.
+        output's computation dtype, the input's for argmin/argmax, as
+        :meth:`widen_reduction_acc_dtype` widens it) when the caller knows it.
         Backends that allocate typed scratch storage for the reduction (e.g.
         Metal's ``threadgroup`` buffers) need it; the rest ignore it.
         """
@@ -2036,6 +2044,23 @@ class Backend(abc.ABC):
     def tracks_flat_grid_origins(self) -> bool:
         """Whether ``FlattenedTileStrategy`` records each block's uniform tile
         origin (``grid_origin_var``) for the backend's root emitters."""
+        return False
+
+    def flattened_tile_shares_one_index(self) -> bool:
+        """Whether a flattened tile's dims share one index, a run of the
+        flattened loop rather than a block of it: one dimension of the
+        values (``TileStrategyDispatch.physical_dims``) or one thread axis.
+        No dim of the tile is then a dim of its own, so an op along one pins
+        its loop unflattened (``pin_unflattened_loops``).  ``False`` keeps
+        the tile's block shape and every dim of it."""
+        return True
+
+    def reduces_every_dim_one_at_a_time(self) -> bool:
+        """Whether ``hl.reduce`` without a dim reduces one dim at a time
+        rather than the whole value at once (``tl.reduce(x, None, fn)``).
+        One at a time, each dim of a flattened tile would reduce the whole
+        tile (``flattened_tile_shares_one_index``), so such a reduction pins
+        the loops of its tile dims unflattened."""
         return False
 
     def reflattens_pointwise_tiles(self) -> bool:

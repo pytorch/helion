@@ -24,8 +24,6 @@ from ...language.reduce_ops import _fake_reduce_tensor
 from ...language.reduce_ops import _reduce
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
     from ..device_ir import HelperFunctionGraphInfo
     from ..inductor_lowering import CodegenState
     from ..reduction_strategy import ReductionStrategy
@@ -299,10 +297,7 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     dim = state.proxy_arg(2)
     is_tuple_input = bool(state.proxy_arg(4))
     proxy_input = state.proxy_arg(1)
-    first_input = (
-        cast("Sequence[object]", proxy_input)[0] if is_tuple_input else proxy_input
-    )
-    assert isinstance(first_input, torch.Tensor)
+    first_input = state.proxy_tensor_arg(1)
     dims = [*range(first_input.ndim)] if dim is None else [cast("int", dim)]
 
     if not is_tuple_input:

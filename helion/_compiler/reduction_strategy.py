@@ -27,7 +27,6 @@ from .device_function import substitute_configured_block_sizes
 from .host_function import HostFunction
 from .inductor_lowering import install_inductor_kernel_handlers
 from .roll_reduction import FREE_IOTA_REDUCTION_META
-from .tile_strategy import CompactedShape
 from .tile_strategy import CuteLaneAxis
 from .tile_strategy import DeviceGridState
 from .tile_strategy import DeviceLoopState
@@ -56,11 +55,15 @@ def reduction_acc_dtype(
 
     The reduction input already carries torch's promotion (a bool or integer
     sum arrives as Int64), so a value reduction accumulates in the output's
-    computation dtype; argmin/argmax track the input's values.
+    computation dtype; argmin/argmax track the input's values.  The backend
+    may widen it (``Backend.widen_reduction_acc_dtype``).
     """
-    if CompileEnvironment.current().backend.is_indexed_reduction(reduction_type):
-        return get_computation_dtype(fake_input.dtype)
-    return get_computation_dtype(fake_output.dtype)
+    backend = CompileEnvironment.current().backend
+    if backend.is_indexed_reduction(reduction_type):
+        dtype = get_computation_dtype(fake_input.dtype)
+    else:
+        dtype = get_computation_dtype(fake_output.dtype)
+    return backend.widen_reduction_acc_dtype(reduction_type, dtype)
 
 
 def _strategies_concurrent_with_block(
@@ -389,9 +392,6 @@ class ReductionStrategy(TileStrategy):
     def user_size(self, block_index: int) -> sympy.Expr:
         return CompileEnvironment.current().block_sizes[block_index].numel
 
-    def compact_shape(self, shapes: list[CompactedShape]) -> list[CompactedShape]:
-        return shapes
-
     def _reduction_thread_count(self) -> int:
         """Return threads used for this reduction on thread-aware backends."""
         return 0
@@ -624,19 +624,21 @@ class ReductionStrategy(TileStrategy):
     ) -> str:
         backend = CompileEnvironment.current().backend
         acc_dtype = reduction_acc_dtype(reduction_type, fake_input, fake_output)
+        # The value may hold a flattened tile's dims in one dimension.
+        physical_dim = self.fn.tile_strategy.physical_dim([*fake_input.size()], dim)
         if backend.is_indexed_reduction(reduction_type):
             return self.call_indexed_reduction(
                 input_name,
                 self.broadcast_str(self.argreduce_position_var(), fake_input, dim),
                 reduction_type,
-                dim,
+                physical_dim,
                 fake_output,
                 dtype=acc_dtype,
             )
         return backend.reduction_expr(
             input_name,
             reduction_type,
-            dim,
+            physical_dim,
             block_size_var=self.block_size_var(self.block_index),
             dtype=acc_dtype,
         )
@@ -1372,7 +1374,7 @@ class LoopedReductionStrategy(ReductionStrategy):
                     acc,
                     acc_index,
                     reduction_type,
-                    dim,
+                    self.fn.tile_strategy.physical_dim([*fake_input.size()], dim),
                     fake_output,
                     dtype=acc_dtype,
                 )

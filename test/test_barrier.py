@@ -185,20 +185,14 @@ class TestBarrier(RefEagerTestBase, TestCase):
                 self.graphs_added: list[int] = []
                 self.outer_count = 0
 
-            def has_matmul_with_rdim(self, graph: torch.fx.Graph) -> bool:
-                return False
-
-            def has_indexing_along_rdim(self, graph: torch.fx.Graph) -> bool:
-                return False
-
-            def has_stack_tensor_with_rdim(self, graph: torch.fx.Graph) -> bool:
-                return False
-
-            def has_unrollable_reduction(self, graph: torch.fx.Graph) -> bool:
+            def cannot_roll_graph(self, graph: torch.fx.Graph) -> bool:
                 return False
 
             def has_pinned_rdim(self) -> bool:
                 return False
+
+            def tied_rdims(self) -> list[int]:
+                return []
 
             def process(self, graph: torch.fx.Graph) -> torch.fx.Graph:
                 reduction_graph = torch.fx.Graph()
@@ -231,6 +225,7 @@ class TestBarrier(RefEagerTestBase, TestCase):
             ),
             backend_name="triton",
             backend=fake_backend,
+            subscript_extent_reductions={},
         )
 
         # The fake roller adds an empty subgraph (only an output node), so the

@@ -84,8 +84,10 @@ class KernelCompiler:
                 if rewrite_ast:
                     hf.backend_rewrote_ast = self.customize_ast(hf)
                 self.propagate_types(hf)
+                self.env.check_config_values_unspecialized()
                 self.finalize_config()
                 self.lower(hf)
+                self.env.check_config_values_unspecialized()
             return hf
         finally:
             self.env.clear_container_identities()

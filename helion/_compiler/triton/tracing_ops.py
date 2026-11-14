@@ -23,31 +23,33 @@ from ..compile_environment import CompileEnvironment
 if TYPE_CHECKING:
     import ast
     from collections.abc import Collection
+    from collections.abc import Sequence
 
+    from ..device_function import DeviceFunction
     from ..inductor_lowering import CodegenState
 
 
 def _tile_mask_expr(
-    state: CodegenState,
-    tensor: torch.Tensor,
+    fn: DeviceFunction,
+    sizes: Sequence[int | torch.SymInt],
     block_ids: Collection[int] | None = None,
 ) -> str | None:
-    """The mask of the active tiles over ``tensor``'s dims (of the canonical
-    ``block_ids`` only, if given), broadcast to its shape, or None when no
-    such dim has a masked tile."""
+    """The mask of the active tiles over the dims of ``sizes`` (of the
+    canonical ``block_ids`` only, if given), broadcast to that shape, or None
+    when no such dim has a masked tile."""
     mask_exprs: list[str] = []
-    input_sizes = [*tensor.size()]
+    input_sizes = [*sizes]
     env = CompileEnvironment.current()
     for dim, size in enumerate(input_sizes):
         if (
             (index := env.resolve_block_id(size)) is not None
             and (block_ids is None or env.canonical_block_id(index) in block_ids)
-            and (mask_var := state.codegen.mask_var(index)) is not None
+            and (mask_var := fn.codegen.mask_var(index)) is not None
         ):
-            expand = state.tile_strategy.expand_str(input_sizes, dim)
+            expand = fn.tile_strategy.expand_str(input_sizes, dim)
             if env.is_jagged_tile(index):
                 mask_shape = env.jagged_tile_mask_shapes[index]
-                expand = state.tile_strategy.jagged_tile_expand_str(
+                expand = fn.tile_strategy.jagged_tile_expand_str(
                     mask_shape, input_sizes
                 )
 
@@ -58,7 +60,9 @@ def _tile_mask_expr(
         return None
     mask_expr = "&".join(mask_exprs)
     if len(mask_exprs) < len(input_sizes):
-        mask_expr = f"tl.broadcast_to({mask_expr}, {state.tile_strategy.shape_str(input_sizes)})"
+        mask_expr = (
+            f"tl.broadcast_to({mask_expr}, {fn.tile_strategy.shape_str(input_sizes)})"
+        )
     return mask_expr
 
 
@@ -68,7 +72,7 @@ def _(state: CodegenState) -> ast.AST:
     assert isinstance(tensor, torch.Tensor)
     other = state.proxy_arg(1)
     assert isinstance(other, (int, float, bool))
-    mask_expr = _tile_mask_expr(state, tensor)
+    mask_expr = _tile_mask_expr(state.device_function, tensor.size())
     if mask_expr is None:
         return state.ast_arg(0)
     # Ensure the masked value literal matches the tensor dtype to avoid unintended upcasts
@@ -89,7 +93,7 @@ def _(state: CodegenState) -> ast.AST:
     assert isinstance(tensor, torch.Tensor)
     block_ids = state.proxy_arg(2)
     assert isinstance(block_ids, tuple)
-    mask_expr = _tile_mask_expr(state, tensor, block_ids)
+    mask_expr = _tile_mask_expr(state.device_function, tensor.size(), block_ids)
     if mask_expr is None:
         return state.ast_arg(0)
     other = state.proxy_arg(1)

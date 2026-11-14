@@ -1625,6 +1625,17 @@ class ConfigSpec:
         self.range_flattens._remove_duplicates()
         self.static_ranges._remove_duplicates()
 
+    def pin_flatten_loop(self, block_id: int) -> None:
+        """Pin the flatten_loops choice of ``block_id``'s loop to False.
+
+        Its slot stays (``FlattenLoopSpec.pinned``).  So does that of a CuTe
+        pointwise re-registration candidate (``cute_reflatten_candidates``):
+        CuTe re-offers it pinned, so a config saved before the pin still loads.
+        """
+        for spec in (*self.flatten_loops, *self.cute_reflatten_candidates):
+            if block_id in spec.block_ids:
+                spec.pinned = True
+
     def disallow_pid_type(
         self, pid_type: PidTypeLiteral, reason: str | None = None
     ) -> None:
@@ -3546,13 +3557,21 @@ class NumThreadsSpec(_PowerOfTwoBlockIdItem):
 
 
 class FlattenLoopSpec(_BlockIdItem):
-    def _fragment(self, base: ConfigSpec) -> BooleanFragment:
+    # Set by ``ConfigSpec.pin_flatten_loop`` for a loop with an op along one
+    # of its tile dims (``pin_unflattened_loops``), which a flattened tile
+    # cannot express: the slot stays, so the config shape does not depend on
+    # the analysis, but its value is pinned to False.
+    pinned: bool = False
+
+    def _fragment(self, base: ConfigSpec) -> BooleanFragment | EnumFragment:
+        if self.pinned:
+            return EnumFragment((False,))
         return BooleanFragment()
 
     def _normalize(self, name: str, value: object) -> bool:
         if not isinstance(value, bool):
             raise InvalidConfig(f"{name} must be a boolean, got {value!r}") from None
-        return value
+        return value and not self.pinned
 
     def _fill_missing(self) -> bool:
         return False
@@ -3572,7 +3591,17 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         self.size_hint = size_hint
         self.allow_non_power_of_two = allow_non_power_of_two
         self.allow_full_extent = allow_full_extent
+        # Why the dim stays persistent, for one that keeps its slot without a
+        # loop: an effectful replay, or a dim older versions offered a loop
+        # (``DeviceIR.register_rollable_reductions``).  The slot stays, so
+        # the configs they saved line up with this version's by position,
+        # but its value is pinned to None and the search space leaves it out.
         self.persistent_reason = persistent_reason
+
+    @property
+    def pinned(self) -> bool:
+        """Whether the slot is pinned to None (``persistent_reason``)."""
+        return self.persistent_reason is not None
 
     def _full_extent_chunk(self) -> int | None:
         # A padded single iteration can preserve vector packets where an exact

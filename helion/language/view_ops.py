@@ -161,7 +161,7 @@ def subscript(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
 def _(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
     env = CompileEnvironment.current()
     output_size = env.backend.fake_subscript_shape(tensor, index)
-    return env.new_index_result(tensor, output_size)
+    return env.new_index_result(tensor, output_size, keep_static_extents=True)
 
 
 @_decorators.codegen(subscript, "common")
@@ -175,8 +175,11 @@ def _(state: CodegenState) -> ast.AST:
             output_keys.append(":")
         else:
             raise exc.InvalidIndexingType(repr(val))
+    output = state.fake_value
+    assert isinstance(output, torch.Tensor)
+    keys = state.tile_strategy.physical_keys(output.size(), output_keys)
     return expr_from_string(
-        f"{{base}}[{', '.join(output_keys)}]",
+        f"{{base}}[{', '.join(keys)}]",
         base=state.ast_arg(0),
     )
 

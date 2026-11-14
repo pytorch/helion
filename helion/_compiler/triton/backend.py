@@ -542,6 +542,8 @@ class TritonBackend(Backend):
             )
         if reduction_type == "prod":
             return f"triton_helpers.prod({input_name}, {dim})"
+        if reduction_type == "any":
+            return f"triton_helpers.any({input_name}, {dim})"
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
 
     def reduction_combine_expr(

@@ -54,6 +54,7 @@ from .aten_lowering import Lowering
 from .aten_lowering import LoweringContext
 from .aten_lowering import aten_lowering_dispatch
 from .compile_environment import CompileEnvironment
+from .compile_environment import ConfigValueExpression
 from .compile_environment import FixedBlockSizeSource
 from .compile_environment import _symint_expr
 from .compile_environment import _symint_sympy_expr
@@ -1088,17 +1089,16 @@ class ReductionLowering(InductorLowering):
 
         env = CompileEnvironment.current()
         if isinstance(reduction_size, sympy.Symbol):
-            block_index = env.get_block_id(reduction_size)
-            if block_index is None:
-                # A bare symbol that is not a block size (e.g. a runtime int).
-                raise exc.ReductionOnNonTile(reduction_size)
-            # A registered extent is a config value, not a tile coordinate.
-            # Its reduction alias carries the full symbolic domain and can
-            # own lanes independently in a materialized consumer stage.
-            if env.registered_extent_owner(block_index) is not None:
-                block_index = env.allocate_reduction_dimension(
-                    to_symint(reduction_size)
-                ).block_id
+            block_index: int | None = env.get_block_id(reduction_size)
+            if block_index is not None:
+                env.record_reduction_over(block_index)
+                # A registered extent is a config value, not a tile coordinate.
+                # Its reduction alias carries the full symbolic domain and can
+                # own lanes independently in a materialized consumer stage.
+                if env.registered_extent_owner(block_index) is not None:
+                    block_index = env.allocate_reduction_dimension(
+                        to_symint(reduction_size)
+                    ).block_id
         elif isinstance(reduction_size, (int, sympy.Integer)):
             # Allocate or find a reduction dimension matching this size.
             # Convert to a SymInt when needed.
@@ -1110,9 +1110,25 @@ class ReductionLowering(InductorLowering):
                 size_symint = to_symint(reduction_size)
                 block_index = env.allocate_reduction_dimension(size_symint).block_id
             else:
-                raise exc.ReductionOnNonTile(reduction_size)
+                block_index = None
         else:
             raise exc.ReductionOnNonTile(reduction_size)
+        if block_index is None:
+            # A dim no block covers: a bare symbol that is not a block size
+            # (a runtime int), or one a config value sizes
+            # (``hl.zeros([tile, helion.next_power_of_2(foo)])``).
+            size: object = reduction_size
+            config_size = (
+                env.config_value_expression(reduction_size)
+                if isinstance(reduction_size, sympy.Expr)
+                else None
+            )
+            if isinstance(config_size, ConfigValueExpression):
+                size = (
+                    f"{config_size}, a size the config sets (size a tunable "
+                    "reduction dim with hl.register_block_size)"
+                )
+            raise exc.ReductionOnNonTile(size)
         self.block_index: int = block_index
 
     @property
@@ -2092,6 +2108,15 @@ class CodegenState(NamedTuple):
 
     def proxy_arg(self, i: int) -> object:
         return self.proxy_args[i]
+
+    def proxy_tensor_arg(self, i: int) -> torch.Tensor:
+        """``proxy_arg(i)``, a tensor or a tuple of them (the input of
+        ``hl.reduce`` or ``hl.associative_scan``): the first tensor."""
+        value = self.proxy_args[i]
+        if isinstance(value, (tuple, list)):
+            value = value[0]
+        assert isinstance(value, torch.Tensor)
+        return value
 
     def ast_arg(self, i: int) -> ast.AST:
         rv = self.ast_args[i]
