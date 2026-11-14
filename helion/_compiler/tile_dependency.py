@@ -6645,19 +6645,15 @@ def _inband_failure(
         )
     ):
         return "R1: one unmasked store through the local view, one tile per task"
-    region = _access_region(store, task_families[store.root])
+    region = _inband_store_region(store, task_families[store.root])
     numel = math.prod(region.layout[0]) if region.layout is not None else 0
     row_major = True
     if scatter:
         # Rows land anywhere: the consumer keys row-major offsets back to rows.
-        shape = [
-            _concrete_integer(extent, description="inband shape")
-            for extent in store.tensor_shape
-        ]
-        numel = math.prod(shape)
-        region = _linear_region(0, numel)
+        assert region.address_interval is not None
+        numel = region.address_interval[1]
         row_major = store.storage_offset == 0 and all(
-            stride == math.prod(shape[dim + 1 :])
+            stride == math.prod(store.tensor_shape[dim + 1 :])
             for dim, stride in enumerate(store.tensor_strides)
         )
     peer_loads = [access for access in accesses if access.owner_rank is not None]
@@ -6675,7 +6671,7 @@ def _inband_failure(
         and all(
             (
                 (load.tensor_shape, load.tensor_strides, load.storage_offset) == layout
-                or (not scatter and _same_dense_storage(load, store, numel))
+                or (not scatter and _same_dense_storage(load, numel))
             )
             and load.dtype == store.dtype
             for load in peer_loads
@@ -6698,6 +6694,18 @@ def _inband_failure(
     return None
 
 
+def _inband_store_region(store: TileAccess, family: TaskFamily) -> AllocationRegion:
+    """The buffer region an inband store fills: its tiles' region, or the whole
+    buffer for a scatter, whose rows land anywhere."""
+    if _scatter_position(store) is None:
+        return _access_region(store, family)
+    shape = [
+        _concrete_integer(extent, description="inband shape")
+        for extent in store.tensor_shape
+    ]
+    return _linear_region(0, math.prod(shape))
+
+
 def _surely_read_in_full(
     store: TileAccess,
     accesses: list[TileAccess],
@@ -6712,7 +6720,7 @@ def _surely_read_in_full(
         axes = [b for b in load.subscript_affine_block_ids if b is not None]
         if len(set(axes)) != len(axes):
             return False
-    region = _access_region(store, task_families[store.root])
+    region = _inband_store_region(store, task_families[store.root])
     return not _misses_a_polled_rank(region, peer_loads, task_families, exact=True)
 
 
@@ -6724,8 +6732,9 @@ def _misses_a_polled_rank(
     exact: bool,
 ) -> bool:
     """Whether the peer loads of some polled rank leave part of ``region``
-    unread: surely (``exact``: only their exact regions cover), or may (each
-    load covering its whole bounding interval, or all of an unknown one)."""
+    unread: may (``exact``: only the regions they surely read cover), or surely
+    (each load covering its whole bounding interval, or all of an unknown
+    one)."""
     for rank in {load.owner_rank for load in peer_loads}:
         reads = [
             _access_region(load, task_families[load.root])
@@ -6743,44 +6752,27 @@ def _misses_a_polled_rank(
     return False
 
 
-def _same_dense_storage(load: TileAccess, store: TileAccess, numel: int) -> bool:
-    """Whether ``load`` views exactly the ``numel`` elements ``store`` fills,
-    densely and from the same storage offset, in any shape or dimension order.
+def _same_dense_storage(load: TileAccess, numel: int) -> bool:
+    """Whether ``load`` views the whole buffer an inband store fills, densely
+    from its start (the test R2 puts to the store's own tiles), in any shape or
+    dimension order.
 
     Pushes and polls both address a word by the element's offset from the
     tensor's start, so such a view reads exactly the words the store pushed.
-    Density keeps what the store's own layout guaranteed: a read's address hull
-    is the set of elements it reads (R6), and the strides above a stride-1 last
-    dimension are multiples of its extent, so of a word's lanes (`_word_poll`).
-    Size-1 and broadcast dimensions address no further elements.
+    Density also keeps the strides above a stride-1 last dimension multiples of
+    its extent, so of a word's lanes, which `_word_poll` assumes.
     """
     try:
-        shape = [
-            _concrete_integer(extent, description="inband shape")
+        bounds = tuple(
+            (0, _concrete_integer(extent, description="inband shape"))
             for extent in load.tensor_shape
-        ]
-        strides = [
+        )
+        for stride in load.tensor_strides:
             _concrete_integer(stride, description="inband stride")
-            for stride in load.tensor_strides
-        ]
-        offsets = [
-            _concrete_integer(access.storage_offset, description="inband offset")
-            for access in (load, store)
-        ]
     except ValueError:
         return False
-    if offsets[0] != offsets[1] or 0 in shape:
-        return False
-    span = 1
-    for stride, extent in sorted(
-        (stride, extent)
-        for extent, stride in zip(shape, strides, strict=True)
-        if extent > 1 and stride != 0
-    ):
-        if stride != span:
-            return False
-        span *= extent
-    return span == numel
+    region = _allocation_region_from_bounds(load, bounds, (True,) * len(bounds))
+    return region.is_exact_contiguous and region.address_interval == (0, numel)
 
 
 def _scatter_tile(
@@ -7159,8 +7151,15 @@ def build_tile_dependency_graph(
             )
         )
         inband_allocation_ids = set()
-    # Polls at root on every rank that surely read each polled rank's whole buffer
-    # wait for every task of the store's root.
+    # Polls at root on every rank that surely read each polled rank's whole
+    # buffer wait for every task of the store's root to push. A root whose tasks
+    # also read keyed peer data may still do so after their push.
+    keyed_readers = {
+        access.root
+        for access in accesses
+        if access.owner_rank is not None
+        and access.allocation_id not in inband_allocation_ids
+    }
     inband_read_roots = {
         access.root
         for allocation_id in inband_allocation_ids
@@ -7178,6 +7177,7 @@ def build_tile_dependency_graph(
         )
         for access in accesses_by_allocation[allocation_id]
         if access.kind == "store"
+        and access.root not in keyed_readers
         and _surely_read_in_full(
             access, accesses_by_allocation[allocation_id], task_families
         )
