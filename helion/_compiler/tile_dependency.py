@@ -6706,11 +6706,15 @@ def _inband_failure(
 
 
 def _same_dense_storage(load: TileAccess, store: TileAccess, numel: int) -> bool:
-    """Whether every element ``load`` can address lies in the ``numel`` elements
-    ``store`` fills, counted from the same storage offset, in any view shape.
+    """Whether ``load`` views exactly the ``numel`` elements ``store`` fills,
+    densely and from the same storage offset, in any shape or dimension order.
 
     Pushes and polls both address a word by the element's offset from the
     tensor's start, so such a view reads exactly the words the store pushed.
+    Density keeps what the store's own layout guaranteed: a read's address hull
+    is the set of elements it reads (R6), and the strides above a stride-1 last
+    dimension are multiples of its extent, so of a word's lanes (`_word_poll`).
+    Size-1 and broadcast dimensions address no further elements.
     """
     try:
         shape = [
@@ -6727,17 +6731,18 @@ def _same_dense_storage(load: TileAccess, store: TileAccess, numel: int) -> bool
         ]
     except ValueError:
         return False
-    return (
-        offsets[0] == offsets[1]
-        and all(
-            extent > 0 and stride >= 0
-            for extent, stride in zip(shape, strides, strict=True)
-        )
-        and sum(
-            (extent - 1) * stride for extent, stride in zip(shape, strides, strict=True)
-        )
-        < numel
-    )
+    if offsets[0] != offsets[1] or 0 in shape:
+        return False
+    span = 1
+    for stride, extent in sorted(
+        (stride, extent)
+        for extent, stride in zip(shape, strides, strict=True)
+        if extent > 1 and stride != 0
+    ):
+        if stride != span:
+            return False
+        span *= extent
+    return span == numel
 
 
 def _scatter_tile(
