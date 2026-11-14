@@ -207,6 +207,7 @@ _CUTE_EXACT_DIV_FORM_RETIRED: frozenset[str] = frozenset({"guard"})
 # from a config that forms no register tile.
 _CUTE_REGISTER_TILE_KNOBS: tuple[str, ...] = (
     "cute_register_tile_warp_fold",
+    "cute_register_tile_cooperative_fold",
     "cute_register_tile_store_first",
 )
 
@@ -1301,6 +1302,7 @@ def _normalize_cute_vector_reductions(
         "cute_scalar_epilogue_owner_fold",
         "cute_warp_fp32_redux",
         "cute_register_tile_warp_fold",
+        "cute_register_tile_cooperative_fold",
         "cute_register_tile_store_first",
         "cute_replicated_reduction",
         "cute_vector_packet_unroll",
@@ -1324,15 +1326,23 @@ def _normalize_cute_vector_reductions(
             raise InvalidConfig(f"{key} requires cute_register_row")
 
 
-def _normalize_cute_warp_aggregated_atomics(
-    config_spec: ConfigSpec, config: dict[str, object], *, fix_invalid: bool
+def _normalize_gated_boolean(
+    config: dict[str, object],
+    key: str,
+    *,
+    enabled: bool,
+    requirement: str,
+    fix_invalid: bool,
 ) -> None:
-    key = "cute_warp_aggregated_atomics"
-    if not config_spec.cute_warp_aggregated_atomics_enabled:
-        if key in config and not fix_invalid:
-            raise InvalidConfig(
-                "cute_warp_aggregated_atomics requires relaxed Int32 tickets"
-            )
+    """A boolean knob the search surface offers only when ``enabled``: off
+    (``False``) by default, and otherwise absent, an explicit value being an
+    error (``"{key} requires {requirement}"``) unless ``fix_invalid``."""
+    if not enabled:
+        # ``False`` is the knob-off code, which every config the search
+        # produced spells out: a tuned config stays valid where its kernel
+        # no longer offers the knob (a larger target, aliased arguments).
+        if config.get(key, False) is not False and not fix_invalid:
+            raise InvalidConfig(f"{key} requires {requirement}")
         config.pop(key, None)
         return
     value = config.setdefault(key, False)
@@ -2295,8 +2305,26 @@ def normalize_knobs(
     normalize_radix_selection(config_spec, config, fix_invalid=fix_invalid)
     _normalize_cute_rng_packet(config_spec, config, fix_invalid=fix_invalid)
     _normalize_cute_vector_reductions(config_spec, config, fix_invalid=fix_invalid)
-    _normalize_cute_warp_aggregated_atomics(
-        config_spec, config, fix_invalid=fix_invalid
+    _normalize_gated_boolean(
+        config,
+        "cute_warp_aggregated_atomics",
+        enabled=config_spec.cute_warp_aggregated_atomics_enabled,
+        requirement="relaxed Int32 tickets",
+        fix_invalid=fix_invalid,
+    )
+    _normalize_gated_boolean(
+        config,
+        "cute_privatize_atomics",
+        enabled=config_spec.cute_privatize_atomics_enabled,
+        requirement=(
+            "a small fp32 or int32 tensor of static shape and rank at least 1 "
+            "the kernel only updates with relaxed atomic adds, through views of "
+            "one dtype, proven not to alias its other tensors, in a kernel "
+            "without a matmul, hl.barrier(), an atomic that is not relaxed, asm "
+            "not declared pure, an access through a stack tensor or a remote "
+            "copy or barrier"
+        ),
+        fix_invalid=fix_invalid,
     )
     _normalize_cute_vloop_sink(config_spec, config, fix_invalid=fix_invalid)
     _normalize_cute_wide_packet_hints(config, fix_invalid=fix_invalid)
@@ -2812,6 +2840,13 @@ def normalize_reduction_threads(
         for key in _CUTE_REGISTER_TILE_KNOBS:
             if config.get(key):
                 config[key] = False
+    elif config.get("cute_register_tile_cooperative_fold") is True and config.get(
+        "cute_register_tile_warp_fold"
+    ):
+        # The cooperative fold fits every group the warp fold fits and wins
+        # there (``RegisterTileOptions``), so beside it the warp fold renders
+        # nothing; dropping it keeps one config per render.
+        config["cute_register_tile_warp_fold"] = False
 
 
 def normalize_after_defaults(
@@ -3650,6 +3685,8 @@ def cute_flat_fields(
             fields["cute_proven_bounds"] = BooleanFragment()
         if config_spec.cute_warp_aggregated_atomics_enabled:
             fields["cute_warp_aggregated_atomics"] = BooleanFragment()
+        if config_spec.cute_privatize_atomics_enabled:
+            fields["cute_privatize_atomics"] = BooleanFragment()
         if len(config_spec.cute_lane_layouts) > 0 and not config_spec.matmul_facts:
             # Seeded, not searched: the masked rolled cluster seeds it only
             # on some extents, and a search space that depends on the extent
@@ -3667,6 +3704,7 @@ def cute_flat_fields(
                 "cute_scalar_epilogue_keep_inputs",
                 "cute_scalar_epilogue_owner_fold",
                 "cute_register_tile_warp_fold",
+                "cute_register_tile_cooperative_fold",
                 "cute_register_tile_store_first",
                 "cute_replicated_reduction",
                 "cute_vector_packet_unroll",

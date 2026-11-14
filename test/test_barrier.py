@@ -194,6 +194,9 @@ class TestBarrier(RefEagerTestBase, TestCase):
             def tied_rdims(self) -> list[int]:
                 return []
 
+            def reads_padded_range(self, graph: torch.fx.Graph) -> bool:
+                return False
+
             def process(self, graph: torch.fx.Graph) -> torch.fx.Graph:
                 reduction_graph = torch.fx.Graph()
                 reduction_graph.output(())

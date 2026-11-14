@@ -1,4 +1,4 @@
-"""Cache-policy forms of the FP8 packet flushes (``cute_store_policy``)."""
+"""Cache-policy forms of the byte packet flushes (``cute_store_policy``)."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from ._mlir_compat import ir
 from .l2_policy import store_u32x4_l2_evict_last
 from .l2_policy import store_u32x4_streaming
 from .vec_utils import _store_fp8_vec
+from .vec_utils import store_u8_vec
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -61,3 +62,11 @@ def store_fp8e4m3fn_vec_streaming(ptr: object, values: list) -> None:
 
 def store_fp8e5m2_vec_streaming(ptr: object, values: list) -> None:
     _store_fp8_vec(ptr, values, cutlass.Float8E5M2, packet_store=store_v16b_streaming)
+
+
+def store_u8_vec_l2_evict_last(ptr: object, values: list) -> None:
+    store_u8_vec(ptr, values, packet_store=store_v16b_l2_evict_last)
+
+
+def store_u8_vec_streaming(ptr: object, values: list) -> None:
+    store_u8_vec(ptr, values, packet_store=store_v16b_streaming)

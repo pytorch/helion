@@ -255,19 +255,44 @@ def test_oversize_unsigned_shift_model():
         assert _Uint32(0xFFFFFF) >> _Uint32(count) == 0
 
 
-def _rewrite(body: str, *, floats=("p",), renames=None):
+def _function(renames=None):
     counter = iter(range(100))
-    function = SimpleNamespace(
+    return SimpleNamespace(
         name="test_kernel",
-        cute_state=SimpleNamespace(uniform_comparison_marker="_marked"),
+        cute_state=SimpleNamespace(
+            uniform_comparison_marker="_marked", uniform_cutoff_dtypes={}
+        ),
         _variable_renames={} if renames is None else renames,
         codegen=SimpleNamespace(module_statements=[]),
         new_var=lambda stem: f"{stem}_{next(counter)}",
     )
+
+
+def _rewrite(body: str, *, floats=("p",), renames=None):
+    function = _function(renames)
     result = lower_uniform_comparisons(
         ast.parse(body).body, function, float_scalar_names=set(floats)
     )
     return ast.Module(body=result, type_ignores=[]), function.codegen.module_statements
+
+
+def test_cutoff_names_record_their_dsl_types():
+    # The hoisted tuple assignment does not show its names' types, so the
+    # function state records them (``sweep_values`` types a carried mask).
+    function = _function()
+    result = lower_uniform_comparisons(
+        ast.parse("keep = _marked(word, uniform, p)").body,
+        function,
+        float_scalar_names={"p"},
+    )
+    assert ast.unparse(result[0]).startswith(
+        "_helion_uniform_first_1, _helion_uniform_span_2, _helion_uniform_all_3 = "
+    )
+    assert function.cute_state.uniform_cutoff_dtypes == {
+        "_helion_uniform_first_1": "cutlass.Uint32",
+        "_helion_uniform_span_2": "cutlass.Uint32",
+        "_helion_uniform_all_3": "cutlass.Boolean",
+    }
 
 
 def test_cutoff_is_shared_outside_packet_and_tail_loops():

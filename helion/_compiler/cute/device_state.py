@@ -726,6 +726,10 @@ class CuteDeviceFunctionState:
         # Kernel-wide per-node lowering facts.
         self.explicit_rng_seed_exprs: set[str] = set()
         self.uniform_comparison_marker: str | None = None
+        # The DSL type of each name a hoisted uniform cutoff binds
+        # (``lower_uniform_comparisons``), which its tuple assignment does not
+        # show: ``sweep_values`` types a carried dropout mask from them.
+        self.uniform_cutoff_dtypes: dict[str, str] = {}
         self.signed_byte_packets: dict[Node, SignedBytePacket] = {}
         # The load_eviction_policies slot each load node took
         # (``memory_ops._cute_load_eviction_slot``): a load lowered again (a
@@ -741,6 +745,9 @@ class CuteDeviceFunctionState:
         self.published_scalar_requests: list[PublishedScalarRequest] = []
         self.register_producer_requests: list[RegisterProducerRequest] = []
         self.shared_arena_requests: list[SharedArenaRequest] = []
+        # The storages whose atomics ``cute_privatize_atomics`` redirects
+        # (``atomic_privatization.privatized_storages``), once computed.
+        self.privatized_storages: frozenset[int] | None = None
 
     # -- tcgen05 registries -----------------------------------------------------
 

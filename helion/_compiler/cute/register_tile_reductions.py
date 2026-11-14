@@ -99,6 +99,7 @@ from .lane_loops.owner_guards import _update_thread_axis_names
 from .lane_loops.split import _contains_unduplicatable_op
 from .lane_loops.split import _lane_split_reorders_aliasing_memory
 from .persistent_branch_vec import _memory_load_calls
+from .reduce_call import shared_columns_elements
 from .register_tile_admission import RegisterTileOptions
 from .register_tile_admission import RegisterTileUnsupported
 from .thread_budget import CUTE_REGISTER_TILE_MAX_LIVE_VALUES
@@ -385,13 +386,11 @@ def _single_reduce_expr(marker: _LaneReduceMarker, acc: str) -> str:
     return acc
 
 
-def _static_smem_bytes(
-    marker: _LaneReduceMarker, count: int, slots_per_column: int
-) -> int:
-    """Static shared memory a combine of ``count`` columns allocates."""
+def _static_smem_bytes(marker: _LaneReduceMarker, elements: int) -> int:
+    """Static shared memory a combine allocating ``elements`` slots takes."""
     ctor = _dtype_ctor_from_identity(marker.identity_expr)
     itemsize = _CUTLASS_SCALAR_TYPES.get(ctor or "", 8)
-    return count * slots_per_column * itemsize
+    return elements * itemsize
 
 
 def _finalize_marker(
@@ -401,16 +400,19 @@ def _finalize_marker(
     count: int,
     *,
     warp_fold: bool = False,
+    cooperative_fold: bool = False,
 ) -> tuple[list[ast.AST], int]:
     """Combine every accumulator element across the live thread group.
 
     Emitted as straight-line statements (``count`` is a small register tile)
     so no later V-loop peephole mistakes the per-element combines for one
     reduction over the elements.  Returns the statements and the static
-    shared memory (bytes) they allocate.  ``warp_fold`` requests the
-    shared-column reduce's warp fold (``RegisterTileOptions.warp_fold``); it
+    shared memory (bytes) they allocate.  ``warp_fold`` and
+    ``cooperative_fold`` request the shared-column reduce's warp and
+    cooperative folds (``RegisterTileOptions``): the cooperative fold applies
+    to a warp-aligned ``pre > 1`` group and wins over the warp fold, which
     applies to a multi-warp ``pre > 1`` group whose sibling count divides a
-    warp and is ignored elsewhere.
+    warp; each is ignored elsewhere.
     """
     if marker.group_cluster_n > 1:
         _reject("cute_cluster_n > 1 cannot combine a register tile across CTAs")
@@ -433,25 +435,27 @@ def _finalize_marker(
         lane_in_group_var = f"{acc_list}_lane_in_group"
         reduced = f"{acc_list}_reduced"
         elements = [marker.finalize_expr(f"{reduced}[{t}]") for t in range(count)]
+        # The cooperative fold's lane blocks shuffle within warp-aligned
+        # groups; requested with the warp fold, it wins
+        # (``RegisterTileOptions``).
+        fold_cooperative = (
+            cooperative_fold and marker.group_pre > 1 and marker.group_span % 32 == 0
+        )
         # The warp fold needs warp-aligned groups whose ``pre`` sibling
         # classes each hold ``32 // pre`` reduction coordinates per warp.
         fold_warp = (
             warp_fold
+            and not fold_cooperative
             and marker.group_pre > 1
             and marker.group_span > 32
             and marker.group_span % 32 == 0
             and 32 % marker.group_pre == 0
         )
-        # One slot per warp (``pre == 1``), per warp and sibling class (the
-        # warp fold) or per thread (serial ``pre > 1``) of every group, per
-        # column (``_cute_grouped_reduce_shared_columns``).
-        if marker.group_pre == 1:
-            slots = marker.group_count * (marker.group_span // 32)
-        elif fold_warp:
-            slots = marker.group_count * (marker.group_span // 32) * marker.group_pre
-        else:
-            slots = marker.group_count * marker.group_span
-        fold_keyword = ", fold='warp'" if fold_warp else ""
+        fold = "cooperative" if fold_cooperative else "warp" if fold_warp else "serial"
+        smem_elements = shared_columns_elements(
+            marker.group_pre, count, marker.group_span, marker.group_count, fold
+        )
+        fold_keyword = "" if fold == "serial" else f", fold={fold!r}"
         return [
             statement_from_string(f"{lane_var} = {shared_lane_expr}"),
             statement_from_string(
@@ -465,7 +469,7 @@ def _finalize_marker(
                 f"{fold_keyword})"
             ),
             statement_from_string(f"{results} = [{', '.join(elements)}]"),
-        ], _static_smem_bytes(marker, count, slots)
+        ], _static_smem_bytes(marker, smem_elements)
     if cross_warp:
         statements: list[ast.AST] = [statement_from_string(f"{results} = []")]
         for t in range(count):
@@ -490,7 +494,7 @@ def _finalize_marker(
         # Every two-stage call stages ``pre`` partials per warp plus one
         # result per sibling coordinate for each group.
         slots = marker.group_count * marker.group_pre * (marker.group_span // 32 + 1)
-        return statements, _static_smem_bytes(marker, count, slots)
+        return statements, _static_smem_bytes(marker, count * slots)
     elements = [
         marker.finalize_expr(_single_reduce_expr(marker, f"{acc_list}[{t}]"))
         for t in range(count)
@@ -940,6 +944,7 @@ def lower_register_tile_lane_loop(
             results_name[leaf.index],
             _tile_count(nest, leaf.path),
             warp_fold=options.warp_fold,
+            cooperative_fold=options.cooperative_fold,
         )
         finalize[marker_level[leaf.index]].extend(statements)
         smem_bytes += allocated

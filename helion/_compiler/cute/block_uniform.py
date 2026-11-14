@@ -236,7 +236,7 @@ def _is_packed_grid_block(block_id: int | None) -> bool:
     if block_id is None:
         return False
     packed = packed_grid_block(
-        CompileEnvironment.current(), DeviceFunction.current().config
+        CompileEnvironment.current().config_spec, DeviceFunction.current().config
     )
     return packed is not None and packed[0] == block_id
 

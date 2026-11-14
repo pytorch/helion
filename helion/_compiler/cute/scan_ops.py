@@ -351,6 +351,7 @@ def cute_serial_axis(
     from .cute_reshape import _get_dim_local_coord
     from .cute_reshape import _resolve_dim_block_id
     from .emitters.memory_access import _cute_active_index_var
+    from .iota_utils import cute_padded_range_length
     from .tile_ops import cute_masked_block_end
 
     env = CompileEnvironment.current()
@@ -408,14 +409,22 @@ def cute_serial_axis(
             )
         position = _get_dim_local_coord(state.codegen, value, dim)
         tile_base = f"({index_var}) - ({position})"
-    return CuteSerialAxis(
-        block_id,
-        extent,
-        position,
-        tile_base,
-        index_var,
-        cute_masked_block_end(state.codegen, block_id, what),
-    )
+    end = cute_masked_block_end(state.codegen, block_id, what)
+    # A padded ``hl.arange`` on the lanes of this reduction dim of its padded
+    # size (``cute_padded_range_reduction_block``) holds elements in its first
+    # ``length`` lanes only, and the dim has no mask that says so: a sort over
+    # ``hl.load(x, [i, hl.arange(5)])`` on 8 lanes must not rank the 3 past
+    # it.  The walked value's own inputs name the range; a full row sorted
+    # beside it walks all 8.
+    assert state.fx_node is not None
+    length = cute_padded_range_length(state.codegen, state.fx_node, block_id)
+    if length is not None:
+        if end is not None:
+            raise exc.BackendUnsupported(
+                "cute", f"{what} along a padded hl.arange on a masked dim"
+            )
+        end = str(length)
+    return CuteSerialAxis(block_id, extent, position, tile_base, index_var, end)
 
 
 def cute_reread_index(
@@ -1801,6 +1810,7 @@ def _cute_try_parallel_scan(
 
     from ..ast_extension import expr_from_string
     from .cute_reshape import _resolve_dim_block_id
+    from .iota_utils import cute_padded_range_length
 
     if not input_nodes or not all(isinstance(node, Node) for node in input_nodes):
         return "an input is not a traced tile"
@@ -1828,6 +1838,15 @@ def _cute_try_parallel_scan(
     block_id = _resolve_dim_block_id(state.codegen, first, dim)
     if block_id is None:
         return "the scan dim has no block"
+    if reverse and (
+        cute_padded_range_length(state.codegen, cast("Node", state.fx_node), block_id)
+        is not None
+    ):
+        # The lanes past a padded ``hl.arange`` on the dim's lanes hold the
+        # zeros its loads fill in, which a reverse scan would fold into every
+        # element, and the shuffles carry no flag for them; the serial walk
+        # ends at the range's length (``cute_serial_axis``).
+        return "a reverse scan reads the padding lanes of an hl.arange"
     geometry = _cute_scan_geometry(state, block_id)
     if geometry is None:
         return (

@@ -55,12 +55,14 @@ A masked load becomes one predicated packet load that leaves zeros
 zero fill are dropped, so ptxas keeps a strip's loads in flight instead of
 consuming each one at once.  A load may move above a segment's stores into
 tensors proven disjoint from the loaded one, and the per-lane stores of such
-a segment (a flat gather's ``out[row + lane]``) flush as one packet after the
-V-loop.  A scalar folded across the lanes (``acc = acc + e``, through its
-loop-carry aliases) stays scalar and accumulates in lane order inside its
-segment's V-loop.  A chunk straddling a jagged tile's extent loads under the
-extent mask evaluated at the chunk base when the load fact proves every
-aligned chunk inside the tensor, keeping the per-lane selects.
+a segment (a flat gather's ``out[row + lane]``, a tile store inside a sunk
+reduction) flush as one packet after the V-loop when no other store of the
+segment may write their tensor.  A scalar folded across the lanes (``acc =
+acc + e``, through its loop-carry aliases) stays scalar and accumulates in
+lane order inside its segment's V-loop.  A chunk straddling a jagged tile's
+extent loads under the extent mask evaluated at the chunk base when the load
+fact proves every aligned chunk inside the tensor, keeping the per-lane
+selects.
 """
 
 from __future__ import annotations
@@ -250,8 +252,13 @@ class _Sinker:
         proven_disjoint_tensor_pairs: Collection[frozenset[str]] = (),
         stores: Mapping[str, CuteVloopStoreFact] | None = None,
         wide_packets: bool = False,
+        trace_lists: frozenset[str] = frozenset(),
     ) -> None:
         self.vec_var = fact.vec_lane_var
+        # Trace-time Python lists (a packet flush collects its lane values in
+        # one, ``_pack_store`` adds its own): appending to them touches no
+        # device memory.
+        self.trace_lists = set(trace_lists)
         # Hinted 32-byte packets take their ``_32b`` helpers
         # (``cache_policy_loads.hint_wide_packets``).
         self.wide_packets = wide_packets
@@ -1264,11 +1271,18 @@ class _Sinker:
         of the segment, so it is packed only when nothing else in the segment
         can observe it: every other memory effect of the segment is a plain
         store (``stored_tensors`` is known) into a tensor proven disjoint from
-        the stored one, no other store site writes the stored tensor, and
-        every load of the segment addresses tensors proven disjoint from it
-        (the vector loads this pass hoists included).  The guard of a masked
-        store must be V-lane-invariant: the flush is predicated by it.
+        the stored one, no other store site of the segment may write the
+        stored tensor (a site this pass cannot pack included: a later masked
+        store of the same elements would otherwise run before the flush,
+        which overwrites it), and every load of the segment addresses tensors
+        proven disjoint from it (the vector loads this pass hoists and a
+        gather's bare ``t[i]`` included; a load form whose tensor is not
+        resolved here packs nothing).  The guard of a masked store must be
+        V-lane-invariant: the flush is predicated by it.
         """
+        from ._ast_pass_utils import _is_proven_relocatable_call
+        from .fuse_two_pass_loads import _is_store_call
+        from .fuse_two_pass_loads import _store_tensor_roots
         from .fuse_two_pass_loads import _tensor_arg_roots
 
         result: dict[
@@ -1300,31 +1314,46 @@ class _Sinker:
                 candidates.append((stmt, *match, guard))
         if not candidates:
             return result
-        # Tensors the segment's loads address (None: an unresolved pointer).
+        # Tensors the segment's loads address, and how many store sites of
+        # the segment may write each tensor (an unresolved address packs
+        # nothing).
         loaded: set[str] = set()
+        store_sites: dict[str, int] = {}
         for stmt in segment:
             for node in ast.walk(stmt):
+                if (
+                    isinstance(node, ast.Subscript)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id in tensor_names
+                ):
+                    loaded.add(node.value.id)
+                    continue
                 if not isinstance(node, ast.Call):
                     continue
-                pointer = _scalar_load_pointer(node)
-                if pointer is None:
-                    if (
-                        isinstance(node.func, ast.Attribute)
-                        and node.func.attr == "load"
-                    ) or ast.unparse(node.func) == "cute.arch.load":
+                if _is_store_call(node):
+                    roots = _store_tensor_roots(node, tensor_names)
+                    if roots is None:
                         return result
+                    for root in roots:
+                        store_sites[root] = store_sites.get(root, 0) + 1
                     continue
-                roots = _tensor_arg_roots(pointer, tensor_names)
+                if _is_proven_relocatable_call(
+                    node, allow_load=False
+                ) or not _is_proven_relocatable_call(node, allow_load=True):
+                    continue
+                pointer = _scalar_load_pointer(node)
+                roots = (
+                    None
+                    if pointer is None
+                    else _tensor_arg_roots(pointer, tensor_names)
+                )
                 if roots is None:
                     return result
                 loaded |= roots
-        store_sites: dict[str, int] = {}
-        for _stmt, _call, _pointer, fact, _guard in candidates:
-            store_sites[fact.tensor_name] = store_sites.get(fact.tensor_name, 0) + 1
         for stmt, call, pointer, fact, guard in candidates:
             tensor = fact.tensor_name
             others = (stored_tensors - {tensor}) | loaded
-            if store_sites[tensor] != 1 or any(
+            if store_sites.get(tensor) != 1 or any(
                 frozenset((tensor, other)) not in self.proven_disjoint_tensor_pairs
                 for other in others
             ):
@@ -1364,6 +1393,7 @@ class _Sinker:
         ):
             return None
         list_var = self.new_var("_vsink_store_vals", dce=False)
+        self.trace_lists.add(list_var)
         pre.append(statement_from_string(f"{list_var} = []"))
         carrier = _CUTE_VECTOR_UNROLL_CARRIER[fact.dtype]
         helper = (
@@ -1389,12 +1419,22 @@ class _Sinker:
         An assignment counts when it writes a tensor in place or calls
         anything outside the proven pure / load set: an atomic whose result
         is bound to a name (``old = cute.arch.atomic_add(...)``) or a
-        shared-memory reduce is such a call.  Every other statement form
-        (``if`` blocks, bare expressions) counts.
+        shared-memory reduce is such a call.  Appending a pure value to a
+        trace-time list (``self.trace_lists``, where packet flushes collect
+        their lanes) does not count; every other statement form (``if``
+        blocks, bare expressions) does.
         """
         from ._ast_pass_utils import _is_proven_relocatable_call
         from .lane_loops.owner_guards import _has_side_effect
+        from .register_tile_reductions import _append_target
 
+        append = _append_target(stmt)
+        if append is not None and append[0] in self.trace_lists:
+            return not all(
+                _is_proven_relocatable_call(node, allow_load=False)
+                for node in ast.walk(append[1])
+                if isinstance(node, ast.Call)
+            )
         if isinstance(stmt, ast.Assign):
             inplace = set(ReadWrites.from_ast(stmt).inplace_writes)
             if inplace - self.fragment_names:
@@ -2433,6 +2473,16 @@ def sink_grid_vector_loops(
     # disjoint from every written tensor (two arguments may share storage:
     # ``x.view(-1)`` next to ``x``, or one tensor passed as input and out).
     written = _written_tensors(body, set(tensor_dtypes))
+    trace_lists = frozenset(
+        node.targets[0].id
+        for stmt in body
+        for node in ast.walk(stmt)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and isinstance(node.value, ast.List)
+        and not node.value.elts
+    )
     cacheable = frozenset(
         name
         for name in tensor_dtypes
@@ -2466,6 +2516,7 @@ def sink_grid_vector_loops(
                     proven_disjoint_tensor_pairs,
                     stores,
                     wide_packets,
+                    trace_lists,
                 )
                 try:
                     replacement = sinker.run()
@@ -2488,7 +2539,8 @@ def sink_grid_vector_loops(
 
 
 class VloopSinkNotApplied(exc.Base):
-    """``cute_vloop_sink`` shaped the thread layout but sank no vector loop.
+    """``cute_vloop_sink`` shaped the code (a thread layout, a flattened
+    tile's index) but sank no vector loop.
 
     The knob must not change the code by itself, so the kernel is regenerated
     with the knob off (``vloop_sink_off_config``): by ``generate_ast`` for the
@@ -2500,7 +2552,12 @@ class VloopSinkNotApplied(exc.Base):
 
 
 def vloop_sink_off_config(config: Config) -> Config:
-    """``config`` with vector-loop sinking (and its lane unroll) off."""
-    return Config.from_dict(
-        {**config.config, "cute_vloop_sink": False, "cute_lane_unroll": 1}
-    )
+    """``config`` with vector-loop sinking off.
+
+    The lane unroll stays: without the knob it asks for the loads-first
+    unroll of the grid lane loops (``unroll_lane_loads.py``), which
+    ``LaneUnrollNotApplied`` switches off in turn where no lane loop takes
+    it, so a knob-on config that sinks nothing generates the code of the
+    knob-off config with the same unroll.
+    """
+    return Config.from_dict({**config.config, "cute_vloop_sink": False})

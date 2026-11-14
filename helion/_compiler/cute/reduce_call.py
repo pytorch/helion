@@ -138,6 +138,52 @@ _SCALAR_SCOPES: dict[str, ReduceScope] = {
 }
 
 
+def cooperative_column_share(pre: int, width: int, group_span: int) -> int:
+    """Threads of a group that sum one output of the cooperative column fold
+    (``reduce_helpers._cute_cooperative_column_sums``): the largest power of
+    two that divides the reduction extent ``group_span // pre`` (so every
+    lane reads the same number of partials) and is at most a warp and the
+    group's threads per output."""
+    extent = group_span // pre
+    per_output = group_span // (pre * width)
+    share = min(32, extent & -extent, max(1, per_output))
+    return 1 << (share.bit_length() - 1)
+
+
+def cooperative_column_slots(pre: int, width: int, group_span: int) -> int:
+    """Output slots per group of the cooperative column fold, the size
+    ``smem_footprint`` gives it: one per lane block and pass, so no two
+    blocks store to one slot.  The ``pre * width`` outputs take the first
+    slots; the blocks past the last output store their recomputed copies to
+    slots nothing reads."""
+    blocks = group_span // cooperative_column_share(pre, width, group_span)
+    return blocks * -(-(pre * width) // blocks)
+
+
+def shared_columns_elements(
+    pre: int, width: int, group_span: int, group_count: int, fold: str
+) -> int:
+    """Shared-memory elements ``reduce_helpers._cute_grouped_reduce_shared_columns``
+    allocates for ``width`` columns of ``group_count`` groups under ``fold``
+    (``"serial"``, ``"warp"`` or ``"cooperative"``), which the register-tile
+    emitter and ``smem_footprint`` both size: one slot per warp
+    (``pre == 1``, any fold), per warp and sibling class (the warp fold) or
+    per thread (the serial fold) of every group, per column; the cooperative
+    fold stages one per thread too and adds its output slots
+    (``cooperative_column_slots``) per group."""
+    if pre == 1:
+        per_group = group_span // 32 * width
+    elif fold == "cooperative":
+        per_group = group_span * width + cooperative_column_slots(
+            pre, width, group_span
+        )
+    elif fold == "warp":
+        per_group = group_span // 32 * pre * width
+    else:
+        per_group = group_span * width
+    return group_count * per_group
+
+
 def runtime_lane_expr(index_type: str) -> str:
     """The flattened CTA thread id of ``index_type`` (``cutlass.Int32`` or
     ``cutlass.Int64``) from the runtime block dims: the lane a cross-warp

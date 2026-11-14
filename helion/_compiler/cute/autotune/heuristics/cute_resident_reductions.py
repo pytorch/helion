@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import dataclasses
+import logging
 from typing import TYPE_CHECKING
 from typing import cast
 
@@ -18,9 +19,12 @@ from ...thread_budget import MAX_THREADS_PER_BLOCK
 from .cute import _seq_config_list
 
 if TYPE_CHECKING:
+    from .....autotuner.config_spec import ConfigSpec
     from ....autotuner_heuristics.registry import CompilerHeuristicSpecializationFact
     from ....compile_environment import CompileEnvironment
     from ....device_ir import DeviceIR
+
+log = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -55,6 +59,30 @@ def _seed_vector(features: int, threads: int, vector: int) -> int | None:
     return None
 
 
+def _vector_row_entries(features: int) -> list[tuple[int, int, int, int, str]]:
+    """One 8-wide feature vector per thread over two- and four-row groups,
+    for features no 8-wide lattice entry tiles.
+
+    The lattice gives 2048 and 4096 features a 16-byte bf16 load per thread
+    (256 or 512 threads of 8); below that it offers at most 128 threads of 4
+    (512 and 1024 features; nothing for 256). These entries give 256, 512
+    and 1024 features 32, 64 and 128 threads of 8, whatever the row loop's
+    form.
+    512 bf16 features (better-benchmark's mix-order RMSNorm backward) ran
+    15-50% faster as 64 threads of 8 with four-row groups than as 128
+    threads of 4, matching Triton's kernel.
+    """
+    if any(
+        vector == 8 and features % (threads * vector) == 0
+        for _coarse, threads, vector, _rows, _schedule in _SEED_LATTICE
+    ):
+        return []
+    threads = features // 8
+    if threads % 32 or not 32 <= threads <= MAX_THREADS_PER_BLOCK:
+        return []
+    return [(32, threads, 8, rows, "pipelined") for rows in (4, 2)]
+
+
 def _occupancy_coarse(rows: int, coarse: int) -> int | None:
     """The power-of-two coarse tile that gives about one CTA per SM, when the
     lattice's ``coarse`` would leave SMs idle.
@@ -73,6 +101,48 @@ def _occupancy_coarse(rows: int, coarse: int) -> int | None:
     per_cta = max(1, -(-rows // units))
     occupancy = 1 << (per_cta - 1).bit_length()
     return occupancy if occupancy < coarse else None
+
+
+def _plan_blocks(spec: ConfigSpec, plan: _ResidentPlan) -> bool:
+    """Whether the searched block sizes are exactly the plan's coarse and row
+    blocks, one block ID each."""
+    return all(
+        len(item.block_ids) == 1
+        and item.block_id in (plan.coarse_block, plan.row_block)
+        for item in spec.block_sizes
+    )
+
+
+def _rows_subdivide_coarse(spec: ConfigSpec, plan: _ResidentPlan) -> bool:
+    """Whether the row loop tiles the coarse tile's own rows
+    (``hl.tile(coarse.begin, coarse.end)``, as in the normalization backward
+    examples) rather than a dim of its own (``x[tile_s, tile_r, :]`` beside
+    ``for tile_r in hl.tile(rows)``)."""
+    row = spec.block_sizes.block_id_lookup(plan.row_block)
+    return row.bounded_by_block_id == plan.coarse_block
+
+
+def _coarse_tile(spec: ConfigSpec, plan: _ResidentPlan, coarse: int) -> int:
+    """The coarse tile a seed can schedule: ``coarse`` when the row loop
+    subdivides the coarse tile (``_rows_subdivide_coarse``), else 1.
+
+    A row loop over a dim of its own runs every row of each coarse index, so
+    a coarse tile wider than one index wraps the row loop in a lane loop over
+    the coarse dim, which the resident lowering does not schedule (it
+    refuses the config). Each CTA then takes one coarse index and all of its
+    rows.
+    """
+    return coarse if _rows_subdivide_coarse(spec, plan) else 1
+
+
+def _cta_rows(env: CompileEnvironment, plan: _ResidentPlan, coarse: int) -> int | None:
+    """The rows one CTA's row loop runs at a coarse tile of ``coarse``: the
+    tile's own when the row loop subdivides it, else every row of the CTA's
+    one coarse index (``_coarse_tile``); ``None`` when that count is unknown."""
+    if _rows_subdivide_coarse(env.config_spec, plan):
+        return coarse
+    rows = env.block_sizes[plan.row_block].size
+    return env.size_hint(rows) if isinstance(rows, (int, torch.SymInt)) else None
 
 
 class CuteResidentReductionHeuristic(AutotunerHeuristic):
@@ -164,8 +234,49 @@ class CuteResidentReductionHeuristic(AutotunerHeuristic):
         plan = cls._plan(env, device_ir)
         if plan is None:
             return frozenset()
-        env.config_spec.cute_resident_reduction_blocks.add(plan.reduction_block)
+        spec = env.config_spec
+        spec.cute_resident_reduction_blocks.add(plan.reduction_block)
+        if _plan_blocks(spec, plan) and not _rows_subdivide_coarse(spec, plan):
+            # One coarse index per CTA is the only coarse tile the resident
+            # lowering schedules in this form (``_coarse_tile``), below the
+            # occupancy floor a large grid gets
+            # (``ConfigSpec.raise_grid_block_minimums``, which never exceeds
+            # the default block size, so the default stays put).  Search it
+            # when a resident family seeds that tile; other surfaces' floors
+            # stay.  The seeds follow the plan's structural match: the
+            # lowering proves each config, and a kernel it refuses searches
+            # the tiles below the floor too.  A split of at most one row keeps
+            # the floor: the lowering proves none of its seeds' carries.
+            coarse = spec.block_sizes.block_id_lookup(plan.coarse_block)
+            rows = _cta_rows(env, plan, 1)
+            if (
+                coarse.occupancy_floor is not None
+                and coarse.autotuner_min == coarse.occupancy_floor[1]
+                and (rows is None or rows > 1)
+                and cls._seeds_resident(env, device_ir)
+            ):
+                coarse.drop_occupancy_floor()
         return cls.CACHE_SPECIALIZATION_FACTS
+
+    @classmethod
+    def _seeds_resident(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        """Whether a resident family seeds a row loop over a dim of its own:
+        the base seeds, which the depth seeds follow (the serial output
+        carrier needs a feature width the base seeds tile too, and the
+        serial-row family offers none in this form).  No seed is planted
+        with autotuner heuristics disabled, nor by a seed generator that
+        fails (``compiler_seed_configs`` logs and skips it)."""
+        if env.settings.disable_autotuner_heuristics:
+            return False
+        try:
+            return bool(cls.get_seed_configs(env, device_ir))
+        except Exception:
+            log.debug(
+                "%s failed while probing its seeds; the occupancy floor stays",
+                cls.name,
+                exc_info=True,
+            )
+            return False
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
@@ -182,38 +293,62 @@ class CuteResidentReductionHeuristic(AutotunerHeuristic):
     def get_seed_configs(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> list[Config] | None:
+        return cls._seed_configs(env, device_ir, with_vector_rows=True)
+
+    @classmethod
+    def _seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR, *, with_vector_rows: bool
+    ) -> list[Config] | None:
+        """The lattice's seeds and their occupancy twins, with the 8-wide
+        entries' (``_vector_row_entries``) when ``with_vector_rows``."""
         plan = cls._plan(env, device_ir)
         if plan is None:
             return None
         spec = env.config_spec
-        if any(
-            len(item.block_ids) != 1
-            or item.block_id not in (plan.coarse_block, plan.row_block)
-            for item in spec.block_sizes
-        ):
+        if not _plan_blocks(spec, plan):
             return None
         seeds = []
+        vector_rows = _vector_row_entries(plan.features) if with_vector_rows else []
+        # Each entry ends with whether its row group shrinks to the rows a
+        # CTA's row loop runs (``_cta_rows``): the 8-wide entries' groups do,
+        # the lattice's keep their size.
         lattice = [
-            (coarse, threads, vector, rows, schedule)
+            (coarse, threads, vector, rows, schedule, False)
             for coarse, threads, vector, rows, schedule in _SEED_LATTICE
             if plan.features % (threads * vector) == 0
         ]
+        lattice.extend(
+            (coarse, threads, vector, rows, schedule, True)
+            for coarse, threads, vector, rows, schedule in vector_rows
+        )
         # The same thread/row/schedule choices at an occupancy-filling coarse
         # tile, after the lattice so the existing primaries keep their rank.
         # Through ``env``: callers hold the environment without entering it.
-        row_size = env.block_sizes[plan.coarse_block].size
-        row_count = (
-            env.size_hint(row_size) if isinstance(row_size, (int, torch.SymInt)) else 0
+        coarse_size = env.block_sizes[plan.coarse_block].size
+        coarse_count = (
+            env.size_hint(coarse_size)
+            if isinstance(coarse_size, (int, torch.SymInt))
+            else 0
         )
-        for coarse, threads, vector, rows, schedule in _SEED_LATTICE:
-            occupancy = _occupancy_coarse(row_count, coarse)
-            seed_vector = _seed_vector(plan.features, threads, vector)
-            if occupancy is None or seed_vector is None:
-                continue
-            entry = (occupancy, threads, seed_vector, rows, schedule)
-            if entry not in lattice:
-                lattice.append(entry)
-        for coarse, threads, vector, rows, schedule in lattice:
+        for entries, fit in ((_SEED_LATTICE, False), (vector_rows, True)):
+            for coarse, threads, vector, rows, schedule in entries:
+                occupancy = _occupancy_coarse(coarse_count, coarse)
+                seed_vector = _seed_vector(plan.features, threads, vector)
+                if occupancy is None or seed_vector is None:
+                    continue
+                entry = (occupancy, threads, seed_vector, rows, schedule, fit)
+                if entry not in lattice:
+                    lattice.append(entry)
+        scheduled = []
+        for coarse, threads, vector, rows, schedule, fit in lattice:
+            cta_rows = _cta_rows(env, plan, coarse) if fit else None
+            # The rows past a CTA's would only take masked staging; a split
+            # of no rows still takes a group of one.
+            group = rows if cta_rows is None else max(1, min(rows, cta_rows))
+            entry = (_coarse_tile(spec, plan, coarse), threads, vector, group, schedule)
+            if entry not in scheduled:
+                scheduled.append(entry)
+        for coarse, threads, vector, rows, schedule in scheduled:
             block_sizes = {plan.coarse_block: coarse, plan.row_block: 1}
             if any(
                 not item.min_size <= block_sizes[item.block_id] <= item.max_size
@@ -253,7 +388,9 @@ class CuteResidentReductionHeuristic(AutotunerHeuristic):
 
         Reuse the typed feature/thread/vector lattice of the existing one-row
         pipeline seeds. A sixteen-row coarse tile amortizes the three-group
-        prefill while keeping more producer CTAs available. The AST matcher
+        prefill while keeping more producer CTAs available (one coarse index
+        per CTA where the rows lie in a dim of their own, ``_coarse_tile``,
+        whose row loop runs all of them). The AST matcher
         still proves every access and charges all four shared-memory slots.
 
         These are appended after every old compiler seed, including host-tail
@@ -263,11 +400,11 @@ class CuteResidentReductionHeuristic(AutotunerHeuristic):
         if plan is None:
             return []
         spec = env.config_spec
-        blocks = {plan.coarse_block: 16, plan.row_block: 1}
+        if not _plan_blocks(spec, plan):
+            return []
+        blocks = {plan.coarse_block: _coarse_tile(spec, plan, 16), plan.row_block: 1}
         if any(
-            len(item.block_ids) != 1
-            or item.block_id not in blocks
-            or not item._fragment(spec).low
+            not item._fragment(spec).low
             <= blocks[item.block_id]
             <= item._fragment(spec).high
             for item in spec.block_sizes
@@ -279,7 +416,10 @@ class CuteResidentReductionHeuristic(AutotunerHeuristic):
             if item.block_id == plan.coarse_block
         )
         result = []
-        for seed in cls.get_seed_configs(env, device_ir) or ():
+        # The lattice's seeds alone: the 8-wide entries' one-row twins (an
+        # occupancy tile of one row) are not its one-row pipeline seeds, and
+        # keep their prefetch.
+        for seed in cls._seed_configs(env, device_ir, with_vector_rows=False) or ():
             if (
                 seed.config["cute_reduction_schedule"] != "pipelined"
                 or seed.config["cute_reduction_group_rows"] != 1
@@ -339,22 +479,26 @@ class CuteResidentReductionHeuristic(AutotunerHeuristic):
         if plan is None or not 32 <= plan.features <= MAX_THREADS_PER_BLOCK:
             return []
         spec = env.config_spec
-        axes = {plan.coarse_block, plan.row_block, plan.reduction_block}
-        if len(axes) != 3 or any(len(item.block_ids) != 1 for item in spec.block_sizes):
+        if not _plan_blocks(spec, plan) or not _rows_subdivide_coarse(spec, plan):
+            # A row loop over a dim of its own does not lower this family
+            # resident: its seed renders the scalar code, at four coarse
+            # indices per CTA as at one (``_coarse_tile``).
             return []
-        blocks = {item.block_id: item for item in spec.block_sizes}
+        axes = {plan.coarse_block, plan.row_block, plan.reduction_block}
+        blocks = dict.fromkeys((plan.coarse_block, plan.row_block), 4)
         threads = {
             plan.coarse_block: 1,
             plan.row_block: 1,
             plan.reduction_block: plan.features,
         }
         if (
-            set(blocks) != {plan.coarse_block, plan.row_block}
-            or set(spec.num_threads.valid_block_ids()) != axes
+            set(spec.num_threads.valid_block_ids()) != axes
             or not axes.issubset(spec.cute_vector_widths.valid_block_ids())
             or not axes.issubset(spec.cute_lane_layouts.valid_block_ids())
             or any(
-                not item._fragment(spec).low <= 4 <= item._fragment(spec).high
+                not item._fragment(spec).low
+                <= blocks[item.block_id]
+                <= item._fragment(spec).high
                 for item in spec.block_sizes
             )
             or any(
@@ -365,7 +509,7 @@ class CuteResidentReductionHeuristic(AutotunerHeuristic):
         ):
             return []
         values = {
-            "block_sizes": _seq_config_list(spec.block_sizes, dict.fromkeys(blocks, 4)),
+            "block_sizes": _seq_config_list(spec.block_sizes, blocks),
             "num_threads": _seq_config_list(spec.num_threads, threads),
             "cute_vector_widths": _seq_config_list(
                 spec.cute_vector_widths, dict.fromkeys(axes, 1)
@@ -407,14 +551,14 @@ class CuteResidentReductionHeuristic(AutotunerHeuristic):
             or spec.target_device_capability[0] != 10
         ):
             return None
-        blocks = {plan.coarse_block: 64, plan.row_block: 1}
+        if not _plan_blocks(spec, plan):
+            return None
+        blocks = {plan.coarse_block: _coarse_tile(spec, plan, 64), plan.row_block: 1}
         axes = {plan.coarse_block, plan.row_block, plan.reduction_block}
         if (
             plan.features % (256 * 2)
             or any(
-                len(item.block_ids) != 1
-                or item.block_id not in blocks
-                or not item._fragment(spec).low
+                not item._fragment(spec).low
                 <= blocks[item.block_id]
                 <= item._fragment(spec).high
                 for item in spec.block_sizes

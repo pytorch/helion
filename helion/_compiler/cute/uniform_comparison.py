@@ -189,6 +189,16 @@ def cutoff_function(name: str) -> ast.FunctionDef:
     )
 
 
+# The cutoff helper's results, in its return order: the name prefixes of the
+# hoisted assignment ``lower_uniform_comparisons`` emits, and their DSL types
+# (recorded in ``cute_state.uniform_cutoff_dtypes``).
+_CUTOFF_RESULTS = (
+    ("_helion_uniform_first", "cutlass.Uint32"),
+    ("_helion_uniform_span", "cutlass.Uint32"),
+    ("_helion_uniform_all", "cutlass.Boolean"),
+)
+
+
 def lower_uniform_comparisons(
     body: list[ast.stmt],
     function: DeviceFunction,
@@ -249,8 +259,14 @@ def lower_uniform_comparisons(
                     helper = function.new_var(f"{function.name}_uniform_cutoff")
                     function.codegen.module_statements.append(cutoff_function(helper))
                 names = tuple(
-                    function.new_var(f"_helion_uniform_{suffix}")
-                    for suffix in ("first", "span", "all")
+                    function.new_var(prefix) for prefix, _dtype in _CUTOFF_RESULTS
+                )
+                function.cute_state.uniform_cutoff_dtypes.update(
+                    zip(
+                        names,
+                        (dtype for _prefix, dtype in _CUTOFF_RESULTS),
+                        strict=True,
+                    )
                 )
                 cutoffs[key] = cast("tuple[str, str, str]", names)
                 preamble.extend(

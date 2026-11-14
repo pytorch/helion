@@ -27,6 +27,7 @@ import torch
 
 from test._cute_kernels import _reduction_kernel
 
+import helion
 from helion._compiler.cute.fuse_two_pass_loads import fuse_two_pass_loads
 from helion._compiler.cute.persistent_branch_vec import (
     vectorize_branch_local_persistent_fragments,
@@ -36,9 +37,17 @@ from helion._testing import HALF_DTYPE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing.cute_sweep_kernels import dropout_layernorm
 
 cutlass = pytest.importorskip("cutlass")
 cute = pytest.importorskip("cutlass.cute")
+
+
+# A word0 dropout mask drawn once per row and needed by all three sweeps
+# (``test_cute_sweep_values.py`` checks the codegen on CPU).
+_dropout_layernorm = helion.kernel(
+    backend="cute", static_shapes=True, cute_rng_stream="word0"
+)(dropout_layernorm)
 
 
 def _nested_persistent_sweeps() -> list[ast.stmt]:
@@ -470,6 +479,61 @@ def _fused(source: str) -> str:
         proven_disjoint_tensor_pairs={frozenset(("x", "out"))},
     )
     return ast.unparse(ast.Module(body=result, type_ignores=[]))
+
+
+@pytest.mark.cpu_only
+def test_only_a_load_of_one_element_takes_a_single_slot() -> None:
+    # ``s`` reads one element in every lane: one slot, written in the first
+    # sweep and read in the second.  ``v`` reads through ``t``, which the lane
+    # index defines, and ``w`` through the lane index itself: a slot per lane
+    # each, indexed by the lane.
+    code = _fused(
+        """
+for synthetic_lane_7 in range(8):
+    t = synthetic_lane_7 * 2
+    s = (x.iterator + 3).load()
+    v = (x.iterator + t).load()
+    w = (x.iterator + synthetic_lane_7).load()
+    acc = acc + s * v * w
+for synthetic_lane_7 in range(8):
+    t = synthetic_lane_7 * 2
+    s = (x.iterator + 3).load()
+    v = (x.iterator + t).load()
+    w = (x.iterator + synthetic_lane_7).load()
+    (out.iterator + synthetic_lane_7).store(s * v * w)
+"""
+    )
+    assert "_fuse_cache_0 = cute.make_rmem_tensor(1, cutlass.Float32)" in code
+    assert "_fuse_cache_0[0] = s" in code
+    assert "s = _fuse_cache_0[0]" in code
+    for cache, name in (("_fuse_cache_1", "v"), ("_fuse_cache_2", "w")):
+        assert f"{cache} = cute.make_rmem_tensor(8, cutlass.Float32)" in code
+        assert f"{name} = {cache}[(synthetic_lane_7 - 0) // 1]" in code
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("per_lane", (False, True))
+def test_smem_mode_syncs_only_for_a_cache_in_shared_memory(
+    monkeypatch: pytest.MonkeyPatch, per_lane: bool
+) -> None:
+    # ``HELION_FUSER_MODE=smem`` puts a per-lane cache in shared memory, which
+    # the sweeps share through a barrier; a one-element load's single slot
+    # stays in registers and needs none.
+    monkeypatch.setenv("HELION_FUSER_MODE", "smem")
+    index = "synthetic_lane_7" if per_lane else "3"
+    code = _fused(
+        f"""
+for synthetic_lane_7 in range(8):
+    v = (x.iterator + {index}).load()
+    acc = acc + v
+for synthetic_lane_7 in range(8):
+    v = (x.iterator + {index}).load()
+    (out.iterator + synthetic_lane_7).store(v)
+"""
+    )
+    assert ("cute.make_rmem_tensor(1, cutlass.Float32)" in code) is not per_lane
+    assert ("cute.arch.alloc_smem(" in code) is per_lane
+    assert ("cute.arch.sync_threads()" in code) is per_lane
 
 
 @pytest.mark.cpu_only
@@ -1347,6 +1411,41 @@ class TestCuteFuseTwoPassLoads(TestCase):
         self.assertGreater(consume_start, 0)
         self.assertNotIn("cute.arch.load(", code[consume_start:])
         self.assertNotIn("_cute_load_", code[consume_start:])
+
+    def test_carried_word0_mask_matches_the_recomputed_mask(self) -> None:
+        """The later sweeps read the first sweep's word0 mask and dropped-out
+        row from fragments instead of redrawing them; the mask matches the
+        ``gmem`` policy's recomputation bit for bit, the other outputs to the
+        last place."""
+        torch.manual_seed(0)
+        x = torch.randn(64, 256, device=DEVICE, dtype=torch.bfloat16)
+        residual = torch.randn(64, 256, device=DEVICE)
+        weight = torch.randn(256, device=DEVICE)
+        bias = torch.randn(256, device=DEVICE)
+        seeds = torch.tensor([3, 1234567, 99, 7], device=DEVICE, dtype=torch.int64)
+        args = (x, seeds, residual, weight, bias, 1, 255)
+        config = {"block_sizes": [4], "num_threads": [4, 32]}
+        code, carried = code_and_output(
+            _dropout_layernorm, args, cute_reduction_reloads=["register"], **config
+        )
+        self.assertRegex(code, r"keep = cutlass\.Boolean\(_fuse_cache_\d+\[")
+        recomputed_code, recomputed = code_and_output(
+            _dropout_layernorm, args, cute_reduction_reloads=["gmem"], **config
+        )
+        self.assertNotIn("_fuse_cache_", recomputed_code)
+        (keep, *values), (recomputed_keep, *recomputed_values) = carried, recomputed
+        self.assertTrue(torch.equal(keep, recomputed_keep))
+        # Under ``gmem`` the mean sweep's dropped-out product feeds only the
+        # sum, and the compiler contracts the two into an FMA (one rounding
+        # fewer); here the product also fills a fragment and is rounded
+        # first.  The means can differ in the last place, and so can any
+        # output after them: by one unit in the last place, or near zero,
+        # where the terms cancel, by their fp32 rounding.
+        for got, expected in zip(values, recomputed_values, strict=True):
+            torch.testing.assert_close(
+                got, expected, rtol=torch.finfo(expected.dtype).eps, atol=1e-5
+            )
+        self.assertGreater(keep.float().mean().item(), 0.8)
 
     def test_fuser_skips_when_cache_size_too_large(self) -> None:
         """The fuser caps cache_size at 64 to avoid the register-pressure
