@@ -7166,7 +7166,7 @@ def build_tile_dependency_graph(
     keyed_peer_roots = {
         access.root
         for access in accesses
-        if access.owner_rank is not None
+        if access.allocation_id in crossing_allocation_ids
         and access.allocation_id not in inband_allocation_ids
     }
     inband_read_roots = {
