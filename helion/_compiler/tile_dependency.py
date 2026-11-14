@@ -6673,7 +6673,10 @@ def _inband_failure(
         and store.dtype is not torch.bool
         and not store.dtype.is_complex
         and all(
-            (load.tensor_shape, load.tensor_strides, load.storage_offset) == layout
+            (
+                (load.tensor_shape, load.tensor_strides, load.storage_offset) == layout
+                or (not scatter and _same_dense_storage(load, store, numel))
+            )
             and load.dtype == store.dtype
             for load in peer_loads
         )
@@ -6700,6 +6703,41 @@ def _inband_failure(
     ):
         return "R8: a scatter's peer loads run unmasked at root"
     return None
+
+
+def _same_dense_storage(load: TileAccess, store: TileAccess, numel: int) -> bool:
+    """Whether every element ``load`` can address lies in the ``numel`` elements
+    ``store`` fills, counted from the same storage offset, in any view shape.
+
+    Pushes and polls both address a word by the element's offset from the
+    tensor's start, so such a view reads exactly the words the store pushed.
+    """
+    try:
+        shape = [
+            _concrete_integer(extent, description="inband shape")
+            for extent in load.tensor_shape
+        ]
+        strides = [
+            _concrete_integer(stride, description="inband stride")
+            for stride in load.tensor_strides
+        ]
+        offsets = [
+            _concrete_integer(access.storage_offset, description="inband offset")
+            for access in (load, store)
+        ]
+    except ValueError:
+        return False
+    return (
+        offsets[0] == offsets[1]
+        and all(
+            extent > 0 and stride >= 0
+            for extent, stride in zip(shape, strides, strict=True)
+        )
+        and sum(
+            (extent - 1) * stride for extent, stride in zip(shape, strides, strict=True)
+        )
+        < numel
+    )
 
 
 def _scatter_tile(
