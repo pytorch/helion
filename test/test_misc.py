@@ -1723,9 +1723,10 @@ class TestMisc(RefEagerTestBase, TestCase):
         else:
             # A kernel that only streams a full head_dim slab per element is
             # pointwise; on the arches where the Triton pointwise seed is
-            # promoted (sm90/sm100) that seed is the default. Its byte budget
-            # over the 128-wide bf16 slab gives one row per CTA on the batch
-            # and head axes and 16 rows along the sequence (both arches).
+            # promoted (TritonPointwiseSeedHeuristic.PROMOTE_TARGETS) that seed
+            # is the default. Its byte budget over the 128-wide bf16 slab gives
+            # one row per CTA on the batch and head axes and 16 rows along the
+            # sequence.
             self.assertIn("triton_pointwise", config_spec.autotuner_heuristics)
             self.assertEqual(block_sizes, [1, 1, 16])
 
