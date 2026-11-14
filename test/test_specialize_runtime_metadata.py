@@ -7,6 +7,7 @@ import torch
 
 import helion
 from helion._testing import cpu_render_target
+from helion._testing import skipUnlessBackends
 from helion._testing.tunable_fragments import load_host_function
 from helion.exc import TypeInferenceError
 import helion.language as hl
@@ -95,17 +96,23 @@ def _after_operator(x, mode: hl.constexpr):
     hl.specialize(x.size())
     hl.specialize(x.stride())
     flat = x.view(-1)
-    if mode == "pure":
-        torch.ops.aten.alias(x)
+    if mode == "packet":
+        # Resolves to the pure .default overload, not the writing .out one.
+        torch.ops.aten.clone(x)
+    elif mode == "overload":
+        torch.ops.aten.alias.default(x)
     else:
-        torch.ops.aten.add_.Tensor(x, 1)
+        torch.ops.aten.t_.default(x)
     out = torch.empty_like(flat)
     for tile in hl.tile(flat.size(0)):
         out[tile] = flat[tile]
     return out
 
 
-@pytest.mark.parametrize("mode", ["pure", "mutating"])
+# Triton passes a non-literal stride as a kernel argument; CuTe always reads
+# strides from the tensor layout, so its code shows no difference.
+@skipUnlessBackends(["triton"])
+@pytest.mark.parametrize("mode", ["packet", "overload", "writing"])
 def test_operator_schema_decides_whether_view_strides_stay_literal(mode):
     # Looking up and calling a schema-pure torch.ops operator keeps the exact
     # layout of a specialized input's view; a writing schema voids it.
@@ -113,4 +120,4 @@ def test_operator_schema_decides_whether_view_strides_stay_literal(mode):
     with cpu_render_target():
         bound = kernel.bind((torch.empty(4, 8), mode))
         code = bound.to_code(bound.config_spec.default_config())
-    assert ("flat_stride_0" in code) == (mode == "mutating")
+    assert ("flat_stride_0" in code) == (mode == "writing")

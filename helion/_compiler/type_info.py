@@ -21,6 +21,7 @@ import sympy
 import torch
 from torch._dynamo.source import TensorProperty
 from torch._dynamo.source import TensorPropertySource
+from torch._higher_order_ops.effects import _get_effect
 from torch._subclasses.fake_tensor import FakeTensor
 from torch.fx.experimental import proxy_tensor
 from torch.utils._python_dispatch import TorchDispatchMode
@@ -168,13 +169,14 @@ def _is_known_host_value(value: object) -> bool:
 
 # Capture Python-library identities before user code can replace module attrs.
 _NATIVE_TENSOR_CLASS = torch.Tensor
-# ``torch.ops``, its namespaces and their packets: attribute lookup resolves a
-# registered operator and runs none of its kernels.
-_NATIVE_OPERATOR_REGISTRY = (
-    torch._ops._Ops,
-    torch._ops._OpNamespace,
-    torch._ops.OpOverloadPacket,
-)
+_NATIVE_OP_OVERLOAD = torch._ops.OpOverload
+_NATIVE_OP_PACKET = torch._ops.OpOverloadPacket
+# ``torch.ops``, its namespaces and their packets, with the ``__getattr__`` each
+# had at import: those resolve a registered operator and run none of its kernels.
+_NATIVE_OPERATOR_REGISTRY: dict[type[object], object] = {
+    kind: getattr_static(kind, "__getattr__")
+    for kind in (torch._ops._Ops, torch._ops._OpNamespace, _NATIVE_OP_PACKET)
+}
 _KNOWN_HOST_CONSTRUCTORS = (
     abs,
     all,
@@ -250,16 +252,16 @@ def _is_known_host_call(
         return True
     if any(fn is split for split in _KNOWN_HOST_SPLITS):
         return bool(args) and type(args[0]) is FakeTensor
-    if isinstance(fn, (torch._ops.OpOverload, torch._ops.OpOverloadPacket)):
-        # A schema without writes cannot change any tensor's storage or
-        # metadata (the contract functionalization relies on). A packet
-        # dispatches to any of its overloads.
-        overloads = (
-            [getattr(fn, name) for name in fn.overloads()]
-            if isinstance(fn, torch._ops.OpOverloadPacket)
-            else [fn]
+    if type(fn) is _NATIVE_OP_PACKET and not fn._has_torchbind_op_overload:
+        # The overload the call dispatches to, by the same schema matching.
+        fn = getattr(
+            fn, torch._C._jit_resolve_packet(fn._qualified_op_name, *args, **kwargs)
         )
-        return not any(overload._schema.is_mutable for overload in overloads)
+    if type(fn) is _NATIVE_OP_OVERLOAD:
+        # A schema without writes or a registered effect cannot change any
+        # tensor's storage or metadata (the contract functionalization relies
+        # on). An argument write stays an unproved effect.
+        return not fn._schema.is_mutable and _get_effect(fn) is None
     if type(fn) is types.MethodType:
         return fn.__func__ is _KNOWN_HOST_SPLITS[1] and type(fn.__self__) is FakeTensor
     if type(fn) is types.MethodDescriptorType:
@@ -288,6 +290,20 @@ def _is_known_host_call(
     return (
         getattr(torch._C._VariableFunctions, fn.__name__, None) is fn
         or getattr(torch._C, fn.__name__, None) is fn
+    )
+
+
+def _is_native_operator_lookup(value: object, attr: str) -> bool:
+    """Whether ``value.attr`` is a stock ``torch.ops`` registry lookup."""
+    kind = type(value)
+    original = _NATIVE_OPERATOR_REGISTRY.get(kind)
+    if original is None:
+        return False
+    # A cached entry is a plain instance attribute; otherwise no class
+    # attribute may intercept the lookup before the import-time __getattr__.
+    return attr in vars(value) or (
+        getattr_static(kind, attr, None) is None
+        and getattr_static(kind, "__getattr__") is original
     )
 
 
@@ -1428,7 +1444,7 @@ class LiteralType(TypeInfo):
             # Native Tensor method lookup does not invoke a user descriptor.
             # Python replacements still go through opaque effect tracking.
             result = descriptor
-        elif any(type(self.value) is kind for kind in _NATIVE_OPERATOR_REGISTRY):
+        elif _is_native_operator_lookup(self.value, attr):
             result = getattr(self.value, attr)
         else:
             with _track_host_storage_effects(self.value, origin):
