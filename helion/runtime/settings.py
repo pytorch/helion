@@ -814,16 +814,26 @@ class Settings(_Settings):
         ),
         "autotune_compile_timeout": (
             "Timeout in seconds for one autotune precompile subprocess "
-            "(autotune_precompile); a CuTe render worker past it is given up "
-            "and its config rendered in-process instead (never failed for the "
-            "timeout alone). Also the benchmark worker's deadline for a "
-            "candidate's compile and first call (the backend JIT; never below "
-            "autotune_benchmark_timeout, armed once the worker is ready so a "
-            "fresh worker's start is not the candidate's; lowered along with the "
-            "setting by autotune_adaptive_timeout): a candidate past it is killed and "
-            "recorded as failed to compile, and the search goes on. Default "
-            "is 60 seconds. In-process compiles cannot be interrupted by it; "
-            "the autotune budget bounds them instead."
+            "(autotune_precompile), the accuracy baseline's included: each baseline "
+            "config is precompiled before it runs in-process, and one past the "
+            "timeout backs off to smaller block sizes (or the next fallback config) "
+            "like a config the device rejects; when every attempt of the autotuning "
+            "reference config is past it, the search stops with InvalidConfig "
+            "where that config is the baseline (raise the timeout if the kernel's "
+            "compile needs longer), and keeps the execution default's output "
+            "unchecked where the reference only checks a promoted default. A CuTe "
+            "render worker past it is given "
+            "up and its config rendered in-process instead (never failed for the "
+            "timeout alone). Also the benchmark worker's deadline for a candidate's "
+            "compile and first call (the backend JIT; never below "
+            "autotune_benchmark_timeout, armed once the worker is ready so a fresh "
+            "worker's start is not the candidate's; lowered along with the setting "
+            "by autotune_adaptive_timeout): a candidate past it is killed and "
+            "recorded as failed to compile, and the search goes on. Default is 60 "
+            "seconds. In-process compiles cannot be interrupted by it (without a "
+            "precompile pool -- autotune_precompile off, or a backend such as CuTe "
+            "-- the baseline's among them); the autotune budget bounds the search's "
+            "instead."
         ),
         "autotune_benchmark_subprocess": "Run the autotune benchmark phase in a long-lived spawn subprocess so a hung/slow kernel can be killed without losing autotune progress. Enabled by default. Set HELION_AUTOTUNE_BENCHMARK_SUBPROCESS=0 to disable.",
         "autotune_benchmark_timeout": (
@@ -881,7 +891,8 @@ class Settings(_Settings):
             "set, the baseline is the output of the config the kernel runs by default "
             "(a compiler-promoted default when there is one, else the conservative "
             "autotuning reference, which is also the fallback when the promoted "
-            "default fails to compile or run)."
+            "default fails to compile or run). A NaN that matches a NaN at the "
+            "same position counts as accurate; a NaN on one side only does not."
         ),
         "autotune_rebenchmark_threshold": "If a config is within threshold*best_perf, re-benchmark it to avoid outliers. Defaults to effort profile value. Set HELION_REBENCHMARK_THRESHOLD to override.",
         "autotune_suspicious_rebenchmark_ratio": "When subprocess benchmarking is enabled, recheck rebenchmark timings below ratio*previous_timing before accepting them. Defaults to 0.9. Set HELION_AUTOTUNE_SUSPICIOUS_REBENCHMARK_RATIO=0 to disable.",
@@ -1083,12 +1094,14 @@ class Settings(_Settings):
         ),
         "autotune_fp8_accuracy": (
             "How autotuning accuracy checks compare fp8 output tensors against the baseline. "
-            "'ulp' (default) compares dequantized values: every element must lie within one fp8 "
-            "ulp of max(|actual|, |baseline|) plus the atol/rtol tolerances (atol scaled by the "
-            "baseline RMS as usual), and the one-ulp differences must not be systematically "
-            "one-directional. This admits the one-bucket flips a kernel that quantizes an "
-            "intermediate to fp8 (e.g. an online-softmax P) produces when its reduction blocking "
-            "changes, while still rejecting multi-ulp and biased differences. "
+            "'ulp' (default) compares dequantized values: every finite element must lie within "
+            "one fp8 ulp of max(|actual|, |baseline|) plus the atol/rtol tolerances (atol scaled "
+            "by the baseline RMS as usual; a float8_e8m0fnu element within one exponent step, "
+            "without the tolerances), NaN and infinite elements must match exactly, and the "
+            "one-ulp differences must not be systematically one-directional. This admits the "
+            "one-bucket flips a kernel that quantizes an intermediate to fp8 (e.g. an "
+            "online-softmax P) produces when its reduction blocking changes, while still "
+            "rejecting multi-ulp and biased differences. "
             "'bitwise' requires identical bytes whenever every output is fp8 and no explicit "
             "tolerance is set (the previous behavior). "
             "Explicit zero tolerances (autotune_baseline_atol=0 with autotune_baseline_rtol=0) "

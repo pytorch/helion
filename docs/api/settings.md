@@ -296,8 +296,13 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
    Timeout in seconds for one precompile subprocess during autotuning, and the benchmark worker's deadline for a
    candidate's compile and first call (never below ``autotune_benchmark_timeout``; a candidate past it is recorded as
    failed to compile and the search goes on). The worker's deadline is armed once the worker is ready, so a fresh
-   worker's start is not the candidate's, and ``autotune_adaptive_timeout`` does not lower it. Default is ``60``.
-   Controlled by ``HELION_AUTOTUNE_COMPILE_TIMEOUT``.
+   worker's start is not the candidate's, and ``autotune_adaptive_timeout`` lowers it along with the setting. With a
+   precompile pool (``autotune_precompile`` on the Triton backend) the accuracy baseline's configs are precompiled
+   under this timeout before they run in-process: one past it backs off to smaller block sizes (or the next fallback
+   config) instead of hanging the search. When every attempt of the autotuning reference config is past it, the
+   search stops with ``InvalidConfig`` without trying sampled configs where that config is the baseline (raise the
+   timeout if the kernel's compile needs longer), and keeps the execution default's output unchecked where the
+   reference only checks a promoted default. Default is ``60``. Controlled by ``HELION_AUTOTUNE_COMPILE_TIMEOUT``.
 
 .. autoattribute:: Settings.autotune_worker_start_timeout
 
@@ -356,7 +361,7 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
 .. autoattribute:: Settings.autotune_accuracy_check
 
-   Validate each candidate configuration against a baseline output before accepting it. Default is ``True``. Controlled by ``HELION_AUTOTUNE_ACCURACY_CHECK``.
+   Validate each candidate configuration against a baseline output before accepting it. A NaN that matches a NaN at the same position counts as accurate; a NaN on one side only does not. Default is ``True``. Controlled by ``HELION_AUTOTUNE_ACCURACY_CHECK``.
 
 .. autoattribute:: Settings.autotune_baseline_atol
 
@@ -372,7 +377,7 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
 .. autoattribute:: Settings.autotune_fp8_accuracy
 
-   How autotune accuracy checks compare fp8 output tensors against the baseline. ``"ulp"`` (default) compares dequantized values: each element must lie within one fp8 ulp plus the tolerances, and the one-ulp differences must not be systematically one-directional. ``"bitwise"`` requires identical bytes whenever every output is fp8 and no explicit tolerance is set. Explicit zero tolerances (``autotune_baseline_atol=0`` with ``autotune_baseline_rtol=0``) select ``"bitwise"`` whatever this setting says. Ignored when ``autotune_baseline_accuracy_check_fn`` is set: that check replaces the default one (an :class:`helion.autotuner.AccuracyCheck` compares fp8 outputs by its own ``fp8_accuracy``). Controlled by ``HELION_AUTOTUNE_FP8_ACCURACY``.
+   How autotune accuracy checks compare fp8 output tensors against the baseline. ``"ulp"`` (default) compares dequantized values: each finite element must lie within one fp8 ulp plus the tolerances (a ``float8_e8m0fnu`` element within one exponent step, without the tolerances), NaN and infinite elements must match exactly, and the one-ulp differences must not be systematically one-directional. ``"bitwise"`` requires identical bytes whenever every output is fp8 and no explicit tolerance is set. Explicit zero tolerances (``autotune_baseline_atol=0`` with ``autotune_baseline_rtol=0``) select ``"bitwise"`` whatever this setting says. Ignored when ``autotune_baseline_accuracy_check_fn`` is set: that check replaces the default one (an :class:`helion.autotuner.AccuracyCheck` compares fp8 outputs by its own ``fp8_accuracy``). Controlled by ``HELION_AUTOTUNE_FP8_ACCURACY``.
 
 .. autoattribute:: Settings.autotune_search_acf
 
@@ -534,7 +539,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_FORCE_AUTOTUNE`` | ``force_autotune`` | Force the autotuner to run even when explicit configs are provided. The result is saved to the cache. |
 | ``HELION_AUTOTUNE_FORCE_PERSISTENT`` | ``autotune_force_persistent`` | Restrict ``pid_type`` to persistent kernel strategies during config search. |
 | ``HELION_DISALLOW_AUTOTUNING`` | ``check_autotuning_disabled`` | Hard-disable autotuning; kernels must supply explicit configs when this is ``1``. |
-| ``HELION_AUTOTUNE_COMPILE_TIMEOUT`` | ``autotune_compile_timeout`` | Maximum seconds for one precompile subprocess, and for a candidate's compile and first call in the benchmark worker (a candidate past it is recorded as failed to compile). |
+| ``HELION_AUTOTUNE_COMPILE_TIMEOUT`` | ``autotune_compile_timeout`` | Maximum seconds for one precompile subprocess (an accuracy-baseline config past it backs off to smaller block sizes; the search stops with ``InvalidConfig`` when every attempt of the autotuning reference config, as the baseline, is past it), and for a candidate's compile and first call in the benchmark worker (a candidate past it is recorded as failed to compile). |
 | ``HELION_AUTOTUNE_WORKER_START_TIMEOUT`` | ``autotune_worker_start_timeout`` | Maximum seconds a fresh benchmark worker may take to start before it is killed; the start is never charged to a candidate's compile deadline. Default: twice the compile deadline, at least ``120``. |
 | ``HELION_AUTOTUNE_LOG_LEVEL`` | ``autotune_log_level`` | Adjust logging verbosity; accepts names like ``INFO`` or numeric levels. |
 | ``HELION_AUTOTUNE_LOG`` | ``autotune_log`` | Base filename for per-config CSV telemetry and mirrored autotune logs. |

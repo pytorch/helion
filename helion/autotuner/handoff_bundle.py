@@ -21,6 +21,7 @@ from .._hardware import get_hardware_info
 from ..language.constexpr import ConstExpr
 from .accuracy import effective_fp8_accuracy
 from .accuracy import is_fp8_dtype
+from .accuracy import same_values
 from .benchmark_provider import _materialize_multi_shape_config
 from .benchmark_provider import _MultiShapeAutotuneArgs
 from .benchmarking import do_bench_generic
@@ -219,7 +220,8 @@ def _tolerances(
                 original.view(torch.uint8) if is_fp8_dtype(original.dtype) else original
             )
             rhs = result.view(torch.uint8) if is_fp8_dtype(result.dtype) else result
-            if not torch.equal(lhs, rhs):
+            # An unchanged input holding a NaN is unchanged.
+            if not same_values(rhs, lhs):
                 dtypes.add(result.dtype)
     atol, rtol = settings.autotune_baseline_atol, settings.autotune_baseline_rtol
     if (

@@ -112,6 +112,10 @@ def test_fp8_reference_tolerances() -> None:
         helion.Settings(autotune_baseline_atol=0.02), output, inputs, inputs
     ) == (0.02, 0.01)
     assert _tolerances(bitwise, output, inputs, (inputs[0] + 1,)) == (0.01, 0.01)
+    # An unchanged input holding a NaN is unchanged (torch.equal counts a NaN
+    # unequal to itself).
+    nans = (torch.tensor([math.nan, 1.0]),)
+    assert _tolerances(bitwise, output, nans, (nans[0].clone(),)) == (0.0, 0.0)
 
 
 def test_agent_rejects_non_source_replacements_before_writing(tmp_path: Path) -> None:

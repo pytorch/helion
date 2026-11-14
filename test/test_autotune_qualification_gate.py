@@ -129,7 +129,9 @@ def test_incomplete_qualification_keeps_provider_cleanup_and_failure_metrics(
 ):
     incomplete_compound(phase)
     search._prepare = Mock()
-    search.settings = SimpleNamespace(autotune_log=False, autotune_log_details=False)
+    search.settings = SimpleNamespace(
+        autotune_log=False, autotune_log_details=False, autotune_compile_timeout=60
+    )
     search.benchmark_provider = Mock()
     search._finalize_autotune_metrics = Mock()
     with pytest.raises(exc.AutotuneError, match="successful transfers=1/2"):

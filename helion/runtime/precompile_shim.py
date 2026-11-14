@@ -1,15 +1,12 @@
 from __future__ import annotations
 
 import os
-import sys
 from typing import TYPE_CHECKING
 from typing import cast
 
 from .._compat import get_triton_find_paths_if
 from .._compat import get_triton_iterable_path
 from .._compat import get_triton_version
-from ..autotuner.logger import classify_triton_exception
-from ..autotuner.logger import format_triton_compile_failure
 from .triton.launcher import compile_only_launch_args
 
 if TYPE_CHECKING:
@@ -121,29 +118,29 @@ def make_precompiler(
             }
 
         def finish_it(in_child_process: bool = True) -> bool:
-            src = fn.ASTSource(fn, signature, constexprs, attrs)
-            # here we update the cache so if this is called in the parent we skip a extra compile
-
+            """Compile the kernel into the cache, raising the compile's error:
+            it returns True only, as the cache-hit sentinel
+            ``already_compiled`` does."""
             compiled_kernel = None
             try:
+                src = fn.ASTSource(fn, signature, constexprs, attrs)
+                # here we update the cache so if this is called in the parent we skip a extra compile
                 kernel_cache[key] = compiled_kernel = fn.compile(
                     src, target=target, options=options.__dict__
                 )
                 _set_helion_compilation_success(compiled_kernel, True)
                 if not in_child_process:
                     compiled_kernel._init_handles()
-            except Exception as e:
-                action = classify_triton_exception(e)
-                if action == "raise":
-                    print(
-                        format_triton_compile_failure(config, e, bound_kernel),
-                        file=sys.stderr,
-                    )
-                if compiled_kernel is not None:
+            except Exception:
+                if not in_child_process and compiled_kernel is not None:
                     _set_helion_compilation_success(compiled_kernel, False)
-                if in_child_process:
-                    sys.exit(1)
-                return False
+                # The precompile child reports the error and its
+                # classification to the parent in its result file
+                # (precompile_future._run_kernel_in_subprocess_fork); the
+                # in-process compile returns it to its caller
+                # (benchmark_provider._triton_compile), which counts, dumps
+                # and logs it.
+                raise
             return True
 
         return finish_it

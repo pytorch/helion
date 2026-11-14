@@ -649,6 +649,52 @@ class TestAutotunerAccuracy(AutotunerTestCase):
         self.assertIn(
             "relative L2", relative_l2_disagreement(big, big * 1e-10, 0.05) or ""
         )
+        # ... and an infinity must keep its sign.
+        inf = a.clone()
+        inf[5] = float("inf")
+        opposite = inf.clone()
+        opposite[5] = float("-inf")
+        self.assertIsNone(relative_l2_disagreement(inf, inf.clone(), 0.05))
+        self.assertIn("non-finite", relative_l2_disagreement(opposite, inf, 0.05) or "")
+        self.assertIn("non-finite", relative_l2_disagreement(inf, opposite, 0.05) or "")
+        # A float64 leaf keeps its range, the norms neither overflow nor
+        # underflow, and a complex leaf's imaginary parts count.
+        wide = torch.tensor([1e100, 1.0], dtype=torch.float64, device=DEVICE)
+        wider = torch.tensor([1e200, 1.0], dtype=torch.float64, device=DEVICE)
+        infinite = torch.tensor([math.inf, 1.0], dtype=torch.float64, device=DEVICE)
+        self.assertIsNone(relative_l2_disagreement(wide, wide.clone(), 0.05))
+        self.assertIn(
+            "non-finite", relative_l2_disagreement(wide, infinite, 0.05) or ""
+        )
+        self.assertIn("relative L2", relative_l2_disagreement(wide, wider, 0.05) or "")
+        large = torch.full([2], 1e20, device=DEVICE)
+        self.assertIn(
+            "relative L2", relative_l2_disagreement(large, large * 1.1, 0.05) or ""
+        )
+        tiny = torch.full([2], 1e-30, device=DEVICE)
+        self.assertIn("relative L2", relative_l2_disagreement(tiny, -tiny, 0.05) or "")
+        # A subnormal peak: CUDA divides by a Python number through its
+        # reciprocal in the tensor's dtype, an infinity here.
+        for subnormal in (
+            torch.full([4], 1e-40, device=DEVICE),
+            torch.full([4], 1e-310, dtype=torch.float64, device=DEVICE),
+        ):
+            self.assertIsNone(
+                relative_l2_disagreement(subnormal, subnormal.clone(), 0.05)
+            )
+            self.assertIn(
+                "relative L2",
+                relative_l2_disagreement(subnormal, -subnormal, 0.05) or "",
+            )
+        twisted = torch.tensor([1 + 2j, 3 + 4j], device=DEVICE)
+        self.assertIsNone(relative_l2_disagreement(twisted, twisted.clone(), 0.05))
+        self.assertIn(
+            "relative L2",
+            relative_l2_disagreement(
+                twisted, torch.tensor([1 - 5j, 3 + 9j], device=DEVICE), 0.05
+            )
+            or "",
+        )
         ints = torch.arange(8, device=DEVICE)
         self.assertIsNone(relative_l2_disagreement(ints, ints.clone(), 0.05))
         self.assertIn("differs", relative_l2_disagreement(ints, ints + 1, 0.05) or "")
@@ -2070,8 +2116,8 @@ class TestAutotuneIgnoreErrors(TestCase):
 
         def fake_make_precompiler(_kernel_obj, _config, _bound_kernel):
             def binder(*_args: object, **_kwargs: object):
-                def run() -> None:
-                    return None
+                def run() -> bool:
+                    return True
 
                 return run
 
@@ -2321,6 +2367,100 @@ class TestAutotuneIgnoreErrors(TestCase):
         self.assertFalse(base_path.with_suffix(".meta.jsonl").exists())
 
 
+@onlyBackends(["triton"])
+@skipIfRefEager("Autotuning not supported in ref eager mode")
+class TestBaselinePrecompileCache(TestCase):
+    """The accuracy baseline's precompile holds the backend compile to
+    ``autotune_compile_timeout`` only if the attempt's run then loads its
+    binary from Triton's cache: a run that compiled again would run ptxas in
+    this process, where no deadline reaches it."""
+
+    def _baseline_compiles(self, precompile: str, n: int) -> tuple[list[int], int]:
+        """Compute the accuracy baseline of an add kernel over ``n`` elements
+        with ``precompile`` against an empty Triton cache; the pids that ran
+        Triton's make_cubin (this process, and a fork child, which inherits
+        the recording) and the cubins in the cache.  Each test passes its own
+        ``n``: the generated code holds the static sizes, so no test loads a
+        module another one compiled (PyCodeCache keeps the modules it loaded
+        by source, with the kernels Triton compiled for them)."""
+        # Only importable with Triton's NVIDIA backend.
+        from triton.backends.nvidia.compiler import CUDABackend
+
+        @helion.kernel(
+            static_shapes=True,
+            autotune_log_level=0,
+            autotune_benchmark_subprocess=False,
+            autotune_precompile=precompile,
+        )
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        # A lone contiguous view 4 bytes into its allocation: the baseline
+        # runs on a clone of it, aligned (Triton specializes on a pointer's
+        # alignment), and the precompile has to compile that specialization.
+        args = (
+            torch.randn([n + 1], device=DEVICE)[1:],
+            torch.randn([n], device=DEVICE),
+        )
+        make_cubin = CUDABackend.make_cubin
+        calls = itertools.count()
+        with (
+            tempfile.TemporaryDirectory() as cache,
+            tempfile.TemporaryDirectory() as compilers,
+        ):
+
+            def recorded_make_cubin(
+                backend: object, *args: object, **kwargs: object
+            ) -> object:
+                Path(compilers, f"{os.getpid()}-{next(calls)}").touch()
+                return make_cubin(backend, *args, **kwargs)
+
+            # _prepare() computes the baseline; it compiles no candidate.
+            search = FiniteSearch(
+                add.bind(args),
+                args,
+                configs=[
+                    helion.Config(block_sizes=[16], num_warps=4),
+                    helion.Config(block_sizes=[32], num_warps=4),
+                ],
+            )
+            with (
+                patch.dict(os.environ, {"TRITON_CACHE_DIR": cache}),
+                patch.object(CUDABackend, "make_cubin", recorded_make_cubin),
+            ):
+                search._prepare()
+            try:
+                torch.testing.assert_close(
+                    search.benchmark_provider._baseline_output, args[0] + args[1]
+                )
+            finally:
+                search.benchmark_provider.cleanup()
+            pids = [int(name.split("-")[0]) for name in os.listdir(compilers)]
+            return pids, len(list(Path(cache).rglob("*.cubin")))
+
+    @skipIfNotCUDA()
+    def test_a_forked_baseline_precompile_compiles_for_the_run(self) -> None:
+        pids, cubins = self._baseline_compiles("fork", 1024)
+        # The child compiled each baseline config; this process loaded it.
+        self.assertTrue(pids)
+        self.assertNotIn(os.getpid(), pids)
+        self.assertGreater(cubins, 0)
+
+    @skipIfNotCUDA()
+    @pytest.mark.slow
+    def test_a_spawned_baseline_precompile_compiles_for_the_run(self) -> None:
+        # A spawned child loads the arguments from a file, which holds them as
+        # the run clones them: on the candidates' file, with the view's
+        # offset, the child would compile another specialization and this
+        # process the run's again.  The child records no make_cubin.
+        pids, cubins = self._baseline_compiles("spawn", 2048)
+        self.assertEqual(pids, [])
+        self.assertGreater(cubins, 0)
+
+
 class TestFp8UlpAccuracy(unittest.TestCase):
     """``accuracy.assert_close`` on fp8 leaves (CPU; no kernel involved)."""
 
@@ -2431,10 +2571,62 @@ class TestFp8UlpAccuracy(unittest.TestCase):
     def test_nan_must_match_nan(self) -> None:
         expected = torch.tensor([float("nan"), 1.0, -2.0]).to(self.DTYPE)
         self._check(expected.clone(), expected, "ulp")
-        with self.assertRaisesRegex(AssertionError, "more than one ulp"):
+        with self.assertRaisesRegex(AssertionError, "NaN or infinite elements"):
             self._check(torch.tensor([1.0, 1.0, -2.0]).to(self.DTYPE), expected, "ulp")
 
+    def test_an_infinity_must_match_the_same_infinity(self) -> None:
+        # Against an infinite baseline element rtol * |inf| is infinite: no
+        # finite value, nor the opposite infinity, may pass there.  The
+        # alternating signs keep the directional check balanced.
+        signs = torch.tensor([1.0, -1.0]).repeat(2048)
+        expected = (signs * math.inf).to(torch.float8_e5m2)
+        self._check(expected.clone(), expected, "ulp")
+        for actual in (torch.zeros(4096), -signs * math.inf):
+            with self.assertRaisesRegex(AssertionError, "NaN or infinite elements"):
+                self._check(actual.to(torch.float8_e5m2), expected, "ulp")
+
+    def test_the_report_tells_non_finite_mismatches_and_the_worst_values(
+        self,
+    ) -> None:
+        expected = torch.tensor([1.0, 2.0, 4.0, 8.0]).to(torch.float8_e5m2)
+        nan = torch.tensor([float("nan"), 2.0, 4.0, 8.0]).to(torch.float8_e5m2)
+        with self.assertRaisesRegex(
+            AssertionError, "differ in NaN or infinite elements, which must match"
+        ) as caught:
+            self._check(nan, expected, "ulp")
+        report = str(caught.exception)
+        self.assertNotIn("more than one ulp", report)
+        self.assertIn("(25.0%), 1 of them NaN or infinite", report)
+        self.assertIn(
+            "difference: nan at index (0,) (actual nan, expected 1.0)", report
+        )
+        # A finite element off by more than one ulp beside an infinity: both
+        # reasons, the infinite one reported as the worst.
+        both = torch.tensor([math.inf, 2.0, 16.0, 8.0]).to(torch.float8_e5m2)
+        with self.assertRaisesRegex(
+            AssertionError,
+            r"plus the tolerance \(atol=.*\) and in NaN or infinite elements",
+        ) as caught:
+            self._check(both, expected, "ulp")
+        self.assertIn("(actual inf, expected 1.0)", str(caught.exception))
+
+    def test_e8m0_nan_is_not_one_ulp_from_the_largest_value(self) -> None:
+        # float8_e8m0fnu: byte 254 is 2**127 and byte 255 is NaN.
+        def e8m0(byte: int) -> torch.Tensor:
+            return torch.tensor([byte, 127], dtype=torch.uint8).view(
+                torch.float8_e8m0fnu
+            )
+
+        largest, nan = e8m0(254), e8m0(255)
+        self._check(e8m0(253), largest, "ulp")
+        for actual, expected in ((nan, largest), (largest, nan)):
+            with self.assertRaisesRegex(AssertionError, "NaN or infinite elements"):
+                self._check(actual, expected, "ulp")
+        self._check(e8m0(255), nan, "ulp")
+
     def test_e8m0_one_exponent_step(self) -> None:
+        from helion.autotuner.accuracy import assert_close
+
         expected = torch.tensor([1.0, 2.0, 0.5, 8.0]).to(torch.float8_e8m0fnu)
         self._check(
             torch.tensor([2.0, 2.0, 0.25, 8.0]).to(torch.float8_e8m0fnu),
@@ -2447,6 +2639,19 @@ class TestFp8UlpAccuracy(unittest.TestCase):
                 expected,
                 "ulp",
             )
+        # An atol as large as the difference does not widen the step, and
+        # the report names no tolerance.
+        with self.assertRaisesRegex(
+            AssertionError, "one exponent step: no tolerance applies"
+        ) as caught:
+            assert_close(
+                torch.tensor([4.0, 2.0, 0.5, 8.0]).to(torch.float8_e8m0fnu),
+                expected,
+                atol=4.0,
+                rtol=0.0,
+                fp8_accuracy="ulp",
+            )
+        self.assertNotIn("atol", str(caught.exception))
 
     def test_mixed_leaves_and_mode_validation(self) -> None:
         from helion.autotuner.accuracy import assert_close
@@ -2717,7 +2922,7 @@ class TestAccuracyCheck(unittest.TestCase):
             base.cache_policy(),
             {
                 "check": "accuracy_check",
-                "version": 3,
+                "version": 4,
                 "atol": 0.02,
                 "rtol": 0.0,
                 "atol_scale": "peak",
