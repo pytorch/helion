@@ -16,9 +16,13 @@ epilogue-issued TMA ring (``_epi_tma_aux_values``), and a grid with fewer
 runs (a 16-bit K tail on whole M and N tiles, or a K tail with ragged M and
 N) take that family's CLC pair seed. A small grid no pair serves splits K on
 a one-CTA 64x64 tile (``_split_k_default``). A transcendental epilogue runs two
-epilogue warp groups (``_transcendental_epilogue_values``). A kernel with an
-atomic keeps the flat base default: codegen refuses atomics beside the pairs'
-shared tiles and the persistent CTAs' warp roles.
+epilogue warp groups (``_transcendental_epilogue_values``). A batched GEMM's
+pairs walk their batches slowest (``_batch_slowest``); per-batch matrices
+narrower than a pair tile, or not whole in its tiles, take a one-CTA tile
+(``_narrow_batched_default``), and so do many small matrices whose operands
+or output TMA cannot address (``_small_matrix_batch_default``). A kernel with
+an atomic keeps the flat base default: codegen refuses atomics beside the
+pairs' shared tiles and the persistent CTAs' warp roles.
 """
 
 from __future__ import annotations
@@ -33,6 +37,8 @@ from ....autotuner_heuristics.registry import AutotunerHeuristic
 from ...cp_async_operand import TCGEN05_CP_ASYNC_A_BLOCK_K
 from ...cp_async_operand import TCGEN05_CP_ASYNC_A_TILE_M
 from ...dense_aligned_n import TILE_N_KEY
+from ...strategies import TCGEN05_BATCH_RASTER_CONFIG_KEY
+from ...strategies import TCGEN05_BATCH_RASTER_SLOWEST
 from ...strategies import TCGEN05_LAYOUT_OVERRIDES_KEYS
 from ...strategies import TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY
 from ...strategies import Tcgen05LayoutStrategy
@@ -55,6 +61,7 @@ from ...tcgen05_constants import TCGEN05_EPI_TMA_AUX_STAGE_COUNT_CHOICES
 from ...tcgen05_constants import TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY
 from ...tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from ...tcgen05_constants import TCGEN05_LONG_N_SWEEP_L2_GROUPING
+from ...tcgen05_constants import TCGEN05_MANY_SMALL_BATCHES
 from ...tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
 from ...tcgen05_constants import TCGEN05_SPLIT_K_MIN_SLICE_K_TILES
 from ...tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
@@ -65,6 +72,8 @@ from ...tcgen05_constants import TCGEN05_TWO_CTA_NARROW_BLOCK_N
 from ...tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     import torch
 
     from .....autotuner.config_spec import ConfigSpec
@@ -176,6 +185,25 @@ def _batched_radix_store(device_ir: DeviceIR) -> tuple[RadixStoreLayout, int] | 
                 tensor = cast("torch.fx.Node", node.args[0]).meta["val"]
                 return layout, tensor.element_size()
     return None
+
+
+def _batch_slowest(
+    state: CuteTcgen05Config, values: Mapping[str, object]
+) -> dict[str, Any]:
+    """``values`` walking a batched grid's batches slowest
+    (``TCGEN05_BATCH_RASTER_CONFIG_KEY``), ungrouped
+    (``ungroup_batch_slowest_walk``): the CTA pairs share one batch's A and
+    B tiles at the same time, as cuBLAS's batched grids do. B200, of the
+    ATen bmm, the 256x256 pair, batches fastest -> slowest: 256 x
+    512x1024x64 0.78 -> 0.90, 256 x 512x512x64 0.86 -> 0.92, 192 x
+    512x512x64 0.85 -> 0.90, 384 x 256x768x64 0.82 -> 0.87 (a batch of one
+    128x128 tile is indifferent)."""
+    walked: dict[str, Any] = {
+        **values,
+        TCGEN05_BATCH_RASTER_CONFIG_KEY: TCGEN05_BATCH_RASTER_SLOWEST,
+    }
+    surface.ungroup_batch_slowest_walk(state, walked)
+    return walked
 
 
 def _one_cta_config(
@@ -562,16 +590,23 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         n: int,
         k: int,
         radix: tuple[RadixStoreLayout, int] | None = None,
+        *,
+        rows: tuple[int, ...] = (128, 64),
+        flat_only: bool = False,
     ) -> Config | None:
         """The one-CTA tile of a batched GEMM whose per-batch matrices are
         narrower than 128 rows or columns (attention's ``[B * H, S, 64]``
-        bmms), or whose store merges heads (``radix``: the proved layout and
-        the element size): 128 rows (64 where M is not whole in them) by the
-        widest of 256, 128, 64 or 32 columns dividing N (a head merge's: the
-        widest tile partitioning its layout whose store boxes sit inside its
-        runs, ``RadixStoreLayout.one_cta_tile``), the deepest of 64-, 32- or
-        16-deep k-blocks dividing K; flat with two AB stages, the persistent
-        loop with four from eight k-blocks on.
+        bmms) or whose K is not whole in 64-deep k-blocks (a 32-, 96- or
+        160-wide head: 1024 x 128x128x32 0.17 -> 0.98 of the ATen bmm), or
+        whose store merges heads (``radix``: the proved layout and the
+        element size): 128 rows (64 where M is not whole in them) by the
+        widest of 256, 128, 64 or 32 columns dividing N, else the narrowest
+        power of two holding N up to 128 columns, else 128 (a head merge's:
+        the widest tile partitioning its layout whose store boxes sit inside
+        its runs, ``RadixStoreLayout.one_cta_tile``), the deepest of 64-,
+        32- or 16-deep k-blocks dividing K, else 64 (32 below 64); flat with
+        two AB stages, the persistent loop with four from eight k-blocks on
+        over whole tiles.
 
         The base default ran a 64x16 tile; B200, Inductor corpus, of the ATen
         GEMM (many batches of one or two tiles each): 1024 x 256x64x256
@@ -584,20 +619,40 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         (32 x 128x64x4096: 18.8 us against 31.4 us here)."""
         spec = env.config_spec
         state = spec._cute_tcgen05_config
-        bk = next((depth for depth in (64, 32, 16) if k % depth == 0), None)
+        # A K tail: 64-deep k-blocks, or two 32-deep ones inside one, the last
+        # zero-filled past K (window attention's 32768 x 32x49x49: 3.6 ms on
+        # the base 64x16x16 tile, 0.18 ms here).
+        bk = next(
+            (depth for depth in (64, 32, 16) if k % depth == 0),
+            32 if k < 64 else 64,
+        )
         if radix is not None:
             layout, element_bytes = radix
             tile = layout.one_cta_tile(element_bytes)
         else:
-            bm = next((rows for rows in (128, 64) if m % rows == 0), None)
-            bn = next((cols for cols in (256, 128, 64, 32) if n % cols == 0), None)
-            tile = None if bm is None or bn is None else (bm, bn)
-        if tile is None or bk is None:
+            # Rows not whole in ``rows`` take 64-row tiles, the last partial
+            # in each matrix, and columns not whole in a tile width the
+            # narrowest power of two holding them up to 128 columns, else
+            # 128-wide tiles (window attention's 32768 x 56x56x32: 14.0 ms on
+            # the SIMT lowering, 0.23 ms on 64x64x32; 768 x 200x64x200: 2.55
+            # ms on the base 64x16x16 tile, 30 us on 64x64x64; 768 x
+            # 196x196x64: 0.27 of the ATen bmm on 128x256, 0.79 on 64x128).
+            bm = next((tile for tile in rows if m % tile == 0), 64)
+            bn = next(
+                (cols for cols in (256, 128, 64, 32) if n % cols == 0),
+                max(32, 1 << (n - 1).bit_length()) if n <= 128 else 128,
+            )
+            tile = (bm, bn)
+        if tile is None:
             return None
         bm, bn = tile
         persistent = (
-            k // bk >= _NARROW_BATCHED_PERSISTENT_MIN_K_TILES
+            not flat_only
+            and k // bk >= _NARROW_BATCHED_PERSISTENT_MIN_K_TILES
             and "persistent_blocked" in spec.allowed_pid_types
+            # a partial batched tile runs only on the flat launch
+            # (``cute_mma._ragged_batched_tcgen05_config``)
+            and facts._static_full_tiles(state, bm=bm, bn=bn, bk=bk)
         )
         stages = 4 if persistent else 2
         block_sizes = facts._matmul_seed_block_sizes(state, bm=bm, bn=bn, bk=bk)
@@ -612,6 +667,49 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             block_sizes,
             pid_type="persistent_blocked" if persistent else "flat",
             ab_stages=stages,
+        )
+
+    @classmethod
+    def _small_matrix_batch_default(cls, env: CompileEnvironment) -> Config | None:
+        """A batched GEMM with an operand or output TMA cannot address
+        (49-column rows: 98 bytes; attention scores stored in 1001-element
+        rows), over many matrices (``TCGEN05_MANY_SMALL_BATCHES``) or one-CTA
+        tiles that fill the machine: the narrow batched default's one-CTA
+        tile at 64 rows, which reaches such an operand without TMA. B200, of
+        the ATen bmm: 32768 x 49x49x32 0.023 on the base 64x16x16 tile ->
+        0.93 on 64x64x32, 32768 x 32x49x49 0.068 -> 1.34, 768 x 49x128x49
+        0.079 -> 2.11 on 64x128x32; 64 x 1000x1000x64 + mask 0.008 -> 0.35
+        on 64x128x64."""
+        state = env.config_spec._cute_tcgen05_config
+        extents = state.matmul_compile_time_static_extents
+        if (
+            state.kernel_has_atomics
+            or extents is None
+            or not all(isinstance(v, int) and v > 0 for v in extents)
+        ):
+            return None
+        m, n, k = cast("tuple[int, int, int]", extents)
+        batch = state.matmul_leading_work_multiplier
+        if batch <= 1 or (
+            batch < TCGEN05_MANY_SMALL_BATCHES
+            and batch * cdiv(m, 64) * cdiv(n, 128) < state.device_sm_count
+        ):
+            # an unbatched GEMM keeps the base default (unmeasured here)
+            return None
+        # 64-row tiles: an operand loaded without TMA spreads over twice the
+        # CTAs (768 x 128x49x49: 0.62 of the ATen bmm on 128x64x32, 1.29 on
+        # 64x64x32). The kernel stays flat: beside an operand TMA cannot load
+        # the persistent loop carries the multi-tile guard, which refuses a
+        # launch of more than one tile (256 x 64x128x512 over an A one
+        # element into its storage), and an output TMA cannot address was
+        # measured on the flat kernel only.
+        return cls._narrow_batched_default(
+            env,
+            m,
+            n,
+            k,
+            rows=(64,),
+            flat_only=True,
         )
 
     @staticmethod
@@ -819,7 +917,9 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         if not spec.tcgen05.search_enabled or state.device_sm_count <= 0:
             return None
         if not spec.tcgen05.matmul_operands_tma_provable:
-            return cls._cp_async_a_default(env) if state.cp_async_a_provable else None
+            if state.cp_async_a_provable:
+                return cls._cp_async_a_default(env)
+            return cls._small_matrix_batch_default(env)
         if state.kernel_has_atomics:
             # Every tile below is a pair or a persistent CTA owning several
             # tiles, where codegen refuses atomics beside the warp roles
@@ -837,13 +937,19 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         # A batch of one still proves its batch mode (``((1, 0),)``), and its
         # default takes the narrow one-CTA tiles as for any batch.
         radix = _batched_radix_store(device_ir)
-        if radix is not None or (batch > 1 and min(m, n) < 128 and not small_grid):
+        if radix is not None or (
+            batch > 1
+            and (min(m, n) < 128 or k % 64 or m % 64 or n % 32)
+            and not small_grid
+        ):
             # A head merge fused into a batched store renders from a one-CTA
             # tile's store boxes (the 128-row pairs' epilogue subtiles do
             # not; the direct-entry 256x256 pair, when its seed takes a
             # whole-tile shape before this heuristic, does), and per-batch
-            # matrices narrower than 128 rows or columns are narrower than
-            # every large-grid candidate below.
+            # matrices narrower than 128 rows or columns, not whole in 64
+            # rows or 32 columns, or with a K that is not whole in 64-deep
+            # k-blocks, fit no large-grid candidate below (each tiles K by
+            # 64 over whole tiles).
             return cls._narrow_batched_default(env, m, n, k, radix)
         if small_grid:
             # Fewer 128x128 tiles than SMs: the 128-row pair with the fewest
@@ -939,7 +1045,19 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
                 best = (key, seed, waves)
                 best_tile = (bm, bn, bk)
         if best is None or (ffi_cost is not None and best[0][0] >= ffi_cost):
-            return None if ffi_cost is None else cls._direct_entry_staged_row(state)
+            if ffi_cost is None:
+                return None
+            staged_row = cls._direct_entry_staged_row(state)
+            if batch == 1:
+                return staged_row
+            seed = (
+                staged_row
+                if staged_row is not None
+                else seeds.full_tile_direct_entry_seed_config(state)
+            )
+            return (
+                None if seed is None else Config(**_batch_slowest(state, seed.config))
+            )
         values = _promoted_values(best[1])
         if ffi_cost is not None:
             # The base default is the FFI direct-entry config; normalization
@@ -1134,6 +1252,10 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             ]
         if pipeline_facts.epilogue_transcendental:
             values = cls._transcendental_epilogue_values(env, values)
+        if batch > 1 and values.get("tcgen05_cluster_m", 1) == 2:
+            # (ungrouped: this overrides the M-tile grouping chosen above;
+            # the small-grid pairs, about one wave, keep their walk)
+            values = _batch_slowest(state, values)
         return Config(**values)
 
     @staticmethod

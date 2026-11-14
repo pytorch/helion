@@ -30,6 +30,7 @@ from ..cute_warp_mma_gemm import WARP_MMA_MIN_BN
 from ..tcgen05_config import facts
 from ..tcgen05_config import surface
 from ..tcgen05_constants import RAGGED_BATCHED_MIN_BLOCK_N
+from ..tcgen05_constants import TCGEN05_MANY_SMALL_BATCHES
 from ..tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from ..tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from ..tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
@@ -227,7 +228,28 @@ def _plan_cute_tcgen05_search_candidate(
             # Only the memory-bound decode shapes profit from the padded
             # tile; a tiny GEMM (33^3) keeps the SIMT lowering, which wins
             # there (2.8 us against the tile's 13.8).
-            else static_m < 2 or (static_m < 64 and (n_hint < 128 or k_hint < 128))
+            else static_m < 2
+            or (
+                static_m < 64
+                and (n_hint < 128 or k_hint < 128)
+                # A batch of such matrices runs one zero-filled tile each
+                # and fills the machine (window attention's 32768 x
+                # 56x56x32: 14.0 ms on the SIMT lowering, 0.23 ms on the
+                # one-CTA 64x64x32 tile).
+                and not (
+                    has_leading_passthrough
+                    # the batch is a rank-3 operand's leading dimension (a
+                    # leading passthrough over two rank-2 operands has none)
+                    and (lhs.ndim == 3 or rhs.ndim == 3)
+                    and (
+                        _static_problem_extent(
+                            env, (lhs if lhs.ndim == 3 else rhs).shape[0]
+                        )
+                        or 0
+                    )
+                    >= TCGEN05_MANY_SMALL_BATCHES
+                )
+            )
         )
         # Size-one tile axes are fixed to block size one before this analysis,
         # so they cannot carry the minimum tcgen05 instruction tile.
