@@ -202,6 +202,7 @@ _BASE_VALID_KEYS = """
     cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_flash_gated_row_warps cute_pdl_spread cute_split_k_atomic_epilogue tcgen05_epi_round_subtiles cute_privatize_atomics
     cross_loop_tmem_prefetch
     cross_loop_cluster_edges
+    cross_loop_dry_passes
 """
 
 # ``BACKEND_SPECIFIC_KEYS``.
@@ -365,6 +366,7 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_flash_gated_row_warps cute_pdl_spread cute_split_k_atomic_epilogue tcgen05_epi_round_subtiles cute_privatize_atomics
     cross_loop_tmem_prefetch
     cross_loop_cluster_edges
+    cross_loop_dry_passes
 """
 
 # ``_CUTE_IMPLICIT_DEFAULT_KEYS``.
@@ -589,7 +591,8 @@ _BASE_CUTE_ACCEPTED = """
 
 # The same census for ``TritonBackend``.
 _BASE_TRITON_ACCEPTED = """
-    advanced_controls_file atomic_indexing block_sizes cross_loop_pipeline
+    advanced_controls_file atomic_indexing block_sizes cross_loop_dry_passes
+    cross_loop_pipeline
     epilogue_subtile flatten_loops host_tensor_descriptors indexing l2_groupings
     load_cache_modifiers load_eviction_policies loop_orders maxnreg
     num_sm_multiplier num_stages num_warps pallas_internal_scratch pid_type
@@ -619,13 +622,14 @@ _BASE_PALLAS_ACCEPTED = """
 
 # The keys ``TritonBackend.supports_config_key`` decides by the device the
 # row runs on: ``host_tensor_descriptors`` needs a CUDA device of capability
-# >= 9.0, ``cross_loop_pipeline`` is off on ROCm, ``waves_per_eu`` /
-# ``matrix_instr_nonkdim`` / ``xcd_remap`` are AMD tunables accepted only
-# there, and the MTIA tunables only on MTIA.
+# >= 9.0, ``cross_loop_pipeline`` and ``cross_loop_dry_passes`` are off on
+# ROCm, ``waves_per_eu`` / ``matrix_instr_nonkdim`` / ``xcd_remap`` are AMD
+# tunables accepted only there, and the MTIA tunables only on MTIA.
 _DEVICE_DECIDED_KEYS = frozenset(
     {
         "host_tensor_descriptors",
         "cross_loop_pipeline",
+        "cross_loop_dry_passes",
         "matrix_instr_nonkdim",
         "waves_per_eu",
         "xcd_remap",

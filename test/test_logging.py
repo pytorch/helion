@@ -10,6 +10,7 @@ import torch
 import torch.fx.experimental._config as fx_config
 
 import helion
+from helion._compiler import cross_loop_codegen
 from helion._compiler import cross_loop_report
 from helion._compiler import tile_dependency
 from helion._testing import DEVICE
@@ -87,6 +88,7 @@ class TestLogging(RefEagerTestDisabled, TestCase):
         helion._logging._internal.parse_log_value("megakernel,timeline")
         # (gluon_ring imports Triton's Gluon, which a CPU-only lane lacks.)
         for name in (
+            cross_loop_codegen.log.name,
             cross_loop_report.log.name,
             tile_dependency.log.name,
             "helion._compiler.triton.gluon_ring",

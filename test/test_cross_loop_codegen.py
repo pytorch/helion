@@ -357,6 +357,132 @@ def singleton_gate_chain(x: torch.Tensor) -> torch.Tensor:
     static_shapes=True,
     autotune_effort="none",
 )
+def deep_anchor_chains(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Twice: a two-root chain on a few workers while a wide root waits on it,
+    then narrow roots reading the wide root's output.  No root runs another's
+    tasks as a continuation (four or eight tasks per row), so lanes pack: each
+    narrow root gets workers of its own after the earlier ones', and its
+    workers ran only the first wide root before the waiting one, whose
+    producers lie two dependency levels deeper (that root's dry-pass anchor).
+    Between the first wide root and its narrow roots, a root of eight tasks
+    per row runs on the chain's workers (roots 1 and 2's, not the narrow
+    roots')."""
+    batch, width = x.size()
+    a = torch.empty_like(x)
+    p = torch.empty((batch, 4), dtype=torch.float32, device=x.device)
+    q = torch.empty((batch, 4), dtype=torch.float32, device=x.device)
+    d = torch.empty_like(x)
+    side = torch.empty((batch, 8), dtype=torch.float32, device=x.device)
+    e = torch.empty((batch, 4), dtype=torch.float32, device=x.device)
+    e2 = torch.empty((batch, 4), dtype=torch.float32, device=x.device)
+    f = torch.empty((batch, 4), dtype=torch.float32, device=x.device)
+    g = torch.empty((batch, 4), dtype=torch.float32, device=x.device)
+    h = torch.empty_like(x)
+    out = torch.empty((batch, 4), dtype=torch.float32, device=x.device)
+    for tile_batch, tile_width in hl.tile([batch, width]):
+        a[tile_batch, tile_width] = x[tile_batch, tile_width] + 1
+    for row, col in hl.tile([batch, 4], block_size=[1, 1]):
+        p[row, col] = torch.sum(a[row, :], dim=-1)[:, None]
+    for row, col in hl.tile([batch, 4], block_size=[1, 1]):
+        q[row, col] = torch.sum(p[row, :], dim=-1)[:, None]
+    for tile_batch, tile_width in hl.tile([batch, width]):
+        d[tile_batch, tile_width] = (
+            a[tile_batch, tile_width] * torch.sum(q[tile_batch, :], dim=-1)[:, None]
+        )
+    for row, col in hl.tile([batch, 8], block_size=[1, 1]):
+        side[row, col] = torch.sum(a[row, :], dim=-1)[:, None]
+    for row, col in hl.tile([batch, 4], block_size=[1, 1]):
+        e[row, col] = torch.sum(d[row, :], dim=-1)[:, None]
+    for row, col in hl.tile([batch, 4], block_size=[1, 1]):
+        e2[row, col] = 2 * torch.sum(d[row, :], dim=-1)[:, None]
+    for row, col in hl.tile([batch, 4], block_size=[1, 1]):
+        f[row, col] = torch.sum(e[row, :], dim=-1)[:, None]
+    for row, col in hl.tile([batch, 4], block_size=[1, 1]):
+        g[row, col] = torch.sum(f[row, :], dim=-1)[:, None]
+    for tile_batch, tile_width in hl.tile([batch, width]):
+        h[tile_batch, tile_width] = (
+            d[tile_batch, tile_width] * torch.sum(g[tile_batch, :], dim=-1)[:, None]
+        )
+    for row, col in hl.tile([batch, 4], block_size=[1, 1]):
+        out[row, col] = torch.sum(h[row, :], dim=-1)[:, None]
+    return out, side, e2
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
+def deep_anchor_chain_with_dot(
+    x: torch.Tensor, xm: torch.Tensor, wm: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The first chain of ``deep_anchor_chains`` with a root of one dot task
+    per worker between the narrow roots' anchor and the narrow roots: on their
+    workers, so a dry-pass loop would run it."""
+    batch, width = x.size()
+    a = torch.empty_like(x)
+    p = torch.empty((batch, 4), dtype=torch.float32, device=x.device)
+    q = torch.empty((batch, 4), dtype=torch.float32, device=x.device)
+    d = torch.empty_like(x)
+    side = torch.empty((batch, 8), dtype=torch.float32, device=x.device)
+    m = torch.empty((xm.size(0), wm.size(1)), dtype=torch.float32, device=x.device)
+    e = torch.empty((batch, 4), dtype=torch.float32, device=x.device)
+    for tile_batch, tile_width in hl.tile([batch, width]):
+        a[tile_batch, tile_width] = x[tile_batch, tile_width] + 1
+    for row, col in hl.tile([batch, 4], block_size=[1, 1]):
+        p[row, col] = torch.sum(a[row, :], dim=-1)[:, None]
+    for row, col in hl.tile([batch, 4], block_size=[1, 1]):
+        q[row, col] = torch.sum(p[row, :], dim=-1)[:, None]
+    for tile_batch, tile_width in hl.tile([batch, width]):
+        d[tile_batch, tile_width] = (
+            a[tile_batch, tile_width] * torch.sum(q[tile_batch, :], dim=-1)[:, None]
+        )
+    for tile_m in hl.tile(xm.size(0), block_size=16):
+        m[tile_m, :] = hl.dot(xm[tile_m, :], wm[:, :])
+    for row, col in hl.tile([batch, 8], block_size=[1, 1]):
+        side[row, col] = torch.sum(a[row, :], dim=-1)[:, None]
+    for row, col in hl.tile([batch, 4], block_size=[1, 1]):
+        e[row, col] = torch.sum(d[row, :], dim=-1)[:, None]
+    return e, m, side
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
+def deep_anchor_chain_guarded(
+    x: torch.Tensor, flags: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The first chain of ``deep_anchor_chains`` whose narrow root runs only
+    the tasks a loaded count keeps (a guarded extent)."""
+    batch, width = x.size()
+    a = torch.empty_like(x)
+    p = torch.empty((batch, 4), dtype=torch.float32, device=x.device)
+    q = torch.empty((batch, 4), dtype=torch.float32, device=x.device)
+    d = torch.empty_like(x)
+    e = torch.zeros((batch, 4), dtype=torch.float32, device=x.device)
+    for tile_batch, tile_width in hl.tile([batch, width]):
+        a[tile_batch, tile_width] = x[tile_batch, tile_width] + 1
+    for row, col in hl.tile([batch, 4], block_size=[1, 1]):
+        p[row, col] = torch.sum(a[row, :], dim=-1)[:, None]
+    for row, col in hl.tile([batch, 4], block_size=[1, 1]):
+        q[row, col] = torch.sum(p[row, :], dim=-1)[:, None]
+    for tile_batch, tile_width in hl.tile([batch, width]):
+        d[tile_batch, tile_width] = (
+            a[tile_batch, tile_width] * torch.sum(q[tile_batch, :], dim=-1)[:, None]
+        )
+    for col, row in hl.tile([4, batch], block_size=[1, 1]):
+        live = torch.sum((flags[:] > 0).to(torch.int32))
+        if row.begin < live:
+            e[row, col] = torch.sum(d[row, :], dim=-1)[:, None]
+    return d, e
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
 def fixed_block_dense_span_chain(x: torch.Tensor) -> torch.Tensor:
     (n,) = x.size()
     y = torch.empty_like(x)
@@ -2445,6 +2571,180 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             code,
         )
         self.assertIn("other=0.0", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_static_dry_pass_keeps_tl_dot_roots_out_of_its_loop(self) -> None:
+        """A block that would run in a dry-pass loop (on the dry root's workers,
+        between its anchor and it) and calls tl.dot (tensor memory on
+        Blackwell) costs the root its dry pass: tl.range fails to compile
+        around the dot."""
+        if torch.cuda.get_device_capability(DEVICE)[0] < 10:
+            self.skipTest("tl.dot roots run in kernel scope from Blackwell on")
+        workers = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+        x = torch.randn([2, 8 * workers], device=DEVICE, dtype=torch.float32)
+        xm = torch.randn([16 * workers, 16], device=DEVICE, dtype=torch.bfloat16)
+        wm = torch.randn([16, 16], device=DEVICE, dtype=torch.bfloat16)
+        a = x + 1
+        d = a * (16 * a.sum(-1, keepdim=True))
+        with self.assertLogs("helion._compiler.cross_loop_codegen", "INFO") as logs:
+            _, (e, m, _) = code_and_output(
+                deep_anchor_chain_with_dot,
+                (x, xm, wm),
+                block_sizes=[1, 16, 1, 16],
+                pid_type="persistent_blocked",
+                cross_loop_pipeline="static",
+                num_sm_multiplier=1,
+                num_warps=4,
+                # Roots 5 and 6, after root 3 (producers two levels deep).
+                cross_loop_dry_passes=[False, True],
+            )
+        torch.testing.assert_close(
+            e, d.sum(-1, keepdim=True).expand(2, 4), rtol=1e-4, atol=1e-1
+        )
+        torch.testing.assert_close(m, xm.float() @ wm.float(), rtol=1e-2, atol=1e-2)
+        self.assertIn(
+            "Root 6 keeps no dry pass: root 4 would run in its loop and uses tl.dot",
+            {line.split(":", 2)[2] for line in logs.output},
+        )
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_static_dry_pass_skips_a_guarded_root(self) -> None:
+        """A root whose task count is loaded (a guarded extent) keeps its
+        block: the dry trip masks that load to zero, so no task would run."""
+        workers = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+        x = torch.randn([2, 8 * workers], device=DEVICE, dtype=torch.float32)
+        flags = torch.tensor([1, 0], device=DEVICE, dtype=torch.int32)
+        a = x + 1
+        d = a * (16 * a.sum(-1, keepdim=True))
+        with self.assertLogs("helion._compiler.cross_loop_codegen", "INFO") as logs:
+            code, (got_d, got_e) = code_and_output(
+                deep_anchor_chain_guarded,
+                (x, flags),
+                block_sizes=[1, 16, 1, 16],
+                pid_type="persistent_blocked",
+                cross_loop_pipeline="static",
+                num_sm_multiplier=1,
+                num_warps=1,
+                cross_loop_dry_passes=[True],
+            )
+        torch.testing.assert_close(got_d, d, rtol=1e-4, atol=1e-1)
+        expected = torch.zeros(2, 4, device=DEVICE)
+        expected[0] = d[0].sum()
+        torch.testing.assert_close(got_e, expected, rtol=1e-4, atol=1e-1)
+        self.assertIn(
+            "Root 4 keeps no dry pass: its task count is loaded (a guarded extent)",
+            {line.split(":", 2)[2] for line in logs.output},
+        )
+        self.assertNotIn("tile_dependency_dry_trip", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_static_dry_pass_runs_before_its_anchor(self) -> None:
+        """``cross_loop_dry_passes`` runs a static root once dry before the
+        latest block on its workers that waits on a deeper chain, in a
+        two-trip loop with that block, and live where it ran before.  A root
+        anchored within a loop joins it (blocks on other workers run after
+        the loop); one anchored past its roots gets a loop of its own."""
+        workers = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+        if workers < 48:
+            self.skipTest("the anchors assume the narrow roots pack up to lane 47")
+        # One task per worker for each wide root.
+        x = torch.randn([2, 8 * workers], device=DEVICE, dtype=torch.float32)
+        a = x + 1
+        total = a.sum(-1, keepdim=True)
+        d = a * (16 * total)
+        e = d.sum(-1, keepdim=True)
+        expected = (
+            (d * (64 * e)).sum(-1, keepdim=True).expand(2, 4),
+            total.expand(2, 8),
+            2 * e.expand(2, 4),
+        )
+        config = {
+            "block_sizes": [1, 16, 1, 16, 1, 16],
+            "pid_type": "persistent_blocked",
+            "cross_loop_pipeline": "static",
+            "num_sm_multiplier": 1,
+            "num_warps": 1,
+        }
+        # Roots that follow root 3 (the first whose producers lie two levels
+        # deep) are the candidates.  Roots 5 and 6 (the first chain's narrow
+        # roots, after root 4) and 10 (the second chain's) run dry; root 4 has
+        # no anchor and keeps its block.
+        graph = deep_anchor_chains.bind((x,)).host_function.device_ir
+        candidates = graph.tile_dependency_graph.dry_pass_candidate_roots
+        self.assertEqual(candidates, tuple(range(4, 11)))
+        with self.assertLogs("helion._compiler.cross_loop_codegen", "INFO") as logs:
+            code, out = code_and_output(
+                deep_anchor_chains,
+                (x,),
+                cross_loop_dry_passes=[root in (4, 5, 6, 10) for root in candidates],
+                **config,
+            )
+        for got, want in zip(out, expected, strict=True):
+            torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-1)
+        self.assertEqual(
+            {line.split(":", 2)[2] for line in logs.output if "runs a" in line},
+            {
+                f"Root {root} runs a dry pass before root {at}"
+                for root, at in ((5, 3), (6, 3), (10, 9))
+            },
+        )
+        self.assertIn(
+            "Root 4 keeps no dry pass: no earlier block on its workers waits on a "
+            "deeper chain",
+            {line.split(":", 2)[2] for line in logs.output},
+        )
+        tree = ast.parse(code)
+        loops = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.For)
+            and isinstance(node.target, ast.Name)
+            and node.target.id.startswith("tile_dependency_dry_trip")
+        ]
+        self.assertEqual(len(loops), 2, code)
+        for loop in loops:
+            # Two trips from a start that is 0 but opaque to the compiler.
+            self.assertEqual(
+                ast.unparse(loop.iter),
+                "tl.range(tl.program_id(0) // 536870912, 2, 1, num_stages=1)",
+            )
+
+        def runs(node: ast.AST, root: int) -> bool:
+            return any(
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Name)
+                and n.func.id == f"tile_dependency_root_{root}_scheduled_task"
+                for n in ast.walk(node)
+            )
+
+        def position(loop: ast.For, root: int) -> int:
+            return next(
+                i for i, statement in enumerate(loop.body) if runs(statement, root)
+            )
+
+        for loop, roots, at in ((loops[0], (5, 6), 3), (loops[1], (10,), 9)):
+            trip = cast("ast.Name", loop.target).id
+            # The roots first (dry: memory masked, waits skipped unless live),
+            # then their anchor on the first trip only.
+            anchor = loop.body[position(loop, at)]
+            self.assertIsInstance(anchor, ast.If)
+            self.assertEqual(ast.unparse(cast("ast.If", anchor).test), f"{trip} == 0")
+            for root in roots:
+                self.assertLess(position(loop, root), position(loop, at))
+        # Root 4 runs on other workers than roots 5 and 6: right after the loop.
+        self.assertFalse(runs(loops[0], 4))
+        kernel = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and loops[0] in node.body
+        )
+        after = kernel.body[kernel.body.index(loops[0]) + 1]
+        self.assertTrue(runs(after, 4))
+        self.assertRegex(code, r"& tile_dependency_live(_\d+)?, other=0\)")
+        self.assertRegex(code, r"if tile_dependency_live(_\d+)?:")
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
