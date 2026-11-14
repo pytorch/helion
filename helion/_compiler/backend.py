@@ -374,6 +374,13 @@ class Backend(abc.ABC):
         return False
 
     @property
+    def intra_loop_barriers_order_atomics(self) -> bool:
+        """Whether a load after an atomic of its loop body takes the barrier
+        ``mark_intra_loop_raw_barriers`` asks for, as one after a store does;
+        a backend whose own barrier pass orders atomics says False."""
+        return True
+
+    @property
     def lowers_chunk_unbind(self) -> bool:
         """Whether ``torch.chunk`` / ``torch.unbind`` of a size-two axis lower
         on the device (through ``hl.split``)."""
@@ -1473,10 +1480,10 @@ class Backend(abc.ABC):
         return constant_repr(value)
 
     def scalar_float_operand_ast(
-        self, x: ast.AST, value: torch.SymFloat, *, computes_in_float64: bool
+        self, x: ast.AST, value: torch.SymFloat | float, *, computes_in_float64: bool
     ) -> ast.AST:
         """``x`` computes ``value``, a SymFloat operand (a Python-float host
-        scalar) of an Inductor op.
+        scalar) of an Inductor op, or a float a scalar node holds.
 
         The op computes with it as a float32 scalar, as torch rounds such a
         scalar to float32 (also the opmath of fp16/bf16 math, see

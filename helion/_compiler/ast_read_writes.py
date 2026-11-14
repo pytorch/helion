@@ -9,6 +9,7 @@ from typing import TypeVar
 from .ast_extension import ExtendedAST
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Mapping
 
     _A = TypeVar("_A", bound=ast.AST)
@@ -79,6 +80,7 @@ class _ReadWriteVisitor(ast.NodeVisitor):
             collections.Counter(),
             set(),
             set(),
+            collections.Counter(),
         )
 
     def _update(self, name: str, ctx: ast.expr_context) -> None:
@@ -118,6 +120,13 @@ class _ReadWriteVisitor(ast.NodeVisitor):
                 self.rw.inplace_writes[first_arg.id] += 1
                 if func.attr.startswith("atomic_"):
                     self.rw.atomic_reads.add(first_arg.id)
+        if (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.attr.endswith("_")
+            and not func.attr.endswith("__")
+        ):
+            self.rw.method_writes[func.value.id] += 1
         self.generic_visit(node)
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
@@ -143,9 +152,9 @@ class ReadWrites(typing.NamedTuple):
     reads: dict[str, int]
     writes: dict[str, int]
     # TODO(tcombes): inplace_writes only tracks subscript stores (x[tile] = ...) and
-    # atomic ops (hl.atomic_*(x, ...)).  If Helion adds support for in-place
-    # methods inside kernels (e.g. x.copy_(), x.fill_()), the visitor should
-    # be updated to detect those as well.
+    # atomic ops (hl.atomic_*(x, ...)).  In-place tensor methods (x.copy_(),
+    # x.fill_()) land in ``method_writes``, which only the device IR reads, so
+    # the readers of this field (``_dynamo``'s mutated parameters) miss them.
     inplace_writes: dict[str, int]
     # Reads of tensor shape/type/device metadata do not access tensor storage.
     # They remain present in ``reads`` for general dependency tracking.
@@ -157,6 +166,12 @@ class ReadWrites(typing.NamedTuple):
     # Atomic operations are read-modify-writes even when the generic Name walk
     # sees only the synthetic first-argument read paired with the in-place write.
     atomic_reads: set[str]
+    # Receivers of trailing-underscore method calls (``acc.add_(x)``).  An
+    # in-place tensor method rebinds a device value to its result, which loops
+    # and branches carry out like an assignment (``device_ir``).  A module
+    # function ending in an underscore (``cutlass.select_``) lands here too, so
+    # only analyses that know their receivers are tensors read this.
+    method_writes: dict[str, int]
 
     def __iter__(self) -> typing.Iterator[str]:
         return iter({**self.reads, **self.writes})
@@ -257,14 +272,20 @@ class _PreserveRequiredSuites(ast.NodeTransformer):
 
 
 class _DeleteAssignments(_PreserveRequiredSuites):
-    def __init__(self, to_remove: set[str]) -> None:
+    def __init__(
+        self,
+        to_remove: set[str],
+        removable: Callable[[ast.Assign], bool] | None = None,
+    ) -> None:
         super().__init__()
         self.to_remove = to_remove
+        self.removable = removable
         self.changed = False
 
     def visit_Assign(self, node: ast.Assign) -> ast.Assign | None:
         """
-        Visit an assignment node and remove it if the target variable is in the to_remove set.
+        Visit an assignment node and remove it if the target variable is in
+        the to_remove set and ``removable``, when given, accepts it.
 
         Args:
             node: The assignment node to visit.
@@ -274,19 +295,26 @@ class _DeleteAssignments(_PreserveRequiredSuites):
         """
         if len(node.targets) == 1:
             (target,) = node.targets
-            if isinstance(target, ast.Name) and target.id in self.to_remove:
+            if (
+                isinstance(target, ast.Name)
+                and target.id in self.to_remove
+                and (self.removable is None or self.removable(node))
+            ):
                 self.changed = True
                 return None
         return node
 
 
 def _delete_assignments(
-    body: list[ast.AST], to_remove: set[str]
+    body: list[ast.AST],
+    to_remove: set[str],
+    removable: Callable[[ast.Assign], bool] | None = None,
 ) -> tuple[list[ast.AST], bool]:
-    """``body`` without the plain assignments to ``to_remove``, and whether any
-    assignment was removed."""
+    """``body`` without the plain assignments to ``to_remove`` that
+    ``removable`` accepts (every one without it), and whether any assignment
+    was removed."""
     new_body = []
-    transformer = _DeleteAssignments(to_remove)
+    transformer = _DeleteAssignments(to_remove, removable)
     for node in body:
         new_node = transformer.visit(node)
         if new_node is not None:
@@ -555,9 +583,16 @@ def dead_assignment_elimination(
     dce_vars: list[str],
     num_iterations: int = 8,
     input_rw: ReadWrites | None = None,
+    removable: Callable[[ast.Assign], bool] | None = None,
 ) -> bool:
     """
     Eliminates dead assignments from body; returns whether any was removed.
+
+    Without ``removable`` every plain assignment to a dead name goes, for
+    names whose every assignment the caller knows to be removable (compiler
+    temporaries).  With it, only the assignments it accepts: a name the
+    caller chose for one pure assignment may have others that must run
+    (``flag = 0`` beside ``flag = x.add_(1)``).
     """
 
     # num_iterations and input_rw are not compatible with each other
@@ -571,7 +606,7 @@ def dead_assignment_elimination(
                 to_remove.add(name)
         if not to_remove:
             break
-        body[:], removed = _delete_assignments(body, to_remove)
+        body[:], removed = _delete_assignments(body, to_remove, removable)
         if not removed:
             # The dead names are not simple assignments: another pass over
             # the same body would find the same statements to keep.

@@ -5,7 +5,8 @@ opmath with the scalar at float32, rounding only the result.  A SymFloat
 operand (``1.0 / n`` with dynamic shapes, or a float kernel argument) or a
 SymInt operand (``n``, or an int kernel argument) was rounded to the 16-bit
 dtype first, so these results differed from eager, and from a static-shape
-literal scalar, in many elements.
+literal scalar, in many elements.  A scalar computed from a full slice's
+size, a constant with static shapes, computes at float32 too.
 
 Static literals and the ``alpha=`` keyword must also preserve the result's
 16-bit rounding before a later conversion to float32.
@@ -106,6 +107,18 @@ def literal_arith_then_widen(x: torch.Tensor) -> torch.Tensor:
         out[6, tile_m, tile_n] = v.to(torch.float32) + 0.1
         out[7, tile_m, tile_n] = torch.add(v, v, alpha=3).to(torch.float32)
         out[8, tile_m, tile_n] = torch.add(v, 0.1, alpha=2).to(torch.float32)
+    return out
+
+
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def row_size_arith(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    out = torch.empty([3, m, n], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        v = x[tile_m, :]
+        out[0, tile_m, :] = v + v.size(1) / 3
+        out[1, tile_m, :] = v * (1.0 / v.size(1))
+        out[2, tile_m, :] = (v.size(1) + 2000) - v
     return out
 
 
@@ -222,6 +235,18 @@ class TestScalarFloatOpmath(TestCase):
                 expected = torch.stack(
                     [x * 2049, x + 2049, 2257 - x, x / 257, x * 2049 + x * 2049]
                 )
+                torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+    def test_full_slice_size_scalars_stay_float32_in_half_math(self) -> None:
+        """Scalars computed from a full slice's size, constants with static
+        shapes, compute at float32 like eager: neither 257 / 3 nor 1 / 257 is
+        rounded to the 16-bit dtype first, nor 2257 to 2256."""
+        torch.manual_seed(0)
+        for dtype in (torch.float16, torch.bfloat16):
+            x = torch.randn(40, 257, device=DEVICE, dtype=dtype) * 3
+            with self.subTest(dtype=dtype):
+                _, out = code_and_output(row_size_arith, (x,))
+                expected = torch.stack([x + 257 / 3, x * (1.0 / 257), 2257 - x])
                 torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
     @skipIfXPU("XPU 16-bit reciprocal results differ from XPU eager")

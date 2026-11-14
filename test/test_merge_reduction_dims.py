@@ -78,7 +78,7 @@ def test_logical_size_preserves_capture_identity_and_arange_extent() -> None:
         sympy_debug=str,
     )
     with patch.object(CompileEnvironment, "current", return_value=env):
-        resolve_reduction_sizes(graph)
+        resolve_reduction_sizes(graph, {})
     assert captured_args[0] is size and size in graph.nodes
     assert size.target is _get_symnode and size.meta["val"] == 33
     output_values = output.args[0]

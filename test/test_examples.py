@@ -1524,17 +1524,36 @@ class TestExamples(RefEagerTestBase, TestCase):
         indices = torch.randint(0, num_nodes, (num_edges,), device=DEVICE).sort()[0]
         input_data = torch.randn(num_edges, num_features, device=DEVICE, dtype=dtype)
 
-        args = (indices, input_data, num_nodes)
-
         # Import and use the reference implementation
         mod = import_path(EXAMPLES_DIR / "segment_reduction.py")
-        expected = mod.segmented_reduction_pytorch(*args)
 
-        check_example(
-            "segment_reduction",
-            args,
-            expected,
-            fn_name="segmented_reduction_helion",
+        # Random segments, then one segment on node 0, whose last row only the
+        # last-row flush ends: its masked next index (0) equals its own.
+        for segment_ids in (indices, torch.zeros_like(indices)):
+            args = (segment_ids, input_data, num_nodes)
+            check_example(
+                "segment_reduction",
+                args,
+                mod.segmented_reduction_pytorch(*args),
+                fn_name="segmented_reduction_helion",
+            )
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("checks the example's Triton reference, not a kernel")
+    def test_segment_reduction_triton_reference(self):
+        """The example's Triton reference ends the last segment at the last
+        element too: one segment on node 0 over 1001 rows, which leaves the
+        last block partial at every block size it autotunes over."""
+        mod = import_path(EXAMPLES_DIR / "segment_reduction.py")
+        indices = torch.zeros(1001, dtype=torch.int64, device=DEVICE)
+        # Small integers: the atomic adds sum them exactly in any order.
+        input_data = torch.randint(-4, 5, (1001, 32), device=DEVICE).float()
+        args = (indices, input_data, 4)
+        torch.testing.assert_close(
+            mod.segmented_reduction_triton(*args),
+            mod.segmented_reduction_pytorch(*args),
+            rtol=0,
+            atol=0,
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)

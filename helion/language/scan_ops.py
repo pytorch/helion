@@ -174,15 +174,14 @@ def _(
         combine_fn, is_tuple_input=is_tuple_input, target_format="unpacked"
     )
 
-    # Create fake inputs for the combine function
-    fake_inputs = []
-    for tensor in input_tensor if is_tuple_input else [input_tensor]:
-        fake_inputs.extend(
-            [
-                torch.empty([1], dtype=tensor.dtype, device=tensor.device),
-                torch.empty([1], dtype=tensor.dtype, device=tensor.device),
-            ]
-        )
+    # Fake inputs in the unpacked format the wrapper takes: every left
+    # element, then every right element, each with its own operand's dtype.
+    operands = input_tensor if is_tuple_input else [input_tensor]
+    fake_inputs = [
+        torch.empty([1], dtype=tensor.dtype, device=tensor.device)
+        for _side in range(2)
+        for tensor in operands
+    ]
 
     combine_graph = proxy_tensor.make_fx(
         combine_fn, decomposition_table=select_decomp_table()

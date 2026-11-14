@@ -23,6 +23,7 @@ from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessHostTensorDescriptor
 from helion._testing import skipUnlessTensorDescriptor
+from helion._testing.row_iota_kernels import onehot_row_update
 import helion.language as hl
 
 
@@ -752,6 +753,38 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         self.assertIn(get_tensor_descriptor_fn_name(), code)
         # Should not contain permute calls since no permutation needed
         self.assertNotIn("tl.permute", code)
+
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    @skipIfRefEager("Test checks the code and the bound kernel specialization cache")
+    def test_bool_tensor_keeps_pointer_indexing(self):
+        """A bool tensor's ``*i1`` pointer has no byte size for a Triton
+        descriptor (``make_tensor_descriptor`` counts "256 * 0 = 0 bytes"),
+        so a bool mask loads through its pointer while the float operands
+        beside it take descriptors, and a misaligned mask reuses the bound
+        kernel of an aligned one: their code is the same."""
+        config = helion.Config(block_sizes=[1, 32], indexing="tensor_descriptor")
+
+        @helion.kernel(autotune_effort="none", static_shapes=True, config=config)
+        def masked_rows(scores: torch.Tensor, keep: torch.Tensor) -> torch.Tensor:
+            b, q, _ = scores.shape
+            out = torch.empty_like(scores)
+            for tile_b, tile_q in hl.tile([b, q]):
+                mask = keep[tile_b, tile_q, :].to(torch.float32)
+                out[tile_b, tile_q, :] = scores[tile_b, tile_q, :] * mask
+            return out
+
+        scores = torch.randn([4, 64, 256], device=DEVICE, dtype=torch.float32)
+        keep = torch.rand([4, 64, 256], device=DEVICE) > 0.5
+        storage = torch.rand(4 * 64 * 256 + 1, device=DEVICE) > 0.5
+        unaligned = storage[1:].view(4, 64, 256)
+        self.assertNotEqual(unaligned.data_ptr() % 16, 0)
+        bound = masked_rows.bind((scores, keep))
+        code = bound.to_triton_code(config)
+        self.assertIn(f"{get_tensor_descriptor_fn_name()}(scores,", code)
+        self.assertNotIn(f"{get_tensor_descriptor_fn_name()}(keep,", code)
+        self.assertIs(bound, masked_rows.bind((scores, unaligned)))
+        torch.testing.assert_close(masked_rows(scores, keep), scores * keep)
+        torch.testing.assert_close(masked_rows(scores, unaligned), scores * unaligned)
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_3d_tensor_permutation(self):
@@ -2099,6 +2132,39 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         )
         normalized = spec.normalized_config(gate.configs[0])
         self.assertEqual(normalized.range_warp_specializes, [None, None, None])
+
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    @skipIfRefEager("asserts the generated code")
+    def test_looped_reduction_beside_a_row_iota(self):
+        # hl.arange(row.size(1)) lowers the row's size to its extent, which
+        # used to stand for the row's block size in its descriptors' block
+        # shapes: [_BLOCK_SIZE_0, 200] failed Triton's power-of-two check,
+        # [_BLOCK_SIZE_0, 256] the looped reduction's chunks of 64, and with
+        # dynamic shapes [_BLOCK_SIZE_0, cols] Triton's constexpr block shape.
+        for cols, static_shapes in ((200, True), (256, True), (200, False)):
+            with self.subTest(cols=cols, static_shapes=static_shapes):
+                kernel = helion.kernel(
+                    onehot_row_update,
+                    static_shapes=static_shapes,
+                    autotune_effort="none",
+                )
+                # A row stride of cols + 8 elements keeps x's descriptor aligned.
+                x = torch.rand(64, cols + 8, device=DEVICE, dtype=torch.bfloat16)
+                x = x[:, :cols]
+                label = torch.randint(0, cols, (64,), device=DEVICE)
+                code, out = code_and_output(
+                    kernel,
+                    (x, label),
+                    block_sizes=[16],
+                    reduction_loops=[64],
+                    indexing="tensor_descriptor",
+                )
+                columns = torch.arange(cols, device=DEVICE)
+                onehot = torch.where(columns[None, :] == label[:, None], -1.0, 0.0)
+                torch.testing.assert_close(
+                    out, x.float() + onehot * onehot.sum(-1, keepdim=True)
+                )
+                self.assertIn("[_BLOCK_SIZE_0, _REDUCTION_BLOCK_1])", code)
 
 
 if __name__ == "__main__":

@@ -21,23 +21,28 @@ from ..compile_environment import CompileEnvironment
 
 if TYPE_CHECKING:
     import ast
+    from collections.abc import Collection
 
     from ..inductor_lowering import CodegenState
 
 
-@_decorators.codegen(_mask_to, "triton")
-def _(state: CodegenState) -> ast.AST:
-    tensor = state.proxy_arg(0)
-    assert isinstance(tensor, torch.Tensor)
-    other = state.proxy_arg(1)
-    assert isinstance(other, (int, float, bool))
+def _tile_mask_expr(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    block_ids: Collection[int] | None = None,
+) -> str | None:
+    """The mask of the active tiles over ``tensor``'s dims (of the canonical
+    ``block_ids`` only, if given), broadcast to its shape, or None when no
+    such dim has a masked tile."""
     mask_exprs: list[str] = []
     input_sizes = [*tensor.size()]
     env = CompileEnvironment.current()
     for dim, size in enumerate(input_sizes):
-        if (index := env.resolve_block_id(size)) is not None and (
-            mask_var := state.codegen.mask_var(index)
-        ) is not None:
+        if (
+            (index := env.resolve_block_id(size)) is not None
+            and (block_ids is None or env.canonical_block_id(index) in block_ids)
+            and (mask_var := state.codegen.mask_var(index)) is not None
+        ):
             expand = state.tile_strategy.expand_str(input_sizes, dim)
             if env.is_jagged_tile(index):
                 mask_shape = env.jagged_tile_mask_shapes[index]
@@ -49,10 +54,22 @@ def _(state: CodegenState) -> ast.AST:
             if expr not in mask_exprs:
                 mask_exprs.append(expr)
     if not mask_exprs:
-        return state.ast_arg(0)
+        return None
     mask_expr = "&".join(mask_exprs)
     if len(mask_exprs) < len(input_sizes):
         mask_expr = f"tl.broadcast_to({mask_expr}, {state.tile_strategy.shape_str(input_sizes)})"
+    return mask_expr
+
+
+@_decorators.codegen(_mask_to, "triton")
+def _(state: CodegenState) -> ast.AST:
+    tensor = state.proxy_arg(0)
+    assert isinstance(tensor, torch.Tensor)
+    other = state.proxy_arg(1)
+    assert isinstance(other, (int, float, bool))
+    mask_expr = _tile_mask_expr(state, tensor)
+    if mask_expr is None:
+        return state.ast_arg(0)
     # Ensure the masked value literal matches the tensor dtype to avoid unintended upcasts
     input_dtype = tensor.dtype
     other_typed = expr_from_string(

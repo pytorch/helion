@@ -1564,6 +1564,14 @@ class CuteBackend(Backend):
         return not in_divergent_control_flow
 
     @property
+    def intra_loop_barriers_order_atomics(self) -> bool:
+        # The thread-barrier pass (``lane_loops/barriers.py``) orders a load
+        # after an atomic itself, and refuses a config that would need such a
+        # barrier in a body a later pass rewrites; a barrier emitted before
+        # the load would hide that refusal.
+        return False
+
+    @property
     def lowers_chunk_unbind(self) -> bool:
         return True
 
@@ -3584,17 +3592,21 @@ class CuteBackend(Backend):
         return super().scalar_literal_expr(value)
 
     def scalar_float_operand_ast(
-        self, x: ast.AST, value: torch.SymFloat, *, computes_in_float64: bool
+        self, x: ast.AST, value: torch.SymFloat | float, *, computes_in_float64: bool
     ) -> ast.AST:
         # The DSL types a Python float combined with an Int as Float64
         # (``n + 0.0`` for ``ToFloat(n)``), which would turn the op's float32
         # math, and any loop carry it feeds, into Float64.  Float kernel
         # arguments are Float32 (see the launcher), and so is an expression
-        # of only them and constants.
+        # of only them and constants.  A float constant alone would take the
+        # other operand's type, a 16-bit one too.
         float_symbols = (SymT.FLOAT, SymT.UNBACKED_FLOAT)
-        if computes_in_float64 or all(
-            symbol_is_type(symbol, float_symbols)
-            for symbol in value._sympy_().free_symbols
+        if computes_in_float64 or (
+            isinstance(value, torch.SymFloat)
+            and all(
+                symbol_is_type(symbol, float_symbols)
+                for symbol in value._sympy_().free_symbols
+            )
         ):
             return x
         return self.cast_ast(x, torch.float32)
