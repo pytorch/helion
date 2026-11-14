@@ -4977,6 +4977,9 @@ class TileDependencyGraph:
                 (allocation_id, self.inband_numel(allocation_id))
                 for allocation_id in sorted(self.inband_allocation_ids)
             ),
+            # Each rank's own peer-load subscripts decide which roots end, and
+            # the done barrier counts their arrivals on every rank.
+            tuple(sorted(self.inband_read_roots)),
             # Keyed peer counters read only these rank-invariant subscripts.
             tuple(
                 (
@@ -5045,6 +5048,14 @@ def _access_region(
         not 0 <= dimension < len(shape) for dimension in position_by_dim
     ):
         return AllocationRegion(None, False)
+    # Bounds are per dimension: a tile axis that indexes two dimensions (a
+    # diagonal) covers only part of the box its bounds span.
+    shared_axes = {
+        block_id
+        for block_id in access.subscript_affine_block_ids
+        if block_id is not None
+        and access.subscript_affine_block_ids.count(block_id) > 1
+    }
 
     bounds: list[tuple[int, int]] = []
     exact_dimensions: list[bool] = []
@@ -5120,7 +5131,9 @@ def _access_region(
             exact_dimensions.append(False)
             continue
         bounds.append((begin, end))
-        exact_dimensions.append(not access.has_explicit_mask)
+        exact_dimensions.append(
+            not access.has_explicit_mask and block_id not in shared_axes
+        )
 
     return _allocation_region_from_bounds(
         dataclasses.replace(
@@ -6716,10 +6729,6 @@ def _surely_read_in_full(
     of bounding intervals.  A region bounds each dimension apart, so a load
     whose subscripts share a tile axis (a diagonal) does not count."""
     peer_loads = [access for access in accesses if access.owner_rank is not None]
-    for load in peer_loads:
-        axes = [b for b in load.subscript_affine_block_ids if b is not None]
-        if len(set(axes)) != len(axes):
-            return False
     region = _inband_store_region(store, task_families[store.root])
     return not _misses_a_polled_rank(region, peer_loads, task_families, exact=True)
 
@@ -7154,7 +7163,7 @@ def build_tile_dependency_graph(
     # Polls at root on every rank that surely read each polled rank's whole
     # buffer wait for every task of the store's root to push. A root whose tasks
     # also read keyed peer data may still do so after their push.
-    keyed_readers = {
+    keyed_peer_roots = {
         access.root
         for access in accesses
         if access.owner_rank is not None
@@ -7177,7 +7186,7 @@ def build_tile_dependency_graph(
         )
         for access in accesses_by_allocation[allocation_id]
         if access.kind == "store"
-        and access.root not in keyed_readers
+        and access.root not in keyed_peer_roots
         and _surely_read_in_full(
             access, accesses_by_allocation[allocation_id], task_families
         )
