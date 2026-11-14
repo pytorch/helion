@@ -32,8 +32,14 @@ in one row; over a tile's steps a lane's are one run of K positions
 (:func:`emit_fragment_run`), a few words and scales of a quantized weight.
 The planner admits a group when the SIMD group can recompute each computed
 operand element from loads, iotas and element-wise ops alone
-(:func:`check_fragment_group`); one SIMD group per threadgroup
-(``check_mpp_launch``) and multiples of 8 (:func:`fragment_grid`).
+(:func:`check_fragment_group`); a tile laid out over one SIMD group's 32
+threads (``check_mpp_launch``) and multiples of 8 (:func:`fragment_grid`).
+
+``num_warps`` SIMD groups split each K loop (the plan's ``split``): each
+runs the tile's 32-thread layout over every ``num_warps``-th K tile, from
+its own, and after the loop the first adds the others' accumulators to
+its own (:func:`emit_split_combine`) and alone writes memory.  The others
+run the same code beside it, so every barrier is reached by all of them.
 """
 
 from __future__ import annotations
@@ -51,15 +57,21 @@ import sympy
 import torch
 
 from ...language import _tracing_ops
+from ...language.creation_ops import full
+from ...language.matmul_ops import dot
 from ...language.memory_ops import load
 from ..ast_extension import expr_from_string
 from ..compile_environment import CompileEnvironment
+from ..inductor_lowering import ReductionLowering
+from ._constants import MAX_THREADGROUP_MEMORY_BYTES
+from ._constants import SIMD_WIDTH
 from .affine_fold import Affine
 from .affine_fold import Fact
 from .affine_fold import evaluate
 from .affine_fold import fold
 from .affine_fold import render
 from .backend import static_extent
+from .free_arange import live_graphs
 from .lane_fold import load_mask_other
 from .lane_fold import tl_load
 from .mpp_matmul import ACC_SEED
@@ -68,6 +80,7 @@ from .mpp_matmul import FRAG_B
 from .mpp_matmul import FRAG_RUN
 from .mpp_matmul import PUT
 from .mpp_matmul import RUN
+from .mpp_matmul import WRITES
 from .mpp_matmul import Dim
 from .mpp_matmul import Graphs
 from .mpp_matmul import MppGroup
@@ -77,6 +90,7 @@ from .mpp_matmul import View
 from .mpp_matmul import assigned_names
 from .mpp_matmul import block_id_of
 from .mpp_matmul import call_name
+from .mpp_matmul import current_plan
 from .mpp_matmul import group_sides
 from .mpp_matmul import matmul_operands
 from .mpp_matmul import metal_unsupported
@@ -97,6 +111,7 @@ if TYPE_CHECKING:
 
     from torch.fx.node import Node
 
+    from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
     from ..tile_strategy import LoopDimInfo
     from .msl_ast_walker import EmitState
@@ -122,6 +137,12 @@ LANE_PREAMBLE = (
 )
 #: What the fold (``affine_fold``) knows of ``_fm`` and ``_fn``.
 _LANE_FACTS = {"_fm": Fact(1, 0, 7), "_fn": Fact(2, 0, 6)}
+#: A kernel whose SIMD groups split its K loops: each thread's SIMD group in
+#: the threadgroup, and the threadgroup buffer through which the SIMD groups
+#: past the first pass their accumulators to it, a lane's two elements of
+#: each fragment (:func:`emit_split_combine`).
+SIMDGROUP = "_frag_sg"
+SPLIT_BUFFER = "_frag_split"
 
 
 class _OperandRecomputable(Recomputable):
@@ -194,6 +215,67 @@ def check_fragment_group(group: MppGroup, plan: MppPlan, graphs: Graphs) -> None
                 f"the operand {node.name}, computed from a load of a tensor the "
                 "kernel writes"
             )
+
+
+def split_refusal(plan: MppPlan, graphs: list[GraphInfo]) -> str | None:
+    """Why the SIMD groups of a threadgroup can't split the K loops of the
+    plan's fragment groups, or None when they can.  Each SIMD group runs
+    the kernel as one SIMD group would, over its share of each K loop's
+    tiles, and after the loop the first adds the others' accumulators to
+    its own; the others then hold zeros and write nothing.  So a K loop may
+    carry nothing but accumulators its runs alone update, and write nothing;
+    an accumulator starts from a constant (the first SIMD group's; the
+    others start from 0); the kernel reads no tensor it writes, which the
+    SIMD groups past the first would read without having written it; and
+    it has no reduction, whose threadgroup combine would take every SIMD
+    group's threads as its own, nor an ``hl.dot`` the runs don't take,
+    whose scalar contraction reduces so too."""
+    known = Graphs(graphs)
+    live = live_graphs(graphs)
+    if any(
+        isinstance(node.meta.get("lowering"), ReductionLowering)
+        for info in live
+        for node in info.graph.nodes
+    ):
+        return "the kernel has a reduction"
+    if any(
+        node not in plan.by_matmul
+        for info in live
+        for node in info.graph.find_nodes(op="call_function", target=dot)
+    ):
+        return (
+            "the kernel has an hl.dot the fragment runs don't take, whose "
+            "contraction reduces across threads"
+        )
+    loops: dict[Node, list[MppGroup]] = {}
+    for group in plan.by_matmul.values():
+        if group.seed is None or group.seed.target is not full:
+            return "an accumulator starts from a tile"
+        if group.update or group.upd is not None:
+            return "the K loop updates an accumulator other than by its matmul"
+        loops.setdefault(group.levels[0].owner, []).append(group)
+    for groups in loops.values():
+        body = groups[0].matmul.graph
+        (output,) = body.find_nodes(op="output")
+        accumulators = {group.matmul for group in groups}
+        carried = output.args[0]
+        assert isinstance(carried, (list, tuple))
+        if any(value not in accumulators for value in carried):
+            return "the K loop carries a value besides its matmuls' accumulators"
+        if any(
+            node.target in WRITES
+            for info in live
+            if known.within(info.graph, body)
+            for node in info.graph.nodes
+        ):
+            return "the K loop writes memory"
+    if any(
+        node.target is load and storage_key(node) in plan.written
+        for info in live
+        for node in info.graph.nodes
+    ):
+        return "the kernel reads a tensor it writes"
+    return None
 
 
 def transposed(group: MppGroup) -> bool:
@@ -347,9 +429,10 @@ def codegen_fragment_run(
     (None when every tile is whole), ``facts`` the tile offsets' ``(offset,
     multiple, least)`` (:func:`_offset_fact`), over which the run folds its
     elements' index arithmetic, ``tables`` the config's
-    ``metal_tabulate_max_entries``, and ``k_step`` the K loop's offset and
+    ``metal_tabulate_max_entries``, ``k_step`` the K loop's offset and
     step when it loads its operands a tile ahead (``range_num_stages=2``),
-    else None."""
+    else None, and ``split`` the K loop's offset and the SIMD groups that
+    split it (:func:`_split`), None for one."""
     backend = CompileEnvironment.current().backend
     m, n, k = static_tile(cg, (group.m_block, group.n_block, group.k_block))
     op = dict(zip((group.m_block, group.n_block), op_dims(group, m, n), strict=True))
@@ -410,26 +493,68 @@ def codegen_fragment_run(
     # call's bounds loads_ahead admits (``register_search_surface``); this
     # checks the loop codegen sees.
     k_step = None
+    k_tiles = None
     if stages >= 2:
         k_fact = _offset_fact(cg, group.k_block)
         k_loop = _static_loop(cg, group.k_block)
-        if (
-            k_fact is None
-            or k_loop is None
-            or not loads_ahead(k_fact[2], _specialized(k_loop[0].end_expr))
-        ):
+        end = None if k_loop is None else _static_int(_specialized(k_loop[0].end_expr))
+        if k_fact is None or k_loop is None or not loads_ahead(k_fact[2], end):
             raise metal_unsupported(
                 "range_num_stages=2 on a K loop without known bounds it runs between"
             )
+        assert end is not None  # loads_ahead admits known bounds only
         k_step = (k_fact[0], k_loop[2])
+        k_tiles = -(-(end - k_loop[1]) // k_loop[2])
     return expr_from_string(
         f"{RUN}({acc.id}, {group.gid}, {', '.join(parts)}, "
         f"anchors=[{anchor_list}], outer=[{', '.join(outers)}], steps={k // 8}, "
         f"k_live={k_live}, facts={facts!r}, "
         f"tables={metal_tabulate_max_entries(cg.device_function.config)}, "
-        f"k_step={k_step!r}, "
+        f"k_step={k_step!r}, split={_split(cg, group, k_tiles)!r}, "
         f"fragment=[{', '.join(sides)}])"
     )
+
+
+def _loop_fragments(cg: GenerateAST, group: MppGroup) -> int:
+    """The accumulator fragments of the fragment groups of ``group``'s K
+    loop, its own included: what a split's combine adds."""
+    loop = group.levels[0].owner
+    total = 0
+    for other in current_plan().by_matmul.values():
+        if other.levels[0].owner is loop:
+            m, n, _ = static_tile(cg, (other.m_block, other.n_block, other.k_block))
+            m, n = op_dims(other, m, n)
+            total += (m // 8) * (n // 8)
+    return total
+
+
+def _split(
+    cg: GenerateAST, group: MppGroup, tiles: int | None
+) -> tuple[str, int] | None:
+    """A fragment run's K loop's offset and the SIMD groups that split the
+    loop (the plan's ``split``), or None when one SIMD group runs it.
+    Refuses (``BackendUnsupported``) a split whose combine needs more
+    threadgroup memory than there is, and one into more SIMD groups than
+    the loop's ``tiles`` when it loads a tile ahead (``tiles`` given): a
+    SIMD group without a tile would load past the loop's end before it."""
+    split = current_plan().split
+    if split == 1:
+        return None
+    fragments = _loop_fragments(cg, group)
+    combine = (split - 1) * fragments * SIMD_WIDTH * 8
+    if combine > MAX_THREADGROUP_MEMORY_BYTES:
+        raise metal_unsupported(
+            f"a fragment K loop split over {split} SIMD groups (num_warps): adding "
+            f"their {fragments} accumulator fragments takes {combine} bytes of "
+            f"threadgroup memory (max {MAX_THREADGROUP_MEMORY_BYTES}); lower num_warps"
+        )
+    if tiles is not None and split > tiles:
+        raise metal_unsupported(
+            f"range_num_stages=2 on a K loop of {tiles} tiles split over {split} "
+            "SIMD groups (num_warps): a SIMD group without a tile would load "
+            "past the loop's end"
+        )
+    return cg.offset_var(group.k_block), split
 
 
 def _offset_fact(cg: GenerateAST, block: int) -> tuple[str, int, int] | None:
@@ -536,12 +661,20 @@ def fragment_run(
     its bindings, and is 0 past the K tile's live length; a view's is a
     masked load (:func:`_view_element`)."""
     grid = _keyword(acc_call, "fragment")
-    steps, k_live, facts, tables, k_step, sides = (
+    steps, k_live, facts, tables, k_step, split, sides = (
         _keyword(call, name)
-        for name in ("steps", "k_live", "facts", "tables", "k_step", "fragment")
+        for name in (
+            "steps",
+            "k_live",
+            "facts",
+            "tables",
+            "k_step",
+            "split",
+            "fragment",
+        )
     )
     assert grid is not None and steps is not None and facts is not None
-    assert tables is not None and k_step is not None
+    assert tables is not None and k_step is not None and split is not None
     assert isinstance(sides, ast.List)
     _, _, flipped = ast.literal_eval(grid)
     outer = run_outer(call)
@@ -585,7 +718,7 @@ def fragment_run(
         ast.Name("_it", ast.Store()),
         ast.Call(
             ast.Name(FRAG_RUN, ast.Load()),
-            [call.args[0], steps, facts, tables, k_step],
+            [call.args[0], steps, facts, tables, k_step, split],
             [],
         ),
         body,
@@ -660,7 +793,9 @@ def emit_fragment_acc(
     name: str, call: ast.Call, parts: list[str], pad: str, state: EmitState
 ) -> None:
     """Declare a fragment group's accumulator, its ``rows * cols`` float
-    fragments, filled with the seed value or from the staged seed tile."""
+    fragments, filled with the seed value or from the staged seed tile.
+    When SIMD groups split the K loops, only the first starts from the
+    seed value; the others add their tiles to 0 (:func:`emit_split_combine`)."""
     grid = _keyword(call, "fragment")
     assert grid is not None
     rows, cols, flipped = ast.literal_eval(grid)
@@ -677,9 +812,12 @@ def emit_fragment_acc(
     if tm > block_m or tn > block_n:
         state.coop_rounded.add(name)
     value = float(fill if seed is None else 0.0)
+    start = f"{value!r}f"
+    if value and state.split > 1:
+        start = f"{SIMDGROUP} == 0 ? {start} : 0.0f"
     parts.append(f"{pad}simdgroup_float8x8 {name}[{rows * cols}];")
     parts += [
-        f"{pad}{name}[{i}] = make_filled_simdgroup_matrix<float, 8, 8>({value!r}f);"
+        f"{pad}{name}[{i}] = make_filled_simdgroup_matrix<float, 8, 8>({start});"
         for i in range(rows * cols)
     ]
     if seed is not None:
@@ -708,7 +846,7 @@ def _run_setup(
     over and its table cap (``metal_tabulate_max_entries``); ``root`` is its
     accumulator's."""
     assert isinstance(stmt.iter, ast.Call)
-    _, steps, facts_arg, tables, _ = stmt.iter.args
+    _, steps, facts_arg, tables, _, _ = stmt.iter.args
     rows, cols, flipped = _grid(state, root)
     row, col = _element_names(flipped)
     a_loop, b_loop = stmt.body
@@ -807,6 +945,9 @@ def emit_fragment_run(
     assert isinstance(stmt.iter, ast.Call)
     acc = stmt.iter.args[0]
     assert isinstance(acc, ast.Name)
+    split = _run_split(stmt)
+    # Its K loop, which it lies in, splits it (``split_range``).
+    assert split is None or split[0] in state.split_loops, split
     rows, cols, _ = _grid(state, state.coop[acc.id])
     n_steps, sides, facts, tables = _run_setup(stmt, state, state.coop[acc.id])
     k, early, elements = state.prefetch.get(stmt, ("", {}, {}))
@@ -963,6 +1104,10 @@ def prefetch_loads(
         if k_step is None or k_step[0] != loop_var:
             continue
         k, step = k_step
+        split = _run_split(stmt)
+        # SIMD groups that split the loop each start at their own tile and
+        # step over the others'.
+        simdgroups = 1 if split is None else split[1]
         acc = stmt.iter.args[0]
         assert isinstance(acc, ast.Name)
         root = acc.id
@@ -994,11 +1139,19 @@ def prefetch_loads(
         state.prefetch[stmt] = (k, early, elements)
         if not early:
             continue
-        next_tile = f"{loop_var} + {step} < {end}"
+        next_tile = f"{loop_var} + {step * simdgroups} < {end}"
         state.early_count += len(early)
         for (ptr, rest, coeff), name in early.items():
             first = rest + Affine.of(int(coeff * begin))
-            nxt = rest + Affine.term(k, 1).scale(coeff) + Affine.of(int(coeff * step))
+            if simdgroups > 1:
+                # The index is an integer at every tile, so ``coeff * step``
+                # is one.
+                first += Affine.term(SIMDGROUP, int(coeff * step))
+            nxt = (
+                rest
+                + Affine.term(k, 1).scale(coeff)
+                + Affine.of(int(coeff * step * simdgroups))
+            )
             before.append(
                 f"{pad}auto {name}_next = {ptr}[{ast.unparse(render(first))}];"
             )
@@ -1009,6 +1162,95 @@ def prefetch_loads(
     if next_tile is not None:
         top += [f"{pad}    if ({next_tile}) {{", *ahead, f"{pad}    }}"]
     return before, top
+
+
+def _run_split(stmt: ast.For) -> tuple[str, int] | None:
+    """A fragment run loop's ``split`` (:func:`fragment_run`): its K loop's
+    offset and the SIMD groups that split the loop, None for one."""
+    assert isinstance(stmt.iter, ast.Call)
+    return ast.literal_eval(stmt.iter.args[5])
+
+
+def split_runs(body: list[ast.stmt], loop_var: str) -> list[ast.For]:
+    """The fragment runs in a K loop's ``body`` that SIMD groups split over
+    the loop (``loop_var``): their ``split`` names its offset."""
+    runs: list[ast.For] = []
+    for stmt in body:
+        if isinstance(stmt, ast.For) and call_name(stmt.iter) == FRAG_RUN:
+            assert isinstance(stmt.iter, ast.Call)
+            split = _run_split(stmt)
+            if split is not None and split[0] == loop_var:
+                runs.append(stmt)
+    return runs
+
+
+def split_range(start: str, step: str, simdgroups: int) -> tuple[str, str]:
+    """A split K loop's start and step: each SIMD group starts at its own
+    tile and steps over the others'."""
+
+    def paren(text: str) -> str:
+        return text if text.isidentifier() or text.isdigit() else f"({text})"
+
+    first = f"{SIMDGROUP} * {paren(step)}"
+    if start != "0":
+        first = f"{paren(start)} + {first}"
+    return first, f"{simdgroups} * {paren(step)}"
+
+
+def emit_split_combine(
+    runs: list[ast.For], parts: list[str], pad: str, state: EmitState
+) -> None:
+    """After a K loop the SIMD groups split, add their accumulators (those
+    the loop's ``runs`` update) into the first's: the others write a lane's
+    two elements of each fragment to threadgroup memory and restart from 0,
+    which keeps an accumulator an enclosing loop carries summed once, and
+    the first adds them in SIMD-group order, so a launch's sum is the same
+    every time.  The first barrier keeps the writes after the first SIMD
+    group's reads of an earlier combine, the second its reads after the
+    writes."""
+    fragments: list[str] = []
+    for run in runs:
+        assert isinstance(run.iter, ast.Call)
+        acc = run.iter.args[0]
+        assert isinstance(acc, ast.Name)
+        root = state.coop[acc.id]
+        rows, cols, _ = _grid(state, root)
+        held = [f"{root}[{i}]" for i in range(rows * cols)]
+        if held[0] not in fragments:
+            fragments += held
+    count = len(fragments)
+    lanes = 2 * SIMD_WIDTH
+    state.split_slots = max(state.split_slots, (state.split - 1) * count * lanes)
+    inner = pad + "    "
+
+    def slot(simdgroup: str, f: int, e: int) -> str:
+        return f"{SPLIT_BUFFER}[({simdgroup} * {count} + {f}) * {lanes} + 2 * {LANE} + {e}]"
+
+    elements = [
+        (f, e, f"{fragment}.thread_elements()[{e}]")
+        for f, fragment in enumerate(fragments)
+        for e in range(2)
+    ]
+    barrier = f"{pad}threadgroup_barrier(mem_flags::mem_threadgroup);"
+    parts += [
+        barrier,
+        f"{pad}if ({SIMDGROUP} != 0) {{",
+        *(
+            f"{inner}{slot(f'({SIMDGROUP} - 1)', f, e)} = {element};"
+            for f, e, element in elements
+        ),
+        *(
+            f"{inner}{fragment} = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);"
+            for fragment in fragments
+        ),
+        f"{pad}}}",
+        barrier,
+        f"{pad}if ({SIMDGROUP} == 0) {{",
+        f"{inner}for (uint _s = 0; _s < {state.split - 1}; _s++) {{",
+        *(f"{inner}    {element} += {slot('_s', f, e)};" for f, e, element in elements),
+        f"{inner}}}",
+        f"{pad}}}",
+    ]
 
 
 def kernel_constants(body: list[ast.stmt]) -> dict[str, int | float]:

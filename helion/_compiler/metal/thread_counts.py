@@ -1,6 +1,8 @@
 """How a Metal launch's tiles take their threads from the threadgroup budget
-(``threadgroup_budget``: ``num_warps`` SIMD groups, at most 1024) and its
-three thread axes, when no reduction or free ``hl.arange`` axis reserves any.
+(``threadgroup_budget``: ``num_warps`` SIMD groups, at most 1024, but one
+SIMD group for a fragment config's tiles, whose ``num_warps`` splits its K
+loops instead) and its three thread axes, when no reduction or free
+``hl.arange`` axis reserves any.
 
 ``MetalBackend._config_with_auto_threads_shrunk`` and
 ``_serialize_nested_auto_tiles`` run the budget rules on each device loop

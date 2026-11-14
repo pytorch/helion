@@ -24,9 +24,13 @@ import helion
 from helion._testing import skipUnlessBackends
 from helion._testing.metal import run_with_msl
 from helion._testing.metal_fragment import e4m3
+from helion._testing.metal_fragment import filled
 from helion._testing.metal_fragment import fp8_rows
+from helion._testing.metal_fragment import fragment_config
 from helion._testing.metal_fragment import k_from_16
 from helion._testing.metal_fragment import nvfp4_rows
+from helion._testing.metal_fragment import seeded_rhs
+from helion._testing.metal_fragment import two_groups
 from helion._testing.metal_fragment import views_epilogue
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.finite_search import FiniteSearch
@@ -40,7 +44,6 @@ if TYPE_CHECKING:
 DEVICE = "mps"
 F32 = torch.float32
 S = {"backend": "metal", "static_shapes": True}
-FRAG = {"metal_matmul": "fragment", "num_warps": 1}
 
 # Metal kernels on macOS only: other backends' suites skip the module.
 pytestmark = [
@@ -51,13 +54,6 @@ _requires_mps = unittest.skipUnless(
     sys.platform == "darwin" and torch.backends.mps.is_available(),
     "requires a Metal GPU",
 )
-
-
-def _frag(
-    block_sizes: list[int], num_threads: list[int] | None = None, **knobs: object
-) -> helion.Config:
-    extra = {} if num_threads is None else {"num_threads": num_threads}
-    return helion.Config(block_sizes=block_sizes, **extra, **knobs, **FRAG)
 
 
 def _run(
@@ -121,22 +117,6 @@ def computed_both(x: torch.Tensor, y: torch.Tensor, c: torch.Tensor) -> torch.Te
 
 
 @helion.kernel(**S)
-def seeded_rhs(x: torch.Tensor, y: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-    """Only the rhs computed, so the accumulator is transposed, and seeded
-    from c."""
-    m, k = x.size()
-    n = y.size(1)
-    out = torch.empty([m, n], dtype=F32, device=x.device)
-    for tile_m, tile_n in hl.tile([m, n]):
-        acc = c[tile_m, tile_n].to(F32)
-        for tile_k in hl.tile(k):
-            b = (y[tile_k, tile_n].to(F32) * 2.0).to(x.dtype)
-            acc = torch.addmm(acc, x[tile_m, tile_k], b)
-        out[tile_m, tile_n] = acc
-    return out
-
-
-@helion.kernel(**S)
 def computed_lhs(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """A computed lhs beside a view rhs: the accumulator is not transposed."""
     m, k = x.size()
@@ -190,22 +170,40 @@ def whole_k_dot(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(**S)
-def two_groups(
-    x: torch.Tensor, y: torch.Tensor, z: torch.Tensor
+def running_sums(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """out[b] = x[0] @ y[0] + ... + x[b] @ y[b]: an accumulator an outer
+    loop carries from one K loop to the next, stored after each."""
+    nb, m, k = x.size()
+    n = y.size(2)
+    out = torch.empty([nb, m, n], dtype=F32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=F32)
+        for b in hl.grid(nb):
+            for tile_k in hl.tile(k):
+                acc = torch.addmm(acc, x[b, tile_m, tile_k], y[b, tile_k, tile_n])
+            out[b, tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(**S)
+def two_k_loops(
+    x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, w: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Two matmuls of x in one K loop, each result stored."""
+    """x @ y + 1 and z @ w: two K loops one after the other, the first's
+    accumulator starting from 1, each result stored."""
     m, k = x.size()
     n = y.size(1)
+    k2 = z.size(1)
     out = torch.empty([m, n], dtype=F32, device=x.device)
     out2 = torch.empty([m, n], dtype=F32, device=x.device)
     for tile_m, tile_n in hl.tile([m, n]):
-        a = hl.zeros([tile_m, tile_n], dtype=F32)
-        b = hl.zeros([tile_m, tile_n], dtype=F32)
+        a = hl.full([tile_m, tile_n], 1.0, dtype=F32)
         for tile_k in hl.tile(k):
-            xt = x[tile_m, tile_k]
-            a = torch.addmm(a, xt, y[tile_k, tile_n])
-            b = torch.addmm(b, xt, z[tile_k, tile_n])
+            a = torch.addmm(a, x[tile_m, tile_k], y[tile_k, tile_n])
         out[tile_m, tile_n] = a
+        b = hl.zeros([tile_m, tile_n], dtype=F32)
+        for tile_k in hl.tile(k2):
+            b = torch.addmm(b, z[tile_m, tile_k], w[tile_k, tile_n])
         out2[tile_m, tile_n] = b
     return out, out2
 
@@ -293,9 +291,9 @@ class TestFragmentMma(unittest.TestCase):
         threads; the accumulator is transposed so the weights are the
         MMA's A."""
         for m, config in (
-            (5, _frag([16, 16, 32], [1, 1, 32])),
-            (11, _frag([16, 16, 64])),
-            (8, _frag([16, 16, 128], [1, 1, 32])),
+            (5, fragment_config([16, 16, 32], [1, 1, 32])),
+            (11, fragment_config([16, 16, 64])),
+            (8, fragment_config([16, 16, 128], [1, 1, 32])),
         ):
             with self.subTest(m=m, config=config):
                 args, ref = _quantized("int4", m, 64, 256)
@@ -308,7 +306,7 @@ class TestFragmentMma(unittest.TestCase):
         # computed.
         static = helion.kernel(dequant_rows.fn, backend="metal", static_shapes=True)
         args, ref = _quantized("int4", 8, 64, 256)
-        config = _frag(
+        config = fragment_config(
             [16, 16, 64],
             [1, 1, 512],
             range_num_stages=[2],
@@ -325,14 +323,16 @@ class TestFragmentMma(unittest.TestCase):
         """nvfp4 codes through half bits and a bitcast (view(dtype)), E4M3
         scales, at 8 rows and at one (decode)."""
         (x, wq, s), ref = _quantized("nvfp4", 8, 48, 256)
-        out, msl = _run(nvfp4_rows, (x[:1], wq, s), _frag([1, 16, 64], [1, 1, 512]))
+        out, msl = _run(
+            nvfp4_rows, (x[:1], wq, s), fragment_config([1, 16, 64], [1, 1, 512])
+        )
         self._close(out, ref[:1])
         self._assert_fragments(msl, transposed=True)
         # The row's block of 1 grows to the B fragment's 8 columns, which the
         # element loops skip past the block.
         self.assertIn("if (_e_m < 1 && _e_n < 16) {", msl)
         knobs = {"metal_tabulate_max_entries": 16, "range_num_stages": [2]}
-        config = _frag([16, 16, 64], [1, 1, 512], **knobs)
+        config = fragment_config([16, 16, 64], [1, 1, 512], **knobs)
         out, msl = _run(nvfp4_rows, (x, wq, s), config)
         self._close(out, ref)
         self._assert_fragments(msl, transposed=True)
@@ -363,7 +363,9 @@ class TestFragmentMma(unittest.TestCase):
         self.assertRegex(msl, r"_early_\d+_next = x\[_fm \* 8 \+ _fn \* 256 \+")
         # Without the keys the loads stay in the operand loop, re-run per
         # element at the element's K, and there is no table.
-        _, msl = _run(nvfp4_rows, (x, wq, s), _frag([16, 16, 64], [1, 1, 512]))
+        _, msl = _run(
+            nvfp4_rows, (x, wq, s), fragment_config([16, 16, 64], [1, 1, 512])
+        )
         self.assertNotIn("_early", msl)
         self.assertNotIn("_helion_table", msl)
         self.assertRegex(
@@ -378,7 +380,7 @@ class TestFragmentMma(unittest.TestCase):
         folds to one floor term of its K run and the tile's offset, a
         multiple of 16 only."""
         args, ref = _quantized("fp8", 8, 40, 224)
-        out, msl = _run(fp8_rows, args, _frag([16, 16, 64]))
+        out, msl = _run(fp8_rows, args, fragment_config([16, 16, 64]))
         self._close(out, ref)
         self._assert_fragments(msl, transposed=True)
         self.assertRegex(msl, r"_e_k < \(end_\d+ - offset_\d+\)\) \? ")
@@ -386,18 +388,20 @@ class TestFragmentMma(unittest.TestCase):
         # A byte's decode takes a 256-entry table, and a 16-entry cap keeps it.
         for cap, table in ((16, False), (256, True)):
             with self.subTest(cap=cap):
-                config = _frag([16, 16, 64], metal_tabulate_max_entries=cap)
+                config = fragment_config([16, 16, 64], metal_tabulate_max_entries=cap)
                 out, msl = _run(fp8_rows, args, config)
                 self._close(out, ref)
                 self.assertEqual("constant float _helion_table_0[256]" in msl, table)
         # Under 2 stages the K tail's loads, all masked, stay in their tile.
-        out, msl = _run(fp8_rows, args, _frag([16, 16, 64], range_num_stages=[2]))
+        out, msl = _run(
+            fp8_rows, args, fragment_config([16, 16, 64], range_num_stages=[2])
+        )
         self._close(out, ref)
         self.assertNotIn("_early", msl)
         # Without a tail the words, scales and x load a tile early, beside a
         # 256-entry table: neither mechanism keys on one format.
         args, ref = _quantized("fp8", 8, 48, 256)
-        config = _frag(
+        config = fragment_config(
             [16, 16, 64],
             [1, 1, 512],
             range_num_stages=[2],
@@ -407,7 +411,7 @@ class TestFragmentMma(unittest.TestCase):
         self._close(out, ref)
         self.assertRegex(msl, r"auto _early_\d+_next = wq\[")
         self.assertIn("constant float _helion_table_0[256]", msl)
-        out, msl = _run(fp8_rows, args, _frag([16, 16, 16]))
+        out, msl = _run(fp8_rows, args, fragment_config([16, 16, 16]))
         self._close(out, ref)
         self.assertRegex(
             msl, r"= static_cast<int>\(\(\(\(_fn \* 2\) \+ offset_\d+\) / 32\)\);"
@@ -421,24 +425,24 @@ class TestFragmentMma(unittest.TestCase):
         y = torch.randn(40, 20, device=DEVICE, dtype=torch.float16)
         bias = torch.randn(20, device=DEVICE)
         ref = torch.relu(x.cpu().double() @ y.cpu().double() + bias.cpu().double())
-        out, msl = _run(views_epilogue, (x, y, bias), _frag([16, 16, 16]))
+        out, msl = _run(views_epilogue, (x, y, bias), fragment_config([16, 16, 16]))
         self._close(out, ref)
         self._assert_fragments(msl, transposed=False)
         # One row: its block of 1 grows to an 8-row fragment, whose rows past
         # the block the element loops skip.
-        out, msl = _run(views_epilogue, (x[:1], y, bias), _frag([1, 16, 16]))
+        out, msl = _run(views_epilogue, (x[:1], y, bias), fragment_config([1, 16, 16]))
         self._close(out, ref[:1])
         self._assert_fragments(msl, transposed=False)
         self.assertIn("if (_e_m < 1 && _e_n < 16) {", msl)
         yt = torch.randn(24, 40, device=DEVICE, dtype=torch.float16)
-        out, msl = _run(transposed_views, (x, yt), _frag([16, 16, 16]))
+        out, msl = _run(transposed_views, (x, yt), fragment_config([16, 16, 16]))
         self._close(out, x.cpu().double() @ yt.cpu().double().T)
         self._assert_fragments(msl, transposed=False)
         # A dim of size 1 broadcasts: K, and K and M alike.
         for rows in (13, 1):
             with self.subTest(broadcast_rows=rows):
                 x1 = torch.randn(rows, 1, device=DEVICE, dtype=torch.float16)
-                out, msl = _run(broadcast_lhs, (x1, y), _frag([16, 16, 16]))
+                out, msl = _run(broadcast_lhs, (x1, y), fragment_config([16, 16, 16]))
                 ref = x1.cpu().double().expand(rows, 40) @ y.cpu().double()
                 self._close(out, ref)
                 self._assert_fragments(msl, transposed=False)
@@ -450,7 +454,7 @@ class TestFragmentMma(unittest.TestCase):
         x = torch.randn(16, 48, device=DEVICE, dtype=torch.float16)
         y = torch.randn(48, 24, device=DEVICE, dtype=torch.float16)
         c = torch.randn(16, 24, device=DEVICE)
-        out, msl = _run(computed_both, (x, y, c), _frag([16, 16, 16]))
+        out, msl = _run(computed_both, (x, y, c), fragment_config([16, 16, 16]))
         acc = c.cpu().double()
         a, b = x.cpu().double() * 2, y.cpu().double() + 1
         for k0 in range(0, 48, 16):
@@ -461,7 +465,10 @@ class TestFragmentMma(unittest.TestCase):
         # A seed of a transposed accumulator, also over one row (the row's
         # block of 1 grows to 8 columns of the fragments).
         y = torch.randn(48, 16, device=DEVICE, dtype=torch.float16)
-        for rows, config in ((16, _frag([16, 16, 16])), (1, _frag([1, 16, 16]))):
+        for rows, config in (
+            (16, fragment_config([16, 16, 16])),
+            (1, fragment_config([1, 16, 16])),
+        ):
             with self.subTest(rows=rows):
                 args = (x[:rows], y, c[:rows, :16])
                 out, msl = _run(seeded_rhs, args, config)
@@ -478,7 +485,10 @@ class TestFragmentMma(unittest.TestCase):
         x = torch.randn(24, 32, device=DEVICE, dtype=torch.float16)
         y = torch.randn(32, 16, device=DEVICE, dtype=torch.float16)
         ref = torch.sigmoid(x.cpu().double()).half().double() @ y.cpu().double()
-        for rows, config in ((24, _frag([16, 16, 16])), (1, _frag([1, 16, 16]))):
+        for rows, config in (
+            (24, fragment_config([16, 16, 16])),
+            (1, fragment_config([1, 16, 16])),
+        ):
             with self.subTest(rows=rows):
                 out, msl = _run(computed_lhs, (x[:rows], y), config)
                 self._close(out, ref[:rows])
@@ -491,10 +501,10 @@ class TestFragmentMma(unittest.TestCase):
         x = torch.randn(16, 32, device=DEVICE, dtype=torch.float16)
         y = torch.randn(32, 16, device=DEVICE, dtype=torch.float16)
         xd, yd = x.cpu().double(), y.cpu().double()
-        out, msl = _run(dot_computed_lhs, (x[:1], y), _frag([1, 16, 16]))
+        out, msl = _run(dot_computed_lhs, (x[:1], y), fragment_config([1, 16, 16]))
         self._close(out, torch.sigmoid(xd[:1]).half().double() @ yd)
         self._assert_fragments(msl, transposed=False)
-        out, msl = _run(whole_k_dot, (x, y), _frag([16, 16]))
+        out, msl = _run(whole_k_dot, (x, y), fragment_config([16, 16]))
         self._close(out, xd @ yd)
         self.assertNotIn("simdgroup_multiply_accumulate", msl)
 
@@ -505,7 +515,7 @@ class TestFragmentMma(unittest.TestCase):
         x = torch.randn(8, 48, device=DEVICE, dtype=torch.float16)
         y = torch.randn(48, 32, device=DEVICE, dtype=torch.float16)
         z = torch.randn(48, 32, device=DEVICE, dtype=torch.float16)
-        out, _, msl = run_with_msl(two_groups, (x, y, z), _frag([16, 16, 16]))
+        out, _, msl = run_with_msl(two_groups, (x, y, z), fragment_config([16, 16, 16]))
         a, b = cast("tuple[torch.Tensor, torch.Tensor]", out)
         xd = x.cpu().double()
         self._close(a, xd @ y.cpu().double())
@@ -513,18 +523,151 @@ class TestFragmentMma(unittest.TestCase):
         self._assert_fragments(msl, transposed=False)
         self.assertEqual(msl.count("constexpr short _fs = 0;"), 2)
         # Under 2 stages both runs load ahead, under one test for a next tile.
-        config = _frag([16, 16, 16], range_num_stages=[2])
+        config = fragment_config([16, 16, 16], range_num_stages=[2])
         out, _, msl = run_with_msl(two_groups, (x, y, z), config)
         a, b = cast("tuple[torch.Tensor, torch.Tensor]", out)
         self._close(a, xd @ y.cpu().double())
         self._close(b, xd @ z.cpu().double())
         self.assertIn("_early_0_next = ", msl)
         self.assertEqual(len(re.findall(r"if \(offset_\d+ \+ 16 < 48\) \{", msl)), 1)
-        out, _, msl = run_with_msl(two_groups, (x, y, z), _frag([16, 32, 16]))
+        out, _, msl = run_with_msl(two_groups, (x, y, z), fragment_config([16, 32, 16]))
         a, b = cast("tuple[torch.Tensor, torch.Tensor]", out)
         self._close(a, xd @ y.cpu().double())
         self._close(b, xd @ z.cpu().double())
         self._assert_fragments(msl, transposed=False)
+
+    def test_split(self) -> None:
+        """SIMD groups splitting the K loop (``num_warps`` > 1) give one SIMD
+        group's results up to the order of the fp32 additions, the same bits
+        at every launch: with a table and loads a tile early, under a
+        persistent grid, where a SIMD group has no K tile (K 40 in tiles of
+        16 over four) and M and N leave tails, for two accumulators in one
+        loop, an accumulator that starts from 0.5, over a K tail (K 224 in
+        tiles of 64), for a dynamic M, for an accumulator an outer loop
+        carries from one split K loop to the next, for two split K loops in
+        a row, and under a persistent grid whose threadgroups each run
+        several tiles, which combine again into the same threadgroup
+        memory."""
+        (x, wq, s), nvfp4_ref = _quantized("nvfp4", 8, 48, 256)
+        # More tiles of 16 columns than threadgroups at one per GPU core.
+        wide = 16 * (2 * helion.runtime.get_num_sm(torch.device(DEVICE)) + 1)
+        (xw, wqw, sw), wide_ref = _quantized("nvfp4", 8, wide, 256)
+        xs = torch.randn(3, 8, 48, device=DEVICE, dtype=torch.float16)
+        ys = torch.randn(3, 48, 32, device=DEVICE, dtype=torch.float16)
+        sums_ref = torch.cumsum(xs.cpu().double() @ ys.cpu().double(), 0)
+        z3 = torch.randn(8, 32, device=DEVICE, dtype=torch.float16)
+        w3 = torch.randn(32, 32, device=DEVICE, dtype=torch.float16)
+        xv = torch.randn(13, 40, device=DEVICE, dtype=torch.float16)
+        yv = torch.randn(40, 20, device=DEVICE, dtype=torch.float16)
+        bias = torch.randn(20, device=DEVICE)
+        views_ref = torch.relu(xv.cpu().double() @ yv.cpu().double() + bias.cpu())
+        x2 = torch.randn(8, 48, device=DEVICE, dtype=torch.float16)
+        y2 = torch.randn(48, 32, device=DEVICE, dtype=torch.float16)
+        z2 = torch.randn(48, 32, device=DEVICE, dtype=torch.float16)
+        fp8_args, fp8_ref = _quantized("fp8", 8, 40, 224)
+        int4_args, int4_ref = _quantized("int4", 11, 64, 256)
+        threads = [1, 2, 16]
+        for kernel, args, ref, config in (
+            (
+                nvfp4_rows,
+                (x, wq, s),
+                nvfp4_ref,
+                fragment_config([8, 16, 16], threads, num_warps=2),
+            ),
+            (
+                nvfp4_rows,
+                (x, wq, s),
+                nvfp4_ref,
+                fragment_config(
+                    [8, 16, 16],
+                    threads,
+                    num_warps=8,
+                    range_num_stages=[2],
+                    metal_tabulate_max_entries=16,
+                ),
+            ),
+            (
+                nvfp4_rows,
+                (x, wq, s),
+                nvfp4_ref,
+                fragment_config(
+                    [8, 16, 16],
+                    threads,
+                    num_warps=4,
+                    pid_type="persistent_blocked",
+                    range_num_stages=[2],
+                ),
+            ),
+            (
+                views_epilogue,
+                (xv, yv, bias),
+                views_ref,
+                fragment_config([16, 16, 16], num_warps=4),
+            ),
+            (
+                two_groups,
+                (x2, y2, z2),
+                (
+                    x2.cpu().double() @ y2.cpu().double(),
+                    x2.cpu().double() @ z2.cpu().double(),
+                ),
+                fragment_config([16, 16, 16], num_warps=2),
+            ),
+            (
+                filled,
+                (x2[:, :32], y2[:32, :16]),
+                x2[:, :32].cpu().double() @ y2[:32, :16].cpu().double() + 0.5,
+                fragment_config([16, 16, 16], num_warps=4),
+            ),
+            (fp8_rows, fp8_args, fp8_ref, fragment_config([16, 16, 64], num_warps=4)),
+            (
+                dequant_rows,
+                int4_args,
+                int4_ref,
+                fragment_config([16, 16, 64], num_warps=2),
+            ),
+            (
+                running_sums,
+                (xs, ys),
+                sums_ref,
+                fragment_config([8, 16, 16], num_warps=2),
+            ),
+            (
+                two_k_loops,
+                (x2, y2, z3, w3),
+                (
+                    x2.cpu().double() @ y2.cpu().double() + 1,
+                    z3.cpu().double() @ w3.cpu().double(),
+                ),
+                fragment_config([8, 16, 16, 16], num_warps=4),
+            ),
+            (
+                nvfp4_rows,
+                (xw, wqw, sw),
+                wide_ref,
+                fragment_config(
+                    [8, 16, 16],
+                    threads,
+                    num_warps=2,
+                    pid_type="persistent_blocked",
+                    num_sm_multiplier=1,
+                ),
+            ),
+        ):
+            with self.subTest(kernel=kernel.name, config=config):
+                out, _, msl = run_with_msl(kernel, args, config)
+                rerun, _, _ = run_with_msl(kernel, args, config)
+                outs = out if isinstance(out, tuple) else (out,)
+                refs = ref if isinstance(ref, tuple) else (ref,)
+                reruns = rerun if isinstance(rerun, tuple) else (rerun,)
+                for o, r, a in zip(outs, refs, reruns, strict=True):
+                    self._close(o, r)
+                    torch.testing.assert_close(a, o, atol=0, rtol=0)
+                simdgroups = config["num_warps"]
+                self.assertIn("[[simdgroup_index_in_threadgroup]]", msl)
+                self.assertRegex(msl, rf"\+= {simdgroups} \* _BLOCK_SIZE_\d+\)")
+                self.assertIn("for (uint _s = 0; _s < ", msl)
+                self.assertNotIn("matmul2d", msl)
 
     def test_k_from_16(self) -> None:
         """A K loop from 16 under 2 stages loads its first tile, K 16 to 48,
@@ -533,7 +676,7 @@ class TestFragmentMma(unittest.TestCase):
         x = torch.randn(16, 80, device=DEVICE)
         y = torch.randn(80, 16, device=DEVICE)
         a, b = x.half().cpu().double(), y.half().cpu().double()
-        config = _frag([16, 16, 32], [1, 1, 32], range_num_stages=[2])
+        config = fragment_config([16, 16, 32], [1, 1, 32], range_num_stages=[2])
         out, msl = _run(k_from_16, (x, y), config)
         self._close(out, a[:, 16:] @ b[16:])
         # The first tile's loads, before the loop, read from K = 16: column
