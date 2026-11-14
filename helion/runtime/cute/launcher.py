@@ -87,7 +87,9 @@ from .capture_pdl_launch import prepare_capture_launch
 from .compile_cache import CompiledCuteLauncher as _CompiledCuteLauncher
 from .compile_cache import disk_cache_key as _cute_disk_cache_key
 from .compile_cache import function_globals
-from .compile_cache import merge_tvm_ffi_compile_option as _merge_tvm_ffi_compile_option
+from .compile_cache import (
+    merge_default_compile_options as _merge_default_compile_options,
+)
 from .compile_cache import (
     patch_cutlass_jit_shutdown_unload as _patch_cutlass_jit_shutdown_unload,
 )
@@ -557,7 +559,7 @@ def _cute_compiled_launcher_discriminator(
     arch_args: tuple[object, ...] | None,
     cluster_shape: object = None,
 ) -> tuple[tuple[object, ...], str, int | None]:
-    merged_compile_options = _merge_tvm_ffi_compile_option(compile_options)
+    merged_compile_options = _merge_default_compile_options(compile_options)
     num_sm = _cute_num_sm_from_arch_args(arch_args)
     resident_clusters = _cute_resident_clusters(
         cluster_shape, _cute_device_from_arch_args(arch_args)
@@ -588,7 +590,9 @@ def _get_compiled_cute_launcher(
     # cast/pointer work in ``generate_execution_args``. We merge rather
     # than replace because other flags (e.g. ``--generate-line-info`` when
     # ``tcgen05_cubin_lineinfo`` is True) can already be in
-    # ``compile_options``.
+    # ``compile_options``.  The division option is merged the same way
+    # (``merge_default_compile_options``): ``div.full.f32`` unless the
+    # kernel's launch chose the IEEE division.
     cluster_shape = getattr(
         cast("Any", cute_kernel), "_helion_cute_cluster_shape", None
     )

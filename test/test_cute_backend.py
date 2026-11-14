@@ -16613,9 +16613,7 @@ class TestCuteBackend(TestCase):
                 return ("launched", args)
 
         def fake_compile(
-            jit_func: object,
-            *args: object,
-            options: str | None = None,
+            jit_func: object, args: tuple[object, ...], options: str | None
         ) -> FakeCompiled:
             compiled_calls.append((jit_func, args, options))
             return FakeCompiled()
@@ -16625,14 +16623,26 @@ class TestCuteBackend(TestCase):
                 "helion.runtime.cute.launcher._create_cute_wrapper",
                 return_value="jit-wrapper",
             ),
-            patch("cutlass.cute.compile", side_effect=fake_compile),
+            patch(
+                "helion.runtime.cute.compile_cache.compile_with_options",
+                side_effect=fake_compile,
+            ),
         ):
             launcher = _get_compiled_cute_launcher(cute_kernel, schema_key, block)
             first = launcher(1, 2, 3)
             second = launcher(4, 5, 6)
 
+        # The launcher's defaults: the FFI bridge, and fp32 division as
+        # ``div.full.f32`` (``merge_default_compile_options``).
         self.assertEqual(
-            compiled_calls, [("jit-wrapper", (1, 2, 3), "--enable-tvm-ffi")]
+            compiled_calls,
+            [
+                (
+                    "jit-wrapper",
+                    (1, 2, 3),
+                    "--enable-tvm-ffi nvvm-options=-prec-div=0",
+                )
+            ],
         )
         self.assertEqual(launched_args, [(1, 2, 3), (4, 5, 6)])
         self.assertEqual(first, ("launched", (1, 2, 3)))
@@ -16817,9 +16827,7 @@ class TestCuteBackend(TestCase):
                 return ("launched", args)
 
         def fake_compile(
-            jit_func: object,
-            *args: object,
-            options: str | None = None,
+            jit_func: object, args: tuple[object, ...], options: str | None
         ) -> FakeCompiled:
             compiled_calls.append((jit_func, args, options))
             return FakeCompiled()
@@ -16829,7 +16837,10 @@ class TestCuteBackend(TestCase):
                 "helion.runtime.cute.launcher._create_cute_wrapper",
                 return_value="jit-wrapper",
             ),
-            patch("cutlass.cute.compile", side_effect=fake_compile),
+            patch(
+                "helion.runtime.cute.compile_cache.compile_with_options",
+                side_effect=fake_compile,
+            ),
         ):
             launcher = _get_compiled_cute_launcher(
                 cute_kernel,
@@ -16839,13 +16850,19 @@ class TestCuteBackend(TestCase):
             )
             result = launcher(1, 2, 3)
 
-        # The runtime merges ``--enable-tvm-ffi`` into any caller-provided
+        # The runtime merges its defaults into any caller-provided
         # compile_options so the generic launcher always benefits from
         # the FFI bridge (e.g. when the autotuner selects
         # ``tcgen05_cubin_lineinfo=True``).
         self.assertEqual(
             compiled_calls,
-            [("jit-wrapper", (1, 2, 3), "--generate-line-info --enable-tvm-ffi")],
+            [
+                (
+                    "jit-wrapper",
+                    (1, 2, 3),
+                    "--generate-line-info --enable-tvm-ffi nvvm-options=-prec-div=0",
+                )
+            ],
         )
         self.assertEqual(result, ("launched", (1, 2, 3)))
 
@@ -17850,7 +17867,10 @@ class TestCuteBackend(TestCase):
             patch(
                 "helion.runtime.cute.launcher._ensure_cute_dsl_arch_env"
             ) as ensure_arch,
-            patch("cutlass.cute.compile", return_value=FakeCompiled()),
+            patch(
+                "helion.runtime.cute.compile_cache.compile_with_options",
+                return_value=FakeCompiled(),
+            ),
         ):
             first = default_cute_launcher(cute_kernel, (1,), 7, block=(32, 1, 1))
             second = default_cute_launcher(cute_kernel, (1,), 7, block=(32, 1, 1))
@@ -17890,7 +17910,10 @@ class TestCuteBackend(TestCase):
                 return_value="stream",
             ),
             patch("helion.runtime.cute.launcher._ensure_cute_dsl_arch_env"),
-            patch("cutlass.cute.compile", return_value=FakeCompiled()),
+            patch(
+                "helion.runtime.cute.compile_cache.compile_with_options",
+                return_value=FakeCompiled(),
+            ),
         ):
             positive = default_cute_launcher(cute_kernel, (1,), 0.0)
             negative = default_cute_launcher(cute_kernel, (1,), -0.0)

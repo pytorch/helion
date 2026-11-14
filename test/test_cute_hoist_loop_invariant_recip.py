@@ -44,6 +44,7 @@ from __future__ import annotations
 import ast
 import os
 import textwrap
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -59,6 +60,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
+from helion._testing.cute_codegen import with_exact_division
 import helion.language as hl
 
 cutlass = pytest.importorskip("cutlass")
@@ -126,9 +128,11 @@ class TestCuteHoistRecip(TestCase):
         """``num_threads`` below the block size puts each thread's elements
         in a lane loop, where the scale is loop-invariant.  Configs must
         never change numerics: without ``fast_math`` that config divides
-        exactly as the one-element-per-thread config (and eager) does."""
+        exactly as the one-element-per-thread config does (``div.full``
+        gives the same bits whether or not ptxas hoists the divisor's
+        reciprocal), and under ``cute_exact_division`` as eager does."""
         torch.manual_seed(0)
-        for kernel, dtype, scale, eager in (
+        for plain, dtype, scale, eager in (
             (_divide_by_scale, torch.float32, 0.0517, torch.div),
             (
                 _round_divide_by_scale,
@@ -139,15 +143,27 @@ class TestCuteHoistRecip(TestCase):
         ):
             x = torch.randn(1 << 16, device=DEVICE, dtype=dtype) * 4
             s = torch.tensor([scale], device=DEVICE, dtype=dtype)
-            expected = eager(x, s[0])
-            for num_threads in (1024, 128):
-                with self.subTest(kernel=kernel.fn.__name__, num_threads=num_threads):
-                    code, out = code_and_output(
-                        kernel, (x, s), block_sizes=[1024], num_threads=[num_threads]
-                    )
-                    self.assertEqual(num_threads < 1024, "for lane_" in code)
-                    self.assertNotIn("_helion_inv_div_", code)
-                    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+            for exact in (False, True):
+                kernel = with_exact_division(plain) if exact else plain
+                outputs = []
+                for num_threads in (1024, 128):
+                    with self.subTest(
+                        kernel=kernel.fn.__name__, exact=exact, num_threads=num_threads
+                    ):
+                        code, out = code_and_output(
+                            kernel,
+                            (x, s),
+                            block_sizes=[1024],
+                            num_threads=[num_threads],
+                        )
+                        self.assertEqual(num_threads < 1024, "for lane_" in code)
+                        self.assertNotIn("_helion_inv_div_", code)
+                        outputs.append(out)
+                        if exact:
+                            torch.testing.assert_close(
+                                out, eager(x, s[0]), rtol=0, atol=0
+                            )
+                torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
 
     @skipIfRefEager("checks the generated code")
     def test_recip_hoist_fires_under_fast_math(self) -> None:
@@ -164,21 +180,29 @@ class TestCuteHoistRecip(TestCase):
         self.assertIn("* _helion_inv_div_0", code)
 
     def test_recip_hoist_needs_fast_math(self) -> None:
-        """Without ``fast_math`` the consume sweep keeps the IEEE quotient by
+        """Without ``fast_math`` the consume sweep keeps the quotient by
         ``di``: the ``1.0 / d`` + multiply rewrite would round differently,
-        and only where a config creates the loop.  The exact hoist
-        (``test_cute_exact_division.py``) takes the sweep instead: the
-        correctly rounded reciprocal and the Markstein sequence, with the
-        original divide kept in the redo copy."""
+        and only where a config creates the loop.  (ptxas hoists the
+        reciprocal of ``div.full`` itself, with the same bits.)  Under
+        ``cute_exact_division`` the exact hoist
+        (``test_cute_exact_division.py``) takes the sweep: the correctly
+        rounded reciprocal and the Markstein sequence, with the original
+        divide kept in the redo copy."""
         x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
-        code, out = code_and_output(
-            _reduction_kernel,
-            (x,),
-            block_sizes=[1, 128],
-            num_threads=[0, 32],
-            cute_vector_widths=[1, 4],
-        )
         ref = torch.nn.functional.softmax(x, dim=1)
+        config: dict[str, Any] = {
+            "block_sizes": [1, 128],
+            "num_threads": [0, 32],
+            "cute_vector_widths": [1, 4],
+        }
+        code, out = code_and_output(_reduction_kernel, (x,), **config)
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+        self.assertNotIn("_helion_inv_div_", code)
+        self.assertNotIn("_helion_exdiv_", code)
+        self.assertIn("/ di\n", code)
+        code, out = code_and_output(
+            with_exact_division(_reduction_kernel), (x,), **config
+        )
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
         self.assertNotIn("_helion_inv_div_", code)
         self.assertIn("_helion_exdiv_y_0 = 1.0 / di", code)

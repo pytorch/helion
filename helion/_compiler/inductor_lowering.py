@@ -1710,17 +1710,16 @@ class GenerateASTFromInductor(DefaultHandler):
         """Divide; under ``fast_math`` the Triton backend takes the approximate divide.
 
         Triton's ``/`` on fp32 is ``div.full.f32`` (2 ulp over the full range,
-        a reciprocal and a multiply).  ``fast_dividef`` is
+        a reciprocal and a multiply), and so is the CuTe backend's
+        (``HelionCuteDSLOpOverrides.truediv``).  ``fast_dividef`` is
         ``div.approx.ftz.f32``: cheaper at the same 2 ulp, but a subnormal
         divisor gives +-inf, a subnormal quotient flushes to zero and a
         divisor above 2**126 gives 0, so it is only emitted when the
-        ``fast_math`` setting opts the kernel into approximations -- the CuTe
-        backend's contract too: IEEE by default, and under the setting
-        ``div.approx.ftz`` for an fp32 quotient (its 16-bit quotients stay
-        exact).  Like Triton's ``/``, the result stays fp32 (half-precision
-        and integer operands are promoted to fp32 first); the consumer casts.
-        TileIR shares the Triton codegen but has no libdevice
-        ``fast_dividef``, so it keeps ``/`` under the setting.
+        ``fast_math`` setting opts the kernel into approximations.  Like
+        Triton's ``/``, the result stays fp32 (half-precision and integer
+        operands are promoted to fp32 first); the consumer casts.  TileIR
+        shares the Triton codegen but has no libdevice ``fast_dividef``, so
+        it keeps ``/`` under the setting.
 
         A quotient its node truncates (``div`` with ``rounding_mode="trunc"``;
         the floor mode's comes through ``div_rn``) is the correctly rounded

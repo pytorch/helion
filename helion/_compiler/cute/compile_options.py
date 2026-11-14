@@ -50,6 +50,13 @@ CONFIG_COMPILE_OPTION_KEYS = tuple(option.key for option in _CONFIG_COMPILE_OPTI
 
 
 def config_compile_options(config: Config, *, ptxas_options: Sequence[str] = ()) -> str:
+    """The options of ``config``, behind the one the kernel's settings choose:
+    under ``Settings.cute_exact_division`` ``/`` is the IEEE division, where
+    the launcher's default is Triton's ``div.full.f32``."""
+    # Both modules import the backends, which import this one.
+    from ...runtime.cute.compile_cache import IEEE_DIVISION_COMPILE_OPTION
+    from ..compile_environment import CompileEnvironment
+
     values = [
         (option, option.format_value(config.get(option.key)))
         for option in _CONFIG_COMPILE_OPTIONS
@@ -59,6 +66,8 @@ def config_compile_options(config: Config, *, ptxas_options: Sequence[str] = ())
         *(value for option, value in values if option.ptxas and value),
     ]
     options = []
+    if CompileEnvironment.current().settings.cute_exact_division:
+        options.append(IEEE_DIVISION_COMPILE_OPTION)
     for option, value in values:
         if option.ptxas:
             if ptxas:

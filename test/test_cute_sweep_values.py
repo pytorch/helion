@@ -117,13 +117,21 @@ _KERNELS = {
 
 
 @functools.cache
-def _sweeps(name: str, reload: str, **options: object) -> tuple[str, ...]:
+def _sweeps(
+    name: str, reload: str, *, exact_division: bool = False, **options: object
+) -> tuple[str, ...]:
     """The source of each top-level loop of ``name``'s kernel, rendered once
     per reload policy (and further config ``options``): one persistent sweep
     per loop."""
     fn, args, settings = _KERNELS[name]
     with cpu_render_target(reduction_smem_budget_bytes=232448):
-        kernel = helion.kernel(fn, backend="cute", static_shapes=True, **settings)
+        kernel = helion.kernel(
+            fn,
+            backend="cute",
+            static_shapes=True,
+            cute_exact_division=exact_division,
+            **settings,
+        )
         bound = cpu_bind(kernel, args())
         config = helion.Config(
             block_sizes=[4],
@@ -196,8 +204,12 @@ def test_register_policy_carries_a_transcendental() -> None:
     _, *sweeps = _sweeps("softmax", "register")
     assert [sweep.count("cute.math.exp(") for sweep in sweeps] == [0, 1, 0]
     assert re.search(r"cutlass\.Float32\(_fuse_cache_\d+\[", sweeps[2])
-    # The carried read stays a provable fp32 dividend, so the normalize
-    # sweep keeps the exact division's fast path.
+    assert " / " in sweeps[2]
+    # The carried read stays a provable fp32 dividend, so under
+    # ``cute_exact_division`` the normalize sweep keeps the exact division's
+    # fast path.
+    _, *sweeps = _sweeps("softmax", "register", exact_division=True)
+    assert re.search(r"cutlass\.Float32\(_fuse_cache_\d+\[", sweeps[2])
     assert "_cute_exact_div_fast_f32" in sweeps[2]
 
 

@@ -244,13 +244,14 @@ class Config(Mapping[str, object]):
                 in-place 16-byte state loads. Zero disables the transformation.
             cute_async_load_lookahead: Async-copy groups kept ahead of compute.
             cute_async_load_group_rows: Per-thread row iterations in each group.
-            cute_exact_div_form: How CuTe lowers an fp32 division by a
-                loop-invariant divisor (a row sum, a scalar argument); both
-                forms give the IEEE quotient bit for bit. ``"redo"`` (default)
-                speculates the Markstein sequence over the loop and re-runs
-                the loop with ``div.rn`` on a hard case (a loop the redo
-                cannot take keeps its plain division), ``"plain"`` keeps one
-                ``div.rn`` per element.
+            cute_exact_div_form: Under ``Settings.cute_exact_division``
+                (IEEE fp32 division, off by default), how CuTe lowers an fp32
+                division by a loop-invariant divisor (a row sum, a scalar
+                argument); both forms give the IEEE quotient bit for bit.
+                ``"redo"`` (default) speculates the Markstein sequence over
+                the loop and re-runs the loop with ``div.rn`` on a hard case
+                (a loop the redo cannot take keeps its plain division),
+                ``"plain"`` keeps one ``div.rn`` per element.
             cute_async_load_cache: PTX cp.async cache policy ("cg" or "ca").
             cute_async_store_policy: Cache policy for the matching in-place
                 16-byte state store ("default" or "l2_evict_last").
