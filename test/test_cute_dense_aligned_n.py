@@ -1183,3 +1183,19 @@ def test_fp8_argument_output_owns_its_ring():
         s.config.get("tcgen05_tile_n") == 80
         for s in bound.config_spec.compiler_seed_configs
     )
+
+
+def test_sixteen_bit_pair_row_operands_keep_the_split_store():
+    # The partial-output TMA store stages each row-vector operand per tile;
+    # its arena model prices power-of-two tiles, not an aligned-N pair's own
+    # ring (the 160-wide pair at eight AB stages leaves 864 B of the opt-in),
+    # so any row operand -- an FP32 column scale here -- keeps the split
+    # store over a partial last N tile (no staged row).
+    x, y, out = bf16_mm_args(8192, 2000, 768)
+    scale = torch.empty((2000,), dtype=torch.float32)
+    bound = column_scale_mm_into._bind_isolated((x, y, scale, out))
+    source = bound.to_code(
+        aligned_n_bf16_config(tcgen05_tile_n=160, tcgen05_ab_stages=8)
+    )
+    assert "_BLOCK_SIZE_1 = 160" in source
+    assert "tcgen05_aux_rowvec_smem" not in source

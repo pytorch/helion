@@ -643,17 +643,78 @@ def test_default_tile_mn_major_b_skips_widths_off_whole_swizzle_rows() -> None:
     assert "tcgen05_tile_n" not in config.config
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _three_f32_rows_residual_mm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    r0: torch.Tensor,
+    r1: torch.Tensor,
+    r2: torch.Tensor,
+    residual: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """``acc`` plus three FP32 rows and a residual."""
+    m, k = a.shape
+    n = b.shape[1]
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        acc = acc + r0[cols] + r1[cols] + r2[cols] + residual[rows, cols]
+        out[rows, cols] = acc.to(out.dtype)
+
+
+def test_rows_past_the_arena_keep_the_split_store() -> None:
+    """Three FP32 rows (3 KiB of a 256-wide tile) do not fit beside a
+    256x256 ab=6 pair: the output-edge kernel keeps the full tiles on the
+    TMA store and the fringe tiles on the SIMT store, the residual read on
+    both."""
+    m, n, k = 8192, 9536, 768
+    row = torch.empty((n,), dtype=torch.float32)
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound = _three_f32_rows_residual_mm._bind_isolated(
+            (
+                torch.empty((m, k), dtype=torch.bfloat16),
+                torch.empty((k, n), dtype=torch.bfloat16),
+                row,
+                row,
+                row,
+                torch.empty((m, n), dtype=torch.bfloat16),
+                torch.empty((m, n), dtype=torch.bfloat16),
+            )
+        )
+        config = bound.config_spec.default_config()
+        config.config.update(
+            block_sizes=[256, 256, 64],
+            pid_type="persistent_interleaved",
+            tcgen05_persistence_model="static_persistent",
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=6,
+            tcgen05_c_stages=2,
+            tcgen05_aux_load_placement="post_acc_wait",
+        )
+        code = bound.to_code(config)
+    assert "tcgen05_tma_store_atom" in code
+    assert "cute.nvgpu.CopyR2GOp()" in code
+
+
 @pytest.mark.parametrize(
-    ("shape", "placement", "ab_stages", "staged", "tma_store"),
+    ("shape", "placement", "ab_stages", "staged", "tma_store", "simt_store"),
     (
-        # 32 x 38 pair tiles: 17 per CTA pair
-        ((8192, 9536, 768), "post_acc_wait", 6, False, True),
+        # 32 x 38 pair tiles: 17 per CTA pair; every tile takes the TMA store
+        # (the N=9536 tiles end 64 columns short), the row staged through a
+        # predicated copy
+        ((8192, 9536, 768), "post_acc_wait", 6, True, True, False),
         # 32 x 9: 4 per pair
-        ((8192, 2112, 768), "pre_acc_wait", 6, False, False),
-        # 26 tiles per pair, two K tiles: the staged row beside the TMA store
-        ((4096, 30000, 128), "pre_acc_wait", 5, True, True),
+        ((8192, 2112, 768), "pre_acc_wait", 6, False, False, True),
+        # 26 tiles per pair, two K tiles: the staged row beside the full
+        # tiles' TMA store
+        ((4096, 30000, 128), "pre_acc_wait", 5, True, True, True),
         # 6 tiles per pair, two K tiles
-        ((32768, 576, 128), "pre_acc_wait", 6, False, False),
+        ((32768, 576, 128), "pre_acc_wait", 6, False, False, True),
     ),
 )
 def test_default_tile_bias_row_takes_the_tma_store_on_many_tiles(
@@ -662,6 +723,7 @@ def test_default_tile_bias_row_takes_the_tma_store_on_many_tiles(
     ab_stages: int,
     staged: bool,
     tma_store: bool,
+    simt_store: bool,
 ) -> None:
     """On an output edge, a ``pre_acc_wait`` bias row at the seed's ring keeps
     every tile on the SIMT store. From 16 tiles per CTA pair on the default
@@ -690,6 +752,167 @@ def test_default_tile_bias_row_takes_the_tma_store_on_many_tiles(
     assert config.config["tcgen05_ab_stages"] == ab_stages
     assert ("tcgen05_aux_rowvec_smem" in code) == staged
     assert ("tcgen05_tma_store_atom" in code) == tma_store
+    assert ("cute.nvgpu.CopyR2GOp()" in code) == simt_store
+
+
+def test_output_edge_bias_default_tile_order() -> None:
+    """An output-edge bias GEMM with many tiles per CTA pair walks groups of
+    32 M tiles over more than 32 of them. A sampled persistent tile order
+    survives the search projection; the swizzle goes back to 1 where nothing
+    runs it: on a flat walk, and under ``tcgen05_cluster_n=2``, whose edge
+    schedule refuses it."""
+    defaults = {}
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        for m, n, k in (
+            (32768, 8128, 768),
+            (32768, 9536, 768),
+            (8192, 9536, 768),
+            (8192, 2112, 768),
+        ):
+            bound = bias_mm_into._bind_isolated(
+                (
+                    torch.empty((m, k), dtype=torch.bfloat16),
+                    torch.empty((k, n), dtype=torch.bfloat16),
+                    torch.empty((n,), dtype=torch.bfloat16),
+                    torch.empty((m, n), dtype=torch.bfloat16),
+                )
+            )
+            config = bound.config_spec.default_config().config
+            defaults[m, n] = (config["l2_groupings"], config["tcgen05_l2_swizzle_size"])
+        # an M edge only, where two-cluster N samples stay
+        bound = bias_mm_into._bind_isolated(
+            (
+                torch.empty((8000, 768), dtype=torch.bfloat16),
+                torch.empty((768, 8192), dtype=torch.bfloat16),
+                torch.empty((8192,), dtype=torch.bfloat16),
+                torch.empty((8000, 8192), dtype=torch.bfloat16),
+            )
+        )
+        spec = bound.config_spec
+        sampled = {}
+        configs = {}
+        for name, tile in (
+            ("persistent", {"pid_type": "persistent_interleaved"}),
+            # a one-CTA flat tile (a flat pair goes back to the pair schedule)
+            (
+                "flat",
+                {
+                    "pid_type": "flat",
+                    "block_sizes": [128, 128, 64],
+                    "tcgen05_cluster_m": 1,
+                },
+            ),
+            (
+                "cluster_n",
+                {"pid_type": "persistent_interleaved", "tcgen05_cluster_n": 2},
+            ),
+        ):
+            config = helion.Config(
+                **{
+                    **spec.default_config().config,
+                    **tile,
+                    "l2_groupings": [4],
+                    "tcgen05_l2_swizzle_size": 4,
+                }
+            )
+            spec.normalize(config, _fix_invalid=True)
+            configs[name] = config
+            sampled[name] = (
+                config.config["pid_type"],
+                config.config.get("tcgen05_cluster_n", 1),
+                config.config["l2_groupings"],
+                config.config["tcgen05_l2_swizzle_size"],
+            )
+        # the cluster_n sample compiles (its edge schedule refuses a swizzle),
+        # as does a plain GEMM's on the same M edge
+        bound.to_code(configs["cluster_n"])
+        plain = plain_mm_into._bind_isolated(
+            (
+                torch.empty((8000, 768), dtype=torch.bfloat16),
+                torch.empty((768, 8192), dtype=torch.bfloat16),
+                torch.empty((8000, 8192), dtype=torch.bfloat16),
+            )
+        )
+        plain_config = helion.Config(
+            **{
+                **plain.config_spec.default_config().config,
+                "pid_type": "persistent_interleaved",
+                "tcgen05_cluster_n": 2,
+                "tcgen05_l2_swizzle_size": 4,
+            }
+        )
+        plain.config_spec.normalize(plain_config, _fix_invalid=True)
+        plain.to_code(plain_config)
+    # 128 M tiles over 32 and 38 N tiles; 32 M tiles (groups of 32 are the
+    # plain raster); 4 tiles per pair
+    assert defaults == {
+        (32768, 8128): ([32], 1),
+        (32768, 9536): ([32], 1),
+        (8192, 9536): ([1], 1),
+        (8192, 2112): ([1], 1),
+    }
+    assert sampled == {
+        "persistent": ("persistent_interleaved", 1, [4], 4),
+        "flat": ("flat", 1, [4], 1),
+        "cluster_n": ("persistent_interleaved", 2, [4], 1),
+    }
+    assert plain_config.config["tcgen05_cluster_n"] == 2
+    assert plain_config.config["tcgen05_l2_swizzle_size"] == 1
+
+
+@pytest.mark.parametrize("kernel", (bias_mm_into, promoted_bias_mm_into))
+def test_direct_entry_bias_default_stages_the_row(kernel: helion.Kernel) -> None:
+    """Whole tiles keep the direct-entry pair, now with the promoted bias row
+    staged per tile (``pre_acc_wait`` at the seed's own rings)."""
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound = kernel._bind_isolated(
+            (
+                torch.empty((8192, 768), dtype=torch.bfloat16),
+                torch.empty((768, 2304), dtype=torch.bfloat16),
+                torch.empty((2304,), dtype=torch.bfloat16),
+                torch.empty((8192, 2304), dtype=torch.bfloat16),
+            )
+        )
+        config = bound.config_spec.default_config()
+        code = bound.to_code(config)
+    assert config.config["tcgen05_tvm_ffi_launch"] is True
+    assert config.config["tcgen05_ab_stages"] == 6
+    assert config.config["tcgen05_aux_load_placement"] == "pre_acc_wait"
+    assert "tcgen05_aux_rowvec_smem" in code
+
+
+def test_direct_entry_drops_a_staged_fp32_row() -> None:
+    """The direct-entry projection keeps a sampled ``pre_acc_wait`` only for
+    promoted rows: an FP32 bias row (read per subtile, never staged by the
+    defaults) comes back without the placement."""
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound = bias_mm_into._bind_isolated(
+            (
+                torch.empty((8192, 768), dtype=torch.bfloat16),
+                torch.empty((768, 2304), dtype=torch.bfloat16),
+                torch.empty((2304,), dtype=torch.float32),
+                torch.empty((8192, 2304), dtype=torch.bfloat16),
+            )
+        )
+        spec = bound.config_spec
+        default = spec.default_config()
+        sampled = helion.Config(
+            **{**default.config, "tcgen05_aux_load_placement": "pre_acc_wait"}
+        )
+        spec.normalize(sampled, _fix_invalid=True)
+    assert default.config["tcgen05_tvm_ffi_launch"] is True
+    assert "tcgen05_aux_load_placement" not in default.config
+    assert sampled.config["tcgen05_tvm_ffi_launch"] is True
+    assert sampled.config.get("tcgen05_aux_load_placement") is None
 
 
 def test_hybrid_store_edge_reads_a_staged_row_from_global_memory() -> None:

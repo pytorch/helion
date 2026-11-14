@@ -4086,9 +4086,9 @@ def _fix_aux_edge_search_config(
     _set_aux_edge_monolithic_prefix(config)
     config["tcgen05_acc_stages"] = 2
     config["tcgen05_c_stages"] = 4
-    config[TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY] = 1
-    if isinstance(config.get("l2_groupings"), list):
-        config["l2_groupings"] = [1] * len(state.config_spec.l2_groupings)
+    # The tile order (``l2_groupings``, ``tcgen05_l2_swizzle_size``) is
+    # left to the sample (``_fix_edge_swizzle_search_config`` drops the
+    # swizzle where it is inert or refused once the walk is final).
     if isinstance(config.get("indexing"), list):
         indexing = cast("list[object]", config["indexing"])
         for i in range(len(indexing)):
@@ -4269,8 +4269,55 @@ def _fix_target1_tvm_ffi_search_config(
         ):
             config[key] = None
         return
+    placement = config.get(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY)
     surface._clear_target1_tvm_ffi_promotion_surface(config)
     config.update(seed.config)
+    if (
+        placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+        and direct_entry_row_stage_fits(state)
+    ):
+        # The staged promoted bias row rides the direct entry's own rings
+        # (``CuteTcgen05DefaultTileHeuristic._direct_entry_staged_row``).
+        config[TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY] = placement
+
+
+def promoted_row_epilogue(state: CuteTcgen05Config) -> bool:
+    """Whether every row-vector operand is a promoted 16-bit row (staged
+    as an FP32 row by the store lowering) beside a row-major output: the
+    epilogues whose rows the defaults stage (``pre_acc_wait``)."""
+    facts = state.pipeline_smem_facts
+    return (
+        facts is not None
+        and bool(facts.rows)
+        and all(row.promoted for row in facts.rows)
+        and not facts.output_column_major
+    )
+
+
+def direct_entry_row_stage_fits(state: CuteTcgen05Config) -> bool:
+    """Whether the direct-entry pair stages its promoted rows.
+
+    ``pre_acc_wait`` stages a promoted row once per tile; the defaults
+    stage only promoted rows (``promoted_row_epilogue``, the measured
+    case), judged here at the seed's own rings and (128, 32) subtile.
+    """
+    pipeline = seeds.full_tile_direct_entry_seed_pipeline(state)
+    if pipeline is None or not promoted_row_epilogue(state):
+        return False
+    bk, ab_stages, c_stages = pipeline
+    return bool(
+        smem.default_layout_smem_fits(
+            state,
+            bm=TCGEN05_TWO_CTA_BLOCK_M,
+            bn=TCGEN05_TWO_CTA_BLOCK_N,
+            bk=bk,
+            cluster_m=2,
+            ab_stages=ab_stages,
+            c_stages=c_stages,
+            stage_rows=True,
+            epi_subtile_n=32,
+        )
+    )
 
 
 def epi_tma_refusal(
@@ -5119,8 +5166,11 @@ def fix_search_config(state: CuteTcgen05Config, config: dict[str, object]) -> No
     # run last, on every path of the body (its early returns included:
     # the one-CTA pipeline, the dense-N tile, the materialized chains
     # and the explicit pair): the persistent grid cap is inert once a
-    # projection drops the cluster to one N tile, and the split-K knobs
-    # apply only on the flat one-CTA family.
+    # projection drops the cluster to one N tile, an edge or K-tail
+    # sample's swizzle is inert on a flat walk and refused under two
+    # N clusters, and the split-K knobs apply only on the flat one-CTA
+    # family.
+    _fix_edge_swizzle_search_config(state, config)
     _fix_persistent_grid_cap_search_config(state, config)
     _normalize_split_k(state, config, fix_invalid=True)
     _fix_split_k_workspace_search_config(state, config)
@@ -5304,6 +5354,36 @@ def _clustered_launch_loop_order_entries(
             return None
         entries.append(matches[0])
     return entries
+
+
+def _fix_edge_swizzle_search_config(
+    state: CuteTcgen05Config, config: dict[str, object]
+) -> None:
+    """Return an edge or K-tail sample's swizzle to 1 where nothing runs it.
+
+    Only a persistent walk's tile scheduler reads
+    ``tcgen05_l2_swizzle_size``: a flat kernel is the same code at any
+    value, and two samples differing only in it would be the same kernel
+    twice. Under ``tcgen05_cluster_n=2`` the edge and K-tail families
+    refuse any swizzle (``cute_mma``: their split full/fringe scheduler
+    does not compose with it). Runs after the body, whose projections may
+    still change the pid type and the cluster.
+    """
+    if not state.search_enabled:
+        return
+    if config.get(TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY, 1) == 1:
+        return
+    if not facts._has_any_matmul_fact_edge_tile(state, config):
+        return
+    persistent = ("persistent_blocked", "persistent_interleaved")
+    # A flat ordered chain whose GEMM launches run persistent
+    # (``tcgen05_region_pid_types``) shares the swizzle with them.
+    walks_persistent = config.get("pid_type") in persistent or any(
+        pid_type in persistent for pid_type in surface._region_pid_types(state, config)
+    )
+    if walks_persistent and config.get("tcgen05_cluster_n", 1) == 1:
+        return
+    config[TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY] = 1
 
 
 def _fix_persistent_grid_cap_search_config(

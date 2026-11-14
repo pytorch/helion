@@ -69,6 +69,7 @@ from ..tcgen05_constants import tcgen05_c_smem_bytes_per_cta
 from ..tcgen05_constants import tcgen05_default_epilogue_tile_size
 from ..tcgen05_constants import tcgen05_fixed_smem_overhead_bytes
 from ..tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
+from ..tcgen05_constants import tcgen05_partial_output_row_stage_smem_bytes
 from ..tcgen05_constants import tcgen05_round_up_smem_bytes
 from ..tcgen05_constants import tcgen05_rowvec_stage_smem_bytes
 from . import facts
@@ -505,6 +506,7 @@ def default_layout_smem_bytes(
     aux_stages: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
     epi_subtile_n: int | None = None,
     epi_warp_groups: int = 1,
+    extra_stage_bytes: int = 0,
 ) -> int | None:
     """Modelled static SMEM arena of a DEFAULT-layout tile, in bytes.
 
@@ -533,7 +535,9 @@ def default_layout_smem_bytes(
     subtile to ``(per-CTA M, epi_subtile_n)`` (``tcgen05_epi_subtile_n``,
     the explicit-tile path) and ``epi_warp_groups`` multiplies the C
     stages (each epilogue warp group owns ``c_stages`` stages of the
-    ring, ``tcgen05_epi_warp_groups``).
+    ring, ``tcgen05_epi_warp_groups``). ``extra_stage_bytes`` adds row
+    stages taken outside ``pre_acc_wait`` (the partial-output store's,
+    ``partial_output_row_stage_fits``) to the leading stage chunk.
     """
     constraints = state.ab_stages_three_search_constraints
     facts = state.rowvec_aux_facts
@@ -563,6 +567,7 @@ def default_layout_smem_bytes(
             if stage_rows
             else 0
         )
+    stage_bytes += extra_stage_bytes
     if stage_bytes:
         # The row stages lead the arena and the C ring's 1 KiB alignment
         # follows them: a 256 B or 512 B promoted row occupies a whole KiB.
@@ -635,6 +640,7 @@ def default_layout_smem_fits(
     aux_stages: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
     epi_subtile_n: int | None = None,
     epi_warp_groups: int = 1,
+    extra_stage_bytes: int = 0,
 ) -> bool:
     """Whether a DEFAULT-layout tile's SMEM plan fits the opt-in capacity.
 
@@ -660,6 +666,7 @@ def default_layout_smem_fits(
         aux_stages=aux_stages,
         epi_subtile_n=epi_subtile_n,
         epi_warp_groups=epi_warp_groups,
+        extra_stage_bytes=extra_stage_bytes,
     )
     if arena_bytes is None:
         return False
@@ -751,6 +758,7 @@ def output_edge_tma_store_smem_fits(
     cluster_m: int,
     ab_stages: int,
     c_stages: int,
+    extra_stage_bytes: int = 0,
 ) -> bool:
     """Whether an output-edge kernel's TMA-store C ring fits beside its AB ring.
 
@@ -767,6 +775,8 @@ def output_edge_tma_store_smem_fits(
     tiles; the aligned-N family prices its own M-edge ring), so the ring
     is charged at CuTe's with-source subtile, or at a configured explicit
     tile when that is wider. Fails closed like the model.
+    ``extra_stage_bytes`` adds the partial-output store's row stages
+    (``partial_output_row_stage_fits``).
     """
     facts = state.rowvec_aux_facts
     if facts is None or cluster_m not in (1, 2):
@@ -782,6 +792,80 @@ def output_edge_tma_store_smem_fits(
         # 51.3 with the staged row beside the TMA store; see
         # ``CuteTcgen05DefaultTileHeuristic._pick``).
         return False
+    return _config_arena_fits(
+        state,
+        config,
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        cluster_m=cluster_m,
+        ab_stages=ab_stages,
+        c_stages=c_stages,
+        epi_subtile_n=_output_edge_epi_subtile_n(state, config, bm=bm, bn=bn),
+        extra_stage_bytes=extra_stage_bytes,
+    )
+
+
+def partial_output_row_stage_fits(
+    state: CuteTcgen05Config,
+    config: dict[str, object],
+    *,
+    bm: int,
+    bn: int,
+    bk: int,
+    cluster_m: int,
+    ab_stages: int,
+    c_stages: int,
+) -> bool:
+    """Whether a partial-output TMA-store epilogue's row stages fit.
+
+    With register (SIMT) auxiliary loads the output-edge TMA store also
+    takes the fringe tiles (``cute_mma``'s
+    ``tcgen05_partial_output_tma_store``), and each row-vector operand
+    then stages one N tile in its own dtype through a predicated copy
+    (``store_epilogue``'s ``stage_partial_tma_rowvec``), which the arena
+    judged by ``output_edge_tma_store_smem_fits`` does not hold: an
+    unpromoted BF16 row is no ``pre_acc_wait`` stage there, but 512 B of a
+    256-wide tile here. This judges that arena with those stages (an upper
+    bound: ``tcgen05_partial_output_row_stage_smem_bytes``).  Callers keep
+    ``pre_acc_wait`` and C-input configs away (their rows stage
+    elsewhere). That arena model prices power-of-two tiles: an aligned-N
+    pair's physical width (priced by ``dense_aligned_n_plan``, up to 2 KB
+    more at 160 columns) with row stages keeps the split store.
+    """
+    rowvec_facts = state.rowvec_aux_facts
+    if (
+        rowvec_facts is not None
+        and rowvec_facts.rows
+        and facts._dense_aligned_n_plan(state, config) is not None
+    ):
+        return False
+    return rowvec_facts is not None and output_edge_tma_store_smem_fits(
+        state,
+        config,
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        cluster_m=cluster_m,
+        ab_stages=ab_stages,
+        c_stages=c_stages,
+        extra_stage_bytes=tcgen05_partial_output_row_stage_smem_bytes(
+            rows=rowvec_facts.rows, bn=bn
+        ),
+    )
+
+
+def _output_edge_epi_subtile_n(
+    state: CuteTcgen05Config, config: dict[str, object], *, bm: int, bn: int
+) -> int:
+    """The C subtile width the output-edge TMA-store plan renders.
+
+    Power-of-two edge tiles never take the plain (128, 32) narrow subtile
+    (it needs static full tiles), so the ring is charged at CuTe's
+    with-source subtile, or at a configured explicit tile when wider.
+    """
+    facts = state.rowvec_aux_facts
+    assert facts is not None
     out_bits = facts.output_itemsize * 8
     _subtile_m, subtile_n = tcgen05_default_epilogue_tile_size(
         bm, bn, elem_width_d=out_bits, elem_width_c=out_bits
@@ -792,17 +876,7 @@ def output_edge_tma_store_smem_fits(
     ):
         if configured is not None:
             subtile_n = max(subtile_n, configured)
-    return _config_arena_fits(
-        state,
-        config,
-        bm=bm,
-        bn=bn,
-        bk=bk,
-        cluster_m=cluster_m,
-        ab_stages=ab_stages,
-        c_stages=c_stages,
-        epi_subtile_n=subtile_n,
-    )
+    return subtile_n
 
 
 def _config_arena_fits(
@@ -816,6 +890,7 @@ def _config_arena_fits(
     ab_stages: int,
     c_stages: int,
     epi_subtile_n: int | None,
+    extra_stage_bytes: int = 0,
 ) -> bool:
     """``default_layout_smem_fits`` with every other input read from ``config``."""
     return default_layout_smem_fits(
@@ -833,6 +908,7 @@ def _config_arena_fits(
         aux_stages=aux_stages_knob(config),
         epi_subtile_n=epi_subtile_n,
         epi_warp_groups=epi_warp_groups_knob(config),
+        extra_stage_bytes=extra_stage_bytes,
     )
 
 
