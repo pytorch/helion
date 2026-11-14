@@ -173,15 +173,25 @@ def _is_known_host_value(value: object) -> bool:
 _NATIVE_TENSOR_CLASS = torch.Tensor
 _NATIVE_OP_OVERLOAD = torch._ops.OpOverload
 _NATIVE_OP_PACKET = torch._ops.OpOverloadPacket
-# ``torch.ops``, its namespaces and their packets, with the ``__getattr__`` each
+# ``torch.ops``, its namespaces and their packets, with the attribute hooks each
 # had at import: those resolve a registered operator and run none of its kernels.
-_NATIVE_OPERATOR_REGISTRY: dict[type[object], object] = {
-    kind: getattr_static(kind, "__getattr__")
+_NATIVE_OPERATOR_REGISTRY = tuple(
+    (
+        kind,
+        getattr_static(kind, "__getattribute__"),
+        getattr_static(kind, "__getattr__"),
+    )
     for kind in (torch._ops._Ops, torch._ops._OpNamespace, _NATIVE_OP_PACKET)
-}
+)
+_NO_ATTRIBUTE = object()
 # The values such a lookup yields: torch's own classes, whose attribute lookup
 # and equality run no user protocol.
-_TORCH_OPS_VALUE_TYPES = (*_NATIVE_OPERATOR_REGISTRY, _NATIVE_OP_OVERLOAD)
+_TORCH_OPS_VALUE_TYPES = (
+    torch._ops._Ops,
+    torch._ops._OpNamespace,
+    _NATIVE_OP_PACKET,
+    _NATIVE_OP_OVERLOAD,
+)
 _KNOWN_HOST_CONSTRUCTORS = (
     abs,
     all,
@@ -263,10 +273,10 @@ def _is_known_host_call(
             fn, torch._C._jit_resolve_packet(fn._qualified_op_name, *args, **kwargs)
         )
     if type(fn) is _NATIVE_OP_OVERLOAD:
-        # A schema without writes or a registered effect cannot change any
-        # tensor's storage or metadata (the contract functionalization relies
-        # on). An argument write stays an unproved effect.
-        return not fn._schema.is_mutable and _get_effect(fn) is None
+        # An operator writes only the arguments its schema marks, which the
+        # tracker checks like a native Tensor method's; a registered effect
+        # reaches beyond them.
+        return _get_effect(fn) is None
     if type(fn) is types.MethodType:
         return fn.__func__ is _KNOWN_HOST_SPLITS[1] and type(fn.__self__) is FakeTensor
     if type(fn) is types.MethodDescriptorType:
@@ -301,15 +311,21 @@ def _is_known_host_call(
 def _is_native_operator_lookup(value: object, attr: str) -> bool:
     """Whether ``value.attr`` is a stock ``torch.ops`` registry lookup."""
     kind = type(value)
-    original = _NATIVE_OPERATOR_REGISTRY.get(kind)
-    if original is None:
-        return False
-    # A cached entry is a plain instance attribute; otherwise no class
-    # attribute may intercept the lookup before the import-time __getattr__.
-    return attr in vars(value) or (
-        getattr_static(kind, attr, None) is None
-        and getattr_static(kind, "__getattr__") is original
-    )
+    for native, getattribute, getattr_hook in _NATIVE_OPERATOR_REGISTRY:
+        if kind is native:
+            # Python consults the class's __getattribute__ and descriptors
+            # before the instance dict, and a module's own __getattr__ before
+            # the class hook: none of them may intercept the lookup.
+            return (
+                getattr_static(kind, "__getattribute__") is getattribute
+                and getattr_static(kind, attr, _NO_ATTRIBUTE) is _NO_ATTRIBUTE
+                and "__getattr__" not in vars(value)
+                and (
+                    attr in vars(value)
+                    or getattr_static(kind, "__getattr__") is getattr_hook
+                )
+            )
+    return False
 
 
 @contextlib.contextmanager

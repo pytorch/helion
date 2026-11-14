@@ -97,12 +97,14 @@ def _after_operator(x, mode: hl.constexpr):
     hl.specialize(x.stride())
     flat = x.view(-1)
     if mode == "packet":
-        # Resolves to the pure .default overload, not the writing .out one.
+        # Resolves to the .default overload, not the writing .out one.
         torch.ops.aten.clone(x)
-    elif mode == "overload":
-        torch.ops.aten.alias.default(x)
-    else:
+    elif mode == "writing":
+        # Changes x's metadata, not flat's: checked like x.t_().
         torch.ops.aten.t_.default(x)
+    else:
+        # A registered effect may reach any tensor.
+        torch.ops.aten._print.default("")
     out = torch.empty_like(flat)
     for tile in hl.tile(flat.size(0)):
         out[tile] = flat[tile]
@@ -112,12 +114,37 @@ def _after_operator(x, mode: hl.constexpr):
 # Triton passes a non-literal stride as a kernel argument; CuTe always reads
 # strides from the tensor layout, so its code shows no difference.
 @skipUnlessBackends(["triton"])
-@pytest.mark.parametrize("mode", ["packet", "overload", "writing"])
-def test_operator_schema_decides_whether_view_strides_stay_literal(mode):
-    # Looking up and calling a schema-pure torch.ops operator keeps the exact
-    # layout of a specialized input's view; a writing schema voids it.
+@pytest.mark.parametrize("mode", ["packet", "writing", "effect"])
+def test_torch_ops_calls_keep_view_strides_unless_effectful(mode):
+    # Looking up and calling a torch.ops operator keeps the exact layout of a
+    # specialized input's view; an operator with a registered effect voids it.
     kernel = helion.kernel(_after_operator, static_shapes=False)
     with cpu_render_target():
         bound = kernel.bind((torch.empty(4, 8), mode))
         code = bound.to_code(bound.config_spec.default_config())
-    assert ("flat_stride_0" in code) == (mode == "writing")
+    assert ("flat_stride_0" in code) == (mode == "effect")
+
+
+def _patched_lookup(x):
+    hl.specialize(x.size())
+    hl.specialize(x.stride())
+    flat = x.view(-1)
+    torch.ops.aten.clone(x)
+    out = torch.empty_like(flat)
+    for tile in hl.tile(flat.size(0)):
+        out[tile] = flat[tile]
+    return out
+
+
+@skipUnlessBackends(["triton"])
+def test_patched_registry_lookup_stays_opaque(monkeypatch):
+    # A class attribute shadowing the operator runs Python on lookup.
+    namespace = type(torch.ops.aten)
+    monkeypatch.setattr(
+        namespace, "clone", property(lambda self: torch.ops.aten.alias), raising=False
+    )
+    kernel = helion.kernel(_patched_lookup, static_shapes=False)
+    with cpu_render_target():
+        bound = kernel.bind((torch.empty(4, 8),))
+        code = bound.to_code(bound.config_spec.default_config())
+    assert "flat_stride_0" in code
