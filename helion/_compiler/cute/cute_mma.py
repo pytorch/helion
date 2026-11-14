@@ -169,6 +169,7 @@ from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_EPI_TMA
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_SIMT
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
 from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+from .tcgen05_constants import TCGEN05_AUX_PRODUCER_UNMODELED_AB_STAGES
 from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_DEFAULT
 from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_VALIDATION_CHOICES
 from .tcgen05_constants import TCGEN05_AUX_STAGES_CONFIG_KEY
@@ -13358,31 +13359,33 @@ def _emit_mma_pipeline(
                 "cute",
                 f"tcgen05 launch block shape {candidate_block_shape} exceeds 1024 threads",
             )
-        # SMEM-budget rejection: ``tcgen05_ab_stages=3`` +
-        # productive C-input warp
+        # SMEM-budget rejection: AB and C rings that overflow beside a
+        # productive C-input warp's aux rings
         # (``tcgen05_warp_spec_c_input_warps=1`` AND non-empty
-        # ``aux_tensor_descriptors`` AND single-store fan-out
-        # gate open) is over the 232 KB B200 SMEM cap at every
-        # validated tcgen05 tile shape (canonical
-        # ``(bm=bn=256, bk=128, cluster_m=2)`` measured 263 KB
-        # used vs 232 KB cap; reducing the aux ring to
+        # ``aux_tensor_descriptors`` AND single-store fan-out gate open),
+        # priced by the arena model (``aux_producer_ring_smem``: one
+        # ``tcgen05_aux_stages``-deep ring per carried operand; without its
+        # facts, two AB stages) against the device's per-CTA SMEM (the
+        # 232 KB B200 cap)
+        # (canonical ``(bm=bn=256, bk=128, cluster_m=2)`` at three stages
+        # measured 263 KB used vs 232 KB cap; reducing the aux ring to
         # ``num_stages=1`` only drops it to 246 KB, still 14 KB
         # over). Reject loudly at MMA-codegen time so:
         #   - explicit user configs fail with a clear message
         #     instead of an opaque ``ptxas: uses too much
         #     shared data`` deep inside the cute_dsl invocation;
-        #   - the autotune search-time fixup can demote
-        #     ``tcgen05_ab_stages=3`` candidates that would
-        #     otherwise trigger this raise mid-tuning (see
-        #     ``tcgen05_config.repair._fix_ab_stages_three_search_config``).
+        #   - the autotune search-time fixup can drop the producer
+        #     warp from deeper candidates that would otherwise
+        #     trigger this raise mid-tuning (see
+        #     ``tcgen05_config.repair._fix_with_scheduler_search_config``).
         # The predicate mirrors the productive-body aux-pipeline
         # allocation gate at ``_emit_mma_pipeline`` below
         # (``has_aux_producer_warp AND aux_tensor_descriptors AND
         # aux_single_store_value``), where the aux producer is the
         # C-input warp (SIMT or TMA) OR — under the cycle-94 merge —
         # the store warp (TMA only). The store-warp TMA aux ring has
-        # the SAME SMEM cost as the C-input TMA ring, so ab=3 overshoots
-        # the cap identically and must be rejected for it too. When the
+        # the SAME SMEM cost as the C-input TMA ring, so a deeper ring
+        # overshoots the cap identically and must be rejected for it too. When the
         # multi-store fan-out gate closes the productive body, the aux
         # SMEM ring + ``c_pipeline_aux`` are NOT allocated and the
         # kernel falls back to GMEM-aux reads with no extra SMEM cost,
@@ -13406,29 +13409,60 @@ def _emit_mma_pipeline(
         ab_reject_has_aux_producer_warp = tcgen05_matmul_plan.has_c_input_warp or (
             tcgen05_matmul_plan.has_store_warp and ab_reject_aux_tma_requested
         )
-        if (
+        productive_aux_producer = (
             ab_reject_has_aux_producer_warp
-            and c_input_aux_tensor_descriptors
+            and bool(c_input_aux_tensor_descriptors)
             and aux_single_store_value
-            and tcgen05_matmul_plan.ab_stage_count >= 3
+        )
+        producer_smem = (
+            repair.aux_producer_ring_smem(
+                env.config_spec._cute_tcgen05_config,
+                df.config,
+                bm=tcgen05_matmul_plan.bm,
+                bn=tcgen05_matmul_plan.bn,
+                bk=tcgen05_matmul_plan.bk,
+                cluster_m=2 if tcgen05_matmul_plan.is_two_cta else 1,
+                ab_stages=tcgen05_matmul_plan.ab_stage_count,
+                c_stages=tcgen05_matmul_plan.c_stage_count,
+            )
+            if productive_aux_producer
+            else None
+        )
+        if productive_aux_producer and (
+            tcgen05_matmul_plan.ab_stage_count
+            > TCGEN05_AUX_PRODUCER_UNMODELED_AB_STAGES
+            if producer_smem is None
+            else producer_smem[0] > producer_smem[1]
         ):
+            overflow = (
+                "without the store facts that price its rings, the AB ring "
+                "keeps the producer's measured "
+                f"{TCGEN05_AUX_PRODUCER_UNMODELED_AB_STAGES} stages"
+                if producer_smem is None
+                else f"its SMEM rings, the AB ring and the C ring need "
+                f"{producer_smem[0]} bytes per CTA of the {producer_smem[1]} "
+                "the device holds"
+            )
+            remedy = (
+                f"Use at most {TCGEN05_AUX_PRODUCER_UNMODELED_AB_STAGES} AB stages"
+                if producer_smem is None
+                else "Use a shallower AB ring (shallower k-blocks hold more "
+                "stages in the same bytes), fewer C stages or fewer staged "
+                "operands"
+            )
             raise exc.BackendUnsupported(
                 "cute",
-                "tcgen05 ``tcgen05_ab_stages=3`` is incompatible "
-                "with a productive aux producer warp "
+                "tcgen05 "
+                f"``tcgen05_ab_stages={tcgen05_matmul_plan.ab_stage_count}`` "
+                f"at ``bk={tcgen05_matmul_plan.bk}`` with "
+                f"``tcgen05_c_stages={tcgen05_matmul_plan.c_stage_count}`` "
+                "is incompatible with a productive aux producer warp "
                 "(``tcgen05_warp_spec_c_input_warps=1``, or the "
                 "cycle-94 store-warp merge "
                 "``tcgen05_warp_spec_store_warps=1`` + "
                 "``tcgen05_aux_load_mode=tma``, + "
-                "non-empty aux tensors from the epilogue chain): "
-                "the aux SMEM ring + AB pipeline together "
-                "overshoot the 232 KB B200 SMEM cap at every "
-                "validated tile shape (the canonical "
-                "``(bm=bn=256, bk=128, cluster_m=2)`` shape uses "
-                "263 KB vs 232 KB cap). Drop to "
-                "``tcgen05_ab_stages=2`` for residual epilogues "
-                "with an aux producer warp, or drop the aux "
-                "producer warp to keep ``tcgen05_ab_stages=3``. See "
+                f"non-empty aux tensors from the epilogue chain): {overflow}. "
+                f"{remedy}, or drop the aux producer warp. See "
                 "``cute_plan.md`` §1.3 / §7.5.3.2.",
             )
         df.cute_state.tcgen05.block_shape = candidate_block_shape

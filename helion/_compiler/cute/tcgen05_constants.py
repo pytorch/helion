@@ -29,6 +29,10 @@ TCGEN05_TWO_CTA_BLOCK_N = 256
 # CtaGroup.TWO M tile and K-tail shape. Autotune can admit the same
 # narrow tile for other shapes that still have an N edge at this size.
 TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N = 128
+# The N of a GEMM one narrow N tile wide that runs the 256 x N CtaGroup.TWO
+# pair (``facts.narrow_n_pair_gemm``): the 256x256 projection would
+# run half of every MMA past N.
+TCGEN05_TWO_CTA_NARROW_BLOCK_N = 128
 # The narrow-N Target8 row has enough SMEM headroom at ab=2 to double the
 # K tile. B200 measurements put this ahead of the older narrow-N K=128 row.
 TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K = 256
@@ -320,6 +324,10 @@ def tcgen05_fixed_smem_overhead_bytes(
 # shared``), so the deeper ring is admitted only behind the c-stages SMEM budget
 # gate in ``CuteTcgen05Config``.
 TCGEN05_RESIDUAL_FULL_TILE_DEEP_C_STAGES = 4
+# The AB depth an aux producer warp keeps where the arena model cannot price
+# its rings (no store facts): the regime the cycle-86/88 producer
+# measurements ran.
+TCGEN05_AUX_PRODUCER_UNMODELED_AB_STAGES = 2
 
 
 def tcgen05_default_epilogue_tile_size(
@@ -688,10 +696,14 @@ class Tcgen05RowvecAuxFacts(NamedTuple):
     rows: tuple[Tcgen05RowvecAuxRow, ...]
     output_count: int = 1
     # Element sizes of the exact-shape rank-2 auxiliary operands on the store
-    # that stages the most bytes of them: the staged aux load modes keep one
+    # that reads the most bytes of them (whose presence keeps the plan's
+    # with-source epilogue subtile).
+    exact_aux_itemsizes: tuple[int, ...] = ()
+    # Those the staged aux load modes carry (``stages_through_smem_ring``: not
+    # a boolean mask), on the store that stages the most bytes: one
     # ``tcgen05_aux_stages``-deep ring of epilogue subtiles per operand, in
     # its own dtype.
-    exact_aux_itemsizes: tuple[int, ...] = ()
+    ring_aux_itemsizes: tuple[int, ...] = ()
 
 
 def tcgen05_rowvec_stage_smem_bytes(
@@ -856,14 +868,17 @@ TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY = "tcgen05_tvm_ffi_launch"
 # (``cute_plan.md`` §6 Target 8) measured the 3-stage variant ~2% slower
 # than the 2-stage default on T8, so the default 2 stays the autotuner's
 # measured optimum; the knob remains in the search surface so future
-# targets can re-explore. ``{2, 3}`` fit structurally on B200 — see
-# ``cute_plan.md`` for the SMEM-budget audit. The autotune gate
+# targets can re-explore. The arena model admits three stages only where
+# the AB ring leaves room; the narrow CLC seed's samples, beside a 256-deep
+# pair ring, take two (``repair._take_two_stage_aux_ring``). The autotune gate
 # (``aux_stages_autotune_fragments`` in ``tcgen05_config/surface.py``)
-# admits the knob only for the ``_aux_tma_edge_search_enabled`` family so other
-# paths stay byte-identical at the default. (Cycle 46 widened
-# ``_aux_tma_search_enabled`` to also admit the full-tile cluster_m=2
-# family, but this stage-count knob remains scoped to the edge gate
-# because its choices were measured only on the T8/CLC edge rows.)
+# searches the knob only for the ``_aux_tma_edge_search_enabled`` family so
+# other paths stay byte-identical at the default; elsewhere it only encodes a
+# compiler seed's other depth (search-only; the ``epi_tma`` default's
+# deeper ring). (Cycle 46 widened ``_aux_tma_search_enabled`` to also admit
+# the full-tile cluster_m=2 family, but this stage-count knob remains scoped
+# to the edge gate because its choices were measured only on the T8/CLC
+# edge rows.)
 TCGEN05_AUX_STAGES_CONFIG_KEY = "tcgen05_aux_stages"
 TCGEN05_AUX_STAGE_COUNT_DEFAULT = 2
 TCGEN05_AUX_STAGE_COUNT_CHOICES = (2, 3)

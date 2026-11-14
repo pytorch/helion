@@ -509,7 +509,12 @@ def test_exact_shape_auxiliary_epilogue_keeps_the_paired_pipeline(
 
 _FACTS = [
     Tcgen05PipelineSmemFacts(
-        in_bytes, out_bytes, 232448, exact_aux_itemsizes=(out_bytes,) * aux
+        in_bytes,
+        out_bytes,
+        232448,
+        exact_aux_itemsizes=(out_bytes,) * aux,
+        # the aux operand's ring (an ``epi_tma`` sample prices it)
+        ring_aux_itemsizes=(out_bytes,) * aux,
     )
     for in_bytes, out_bytes, aux in itertools.product((1, 2), (2, 4), (0, 1))
 ]

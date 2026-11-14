@@ -4048,6 +4048,15 @@ class CuteSearchSurface(BackendSearchSurface):
     def trim_default_config(self, config_spec: ConfigSpec, config: Config) -> None:
         _drop_inert_workspace_knobs(config)
 
+    def overlay_promoted_default(
+        self,
+        config_spec: ConfigSpec,
+        base: dict[str, object],
+        promoted: Mapping[str, object],
+    ) -> None:
+        # A promoted ``pid_type`` re-derives the tcgen05 persistence model.
+        surface.drop_stale_persistence_model(config_spec.tcgen05, base, promoted)
+
     def prepare_flat_config(
         self, config_spec: ConfigSpec, config: dict[str, object]
     ) -> None:

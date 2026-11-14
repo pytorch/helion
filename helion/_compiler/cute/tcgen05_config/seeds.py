@@ -734,9 +734,13 @@ def _paired_pipeline_seed_configs(
                     continue
                 block_sizes = facts._matmul_seed_block_sizes(state, bm=bm, bn=bn, bk=bk)
                 assert block_sizes is not None
+                # A 128-row pair beside a column-major output reads its
+                # row operands per subtile after the wait
+                # (``pre_acc_wait_column_major_half_pair``).
                 placements = (
                     ("post_acc_wait", "pre_acc_wait")
                     if pipeline_facts.has_auxiliary_loads
+                    and not (pipeline_facts.output_column_major and bm == 128)
                     else ("post_acc_wait",)
                 )
                 # The epilogue-issued aux ring (``epi_tma``) is a second
@@ -745,7 +749,7 @@ def _paired_pipeline_seed_configs(
                 # model fits beside the rings, with both placements.
                 aux_modes: tuple[str, ...] = (TCGEN05_AUX_LOAD_MODE_SIMT,)
                 if (
-                    pipeline_facts.exact_aux_itemsizes
+                    pipeline_facts.ring_aux_itemsizes
                     and state.exact_aux_tma_provable
                     and bm == TCGEN05_TWO_CTA_BLOCK_M
                     and pipeline_facts.input_dtype_bytes == 2
@@ -875,8 +879,9 @@ def _small_grid_seed_configs(state: CuteTcgen05Config) -> list[Config]:
     A GEMM with fewer 128x128 output tiles than SMs is bound by per-CTA
     fixed latency and by each SM's L2->SMEM bandwidth, not by MMA
     throughput. Small one-CTA tiles spread the operand re-reads over more
-    SMs (the cuBLAS heuristic picks 64x8 .. 64x32 tiles there); the paired
-    two-CTA seeds above cover the machine-filling shapes. The tiles are
+    SMs (the cuBLAS heuristic picks 64x8 .. 64x32 tiles there), beside the
+    paired seeds' 128-row pairs, which the small-grid default takes where
+    one fills more SMs. The tiles are
     chosen from the problem's geometry only: whole tiles, the widest K
     packet the search admits, and an AB ring no deeper than the K loop.
 
@@ -1693,6 +1698,10 @@ def full_tile_direct_entry_seed_eligible(state: CuteTcgen05Config) -> bool:
     # bf16) forces the dot through the non-tcgen05 fallback, where the
     # flat-role / FFI seed config is rejected.
     if state.matmul_has_non_tcgen05_operand:
+        return False
+    # The pair's two CTAs share each tile, where codegen refuses an atomic
+    # (``reject_atomics_beside_warp_roles``).
+    if state.kernel_has_atomics:
         return False
     # The flat-role launch path hard-requires the TMA A/B pipeline and the
     # TMA store epilogue, which codegen disables when an operand's or the

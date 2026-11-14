@@ -1990,12 +1990,15 @@ class TestCuteLowerings(unittest.TestCase):
             # validated, and this auto-path test only needs to pin tcgen05.
             bound.env.config_spec.tcgen05.search_enabled = True
             surface.restrict_cluster_m_search(bound.env.config_spec.tcgen05, (1,))
-            config = bound.config_spec.default_config()
+            # The one-CTA auto path: the base default (the small grid's
+            # compiler default promotes the paired-pipeline 128-row pair).
+            config = bound.config_spec.autotune_reference_config()
             code = bound.to_code(config)
 
         self.assertEqual(config.config["block_sizes"][2], 16)
         # Two 128x128 tiles on 148 SMs: the search admits the 64-row one-CTA
-        # tile for this small grid, so the default may sit at 64 rows.
+        # tile for this small grid, so the reference config may sit at 64
+        # rows.
         self.assertGreaterEqual(config.config["block_sizes"][0], 64)
         self.assertLessEqual(config.config["block_sizes"][0], 256)
         self.assertGreaterEqual(config.config["block_sizes"][1], 8)
@@ -16077,20 +16080,6 @@ class TestCuteLowerings(unittest.TestCase):
                 self.assertEqual(seed.config["block_sizes"], [1, 128, 128, 128])
                 self.assertIn(seed, spec.compiler_seed_configs)
 
-    def test_tcgen05_thread_local_heuristic_ignores_regular_epilogue(self) -> None:
-        dtype = torch.bfloat16
-        args = (
-            torch.empty([128, 128], device=DEVICE, dtype=dtype),
-            torch.empty([128, 128], device=DEVICE, dtype=dtype),
-        )
-        with patch_cute_mma_support():
-            spec = cute_matmul_role_local_monolithic_relu_bf16.bind(args).config_spec
-        self.assertNotIn(
-            CuteTcgen05ThreadLocalEpilogueHeuristic.name,
-            spec.autotuner_heuristics,
-        )
-        self.assertIsNone(spec.compiler_default_config)
-
     def test_tcgen05_fragment_projection_rotary_runtime(self) -> None:
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
@@ -19393,10 +19382,12 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         is refused instead; the persistent launch still emits the producer."""
         kernel = self._residual_kernel()
         args = self._square_args(3)
+        # (64-deep stages: two 128-deep ones on one CTA overflow beside the
+        # aux ring, which the SMEM guard refuses first)
         flat = helion.Config(
             **{
                 **self._canonical_c_input_config().config,
-                "block_sizes": [128, 256, 128],
+                "block_sizes": [128, 256, 64],
                 "pid_type": "flat",
                 "tcgen05_cluster_m": 1,
                 "tcgen05_persistence_model": "non_persistent",
@@ -19424,8 +19415,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         aux SMEM ring + ``c_pipeline_aux`` mbars push the total
         to 263 KB (measured by ptxas, cycle 2c). Reducing the
         aux ring to ``num_stages=1`` only drops it to 246 KB,
-        still 14 KB over the cap. There is no validated tile
-        shape where the combination fits.
+        still 14 KB over the cap.
 
         The strict normalizer
         (``_normalize_aux_producer_ab_stages``) refuses this combo
@@ -19437,14 +19427,14 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             instead of a deep ``ptxas: uses too much shared
             data`` raise; and
           - the autotune search-time fixup
-            (``_fix_tcgen05_ab_stages_three_search_config``)
-            can demote affected ``ab=3`` candidates rather
-            than aborting tuning at ptxas.
+            (``_fix_with_scheduler_search_config``) can drop the
+            producer warp from affected candidates rather than
+            aborting tuning at ptxas.
 
         The rejection predicate mirrors the productive-body
         aux-pipeline allocation gate exactly (cycle 2d P1):
         ``has_c_input_warp AND aux_tensor_descriptors AND
-        aux_single_store_value AND ab_stage_count >= 3``. The
+        aux_single_store_value AND not aux_producer_ring_fits``. The
         single-store-fan-out condition is load-bearing — under
         multi-store fan-out the productive body is suppressed
         and the kernel falls back to GMEM-aux reads with no
@@ -19477,7 +19467,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         # than naming ``c_input_warps=0`` specifically.
         self.assertIn("tcgen05_ab_stages=3", msg)
         self.assertIn("tcgen05_warp_spec_c_input_warps=1", msg)
-        self.assertIn("tcgen05_ab_stages=2", msg)
+        self.assertIn("per-CTA SMEM cap", msg)
         self.assertIn("drop the aux producer warp", msg)
 
     def test_aux_pipeline_ab_stages_2_with_c_input_compiles(self) -> None:

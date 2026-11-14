@@ -526,13 +526,17 @@ def test_family_keys_appear_only_where_admitted() -> None:
 
 
 def test_default_config_keeps_the_tcgen05_tile() -> None:
-    # The widened floors do not move the default: the tcgen05 family clamps
-    # the 16-row default back to its own floor.
+    # The widened floors do not move the base default below the tcgen05
+    # family's own floor (its 16-row floor clamps to the 64-row tile); this
+    # small grid's promoted default is the 128-row pair seed.
     bound = _bind_gemm((256, 256, 256), torch.float16)
     with bound.env:
+        base = bound.config_spec.autotune_reference_config().config
         config = bound.config_spec.default_config().config
+    assert base["block_sizes"][0] == 64
     assert config[FAMILY] == family.MATMUL_FAMILY_TCGEN05
-    assert config["block_sizes"][0] == 64 and config["block_sizes"][1] >= 8
+    assert config["block_sizes"] == [128, 64, 64]
+    assert config["tcgen05_cluster_m"] == 2
 
 
 def test_tcgen05_family_clamps_rows_below_its_floor() -> None:

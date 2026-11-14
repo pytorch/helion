@@ -577,7 +577,12 @@ def enable_cute_tcgen05_search(
         allow_full_tile_cluster_m2_search = (
             allow_whole_k_persistent_pid_types
             and max_search_m >= TCGEN05_TWO_CTA_BLOCK_M
-            and max_search_n >= TCGEN05_TWO_CTA_BLOCK_N
+            and (
+                max_search_n >= TCGEN05_TWO_CTA_BLOCK_N
+                # a GEMM one narrow N tile wide runs the 256 x N pair, unless
+                # a registered block size leaves its 256 x 128 tile out
+                or facts.narrow_n_pair_gemm(spec.tcgen05)
+            )
             and static_k <= max_cluster_m2_search_k
         )
         allow_edge_cluster_m2_search = (

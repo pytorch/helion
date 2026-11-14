@@ -91,6 +91,8 @@ from ..tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENTS
 from ..tcgen05_constants import TCGEN05_AUX_PREFETCH_MAX_SUBTILES
 from ..tcgen05_constants import TCGEN05_AUX_PREFETCH_SUBTILES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_CHOICES
+from ..tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_DEFAULT
+from ..tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_VALIDATION_CHOICES
 from ..tcgen05_constants import TCGEN05_AUX_STAGES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENTS
@@ -457,6 +459,8 @@ def _aux_tma_edge_search_enabled(state: CuteTcgen05Config) -> bool:
     return (
         state.exact_shape_aux_kernel_detected
         and state.exact_aux_tma_provable
+        # an operand the producer's ring carries (not only a boolean mask)
+        and not facts.exact_aux_mask_only(state)
         and constraints is not None
         and constraints.allow_edge_k_tail_family
     )
@@ -475,6 +479,8 @@ def _aux_tma_full_tile_search_enabled(state: CuteTcgen05Config) -> bool:
         state.exact_shape_aux_kernel_detected
         and state.exact_aux_tma_provable
         and not state.matmul_has_leading_passthrough
+        # an operand the producer's ring carries (not only a boolean mask)
+        and not facts.exact_aux_mask_only(state)
         and constraints is not None
         and not constraints.allow_edge_k_tail_family
         and not constraints.one_wave_only
@@ -896,6 +902,25 @@ def prepare_override_normalization(
                 "fixed block_sizes overrides cannot select a different physical N tile"
             )
         config[TILE_N_KEY] = 0
+    drop_stale_persistence_model(state, config, overrides)
+
+
+def drop_stale_persistence_model(
+    state: CuteTcgen05Config,
+    config: dict[str, object],
+    overrides: Mapping[str, object],
+) -> None:
+    """Drop ``config``'s persistence model where a ``pid_type`` layered
+    from ``overrides`` contradicts it, so normalization derives it from
+    that ``pid_type`` (``ConfigSpec.promoted_default_values`` layers a
+    compiler default over the base default the same way).
+
+    A flat base's ``non_persistent`` beside a promoted persistent
+    ``pid_type`` made strategy validation reset the promoted strategy
+    fields, which dropped a residual pair's aux-TMA producer but kept the
+    producer's two-stage AB ring on the SIMT loads (B200, bf16
+    1000x4096x4096 + residual: 0.61 of the ATen GEMM, 0.79 on the
+    producer)."""
     if "pid_type" not in overrides:
         return
     if TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY in overrides:
@@ -1587,6 +1612,8 @@ def epi_tma_search_enabled(state: CuteTcgen05Config) -> bool:
         and state.exact_shape_aux_kernel_detected
         and state.exact_aux_tma_provable
         and not state.matmul_has_leading_passthrough
+        # an operand the ring carries (not only a boolean mask)
+        and not facts.exact_aux_mask_only(state)
     )
 
 
@@ -1595,20 +1622,44 @@ def aux_stages_autotune_fragments(
 ) -> dict[str, ConfigSpecFragment]:
     """Per-config aux-pipeline stage-count knob.
 
-    Admitted only under ``_aux_tma_edge_search_enabled``, which pins the
+    Searched only under ``_aux_tma_edge_search_enabled``, which pins the
     surface to the validated edge+K-tail family with ``cluster_m=2``
-    and the c-input warp + aux-TMA combination. Configs outside that
-    gate never see the knob; codegen at the default of 2 is unchanged.
+    and the c-input warp + aux-TMA combination. Outside that gate the
+    knob encodes only the compiler seeds' depths other than the default
+    of 2 (search-only, so the search itself keeps 2), and is absent
+    where no seed carries one.
 
-    Cycle 46 intentionally keeps this scoped to the edge+K-tail gate
-    even though ``_aux_tma_search_enabled`` was widened to admit the
+    Cycle 46 intentionally keeps the search scoped to the edge+K-tail
+    gate even though ``_aux_tma_search_enabled`` was widened to admit the
     full-tile cluster_m=2 family. The stage-count choices were tuned
     on the T8/CLC edge rows; exposing them to T14/T20/T25/T28 would
     let autotune sample stage counts on shapes they were not measured
     on.
     """
     if not _aux_tma_edge_search_enabled(state):
-        return {}
+        # A promoted compiler default may carry a deeper epilogue-issued
+        # ring (the short-K ``epi_tma`` default of
+        # ``CuteTcgen05DefaultTileHeuristic``): the knob encodes the
+        # seeds' depths, search-only where they widen it, so the default
+        # survives the flat round trip.
+        seed_choices = _compiler_seed_values(
+            state.config_spec.compiler_seed_configs,
+            TCGEN05_AUX_STAGES_CONFIG_KEY,
+            int,
+            lambda value: value in TCGEN05_AUX_STAGE_COUNT_VALIDATION_CHOICES,
+        )
+        if not any(
+            choice != TCGEN05_AUX_STAGE_COUNT_DEFAULT for choice in seed_choices
+        ):
+            return {}
+        return {
+            TCGEN05_AUX_STAGES_CONFIG_KEY: _enum_fragment_with_seed_values(
+                (TCGEN05_AUX_STAGE_COUNT_DEFAULT,),
+                seed_choices,
+                search_choices=(TCGEN05_AUX_STAGE_COUNT_DEFAULT,),
+                search_only_if_widened=True,
+            )
+        }
     return {
         TCGEN05_AUX_STAGES_CONFIG_KEY: EnumFragment(TCGEN05_AUX_STAGE_COUNT_CHOICES)
     }

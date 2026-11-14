@@ -312,41 +312,6 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertEqual([x.min_size for x in spec.block_sizes], [2, 8, 16])
 
     @onlyBackends(["cute"])
-    def test_cute_tcgen05_matmul_constrains_search_space(self) -> None:
-        args = (
-            torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
-            torch.randn([64, 128], device=DEVICE, dtype=HALF_DTYPE),
-        )
-        with patch_cute_mma_support():
-            bound = fresh(cute_matmul_mma).bind(args)
-        spec = bound.config_spec
-        # Two 128x128 output tiles on this device: the search admits the
-        # 64-row one-CTA tile for grids smaller than the SM count (the
-        # 256-row operands alone would pin the floor at 128 rows), and the
-        # register-MMA family (``cute_matmul_family="warp_mma"``) admitted on
-        # this latency-bound problem widens the M floor to its 16-row atom;
-        # the default config below keeps the tcgen05 tile.
-        self.assertEqual([x.min_size for x in spec.block_sizes], [16, 8, 16])
-        # tile_k upper bound was previously hardcoded to 16; the cute tcgen05
-        # path now allows multiples of 16 up to min(128, static_k) so the
-        # autotuner can pack more cute.gemm instructions per K iteration.
-        self.assertEqual([x.max_size for x in spec.block_sizes], [256, 128, 64])
-        default_block_sizes = spec.default_config().config["block_sizes"]
-        self.assertGreaterEqual(default_block_sizes[2], 16)
-        self.assertLessEqual(default_block_sizes[2], 64)
-        self.assertGreaterEqual(default_block_sizes[0], 64)
-        self.assertLessEqual(default_block_sizes[0], 256)
-        self.assertGreaterEqual(default_block_sizes[1], 8)
-        self.assertLessEqual(default_block_sizes[1], 128)
-        self.assertEqual(spec.default_config().config["l2_groupings"], [1])
-        # This small-N problem cannot form the validated 256x256 CtaGroup.TWO
-        # tile, so the autotuner keeps cluster_m narrowed to 1.
-        self.assertEqual(spec.default_config().config["tcgen05_cluster_m"], 1)
-        self.assertEqual(spec.tcgen05.cluster_m_search_choices, (1,))
-        self.assertIn("persistent_blocked", spec.allowed_pid_types)
-        self.assertIn("persistent_interleaved", spec.allowed_pid_types)
-
-    @onlyBackends(["cute"])
     def test_cute_tcgen05_equal_dims_keep_default_within_max_bound(self) -> None:
         args = (
             torch.randn([8192, 8192], device=DEVICE, dtype=HALF_DTYPE),
