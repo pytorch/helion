@@ -15,8 +15,10 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import onlyBackends
+from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfCute
 from helion._testing import skipIfNotCUDA
+from helion.autotuner.aot_cache import _config_uses_tensor_descriptor
 from helion.autotuner.aot_compile import generate_standalone_file
 import helion.language as hl
 
@@ -87,6 +89,19 @@ def _aot_add_one(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(
+    static_shapes=True,
+    config=helion.Config(block_sizes=[64, 64], prefetch_indexing="tensor_descriptor"),
+)
+def _aot_prefetch_copy(w: torch.Tensor, wp: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(w)
+    for tile_p in hl.tile(wp.size(0), block_size=1):
+        hl.prefetch(wp, [tile_p.begin, slice(None), slice(None)])
+    for tile_k, tile_n in hl.tile(w.size()):
+        out[tile_k, tile_n] = w[tile_k, tile_n]
+    return out
+
+
 @onlyBackends(["triton", "cute"])
 @skipIfCute(_TRITON_RUNTIME_EMBEDDING)
 @skipIfNotCUDA()
@@ -115,6 +130,32 @@ class TestAOTStandaloneRuntime(RefEagerTestDisabled, TestCase):
                 self.assertIs(
                     module.add(torch.device(DEVICE)), module._default_launcher
                 )
+
+    @skipIfCudaCapabilityLessThan((9, 0), reason="TMA needs sm90")
+    def test_box_prefetch_inlines_tensor_maps(self) -> None:
+        """A box-form prefetch's tensor maps are inlined (no helion import),
+        and its config counts as descriptor indexing for the dispatch's
+        alignment predicates."""
+        w = torch.randn(1024, 256, device=DEVICE, dtype=torch.bfloat16)
+        bound = _aot_prefetch_copy.bind((w, w.view(16, 64, 256)))
+        self.assertTrue(_config_uses_tensor_descriptor(_aot_prefetch_copy.configs[0]))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = generate_standalone_file(
+                "_aot_prefetch_copy", [bound.to_triton_code()], "", Path(tmp)
+            )
+            source = path.read_text()
+            self.assertNotIn("import helion", source)
+            self.assertNotIn("from helion", source)
+            self.assertEqual(source.count("def _make_helion_tensor_maps"), 1)
+            self.assertIn("cp.async.bulk.prefetch.tensor", source)
+            name = "_helion_aot_prefetch_test"
+            spec = importlib.util.spec_from_file_location(name, path)
+            assert spec is not None and spec.loader is not None
+            # Not registered in sys.modules: the inlined maps need no module.
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            out = module._aot_prefetch_copy(w, w.view(16, 64, 256))
+            torch.testing.assert_close(out, w, atol=0, rtol=0)
 
     def test_generated_aot_reuses_canonical_runtime(self) -> None:
         x = torch.randn(64, device=DEVICE)

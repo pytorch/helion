@@ -204,6 +204,7 @@ class Config(Mapping[str, object]):
         host_tensor_descriptors: bool | None = None,
         indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
         atomic_indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
+        prefetch_indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
         advanced_controls_file: str | None = None,
         epilogue_subtile: int | None = None,
         xcd_remap: bool | None = None,
@@ -569,6 +570,11 @@ class Config(Mapping[str, object]):
             atomic_indexing: Indexing strategy for atomic operations (e.g., hl.atomic_add).
                 Same format as ``indexing`` (a single string or a list per atomic op).
                 Defaults to "pointer" when omitted.
+            prefetch_indexing: Form of each ``hl.prefetch`` on NVIDIA targets of the
+                Triton and Gluon backends. Same format as ``atomic_indexing`` (a single
+                string or a list per prefetch). "pointer" (the default) issues bulk or
+                per-element L2 prefetches; "tensor_descriptor" issues TMA box prefetches
+                from a host-built tensor map where a box can describe the subscript.
             advanced_controls_file: Path to a PTXAS control file applied during compilation, or empty string for none.
             epilogue_subtile: Split factor for the epilogue (post-matmul pointwise + store) along
                 the N dimension. None = disabled (default), valid values are 2 or 4.
@@ -641,6 +647,7 @@ class Config(Mapping[str, object]):
             "num_stages": num_stages,
             "indexing": indexing,
             "atomic_indexing": atomic_indexing,
+            "prefetch_indexing": prefetch_indexing,
             "pid_type": pid_type,
             "cross_loop_pipeline": cross_loop_pipeline,
             "num_sm_multiplier": num_sm_multiplier,
@@ -1004,6 +1011,13 @@ class Config(Mapping[str, object]):
         return cast(
             "IndexingLiteral | list[IndexingLiteral]",
             self.config.get("atomic_indexing", []),
+        )
+
+    @property
+    def prefetch_indexing(self) -> IndexingLiteral | list[IndexingLiteral]:
+        return cast(
+            "IndexingLiteral | list[IndexingLiteral]",
+            self.config.get("prefetch_indexing", []),
         )
 
     @property

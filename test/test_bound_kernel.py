@@ -6,13 +6,12 @@ backend DSL only, or ``jax`` alone for ``jax_fn=True``)."""
 from __future__ import annotations
 
 from pathlib import Path
-import subprocess
 import sys
 import tempfile
-import textwrap
 from typing import Any
 import unittest
 
+import pytest
 import torch
 
 import helion
@@ -22,6 +21,7 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfCute
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessPallas
+from helion._testing.standalone import run_add_without_helion
 import helion.language as hl
 from helion.runtime.settings import _get_backend
 
@@ -93,41 +93,6 @@ def _write(tmp: str, code: str) -> str:
     return str(path)
 
 
-def _run_add_no_helion(code: str, entrypoint: str, shape: tuple[int, int]) -> None:
-    """Run an **add** standalone in a subprocess where importing ``helion`` is
-    blocked, proving zero Helion runtime dependency and the right result. Specific
-    to add kernels -- it hardcodes the ``x + y`` reference."""
-    m, n = shape
-    with tempfile.TemporaryDirectory() as tmp:
-        path = _write(tmp, code)
-        script = textwrap.dedent(f"""
-            import sys
-            # Poison the helion package so any leftover dependency fails loudly.
-            sys.modules["helion"] = None
-            import importlib.util
-            import torch
-
-            spec = importlib.util.spec_from_file_location("_standalone", {path!r})
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-
-            torch.manual_seed(0)
-            x = torch.randn([{m}, {n}], device="{DEVICE}", dtype=torch.bfloat16)
-            y = torch.randn([{m}, {n}], device="{DEVICE}", dtype=torch.bfloat16)
-            out = mod.{entrypoint}(x, y)
-            torch.testing.assert_close(out, x + y)
-            print("STANDALONE_OK")
-        """)
-        result = subprocess.run(
-            [sys.executable, "-c", script], capture_output=True, text=True
-        )
-        if "STANDALONE_OK" not in result.stdout:
-            raise AssertionError(
-                f"standalone run failed:\nstdout:\n{result.stdout}\n"
-                f"stderr:\n{result.stderr}"
-            )
-
-
 def _import_code(code: str, name: str, tmp: str) -> Any:
     """Import generated standalone source as a module (registered in
     ``sys.modules`` before ``exec_module`` so any inlined ``@dataclass`` can
@@ -193,12 +158,14 @@ class TestToCodeTriton(TestCase):
         self.assertIn("_default_launcher = helion.runtime.default_launcher", code)
         self.assertIn("def add(", code)
 
+    @pytest.mark.slow  # spawns an interpreter
     def test_standalone_runs_without_helion(self) -> None:
         x = torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16)
         y = torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16)
         code = add.bind((x, y)).to_code(options=_FREE)
-        _run_add_no_helion(code, "add", (128, 128))
+        run_add_without_helion(code, "add", (128, 128))
 
+    @pytest.mark.slow  # spawns an interpreter
     def test_persistent_kernel_get_num_sm_via_shim(self) -> None:
         """A persistent kernel calls ``helion.runtime.get_num_sm`` to size its
         grid. The body is emitted verbatim and the call is satisfied by the inlined
@@ -209,8 +176,9 @@ class TestToCodeTriton(TestCase):
         self.assertNotIn("import helion", code)
         self.assertIn("helion.runtime.get_num_sm(", code)  # verbatim body call
         self.assertIn("get_num_sm=get_num_sm", code)  # shim re-export
-        _run_add_no_helion(code, "add_persistent", (128, 128))
+        run_add_without_helion(code, "add_persistent", (128, 128))
 
+    @pytest.mark.slow  # spawns an interpreter
     def test_tma_kernel_set_triton_allocator_via_shim(self) -> None:
         """A tensor-descriptor (TMA) kernel calls
         ``helion.runtime.set_triton_allocator``; the shim satisfies it."""
@@ -220,8 +188,9 @@ class TestToCodeTriton(TestCase):
         self.assertNotIn("import helion", code)
         self.assertIn("helion.runtime.set_triton_allocator(", code)  # verbatim call
         self.assertIn("set_triton_allocator=set_triton_allocator", code)
-        _run_add_no_helion(code, "add_tma", (128, 128))
+        run_add_without_helion(code, "add_tma", (128, 128))
 
+    @pytest.mark.slow  # spawns an interpreter
     def test_dynamic_shapes_run_at_other_shapes(self) -> None:
         """A static_shapes=False kernel's standalone runs correctly at shapes other
         than the one it was bound with (grid + output shape derived from input)."""
@@ -229,8 +198,9 @@ class TestToCodeTriton(TestCase):
         y = torch.zeros([128, 128], device=DEVICE, dtype=torch.bfloat16)
         code = add_dynamic.bind((x, y)).to_code(options=_FREE)
         for shape in ((128, 128), (256, 64), (64, 256)):
-            _run_add_no_helion(code, "add_dynamic", shape)
+            run_add_without_helion(code, "add_dynamic", shape)
 
+    @pytest.mark.slow  # spawns an interpreter
     def test_kernel_named_like_runtime_helper(self) -> None:
         """A kernel literally named ``get_num_sm`` exports safely: the launcher
         helpers are isolated in a private scope, so the kernel name can't shadow
@@ -238,7 +208,7 @@ class TestToCodeTriton(TestCase):
         x = torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16)
         y = torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16)
         code = get_num_sm.bind((x, y)).to_code(options=_FREE)
-        _run_add_no_helion(code, "get_num_sm", (128, 128))
+        run_add_without_helion(code, "get_num_sm", (128, 128))
 
 
 @helion.kernel(backend="pallas", static_shapes=True)

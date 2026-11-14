@@ -55,6 +55,7 @@ from .variable_origin import TileExtentOrigin
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
+    from ..runtime.config import IndexingLiteral
     from .cross_loop_codegen import PeerState
     from .cute.bounded_cache_codegen import BoundedCacheRequest
     from .cute.device_state import CuteDeviceFunctionState
@@ -417,6 +418,7 @@ class DeviceFunction:
         self._tensor_descriptor_args: dict[
             tuple[torch.Tensor, str, bool | None], TensorDescriptorArg
         ] = {}
+        self.prefetch_map_args: dict[tuple[torch.Tensor, tuple[int, ...]], str] = {}
         self._expr_args: dict[sympy.Expr, NumericArgument] = {}
         self._constexpr_exprs: set[sympy.Expr] = set()
         self._constexpr_args: dict[str, ConstExprArg] = {}
@@ -695,6 +697,28 @@ class DeviceFunction:
             self.atomic_indexing_strategies.append(strategy)
 
         return self.atomic_indexing_strategies[index]
+
+    def prefetch_indexing(self, index: int) -> IndexingLiteral:
+        """The form ``prefetch_indexing`` gives the prefetch in slot ``index``:
+        a single string applies to every prefetch; omitted, "pointer"."""
+        config = self.config.prefetch_indexing
+        if isinstance(config, str):
+            form = config
+        elif not config:
+            return "pointer"
+        else:
+            assert index < len(config), (
+                f"Prefetch operation {index} exceeds prefetch_indexing config "
+                f"length {len(config)}. Please specify prefetch_indexing for all "
+                "prefetches."
+            )
+            form = config[index]
+        if form not in ("pointer", "tensor_descriptor"):
+            raise RuntimeError(
+                f"Invalid prefetch_indexing: {form!r}, "
+                "must be one of 'pointer', 'tensor_descriptor'"
+            )
+        return form
 
     def has_rng_ops(self) -> bool:
         """Check if this kernel uses any RNG operations."""
@@ -1335,7 +1359,8 @@ class DeviceFunction:
         self._constexpr_host_defs.add(name)
 
     def host_constexpr_def(self, name: str, host_expr: str) -> str:
-        """Define a host-only constant once (launch-grid inputs, not kernel args).
+        """Define a host-only value once: a launch-grid input, or an object a
+        kernel argument reads (it stays bound until the launch is submitted).
 
         Returns ``name``; the definition is appended to the host statements
         the first time it is requested for this function.

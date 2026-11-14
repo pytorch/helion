@@ -165,8 +165,9 @@ _BASE_VALID_KEYS = """
     pallas_emit_pipeline_group_size pallas_fold_dot_lhs_cast
     pallas_indirect_access_mode pallas_internal_scratch pallas_load_buffer_count
     pallas_loop_type pallas_pre_broadcast pallas_use_low_level_scheduler
-    pallas_worklist_grouping pid_type range_flattens range_multi_buffers
-    range_num_stages range_unroll_factors range_warp_specializes reduction_fusion
+    pallas_worklist_grouping pid_type prefetch_indexing range_flattens
+    range_multi_buffers range_num_stages range_unroll_factors
+    range_warp_specializes reduction_fusion
     reduction_loops static_ranges store_cache_modifiers tcgen05_ab_stages
     tcgen05_ab_startup_prefill tcgen05_acc_stages tcgen05_acc_wait_placement
     tcgen05_aux_fragment_hoist tcgen05_aux_load_mode tcgen05_aux_load_placement
@@ -332,8 +333,9 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     pallas_emit_pipeline_group_size pallas_fold_dot_lhs_cast
     pallas_indirect_access_mode pallas_load_buffer_count pallas_loop_type
     pallas_pre_broadcast pallas_use_low_level_scheduler pallas_worklist_grouping
-    store_cache_modifiers tcgen05_ab_stages tcgen05_ab_startup_prefill
-    tcgen05_acc_stages tcgen05_acc_wait_placement tcgen05_aux_fragment_hoist
+    prefetch_indexing store_cache_modifiers tcgen05_ab_stages
+    tcgen05_ab_startup_prefill tcgen05_acc_stages tcgen05_acc_wait_placement
+    tcgen05_aux_fragment_hoist
     tcgen05_aux_load_mode tcgen05_aux_load_placement tcgen05_aux_prefetch_subtiles
     tcgen05_aux_stages tcgen05_batch_raster tcgen05_c_acquire_placement
     tcgen05_c_stages tcgen05_c_store_mode tcgen05_clc_query_pacing tcgen05_cluster_m
@@ -597,9 +599,9 @@ _BASE_TRITON_ACCEPTED = """
     epilogue_subtile flatten_loops host_tensor_descriptors indexing l2_groupings
     load_cache_modifiers load_eviction_policies loop_orders maxnreg
     num_sm_multiplier num_stages num_warps pallas_internal_scratch pid_type
-    range_flattens range_multi_buffers range_num_stages range_unroll_factors
-    range_warp_specializes reduction_fusion reduction_loops static_ranges
-    store_cache_modifiers
+    prefetch_indexing range_flattens range_multi_buffers range_num_stages
+    range_unroll_factors range_warp_specializes reduction_fusion reduction_loops
+    static_ranges store_cache_modifiers
 """
 
 # The same census for ``GluonBackend``: Triton's keys but the ones Gluon
@@ -609,9 +611,9 @@ _BASE_GLUON_ACCEPTED = """
     advanced_controls_file atomic_indexing block_sizes cross_loop_pipeline
     epilogue_subtile flatten_loops indexing l2_groupings load_cache_modifiers
     load_eviction_policies loop_orders num_sm_multiplier num_stages num_warps
-    pallas_internal_scratch pid_type range_num_stages range_unroll_factors
-    range_warp_specializes reduction_fusion reduction_loops static_ranges
-    store_cache_modifiers worker_registers
+    pallas_internal_scratch pid_type prefetch_indexing range_num_stages
+    range_unroll_factors range_warp_specializes reduction_fusion reduction_loops
+    static_ranges store_cache_modifiers worker_registers
 """
 
 # The same census for ``TileIRBackend``.
@@ -635,13 +637,14 @@ _BASE_PALLAS_ACCEPTED = """
 
 # The keys ``TritonBackend.supports_config_key`` decides by the device the
 # row runs on: ``host_tensor_descriptors`` needs a CUDA device of capability
-# >= 9.0, ``cross_loop_pipeline`` is off on ROCm, ``waves_per_eu`` /
-# ``matrix_instr_nonkdim`` / ``xcd_remap`` are AMD tunables accepted only
-# there, and the MTIA tunables only on MTIA.
+# >= 9.0, ``cross_loop_pipeline`` and ``prefetch_indexing`` are off on ROCm,
+# ``waves_per_eu`` / ``matrix_instr_nonkdim`` / ``xcd_remap`` are AMD tunables
+# accepted only there, and the MTIA tunables only on MTIA.
 _DEVICE_DECIDED_KEYS = frozenset(
     {
         "host_tensor_descriptors",
         "cross_loop_pipeline",
+        "prefetch_indexing",
         "matrix_instr_nonkdim",
         "waves_per_eu",
         "xcd_remap",

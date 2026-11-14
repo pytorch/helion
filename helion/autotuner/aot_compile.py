@@ -37,6 +37,7 @@ from .._compiler.compile_environment import (
 )
 from .._compiler.output_code_utils import _check_kernel_name_not_shadowed
 from .._compiler.output_code_utils import dependency_free_runtime_source
+from .._compiler.triton.backend import TritonBackend
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -150,6 +151,9 @@ def _is_supported_helion_import(import_line: str) -> bool:
     return import_line in {
         "import helion",
         "from helion.runtime import default_launcher as _default_launcher",
+        # The tensor maps of box-form prefetches, inlined as ``to_code``'s
+        # Helion-free output does (``TritonBackend.embedded_helper_source``).
+        TritonBackend().library_imports["helion_tensor_maps"],
     }
 
 
@@ -380,8 +384,6 @@ def generate_standalone_file(
         all_imports.add("import torch")
 
     if needs_runtime:
-        from .._compiler.triton.backend import TritonBackend
-
         launcher_info = TritonBackend().dependency_free_launcher_info
         supported_runtime_names = {
             launcher_info.launcher_symbol,
@@ -393,6 +395,9 @@ def generate_standalone_file(
                 f"{', '.join(sorted(unknown))}"
             )
         runtime_source = dependency_free_runtime_source(launcher_info)
+        all_imports.add("import types")
+    embedded = TritonBackend().embedded_helper_source("\n".join(bodies))
+    if embedded:
         all_imports.add("import types")
 
     # -- assemble -----------------------------------------------------------
@@ -413,6 +418,8 @@ def generate_standalone_file(
 
     if runtime_source is not None:
         parts.append(runtime_source)
+    if embedded:
+        parts.append(embedded)
     if dispatch_keys is not None:
         parts.extend(
             [
