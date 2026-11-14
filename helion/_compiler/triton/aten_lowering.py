@@ -840,7 +840,7 @@ def _codegen_float_topk(
     # GB300 measurements favor sort for one row per four-warp program in this
     # crossover range. Multi-row tiles, smaller k, and other targets use topk.
     if (
-        env.backend_name == "triton"
+        env.backend.uses_triton_compiler
         and not is_hip()
         and capability is not None
         and capability[0] == 10

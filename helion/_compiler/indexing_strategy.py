@@ -17,7 +17,6 @@ from torch._prims_common import compute_required_storage_length
 from .. import exc
 from .._compat import fp8_block_ptr_padding_broken
 from .._compat import get_tensor_descriptor_fn_name
-from .._compat import supports_block_ptr
 from .._utils import next_power_of_2
 from .ast_extension import expr_from_string
 from .compile_environment import CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
@@ -38,6 +37,7 @@ if TYPE_CHECKING:
     from ..runtime.config import Config
     from ..runtime.config import IndexingLiteral
     from .device_function import TensorDescriptorArg
+    from .generate_ast import GenerateAST
     from .inductor_lowering import CodegenState
 
     SymIntLike = torch.SymInt | int
@@ -570,14 +570,28 @@ def _scalar_tensor_index_expr(
 
 
 def _in_warp_specialized_loop(state: CodegenState) -> bool:
-    env = CompileEnvironment.current()
-    specialized = state.device_function.config.range_warp_specializes
+    return in_warp_specialized_loop(
+        state.device_function, state.codegen, requested=False
+    )
+
+
+def in_warp_specialized_loop(
+    device_function: DeviceFunction, codegen: GenerateAST, *, requested: bool
+) -> bool:
+    """Whether an active loop warp-specializes with Triton (or, ``requested``,
+    by its config, whichever backend implements it)."""
+    config = device_function.config
+    specialized = (
+        config.range_warp_specializes
+        if requested
+        else CompileEnvironment.current().backend.range_warp_specializes(config)
+    )
     return any(
         loops
-        and env.config_spec.range_warp_specialize.config_get(
+        and CompileEnvironment.current().config_spec.range_warp_specialize.config_get(
             specialized, block_idx, None
         )
-        for block_idx, loops in state.codegen.active_device_loops.items()
+        for block_idx, loops in codegen.active_device_loops.items()
     )
 
 
@@ -653,9 +667,9 @@ class IndexingStrategy:
         if indexing_literal == "tensor_descriptor":
             return TensorDescriptorIndexingStrategy()
         if indexing_literal == "block_ptr":
-            if not supports_block_ptr():
-                # Triton >= 3.9 removed block pointers; keep configs that
-                # name them working by lowering them as pointer indexing.
+            if not CompileEnvironment.current().backend.supports_block_ptr_indexing():
+                # Triton >= 3.9 and Gluon have no block pointers; keep configs
+                # that name them working by lowering them as pointer indexing.
                 global _warned_block_ptr_fallback
                 if not _warned_block_ptr_fallback:
                     _warned_block_ptr_fallback = True
@@ -1294,14 +1308,17 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             return False
 
         # Additional tensor descriptor requirements:
-        # 1) ndim must be between 2 and 5
-        if not (2 <= fake_tensor.ndim <= 5):
+        # 1) ndim must be between 2 and 5, every extent positive (a dynamic
+        # extent's class keys its emptiness)
+        env = CompileEnvironment.current()
+        if not (2 <= fake_tensor.ndim <= 5) or any(
+            env.size_hint(size) == 0 for size in fake_tensor.size()
+        ):
             return False
 
         # 2) Exactly one dimension must be contiguous. Triton may permute the
         # descriptor so this dimension is last, but support checks are easier
         # to express in the original tensor dimension order.
-        env = CompileEnvironment.current()
         config = DeviceFunction.current().config
         element_size = fake_tensor.element_size()
         layout_signature = env.tensor_descriptor_layout_signature(fake_tensor)
@@ -1333,18 +1350,24 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             # classifier. Keep its descriptor access on pointer indexing.
             return False
 
-        def valid_block_size(
-            block_size: int | torch.SymInt | None,
-            stride: int | torch.SymInt,
-            idx: int,
-            dim_size: int | torch.SymInt,
-        ) -> bool:
+        exceed = env.backend.tiles_exceed_extents
+
+        def valid_block_size(block_size: int | torch.SymInt | None, idx: int) -> bool:
+            """``idx``: the tensor dimension."""
             if (
                 not isinstance(block_size, int)
                 or block_size <= 0
                 or (
                     env.device.type == "cuda"
                     and block_size > CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
+                    # A contiguous dim wider than the 128-byte swizzle is
+                    # issued as several boxes of at most 256.
+                    and not (
+                        exceed
+                        and idx == stride_one_dim
+                        and block_size * element_size % 128 == 0
+                        and block_size * element_size <= 1024
+                    )
                 )
                 or block_size & (block_size - 1) != 0
             ):
@@ -1363,27 +1386,31 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                     return False
 
             # CUDA TMA descriptors require boxDim <= tensorDim in every
-            # dimension (see PR #2555). For a statically-known size we compare
-            # directly; for a symbolic/dynamic dimension (e.g. an unspecialized
-            # matmul M) we compare against the size hint, which is the
-            # dimension's extent while the autotuner benchmarks. Matmul
-            # block-size overshoot can raise a block above a small dynamic dim,
-            # which would otherwise build an invalid descriptor and crash with a
-            # misaligned-address error.
-            dim_extent = (
-                dim_size if isinstance(dim_size, int) else env.size_hint(dim_size)
-            )
-            if block_size > dim_extent:
+            # dimension (see PR #2555) unless the backend's tiles exceed
+            # extents. For a statically-known size we compare directly; for a
+            # symbolic/dynamic dimension (e.g. an unspecialized matmul M) we
+            # compare against the size hint, which is the dimension's extent
+            # while the autotuner benchmarks. Matmul block-size overshoot can
+            # raise a block above a small dynamic dim, which would otherwise
+            # build an invalid descriptor and crash with a misaligned-address
+            # error.
+            if not exceed and block_size > env.size_hint(fake_tensor.size(idx)):
                 return False
 
             # Tensor-descriptor path (TMA + WGMMA / stmatrix writes)
             # moves data in 16-byte chunks. Enforce a 16-byte minimum so the
             # generated stores stay aligned and avoid misaligned-address errors.
-            # Leading batch dims sit outside the 2D smem tile and need only fit.
-            batch = isinstance(stride, int) and any(
-                isinstance(s, int) and 1 < s < stride for s in fake_tensor.stride()
+            # Leading batch dims sit outside the 2D smem tile and need only fit:
+            # the tile is the descriptor's last two dims (the contiguous one
+            # moved last).
+            order = [d for d in range(fake_tensor.ndim) if d != stride_one_dim]
+            batch = idx in order[: fake_tensor.ndim - 2]
+            # TMA itself constrains only the contiguous box dimension; a load's
+            # other tile dimension needs only a swizzle atom of rows.
+            outer_load = (
+                exceed and not for_store and idx != stride_one_dim and block_size >= 8
             )
-            return batch or block_size * element_size >= 16
+            return batch or outer_load or block_size * element_size >= 16
 
         # 4) Validate subscript forms and collect the descriptor block_shape in
         # tensor-dimension order. Scalar indices become block_shape=1, which is
@@ -1393,7 +1420,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         sizes = fake_tensor.size()
         strides = fake_tensor.stride()
         if env.index_dtype == torch.int64 and (
-            not config.host_tensor_descriptors
+            not CompileEnvironment.current().backend.host_tensor_descriptors(config)
             or not all(_tensor_dimension_fits_int32(size) for size in sizes)
         ):
             # Preserve the established fallback for device-created descriptors.
@@ -1417,7 +1444,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 block_size = env.allocate_reduction_dimension(slice_size).from_config(
                     config
                 )
-                if not valid_block_size(block_size, stride, i, size):
+                if not valid_block_size(block_size, len(descriptor_block_shape)):
                     return False
                 assert isinstance(block_size, int)
                 descriptor_block_shape.append(block_size)
@@ -1430,14 +1457,14 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                     if tile_info.block_size is not None
                     else env.block_sizes[tile_info.block_id].from_config(config)
                 )
-                if not valid_block_size(block_size, stride, i, size):
+                if not valid_block_size(block_size, len(descriptor_block_shape)):
                     return False
                 assert isinstance(block_size, int)
                 descriptor_block_shape.append(block_size)
             elif isinstance(k, torch.SymInt):
                 if (origin := _block_size_origin(k)) is not None:
                     block_size = env.block_sizes[origin.block_id].from_config(config)
-                    if not valid_block_size(block_size, stride, i, size):
+                    if not valid_block_size(block_size, len(descriptor_block_shape)):
                         return False
                     assert isinstance(block_size, int)
                     descriptor_block_shape.append(block_size)
@@ -1450,7 +1477,9 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                     if not _scalar_symint_can_codegen_as_scalar(k):
                         return False
             elif isinstance(k, torch.Tensor):
-                if not config.host_tensor_descriptors:
+                if not CompileEnvironment.current().backend.host_tensor_descriptors(
+                    config
+                ):
                     # Device-produced descriptor coordinates are part of the
                     # host-descriptor feature; keep the legacy device-created
                     # descriptor path unchanged.
@@ -1462,7 +1491,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 if info is None:
                     return False
                 block_size = _resolve_configured_extent(info.extent, config)
-                if not valid_block_size(block_size, stride, i, size):
+                if not valid_block_size(block_size, len(descriptor_block_shape)):
                     return False
                 assert block_size is not None
                 descriptor_block_shape.append(block_size)
@@ -1473,12 +1502,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         # least 16 bytes. This catches cases like g[batch, tile_t, head], where
         # scalar head indexing would emit block_shape=[1, block_t, 1] and the
         # stride-one dimension would move only one element.
-        return valid_block_size(
-            descriptor_block_shape[stride_one_dim],
-            fake_tensor.stride(stride_one_dim),
-            stride_one_dim,
-            fake_tensor.size(stride_one_dim),
-        )
+        return valid_block_size(descriptor_block_shape[stride_one_dim], stride_one_dim)
 
     def codegen_load(
         self,
@@ -1499,10 +1523,25 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 cache_modifier,
             )
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
+        if indexing.broadcasts_tile and not indexing.pad_overshoot():
+            # The box holds a broadcast tile dim as 1 (see ``needs_pointer``).
+            return PointerIndexingStrategy().codegen_load(
+                state,
+                fake_tensor,
+                subscript,
+                extra_mask,
+                eviction_policy,
+                cache_modifier,
+            )
 
         # Load from tensor descriptor with permuted offsets
+        backend = CompileEnvironment.current().backend
         load_expr = expr_from_string(
-            f"{indexing.tensor_descriptor(state)}.load({indexing.offsets_str_permuted(state)})"
+            backend.descriptor_call(
+                "load",
+                indexing.tensor_descriptor(state),
+                indexing.offsets_str_permuted(state),
+            )
         )
 
         # Apply inverse permutation to the loaded result if needed
@@ -1542,6 +1581,10 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         indexing = BlockedSubscriptIndexing.create(
             state, fake_tensor, subscript, for_store=True
         )
+        if indexing.broadcasts_tile and not indexing.pad_overshoot():
+            return PointerIndexingStrategy().codegen_store(
+                state, fake_tensor, subscript, value, extra_mask, cache_modifier
+            )
         state.device_function.note_tma_store(
             warp_specialized=_in_warp_specialized_loop(state)
         )
@@ -1558,8 +1601,13 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 store_val=store_value,
             )
 
+        backend = CompileEnvironment.current().backend
         return expr_from_string(
-            f"{indexing.tensor_descriptor(state)}.store({indexing.offsets_str_permuted(state)}, {{value}})",
+            backend.descriptor_call(
+                "store",
+                indexing.tensor_descriptor(state),
+                f"{indexing.offsets_str_permuted(state)}, {{value}}",
+            ),
             value=store_value,
         )
 
@@ -1600,6 +1648,8 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         indexing = BlockedSubscriptIndexing.create(
             state, fake_tensor, subscript, for_store=True
         )
+        if indexing.broadcasts_tile and not indexing.pad_overshoot():
+            return fallback(op, state, fake_tensor, subscript, value, sem)
         state.device_function.note_tma_store(
             warp_specialized=_in_warp_specialized_loop(state)
         )
@@ -2307,6 +2357,11 @@ class SubscriptIndexing(NamedTuple):
                 assert isinstance(ast_index, (list, tuple))
                 index_var = state.codegen.lift(ast_index[n], prefix="index").id
 
+                if should_broadcast and not tensor_indexer_broadcast_dims:
+                    # Only 0-d tensor indexers: each indexes like an int.
+                    block_dims.append(False)
+                    index_values.append(f"({index_var})")
+                    continue
                 # Use broadcast handling for: multiple tensors, or single tensor with ndim > 1
                 if should_broadcast:
                     idx_val, new_masks = handle_broadcast_tensor(
@@ -2424,6 +2479,10 @@ class BlockedSubscriptIndexing:
     reshaped_size: list[int | torch.SymInt] = dataclasses.field(default_factory=list)
     # A tile wider than 1 landed on a size-1 dim, which the block holds as 1
     broadcasts_tile: bool = False
+    # Per such dim: its index in ``block_shape``, the tile's block size and id.
+    broadcast_dims: list[tuple[int, int | torch.SymInt, int]] = dataclasses.field(
+        default_factory=list
+    )
 
     def needs_pointer(self) -> bool:
         """Whether pointer indexing must stand in: the block holds a broadcast
@@ -2435,6 +2494,26 @@ class BlockedSubscriptIndexing:
         return self.broadcasts_tile or all(
             env.known_equal(size, 1) for size in self.block_shape
         )
+
+    def pad_overshoot(self) -> bool:
+        """Widen the box over broadcast dims whose tile spans a one-element
+        extent (a matmul block overshooting a size-1 dim): TMA zero-fills a
+        load's padded lanes and drops a store's, as the pointer path's mask
+        would.  False (box unchanged) if a wider loop indexes a broadcast dim."""
+        env = CompileEnvironment.current()
+        sizes = [
+            env.block_sizes[env.canonical_block_id(block_id)].size
+            for _, _, block_id in self.broadcast_dims
+        ]
+        if not all(
+            isinstance(size, (int, torch.SymInt)) and env.known_equal(size, 1)
+            for size in sizes
+        ):
+            return False
+        for dim, block_size, _ in self.broadcast_dims:
+            self.block_shape[dim] = block_size
+        self.broadcasts_tile = False
+        return True
 
     def make_block_ptr(self, state: CodegenState) -> ast.AST:
         name = state.device_function.tensor_arg(self.base).name
@@ -2467,7 +2546,9 @@ class BlockedSubscriptIndexing:
         offsets = self.offsets
         if desc_arg.permutation is not None:
             offsets = [offsets[i] for i in desc_arg.permutation]
-        if DeviceFunction.current().config.host_tensor_descriptors:
+        if CompileEnvironment.current().backend.host_tensor_descriptors(
+            DeviceFunction.current().config
+        ):
             # Host-descriptor coordinates are int32 even when a scalar tensor
             # subscript independently carries int64 values. Descriptor selection
             # proves each dimension fits before this narrowing conversion.
@@ -2591,12 +2672,15 @@ class BlockedSubscriptIndexing:
                     if allow_descriptor_coordinates
                     else None
                 )
+                # The index adds no masked lanes, and TMA fills lanes past the
+                # tensor's end with zeros: a load whose masked lanes must read
+                # 0 (a reduction or dot operand) keeps that value.
                 contiguous = (
                     info is not None
                     and _contiguous_integer_tensor_index_base(state, info) is not None
                     and (
                         state.fx_node is None
-                        or "masked_value" not in state.fx_node.meta
+                        or state.fx_node.meta.get("masked_value") in (None, 0)
                     )
                 )
                 if (
@@ -2677,11 +2761,14 @@ class BlockedSubscriptIndexing:
                     res.offsets.append(f"({offset_var} + {offset_expr})")
                     res.block_shape.append(tile_info.resolved_block_size_var(env))
                 else:
+                    block_size = tile_info.resolved_block_size_var(env)
+                    if is_wide(block_size, block_id):
+                        res.broadcasts_tile = True
+                        res.broadcast_dims.append(
+                            (len(res.block_shape), block_size, block_id)
+                        )
                     res.offsets.append("0")
                     res.block_shape.append(1)
-                    res.broadcasts_tile |= is_wide(
-                        tile_info.resolved_block_size_var(env), block_id
-                    )
             elif isinstance(k, torch.SymInt):
                 if (origin := _block_size_origin(k)) is not None:
                     block_id = _resolve_codegen_block_id(state, origin.block_id)
@@ -2689,9 +2776,13 @@ class BlockedSubscriptIndexing:
                         res.offsets.append(state.codegen.offset_var(block_id))
                         res.block_shape.append(k)
                     else:
+                        if is_wide(k, block_id):
+                            res.broadcasts_tile = True
+                            res.broadcast_dims.append(
+                                (len(res.block_shape), k, block_id)
+                            )
                         res.offsets.append("0")
                         res.block_shape.append(1)
-                        res.broadcasts_tile |= is_wide(k, block_id)
                 else:
                     if (index_ast := _subscript_index_ast(state, n)) is not None:
                         res.offsets.append(

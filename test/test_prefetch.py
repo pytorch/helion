@@ -151,13 +151,15 @@ class TestPrefetch(RefEagerTestDisabled, TestCase):
         self.assertIn("rindex_1", line)
 
     @skipIfCudaCapabilityLessThan((9, 0), reason="cp.async.bulk needs sm90")
-    def test_scalar_prefetch_issues_from_one_thread(self) -> None:
+    def test_scalar_prefetch_issues_from_one_lane_per_warp(self) -> None:
         x = torch.randn(1000, device=DEVICE)
         code, out = code_and_output(scale_prefetched, (x,), block_sizes=[256])
         torch.testing.assert_close(out, x * 2)
         (line,) = _prefetch_lines(code)
         self.assertIn(_BULK, line)
-        self.assertIn("%tid.x", line)
+        # An elected lane, not %tid.x (which costs ptxas its uniformity analysis).
+        self.assertIn("elect.sync", line)
+        self.assertNotIn("%tid.x", line)
 
     def test_gather_and_extra_mask_prefetch_per_element(self) -> None:
         x = torch.randn(50, 300, device=DEVICE)

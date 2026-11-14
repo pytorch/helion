@@ -1468,7 +1468,7 @@ class GenerateASTFromInductor(DefaultHandler):
         inner_name = self._lift(self._create_cast_expr(x, torch.float32))
 
         env = CompileEnvironment.current()
-        if env.settings.fast_math and env.backend.name == "triton":
+        if env.settings.fast_math and env.backend.uses_triton_compiler:
             # libdevice's fast_dividef / fast_expf exist on the Triton backend
             # only; TileIR shares the Triton codegen and keeps the exact form.
             # The exponent is of -|x| so it never overflows (``fast_expf`` of a
@@ -1510,7 +1510,7 @@ class GenerateASTFromInductor(DefaultHandler):
         so it keeps the exact divide under the setting.
         """
         env = CompileEnvironment.current()
-        if env.backend.name != "triton" or not env.settings.fast_math:
+        if not env.backend.uses_triton_compiler or not env.settings.fast_math:
             return self._default("truediv", (a, b), {})
         node = V.current_node
         if node is None or not _is_plain_true_division(node):
@@ -1583,7 +1583,7 @@ class GenerateASTFromInductor(DefaultHandler):
         # Retain the legacy dtype correction for non-opmath Triton products.
         # Opmath products round once at the FX node boundary instead, including
         # fused inner math such as the scalar multiplication in add(alpha=...).
-        if CompileEnvironment.current().backend.name != "triton":
+        if not CompileEnvironment.current().backend.uses_triton_compiler:
             return self._default("mul", (a, b), {})
 
         result_expr = self._parse_op(self.parent_handler.mul(a, b))
@@ -1799,7 +1799,13 @@ class GraphInterpreter(LoweringContext, Interpreter):
                     # pyrefly: ignore [no-matching-overload]
                     self.env.update(exchanged)
                     try:
-                        result = lowering.codegen(self, n)
+                        result = (
+                            CompileEnvironment.current().backend.codegen_node(self, n)
+                            if CompileEnvironment.has_current()
+                            else NotImplemented
+                        )
+                        if result is NotImplemented:
+                            result = lowering.codegen(self, n)
                     finally:
                         self.env.update(own_values)
                     n.meta["codegen"] = result

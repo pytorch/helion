@@ -21,13 +21,18 @@ from ...language.memory_ops import prefetch_is_bulk
 from ...language.memory_ops import store
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
+from ..cross_loop_codegen import TaggedPeerFallback
 from ..indexing_strategy import SubscriptIndexing
 from ..indexing_strategy import _resolve_codegen_block_id
 from .distributed_ops import inband_load_codegen
 from .distributed_ops import inband_store_codegen
+from .distributed_ops import tagged_access
+from .distributed_ops import tagged_store_codegen
+from .prefetch import prefetch_asm
 
 if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
+    from .gluon_ops import SharedValue
 
 
 # Map short config names to full Triton API names for eviction policies
@@ -72,7 +77,9 @@ def _(state: CodegenState) -> ast.AST:
             if modifier_idx < len(modifiers) and modifiers[modifier_idx]:
                 cache_modifier = ast.Constant(value=modifiers[modifier_idx])
 
-        codegen_store = inband_store_codegen(state, strategy.codegen_store)
+        codegen_store = tagged_store_codegen(
+            state, inband_store_codegen(state, strategy.codegen_store)
+        )
         if state.codegen.store_transform is not None:
             return state.codegen.store_transform(
                 state,
@@ -112,7 +119,7 @@ def _(state: CodegenState) -> ast.AST:
 
 
 @_decorators.codegen(load, "triton")
-def _(state: CodegenState) -> ast.AST:
+def _(state: CodegenState) -> ast.AST | SharedValue:
     # A store to this tensor earlier in the same loop body followed by this load
     # is a cross-thread read-after-write on global memory; emit a barrier so the
     # store is visible before the read (see mark_intra_loop_raw_barriers).
@@ -174,6 +181,23 @@ def _(state: CodegenState) -> ast.AST:
         strategy = device_fn.get_indexing_strategy(indexing_idx)
 
         codegen_load = inband_load_codegen(state, strategy.codegen_load)
+        # A ring slot replaces a plain load (not an in-band poll or a fusion).
+        if (
+            device_fn.ring is not None
+            and codegen_load == strategy.codegen_load
+            and state.codegen.load_transform is None
+            and (
+                ring_slot := device_fn.ring.codegen_load(
+                    state, tensor, [*subscript], extra_mask, strategy
+                )
+            )
+        ):
+            return ring_slot
+        if (access := tagged_access(state)) is not None:
+            # Only a ring producer reads a tagged allocation (its mirror).
+            raise TaggedPeerFallback(
+                f"T6: {access.tensor_name}: a consumer load that is not a ring operand"
+            )
         if state.codegen.load_transform is not None:
             return state.codegen.load_transform(
                 state,
@@ -185,9 +209,14 @@ def _(state: CodegenState) -> ast.AST:
                 codegen_load,
             )
 
-        return codegen_load(
+        value = codegen_load(
             state, tensor, [*subscript], extra_mask, eviction_policy, cache_modifier
         )
+        if CompileEnvironment.current().backend_name == "gluon" and state.fx_node:
+            from .gluon_ops import plan_load  # Gluon needs Triton >= 3.8: gluon only
+
+            plan_load(device_fn, state.fx_node, value)
+        return value
     if isinstance(tensor, tuple):
         from ..indexing_strategy import StackIndexingStrategy
 
@@ -207,32 +236,6 @@ def _(state: CodegenState) -> ast.AST:
             cache_modifier,
         )
     raise NotImplementedError(f"Unsupported tensor type: {type(tensor)}")
-
-
-def _prefetch_asm(*, bulk: bool, scalar: bool) -> str:
-    """PTX for one L2 prefetch per element of the pointer operand ($1).
-
-    The plain form issues ``prefetch.global.L2`` unless the int32 predicate
-    ($2) is 0.  The bulk form's $2 is a byte count instead, skipped unless
-    positive, and widens [$1, $1 + $2) to the 16-byte granules
-    ``cp.async.bulk`` requires (a granule never crosses a page).  A scalar
-    prefetch is issued by thread 0 alone instead of by every thread.
-    """
-    if bulk:
-        regs = ".reg .pred p; .reg .b32 t, n; .reg .b64 a, e;"
-        test = "setp.gt.s32 p, $2, 0;"
-        issue = (
-            "and.b64 a, $1, -16; cvt.s64.s32 e, $2; add.s64 e, e, $1; "
-            "add.s64 e, e, 15; and.b64 e, e, -16; sub.s64 e, e, a; "
-            "cvt.u32.u64 n, e; @p cp.async.bulk.prefetch.L2.global [a], n;"
-        )
-    else:
-        regs = ".reg .pred p; .reg .b32 t;"
-        test = "setp.ne.b32 p, $2, 0;"
-        issue = "@p prefetch.global.L2 [$1];"
-    if scalar:
-        test += " mov.u32 t, %tid.x; setp.eq.and.u32 p, t, 0, p;"
-    return f"{{ {regs} {test} {issue} }} mov.u32 $0, 0;"
 
 
 def _prefetch_row_segment(
@@ -258,7 +261,8 @@ def _prefetch_row_segment(
 
 @_decorators.codegen(prefetch, "triton")
 def _(state: CodegenState) -> None:
-    if CompileEnvironment.current().ptx_capability is None:
+    capability = CompileEnvironment.current().ptx_capability
+    if capability is None:
         return None  # both prefetch instructions are PTX
     tensor = state.proxy_arg(0)
     assert isinstance(tensor, torch.Tensor)
@@ -286,7 +290,9 @@ def _(state: CodegenState) -> None:
     scalar = extra_mask is None and not SubscriptIndexing.compute_shape(
         tensor, index, state
     )
-    asm = _prefetch_asm(bulk=segment is not None, scalar=scalar)
+    asm = prefetch_asm(
+        bulk=segment is not None, scalar=scalar, elect=capability >= (9, 0)
+    )
     state.add_statement(
         statement_from_string(
             f"tl.inline_asm_elementwise({asm!r}, '=r,l,r', "

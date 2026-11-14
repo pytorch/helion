@@ -125,7 +125,7 @@ class BarrierOnlyAllowedAtTopLevel(BaseError):
 class PdlPlacement(BaseError):
     message = (
         "PDL ops run on the host before the first top level loop (entry) or after "
-        "the last one (exit); hl.pdl_wait() only at entry."
+        "the last one (exit); hl.pdl_wait() and hl.prefetch_code() only at entry."
     )
 
 
@@ -510,8 +510,8 @@ class BaseWarning(_FixedMessage):
 
 class BlockPtrIndexingUnavailable(BaseWarning):
     message = (
-        "indexing='block_ptr' was requested, but this Triton build has no block "
-        "pointers (removed in Triton 3.9); using pointer indexing instead."
+        "indexing='block_ptr' was requested, but this backend has no block pointers "
+        "(the gluon backend, or Triton >= 3.9); using pointer indexing instead."
     )
 
 

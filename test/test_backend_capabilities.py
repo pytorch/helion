@@ -45,9 +45,11 @@ class TestCapabilityHooks(unittest.TestCase):
             self.assertEqual(str(error), f"Backend '{name}' does not support: a detail")
 
     def test_table(self) -> None:
-        for name, backend in _backends().items():
+        for registered, backend in _backends().items():
             codegen_name = backend.codegen_name
-            with self.subTest(backend=name):
+            # The gluon backend answers as Triton, whose lowering it compiles.
+            name = "triton" if registered == "gluon" else registered
+            with self.subTest(backend=registered):
                 self.assertEqual(
                     backend.reserved_device_names(),
                     frozenset({"_"}) if name == "cute" else frozenset(),
@@ -63,6 +65,7 @@ class TestCapabilityHooks(unittest.TestCase):
                 )
                 self.assertFalse(backend.prefers_wall_clock_bench())
                 triton_barriers = codegen_name == "triton" and name != "tileir"
+                self.assertEqual(backend.uses_triton_compiler, name == "triton")
                 self.assertEqual(backend.supports_inter_loop_barriers, triton_barriers)
                 self.assertEqual(
                     backend.supports_intra_loop_barriers(
@@ -171,7 +174,8 @@ class TestCapabilityHooks(unittest.TestCase):
                     backend.finish_device_loop_body(arg, arg, outputs, {})
                 )
                 self.assertEqual(outputs, [arg])
-                self.assertEqual(backend.finalize_kernel_def(arg, [], arg), [])
+                if name != "gluon":  # gluon finalizes its ring and pipelining
+                    self.assertEqual(backend.finalize_kernel_def(arg, [], arg), [])
                 statements: list[object] = [arg]
                 result = backend.finalize_host_statements(arg, arg, statements)
                 self.assertIs(result[0], statements)

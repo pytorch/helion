@@ -1727,11 +1727,16 @@ class DeviceIRAnalysis:
         """Record allocation-coordinate accesses used for cross-root scheduling."""
         from ..language import memory_ops
         from ..language.atomic_ops import ATOMIC_OPS
+        from ..language.quantized_ops import load_bfloat16_x16_to_float16
+        from ..language.quantized_ops import load_float4_e2m1fn_x16_to_float16
         from .tile_dependency import TileAccess
         from .tile_dependency import owner_roots_by_graph_id
 
         if len(device_ir.root_ids) <= 1:
             return ()
+        # Loads of the tensor they are passed at flat offsets (a footprint of
+        # the whole tensor), not memory ops of the indexing config.
+        flat_loads = (load_float4_e2m1fn_x16_to_float16, load_bfloat16_x16_to_float16)
 
         graph_owners = owner_roots_by_graph_id(device_ir)
         allocation_ids: dict[torch.UntypedStorage, int] = {}
@@ -1742,10 +1747,12 @@ class DeviceIRAnalysis:
             for graph_node_index, node in enumerate(graph_analysis.nodes):
                 if node.op != "call_function":
                     continue
-                is_load = node.target is memory_ops.load
+                is_flat_load = node.target in flat_loads
+                is_load = node.target is memory_ops.load or is_flat_load
                 is_store = node.target is memory_ops.store
                 is_atomic = node.target in ATOMIC_OPS
-                if not (is_load or is_store or is_atomic):
+                if not (is_load or is_store or is_atomic) or is_flat_load:
+                    # A flat load of symmetric memory is no peer load either.
                     if env.process_group_name is not None and (
                         _may_access_memory_unseen(node, host.compiler_state)
                     ):
@@ -1753,7 +1760,8 @@ class DeviceIRAnalysis:
                             f"because {node.name} may access another rank's "
                             "memory outside a load or store"
                         )
-                    continue
+                    if not is_flat_load:
+                        continue
 
                 fake = _accessed_tensor_fake(node)
                 if fake is not None:
@@ -1814,6 +1822,15 @@ class DeviceIRAnalysis:
                     tensor_shape = symbolic_layout[:rank]
                     tensor_strides = symbolic_layout[rank : 2 * rank]
                     storage_offset = symbolic_layout[-1]
+                    # Local views of a symmetric allocation are placed from its
+                    # base, as its peer views are.
+                    base = host.compiler_state.symmetric_bases.get(
+                        fake.untyped_storage()
+                    )
+                    if base is not None:
+                        storage_offset = env.shape_env.simplify(
+                            storage_offset - sympy.sympify(base)
+                        )
                     index_list = node.args[1] if len(node.args) >= 2 else None
                     if isinstance(index_list, (list, tuple)):
                         subscript_dims = tuple(range(min(len(index_list), fake.ndim)))
@@ -1867,7 +1884,9 @@ class DeviceIRAnalysis:
                     accesses.append(
                         TileAccess(
                             access_id=len(accesses),
-                            memory_op_index=memory_op_index if not is_atomic else -1,
+                            memory_op_index=(
+                                -1 if is_atomic or is_flat_load else memory_op_index
+                            ),
                             graph_id=graph_analysis.graph_id,
                             root=owner_root,
                             allocation_id=allocation_id,
@@ -1893,7 +1912,7 @@ class DeviceIRAnalysis:
                             affine_subscript_ranges=affine_subscript_ranges,
                         )
                     )
-                if not is_atomic:
+                if not (is_atomic or is_flat_load):
                     memory_op_index += 1
 
         return tuple(accesses)

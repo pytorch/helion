@@ -1274,7 +1274,9 @@ class TileStrategy:
             config.range_unroll_factors, block_idx, 0
         )
         range_warp_specialize = env.config_spec.range_warp_specialize.config_get(
-            config.range_warp_specializes, block_idx, None
+            CompileEnvironment.current().backend.range_warp_specializes(config),
+            block_idx,
+            None,
         )
         range_num_stages = env.config_spec.range_num_stages.config_get(
             config.range_num_stages, block_idx, 0
@@ -1291,8 +1293,13 @@ class TileStrategy:
             if range_num_stages > 0 and not config.host_tensor_descriptors:
                 range_num_stages = 0
             # Host construction has not established that descriptor indexing
-            # is safe with both unrolling and a separate kernel-level pipeline.
-            if range_unroll_factor > 0 and num_stages > 1:
+            # is safe with both unrolling and a separate kernel-level pipeline
+            # (Triton's: gluon has none, its num_stages is the ring's depth).
+            if (
+                range_unroll_factor > 0
+                and num_stages > 1
+                and env.backend.name != "gluon"
+            ):
                 range_unroll_factor = 0
         elif (
             range_num_stages > 1

@@ -11,12 +11,14 @@ from typing import Literal
 from typing import cast
 
 import torch
+from torch.utils._pytree import tree_map_only
 
 from .ast_extension import create
 from .ast_extension import create_arg
 from .ast_extension import create_arguments
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
+from .compile_environment import CompileEnvironment
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -172,11 +174,44 @@ class HelperFunctionManager:
     def __init__(self) -> None:
         self.helper_functions: dict[str, HelperFunctionGraphInfo] = {}
         self._final_names: dict[str, str] = {}
+        self._by_structure: dict[tuple[object, ...], str] = {}
 
     def register_helper_function(
         self, helper_graph_info: HelperFunctionGraphInfo, final_name: str
     ) -> None:
-        """Register a helper function to be generated at global scope."""
+        """Register a helper function to be generated at global scope; one
+        identical to a registered helper (every reduction's combine function)
+        shares its definition."""
+        graph = helper_graph_info.graph
+        index = {node: i for i, node in enumerate(graph.nodes)}
+
+        def ref(node: torch.fx.Node) -> torch.fx.node.Argument:
+            return ("node", index[node])
+
+        def value(node: torch.fx.Node) -> str:
+            # The generated body depends on each value's dtype (casts, constants).
+            return repr(
+                tree_map_only(
+                    torch.Tensor,
+                    lambda t: (t.dtype, tuple(t.shape)),
+                    node.meta.get("val"),
+                )
+            )
+
+        structure = tuple(
+            (
+                node.op,
+                str(node.target),
+                repr(torch.fx.node.map_arg(node.args, ref)),
+                repr(torch.fx.node.map_arg(node.kwargs, ref)),
+                value(node),
+            )
+            for node in graph.nodes
+        )
+        same = self._by_structure.setdefault(structure, helper_graph_info.name)
+        if same != helper_graph_info.name:
+            self._final_names[helper_graph_info.name] = self._final_names[same]
+            return
         self.helper_functions[helper_graph_info.name] = helper_graph_info
         self._final_names[helper_graph_info.name] = final_name
 
@@ -210,7 +245,11 @@ class HelperFunctionManager:
                 name=final_name,
                 args=create_arguments(args),
                 body=func_body,
-                decorator_list=[expr_from_string("triton.jit")],
+                decorator_list=[
+                    expr_from_string(
+                        CompileEnvironment.current().backend.helper_decorator
+                    )
+                ],
                 type_params=[],
             )
 

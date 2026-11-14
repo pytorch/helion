@@ -1699,7 +1699,8 @@ def _check_no_stmts_between_loops(body: list[ast.stmt]) -> None:
 
 
 def _place_pdl_ops(body: list[ast.stmt]) -> None:
-    """Run top level hl.pdl_* ops at entry if they precede the loops, else at exit."""
+    """Run top level hl.pdl_* ops at entry if they precede the loops, else at
+    exit; hl.prefetch_code() marks the kernel (entry only)."""
     env = CompileEnvironment.current()
     seen_loop = False
     for stmt in body:
@@ -1720,8 +1721,14 @@ def _place_pdl_ops(body: list[ast.stmt]) -> None:
             raise exc.PdlPlacement
         op = ops[0]._type_info
         assert isinstance(op, PdlResultType) and isinstance(op.value, str)
-        if seen_loop and op.value == "wait":
+        if seen_loop and op.value in ("wait", "prefetch_code"):
             raise exc.PdlPlacement
+        if op.value == "prefetch_code":
+            # The cubin pass resolves sm_90+ relocations (``.rela.nv.global.init``;
+            # older targets emit ``.rel``): elsewhere the kernel is not marked.
+            capability = env.ptx_capability
+            env.prefetch_code = capability is not None and capability >= (9, 0)
+            continue
         # griddepcontrol needs sm_90; older targets run in plain stream order.
         capability = env.backend.pdl_capability(env)
         if capability is not None and capability >= (9, 0):

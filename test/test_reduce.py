@@ -18,8 +18,10 @@ from helion._testing import TestCase
 from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfCute
 from helion._testing import skipIfFn
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfTileIR
 import helion.language as hl
 from helion.language._tracing_ops import _mask_to
 from helion.language.reduce_ops import _reduce
@@ -53,6 +55,11 @@ def max_min_combine_fn(left_max, left_min, right_max, right_min):
 def scaled_max_combine_fn(x, y):
     """Ends in ``torch.maximum`` but scales its right operand first."""
     return torch.maximum(x, y * 2)
+
+
+def scaled_add_combine_fn(x, y):
+    """A sum whose constant takes the input's dtype in the generated helper."""
+    return x + y * 1.0
 
 
 def keep_left_max_combine_fn(x, y):
@@ -318,6 +325,29 @@ class TestReduce(RefEagerTestBase, TestCase):
             # Check that the generated code contains triton reduce calls
             self.assertIn("tl.reduce", code)
             self.assertIn("add_combine_fn_", code)
+
+    @skipIfCute("CuTe supports only builtin hl.reduce combine functions")
+    @skipIfTileIR("TileIR does not compile a custom-combine tl.reduce over bf16")
+    def test_reduce_helpers_keep_their_dtypes(self):
+        """One combine function over a bf16 and an fp32 row: each keeps its own
+        helper (a shared one would cast the fp32 partial sums to bf16)."""
+
+        @helion.kernel(autotune_effort="none")
+        def two_sums(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            out_x = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+            out_y = torch.empty([y.size(0)], dtype=y.dtype, device=y.device)
+            for i in hl.tile(x.size(0)):
+                out_x[i] = hl.reduce(scaled_add_combine_fn, x[i, :], dim=1)
+                out_y[i] = hl.reduce(scaled_add_combine_fn, y[i, :], dim=1)
+            return out_x, out_y
+
+        x = torch.randn([8, 64], device=DEVICE, dtype=torch.bfloat16)
+        y = 1 + torch.rand([8, 64], device=DEVICE) * 1e-3
+        _, (out_x, out_y) = code_and_output(two_sums, (x, y))
+        torch.testing.assert_close(out_y, y.sum(1), rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(out_x, x.sum(1), rtol=2e-2, atol=2e-2)
 
     def test_reduce_max(self):
         """Test reduce with maximum operation."""

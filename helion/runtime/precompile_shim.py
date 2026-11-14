@@ -35,14 +35,19 @@ def _get_helion_compilation_success(kernel: CompiledKernel) -> bool:
     return getattr(kernel, "_helion_compilation_success", True)
 
 
-def _device_probe_values(values: Sequence[object]) -> list[object]:
+def _device_probe_values(
+    values: Sequence[object], *, gluon: bool = False
+) -> list[object]:
     """Launch arguments as seen by device discovery.
 
-    A launch whose every tensor travels as a Triton ``TensorDescriptor`` (all
-    ``tensor_descriptor`` indexing, no bare tensor argument) carries its device
-    only inside the descriptors' ``base`` tensors.
+    A launch whose every tensor travels as a Triton (``gluon``: Gluon)
+    ``TensorDescriptor`` (all ``tensor_descriptor`` indexing, no bare tensor
+    argument) carries its device only inside the descriptors' ``base`` tensors.
     """
-    from triton.tools.tensor_descriptor import TensorDescriptor
+    if gluon:
+        from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
+    else:
+        from triton.tools.tensor_descriptor import TensorDescriptor
 
     return [
         value.base if isinstance(value, TensorDescriptor) else value for value in values
@@ -65,7 +70,12 @@ def make_precompiler(
         # pyrefly: ignore [bad-argument-type]
         args, kwargs = compile_only_launch_args(*args, **kwargs)
         # pyrefly: ignore [bad-argument-type]
-        device = _find_device(_device_probe_values([*args, *kwargs.values()]))
+        device = _find_device(
+            _device_probe_values(
+                [*args, *kwargs.values()],
+                gluon=bound_kernel.env.backend_name == "gluon",
+            )
+        )
         kwargs["debug"] = (
             kwargs.get("debug", fn.debug) or os.environ.get("TRITON_DEBUG", "0") == "1"
         )

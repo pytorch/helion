@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     from .host_function import HostFunction
     from .inductor_lowering import CodegenState
     from .inductor_lowering import GenerateASTFromInductor
+    from .inductor_lowering import GraphInterpreter
     from .program_id import ProgramIDs
     from .reduction_strategy import BlockReductionStrategy
     from .reduction_strategy import ReductionEmitter
@@ -542,6 +543,30 @@ class Backend(abc.ABC):
         return False
 
     @property
+    def tiles_exceed_extents(self) -> bool:
+        """Whether a tile may be larger than its dimension: a size-1 matmul
+        output dimension takes its configured block (``pads_small_matmul_dims``)
+        rather than 1, and a tensor descriptor's box may exceed the tensor
+        (TMA zero-fills a load's excess and drops a store's) and, along the
+        contiguous dimension, 256 elements (issued as several boxes)."""
+        return False
+
+    @property
+    def places_pdl_markers(self) -> bool:
+        """Whether ``finalize_device_body`` takes the kernel's entry markers
+        (``hl.prefetch_code`` and the PDL entry ops) and exit ops in the body and
+        places them itself; otherwise they surround the final body."""
+        return False
+
+    @property
+    def uses_triton_compiler(self) -> bool:
+        """Whether kernels compile through Triton's compiler and GPU targets,
+        whose libdevice, inline PTX, descriptor legality checks and outlined
+        helpers Helion relies on (Triton and Gluon; not TileIR, whose Triton
+        front end feeds another compiler)."""
+        return False
+
+    @property
     def pad_factory_tensors_to_power_of_2(self) -> bool:
         """Whether on-device tensor factory ops (zeros/ones/empty/full/...) should
         have their integer dim sizes rounded up to the next power of 2.
@@ -878,6 +903,23 @@ class Backend(abc.ABC):
     def supports_block_ptr_indexing(self) -> bool:
         """Whether ``indexing="block_ptr"`` is a valid config value for this backend."""
         return True
+
+    def host_tensor_descriptors(self, config: Config) -> bool:
+        """Whether ``config``'s tensor descriptors are built on the host."""
+        return config.host_tensor_descriptors
+
+    def range_warp_specializes(self, config: Config) -> list[bool | None]:
+        """The loops whose warp specialization ``config`` asks the compiler for."""
+        return config.range_warp_specializes
+
+    def descriptor_call(self, method: str, desc: str, args: str) -> str:
+        """A tensor descriptor's ``load`` / ``store`` in generated code."""
+        return f"{desc}.{method}({args})"
+
+    def codegen_node(self, interp: GraphInterpreter, node: torch.fx.Node) -> object:
+        """This backend's own lowering of ``node``, or NotImplemented (its
+        ``Lowering``'s)."""
+        return NotImplemented
 
     def process_fake_tensor_load(
         self,
@@ -1504,6 +1546,12 @@ class Backend(abc.ABC):
         For example, Triton returns 'triton.jit'.
         """
         ...
+
+    @property
+    def helper_decorator(self) -> str:
+        """Expression string for the decorator of the device helper functions a
+        kernel calls (combine functions, outlined helpers)."""
+        return "triton.jit"
 
     def function_decorator_for_args(self, args: Sequence[Argument]) -> str:
         """Expression string for the kernel function decorator.
@@ -2152,6 +2200,14 @@ class Backend(abc.ABC):
         nothing and returns ``[]``.
         """
         return []
+
+    def pipeline_loops(
+        self, body: list[ast.stmt], device_function: DeviceFunction
+    ) -> list[ast.stmt]:
+        """``body`` (a kernel's or an outlined helper's) with its loops software
+        pipelined by the backend; the default returns it unchanged (Triton's
+        compiler pipelines the loops itself)."""
+        return body
 
     def validate_codegen_config(
         self, env: CompileEnvironment, device_ir: DeviceIR, config: Config

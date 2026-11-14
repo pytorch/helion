@@ -192,12 +192,15 @@ def _(
 
 
 def _dot_dimensions(
-    lhs: torch.Tensor, rhs: torch.Tensor
+    lhs: torch.Tensor, rhs: torch.Tensor, k_packing: tuple[int, int] = (1, 1)
 ) -> tuple[int | torch.SymInt, int | torch.SymInt, int | torch.SymInt]:
-    """Return the M, N, and K problem extents for a dot."""
+    """Return the M, N, and K problem extents for a dot (K as ``lhs`` stores it;
+    ``k_packing``: each operand's elements per stored K position)."""
     m, k = lhs.shape[-2:]
     k2, n = rhs.shape[-2:]
-    assert k == k2, f"Mismatched K dimensions for dot: {k} vs {k2}"
+    assert k * k_packing[0] == k2 * k_packing[1], (
+        f"Mismatched K dimensions for dot: {k} vs {k2}"
+    )
     return m, n, k
 
 
@@ -226,14 +229,20 @@ def _static_problem_extent(
     return None if problem_extent is None else _static_dim_value(env, problem_extent)
 
 
-def enforce_dot_requirements(lhs: torch.Tensor, rhs: torch.Tensor) -> int:
-    """Record a matmul fact and apply backend-independent dot constraints."""
-    m, n, k = _dot_dimensions(lhs, rhs)
+def enforce_dot_requirements(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    k_packing: tuple[int, int] = (1, 1),
+    mma_dtypes: tuple[torch.dtype, torch.dtype] | None = None,
+) -> int:
+    """Record a matmul fact and apply backend-independent dot constraints
+    (``mma_dtypes``: the operands' dtypes in the MMA, else their own)."""
+    m, n, k = _dot_dimensions(lhs, rhs, k_packing)
 
     from ..autotuner.config_spec import SMALL_DIM_BLOCK_SIZE_OVERSHOOT
 
     env = CompileEnvironment.current()
-    a, b, c = min_dot_size(lhs.device, lhs.dtype, rhs.dtype)
+    a, b, c = min_dot_size(lhs.device, *(mma_dtypes or (lhs.dtype, rhs.dtype)))
     # M and N are the output tile dims; K is the contraction loop.
     for shape, min_size, is_output_dim in (
         (m, a, True),
@@ -419,10 +428,10 @@ VALID_SCALED_FORMATS = frozenset({"e2m1", "e4m3", "e5m2", "bf16", "fp16"})
 @_decorators.api(is_device_only=True)
 def dot_scaled(
     mat1: torch.Tensor,
-    mat1_scale: torch.Tensor,
+    mat1_scale: torch.Tensor | None,
     mat1_format: str,
     mat2: torch.Tensor,
-    mat2_scale: torch.Tensor,
+    mat2_scale: torch.Tensor | None,
     mat2_format: str,
     acc: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
@@ -436,10 +445,10 @@ def dot_scaled(
 
     Args:
         mat1: First matrix (2D tensor of packed data)
-        mat1_scale: Scale factors for mat1 (2D tensor)
+        mat1_scale: Scale factors for mat1 (2D tensor), or None for a bf16 / fp16 mat1
         mat1_format: Format string for mat1 (one of "e2m1", "e4m3", "e5m2", "bf16", "fp16")
         mat2: Second matrix (2D tensor of packed data)
-        mat2_scale: Scale factors for mat2 (2D tensor)
+        mat2_scale: Scale factors for mat2 (2D tensor), or None for a bf16 / fp16 mat2
         mat2_format: Format string for mat2 (one of "e2m1", "e4m3", "e5m2", "bf16", "fp16")
         acc: Optional accumulator tensor (2D, float32 or float16)
         out_dtype: Optional output dtype for the multiplication
@@ -453,19 +462,19 @@ def dot_scaled(
 @_decorators.prepare_args(dot_scaled)
 def _(
     mat1: torch.Tensor,
-    mat1_scale: torch.Tensor,
+    mat1_scale: torch.Tensor | None,
     mat1_format: str,
     mat2: torch.Tensor,
-    mat2_scale: torch.Tensor,
+    mat2_scale: torch.Tensor | None,
     mat2_format: str,
     acc: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
 ) -> tuple[
     torch.Tensor,
-    torch.Tensor,
+    torch.Tensor | None,
     str,
     torch.Tensor,
-    torch.Tensor,
+    torch.Tensor | None,
     str,
     torch.Tensor | None,
     torch.dtype | None,
@@ -486,14 +495,17 @@ def _(
     if mat2.ndim != 2:
         raise ValueError(f"hl.dot_scaled: mat2 must be a 2D tensor, got {mat2.ndim}D")
 
-    if mat1_scale.ndim != 2:
-        raise ValueError(
-            f"hl.dot_scaled: mat1_scale must be a 2D tensor, got {mat1_scale.ndim}D"
-        )
-    if mat2_scale.ndim != 2:
-        raise ValueError(
-            f"hl.dot_scaled: mat2_scale must be a 2D tensor, got {mat2_scale.ndim}D"
-        )
+    for name, scale, fmt in (
+        ("mat1_scale", mat1_scale, mat1_format),
+        ("mat2_scale", mat2_scale, mat2_format),
+    ):
+        if scale is None:
+            if fmt not in ("bf16", "fp16"):
+                raise ValueError(f"hl.dot_scaled: {name} is None for a {fmt} operand")
+        elif scale.ndim != 2:
+            raise ValueError(
+                f"hl.dot_scaled: {name} must be a 2D tensor, got {scale.ndim}D"
+            )
 
     if acc is not None:
         expected_shape = [mat1.shape[0], mat2.shape[-1]]
@@ -516,8 +528,12 @@ def _(
             f"hl.dot_scaled: out_dtype must be a torch.dtype or None, got {type(out_dtype)}"
         )
 
-    # Enforce minimum block sizes so autotuner picks valid configs.
-    enforce_dot_requirements(mat1, mat2)
+    # Enforce minimum block sizes so autotuner picks valid configs. A packed
+    # e2m1 operand stores two K elements per byte; beside a 16-bit operand an
+    # 8-bit one is upcast for the MMA.
+    packing = (2 if mat1_format == "e2m1" else 1, 2 if mat2_format == "e2m1" else 1)
+    wide = max(mat1.dtype, mat2.dtype, key=lambda dtype: dtype.itemsize)
+    enforce_dot_requirements(mat1, mat2, packing, (wide, wide))
     # K must be >= 32 because scale tensors have shape [dim, K // 32].
     env = CompileEnvironment.current()
     k_dim = mat1.shape[-1]
@@ -540,10 +556,10 @@ def _(
 @_decorators.register_fake(dot_scaled)
 def _(
     mat1: torch.Tensor,
-    mat1_scale: torch.Tensor,
+    mat1_scale: torch.Tensor | None,
     mat1_format: str,
     mat2: torch.Tensor,
-    mat2_scale: torch.Tensor,
+    mat2_scale: torch.Tensor | None,
     mat2_format: str,
     acc: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
@@ -561,16 +577,20 @@ _decorators.post_create_proxy(dot_scaled)(_associate_latest_matmul_fact)
 @_decorators.ref(dot_scaled)
 def _(
     mat1: torch.Tensor,
-    mat1_scale: torch.Tensor,
+    mat1_scale: torch.Tensor | None,
     mat1_format: str,
     mat2: torch.Tensor,
-    mat2_scale: torch.Tensor,
+    mat2_scale: torch.Tensor | None,
     mat2_format: str,
     acc: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    def _dequant(data: torch.Tensor, scale: torch.Tensor, fmt: str) -> torch.Tensor:
+    def _dequant(
+        data: torch.Tensor, scale: torch.Tensor | None, fmt: str
+    ) -> torch.Tensor:
         data_f32 = data.to(torch.float32)
+        if scale is None:
+            return data_f32
         # Scale is in e8m0 format (uint8): value = 2^(byte - 127)
         # e.g. byte=127 means 2^0=1.0, byte=0 means 2^(-127), byte=254 means 2^127
         scale_f32 = torch.pow(2.0, scale.to(torch.float32) - 127.0)

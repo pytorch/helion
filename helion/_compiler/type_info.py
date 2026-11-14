@@ -1661,6 +1661,9 @@ class _PeerViewCapture(TorchDispatchMode):
                 and local.is_contiguous()
             )
             if mapped:
+                HostFunction.current().compiler_state.symmetric_bases[storage] = (
+                    _offset_expr(owners[0])
+                )
                 env.register_runtime_input_specialization(
                     f"symmetric_allocation_base:{source!r}",
                     RuntimeInputSpecialization(
@@ -1671,6 +1674,14 @@ class _PeerViewCapture(TorchDispatchMode):
                             ("data_ptr", "storage_span")
                         ),
                     ),
+                )
+            if all(
+                isinstance(size, int)
+                or isinstance(env.shape_env.replace(size._sympy_()), sympy.Integer)
+                for size in local.shape[1:]
+            ):
+                HostFunction.current().compiler_state.static_peer_layouts.update(
+                    peer.untyped_storage() for peer in result
                 )
             HostFunction.current().compiler_state.peer_views.update(
                 (
