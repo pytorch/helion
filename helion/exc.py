@@ -125,7 +125,7 @@ class BarrierOnlyAllowedAtTopLevel(BaseError):
 class PdlPlacement(BaseError):
     message = (
         "PDL ops run on the host before the first top level loop (entry) or after "
-        "the last one (exit); hl.pdl_wait() and hl.code_warm() only at entry."
+        "the last one (exit); hl.pdl_wait() and hl.prefetch_code() only at entry."
     )
 
 

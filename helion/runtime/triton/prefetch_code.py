@@ -1,11 +1,11 @@
-"""Megakernel code warm.
+"""Megakernel code prefetch.
 
 A megakernel's native text outgrows the launch prefetch window, and the weights
 it and the kernels between its launches stream evict that text from L2, so its
-tasks first run their code from DRAM. Kernels that call ``code_warm()`` (what
-``hl.code_warm()`` lowers to) L2-warm their own text at entry, before their PDL
-wait.
-Importing this module (a generated kernel calling ``code_warm()`` does)
+tasks first run their code from DRAM. Kernels that call ``prefetch_code()`` (what
+``hl.prefetch_code()`` lowers to) prefetch their own text into L2 at entry,
+before their PDL wait.
+Importing this module (a generated kernel calling ``prefetch_code()`` does)
 registers a compiler stage hook: the PTX stage gives a marked kernel a table of
 its entry and helper functions plus the entry loop, and the cubin stage turns the
 table's function relocations into text addresses and writes the text sizes (when
@@ -29,22 +29,22 @@ import triton
 import triton.language as tl
 
 # Compiled kernels are cached under a key that tracks this pass's source.
-_KEY = "helion_code_warm_" + hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+_KEY = "helion_prefetch_code_" + hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 _R_CUDA_64 = 2
 _R_CUDA_DESCRIPTOR = 35
 log: logging.Logger = logging.getLogger(__name__)
 
 
-_CW_TAB = "helion_codewarm_tab"
-_CW_FN = "helion_codewarm_fn"
-_CW_MARK = "// helion code warm"
+_CW_TAB = "helion_prefetch_code_tab"
+_CW_FN = "helion_prefetch_code_fn"
+_CW_MARK = "// helion prefetch code"
 
 
 @triton.jit
-def code_warm():  # noqa: ANN201
-    """Mark the calling kernel to L2-warm its own native text at entry."""
+def prefetch_code():  # noqa: ANN201
+    """Mark the calling kernel to prefetch its own native text into L2 at entry."""
     tl.inline_asm_elementwise(
-        "mov.u32 $0, 0; // helion code warm",
+        "mov.u32 $0, 0; // helion prefetch code",
         "=r",
         [],
         dtype=tl.int32,
@@ -53,18 +53,18 @@ def code_warm():  # noqa: ANN201
     )
 
 
-def code_warm_here(warps: int) -> str:
-    """Device code warming the kernel's text where it sits, by the calling
+def prefetch_code_here(warps: int) -> str:
+    """Device code prefetching the kernel's text where it sits, by the calling
     partition's ``warps`` warps (a warp-specialized kernel's idle partition)."""
     marker = f"mov.u32 $0, 0; {_CW_MARK} here {warps}"
     return f"tl.inline_asm_elementwise({marker!r}, '=r', [], tl.int32, False, 1)"
 
 
-def codewarm_ptx(ptx: str) -> str:
+def prefetch_code_ptx(ptx: str) -> str:
     """Declare the text-range table (a (base, bytes) pair per function, then a
-    sink word) and emit the warm (CTAs with blockIdx % 16 == 0 share the lines,
-    evict_last loads): at a partition's code_warm_here<W> marker by its W warps,
-    else at entry by one warp.  The warm is its own function: inline, its loop
+    sink word) and emit the prefetch (CTAs with blockIdx % 16 == 0 share the lines,
+    evict_last loads): at a partition's prefetch_code_here<W> marker by its W warps,
+    else at entry by one warp.  The prefetch is its own function: inline, its loop
     costs ptxas its uniform-register analysis across the whole kernel (every
     kernel argument then moves to a uniform register at each use).  It must not
     use bar.sync 0: a warp-specialized partition calls it."""
@@ -86,7 +86,9 @@ def codewarm_ptx(ptx: str) -> str:
     marker = r"(mov\.u32 \t?%r\d+, 0; " + re.escape(_CW_MARK) + r" here (\d+))"
     here = re.search(marker, ptx[body.end() :])
     if here is None and f"{_CW_MARK} here" in ptx:
-        _warn_unresolved("a partition warm marker outside the entry; warming at entry")
+        _warn_unresolved(
+            "a partition prefetch marker outside the entry; prefetching at entry"
+        )
     lanes = 32 * int(here[2]) if here is not None else 32
     slots = ", ".join(f"{n}, 0" for n in names)
     table = f".global .align 8 .u64 {_CW_TAB}[{2 * len(names) + 1}] = {{{slots}, 0}};"
@@ -147,7 +149,7 @@ CW_DONE:
     )
 
 
-def codewarm_cubin(cubin: bytes) -> bytes:
+def prefetch_code_cubin(cubin: bytes) -> bytes:
     """Retype the table's descriptor relocations to text PCs; write text sizes."""
     if _CW_TAB.encode() not in cubin:
         return cubin
@@ -212,7 +214,7 @@ def _unresolved(cubin: bytes, reason: str) -> bytes:
 @functools.cache
 def _warn_unresolved(reason: str) -> None:
     log.warning(
-        "code warm: cannot resolve the text table (%s); it loads nothing", reason
+        "prefetch code: cannot resolve the text table (%s); it loads nothing", reason
     )
 
 
@@ -220,15 +222,17 @@ def _wrap_stages(stages: dict[str, Any]) -> None:
     if "ptx" not in stages or "cubin" not in stages:
         return
     make_ptx, make_cubin = stages["ptx"], stages["cubin"]
-    stages["ptx"] = lambda src, metadata: codewarm_ptx(make_ptx(src, metadata))
-    stages["cubin"] = lambda src, metadata: codewarm_cubin(make_cubin(src, metadata))
+    stages["ptx"] = lambda src, metadata: prefetch_code_ptx(make_ptx(src, metadata))
+    stages["cubin"] = lambda src, metadata: prefetch_code_cubin(
+        make_cubin(src, metadata)
+    )
 
 
 def _install() -> None:
     # Triton calls the hook with no args for a cache key, else with
     # (backend, stages, options, language, capability); keep any earlier hook.
     prev: Any = triton.knobs.runtime.add_stages_inspection_hook
-    if getattr(prev, "code_warm_key", None) == _KEY:
+    if getattr(prev, "prefetch_code_key", None) == _KEY:
         return  # Installed already (a reload of this module).
 
     def hook(*args: object) -> tuple[str, str] | None:
@@ -242,7 +246,7 @@ def _install() -> None:
         _wrap_stages(cast("dict[str, Any]", args[1]))
         return None
 
-    hook.code_warm_key = _KEY  # pyrefly: ignore[missing-attribute]
+    hook.prefetch_code_key = _KEY  # pyrefly: ignore[missing-attribute]
     triton.knobs.runtime.add_stages_inspection_hook = hook  # pyrefly: ignore[bad-assignment]
 
 

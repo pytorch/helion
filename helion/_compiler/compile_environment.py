@@ -794,8 +794,8 @@ class CompileEnvironment:
         # hl.pdl_* ops in source order, run at kernel entry or exit.
         self.pdl_entry: list[str] = []
         self.pdl_exit: list[str] = []
-        # hl.code_warm(): the kernel L2-warms its native code at entry.
-        self.code_warm: bool = False
+        # hl.prefetch_code(): the kernel prefetches its native code into L2 at entry.
+        self.prefetch_code: bool = False
 
     def warn_symbolic_fragment_domain(self) -> None:
         """Emit at most once per binding, subject to Python's warning filters."""
