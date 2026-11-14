@@ -4460,7 +4460,11 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 PreparedMetadataSpecializationExtractor(make_extractor(source))
             )
         candidate_configs: tuple[Config, ...] | None
-        if tensor_descriptor_layout_guards or tensor_descriptor_alignment_guards:
+        # Only operation guards depend on the config (a prefetch's does not).
+        if tensor_descriptor_layout_guards or any(
+            guard.memory_op_indices or guard.atomic_op_indices
+            for guard in tensor_descriptor_alignment_guards.values()
+        ):
             implicit_config = self._fixed_config_for_td_layout_guards()
             if implicit_config is not None:
                 candidate_configs = (implicit_config,)
@@ -4586,14 +4590,23 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             tensor_descriptor_alignment_guards.items(),
             key=lambda item: repr(item[0]),
         ):
-            if not guard_is_active(guard):
-                continue
-            # Prepared metadata guards do not cover base pointers.
-            extractors.append(
-                _TensorDescriptorAlignmentExtractor(
-                    make_extractor(source), guard.requires_zero_storage_offset
+            # Prepared metadata guards do not cover base pointers.  A guard only
+            # a prefetch registered keys its base alone (below).
+            active = bool(
+                guard.memory_op_indices or guard.atomic_op_indices
+            ) and guard_is_active(guard)
+            if active:
+                extractors.append(
+                    _TensorDescriptorAlignmentExtractor(
+                        make_extractor(source), guard.requires_zero_storage_offset
+                    )
                 )
-            )
+            # A prefetch needs only the base aligned (bound_prefetch_alignments),
+            # whatever storage offset a descriptor sharing the guard requires.
+            if guard.prefetch and (not active or guard.requires_zero_storage_offset):
+                extractors.append(
+                    _TensorDescriptorAlignmentExtractor(make_extractor(source), False)
+                )
 
         for key, specialization in sorted(
             self.env.runtime_input_specializations.items(),

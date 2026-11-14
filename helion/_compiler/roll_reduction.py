@@ -26,7 +26,7 @@ from ..language.matmul_ops import dot as hl_dot
 from ..language.matmul_ops import dot_scaled as hl_dot_scaled
 from ..language.memory_ops import load
 from ..language.memory_ops import prefetch
-from ..language.memory_ops import prefetch_is_bulk
+from ..language.memory_ops import prefetch_spanned_dims
 from ..language.memory_ops import store
 from ..language.reduce_ops import _reduce
 from ..language.scan_ops import _associative_scan
@@ -355,13 +355,15 @@ class ReductionRoller:
                 num_rdims = self._count_rdim_axes_in_subscript(target, index_arg)
         elif node.target is prefetch:
             # A prefetch has no value; its subscript says what it covers, less
-            # the row segment a bulk prefetch covers by its byte count.
+            # what one prefetch covers (a TMA box, a bulk row segment).
             target, index_arg, extra_mask = node.args
             assert isinstance(target, torch.fx.Node)
             assert isinstance(index_arg, (list, tuple))
             index = [*map_arg(index_arg, lambda arg: arg.meta["val"])]
-            if prefetch_is_bulk(target.meta["val"], index, extra_mask is not None):
-                index_arg = [*index_arg[:-1], 0]
+            spanned = prefetch_spanned_dims(
+                target.meta["val"], index, extra_mask is not None
+            )
+            index_arg = [0 if d in spanned else s for d, s in enumerate(index_arg)]
             num_rdims = self._count_rdim_axes_in_subscript(target, index_arg)
         else:
             val = node.meta.get("val", None)

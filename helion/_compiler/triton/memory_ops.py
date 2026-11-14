@@ -9,32 +9,50 @@ the same eager timing as before.
 from __future__ import annotations
 
 import ast
+import itertools
+import logging
+import math
 from typing import TYPE_CHECKING
+from typing import cast
 
 import torch
 
+from ..._compat import supports_tensor_descriptor
 from ...language import _decorators
 from ...language.memory_ops import _maybe_materialize_tile_index_load
 from ...language.memory_ops import load
 from ...language.memory_ops import prefetch
+from ...language.memory_ops import prefetch_box
 from ...language.memory_ops import prefetch_is_bulk
 from ...language.memory_ops import store
 from ..ast_extension import statement_from_string
+from ..backend import PrefetchBox
+from ..compile_environment import CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
 from ..compile_environment import CompileEnvironment
 from ..cross_loop_codegen import TaggedPeerFallback
+from ..device_function import SymbolArgument
+from ..host_function import HostFunction
 from ..indexing_strategy import SubscriptIndexing
 from ..indexing_strategy import _resolve_codegen_block_id
+from ..indexing_strategy import is_block_size_index
 from .cluster_edges import cluster_load_codegen
 from .cluster_edges import cluster_store_codegen
 from .distributed_ops import inband_load_codegen
 from .distributed_ops import inband_store_codegen
 from .distributed_ops import tagged_access
 from .distributed_ops import tagged_store_codegen
+from .prefetch import TENSOR_MAP_ACQUIRE_ASM
 from .prefetch import prefetch_asm
+from .prefetch import tensor_prefetch_asm
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from ..device_function import DeviceFunction
     from ..inductor_lowering import CodegenState
     from .gluon_ops import SharedValue
+
+log = logging.getLogger(__name__)
 
 
 # Map short config names to full Triton API names for eviction policies
@@ -242,6 +260,93 @@ def _(state: CodegenState) -> ast.AST | SharedValue:
     raise NotImplementedError(f"Unsupported tensor type: {type(tensor)}")
 
 
+def tensor_prefetch_box_shape(
+    tensor: torch.Tensor, index: Sequence[object], has_extra_mask: bool
+) -> PrefetchBox | None:
+    """The TMA box of a tensor-form ``hl.prefetch`` (Gluon, whose host module
+    builds the tensor map; ``Backend.prefetch_box_shape``): at sm_90+ with
+    tensor descriptors, scalar indices (ints, symbols or loaded scalars; box
+    extent 1) and full slices of static dims, the last a full slice, within the
+    TMA encoder's limits, with 16-byte rows and strides, covering more than one
+    row (one row is a single bulk prefetch).  A slice longer than a box dim, or
+    a box over the encoder's byte limit (the outermost spanned dim halved until
+    it fits), is covered by consecutive boxes, at most ``_MAX_BOXES``."""
+    env = CompileEnvironment.current()
+    capability = env.ptx_capability
+    if (
+        has_extra_mask
+        or capability is None
+        or capability < (9, 0)
+        or not supports_tensor_descriptor()
+        or not 2 <= tensor.ndim <= 5
+        or len(index) != tensor.ndim
+        or tensor.element_size() not in _TMA_ELEMENT_SIZES
+    ):
+        return None
+    if not isinstance(index[-1], slice):
+        return None
+    for s in index:
+        if isinstance(s, slice):
+            if s != slice(None):
+                return None
+            continue
+        if is_block_size_index(s):
+            return None  # a tile: one box per element is the bulk form's job
+        if not isinstance(s, (int, torch.SymInt)) and not (
+            isinstance(s, torch.Tensor) and s.ndim == 0
+        ):
+            return None
+    # Strides every call has (a dynamic-shape kernel's traced stride may be
+    # only the first call's): the map is encoded per call from the real ones.
+    known = [
+        *(env.static_kernel_tensor_extent(n) for n in tensor.shape),
+        *(env.known_stride(tensor, d) for d in range(tensor.ndim)),
+    ]
+    if any(n is None for n in known):
+        return None
+    sizes = cast("list[int]", known[: tensor.ndim])
+    strides = cast("list[int]", known[tensor.ndim :])
+    size = tensor.element_size()
+    if strides[-1] != 1 or any(n == 0 or n >= _TMA_MAX_DIM for n in sizes):
+        return None
+    if any((st * size) % 16 or st * size >= _TMA_MAX_STRIDE for st in strides[:-1]):
+        return None
+    box = [
+        min(n, CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE) if isinstance(s, slice) else 1
+        for s, n in zip(index, sizes, strict=True)
+    ]
+    counts = [
+        -(-n // CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE) if isinstance(s, slice) else 1
+        for s, n in zip(index, sizes, strict=True)
+    ]
+    while math.prod(box) * size > _MAX_BOX_BYTES:
+        dim = next((d for d, n in enumerate(box[:-1]) if n > 1), None)
+        if dim is None:
+            return None
+        box[dim] = -(-box[dim] // 2)
+        counts[dim] = -(-sizes[dim] // box[dim])
+    if (box[-1] * size) % 16 or math.prod(counts) > _MAX_BOXES:
+        return None
+    if all(n == 1 for n in box[:-1]):
+        return None  # one row: the bulk form's single prefetch, no map
+    return PrefetchBox(box, counts)
+
+
+# One prefetch issues at most this many boxes (a box spans at most
+# CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE elements per dim; a longer span keeps
+# the bulk or per-element form).
+_MAX_BOXES = 16
+# cuTensorMapEncodeTiled rejects a box larger than the device's shared memory
+# (B200: past 228 KB); this stays below every sm_90+ part's.
+_MAX_BOX_BYTES = 96 * 1024
+# cuTensorMapEncodeTiled: element sizes of its integer types and byte strides it
+# accepts.  Dims stay below 2**31: the prefetch's box coordinates are signed
+# 32-bit (the encoder itself accepts up to 2**32).
+_TMA_ELEMENT_SIZES = (1, 2, 4, 8)
+_TMA_MAX_DIM = 1 << 31
+_TMA_MAX_STRIDE = 1 << 40
+
+
 def _prefetch_row_segment(
     state: CodegenState, tensor: torch.Tensor, last: object
 ) -> tuple[str, str] | None:
@@ -263,6 +368,52 @@ def _prefetch_row_segment(
     return start, f"tl.minimum({block}, {size} - {start})"
 
 
+def _prefetch_box_coords(
+    state: CodegenState, tensor: torch.Tensor, subscript: list[object]
+) -> list[str]:
+    """The coordinates of the TMA box of ``tensor[subscript]`` (innermost dim
+    first): the scalar indices, 0 for the spanned dims."""
+    spans = [isinstance(s, slice) for s in subscript]
+    per_dim = SubscriptIndexing.compute_per_dim_indexing(
+        state,
+        tensor,
+        [0 if span else s for s, span in zip(subscript, spans, strict=True)],
+    )
+    return [
+        "0" if spans[d] else f"tl.cast({per_dim.dim_index_exprs[d]}, tl.int32)"
+        for d in reversed(range(tensor.ndim))
+    ]
+
+
+def _prefetch_map_arg(
+    device_function: DeviceFunction, fake_value: torch.Tensor, box: list[int]
+) -> str:
+    """The address of a tensor map (TMA descriptor) in global memory of
+    ``fake_value`` with box ``box``, for a tensor-form L2 prefetch: a kernel
+    argument (``gluon_ring.prefetch_map`` builds the map) acquired once in the
+    preamble."""
+    key = (fake_value, tuple(box))
+    cache = device_function.prefetch_map_args
+    if key not in cache:
+        origin = HostFunction.current().tensor_to_origin[fake_value]
+        name = device_function.new_var(origin.suggest_var_name() + "_pf_map")
+        # A host local holds the map until the launch is submitted.
+        held = device_function.host_constexpr_def(
+            name, f"_helion_ring.prefetch_map({origin.host_str()}, {box!r})"
+        )
+        device_function.arguments.append(SymbolArgument(name, f"{held}.address"))
+        acquired = device_function.new_var(name + "_acquired")
+        device_function.preamble.append(
+            statement_from_string(
+                f"{acquired} = tl.inline_asm_elementwise("
+                f"{TENSOR_MAP_ACQUIRE_ASM!r}, '=l,l', [{name}], "
+                "dtype=tl.int64, is_pure=True, pack=1)"
+            )
+        )
+        cache[key] = acquired
+    return cache[key]
+
+
 @_decorators.codegen(prefetch, "triton")
 def _(state: CodegenState) -> None:
     capability = CompileEnvironment.current().ptx_capability
@@ -274,10 +425,48 @@ def _(state: CodegenState) -> None:
     assert isinstance(subscript, (list, tuple))
     extra_mask = state.ast_args[2]
     assert isinstance(extra_mask, (type(None), ast.AST))
+    tensor_form = prefetch_box(tensor, [*subscript], extra_mask is not None)
+    if tensor_form is not None:
+        if not CompileEnvironment.current().prefetch_base_is_aligned(tensor):
+            # The bound kernel is keyed on a misaligned base: no tensor map.
+            log.debug("hl.prefetch: misaligned base, skipped")
+            return None
+        # TMA box prefetches from the tensor map: one per box covering the
+        # spanned slices.
+        box, counts = tensor_form
+        coords = _prefetch_box_coords(state, tensor, [*subscript])
+        tensor_map = _prefetch_map_arg(state.device_function, tensor, box)
+        asm = tensor_prefetch_asm(tensor.ndim, state.device_function.config.num_warps)
+        constraints = "=r,l" + ",r" * tensor.ndim
+        log.debug(
+            "hl.prefetch(%s): tensor form, box %s x %d",
+            tensor_map,
+            box,
+            math.prod(counts),
+        )
+        # ``coords`` is innermost dim first.
+        for chunk in itertools.product(*(range(c) for c in reversed(counts))):
+            moved = [
+                c if k == 0 else f"({c}) + {k * b}"
+                for c, k, b in zip(coords, chunk, reversed(box), strict=True)
+            ]
+            state.add_statement(
+                statement_from_string(
+                    f"tl.inline_asm_elementwise({asm!r}, {constraints!r}, "
+                    f"[{tensor_map}, {', '.join(moved)}], "
+                    "dtype=tl.int32, is_pure=False, pack=1)"
+                )
+            )
+        return None
     name = state.device_function.tensor_arg(tensor).name
     segment = None
     if prefetch_is_bulk(tensor, [*subscript], extra_mask is not None):
         segment = _prefetch_row_segment(state, tensor, subscript[-1])
+    log.debug(
+        "hl.prefetch(%s): %s",
+        name,
+        "bulk row segments" if segment is not None else "per-element lines",
+    )
     if segment is not None:
         # One bulk prefetch per element of the leading indices.
         start, count = segment

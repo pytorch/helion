@@ -11,6 +11,7 @@ import os
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+from typing import NamedTuple
 from typing import Sequence
 
 import torch
@@ -279,6 +280,14 @@ FAST_MATH_SENSITIVE_TARGETS: dict[object, str] = {
     torch.ops.aten.erf.default: "erf",
     torch.ops.aten.gelu.default: "gelu",
 }
+
+
+class PrefetchBox(NamedTuple):
+    """A tensor-form ``hl.prefetch``: the TMA box and the boxes per dim covering
+    the spanned slices (one at a scalar index)."""
+
+    box: list[int]
+    counts: list[int]
 
 
 class Backend(abc.ABC):
@@ -1003,6 +1012,15 @@ class Backend(abc.ABC):
         ``cross_loop_tmem_prefetch`` config key.
         """
         return []
+
+    def prefetch_box_shape(
+        self, tensor: torch.Tensor, index: Sequence[object], has_extra_mask: bool
+    ) -> PrefetchBox | None:
+        """The TMA box of ``hl.prefetch(tensor, index)`` when this backend
+        issues it as tensor-form box prefetches (``hl.prefetch``'s
+        ``prefetch_box`` adds that the bound kernel can key the base's
+        alignment); None for the bulk or per-element form."""
+        return None
 
     # -- indexing, fake tensors and block-size constraints ---------------------
 
