@@ -10530,6 +10530,55 @@ class TestMetalMaskedLoads(unittest.TestCase):
                 torch.testing.assert_close(out, expected, atol=0, rtol=0)
 
 
+@helion.kernel(
+    backend="metal", static_shapes=True, config=helion.Config(block_sizes=[64])
+)
+def index_minus_three(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty(x.shape, dtype=torch.float32, device=x.device)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = (tile.index - 3).to(torch.float32)
+    return out
+
+
+@helion.kernel(
+    backend="metal", static_shapes=True, config=helion.Config(block_sizes=[128])
+)
+def previous_row(x: torch.Tensor) -> torch.Tensor:
+    """Row t is x's row t - 1, 0 for t = 0: a load whose row goes negative,
+    masked off by a condition on ``tile.index``."""
+    t_len, n = x.shape
+    out = torch.empty_like(x)
+    for tile_n, tile_t in hl.tile([n, t_len], block_size=[None, 1]):
+        t = tile_t.begin
+        out[t, tile_n] = hl.load(
+            x, [t - 1, tile_n], extra_mask=tile_n.index * 0 + t - 1 >= 0
+        )
+    return out
+
+
+@_requires_darwin
+class TestMetalTileIndexIsSigned(unittest.TestCase):
+    """``tile.index`` has the signed index dtype although Metal's loop
+    indices are ``uint``: arithmetic on it must not wrap."""
+
+    def test_negative_values(self) -> None:
+        out = index_minus_three(torch.empty(64, device=DEVICE))
+        expected = torch.arange(-3, 61, dtype=torch.float32, device=DEVICE)
+        torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+    def test_mask_on_negative_row(self) -> None:
+        """At one row, x's row dimension has size 1 and drops out of the
+        address, so the masked-off load of row -1 lands in bounds on row 0:
+        the mask alone keeps it out (it used to wrap to true)."""
+        for t_len in (1, 3):
+            with self.subTest(t_len=t_len):
+                x = torch.randn(t_len, 128, device=DEVICE)
+                expected = torch.zeros_like(x)
+                expected[1:] = x[:-1]
+                out = previous_row(x)
+                torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+
 @_requires_darwin
 class TestMetalFmaFusion(unittest.TestCase):
     def test_float_multiply_add(self) -> None:
