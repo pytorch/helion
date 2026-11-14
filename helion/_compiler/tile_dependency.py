@@ -6686,15 +6686,8 @@ def _inband_failure(
         return "R3: peer loads run in a later root than the store"
     # Every rank receives the whole buffer, so no polled rank's reads may surely miss
     # part of it. A read may touch its whole interval, or all of an unknown one.
-    for rank in {load.owner_rank for load in peer_loads}:
-        spans = [
-            _access_region(load, task_families[load.root]).address_interval
-            for load in peer_loads
-            if load.owner_rank == rank
-        ]
-        covers = tuple(_linear_region(*(span or (0, numel))) for span in spans)
-        if _subtract_regions(region, covers):
-            return "R6: peer loads read the whole buffer of each polled rank"
+    if _misses_a_polled_rank(region, peer_loads, task_families, exact=False):
+        return "R6: peer loads read the whole buffer of each polled rank"
     if 8 * world_size * numel > _INBAND_PUSH_BYTES:
         return "R7: each rank pushes at most 32 MiB of tagged words"
     # Every rank then reads each scatter row it may have to fetch from the owner.
@@ -6703,6 +6696,51 @@ def _inband_failure(
     ):
         return "R8: a scatter's peer loads run unmasked at root"
     return None
+
+
+def _surely_read_in_full(
+    store: TileAccess,
+    accesses: list[TileAccess],
+    task_families: tuple[TaskFamily, ...],
+) -> bool:
+    """Whether the peer loads of an inband allocation (``store`` writes it)
+    surely read each polled rank's whole buffer: R6 with exact regions in place
+    of bounding intervals.  A region bounds each dimension apart, so a load
+    whose subscripts share a tile axis (a diagonal) does not count."""
+    peer_loads = [access for access in accesses if access.owner_rank is not None]
+    for load in peer_loads:
+        axes = [b for b in load.subscript_affine_block_ids if b is not None]
+        if len(set(axes)) != len(axes):
+            return False
+    region = _access_region(store, task_families[store.root])
+    return not _misses_a_polled_rank(region, peer_loads, task_families, exact=True)
+
+
+def _misses_a_polled_rank(
+    region: AllocationRegion,
+    peer_loads: list[TileAccess],
+    task_families: tuple[TaskFamily, ...],
+    *,
+    exact: bool,
+) -> bool:
+    """Whether the peer loads of some polled rank leave part of ``region``
+    unread: surely (``exact``: only their exact regions cover), or may (each
+    load covering its whole bounding interval, or all of an unknown one)."""
+    for rank in {load.owner_rank for load in peer_loads}:
+        reads = [
+            _access_region(load, task_families[load.root])
+            for load in peer_loads
+            if load.owner_rank == rank
+        ]
+        if not exact:
+            whole = region.address_interval
+            assert whole is not None
+            reads = [
+                _linear_region(*(read.address_interval or whole)) for read in reads
+            ]
+        if _subtract_regions(region, tuple(reads)):
+            return True
+    return False
 
 
 def _same_dense_storage(load: TileAccess, store: TileAccess, numel: int) -> bool:
@@ -7121,7 +7159,8 @@ def build_tile_dependency_graph(
             )
         )
         inband_allocation_ids = set()
-    # R6 covers each polled rank; polls at root on every rank read every task.
+    # Polls at root on every rank that surely read each polled rank's whole buffer
+    # wait for every task of the store's root.
     inband_read_roots = {
         access.root
         for allocation_id in inband_allocation_ids
@@ -7139,6 +7178,9 @@ def build_tile_dependency_graph(
         )
         for access in accesses_by_allocation[allocation_id]
         if access.kind == "store"
+        and _surely_read_in_full(
+            access, accesses_by_allocation[allocation_id], task_families
+        )
     }
     # Tagged candidates among the keyed peer counters.
     tagged_failures = {
