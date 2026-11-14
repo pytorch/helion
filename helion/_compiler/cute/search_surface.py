@@ -463,7 +463,7 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
                         allow_leading_passthrough=(
                             candidate.operands.has_leading_passthrough
                         ),
-                        allow_fp8_broadcasts=(
+                        allow_broadcasts=(
                             len(device_ir.root_ids) == 1
                             and env_state.fission_plan is None
                         ),

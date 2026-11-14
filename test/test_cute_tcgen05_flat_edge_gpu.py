@@ -293,15 +293,65 @@ class TestCuteTcgen05RaggedTwoCtaSearch(RefEagerTestDisabled, TestCase):
                 bound(a, b, bias), expected, rtol=1e-2, atol=1e-1
             )
 
-    def test_k_tail_only_gemm_keeps_the_one_cta_search(self) -> None:
-        # Only M and N fringes qualify for the edge family; a K tail alone
-        # stays on the one-CTA surface (its own TMA zero-fill handles it).
+    def test_k_tail_defaults_above_the_sm_gate_match_torch(self) -> None:
+        # The edge + K-tail default on grids that fill the machine: the
+        # 128-deep two-stage pair (bf16 3000x3000x2880, FP8 3000x3000x3008)
+        # and the 64-deep deep-ring pair (bf16 2048x2560x8008).
+        @helion.kernel(static_shapes=True)
+        def fp8_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            m, k = a.size()
+            _, n = b.size()
+            out = torch.empty([m, n], dtype=torch.bfloat16, device=a.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(a[tile_m, tile_k], b[tile_k, tile_n], acc=acc)
+                out[tile_m, tile_n] = acc.to(torch.bfloat16)
+            return out
+
+        cases = (
+            (_gemm, (3000, 3000, 2880), torch.bfloat16, 128),
+            (_gemm, (2048, 2560, 8008), torch.bfloat16, 64),
+            (fp8_gemm, (3000, 3000, 3008), torch.float8_e4m3fn, 128),
+        )
+        for kernel, (m, n, k), dtype, bk in cases:
+            with self.subTest(shape=(m, n, k), dtype=dtype):
+                a = (torch.randn(m, k, device=DEVICE) * 0.5).to(dtype)
+                b = (torch.randn(n, k, device=DEVICE) * 0.5).to(dtype).T
+                bound = kernel.bind((a, b))
+                config = bound.config_spec.default_config()
+                self.assertEqual(config.block_sizes, [256, 256, bk])
+                self.assertEqual(config.config["tcgen05_cluster_m"], 2)
+                bound.set_config(config)
+                torch.testing.assert_close(
+                    bound(a, b).float(), a.float() @ b.float(), rtol=3e-2, atol=1.0
+                )
+
+    def test_k_tail_on_whole_tiles_runs_the_edge_family(self) -> None:
+        # A 16-bit K tail on whole M and N tiles runs the edge + K-tail
+        # family's pairs (TMA zero-fills past K; nothing is clipped): its
+        # plain 256x256x64 pair seed and its 128-row pair seed compile and
+        # match torch.
         a = torch.randn(1024, 1000, device=DEVICE, dtype=torch.bfloat16)
         b = torch.randn(1000, 1024, device=DEVICE, dtype=torch.bfloat16)
         bound = _gemm.bind((a, b))
-        self.assertEqual(
-            bound.config_spec._cute_tcgen05_config.cluster_m_search_choices, (1,)
-        )
+        state = bound.config_spec._cute_tcgen05_config
+        self.assertIn(2, state.cluster_m_search_choices)
+        seeds = [
+            seed
+            for seed in bound.config_spec.compiler_seed_configs
+            if seed.get("tcgen05_cluster_m") == 2
+        ]
+        chosen = [
+            next(
+                seed for seed in seeds if seed.get("block_sizes")[:3] == [256, 256, 64]
+            ),
+            next(seed for seed in seeds if seed.get("block_sizes")[0] == 128),
+        ]
+        expected = (a.float() @ b.float()).to(a.dtype)
+        for seed in chosen:
+            bound.set_config(seed)
+            torch.testing.assert_close(bound(a, b), expected, rtol=1e-2, atol=1e-1)
 
 
 if __name__ == "__main__":

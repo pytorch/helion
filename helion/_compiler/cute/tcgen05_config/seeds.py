@@ -2586,7 +2586,9 @@ def autotune_seed_configs(state: CuteTcgen05Config) -> list[Config]:
         # edge seed's 852 TFLOP/s.
         edge_n2_seed_config: dict[str, Any] = dict(plain_edge_seed.config)
         edge_n2_seed_config["tcgen05_cluster_n"] = 2
-        seeds.append(Config(**edge_n2_seed_config))
+        # A cluster pairs N tiles: an odd static N tile count refuses it.
+        if repair._cluster_n2_n_tile_refusal(state, edge_n2_seed_config) is None:
+            seeds.append(Config(**edge_n2_seed_config))
     if plain_clc_seed is not None:
         # Deep-staged bk=64 variant of the plain CLC seed: halving the K
         # tile and doubling the AB pipeline depth absorbs UMMA latency on

@@ -6,7 +6,9 @@ Among the compiler's proved tcgen05 seeds (plus the one-CTA 128x256 tile on
 whole tiles, and the 16-bit dense aligned-N pairs at their physical widths)
 this heuristic promotes the one whose tile minimizes wave-quantized MMA
 time; whole 256x256-tile shapes keep the FFI direct-entry
-default unless a candidate is clearly cheaper.
+default unless a candidate is clearly cheaper. Plain GEMMs only the edge +
+K-tail family runs (a 16-bit K tail on whole M and N tiles, or a K tail with
+ragged M and N) take that family's CLC pair seed.
 """
 
 from __future__ import annotations
@@ -25,6 +27,9 @@ from ...strategies import Tcgen05LayoutStrategy
 from ...tcgen05_config import facts
 from ...tcgen05_config import seeds
 from ...tcgen05_config import smem
+from ...tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
+from ...tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
+from ...tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
 from ...tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from ...tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from ...tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
@@ -35,6 +40,7 @@ from ...tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 if TYPE_CHECKING:
     from ....compile_environment import CompileEnvironment
     from ....device_ir import DeviceIR
+    from ...tcgen05_config import CuteTcgen05Config
 
 # Per-SM MMA efficiency of a tile relative to the CtaGroup.TWO 256x256 tile,
 # whose pair shares one B tile across both CTAs; narrower tiles move more
@@ -67,6 +73,9 @@ def _aligned_n_efficiency(cluster_m: int, bm: int, width: int) -> float | None:
     return low + (high - low) * (width - 128) / (TCGEN05_TWO_CTA_BLOCK_N - 128)
 
 
+# Tiles per CTA (waves) from which an output-edge bias GEMM's default takes
+# the hybrid TMA store (``post_acc_wait``) over the SIMT store (see ``_pick``).
+_TMA_STORE_MIN_WAVES = 16
 # A candidate replaces the FFI default only below this fraction of its cost.
 _FFI_REPLACEMENT_MARGIN = 0.9
 
@@ -92,6 +101,22 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
         return cls._pick(env)
+
+    @staticmethod
+    def _edge_k_tail_default(state: CuteTcgen05Config) -> Config | None:
+        """The edge + K-tail family's plain pair seed (CLC-persistent where
+        the CLC search is enabled, else static persistent): a K tail on whole
+        tiles, and a K tail with ragged M and N, run nowhere else but the
+        flat one-CTA kernel, whose default 128x16 tile is a tenth of
+        cuBLAS. bf16 2048x2560x8008 (fp32 out): 0.92 of cuBLAS on the
+        family's 256x256x64 ab=5 seed, 0.08 on the flat default."""
+        seed = seeds._plain_edge_seed_config(state)
+        if seed is None:
+            return None
+        values: dict[str, Any] = dict(seed.config)
+        # PDL stays a target decision of the base default.
+        values.pop("cute_pdl", None)
+        return Config(**values)
 
     @staticmethod
     def _one_cta_candidates(
@@ -145,13 +170,12 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
     def _pick(cls, env: CompileEnvironment) -> Config | None:
         spec = env.config_spec
         state = spec._cute_tcgen05_config
-        # Only kernels whose dense pipeline the compiler proved (TMA operands,
-        # allocation facts): anything else beside the warp roles (a side
-        # store, an unprovable operand) refuses the persistent schedules.
+        # Only kernels whose pipeline the compiler proved: TMA operands, and
+        # the paired-pipeline allocation facts or, for the edge + K-tail
+        # family, a plain dense GEMM body (``_edge_k_tail_default``).
         if (
             not spec.tcgen05.search_enabled
             or state.device_sm_count <= 0
-            or state.pipeline_smem_facts is None
             or not spec.tcgen05.matmul_operands_tma_provable
         ):
             return None
@@ -163,6 +187,20 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
         if batch * cdiv(m, 128) * cdiv(n, 128) < state.device_sm_count:
             # Fewer 128x128 tiles than SMs: per-CTA latency, not wave
             # quantization, decides the tile (the small-grid seeds' regime).
+            return None
+        constraints = state.cluster_m2_search_constraints
+        if (
+            constraints is not None
+            and constraints.allow_edge_k_tail_family
+            and state.dense_gemm_facts is not None
+            and state.dense_gemm_facts.plain_epilogue
+        ):
+            # The edge + K-tail family proves its own schedule (no paired-
+            # pipeline facts); the dense GEMM facts prove a plain body beside
+            # the warp roles (no atomic, no side store, no scale epilogue),
+            # the only one measured on it.
+            return cls._edge_k_tail_default(state)
+        if state.pipeline_smem_facts is None:
             return None
         # Whole 256x256 tiles already default to the FFI direct-entry pair
         # tile; replace it only where its wave quantization is clearly worse
@@ -179,6 +217,7 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
                 * _FFI_REPLACEMENT_MARGIN
             )
         best: tuple[tuple[float, int, int], Config, int] | None = None
+        best_tile = (0, 0, 0)
         for seed in [
             *seeds.autotune_seed_configs(state),
             *cls._one_cta_candidates(env, m, n, k),
@@ -239,6 +278,7 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             key = (cost, -stages, bk)
             if best is None or key < best[0]:
                 best = (key, seed, waves)
+                best_tile = (bm, bn, bk)
         if best is None or (ffi_cost is not None and best[0][0] >= ffi_cost):
             return None
         values = dict(best[1].config)
@@ -255,6 +295,31 @@ class CuteTcgen05DefaultTileHeuristic(AutotunerHeuristic):
             )
             for key in TCGEN05_LAYOUT_OVERRIDES_KEYS:
                 values[key] = None
+        pipeline_facts = state.pipeline_smem_facts
+        assert pipeline_facts is not None
+        if (
+            best[2] >= _TMA_STORE_MIN_WAVES
+            and values.get(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY)
+            == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+            and pipeline_facts.rows
+            and all(row.itemsize == 2 for row in pipeline_facts.rows)
+            and not facts._static_full_tiles(
+                state, bm=best_tile[0], bn=best_tile[1], bk=best_tile[2]
+            )
+        ):
+            # On an output edge a ``pre_acc_wait`` bias row keeps every tile
+            # on the predicated SIMT store (``output_edge_tma_store_smem_fits``
+            # refuses the hybrid full-tile TMA store beside row stages);
+            # ``post_acc_wait`` stores the full tiles through TMA. The TMA
+            # store wins from 16 tiles per CTA (pair) on, the SIMT store
+            # below. Inductor corpus, 256x256x64 ab6 pairs + bf16 bias, of
+            # cuBLAS, SIMT -> TMA store: 104 tiles per pair
+            # (16384x30528x768) 0.63 -> 0.92, 26 (4096x30000x128) 0.41 ->
+            # 0.52; 13 (25216x2304x768) 0.67 -> 0.61, 6 (32768x576x192)
+            # 0.50 -> 0.29, 4 (2048x8008x2560) 1.06 -> 0.86.
+            values[TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY] = (
+                TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
+            )
         if (
             best[2] > 1
             and len(spec.l2_groupings) == 1

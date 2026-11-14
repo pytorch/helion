@@ -502,13 +502,24 @@ def enable_cute_tcgen05_search(
     # pair tile; shapes ragged in both M and N stay on the flat pipeline.
     output_edge_shape = False
     if static_m is not None and static_n is not None and static_k is not None:
+        # The edge + K-tail CtaGroup.TWO family (``allow_edge_cluster_m2_search``
+        # below also asks for a K tail): ragged in both M and N, or, for
+        # 16-bit operands, whole in both with a K that no 64-deep tile
+        # divides (the family's edges with nothing clipped; bf16
+        # 2048x2560x8008, fp32 out: 0.92 of cuBLAS on the family's
+        # 256x256x64 seed, 0.75 on the flat pipeline's autotuned winner).
+        # A single ragged edge with a K tail is outside the runtime's
+        # validated persistent shapes.
+        m_ragged = static_m % TCGEN05_TWO_CTA_BLOCK_M != 0
+        n_ragged = static_n % TCGEN05_TWO_CTA_BLOCK_N != 0
+        k_tail = static_k % TCGEN05_WHOLE_K_TILE_MIN != 0
         edge_k_tail_shape = (
             not has_leading_passthrough
             and plan.max_tcgen05_m >= TCGEN05_TWO_CTA_BLOCK_M
             and plan.max_tcgen05_n >= TCGEN05_TWO_CTA_BLOCK_N
             and min(static_m, static_n, static_k) >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
-            and static_m % TCGEN05_TWO_CTA_BLOCK_M != 0
-            and static_n % TCGEN05_TWO_CTA_BLOCK_N != 0
+            and m_ragged == n_ragged
+            and (m_ragged or (k_tail and input_dtype.itemsize == 2))
         )
         m_edge = static_m % max_search_m != 0
         n_edge = static_n % max_search_n != 0
@@ -526,10 +537,10 @@ def enable_cute_tcgen05_search(
             and (output_edge_shape or not (m_edge or n_edge))
             and whole_k_tile >= TCGEN05_WHOLE_K_TILE_MIN
         ):
-            # Only the double-output-edge family clamps a 16-bit K tail box
-            # (FP8 keeps its K128 tiles and the proved paired K-tail
-            # protocol); any other K tail confines the search to the flat
-            # one-CTA pipeline. Whole K tiles cost nothing there (bk=64 is the
+            # Only the edge + K-tail family clamps a 16-bit K tail box (FP8
+            # keeps its K128 tiles and the proved paired K-tail protocol);
+            # any other K tail confines the search to the flat one-CTA
+            # pipeline. Whole K tiles cost nothing there (bk=64 is the
             # deep-pipeline tile anyway), so where whole K tiles admit the
             # persistent and CtaGroup.TWO schedules, cap the K tile at the
             # largest power of two dividing K: bf16 1000x4096x2880 ran its

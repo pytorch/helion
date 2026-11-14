@@ -303,7 +303,7 @@ def test_other_pipeline_analyzer_callers_do_not_inherit_fp8_admission() -> None:
     )
     assert (
         analyze_pipeline_smem_facts(
-            candidate, node, ir.graphs, capacity_bytes=232448, allow_fp8_broadcasts=True
+            candidate, node, ir.graphs, capacity_bytes=232448, allow_broadcasts=True
         )
         is not None
     )
