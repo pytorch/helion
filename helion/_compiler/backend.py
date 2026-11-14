@@ -179,6 +179,17 @@ class HandlerOpOverrides:
     def rsqrt(self, handler: GenerateASTFromInductor, x: object) -> str | None:
         return None
 
+    def div_rn(
+        self, handler: GenerateASTFromInductor, a: object, b: object
+    ) -> str | None:
+        """The round-to-nearest fp32 quotient of a 32-bit or 16-bit float
+        division (operands widened, the quotient left in fp32), on a backend
+        whose ``/`` is not one; ``None`` where it is.  Asked for a quotient
+        that is then truncated or floored
+        (``GenerateASTFromInductor.truediv``), and for a lowering's
+        ``ops.div_rn`` (``GenerateASTFromInductor.div_rn``)."""
+        return None
+
     def integer_shift(
         self, handler: GenerateASTFromInductor, name: str, x: object, y: object
     ) -> str | None:

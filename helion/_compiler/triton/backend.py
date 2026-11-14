@@ -18,8 +18,10 @@ import torch
 
 from ... import _compat
 from ... import exc
+from ..ast_extension import expr_from_string
 from ..backend import Backend
 from ..backend import BackendState
+from ..backend import HandlerOpOverrides
 from ..backend import LauncherInfo
 from ..backend import log
 
@@ -35,6 +37,7 @@ if TYPE_CHECKING:
     from ..autotuner_heuristics.registry import AutotunerHeuristicType
     from ..compile_environment import CompileEnvironment
     from ..device_function import Argument
+    from ..inductor_lowering import GenerateASTFromInductor
 
     InductorOpOverrides = OpsHandler[Any]
 
@@ -77,6 +80,9 @@ class TritonBackend(Backend):
     @property
     def name(self) -> str:
         return "triton"
+
+    def handler_op_overrides(self) -> HandlerOpOverrides:
+        return TritonHandlerOpOverrides()
 
     def llm_prompt_profile(self) -> LlmPromptProfile:
         from ...autotuner.llm.profile import LlmPromptProfile
@@ -755,12 +761,40 @@ class TritonBackend(Backend):
         return frozenset({"grid", "warmup", "num_warps", "num_stages"})
 
 
+class TritonHandlerOpOverrides(HandlerOpOverrides):
+    def div_rn(
+        self, handler: GenerateASTFromInductor, a: object, b: object
+    ) -> str | None:
+        # Triton's ``/`` is ``div.full.f32``: a reciprocal and a multiply,
+        # within 2 ulp.  ``tl.div_rn`` is ``div.rn.f32``; like ``/`` it
+        # divides in fp32 (half-precision and integer operands are promoted
+        # first) and the result stays fp32, for the consumer to cast.
+        return handler._lift(
+            expr_from_string(
+                "tl.div_rn({a}, {b})",
+                a=handler._create_cast_expr(a, torch.float32),
+                b=handler._create_cast_expr(b, torch.float32),
+            )
+        )
+
+
+class TileIRHandlerOpOverrides(TritonHandlerOpOverrides):
+    def div_rn(
+        self, handler: GenerateASTFromInductor, a: object, b: object
+    ) -> str | None:
+        # ``tl.div_rn`` was not tried on TileIR: it keeps ``/``.
+        return None
+
+
 class TileIRBackend(TritonBackend):
     """TileIR code generation backend (extends Triton)."""
 
     @property
     def name(self) -> str:
         return "tileir"
+
+    def handler_op_overrides(self) -> HandlerOpOverrides:
+        return TileIRHandlerOpOverrides()
 
     def llm_prompt_profile(self) -> LlmPromptProfile:
         # The prompts name this backend by its registry name.
