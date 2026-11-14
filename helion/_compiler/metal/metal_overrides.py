@@ -11,6 +11,11 @@ Overrides:
 - ``exp`` / ``truediv``: under the kernel's ``fast_math`` setting, take
   ``metal::fast::exp`` and ``metal::fast::divide``, the operations the Triton
   backend makes approximate under the same setting.
+- ``log1p`` / ``expm1``: Inductor's MPS overrides before pytorch#201580 have
+  neither, so they would fall back to ``log(1 + x)`` and ``exp(x) - 1``, which
+  lose every digit of a small ``x`` (``log1p(1e-8)`` is 0); later ones still
+  take ``exp(x) - 1`` for ``|x| >= 0.1``.  log1p takes c10's accurate
+  function, as torch's MPS kernels do; expm1 Kahan's formula.
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ from typing import TYPE_CHECKING
 import torch
 from torch._inductor.codegen.mps import MetalOverrides as _InductorMetalOverrides
 from torch._inductor.virtualized import V
+from torch._inductor.virtualized import ops
 
 from ..compile_environment import CompileEnvironment
 from ..inductor_lowering import _is_plain_true_division
@@ -47,6 +53,27 @@ class MetalOverrides(_InductorMetalOverrides):
         if CompileEnvironment.current().settings.fast_math:
             return f"metal::fast::exp({x})"
         return _InductorMetalOverrides.exp(x)
+
+    @staticmethod
+    def log1p(x: CSEVariable) -> str:
+        return f"c10::metal::log1p(static_cast<float>({x}))"
+
+    @staticmethod
+    def expm1(x: CSEVariable) -> str:
+        # Kahan's expm1: (e^x - 1) * (x / log(e^x)) cancels the rounding error
+        # of e^x, to a few ulp; x / log(e^x) is near 1, so the product only
+        # overflows where e^x - 1 does.  Not c10::metal::expm1f, whose
+        # argument reduction drops the low half of log(2): about 50-70 ulp off
+        # at |x| > log(2) / 2.
+        xf = ops.to_dtype(x, torch.float32)
+        one = ops.constant(1.0, torch.float32)
+        u = ops.exp(xf)
+        um1 = ops.sub(u, one)
+        result = ops.mul(um1, ops.truediv(xf, ops.log(u)))
+        result = ops.where(ops.isinf(u), u, result)
+        minus_one = ops.constant(-1.0, torch.float32)
+        result = ops.where(ops.eq(um1, minus_one), um1, result)
+        return ops.where(ops.eq(u, one), xf, result)
 
     @staticmethod
     def truediv(a: object, b: object) -> str:

@@ -325,6 +325,17 @@ def special_kernel(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def log1p_expm1_kernel(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Ops Inductor's MPS overrides lack, whose fallbacks lose small x."""
+    a = torch.empty_like(x)
+    b = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        a[tile] = torch.log1p(x[tile])
+        b[tile] = torch.expm1(x[tile])
+    return a, b
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
 def floordiv_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Inductor lowers float ``//`` with logical ops and ``where``."""
     out = torch.empty_like(x)
@@ -742,6 +753,49 @@ class TestMetalMathOps(unittest.TestCase):
         x = torch.randn(1024, device=DEVICE)
         expected = torch.erf(x) + torch.lgamma(x.abs() + 1)
         torch.testing.assert_close(special_kernel(x), expected, atol=1e-5, rtol=1e-5)
+
+    def test_log1p_expm1_of_small_values(self) -> None:
+        """Accurate where log(1 + x) and exp(x) - 1 lose the digits of a
+        small x (log1p(1e-8) and expm1(1e-8) were 0), in float and rounded
+        back once for 16-bit inputs: within the dtype's default rtol of
+        float64, with no atol to absorb the tiny values."""
+        rtols = {torch.float32: 1.3e-6, torch.float16: 1e-3, torch.bfloat16: 1.6e-2}
+        generator = torch.Generator().manual_seed(0)
+        sign = torch.randint(0, 2, (1024,), generator=generator) * 2 - 1
+        x64 = (sign * torch.logspace(-12, -0.1, 1024)).double()
+        for dtype, rtol in rtols.items():
+            with self.subTest(dtype=dtype):
+                x = x64.to(dtype).to(DEVICE)
+                log1p, expm1 = log1p_expm1_kernel(x)
+                exact = x.cpu().double()
+                for out, expected in (
+                    (log1p, torch.log1p(exact)),
+                    (expm1, torch.expm1(exact)),
+                ):
+                    torch.testing.assert_close(
+                        out.cpu().double(),
+                        expected.to(dtype).double(),
+                        rtol=rtol,
+                        atol=0,
+                    )
+                # torch's MPS log1p runs the same c10 function.
+                torch.testing.assert_close(log1p, torch.log1p(x), atol=0, rtol=0)
+        # The special values: infinities, NaN, signed zero, the pole, the
+        # domain's edge, the largest finite results and overflow.
+        edges = [float("inf"), float("-inf"), float("nan"), -0.0, 0.0]
+        x = torch.tensor(
+            [*edges, -1.0, -2.0, 85.0, 88.0, 88.7, 89.0, -89.0, 1e-30], device=DEVICE
+        )
+        log1p, expm1 = log1p_expm1_kernel(x)
+        for out, expected in (
+            (log1p, torch.log1p(x.cpu())),
+            (expm1, torch.expm1(x.cpu())),
+        ):
+            torch.testing.assert_close(out.cpu(), expected, equal_nan=True)
+            real = ~expected.isnan()
+            self.assertEqual(
+                out.cpu()[real].signbit().tolist(), expected[real].signbit().tolist()
+            )
 
     def test_atan2(self) -> None:
         y = torch.randn(1024, device=DEVICE)
