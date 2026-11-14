@@ -73,6 +73,7 @@ from .math_templates import nan_extremum_expr
 from .pdl_release import ZERO_FILL_KERNEL_PREFIX
 from .pdl_release import generic_release_rendered
 from .pdl_release import spread_rendered
+from .scalar_recipe import PURE_HELPERS
 from .state import cute_codegen_state
 from .state import cute_env_state
 from .state import new_codegen_state
@@ -1535,6 +1536,7 @@ class CuteBackend(Backend):
 
     # Bump when config_value_priors() changes its candidate distribution.
     config_value_priors_version = 4
+    pure_scalar_helpers = PURE_HELPERS
 
     @property
     def name(self) -> str:
