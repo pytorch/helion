@@ -13128,14 +13128,15 @@ class TestMppOpDims(_MppCase):
             y = torch.randn(32, n, device=DEVICE)
             self._check(kernel, (x, y), config, ref(_mm(x, y)), op)
         # At the default num_warps the 16 x 16 tile runs in a lane loop, and
-        # its column sum is rejected rather than miscompiled.
+        # its column sum is rejected rather than miscompiled: the split of
+        # the grid's lane loop can't reorder the K loop beside it.
         x = torch.randn(4, 32, device=DEVICE)
         y = torch.randn(32, 40, device=DEVICE)
         self._rejects(
             colsum_seeded,
             (x, y),
             helion.Config(block_sizes=[16, 16, 16]),
-            "sum reduction over an axis strided by a tile lane loop",
+            "lane reduction beside a statement the split cannot schedule",
         )
 
     def test_unchanged_dims(self) -> None:

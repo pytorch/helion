@@ -802,6 +802,13 @@ class DeviceGridState(DeviceLoopOrGridState):
     # active, before the body's reductions added theirs to
     # ``thread_axis_sizes`` (``GenerateAST.set_active_loops``).
     root_axis_sizes: dict[int, int] = dataclasses.field(default_factory=dict)
+    # Run on the statements ``wrap_body`` returns, which they may rewrite in
+    # place, once the root body is complete and wrapped in its lane loops
+    # (Metal: split a lane loop into passes around the reductions over its
+    # block).
+    body_finalizers: list[Callable[[list[ast.AST]], None]] = dataclasses.field(
+        default_factory=list
+    )
 
     def has_lane_loops(self) -> bool:
         return bool(self.lane_loops)
