@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from ...runtime.config import Config
     from ...runtime.kernel import BoundKernel
     from ..autotuner_heuristics.registry import AutotunerHeuristicType
+    from ..backend import PrefetchBox
     from ..compile_environment import CompileEnvironment
     from ..device_function import Argument
     from ..device_function import DeviceBodyContext
@@ -806,6 +807,14 @@ class GluonBackend(TritonBackend):
         if key in ("cross_loop_tmem_prefetch", "cross_loop_cluster_edges"):
             return True
         return key not in self._IGNORED_KEYS and super().supports_config_key(key)
+
+    def prefetch_box_shape(
+        self, tensor: torch.Tensor, index: Sequence[object], has_extra_mask: bool
+    ) -> PrefetchBox | None:
+        # The host module builds the tensor map (gluon_ring.prefetch_map).
+        from .memory_ops import tensor_prefetch_box_shape
+
+        return tensor_prefetch_box_shape(tensor, index, has_extra_mask)
 
     def tmem_prefetch_candidates(self, device_ir: DeviceIR) -> list[list[int]]:
         from .gluon_ring import tmem_prefetch_candidates

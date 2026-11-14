@@ -3706,6 +3706,23 @@ def _register_tensor_descriptor_layout_guards(device_ir: DeviceIR) -> None:
                         has_derived_block_extent=has_derived_block_extent(node),
                     )
                 atomic_op_index += 1
+                continue
+            if node.target is memory_ops.prefetch:
+                # A tensor-form prefetch keys the kernel on its base's
+                # alignment (a misaligned base skips it).
+                target, index, extra_mask = node.args
+                assert isinstance(target, torch.fx.Node)
+                assert isinstance(index, (list, tuple))
+                tensor = target.meta["val"]
+                if (
+                    memory_ops.prefetch_box(
+                        tensor,
+                        [tensor_arg_value(i) for i in index],
+                        extra_mask is not None,
+                    )
+                    is not None
+                ):
+                    env.register_prefetch_alignment_guard(tensor)
 
 
 def _root_phases(phases: list[KernelPhase], root_count: int) -> tuple[int, ...]:

@@ -10,6 +10,7 @@ import re
 from types import SimpleNamespace
 from typing import cast
 import unittest
+from unittest import mock
 
 import pytest
 import torch
@@ -24,11 +25,13 @@ if _get_backend() != "triton" or not gluon_api_available():
         "the gluon backend's units run in the triton lane on Triton >= 3.8"
     )
 
+from helion._compiler.backend import PrefetchBox
 from helion._compiler.cross_loop_codegen import TaggedPeerFallback
 from helion._compiler.device_function import SyncRole
 from helion._compiler.triton import gluon_ops
 from helion._compiler.triton import gluon_pipeline
 from helion._compiler.triton import gluon_ring
+from helion._compiler.triton import memory_ops
 from helion._compiler.triton.gluon_ops import tl_namespace
 
 pytestmark = pytest.mark.cpu_only
@@ -265,6 +268,59 @@ class TestNativeKernel(TestCase):
         backend = SimpleNamespace(parse_options=parse_options, parse_attr=str)
         kernel._pack_args(backend, {"num_warps": 4}, {"x": 1}, [("i32", "")], None)
         self.assertEqual(options, {"maxnreg": 128, "num_warps": 4})
+
+
+class TestTensorPrefetchBox(TestCase):
+    def _box(
+        self, tensor: torch.Tensor, index: list[object], stride_known: bool = True
+    ) -> object:
+        """``tensor_prefetch_box_shape`` on an sm_100 target with static sizes
+        (and strides, unless ``stride_known`` is False)."""
+        env = SimpleNamespace(
+            ptx_capability=(10, 0),
+            static_kernel_tensor_extent=lambda n: n,
+            known_stride=lambda t, d: t.stride(d) if stride_known else None,
+        )
+        with (
+            mock.patch.object(
+                memory_ops.CompileEnvironment, "current", return_value=env
+            ),
+            mock.patch.object(
+                memory_ops, "supports_tensor_descriptor", return_value=True
+            ),
+        ):
+            return memory_ops.tensor_prefetch_box_shape(tensor, index, False)
+
+    def test_box_shapes_and_bulk_fallbacks(self) -> None:
+        """Spanned slices longer than a box dim or a box over the byte limit
+        take consecutive boxes; over 16 boxes, rows that are no multiple of 16
+        bytes, one row and strides only the first call has keep the bulk
+        form."""
+        rows = slice(None)
+        bf16 = torch.bfloat16
+        # 2 x 512 rows of 512 B: [1, 256, 256] is 128 KB, so [1, 128, 256] x 4.
+        self.assertEqual(
+            self._box(torch.empty(2, 512, 256, dtype=bf16), [0, rows, rows]),
+            PrefetchBox([1, 128, 256], [1, 4, 1]),
+        )
+        self.assertEqual(
+            self._box(torch.empty(16, 64, 256, dtype=bf16), [0, rows, rows]),
+            PrefetchBox([1, 64, 256], [1, 1, 1]),
+        )
+        storage = torch.empty(16 * 64 * 257, dtype=bf16)
+        for tensor in (
+            torch.empty(1, 32, 32 * 256, dtype=bf16),  # 32 boxes
+            storage.as_strided([16, 64, 256], [64 * 257, 257, 1]),  # 514 B rows
+            torch.empty(64, 1, 16 * 256, dtype=bf16),  # one row
+        ):
+            self.assertIsNone(self._box(tensor, [0, rows, rows]))
+        self.assertIsNone(
+            self._box(
+                torch.empty(16, 64, 256, dtype=bf16),
+                [0, rows, rows],
+                stride_known=False,
+            )
+        )
 
 
 if __name__ == "__main__":

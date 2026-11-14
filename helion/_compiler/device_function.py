@@ -417,6 +417,7 @@ class DeviceFunction:
         self._tensor_descriptor_args: dict[
             tuple[torch.Tensor, str, bool | None], TensorDescriptorArg
         ] = {}
+        self.prefetch_map_args: dict[tuple[torch.Tensor, tuple[int, ...]], str] = {}
         self._expr_args: dict[sympy.Expr, NumericArgument] = {}
         self._constexpr_exprs: set[sympy.Expr] = set()
         self._constexpr_args: dict[str, ConstExprArg] = {}
@@ -1318,7 +1319,8 @@ class DeviceFunction:
         self._constexpr_host_defs.add(name)
 
     def host_constexpr_def(self, name: str, host_expr: str) -> str:
-        """Define a host-only constant once (launch-grid inputs, not kernel args).
+        """Define a host-only value once: a launch-grid input, or an object a
+        kernel argument reads (it stays bound until the launch is submitted).
 
         Returns ``name``; the definition is appended to the host statements
         the first time it is requested for this function.

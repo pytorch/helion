@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import contextlib
+import functools
 import itertools
 import os
 import tempfile
+from typing import TYPE_CHECKING
 import unittest
 from unittest import mock
+import weakref
 
 import torch
 
@@ -25,6 +29,9 @@ from helion._testing import skipUnlessGluon
 import helion.language as hl
 from helion.runtime import timeline
 from helion.runtime.triton.launcher import get_cluster_capacity
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 RING = {
     "indexing": "tensor_descriptor",
@@ -287,6 +294,130 @@ def scale_then_mm(
             acc = hl.dot(y[tile_m, tile_k], w[tile_k, tile_n], acc=acc)
         out[tile_m, tile_n] = acc
     return y, out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def scale_boxprefetch_mm(
+    x: torch.Tensor, w: torch.Tensor, wp: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``scale_then_mm`` with a root between the two that only warms the L2
+    for the dot's weights, as TMA boxes of ``wp`` (``w`` viewed as 64-row
+    blocks): one tensor-form prefetch per block."""
+    m, k = x.size()
+    _, n = w.size()
+    y = torch.empty_like(x)
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tile_r, tile_c in hl.tile([m, k]):
+        y[tile_r, tile_c] = x[tile_r, tile_c] * 2
+    for tile_p in hl.tile(wp.size(0), block_size=1):
+        hl.prefetch(wp, [tile_p.begin, slice(None), slice(None)])
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(y[tile_m, tile_k], w[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = acc
+    return y, out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def viewprefetch_copy(w: torch.Tensor) -> torch.Tensor:
+    """Prefetch ``w`` as 64-row boxes and copy it through a kernel-code view:
+    the copy's descriptor needs a zero storage offset, the prefetch only an
+    aligned base."""
+    k, n = w.size()
+    wp = w.view(-1, 64, n)
+    wv = w.view(k, n)
+    out = torch.empty_like(w)
+    for tile_p in hl.tile(wp.size(0), block_size=1):
+        hl.prefetch(wp, [tile_p.begin, slice(None), slice(None)])
+    for tile_k, tile_n in hl.tile([k, n]):
+        out[tile_k, tile_n] = wv[tile_k, tile_n]
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def boxprefetch_copy(w: torch.Tensor, wp: torch.Tensor) -> torch.Tensor:
+    """Prefetch ``wp`` (a view of ``w``) one leading index at a time, then copy
+    ``w``: how a prefetch lowers, without a ring or a dot."""
+    out = torch.empty_like(w)
+    for tile_p in hl.tile(wp.size(0), block_size=1):
+        hl.prefetch(wp, [tile_p.begin, slice(None), slice(None)])
+    for tile_k, tile_n in hl.tile(w.size()):
+        out[tile_k, tile_n] = w[tile_k, tile_n]
+    return out
+
+
+@helion.kernel(static_shapes=False, backend="gluon")
+def dynboxprefetch_copy(w: torch.Tensor, wp: torch.Tensor) -> torch.Tensor:
+    """``boxprefetch_copy`` with dynamic shapes, every size specialized but not
+    the prefetched tensor's strides."""
+    hl.specialize(w.size())
+    hl.specialize(wp.size())
+    out = torch.empty_like(w)
+    for tile_p in hl.tile(wp.size(0), block_size=1):
+        hl.prefetch(wp, [tile_p.begin, slice(None), slice(None)])
+    for tile_k, tile_n in hl.tile(w.size()):
+        out[tile_k, tile_n] = w[tile_k, tile_n]
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def halfboxprefetch_copy(w: torch.Tensor, wh: torch.Tensor) -> torch.Tensor:
+    """``boxprefetch_copy`` prefetching each 64-row block of ``w`` as two boxes
+    of column halves (``wh``: ``w`` viewed as blocks x rows x halves x
+    columns), a scalar index between the spanned dims."""
+    out = torch.empty_like(w)
+    for tile_p, tile_h in hl.tile([wh.size(0), wh.size(2)], block_size=[1, 1]):
+        hl.prefetch(wh, [tile_p.begin, slice(None), tile_h.begin, slice(None)])
+    for tile_k, tile_n in hl.tile(w.size()):
+        out[tile_k, tile_n] = w[tile_k, tile_n]
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def scale_idprefetch_mm(
+    x: torch.Tensor, w: torch.Tensor, wp: torch.Tensor, ids: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``scale_boxprefetch_mm`` prefetching the blocks of ``wp`` that ``ids``
+    lists (-1: none), as an expert prefetch reads its routing."""
+    m, k = x.size()
+    _, n = w.size()
+    y = torch.empty_like(x)
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tile_r, tile_c in hl.tile([m, k]):
+        y[tile_r, tile_c] = x[tile_r, tile_c] * 2
+    for tile_p in hl.tile(ids.size(0), block_size=1):
+        block = ids[tile_p.begin]
+        if block >= 0:
+            hl.prefetch(wp, [block, slice(None), slice(None)])
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(y[tile_m, tile_k], w[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = acc
+    return y, out
+
+
+# The config every tensor-form prefetch test runs (``scale_then_mm`` shapes).
+PREFETCH_CONFIG = {
+    "block_sizes": [128, 64, 128, 64, 64],
+    "pid_type": "persistent_blocked",
+    "num_sm_multiplier": 1,
+    "num_warps": 4,
+    "indexing": "tensor_descriptor",
+}
+
+
+@functools.cache
+def _prefetch_reference() -> tuple[torch.Tensor, ...]:
+    """Inputs and the static-pipeline ``scale_then_mm`` outputs every
+    prefetching variant must reproduce exactly (a prefetch changes no value)."""
+    x = torch.randn([256, 1024], device=DEVICE, dtype=torch.bfloat16)
+    w = torch.randn([1024, 256], device=DEVICE, dtype=torch.bfloat16)
+    _, (y, out) = code_and_output(
+        scale_then_mm, (x, w), cross_loop_pipeline="static", **PREFETCH_CONFIG
+    )
+    return x, w, y, out
 
 
 @helion.kernel(static_shapes=True, backend="gluon")
@@ -563,6 +694,19 @@ def _replay(run: object, inputs: list[tuple[torch.Tensor, ...]]) -> list[object]
 def _functions(code: str) -> dict[str, str]:
     """The generated module's functions, by name."""
     return {chunk.split("(", 1)[0]: chunk for chunk in code.split("\ndef ")[1:]}
+
+
+@contextlib.contextmanager
+def _empty_prefetch_maps() -> Iterator[None]:
+    """An empty tensor-map cache (``gluon_ring.prefetch_map``) for the block."""
+    from helion._compiler.triton import gluon_ring  # needs Triton >= 3.8
+
+    with (
+        mock.patch.dict(gluon_ring._PREFETCH_MAPS, clear=True),
+        mock.patch.dict(gluon_ring._UNCAPTURED_PREFETCH_MAPS, clear=True),
+        mock.patch.object(gluon_ring, "_CAPTURED_PREFETCH_MAPS", []),
+    ):
+        yield
 
 
 class TestGluonRing(TestCase):
@@ -902,6 +1046,272 @@ class TestGluonRing(TestCase):
                 self.assertLess(at, warm.index("_launch("))
                 self.assertIn("return (tile_dependency_epoch,)", body)
                 self.assertNotIn("def _helion_scale_then_mm_claimer(", code)
+
+    def _prefetch_case(self, kernel, args: tuple[object, ...]) -> str:
+        """Run a prefetching ``scale_then_mm`` variant in a ring and check it
+        against the shared static ``scale_then_mm`` reference; its code."""
+        x, w, y_ref, expected = _prefetch_reference()
+        code, (y, out) = code_and_output(
+            kernel,
+            (x, w, *args),
+            num_stages=2,
+            cross_loop_pipeline="dynamic",
+            **PREFETCH_CONFIG,
+        )
+        torch.testing.assert_close(y, y_ref, atol=0, rtol=0)
+        torch.testing.assert_close(out, expected, atol=0, rtol=0)
+        return code
+
+    def _copy_case(self, kernel, w: torch.Tensor, view: torch.Tensor) -> str:
+        """Run a prefetching copy of ``w`` (``view``: the prefetched view of
+        it) and check the copy; its code."""
+        code, out = code_and_output(
+            kernel, (w, view), block_sizes=[64, 64], pid_type="persistent_blocked"
+        )
+        torch.testing.assert_close(out, w, atol=0, rtol=0)
+        return code
+
+    def _assert_prefetch_in_body(self, code: str, kernel_name: str) -> None:
+        """The tensor prefetches issue from the body partition (inlined, or in
+        a task function it calls)."""
+        functions = _functions(code)
+        body = functions[f"_helion_{kernel_name}_body"]
+        holders = [
+            name
+            for name, fn in functions.items()
+            if "cp.async.bulk.prefetch.tensor" in fn
+        ]
+        self.assertTrue(holders)
+        for name in holders:
+            self.assertTrue(
+                name == f"_helion_{kernel_name}_body" or f"{name}(" in body, name
+            )
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_tensor_form_prefetch(self) -> None:
+        """A prefetch of whole trailing dims is one TMA box prefetch from a tensor
+        map in global memory (built on the host)."""
+        _, w, _, _ = _prefetch_reference()
+        wp = w.view(16, 64, 256)
+        code = self._prefetch_case(scale_boxprefetch_mm, (wp,))
+        self.assertIn("cp.async.bulk.prefetch.tensor.3d.L2.global.tile", code)
+        self.assertNotIn("cp.async.bulk.prefetch.L2.global", code)
+        self.assertIn("_helion_ring.prefetch_map(wp, [1, 64, 256])", code)
+        # One warp of the body's four issues each box.
+        self.assertIn("mov.u32 t, %warpid; and.b32 t, t, 3;", code)
+        # The box covers the trailing dims: no reduction dim for them.
+        self.assertNotIn("_RDIM_SIZE", code)
+        # The map is acquired once at the partition's entry, not per prefetch.
+        body = _functions(code)["_helion_scale_boxprefetch_mm_body"]
+        self.assertEqual(body.count("fence.proxy.tensormap"), 1)
+        self.assertLess(body.index("fence.proxy.tensormap"), body.index("for "))
+        self._assert_prefetch_in_body(code, "scale_boxprefetch_mm")
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_tensor_form_prefetch_long_span(self) -> None:
+        """A spanned slice longer than a TMA box dim is consecutive boxes, not
+        the bulk form; so is a box over the encoder's byte limit (a 128 KB
+        [1, 256, 256] box halves into two)."""
+        _, w, _, _ = _prefetch_reference()
+        code = self._copy_case(boxprefetch_copy, w, w.view(2, 512, 256))
+        self.assertEqual(
+            code.count("cp.async.bulk.prefetch.tensor.3d.L2.global.tile"), 4
+        )
+        self.assertNotIn("cp.async.bulk.prefetch.L2.global", code)
+        self.assertIn("_helion_ring.prefetch_map(wp, [1, 128, 256])", code)
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_tensor_form_prefetch_misaligned_base(self) -> None:
+        """The bound kernel is keyed on the prefetched input's base alignment:
+        a misaligned call after an aligned one skips the prefetch instead of
+        building a tensor map the encoder rejects (and keeps the aligned
+        call's config surface)."""
+        storage = torch.randn([1024 * 256 + 8], device=DEVICE, dtype=torch.bfloat16)
+        aligned, misaligned = (
+            self._copy_case(boxprefetch_copy, w, w.view(16, 64, 256))
+            for w in (
+                storage[offset : offset + 1024 * 256].view(1024, 256)
+                for offset in (0, 1)
+            )
+        )
+        self.assertIn("cp.async.bulk.prefetch.tensor", aligned)
+        self.assertNotIn("cp.async.bulk.prefetch", misaligned)
+        self.assertNotIn("prefetch_map(", misaligned)
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_tensor_form_prefetch_keyed_on_base_only(self) -> None:
+        """A view made in the kernel's host code is keyed on its input's base
+        like a passed tensor, and a descriptor reading that input through
+        another kernel-code view keys a zero storage offset too: an aligned base
+        at a nonzero offset keeps the box form (no reduction dim for its spanned
+        dims), and a misaligned base after it gets its own bound kernel (no
+        prefetch)."""
+        storage = torch.randn([1024 * 256 + 8], device=DEVICE, dtype=torch.bfloat16)
+        codes = []
+        for offset in (8, 1):
+            w = storage[offset : offset + 1024 * 256].view(1024, 256)
+            code, out = code_and_output(
+                viewprefetch_copy,
+                (w,),
+                block_sizes=[64, 64],
+                pid_type="persistent_blocked",
+                indexing="tensor_descriptor",
+            )
+            torch.testing.assert_close(out, w, atol=0, rtol=0)
+            codes.append(code)
+        self.assertIn("cp.async.bulk.prefetch.tensor.3d.L2.global.tile", codes[0])
+        self.assertNotIn("_RDIM_SIZE", codes[0])
+        self.assertNotIn("prefetch_map(", codes[1])
+
+    @skipIfRefEager("runs CUDA graphs")
+    @skipUnlessGluon()
+    def test_tensor_form_prefetch_map_first_built_in_capture(self) -> None:
+        """A map first built under CUDA graph capture is copied by every graph
+        captured before an eager launch (any of them may replay first), and the
+        first eager launch writes it for every stream."""
+        from helion._compiler.triton import gluon_ring  # needs Triton >= 3.8
+
+        x, w, _, expected = _prefetch_reference()
+        w2 = w.clone()
+        config = helion.Config(
+            **PREFETCH_CONFIG, num_stages=2, cross_loop_pipeline="dynamic"
+        )
+        run = scale_boxprefetch_mm.bind((x, w, w.view(16, 64, 256))).compile_config(
+            config
+        )
+        with _empty_prefetch_maps():
+            run(x, w, w.view(16, 64, 256))
+            graphs = [torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()]
+            for graph in graphs:
+                with torch.cuda.graph(graph):
+                    _, out = run(x, w2, w2.view(16, 64, 256))
+            (entry,) = [
+                e
+                for key, e in gluon_ring._PREFETCH_MAPS.items()
+                if key[0] == w2.data_ptr()
+            ]
+            self.assertFalse(entry.written)
+            # The second graph replays first: its own copy writes the map.
+            entry.device.zero_()
+            graphs[1].replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(entry.device.cpu(), entry.host, atol=0, rtol=0)
+            torch.testing.assert_close(out, expected, atol=0, rtol=0)
+            # The first eager launch copies on its stream without waiting; once
+            # that copy completed, no launch copies or waits again.
+            run(x, w2, w2.view(16, 64, 256))
+            self.assertIsNotNone(entry.copied)
+            torch.cuda.synchronize()
+            run(x, w2, w2.view(16, 64, 256))
+            self.assertTrue(entry.written)
+            del graphs
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_tensor_form_prefetch_falls_back_to_bulk(self) -> None:
+        """A dynamic-shape kernel's strides are the first call's only, unless
+        specialized: a later call may bring rows the encoder rejects, so the
+        prefetch keeps the bulk form (the static fallbacks are
+        test_gluon_units.TestTensorPrefetchBox)."""
+        _, w, _, _ = _prefetch_reference()
+        code = self._copy_case(dynboxprefetch_copy, w, w.view(16, 64, 256))
+        self.assertIn("cp.async.bulk.prefetch.L2.global", code)
+        self.assertNotIn("prefetch_map(", code)
+
+    @skipIfRefEager("builds tensor maps")
+    @skipUnlessGluon()
+    def test_prefetch_map_cache(self) -> None:
+        """The copy's event is recorded before another thread can see it; maps
+        live in a pool of their own, also under capture, with the streams that
+        read them recorded; maps no graph captured are dropped past the cap on
+        an eager miss and freed once no launch holds them; captured ones
+        stay."""
+        from helion._compiler.triton import gluon_ring  # needs Triton >= 3.8
+
+        published: list[bool] = []
+
+        class Event(torch.cuda.Event):
+            def record(self, stream: torch.cuda.Stream | None = None) -> None:
+                published.extend(
+                    e.copied is self for e in gluon_ring._PREFETCH_MAPS.values()
+                )
+                super().record(stream)
+
+        def pool(address: int) -> tuple[int, int]:
+            (segment,) = [
+                s
+                for s in torch.cuda.memory_snapshot()
+                if s["address"] <= address < s["address"] + s["total_size"]
+            ]
+            return segment["segment_pool_id"]
+
+        tensors = [torch.zeros([64, 64], device=DEVICE) for _ in range(4)]
+        with (
+            _empty_prefetch_maps(),
+            mock.patch.object(gluon_ring, "_MAX_PREFETCH_MAPS", 2),
+            mock.patch.object(gluon_ring.torch.cuda, "Event", Event),
+        ):
+            graphs = [torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()]
+            with torch.cuda.graph(graphs[0]):
+                captured = gluon_ring.prefetch_map(tensors[0], [64, 64]).address
+            self.assertEqual(
+                pool(captured), gluon_ring._PREFETCH_MAP_POOLS[tensors[0].device].id
+            )
+            # Maps launches hold (their host code keeps them until submitted).
+            held = [gluon_ring.prefetch_map(t, [64, 64]) for t in tensors[1:3]]
+            self.assertTrue(published)
+            self.assertFalse(any(published))
+            side = torch.cuda.Stream()
+            with torch.cuda.stream(side):
+                gluon_ring.prefetch_map(tensors[1], [64, 64])
+            self.assertEqual(
+                held[0].streams,
+                {torch.cuda.current_stream().stream_id, side.stream_id},
+            )
+            self.assertEqual(len(gluon_ring._PREFETCH_MAPS), 3)
+            # A miss under capture drops nothing.
+            with torch.cuda.graph(graphs[1]):
+                gluon_ring.prefetch_map(tensors[2].view(128, 32), [128, 32])
+            self.assertEqual(len(gluon_ring._PREFETCH_MAPS), 4)
+            # An eager miss drops the two uncaptured maps: the one a launch
+            # holds lives on, the other is freed.
+            unheld = weakref.ref(held.pop())
+            gluon_ring.prefetch_map(tensors[1].view(32, 128), [32, 128])
+            self.assertEqual(len(gluon_ring._PREFETCH_MAPS), 3)
+            self.assertIsNone(unheld())
+            self.assertNotIn(held[0], gluon_ring._PREFETCH_MAPS.values())
+            self.assertEqual(
+                gluon_ring.prefetch_map(tensors[0], [64, 64]).address, captured
+            )
+            del graphs
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_tensor_form_prefetch_scalar_between_spans(self) -> None:
+        """A scalar index between full slices is a box extent of 1: still one
+        tensor-form prefetch per box."""
+        _, w, _, _ = _prefetch_reference()
+        code = self._copy_case(halfboxprefetch_copy, w, w.view(16, 64, 2, 128))
+        self.assertIn("cp.async.bulk.prefetch.tensor.4d.L2.global.tile", code)
+        self.assertNotIn("cp.async.bulk.prefetch.L2.global", code)
+        self.assertIn("_helion_ring.prefetch_map(wh, [1, 64, 1, 128])", code)
+        self.assertNotIn("_RDIM_SIZE", code)
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_loaded_index_tensor_form_prefetch(self) -> None:
+        """A prefetch at a loaded block index (an expert prefetch reading its
+        routing) keeps the tensor form: the index is a box coordinate."""
+        _, w, _, _ = _prefetch_reference()
+        ids = torch.tensor([3, -1, 7, 0], device=DEVICE, dtype=torch.int32)
+        code = self._prefetch_case(scale_idprefetch_mm, (w.view(16, 64, 256), ids))
+        self.assertIn("cp.async.bulk.prefetch.tensor.3d.L2.global.tile", code)
+        self.assertNotIn("_RDIM_SIZE", code)
+        self._assert_prefetch_in_body(code, "scale_idprefetch_mm")
 
     @skipIfRefEager("checks generated code")
     @skipUnlessGluon()

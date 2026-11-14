@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     import ast
     from collections.abc import Sequence
 
+    from .._compiler.backend import PrefetchBox
     from .._compiler.inductor_lowering import CodegenState
 
 # TileBeginWithOffset removed - using TileBeginWithOffsetPattern instead
@@ -447,7 +448,18 @@ def prefetch(
     tile of a stride-1 dim and there is no ``extra_mask``, each element of the
     leading indices issues one ``cp.async.bulk.prefetch.L2`` covering its row
     segment (sm_90+).  Any other prefetch issues ``prefetch.global.L2`` per
-    element (one 128-byte line each).  Other targets drop it.
+    element (one 128-byte line each).  On the Gluon backend, scalar indices
+    and full slices of static dims a TMA box can span (the last index a full
+    slice) that cover more than one row are ``cp.async.bulk.prefetch.tensor``
+    of TMA boxes instead (box extent 1 at the scalars; a bounded number of
+    consecutive boxes over a slice longer than a box dim), issued by one lane
+    of one warp from a tensor map the host builds once per tensor; the tensor
+    needs a 16-byte aligned base (a call with a misaligned base skips the
+    prefetch).  Each distinct tensor (address, shape, strides) gets its own
+    128-byte map, encoded on the launch path; past a per-device cap on the maps
+    no CUDA graph captured, an eager call drops them.  The form suits tensors
+    whose address stays fixed across calls, such as weights.  Other targets
+    drop it.
 
     Args:
         tensor: The tensor to prefetch from
@@ -471,6 +483,21 @@ def _(
         raise NotImplementedError(f"Cannot prefetch from type: {type(tensor)}")
     index = Tile._tiles_to_sizes_for_index(index)
     return (tensor, normalize_index_slices(tensor.shape, index), extra_mask)
+
+
+def prefetch_box(
+    tensor: torch.Tensor, index: Sequence[object], has_extra_mask: bool
+) -> PrefetchBox | None:
+    """The tensor form of ``hl.prefetch(tensor, index)``, else None: the box the
+    backend gives it (``Backend.prefetch_box_shape``), when the bound kernel can
+    key the base's alignment (``register_prefetch_alignment_guard``).  It does
+    not depend on the alignment: a misaligned base drops the prefetch
+    (``prefetch_base_is_aligned``), so both keep one config surface."""
+    env = CompileEnvironment.current()
+    shape = env.backend.prefetch_box_shape(tensor, index, has_extra_mask)
+    if shape is None or env.tensor_descriptor_alignment_source(tensor) is None:
+        return None
+    return shape
 
 
 def prefetch_is_bulk(
@@ -498,6 +525,19 @@ def prefetch_is_bulk(
     return isinstance(last, torch.SymInt) and env.get_block_id(last) is not None
 
 
+def prefetch_spanned_dims(
+    tensor: torch.Tensor, index: Sequence[object], has_extra_mask: bool
+) -> frozenset[int]:
+    """The dims of ``index`` one prefetch of ``hl.prefetch(tensor, index)``
+    covers: the spanned dims of a TMA box, the row segment of a bulk prefetch.
+    One prefetch is issued per element of the other dims."""
+    if prefetch_box(tensor, index, has_extra_mask) is not None:
+        return frozenset(d for d, s in enumerate(index) if isinstance(s, slice))
+    if prefetch_is_bulk(tensor, index, has_extra_mask):
+        return frozenset([len(index) - 1])
+    return frozenset()
+
+
 @_decorators.register_fake(prefetch)
 def _(
     tensor: torch.Tensor,
@@ -505,9 +545,10 @@ def _(
     extra_mask: torch.Tensor | None = None,
 ) -> None:
     # Allocate the reduction dims of full slices as ``hl.load`` does, except
-    # a bulk prefetch's row segment, which its byte count covers.
-    if prefetch_is_bulk(tensor, index, extra_mask is not None):
-        index = [*index[:-1], 0]
+    # what one prefetch covers: a TMA box's spanned dims, a bulk prefetch's row
+    # segment.
+    spanned = prefetch_spanned_dims(tensor, index, extra_mask is not None)
+    index = [0 if d in spanned else s for d, s in enumerate(index)]
     SubscriptIndexing.compute_shape(tensor, index)
     return None
 

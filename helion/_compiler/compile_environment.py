@@ -130,6 +130,8 @@ class TensorDescriptorAlignmentGuard:
     memory_op_indices: set[int] = dataclasses.field(default_factory=set)
     atomic_op_indices: set[int] = dataclasses.field(default_factory=set)
     requires_zero_storage_offset: bool = False
+    # A tensor-form L2 prefetch reads the input whatever the indexing config.
+    prefetch: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -725,6 +727,7 @@ class CompileEnvironment:
             Source, TensorDescriptorAlignmentGuard
         ] = {}
         self.bound_tensor_descriptor_alignments: dict[Source, bool] = {}
+        self.bound_prefetch_alignments: dict[Source, bool] = {}
         self.runtime_input_specializations: dict[str, RuntimeInputSpecialization] = {}
         # Original inputs/proxies are retained only until frontend compilation
         # completes. Identity witnesses never become serialized cache-key data.
@@ -1006,6 +1009,24 @@ class CompileEnvironment:
             and source in self.tensor_descriptor_layout_guards
         )
 
+    def register_prefetch_alignment_guard(self, fake_tensor: torch.Tensor) -> None:
+        """Key the bound kernel on the base alignment of a prefetched input:
+        its tensor map needs a 16-byte aligned base on every launch."""
+        source = self.tensor_descriptor_alignment_source(fake_tensor)
+        if source is not None:
+            self.tensor_descriptor_alignment_guards.setdefault(
+                source, TensorDescriptorAlignmentGuard()
+            ).prefetch = True
+
+    def prefetch_base_is_aligned(self, fake_tensor: torch.Tensor) -> bool:
+        """Whether every launch of the bound kernel gives a prefetch of
+        ``fake_tensor`` a 16-byte aligned base: the bound kernel's snapshot of
+        its owner input (False without one: no runtime key covers the base)."""
+        source = self.tensor_descriptor_alignment_source(fake_tensor)
+        if source is None:
+            return False
+        return self.bound_prefetch_alignments.get(source, False)
+
     def tensor_descriptor_base_is_aligned(self, fake_tensor: torch.Tensor) -> bool:
         """Whether a tensor descriptor can prove its runtime base is 16B aligned."""
         source = self.tensor_descriptor_alignment_source(fake_tensor)
@@ -1153,7 +1174,16 @@ class CompileEnvironment:
                 value, guard.requires_zero_storage_offset
             )
             for source, guard in self.tensor_descriptor_alignment_guards.items()
-            if (value := _replay_tensor_input_source(source, root_values)) is not None
+            if (guard.memory_op_indices or guard.atomic_op_indices)
+            and (value := _replay_tensor_input_source(source, root_values)) is not None
+        }
+        # A prefetch needs only the base aligned, whatever a descriptor guard
+        # sharing the input requires.
+        self.bound_prefetch_alignments = {
+            source: _concrete_tensor_base_is_aligned(value)
+            for source, guard in self.tensor_descriptor_alignment_guards.items()
+            if guard.prefetch
+            and (value := _replay_tensor_input_source(source, root_values)) is not None
         }
 
     def tensor_input_source(self, fake_tensor: torch.Tensor) -> Source | None:
