@@ -57,6 +57,17 @@ def test_cuda_work_guard_rejects_native_compile_with_existing_context() -> None:
         cutlass.cute.compile(None)
 
 
+def test_cuda_work_guard_rejects_native_compile_with_options() -> None:
+    # ``cute.compile[options](...)`` is how the launchers compile.
+    cutlass = pytest.importorskip("cutlass")
+    with (
+        patch("torch.cuda.is_initialized", return_value=True),
+        pytest.raises(AssertionError, match="native forbidden"),
+        forbid_cuda_work(),
+    ):
+        cutlass.cute.compile[()](None)
+
+
 def test_cuda_work_guard_detects_context_state_change() -> None:
     with (
         patch("torch.cuda.is_initialized", side_effect=(False, True)),

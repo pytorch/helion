@@ -638,9 +638,9 @@ _SIGMOID_TEMPLATE = SIGMOID_TEMPLATE.format(x="{inner}")
 # resolves to a single SSA name (no source-size blowup).
 # ``x * sigmoid(x)``: the sigmoid contract, with or without ``fast_math``.
 _SILU_SIGMOID_TEMPLATE = f"(({{inner}}) * {_SIGMOID_TEMPLATE})"
-# ``x / (1 + exp(-x))`` without ``fast_math``: the IEEE quotient of the
-# exactly reduced ``cute.math.exp`` (no reciprocal-then-multiply, which
-# rounds twice).
+# ``x / (1 + exp(-x))`` without ``fast_math``: the quotient of the exactly
+# reduced ``cute.math.exp`` as the launch divides (no
+# reciprocal-then-multiply, which rounds twice).
 _SILU_DIVISION_TEMPLATE = "(({inner}) / (1.0 + cute.math.exp(-({inner}))))"
 
 
@@ -1739,7 +1739,7 @@ def _classify_silu(
 
     Each form renders the pointwise lowering's math for it
     (``_silu_step``): the mul form ``x * sigmoid(x)`` with the sigmoid
-    contract, the div form the IEEE quotient of the exact ``exp`` (the
+    contract, the div form the quotient of the exact ``exp`` (the
     sigmoid form under ``fast_math``). The pattern only matches when the
     inner references point at the *same* carrier FX node — divergent
     operands fall through to the generic binary classifier.

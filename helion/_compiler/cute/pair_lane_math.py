@@ -149,10 +149,15 @@ _CUTLASS_TYPE = re.compile(r"cutlass\.[A-Z]\w*")
 _INLINE_LIMIT = 64
 
 
-def has_pairable_exps_or_divisions(device_ir: DeviceIR) -> bool:
+def has_pairable_exps_or_divisions(
+    device_ir: DeviceIR, *, exact_division: bool
+) -> bool:
     """Whether the kernel traces an exp or a sigmoid (which lowers through
-    one) below float64, or a true division: with its fp32 arithmetic, what
-    offers ``cute_pair_lane_math`` to the autotuner.  Structure only, like
+    one) below float64, or, with ``exact_division``
+    (``Settings.cute_exact_division``), a true division: with its fp32
+    arithmetic, what offers ``cute_pair_lane_math`` to the autotuner.  The
+    pass pairs a division only as the exact division's fast path, which the
+    default ``div.full.f32`` does not have.  Structure only, like
     ``has_fp32_arithmetic``."""
     from ..inductor_lowering import _is_plain_true_division
 
@@ -165,7 +170,7 @@ def has_pairable_exps_or_divisions(device_ir: DeviceIR) -> bool:
                 and value.dtype.is_floating_point
                 and (
                     (node.target in _TRACED_EXPS and value.dtype != torch.float64)
-                    or _is_plain_true_division(node)
+                    or (exact_division and _is_plain_true_division(node))
                 )
             ):
                 return True

@@ -29,6 +29,7 @@ from .._compiler.cute.lane_loops.barriers import is_barrier as is_barrier
 from .._compiler.cute.target_facts import B200
 from .._utils import triton_is_available
 from ..runtime.config import Config
+from ..runtime.cute.compile_cache import IEEE_DIVISION_COMPILE_OPTION
 from ..runtime.ref_mode import RefMode
 from ..runtime.ref_mode import RefModeContext
 from ..runtime.ref_mode import RefModeTorchFunctionMode
@@ -142,6 +143,34 @@ def codegen_skip_reason(backend: str) -> str | None:
     return None
 
 
+# What a kernel compiled under ``Settings.cute_exact_division`` adds to a
+# launch that names no other compile option: ``/`` is the IEEE division
+# there, ``div.full.f32`` otherwise.
+IEEE_DIVISION_LAUNCH = f", cute_compile_options='{IEEE_DIVISION_COMPILE_OPTION}'"
+
+
+def with_exact_division(kernel: Kernel[object]) -> Kernel[object]:
+    """``kernel`` again under ``Settings.cute_exact_division`` (off by
+    default): its ``/`` is the IEEE division, with the hoisted form and its
+    redo copies."""
+    return type(kernel)(
+        kernel.fn,
+        configs=kernel.configs,
+        settings=dataclasses.replace(kernel.settings, cute_exact_division=True),
+        key=kernel._key_fn,
+        cute_structural_policy=kernel._cute_structural_policy,
+    )
+
+
+def without_ieee_division_launch(code: str) -> str:
+    """``code`` without the compile option of ``Settings.cute_exact_division``
+    (the first of a launch's options, or its only one), for comparing an
+    exact render's statements with a default render's."""
+    return code.replace(IEEE_DIVISION_LAUNCH, "").replace(
+        f"{IEEE_DIVISION_COMPILE_OPTION} ", ""
+    )
+
+
 def kernel_body(code: str) -> str:
     """The ``@cute.kernel`` function of rendered module ``code``, up to the
     next top-level function (the host function), without the ``# src[...]``
@@ -229,12 +258,15 @@ def forbid_native_compile() -> Generator[list[MagicMock], None, None]:
     with ExitStack() as stack:
         mocks: list[MagicMock] = []
         if importlib.util.find_spec("cutlass") is not None:
-            mocks.extend(
-                stack.enter_context(
+            for target in ("cutlass.cute.compile", "cutlass.compile"):
+                mock = stack.enter_context(
                     patch(target, side_effect=AssertionError("native forbidden"))
                 )
-                for target in ("cutlass.cute.compile", "cutlass.compile")
-            )
+                # ``cute.compile[options](...)``, the launchers' spelling, is
+                # the same forbidden call: a MagicMock's subscript would
+                # return a child that neither raises nor counts.
+                mock.__getitem__.return_value = mock
+                mocks.append(mock)
         yield mocks
 
 

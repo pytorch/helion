@@ -365,9 +365,10 @@ Warnings can be suppressed by including them in the `ignore_warnings` setting:
 
 .. autoclass:: FastMathUnused
 
-   Warns when a kernel uses operations (fp32 division, exp, rsqrt, erf, and on
-   Triton sigmoid and max/min, ...) that the ``fast_math`` setting would lower to
-   faster approximate forms, but the setting is off. Enable it with ``@helion.kernel(fast_math=True)`` or
+   Warns when a kernel uses operations (fp32 division, exp, rsqrt, erf, on CuTe
+   also sqrt, log, log2, sin, cos and tanh, and on Triton sigmoid and max/min, ...)
+   that the ``fast_math`` setting would lower to faster approximate forms, but
+   the setting is off. Enable it with ``@helion.kernel(fast_math=True)`` or
    ``HELION_FAST_MATH=1`` when the kernel's consumers tolerate the approximations.
 
 ```

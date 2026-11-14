@@ -2634,9 +2634,9 @@ def normalize_knobs(
         "cute_pair_lane_math",
         enabled=config_spec.cute_pair_lane_math_sites,
         requirement=(
-            "an exp or sigmoid below fp64, a true division, fp32 arithmetic, or "
-            "a bf16/f16 max or min reduction, on sm_100 without fast_math, in a "
-            "kernel without a matmul"
+            "an exp or sigmoid below fp64, a true division under "
+            "cute_exact_division, fp32 arithmetic, or a bf16/f16 max or min "
+            "reduction, on sm_100 without fast_math, in a kernel without a matmul"
         ),
         fix_invalid=fix_invalid,
         fill=False,

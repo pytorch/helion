@@ -1,7 +1,9 @@
 """Device helpers for the exact loop-invariant fp32 division hoist.
 
-The generic CuTe lowering renders an fp32 quotient as ``a / b``, which NVVM
-emits as ``div.rn.f32``.  ptxas expands every ``div.rn.f32`` into its own
+The generic CuTe lowering renders an fp32 quotient as ``a / b``, which under
+``Settings.cute_exact_division`` NVVM emits as ``div.rn.f32`` (by default it
+is ``div.full.f32``, a reciprocal and a multiply, and this module is not
+used).  ptxas expands every ``div.rn.f32`` into its own
 ``MUFU.RCP`` + two reciprocal-refinement ``FFMA`` + ``FCHK`` + three
 ``FFMA`` + a slow-path call skeleton, PER ELEMENT, even when the divisor
 is the same for a whole row (a softmax row sum, a kernel-wide
@@ -114,10 +116,11 @@ every piece below is checked by ``test/test_cute_exact_division.py``):
 Everything here is exact in IEEE-754 arithmetic; nothing depends on
 ``fast_math`` (whose fp32 division is the approximate ``cute.math.div``
 and never reaches this module).  ``Settings.cute_exact_division`` turns
-the lowering off; the config knob ``cute_exact_div_form`` picks the form
-(``redo`` / ``plain``) per kernel so the autotuner can keep the plain
-``div.rn`` where the redo copy would push a 1024-thread kernel to the
-register cap.
+the lowering on (without it ``/`` is ``div.full.f32``, the Triton backend's
+division, and none of this runs); the config knob ``cute_exact_div_form``
+picks the form (``redo`` / ``plain``) per kernel so the autotuner can keep
+the plain ``div.rn`` where the redo copy would push a 1024-thread kernel to
+the register cap.
 """
 
 from __future__ import annotations

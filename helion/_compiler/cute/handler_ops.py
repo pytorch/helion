@@ -62,6 +62,26 @@ class CuteHandlerOpOverrides(HandlerOpOverrides):
                     return handler._lift(expr_from_string(exact))
         return None
 
+    def div_rn(
+        self, handler: GenerateASTFromInductor, a: object, b: object
+    ) -> str | None:
+        # ``/`` compiles to ``div.full.f32`` (the launcher's ``-prec-div=0``)
+        # unless ``Settings.cute_exact_division`` asks for the IEEE division.
+        # ``div.rn.f32`` as an NVVM intrinsic keeps its rounding under either
+        # option, and no pass rewrites it: under the setting too, where
+        # ``fast_math`` turns a ``/`` by a loop-invariant divisor into a
+        # multiply by its reciprocal (41 * RN(1 / 41) truncates to 0).  It
+        # takes fp32 scalars, so 16-bit and integer operands are widened
+        # first; the quotient stays fp32, as the Triton backend's does, for
+        # the lowering to round where eager does and for the store to cast.
+        return handler._lift(
+            expr_from_string(
+                "cute.math.div({a}, {b}, rounding=cute.math.RoundingMode.NEAREST_EVEN)",
+                a=handler._create_cast_expr(a, torch.float32),
+                b=handler._create_cast_expr(b, torch.float32),
+            )
+        )
+
     def rsqrt(self, handler: GenerateASTFromInductor, x: object) -> str | None:
         suffix = (
             ", fastmath=True" if CompileEnvironment.current().settings.fast_math else ""

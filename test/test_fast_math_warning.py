@@ -52,6 +52,15 @@ def _sigmoid(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _sigmoid_in_place(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size()):
+        value = x[tile]
+        value.sigmoid_()
+        out[tile] = value
+    return out
+
+
 def _row_max(x: torch.Tensor) -> torch.Tensor:
     n, d = x.size()
     out = x.new_empty([n])
@@ -104,6 +113,16 @@ class TestFastMathWarning(TestCase):
         # without the setting, so only Triton kernels are told about it.
         self._assert_counts_on_triton_only(
             _sigmoid,
+            torch.sigmoid,
+            "WARNING[FastMathUnused]: This kernel computes sigmoid,",
+        )
+
+    @skipIfRefEager("Warning emitted in compile mode only")
+    def test_an_in_place_sigmoid_counts_as_sigmoid(self) -> None:
+        # ``x.sigmoid_()`` lowers as ``aten.sigmoid``: the warning's tables
+        # are read with the functional overload.
+        self._assert_counts_on_triton_only(
+            _sigmoid_in_place,
             torch.sigmoid,
             "WARNING[FastMathUnused]: This kernel computes sigmoid,",
         )

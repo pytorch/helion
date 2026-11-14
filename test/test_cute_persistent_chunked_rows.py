@@ -31,6 +31,7 @@ from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_native_compile
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_codegen import with_exact_division
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -178,7 +179,10 @@ def _code(
     vec_width: int,
     *,
     row_block: int = 1,
+    exact_division: bool = False,
 ) -> str:
+    if exact_division:
+        kernel = with_exact_division(kernel)
     with mock_cuda_unavailable(), forbid_native_compile():
         bound = cpu_bind(kernel, args)
         config = _config(bound, vec_width, row_block=row_block)
@@ -190,24 +194,31 @@ def _code(
 def test_each_chunk_takes_one_packet(vec_width: int) -> None:
     chunks = 16 // vec_width
     packet = f"ir.VectorType.get([{vec_width}], cutlass.Uint16.mlir_type)"
-    code = _code(_shifted_softmax, _shifted_args(4, 512), vec_width)
-    # 512 elements over 32 threads: one constexpr loop over each thread's 16.
-    assert "for synthetic_lane_1 in cutlass.range_constexpr(16):" in code, code
-    assert (
-        f"synthetic_lane_1 // {vec_width} * {32 * vec_width}"
-        f" + synthetic_lane_1 % {vec_width}"
-    ) in code, code
-    # ``content`` takes one packet per chunk, read again by the later sweeps.
-    assert code.count(packet) == chunks, code
-    # ``position`` rows are not packet aligned: its loads stay scalar.
-    assert "position.iterator" in code and ".load()" in code, code
-    # The store sweep collects its packets in lists, which a redo of the loop
-    # would append to twice: the exact division keeps its plain form there.
-    assert REDO not in code, code
-    # Each chunk is flushed once.
-    for chunk in range(chunks):
-        lanes = f"[{chunk * vec_width}:{(chunk + 1) * vec_width}])"
-        assert code.count(lanes) == 1, code
+    # With ``cute_exact_division`` too: the store sweep collects its packets
+    # in lists, which a redo of the loop would append to twice, so the exact
+    # division keeps its plain form there and the layout is the same.
+    for exact_division in (False, True):
+        code = _code(
+            _shifted_softmax,
+            _shifted_args(4, 512),
+            vec_width,
+            exact_division=exact_division,
+        )
+        # 512 elements over 32 threads: one constexpr loop over each thread's 16.
+        assert "for synthetic_lane_1 in cutlass.range_constexpr(16):" in code, code
+        assert (
+            f"synthetic_lane_1 // {vec_width} * {32 * vec_width}"
+            f" + synthetic_lane_1 % {vec_width}"
+        ) in code, code
+        # ``content`` takes one packet per chunk, read again by the later sweeps.
+        assert code.count(packet) == chunks, code
+        # ``position`` rows are not packet aligned: its loads stay scalar.
+        assert "position.iterator" in code and ".load()" in code, code
+        assert REDO not in code, code
+        # Each chunk is flushed once.
+        for chunk in range(chunks):
+            lanes = f"[{chunk * vec_width}:{(chunk + 1) * vec_width}])"
+            assert code.count(lanes) == 1, code
 
 
 def test_one_packet_per_thread_keeps_its_layout() -> None:
@@ -232,7 +243,12 @@ def test_an_in_place_row_keeps_its_chunks(vec_width: int) -> None:
 
 @pytest.mark.parametrize("vec_width", [2, 4, 8])
 def test_exact_division_reads_each_chunk_packet_once(vec_width: int) -> None:
-    code = _code(_rows_div, (torch.empty((4, 512)), torch.empty(4)), vec_width)
+    code = _code(
+        _rows_div,
+        (torch.empty((4, 512)), torch.empty(4)),
+        vec_width,
+        exact_division=True,
+    )
     read = f"[synthetic_lane_1 // {vec_width}][synthetic_lane_1 % {vec_width}]"
     # The packet-store sweep keeps the plain IEEE division: no redo copy.
     assert code.count(read) == 1, code
@@ -507,7 +523,7 @@ def test_cuda_chunked_rows_divide_exactly() -> None:
     s[5] = 0.3
     x, s = x.to(DEVICE), s.to(DEVICE)
     expected = (x / s[:, None]).view(torch.int32)
-    bound = _rows_div._bind_isolated((x, s))
+    bound = with_exact_division(_rows_div)._bind_isolated((x, s))
     for vec_width in (4, 8):
         out = bound.compile_config(_config(bound, vec_width))(x, s)
         assert torch.equal(out.view(torch.int32), expected), vec_width

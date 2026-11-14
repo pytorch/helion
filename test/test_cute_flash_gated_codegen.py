@@ -11,8 +11,6 @@ import re
 import pytest
 import torch
 
-from test.test_cute_flash_gated import _APPROX_GATE_DIVISION
-from test.test_cute_flash_gated import _IEEE_GATE_DIVISION
 from test.test_cute_flash_gated import _cpu_codegen_patches
 from test.test_cute_flash_gated import _division_gate_kernel
 from test.test_cute_flash_gated import _extrema_gate_kernel
@@ -28,6 +26,8 @@ import helion
 from helion._compiler.cute import cute_flash_gated
 from helion._compiler.cute.math_templates import SIGMOID_TEMPLATE
 from helion._testing.cute_codegen import cpu_target
+from helion._testing.cute_flash import APPROX_GATE_DIVISION
+from helion._testing.cute_flash import PLAIN_GATE_DIVISION
 from helion._testing.cute_flash import compile_and_run
 from helion._testing.cute_flash import gated_attention_match
 import helion.language as hl
@@ -627,8 +627,9 @@ def test_gate_extrema_render_the_pointwise_nan_forms() -> None:
 
 def test_fast_math_setting_selects_approximate_gate_math() -> None:
     """The existing fast_math setting (never a config knob) switches the gate's
-    division and exp to the approximate forms; without it the gate stays IEEE
-    and its exp the exactly reduced ``cute.math.exp``.  Either way the exp is
+    division and exp to the approximate forms; without it the gate divides
+    with ``/`` and its exp is the exactly reduced ``cute.math.exp``.  Either
+    way the exp is
     the one a config the fused body declines (the scalar path) computes.  The
     shipped example enables the setting; its exact twin is built here."""
     mod = _hstu_module()
@@ -667,10 +668,10 @@ def test_fast_math_setting_selects_approximate_gate_math() -> None:
     assert "fastmath=True" not in exact
     assert "cute.math.exp(" not in fast
     assert fast.count("fastmath=True") == 1
-    assert _IEEE_GATE_DIVISION.search(exact)
-    assert not _APPROX_GATE_DIVISION.search(exact)
-    assert _APPROX_GATE_DIVISION.search(fast)
-    assert not _IEEE_GATE_DIVISION.search(fast)
+    assert PLAIN_GATE_DIVISION.search(exact)
+    assert not APPROX_GATE_DIVISION.search(exact)
+    assert APPROX_GATE_DIVISION.search(fast)
+    assert not PLAIN_GATE_DIVISION.search(fast)
 
 
 def test_sigmoid_gate_computes_the_pointwise_sigmoid() -> None:
@@ -834,7 +835,8 @@ def test_fast_math_gate_divisions_follow_the_pointwise_lowering() -> None:
     # ``x / (1 + exp(-x))`` and its quotient by ``seq_len``: div.approx.ftz on
     # the scalar path.
     scalar_divisions = re.findall(
-        r"= cute\.math\.div\(v_\d+, v_\d+, approx=True, ftz=True\)$",
+        r"= cute\.math\.div\(cutlass\.Float32\(v_\d+\), "
+        r"cutlass\.Float32\(v_\d+\), approx=True, ftz=True\)$",
         scalar,
         re.MULTILINE,
     )
@@ -845,7 +847,7 @@ def test_fast_math_gate_divisions_follow_the_pointwise_lowering() -> None:
     # ``gated_mul_ftz_vec``: the flush-to-zero product div.approx.ftz takes.
     vector_division = r"= _helion_flash_rt\.gated_mul_ftz_vec\(flash_g\d+, {}\)$"
     for code, width in ((fused, 32), (row, 8)):
-        # The bf16 quotient ``qk / (1 + exp(-qk))``: IEEE, as on the scalar
+        # The bf16 quotient ``qk / (1 + exp(-qk))``: ``/``, as on the scalar
         # path.
         assert re.search(
             r"_helion_flash_rt\.gated_round_vec\(flash_g\d+ / flash_g\d+, "
@@ -871,6 +873,29 @@ def test_fast_math_gate_divisions_follow_the_pointwise_lowering() -> None:
         broadcast = rf"cute\.full\(\({width},\), {scalar_rcp}, cutlass\.Float32\)"
         assert re.search(vector_division.format(broadcast), code, re.MULTILINE)
         assert "approx=True)" not in code
+
+
+def test_a_gate_reciprocal_divides_as_the_launch_does() -> None:
+    """Without fast_math the pointwise lowering's ``1 / x`` is the division
+    the launch compiles ``/`` to (``div.full.f32`` unless the kernel chose
+    the IEEE one).  The DSL's ``rcp`` of a scalar is the ``rcp.rn``
+    intrinsic, which that option does not reach, so the fused bodies spell a
+    scalar reciprocal as the quotient."""
+    kernel = _with_fast_math(_division_gate_kernel, False)
+    with cpu_target():
+        kernel.reset()
+        bound = kernel.bind(_hstu_args())
+        fused = bound.to_code(
+            helion.Config(block_sizes=[128, 128], cute_flash_kv_stage=2)
+        )
+        row = bound.to_code(helion.Config(block_sizes=[16, 64]))
+    for code in (fused, row):
+        assert re.search(
+            r"= cutlass\.Float32\(1\.0\) / cutlass\.Float32\(flash_g\d+\)$",
+            code,
+            re.MULTILINE,
+        )
+        assert "cute.math.rcp(" not in code
 
 
 @pytest.mark.parametrize(
