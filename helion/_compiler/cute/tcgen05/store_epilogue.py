@@ -47,7 +47,6 @@ from ..state import cute_codegen_state
 from ..strategies import tcgen05_explicit_d_store_tile_expr
 from ..strategies import tcgen05_is_two_cta_m128
 from ..strategies import tcgen05_resolve_epilogue_tile
-from ..strategies import tcgen05_two_cta_m128_epilogue_tile_expr
 from ..tcgen05_constants import SM100_SMEM_PER_BLOCK_OPTIN_BYTES
 from ..tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP
 from ..tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY
@@ -867,23 +866,34 @@ def _codegen_cute_store_tcgen05_tile(
     backend = env.backend
     tensor_name = df.tensor_arg(tensor).name
     target_dtype = backend.dtype_str(tensor.dtype)
-    # The matmul plan computed `tcgen05_epi_tile` (role-local t2r
-    # partition) with `epi_elem_dtype_str`; the store path below
-    # recomputes `tcgen05_store_epi_tile` with `target_dtype`. They must
-    # match or `compute_epilogue_tile_shape` selects different `tile_n`
-    # values on the two sides and the t2r / r2s SMEM staging silently
-    # corrupts. The loud-failure backstop covers cases where MMA-codegen-
-    # time forward-tracing of the matmul fx_node could not pin a unique
-    # store target dtype.
-    if (
-        tcgen05_value.epi_elem_dtype_str
-        and tcgen05_value.epi_elem_dtype_str != target_dtype
-    ):
+    # Every store of the accumulator walks the matmul plan's subtiles
+    # (`epi_elem_dtype`, the widest output store's; the tile expression is
+    # shown at ``cute_mma._tcgen05_epilogue_tile_dtype``) and stages and
+    # stores them in its own `target_dtype`: beside an FP32
+    # `out0[tile] = acc` on a 128x64 tile, a BF16
+    # `out2[tile] = (acc + aux).to(bf16)` stages the FP32-sized (128, 16)
+    # subtiles as
+    #
+    #   tcgen05_sD_layout = make_smem_layout_epi(cutlass.BFloat16,
+    #       ROW_MAJOR, tcgen05_store_epi_tile, 2)
+    #
+    # and the wrapper builds its TMA store atom from the same tile
+    # (``epi_tile_raw_expr`` below). Sized by `target_dtype` instead, out2
+    # walks (128, 32) subtiles while its epilogue-issued aux ring
+    # (``tcgen05_aux_load_mode="epi_tma"``) holds the plan's (128, 16) ones,
+    # and the copy out of the ring fails to build (16 staged values against
+    # 32 per thread). A store wider than the plan's dtype (its
+    # forward trace failed and the plan fell back to the input dtype) would
+    # outgrow the C ring the SMEM model prices, so it is refused.
+    epi_tile_torch_dtype = tcgen05_value.epi_elem_dtype or tensor.dtype
+    epi_tile_dtype = backend.dtype_str(epi_tile_torch_dtype)
+    epi_tile_bits = epi_tile_torch_dtype.itemsize * 8
+    if tensor.dtype.itemsize > epi_tile_torch_dtype.itemsize:
         raise exc.BackendUnsupported(
             "cute",
             "tcgen05 epilogue element-type mismatch: matmul plan was set "
-            f"up with epi_elem_dtype_str={tcgen05_value.epi_elem_dtype_str!r} "
-            f"but the store target tensor dtype is {target_dtype!r}.",
+            f"up with the epilogue dtype {epi_tile_dtype!r} but the store "
+            f"target tensor dtype is the wider {target_dtype!r}.",
         )
     if tcgen05_value.orientation is Tcgen05Orientation.NM and target_dtype not in (
         "cutlass.Float16",
@@ -1339,8 +1349,9 @@ def _codegen_cute_store_tcgen05_tile(
     # The static loop needs the subtile count at codegen time (its ring
     # buffers and group split are Python-level): per-CTA rows over the plan's
     # subtile. The subtile width is the explicit tile's or CuTe's with-source
-    # rule at the output width (the plan's ``compute_epilogue_tile_shape``);
-    # the generated loop asserts the rendered count matches.
+    # rule at the plan's epilogue dtype width (the plan's
+    # ``compute_epilogue_tile_shape``); the generated loop asserts the
+    # rendered count matches.
     tcgen05_static_subtile_count = 0
     tcgen05_static_epi_tile_m = 0
     tcgen05_static_epi_tile_n = 0
@@ -1348,9 +1359,10 @@ def _codegen_cute_store_tcgen05_tile(
     tcgen05_ragged_groups = False
     if static_subtile_loop:
         # The subtile the plan renders: the explicit tile, or CuTe's
-        # with-source rule at the output width (``tcgen05_epi_tile_m`` above
-        # is the per-thread row extent, the whole 256-row pair tile on the
-        # legacy two-CTA path; the rule's M is the 128-lane datapath tile).
+        # with-source rule at the plan's epilogue dtype width
+        # (``tcgen05_epi_tile_m`` above is the per-thread row extent, the
+        # whole 256-row pair tile on the legacy two-CTA path; the rule's M is
+        # the 128-lane datapath tile).
         if tcgen05_value.has_explicit_epilogue_tile:
             assert tcgen05_value.explicit_epi_tile_m is not None
             assert tcgen05_value.explicit_epi_tile_n is not None
@@ -1361,8 +1373,8 @@ def _codegen_cute_store_tcgen05_tile(
                 tcgen05_default_epilogue_tile_size(
                     tcgen05_value.bm,
                     tcgen05_value.bn,
-                    elem_width_d=tensor.dtype.itemsize * 8,
-                    elem_width_c=tensor.dtype.itemsize * 8,
+                    elem_width_d=epi_tile_bits,
+                    elem_width_c=epi_tile_bits,
                 )
             )
         tcgen05_static_rows = (
@@ -1591,6 +1603,20 @@ def _codegen_cute_store_tcgen05_tile(
             tcgen05_value.explicit_epi_tile_m,
             tcgen05_value.explicit_d_store_box_n,
         )
+    # The bm=128 CtaGroup.TWO family stores through the per-CTA epilogue tile
+    # (m of 64, ``use_2cta=True``, no-source) so the store-side
+    # ``tcgen05_store_epi_tile``, the ``kernel_desc.cta_tile_shape_mnk``, and
+    # the host TMA-store atom all match the device-side N-mode-permuted tile.
+    # Resolved through the shared helper so this ``(store_tile_m, epi_tile_expr)``
+    # pair stays identical to the layout-plan side in ``cute_mma.py``.
+    tcgen05_store_tile_m, tcgen05_store_epi_tile_expr = tcgen05_resolve_epilogue_tile(
+        bm=tcgen05_value.bm,
+        bn=tcgen05_value.bn,
+        is_two_cta=tcgen05_lifecycle.is_two_cta,
+        elem_dtype=epi_tile_dtype,
+        c_layout=tcgen05_d_store_layout,
+        explicit_expr=tcgen05_explicit_store_tile_expr,
+    )
 
     # Per-thread epilogue M extent. The tcgen05 TMEM->register (T2R) copy
     # distributes the epilogue tile's M dimension across the 128-lane TMEM
@@ -3413,6 +3439,18 @@ def _codegen_cute_store_tcgen05_tile(
         d_two_cta_m128 = tcgen05_is_two_cta_m128(
             is_two_cta=tcgen05_lifecycle.is_two_cta, bm=tcgen05_value.bm
         )
+        # The wrapper sizes the TMA store box from the output dtype unless
+        # the plan names the tile: a BF16 store beside an FP32 one passes the
+        # FP32-sized tile its device loop stages (the expression shown at
+        # ``cute_mma._tcgen05_epilogue_tile_dtype``). Without it the host
+        # builds a (128, 32) BF16 box over the (128, 16) SMEM subtiles and the
+        # stored values come back wrong.
+        d_epi_tile_raw_expr = (
+            tcgen05_store_epi_tile_expr
+            if (d_two_cta_m128 or epi_tile_dtype != target_dtype)
+            and not tcgen05_value.has_explicit_epilogue_tile
+            else None
+        )
         d_tma_plan: dict[str, object] = {
             "kind": "tcgen05_d_tma",
             "d_name": tensor_name,
@@ -3429,15 +3467,8 @@ def _codegen_cute_store_tcgen05_tile(
             **({"rank3_mnl_tensor": True} if d_tma_uses_rank3_mnl_tensor else {}),
             **({"bounded_output_shift": True} if grouped_bounded_output_shift else {}),
             **(
-                {
-                    "epi_tile_raw_expr": tcgen05_two_cta_m128_epilogue_tile_expr(
-                        tcgen05_value.bm,
-                        tcgen05_value.bn,
-                        target_dtype,
-                        c_layout=tcgen05_d_store_layout,
-                    )
-                }
-                if d_two_cta_m128 and not tcgen05_value.has_explicit_epilogue_tile
+                {"epi_tile_raw_expr": d_epi_tile_raw_expr}
+                if d_epi_tile_raw_expr is not None
                 else {}
             ),
             **(
@@ -3491,20 +3522,6 @@ def _codegen_cute_store_tcgen05_tile(
     tcgen05_c_pipeline_stage_count = tcgen05_c_stage_count // tcgen05_epi_round_subtiles
     tcgen05_is_two_cta = tcgen05_lifecycle.is_two_cta
     tcgen05_thr_mma = tcgen05_value.thr_mma
-    # The bm=128 CtaGroup.TWO family stores through the per-CTA epilogue tile
-    # (m of 64, ``use_2cta=True``, no-source) so the store-side
-    # ``tcgen05_store_epi_tile``, the ``kernel_desc.cta_tile_shape_mnk``, and
-    # the host TMA-store atom all match the device-side N-mode-permuted tile.
-    # Resolved through the shared helper so this ``(store_tile_m, epi_tile_expr)``
-    # pair stays identical to the layout-plan side in ``cute_mma.py``.
-    tcgen05_store_tile_m, tcgen05_store_epi_tile_expr = tcgen05_resolve_epilogue_tile(
-        bm=tcgen05_bm,
-        bn=tcgen05_bn,
-        is_two_cta=tcgen05_is_two_cta,
-        elem_dtype=target_dtype,
-        c_layout=tcgen05_d_store_layout,
-        explicit_expr=tcgen05_explicit_store_tile_expr,
-    )
     full_tile_expr = (
         (
             f"{segment_store_local_m} + cutlass.Int32({tcgen05_source_bm}) "
@@ -3683,9 +3700,11 @@ def _codegen_cute_store_tcgen05_tile(
                 "})()"
             ),
             (
-                # The fallback helper must receive the D-output dtype through
-                # ``layout_c=`` / ``elem_ty_c=`` so it selects the same
-                # with-source branch as the matmul-plan ``tcgen05_epi_tile``.
+                # The fallback helper must receive the plan's epilogue dtype
+                # (the widest output store's, maybe wider than this store's)
+                # through ``layout_c=`` / ``elem_ty_c=`` so it selects the same
+                # with-source branch and tile as the matmul-plan
+                # ``tcgen05_epi_tile``.
                 # The explicit path instead uses the D-store box field directly.
                 # Keep both forms in lockstep with the wrapper-side TMA atom.
                 f"{epi_tile} = {epi_tile_expr}"
@@ -5667,8 +5686,8 @@ def _codegen_cute_store_tcgen05_tile(
             round_epi_tile_m, round_epi_tile_n = tcgen05_default_epilogue_tile_size(
                 tcgen05_value.bm,
                 tcgen05_value.bn,
-                elem_width_d=tensor.dtype.itemsize * 8,
-                elem_width_c=tensor.dtype.itemsize * 8,
+                elem_width_d=epi_tile_bits,
+                elem_width_c=epi_tile_bits,
             )
         round_rows = tcgen05_value.bm // 2 if tcgen05_is_two_cta else tcgen05_value.bm
         if round_rows % round_epi_tile_m or tcgen05_value.bn % round_epi_tile_n:
@@ -5853,7 +5872,8 @@ def _codegen_cute_store_tcgen05_tile(
     )
     tma_store_smem_setup = [
         # Must match the wrapper-side `tcgen05_d_tma` TMA atom layout in
-        # `helion/runtime/__init__.py`; both describe one D SMEM stage.
+        # `helion/runtime/cute/host_wrappers/tcgen05.py`; both describe one D
+        # SMEM stage.
         (
             f"{smem_d_layout} = cutlass.utils.blackwell_helpers.make_smem_layout_epi("
             f"{target_dtype}, {tcgen05_d_store_layout}, "

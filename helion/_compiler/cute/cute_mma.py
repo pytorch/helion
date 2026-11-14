@@ -242,6 +242,7 @@ from .tcgen05_prologue import split_barrier_init_supported
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Collection
     from collections.abc import Iterator
     from collections.abc import Sequence
 
@@ -7220,11 +7221,11 @@ def _trace_mma_to_stores(
     return tuple(stores) if stores else None
 
 
-def _trace_mma_to_store_dtype(
+def _trace_mma_to_store_dtypes(
     mma_node: Node,
     graphs: list[GraphInfo],
-) -> torch.dtype | None:
-    """Forward-trace ``mma_node`` to a unique reachable store dtype."""
+) -> frozenset[torch.dtype] | None:
+    """Forward-trace ``mma_node`` to the dtypes of every store it reaches."""
     stores = _trace_mma_to_stores(mma_node, graphs)
     if stores is None:
         return None
@@ -7237,7 +7238,59 @@ def _trace_mma_to_store_dtype(
         if not isinstance(fake, torch.Tensor):
             return None
         discovered.add(fake.dtype)
-    return next(iter(discovered)) if len(discovered) == 1 else None
+    return frozenset(discovered)
+
+
+def _trace_mma_to_store_dtype(
+    mma_node: Node,
+    graphs: list[GraphInfo],
+) -> torch.dtype | None:
+    """Forward-trace ``mma_node`` to a unique reachable store dtype."""
+    discovered = _trace_mma_to_store_dtypes(mma_node, graphs)
+    if discovered is None or len(discovered) != 1:
+        return None
+    return next(iter(discovered))
+
+
+def _tcgen05_epilogue_tile_dtype(
+    store_dtypes: frozenset[torch.dtype] | None,
+    input_dtype: torch.dtype,
+    supported: Collection[torch.dtype],
+) -> torch.dtype | None:
+    """The element type that sizes the epilogue tile all of a matmul's output
+    stores walk: their one dtype, or the widest of several.
+
+    Every store stages and stores the plan's subtiles in its own element type
+    (``store_epilogue._codegen_cute_store_tcgen05_tile``): an FP32
+    ``out0[tile] = acc`` beside a BF16 ``out2[tile] = (acc + aux).to(bf16)``
+    on a 128x64 tile both render
+    ::
+
+        compute_epilogue_tile_shape(
+            (128, 64),
+            False,
+            ROW_MAJOR,
+            cutlass.Float32,
+            layout_c=ROW_MAJOR,
+            elem_ty_c=cutlass.Float32,
+        )
+
+    four (128, 16) subtiles, out2 in BF16 32-byte TMA boxes. Falling back to
+    the BF16 input dtype instead (a unique store dtype is required otherwise),
+    the store side refuses the FP32 store as wider than the plan's dtype
+    ("tcgen05 epilogue element-type mismatch"): the BF16 (128, 32) subtile
+    would size its C ring past the one the SMEM model prices (each ring at
+    the widest output's subtile). Among equally wide dtypes the matmul's
+    input dtype wins, then the first by name; ``None`` when a store dtype
+    has no tcgen05 epilogue.
+    """
+    if not store_dtypes or not all(dtype in supported for dtype in store_dtypes):
+        return None
+    widest = max(dtype.itemsize for dtype in store_dtypes)
+    candidates = sorted(
+        (dtype for dtype in store_dtypes if dtype.itemsize == widest), key=str
+    )
+    return input_dtype if input_dtype in candidates else candidates[0]
 
 
 def _analyze_packed_split_mma_output_store(
@@ -8478,19 +8531,22 @@ def plan_tcgen05_pipeline(
     # `compute_epilogue_tile_shape` — `tile_n` differs between the
     # with-source bf16/fp16 `n_perf=64` branch and the fp32-with-source
     # `n_perf=32` branch, and a mismatch silently corrupts SMEM staging.
-    # Forward-trace the matmul fx_node to its consuming store target so
-    # both sides see the same dtype. When the trace fails (no fx_node,
-    # multi-store fan-out, opaque op) or returns a dtype outside the
-    # known matmul output family, we fall back to the input dtype here;
-    # the store-side equality check on the registered
-    # `CuteTcgen05StoreValue` is the loud-failure backstop and
-    # surfaces `BackendUnsupported` if the runtime D-tensor dtype
-    # disagrees with the matmul plan's assumption.
+    # Forward-trace the matmul fx_node to its consuming store targets so
+    # both sides see the same dtype: the stores' one dtype, or the widest of
+    # several (`_tcgen05_epilogue_tile_dtype`), which every store sizes its
+    # subtiles by. When the trace fails (no fx_node, opaque op) or reaches a
+    # dtype outside the known matmul output family, we fall back to the
+    # input dtype here; the store-side width check on the registered
+    # `CuteTcgen05StoreValue` is the loud-failure backstop and surfaces
+    # `BackendUnsupported` if the runtime D-tensor is wider than the matmul
+    # plan's assumption.
     epi_elem_dtype: torch.dtype | None = None
     if fx_node is not None:
-        traced = _trace_mma_to_store_dtype(fx_node, cg.codegen_graphs)
-        if traced in _dtype_map:
-            epi_elem_dtype = traced
+        epi_elem_dtype = _tcgen05_epilogue_tile_dtype(
+            _trace_mma_to_store_dtypes(fx_node, cg.codegen_graphs),
+            input_dtype,
+            _dtype_map,
+        )
     epi_elem_dtype_str = (
         _dtype_map[epi_elem_dtype] if epi_elem_dtype is not None else input_dtype_str
     )
@@ -17387,10 +17443,10 @@ def _emit_mma_pipeline(
                 partial_output_tma_store=tcgen05_partial_output_tma_store,
                 partial_output_row_lookahead=tcgen05_partial_output_row_lookahead,
                 # Mirror the value passed to `_make_tcgen05_layout_plan_setup`
-                # above; the store path compares this against `target_dtype`
-                # to enforce the kernel/store equality contract on
-                # `compute_epilogue_tile_shape`'s dtype kwargs.
-                epi_elem_dtype_str=plan.epi_elem_dtype_str,
+                # above; every store sizes its `compute_epilogue_tile_shape`
+                # by this dtype rather than its own, so the kernel and store
+                # sides walk the same subtiles.
+                epi_elem_dtype=plan.epi_elem_dtype or plan.input_dtype,
                 explicit_epi_tile_m=tcgen05_explicit_epi_tile_m,
                 explicit_epi_tile_n=tcgen05_explicit_epi_tile_n,
                 explicit_d_store_box_n=tcgen05_explicit_d_store_box_n,
@@ -18051,15 +18107,17 @@ def _make_tcgen05_layout_plan_setup(
     c_layout: str = "cutlass.utils.layout.LayoutEnum.ROW_MAJOR",
 ) -> list[ast.AST]:
     # `compute_epilogue_tile_shape` must receive `elem_ty_d` and `elem_ty_c`
-    # equal to the eventual D-output dtype so the helper takes the
-    # with-source branch (e.g. bf16 → `tile_n=64`) rather than the
-    # `disable_source=True` branch (`tile_n=32`); the matmul-plan epi_tile
-    # built here, the store-side epi_tile in
-    # `_codegen_cute_store_tcgen05_tile`, and the wrapper-side TMA atom in
-    # `helion/runtime/__init__.py` must all see the same `tile_n`. When
-    # `epi_elem_dtype_str` is omitted the input dtype is used as a fallback;
-    # the store-side equality check on the registered `CuteTcgen05StoreValue`
-    # is the loud-failure backstop for any mismatch.
+    # equal to the plan's epilogue dtype (the widest output store's,
+    # `_tcgen05_epilogue_tile_dtype`) so the helper takes the with-source
+    # branch (e.g. bf16 → `tile_n=64`) rather than the `disable_source=True`
+    # branch (`tile_n=32`); the matmul-plan epi_tile built here, the
+    # store-side epi_tile in `_codegen_cute_store_tcgen05_tile`, and the
+    # wrapper-side TMA atom in `helion/runtime/cute/host_wrappers/tcgen05.py`
+    # must all see the same `tile_n` (every store sizes its tile by this
+    # dtype). When `epi_elem_dtype_str` is omitted the input dtype is used as
+    # a fallback; the store-side width check on the registered
+    # `CuteTcgen05StoreValue` is the loud-failure backstop for a store wider
+    # than it.
     if epi_elem_dtype_str is None:
         epi_elem_dtype_str = input_dtype_str
     if (explicit_epi_tile_m is None) != (explicit_epi_tile_n is None):
