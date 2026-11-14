@@ -5,6 +5,7 @@ import time
 from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import Mock
+import weakref
 
 import pytest
 import torch
@@ -15,6 +16,7 @@ from helion.autotuner.benchmarking import do_bench_cuda_graph
 from helion.autotuner.handoff_evaluation import _alias_signature
 from helion.autotuner.handoff_evaluation import _EvaluateCase
 from helion.autotuner.handoff_evaluation import _input_reset
+from helion.autotuner.input_banks import InputBankCycle
 import helion.runtime as helion_runtime
 
 if TYPE_CHECKING:
@@ -53,7 +55,8 @@ def test_graph_timer_propagates_capture_errors(monkeypatch: pytest.MonkeyPatch) 
         do_bench_cuda_graph(lambda: x + 1, fixed_repetitions=1)
 
 
-def test_graph_reset_preserves_overlapping_offset_views() -> None:
+@pytest.mark.parametrize("prime", [False, True])
+def test_graph_reset_preserves_overlapping_offset_views(prime: bool) -> None:
     storage = torch.arange(33, dtype=torch.float32, device=DEVICE)
     inputs = (storage[1:17], storage[9:25])
     args = cast(
@@ -68,7 +71,13 @@ def test_graph_reset_preserves_overlapping_offset_views() -> None:
         output = args[1]
         return output
 
-    do_bench_cuda_graph(run, fixed_repetitions=7, reset=_input_reset(inputs, args))
+    do_bench_cuda_graph(
+        run,
+        fixed_repetitions=7,
+        reset=_input_reset(inputs, args),
+        pre_timing=run if prime else None,
+        l2_flush_mode="off" if prime else "replay",
+    )
     expected = storage.clone()
     expected[1:17] += 1
     torch.testing.assert_close(output, expected[9:25])
@@ -76,6 +85,50 @@ def test_graph_reset_preserves_overlapping_offset_views() -> None:
     assert args[1].storage_offset() == 9
     assert args[0].untyped_storage() == args[1].untyped_storage()
     torch.testing.assert_close(storage, torch.arange(33, device=DEVICE).float())
+
+
+def test_resident_cycle_retains_distinct_primer_and_timed_outputs() -> None:
+    banks = (
+        (torch.full((16,), 2.0, device=DEVICE),),
+        (torch.full((16,), 5.0, device=DEVICE),),
+    )
+    phase = "setup"
+    outputs = []
+    kept = []
+
+    def run(value):
+        result = value + 1
+        if phase == "capture":
+            outputs.append(weakref.ref(result))
+        return result
+
+    def observe(name):
+        nonlocal phase
+        phase = name
+        if name == "measure":
+            assert len(outputs) == 4
+            for ref in outputs:
+                value = ref()
+                assert value is not None
+                kept.append(value)
+                value.fill_(float("nan"))
+            assert len({value.data_ptr() for value in kept}) == 4
+            # Poisoning occurs outside capture and before the timer's stream
+            # replays. Synchronize here so the check introduces no data race.
+            torch.cuda.synchronize()
+
+    cycle = InputBankCycle(run, banks)
+    result = do_bench_cuda_graph(
+        cycle,
+        l2_flush_mode="off",
+        pre_timing=cycle,
+        phase=observe,
+        fixed_repetitions=3,
+        return_mode="median",
+    )
+    assert isinstance(result, float) and result > 0
+    for value, expected in zip(kept, (3.0, 6.0, 3.0, 6.0), strict=True):
+        torch.testing.assert_close(value, torch.full_like(value, expected))
 
 
 @pytest.mark.parametrize("error", [None, "visible", "outside"])

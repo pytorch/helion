@@ -32,6 +32,7 @@ from ..ast_read_writes import dead_lane_loop_elimination
 from ..compile_environment import CompileEnvironment
 from ..device_ir import ForLoopGraphInfo
 from ..device_ir import control_flow_parent_entries
+from ..fx_side_effects import is_impure_node
 from ..reduction_strategy import PersistentReductionStrategy
 from ..tile_strategy import DeviceLoopState
 from ..variable_origin import BlockSizeOrigin
@@ -396,7 +397,7 @@ def _is_effectful_or_control_flow(node: Node) -> bool:
         return False
     target = node.target
     return (
-        node.is_impure()
+        is_impure_node(node)
         or target is _tracing_ops._phi
         or target is _tracing_ops._if
         or _tracing_ops.is_for_loop_target(target)

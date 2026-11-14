@@ -98,11 +98,15 @@ def active_fragment_roots(
 
 
 def fragment_root_regions(ir: DeviceIR) -> list[tuple[int, list[GraphInfo]]]:
-    """Project exactly the regions accepted by explicit ordered phase codegen."""
+    """Project exactly the regions accepted by proved ordered phase codegen."""
+    from ...dependent_phases import required_owner_regions
     from ...materialized_fission_codegen import _region_graph_ids
 
     if len(ir.root_ids) == 1:
         return [(ir.root_ids[0], ir.graphs)]
+    projected = required_owner_regions(ir)
+    if projected is not None:
+        return projected
     if not (
         ir.phases
         and not ir.implicit_dependency_starts

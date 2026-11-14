@@ -33,12 +33,12 @@ from ...language.view_ops import join as hl_join
 from ...language.view_ops import split as hl_split
 from ...language.view_ops import subscript as hl_subscript
 from ..compile_environment import CompileEnvironment
+from ..rebound_dims import operand_positions
+from ..rebound_dims import rebound_consumer_dims
+from ..rebound_dims import rebound_operands
 from .cute_reshape import CUTE_DIM_LOCAL_COORD_META
-from .cute_reshape import _rebound_consumer_dims
-from .cute_reshape import _rebound_operands
 from .cute_reshape import _resolve_dim_block_id
 from .cute_reshape import _resolve_tile_extent
-from .cute_reshape import operand_positions
 from .cute_reshape import tensor_dim_block_ids
 
 if TYPE_CHECKING:
@@ -682,7 +682,7 @@ def _combination_conflict(cg: CodegenInterface, node: torch.fx.Node) -> str | No
     result must keep the coordinates of every position a split-view dim
     reaches (``_pointwise_coord_meta`` takes them from same-rank operands).
     """
-    consumer = _rebound_consumer_dims(node)
+    consumer = rebound_consumer_dims(node)
     if consumer is None:
         return "split-view operands it cannot align"
     sizes, lower_rank_by_block_id = consumer
@@ -690,7 +690,7 @@ def _combination_conflict(cg: CodegenInterface, node: torch.fx.Node) -> str | No
     block_ids = tensor_dim_block_ids(env, sizes)
     entries: list[list[tuple[torch.fx.Node, torch.Tensor, int]]] = [[] for _ in sizes]
     view_positions: set[int] = set()
-    for operand in _rebound_operands(node):
+    for operand in rebound_operands(node):
         value = operand.meta.get("val")
         if not isinstance(value, torch.Tensor):
             continue

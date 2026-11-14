@@ -203,6 +203,15 @@ def lane_group_max(value: object, width: int) -> object:
     return value
 
 
+def octet_max_nan(value: object) -> object:
+    """NaN-propagating max over the eight lanes sharing ``lane % 4``."""
+    for offset in (4, 8, 16):
+        value = cute.math.max(
+            value, cute.arch.shuffle_sync_bfly(value, offset), propagate_nan=True
+        )
+    return value
+
+
 def lane_group_min(value: object, width: int) -> object:
     """NaN-propagating min over the ``width`` consecutive lanes of a row."""
     offset = 1

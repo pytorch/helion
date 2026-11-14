@@ -47,8 +47,8 @@ def reject_positional_rebinds(graphs: list[GraphInfo]) -> None:
 
     Only kernels holding an ``aten.permute`` are checked.  A permute-free
     kernel can also meet dims on different blocks (``out[tm, tn] =
-    y[tn, tm]``); Metal lowers that by block, as a transpose, and this check
-    leaves it alone.
+    y[tn, tm]``); ``literal_dims.reject_literal_dims``, which runs after this
+    on every kernel, refuses those.
     """
     nodes = [
         node

@@ -716,13 +716,14 @@ def _real_codegen_tensor_metadata(
     )
 
 
+@pytest.mark.cpu_only
 def test_fixed_rank1_t3_real_codegen_reaches_direct_async_emission() -> None:
-    from test.test_cute_affine_scan_heuristic import _fake_cute_context
-    from test.test_cute_fixed_token_rank1_recurrence import _fixed_rank1
-    from test.test_cute_fixed_token_rank1_recurrence import _inputs
+    from helion._testing.cute_fixed_token_rank1 import fixed_rank1
+    from helion._testing.cute_fixed_token_rank1 import fixed_rank1_cpu_target
+    from helion._testing.cute_fixed_token_rank1 import fixed_rank1_inputs
 
     with (
-        _fake_cute_context(),
+        fixed_rank1_cpu_target(),
         patch.object(
             lowering,
             "_tensor_metadata",
@@ -737,8 +738,8 @@ def test_fixed_rank1_t3_real_codegen_reaches_direct_async_emission() -> None:
             return_value=True,
         ),
     ):
-        bound = _fixed_rank1._bind_isolated(
-            (*_inputs(3), 3, 1.0e-6, True, False, False, False)
+        bound = fixed_rank1._bind_isolated(
+            (*fixed_rank1_inputs(3), 3, 1.0e-6, True, False, False, False)
         )
         config = next(
             seed
@@ -777,16 +778,17 @@ def test_fixed_rank1_t3_real_codegen_reaches_direct_async_emission() -> None:
         ),
     ],
 )
+@pytest.mark.cpu_only
 def test_direct_affine_rejects_conflicting_fragment_schedule(
     key: str, value: int | str, message: str
 ) -> None:
-    from test.test_cute_affine_scan_heuristic import _fake_cute_context
-    from test.test_cute_fixed_token_rank1_recurrence import _fixed_rank1
-    from test.test_cute_fixed_token_rank1_recurrence import _inputs
+    from helion._testing.cute_fixed_token_rank1 import fixed_rank1
+    from helion._testing.cute_fixed_token_rank1 import fixed_rank1_cpu_target
+    from helion._testing.cute_fixed_token_rank1 import fixed_rank1_inputs
 
-    with _fake_cute_context():
-        bound = _fixed_rank1._bind_isolated(
-            (*_inputs(3), 3, 1.0e-6, True, False, False, False)
+    with fixed_rank1_cpu_target():
+        bound = fixed_rank1._bind_isolated(
+            (*fixed_rank1_inputs(3), 3, 1.0e-6, True, False, False, False)
         )
         config = deepcopy(
             next(
@@ -951,14 +953,14 @@ def test_fixed_rank1_direct_runtime_matches_reference(
     schedule: str,
     row_tile: int,
 ) -> None:
-    from test.test_cute_fixed_token_rank1_recurrence import _fixed_rank1
+    from helion._testing.cute_fixed_token_rank1 import fixed_rank1
 
     args = _runtime_inputs(token_count)
     reference_args = tuple(
         value.clone() if isinstance(value, torch.Tensor) else value for value in args
     )
     expected = _reference_fixed_rank1(reference_args)
-    bound = _fixed_rank1._bind_isolated(args)
+    bound = fixed_rank1._bind_isolated(args)
     config = next(
         seed
         for seed in bound.config_spec.compiler_seed_configs

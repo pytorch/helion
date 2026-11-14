@@ -14,7 +14,10 @@ from unittest.mock import Mock
 from unittest.mock import call
 from unittest.mock import patch
 
+import pytest
 import torch
+from torch.testing._internal.common_utils import instantiate_parametrized_tests
+from torch.testing._internal.common_utils import parametrize
 
 from test._autotuner_test_utils import AutotunerTestCase
 from test._autotuner_test_utils import _assert_phase_config_manifest
@@ -93,9 +96,14 @@ _CACHE_POLICY_BASELINE_SCALE = 1
 _CACHE_POLICY_DYNAMIC_HELPER: object = None
 
 
+@instantiate_parametrized_tests
 @onlyBackends(["cute"])
 class TestAutotunerCuteFlash(AutotunerTestCase):
-    def test_lfbo_flash_terminal_coordinate_refinement_runs_two_rounds(self):
+    @pytest.mark.cpu_only
+    @parametrize("missing_phase", [None, "rounds", "all", "confirmation", "reference"])
+    def test_lfbo_flash_terminal_coordinate_refinement_runs_two_rounds(
+        self, missing_phase
+    ):
         def make_fn(source_id: int):
             def fn():
                 return None
@@ -134,6 +142,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
                         outcome="candidate",
                         flat_values=[target],
                         config=projected,
+                        requested_flat_values=[target],
                     )
                 )
             return result
@@ -196,6 +205,9 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         )
 
         initial_perfs = {1: 9.9, 2: 10.2}
+        if missing_phase == "rounds":
+            # The missing candidate's old observation would win every round.
+            initial_perfs[2] = 0.1
 
         def benchmark_population(members, *, desc):
             self.assertIn("Terminal coordinate refinement", desc)
@@ -223,12 +235,30 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         def mirrored_rebenchmark(members, *, desc, target_ms):
             values = timing_rounds[mirrored_rebenchmark.calls]
             mirrored_rebenchmark.calls += 1
-            timings = [
-                values[member.config.config[cute_flash.FLASH_WAIT_HINT_KEY]]
+            statuses = [
+                "incomplete"
+                if missing_phase == "all"
+                or (
+                    missing_phase == "rounds"
+                    and member.config.config[cute_flash.FLASH_WAIT_HINT_KEY] == 2
+                )
+                or (missing_phase == "confirmation" and "confirming" in desc)
+                or (
+                    missing_phase == "reference"
+                    and member.config.config[cute_flash.FLASH_WAIT_HINT_KEY] == 0
+                )
+                else "ok"
                 for member in members
             ]
-            for member, timing in zip(members, timings, strict=True):
-                member.perfs.append(timing)
+            timings = [
+                values[member.config.config[cute_flash.FLASH_WAIT_HINT_KEY]]
+                if status == "ok"
+                else math.inf
+                for member, status in zip(members, statuses, strict=True)
+            ]
+            for member, timing, status in zip(members, timings, statuses, strict=True):
+                if status == "ok":
+                    member.perfs.append(timing)
             order = list(range(len(members)))
             return MirroredBenchmarkTrace(
                 orders=[order, list(reversed(order))],
@@ -237,12 +267,44 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
                 sweep_count=2,
                 calls_per_sample=1,
                 total_calls=2,
+                statuses=statuses if missing_phase is not None else None,
             )
 
         mirrored_rebenchmark.calls = 0
         search.mirrored_rebenchmark = Mock(side_effect=mirrored_rebenchmark)
 
         selected = search.run_terminal_refinement(best)
+
+        if missing_phase is not None:
+            transcript = search._autotune_metrics.search_phase_metrics[
+                "terminal_coordinate_refinement"
+            ]
+            self.assertEqual(
+                selected.config.config[cute_flash.FLASH_WAIT_HINT_KEY],
+                1 if missing_phase == "rounds" else 0,
+            )
+            if missing_phase == "rounds":
+                self.assertNotIn(
+                    canonical_config_id(make_member(2, 0.1).config),
+                    transcript["accepted_config_ids"],
+                )
+            elif missing_phase in ("all", "reference"):
+                self.assertFalse(transcript["accepted_config_ids"])
+                self.assertEqual(best.perfs, [10.0])
+            else:
+                self.assertFalse(transcript["confirmation"]["accepted"])
+            measurements = [row["measurement"] for row in transcript["rounds"]] + [
+                transcript["confirmation"]["measurement"]
+            ]
+            self.assertTrue(
+                any(
+                    measurement is not None and "incomplete" in measurement["statuses"]
+                    for measurement in measurements
+                )
+            )
+            self.assertEqual(search._autotune_metrics.num_generations, 20)
+            self.assertTrue(transcript["completed"])
+            return
 
         self.assertEqual(
             selected.config.config[cute_flash.FLASH_WAIT_HINT_KEY],
@@ -463,6 +525,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search.benchmark_population.assert_not_called()
         search.mirrored_rebenchmark.assert_not_called()
 
+    @pytest.mark.cpu_only
     def test_lfbo_flash_terminal_coordinate_refinement_crosses_beam_valley(self):
         def member(
             e2e_offset: int,
@@ -500,6 +563,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
                         "candidate",
                         [5, 12.0],
                         intermediate_config,
+                        [5, 12.0],
                     )
                 ]
             if flat == [5, 12.0]:
@@ -513,6 +577,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
                         "candidate",
                         [5, 4.0],
                         endpoint_config,
+                        [5, 4.0],
                     )
                 ]
             return []
@@ -5210,6 +5275,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
                     )
                 )
 
+    @pytest.mark.cpu_only
     def test_lfbo_flash_qualification_reserves_lanes_before_surrogate_pruning(
         self,
     ):
@@ -5325,6 +5391,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
                         "candidate",
                         child_flat,
                         by_flat[tuple(child_flat)].config,
+                        child_flat,
                     )
                     for child_flat in generate(parent, _leaf, constraints, limit)
                 ]
@@ -7364,6 +7431,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
 
 
 @onlyBackends(["cute"])
+@pytest.mark.cpu_only
 class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
     @staticmethod
     def _search(
@@ -7412,6 +7480,8 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
         assert pattern is not None
         search = object.__new__(LFBOTreeSearch)
         search.settings = settings
+        search._benchmark_provider_cls = LocalBenchmarkProvider
+        search.final_selection = search._final_selection_from_settings(settings)
         search.config_spec = SimpleNamespace(  # type: ignore[assignment]
             compiler_seed_configs=[],
             compiler_coverage_groups=(),
@@ -7463,11 +7533,15 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
             cute_flash_search_enabled=enabled,
         )
 
-    def test_non_flash_preserves_legacy_empty_policy(self) -> None:
+    def test_non_flash_preserves_policy_equivalence_with_clone_version(self) -> None:
         full = self._search()
         quick = self._search(effort="quick", max_generations=5)
-        self.assertEqual(self._hash(full, enabled=False), "")
-        self.assertEqual(self._hash(quick, enabled=False), "")
+        # Clone semantics version even default one-bank cache keys; disabled
+        # flash search still leaves full and quick search policies equivalent.
+        full_key = self._hash(full, enabled=False)
+        self.assertNotEqual(full_key, "")
+        self.assertEqual(full_key, self._hash(full, enabled=False))
+        self.assertEqual(full_key, self._hash(quick, enabled=False))
 
     def test_config_generation_policy_version_covers_flash_searches(self) -> None:
         def random_search(*, cute_flash: bool) -> RandomSearch:
@@ -7867,7 +7941,7 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
         search = object.__new__(RandomSearch)
         search.count = 100
         search._benchmark_provider_cls = object
-        self.assertIsNone(search._algorithm_cache_policy())
+        self.assertIsNone(search.cache_policy())
 
         search._benchmark_provider_cls = LocalBenchmarkProvider
         self.assertEqual(
@@ -8080,6 +8154,7 @@ class TestCuteAutotuner(TestCase):
             {
                 "block_sizes",
                 "num_threads",
+                "cute_compiler_pipeline",
                 "flatten_loops",
                 "loop_orders",
                 "cute_vector_widths",
@@ -8119,40 +8194,7 @@ class TestCuteAutotuner(TestCase):
         configs = [gen.random_config() for _ in range(20)]
         self.assertTrue(any(config.num_threads for config in configs))
         for config in configs:
-            self.assertLessEqual(
-                set(config.config),
-                {
-                    "block_sizes",
-                    "num_threads",
-                    "flatten_loops",
-                    "loop_orders",
-                    "cute_vector_widths",
-                    "cute_lane_layouts",
-                    "cute_cluster_n",
-                    "cute_min_blocks_per_mp",
-                    "cute_proven_bounds",
-                    "cute_packet_prefetch",
-                    "cute_independent_reduction",
-                    "cute_cluster_warp_online",
-                    "cute_register_row",
-                    "cute_register_row_tensor_copy",
-                    "cute_scalar_epilogue",
-                    "cute_scalar_epilogue_keep_inputs",
-                    "cute_scalar_epilogue_owner_fold",
-                    "cute_warp_fp32_redux",
-                    "cute_register_tile_warp_fold",
-                    "cute_register_tile_store_first",
-                    "cute_replicated_reduction",
-                    "cute_vector_packet_unroll",
-                    "cute_vloop_sink",
-                    "cute_lane_unroll",
-                    "cute_pdl",
-                    "cute_pdl_release",
-                    "cute_pdl_spread",
-                    "cute_store_policy",
-                    "load_eviction_policies",
-                },
-            )
+            self.assertLessEqual(set(config.config), flat_keys)
             self.assertNotIn("persistent", config.pid_type)
             explicit_threads = [nt for nt in config.num_threads if nt > 0]
             if explicit_threads:
@@ -8922,7 +8964,7 @@ class TestCuteAutotuner(TestCase):
         ):
             flat = generation.flatten(config)
             generation.encode_config(flat)
-            expected = dict(config.config)
+            expected = dict(config.config, cute_compiler_pipeline="default")
             expected.pop("cute_vector_widths", None)
             expected.pop("cute_lane_layouts", None)
             self.assertEqual(generation.unflatten(flat).config, expected)

@@ -112,6 +112,8 @@ from .cute_mma_dag import cluster_split_axis
 from .cute_mma_dag import staged_store_reason
 from .cute_mma_dag import streamed_loop_subject
 from .cute_mma_dag_emitter_base import _RUNTIME
+from .cute_mma_dag_emitter_base import _float_literal
+from .cute_mma_dag_emitter_base import _reduce_combine
 from .cute_mma_dag_emitter_base import _shape
 from .cute_mma_dag_tcgen05 import _PRIMS
 from .cute_mma_dag_tcgen05 import _RT
@@ -226,12 +228,6 @@ def region_program_reason(program: MmaDagProgram) -> str | None:
         # transposed half tile of se_block dw's A as the fp32 B tiles.  A
         # tile read K-major by another dot takes that layout for both
         # readers: ``tile_mn_major``.)
-    for step in program.vec_stores:
-        slot = program.vec_leaves[step.vec]
-        if program.vec_slots[slot].orient == "cols" and (
-            program.vec_slots[slot].axis is not None
-        ):
-            return "a store of a column vector"
     return None
 
 
@@ -531,6 +527,10 @@ def region_block_steps(program: MmaDagProgram, steps: Sequence[Step]) -> list[Bl
     deferred_reads: set[int] = set()
     deferred_writes: set[int] = set()
 
+    def vectors(nodes: Sequence[Node]) -> set[int]:
+        # Fragment and vector slots are disjoint scheduler resources.
+        return {len(program.slots) + program.vec_leaves[node] for node in nodes}
+
     def flush() -> None:
         nonlocal \
             work, \
@@ -558,6 +558,7 @@ def region_block_steps(program: MmaDagProgram, steps: Sequence[Step]) -> list[Bl
                 dot_prepares(step) or step.acc_frag not in produced_nodes(dots)
             ):
                 reads.add(step.acc_slot)
+            reads |= vectors(step.acc_vecs)
             if (
                 reads & produced
                 or reads & deferred_writes
@@ -571,15 +572,20 @@ def region_block_steps(program: MmaDagProgram, steps: Sequence[Step]) -> list[Bl
             continue
         if isinstance(step, Derived):
             reads = {program.frag_slots[frag] for frag in step.frags}
+            reads |= vectors(step.vecs)
             writes = step.slot
         elif isinstance(step, Store):
             reads = {program.frag_slots[step.frag]}
             writes = -1
         elif isinstance(step, Reduce):
             reads = {program.frag_slots[step.frag]} if step.frag is not None else set()
-            writes = -1
-        elif isinstance(step, (VecOp, VecStore)):
-            reads = set()
+            reads |= vectors(step.vecs)
+            writes = len(program.slots) + step.slot
+        elif isinstance(step, VecOp):
+            reads = vectors(step.vecs)
+            writes = len(program.slots) + step.slot
+        elif isinstance(step, VecStore):
+            reads = vectors((step.vec,))
             writes = -1
         else:
             raise AssertionError(step)
@@ -986,14 +992,17 @@ def step_depends(program: MmaDagProgram, later: Dot | Derived, earlier: Dot) -> 
     accumulators or derived chains): the block builder then flushes the
     pending batch ahead of it, so the two never share a batch."""
     if isinstance(later, Derived):
-        pending = list(later.frags)
+        pending = [*later.frags, *later.vecs]
     else:
         pending = [
             operand.frag for operand in (later.a, later.b) if operand.frag is not None
         ]
         if later.acc_frag is not None:
             pending.append(later.acc_frag)
+        pending.extend(later.acc_vecs)
     derived_by_node = {step.node: step for step in program.derived}
+    reduce_by_node = {step.node: step for step in program.reduces}
+    vec_by_node = {step.node: step for step in program.vec_ops}
     seen: set[Node] = set()
     while pending:
         node = program.resolve(pending.pop())
@@ -1005,6 +1014,15 @@ def step_depends(program: MmaDagProgram, later: Dot | Derived, earlier: Dot) -> 
         derived = derived_by_node.get(node)
         if derived is not None:
             pending.extend(derived.frags)
+            pending.extend(derived.vecs)
+        reduce = reduce_by_node.get(node)
+        if reduce is not None:
+            if reduce.frag is not None:
+                pending.append(reduce.frag)
+            pending.extend(reduce.vecs)
+        vec = vec_by_node.get(node)
+        if vec is not None:
+            pending.extend(vec.vecs)
     return False
 
 
@@ -3422,12 +3440,16 @@ class Tcgen05RegionMmaDagEmitter(Tcgen05MmaDagEmitter):
         # tiles, the N tile fastest (``md_mtile``, ``md_crank``).
         for axis in self.program.axes:
             if self.is_split_axis(axis):
-                self.emit(f"{self.axis_base(axis)} = md_crank * {self.plan.size(axis)}")
+                self.emit(
+                    f"{self.axis_base(axis)} = {self.axis_product(axis, 'md_crank')}"
+                )
             elif axis.kind == AXIS_ROOT:
-                self.emit(f"{self.axis_base(axis)} = md_mtile * {self.plan.size(axis)}")
+                self.emit(
+                    f"{self.axis_base(axis)} = {self.axis_product(axis, 'md_mtile')}"
+                )
             elif axis.kind not in (AXIS_LOOP, AXIS_RDIM):
                 self.emit(
-                    f"{self.axis_base(axis)} = cutlass.Int32({self.cg.tile_begin_var(axis.block_id)})"
+                    f"{self.axis_base(axis)} = {self.index_cast(self.cg.tile_begin_var(axis.block_id))}"
                 )
 
     # -- the split's exchange rounds --------------------------------------------
@@ -3451,7 +3473,9 @@ class Tcgen05RegionMmaDagEmitter(Tcgen05MmaDagEmitter):
         program = self.program
         # The values through their ``_mask_to`` wrappers (whole tiles).
         if (
-            first.frag is None
+            first.kind != "sum"
+            or second.kind != "sum"
+            or first.frag is None
             or first.frag is not second.frag
             or program.resolve(first.value) is not program.resolve(first.frag)
         ):
@@ -3469,12 +3493,10 @@ class Tcgen05RegionMmaDagEmitter(Tcgen05MmaDagEmitter):
         ):
             return None
         value = program.resolve(second.value)
-        # The Inductor lowering masks a repeated input to None (``x * x``
-        # arrives as ``mul(x, None)``).
         if (
             _is_call(value, torch.ops.aten.mul.Tensor)
             and len(value.args) == 2
-            and value.args[1] in (None, value.args[0])
+            and value.args[1] is value.args[0]
         ) or (
             _is_call(value, torch.ops.aten.pow.Tensor_Scalar)
             and len(value.args) == 2
@@ -3520,11 +3542,11 @@ class Tcgen05RegionMmaDagEmitter(Tcgen05MmaDagEmitter):
             return self.emit_fixup_exchange(partials, frag_slot)
         return self.emit_cluster_exchange(partials, frag_slot)
 
-    def emit_ordered_sum(self, values: Sequence[str]) -> str:
-        """The values added in order (the tile order of an exchange)."""
+    def emit_ordered_reduce(self, values: Sequence[str], kind: str = "sum") -> str:
+        """The values reduced in order (the tile order of an exchange)."""
         total = values[0]
         for value in values[1:]:
-            total = self.bind("md_s", f"{total} + {value}")
+            total = self.bind("md_s", _reduce_combine(kind, total, value))
         return total
 
     def emit_fused_variance(
@@ -3548,7 +3570,7 @@ class Tcgen05RegionMmaDagEmitter(Tcgen05MmaDagEmitter):
         for value in values:
             deviation = self.bind("md_s", f"{value} - {mean}")
             squares.append(self.bind("md_s", f"{deviation} * {deviation}"))
-        return self.emit_tree_sum(squares)
+        return self.emit_tree_reduce(squares)
 
     def emit_chan_update(
         self,
@@ -3591,14 +3613,13 @@ class Tcgen05RegionMmaDagEmitter(Tcgen05MmaDagEmitter):
         self.fused_m2 = m2_run
         return s_run
 
-    def emit_tree_sum(self, values: Sequence[str]) -> str:
-        """A pairwise tree over ``values`` (eight dependent adds for 256
-        columns instead of 255: the serial chain was ~0.5 us of a 128-row
-        epilogue's pass at one CTA per SM)."""
+    def emit_tree_reduce(self, values: Sequence[str], kind: str = "sum") -> str:
+        """A pairwise tree over ``values``: eight dependent operations for
+        256 columns instead of 255."""
         level = list(values)
         while len(level) > 1:
             level = [
-                self.bind("md_s", f"{level[i]} + {level[i + 1]}")
+                self.bind("md_s", _reduce_combine(kind, level[i], level[i + 1]))
                 if i + 1 < len(level)
                 else level[i]
                 for i in range(0, len(level), 2)
@@ -4377,7 +4398,7 @@ class Tcgen05RegionMmaDagEmitter(Tcgen05MmaDagEmitter):
         """One phase over the fragment row, a 64-column chunk at a time:
         the chunk's columns of every source slot are read from tensor
         memory, the chunk's side-vector packets are issued up front, the
-        stores stage the chunk's packets, and the reduction sums the chunk
+        stores stage the chunk's packets, and the reduction combines the chunk
         (a pairwise tree) into the running total -- for the fused mean /
         variance pair each chunk's sum and second moment about its own
         mean, combined chunk by chunk with Chan's update, so the tile's
@@ -4431,7 +4452,7 @@ class Tcgen05RegionMmaDagEmitter(Tcgen05MmaDagEmitter):
                     coords = self.element_coords(reduce.value, reduce_slot, c)
                     values.append(self.evaluator.evaluate(reduce.value, coords))
                 self.evaluator.leave_frag()
-                part = self.emit_tree_sum(values)
+                part = self.emit_tree_reduce(values, reduce.kind)
                 if stats:
                     m2 = self.emit_second_moment(part, values, hi - lo)
                     if moments is None:
@@ -4442,7 +4463,9 @@ class Tcgen05RegionMmaDagEmitter(Tcgen05MmaDagEmitter):
                     total = (
                         part
                         if total is None
-                        else self.bind("md_s", f"{total} + {part}")
+                        else self.bind(
+                            "md_s", _reduce_combine(reduce.kind, total, part)
+                        )
                     )
             self.evaluator.pop()
         for slot in slots:
@@ -4459,7 +4482,7 @@ class Tcgen05RegionMmaDagEmitter(Tcgen05MmaDagEmitter):
         elif split:
             assert total is not None
             (tiles,) = self.emit_split_exchange([total], reduce_slot)
-            total = self.emit_ordered_sum(tiles)
+            total = self.emit_ordered_reduce(tiles, reduce.kind)
         self.emit(f"{self.vreg(reduce.slot)} = {total}")
 
     def side_vector_loads(self, value: Node) -> list[Node]:
@@ -4629,6 +4652,16 @@ class Tcgen05RegionMmaDagEmitter(Tcgen05MmaDagEmitter):
             return "md_lane < 16"
         return None
 
+    def vec_extent_predicate(self, slot: int) -> str | None:
+        """Exclude rows of a rectangular family that have no vector element."""
+        axis = self.program.vec_slots[slot].axis
+        family = self.vec_family_slot(slot)
+        if axis is not None and family is not None:
+            extent = self.plan.size(axis)
+            if extent < self.slot(family).rows:
+                return f"{self.vec_row(slot)} < {extent}"
+        return None
+
     def emit_vec_init(self, loop: Loop) -> None:
         for carry in loop.vec_carries:
             if carry.identity:
@@ -4638,10 +4671,12 @@ class Tcgen05RegionMmaDagEmitter(Tcgen05MmaDagEmitter):
                 if source != carry.slot:
                     self.emit(f"{self.vreg(carry.slot)} = {self.vreg(source)}")
                 continue
-            self.emit(f"{self.vreg(carry.slot)} = cutlass.Float32(0.0)")
+            self.emit(
+                f"{self.vreg(carry.slot)} = cutlass.Float32({_float_literal(carry.init_fill)})"
+            )
 
     def emit_reduce(self, step: Reduce, loaded: set[int]) -> None:
-        """Sums of a pointwise value over a fragment along its columns (the
+        """Reductions of a pointwise value over a fragment along its columns (the
         thread's row: its local columns, then the other half) or its rows
         (the warp's rows by shuffles, the epilogue warps through the
         scratch, relaid into the row layout), or of a vector into a scalar."""
@@ -4673,20 +4708,23 @@ class Tcgen05RegionMmaDagEmitter(Tcgen05MmaDagEmitter):
             values.append(self.evaluator.evaluate(step.value, coords))
         self.evaluator.leave_frag()
         if step.orient == "rows":
-            total = self.emit_tree_sum(values)
+            total = self.emit_tree_reduce(values, step.kind)
             if self.half_cols(frag_slot):
                 total = self.bind(
-                    "md_s", f"{total} + cute.arch.shuffle_sync_bfly({total}, 16)"
+                    "md_s",
+                    _reduce_combine(
+                        step.kind, total, f"cute.arch.shuffle_sync_bfly({total}, 16)"
+                    ),
                 )
             if self.is_split_axis(program.slots[frag_slot][1]):
                 if fused is not None and step is fused[0]:
                     total = self.emit_fused_variance(total, values, frag_slot, fused[2])
                 else:
                     (tiles,) = self.emit_split_exchange([total], frag_slot)
-                    total = self.emit_ordered_sum(tiles)
+                    total = self.emit_ordered_reduce(tiles, step.kind)
             self.emit(f"{self.vreg(step.slot)} = {total}")
             return
-        # Column sums: the lanes holding the warp's rows meet by shuffles
+        # Column reductions: the lanes holding the warp's rows meet by shuffles
         # (16 rows per warp of a 64-row fragment, 32 of a 128-row one), the
         # epilogue warps' partials meet in the scratch, read back at the
         # thread's row index.
@@ -4696,10 +4734,10 @@ class Tcgen05RegionMmaDagEmitter(Tcgen05MmaDagEmitter):
         extent = geometry.cols
         if extent > geometry.rows:
             raise _decline(
-                f"{step.node.name} sums {extent} columns into {geometry.rows} rows"
+                f"{step.node.name} reduces {extent} columns into {geometry.rows} rows"
             )
         partials = [
-            self.bind("md_s", f"{_RUNTIME}.lane_group_sum({value}, {width})")
+            self.bind("md_s", f"{_RUNTIME}.lane_group_{step.kind}({value}, {width})")
             for value in values
         ]
         owner = (
@@ -4727,15 +4765,17 @@ class Tcgen05RegionMmaDagEmitter(Tcgen05MmaDagEmitter):
                     f"{_RUNTIME}.lds_f32({base} + ({warp * extent} + {row}) * 4)",
                 )
                 total = (
-                    value if total is None else self.bind("md_s", f"{total} + {value}")
+                    value
+                    if total is None
+                    else self.bind("md_s", _reduce_combine(step.kind, total, value))
                 )
             assert total is not None
             self.emit(f"{self.vreg(step.slot)} = {total}")
         self.emit(self.epilogue_sync)
 
     def emit_scalar_reduce(self, step: Reduce) -> None:
-        """A vector summed into a scalar: the distinct rows of each warp by
-        shuffles (the duplicate half of a 64-row family zeroed), the
+        """A vector reduced into a scalar: the distinct rows of each warp by
+        shuffles (a width of 16 excludes the duplicate half of a 64-row family), the
         epilogue warps through the scratch."""
         program = self.program
         assert step.vec is not None
@@ -4743,8 +4783,21 @@ class Tcgen05RegionMmaDagEmitter(Tcgen05MmaDagEmitter):
         family = self.vec_family_slot(source)
         assert family is not None
         width = 16 if self.half_rows(family) else 32
+        guard = self.vec_extent_predicate(source)
+        identity = _float_literal(0.0 if step.kind == "sum" else float("-inf"))
+        value = self.bind("md_s", f"cutlass.Float32({identity})") if guard else None
+        with self.block(f"if {guard}:" if guard else None):
+            self.evaluator.vec_reg = (0, 0)
+            element = self.evaluator.evaluate(
+                step.value, self.vector_coords(step.value, source)
+            )
+            self.evaluator.vec_reg = None
+            if value is None:
+                value = element
+            else:
+                self.emit(f"{value} = {element}")
         total = self.bind(
-            "md_s", f"{_RUNTIME}.lane_group_sum({self.vreg(source)}, {width})"
+            "md_s", f"{_RUNTIME}.lane_group_{step.kind}({value}, {width})"
         )
         base = self.scratch_base()
         with self.nest("if md_lane == 0:"):
@@ -4754,7 +4807,9 @@ class Tcgen05RegionMmaDagEmitter(Tcgen05MmaDagEmitter):
         for warp in range(TCGEN05_EPILOGUE_WARPS):
             value = self.bind("md_s", f"{_RUNTIME}.lds_f32({base} + {warp * 4})")
             result = (
-                value if result is None else self.bind("md_s", f"{result} + {value}")
+                value
+                if result is None
+                else self.bind("md_s", _reduce_combine(step.kind, result, value))
             )
         self.emit(self.epilogue_sync)
         self.emit(f"{self.vreg(step.slot)} = {result}")
@@ -4764,11 +4819,13 @@ class Tcgen05RegionMmaDagEmitter(Tcgen05MmaDagEmitter):
         # A vector is one register per epilogue thread (the thread's row):
         # the vector steps read every vector leaf as that register; a
         # fragment value reading a vector goes through ``frag_vec`` instead.
-        self.evaluator.vec_reg = (0, 0)
-        coords = self.vector_coords(step.node, step.slot)
-        value = self.evaluator.define(step.node, coords)
-        self.evaluator.vec_reg = None
-        self.emit(f"{self.vreg(step.slot)} = {value}")
+        guard = self.vec_extent_predicate(step.slot)
+        with self.block(f"if {guard}:" if guard else None):
+            self.evaluator.vec_reg = (0, 0)
+            coords = self.vector_coords(step.node, step.slot)
+            value = self.evaluator.define(step.node, coords)
+            self.evaluator.vec_reg = None
+            self.emit(f"{self.vreg(step.slot)} = {value}")
 
     def emit_vec_store(self, step: VecStore) -> None:
         slot = self.program.vec_leaves[step.vec]
@@ -4776,14 +4833,17 @@ class Tcgen05RegionMmaDagEmitter(Tcgen05MmaDagEmitter):
         positions = access.tile_positions
         self.hoist_scalars(step.value)
         owner = self.vec_owner(slot)
+        live = self.vec_extent_predicate(slot)
+        if live:
+            owner = f"{owner} and {live}" if owner else live
+        element = ["0"] * len(access.dims)
+        if positions:
+            element[positions[0]] = self.vec_row(slot)
         with self.block(f"if {owner}:" if owner else None):
             self.evaluator.vec_reg = (0, 0)
             coords = self.vector_coords(step.value, slot)
             value = self.evaluator.evaluate(step.value, coords)
             self.evaluator.vec_reg = None
-            element = ["0"] * len(access.dims)
-            if positions:
-                element[positions[0]] = self.vec_row(slot)
             self.emit(
                 f"{_RUNTIME}.stg_f32({self.address(access, tuple(element))}, {value})"
             )
@@ -5008,6 +5068,21 @@ class Tcgen05RegionMmaDagEmitter(Tcgen05MmaDagEmitter):
         lands in a fresh slot) move into the carry's slot for the next
         iteration -- unless the layout gave the output the carry's columns
         (``region_tmem_layout``), where the value already sits."""
+        vector_copies = [
+            (carry.slot, self.program.vec_leaves[self.program.resolve(carry.output)])
+            for carry in loop.vec_carries
+            if not carry.identity
+            and self.program.vec_leaves[self.program.resolve(carry.output)]
+            != carry.slot
+        ]
+        if vector_copies:
+            with self.block("if md_epi:"):
+                values = [
+                    self.bind("md_vnext", self.vreg(source))
+                    for _target, source in vector_copies
+                ]
+                for (target, _source), value in zip(vector_copies, values, strict=True):
+                    self.emit(f"{self.vreg(target)} = {value}")
         copies = []
         for other, carry, source in copied_carries(self.program):
             if other.index != loop.index:
@@ -5032,6 +5107,9 @@ class Tcgen05RegionMmaDagEmitter(Tcgen05MmaDagEmitter):
                 if source not in loaded:
                     self.emit_ld(source)
                     loaded.add(source)
+            # Load every source before writing a destination: nested-loop
+            # results can exchange carry slots at their parent's boundary.
+            for source, target in copies:
                 for chunk in range(self.ld_chunks(target)):
                     self.emit_st_array(f"{self.vec}{source}_{chunk}", target, chunk)
             self.emit(f"{_PRIMS}.tcgen05_wait(kind={_PRIMS}.Tcgen05Wait.STORE)")
@@ -5374,8 +5452,10 @@ class Tcgen05RegionMmaDagEmitter(Tcgen05MmaDagEmitter):
         ]
         if not tc.tma or (not root_rings and not tc.staged_tx.get(-1)):
             return False
-        if program.scalar_loads or any(
-            access.windows for spec in tc.tma for access in (spec.access,)
+        if (
+            program.scalar_loads
+            or program.index_loads
+            or any(access.windows for spec in tc.tma for access in (spec.access,))
         ):
             return False
         planned = self.next_tile_coords()
@@ -5729,7 +5809,7 @@ class Tcgen05RegionMmaDagEmitter(Tcgen05MmaDagEmitter):
         var = self.loop_index_var(loop.index)
         for axis in loop.axes:
             offset = self.axis_offset(axis, var)
-            self.emit(f"{self.axis_base(axis)} = {offset} * {self.plan.size(axis)}")
+            self.emit(f"{self.axis_base(axis)} = {self.axis_product(axis, offset)}")
         self.forget_iteration_bases(loop.index)
         if loop.index in self.counted:
             count = self.counter(loop.index)

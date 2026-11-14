@@ -36,10 +36,11 @@ from ..device_ir import ElseGraphInfo
 from ..device_ir import IfGraphInfo
 from ..device_ir import ReductionLoopGraphInfo
 from ..device_ir import RootGraphInfo
+from ..fx_side_effects import is_impure_node
 from ..host_function import HostFunction
 from ..inductor_lowering import ReductionLowering
 from ..program_id import XYZProgramIDs
-from ..runtime_tensor_guards import runtime_tensors_are_proven_disjoint
+from ..runtime_tensor_guards import tensors_have_proven_disjoint_storage
 from ..tile_strategy import DeviceGridState
 from .bounded_gather import integer_bounds
 from .register_program import emit_register_program
@@ -481,7 +482,7 @@ class _TensorGraphBuilder:
 
     def finish(self, outputs: Sequence[Node]) -> GraphModule | None:
         self.graph.output(tuple(outputs))
-        self.graph.eliminate_dead_code()
+        self.graph.eliminate_dead_code(is_impure_node=is_impure_node)
         module = GraphModule(self.attributes, self.graph)
         if not register_program_supported(
             module, list(self.graph.find_nodes(op="placeholder")), lanes=self.groups
@@ -577,19 +578,14 @@ def plan_register_region(
         ):
             return None
         tensors.append(tensor)
-    # Fresh wrapper allocations have private storage. Runtime arguments need
-    # the cache-specialized span proof, including distinct DLPack wrappers.
+    # Every possible output origin must be disjoint from earlier accesses,
+    # including joins whose synthetic storage differs from a possible owner.
     for index in range(len(loads), len(tensors)):
         output = tensors[index]
         for other in tensors[:index]:
             if output.untyped_storage()._cdata == other.untyped_storage()._cdata:
                 return None
-            if (
-                output.untyped_storage() not in env._symbolically_exact_layout_storages
-                and other.untyped_storage()
-                not in env._symbolically_exact_layout_storages
-                and not runtime_tensors_are_proven_disjoint(env, output, other)
-            ):
+            if not tensors_have_proven_disjoint_storage(env, output, other):
                 return None
     module = _tensor_graph(root, loads, stores, groups, graphs)
     if module is None:

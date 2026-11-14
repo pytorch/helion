@@ -39,9 +39,9 @@ from ..cute_warp_mma_gemm import warp_mma_max_legal_warps
 from ..cute_warp_mma_gemm import warp_mma_tile_reason
 from ..cute_warp_mma_gemm import warp_mma_warp_layout
 from ..dense_aligned_n import ALIGNED_N_CHOICES
+from ..dense_aligned_n import DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K
 from ..dense_aligned_n import TILE_N_KEY
 from ..dense_aligned_n import carrier_n
-from ..dense_aligned_n import dense_aligned_n_defaults
 from ..epilogue_fanout import FANOUT_CONFIG_KEY
 from ..epilogue_fanout import FANOUT_MODES
 from ..epilogue_fanout import schedule_supported as fanout_schedule_supported
@@ -98,8 +98,6 @@ from ..strategies import tcgen05_explicit_epilogue_tile_supported
 from ..strategies import validate_tcgen05_strategy_invariants
 from ..strategies import warp_spec_from_config
 from ..tcgen05.knobs import acc_stages_knob
-from ..tcgen05.knobs import aux_load_mode_knob
-from ..tcgen05.knobs import aux_stages_knob
 from ..tcgen05.knobs import epi_subtile_n_knob
 from ..tcgen05.knobs import epi_warp_groups_knob
 from ..tcgen05.knobs import epi_warps_knob
@@ -280,6 +278,44 @@ def _fix_full_tile_schedule_search_config(
     config["tcgen05_cluster_n"] = 1
     if restored_pid:
         config["pid_type"] = "flat"
+
+
+def _drop_unproved_n_edge_cluster_n(
+    state: CuteTcgen05Config, config: dict[str, object]
+) -> None:
+    """A persistent N-edge sample (whole M and K tiles, a partial last N
+    tile) left at ``tcgen05_cluster_n=2`` outside the proved N-multicast
+    schedule takes one N cluster: codegen refuses it (``tcgen05 N-edge
+    cluster_n=2 requires ...``), e.g. on a 16-deep K tile, or on a tile
+    order that a projection running after the schedule's own
+    (``n_edge_cluster_schedule_defaults``) grouped again. A post-pass over
+    the projected sample judges the final config, whichever projection
+    moved it."""
+    pid_type = config.get("pid_type", "flat")
+    extents = state.matmul_compile_time_static_extents
+    view = facts._matmul_config_view(state, config)
+    if (
+        config.get("tcgen05_cluster_n") != 2
+        or not (isinstance(pid_type, str) and pid_type.startswith("persistent"))
+        or extents is None
+        or view is None
+    ):
+        return
+    blocks, mi, ni, ki = view
+    tile = (blocks[mi], blocks[ni], blocks[ki])
+    if not all(type(value) is int and value > 0 for value in (*tile, *extents)):
+        return
+    (m, n, k), (bm, bn, bk) = (
+        cast("tuple[int, int, int]", extents),
+        cast("tuple[int, int, int]", tile),
+    )
+    if (
+        m % bm == 0
+        and n % bn != 0
+        and k % bk == 0
+        and not n_edge_cluster_schedule_config_supported(state, config)
+    ):
+        config["tcgen05_cluster_n"] = 1
 
 
 def n_edge_cluster_schedule_config_supported(
@@ -2091,10 +2127,15 @@ def _normalize_dense_aligned_n(
         )
     if fix_invalid:
         view = facts._matmul_config_view(state, config)
-        if view is not None:
-            blocks, mi, ni, _ki = view
+        block_m = facts._dense_aligned_n_block_m(state)
+        if view is not None and block_m is not None:
+            blocks, mi, ni, ki = view
             blocks = list(blocks)
-            blocks[mi], blocks[ni] = 128, carrier_n(width)
+            blocks[mi], blocks[ni] = block_m, carrier_n(width)
+            if facts._dense_aligned_n_sixteen_bit(state):
+                blocks[ki] = DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K
+            elif blocks[ki] not in (64, 128):
+                blocks[ki] = 64
             config["block_sizes"] = blocks
         acc_stages = config.get("tcgen05_acc_stages", 2)
         if type(acc_stages) is not int or acc_stages not in (1, 2):
@@ -2102,21 +2143,43 @@ def _normalize_dense_aligned_n(
         store_mode = config.get("tcgen05_c_store_mode", "normal")
         if store_mode not in ("normal", "direct"):
             store_mode = "normal"
-        config.update(
-            dense_aligned_n_defaults(
-                acc_stages=acc_stages, store_mode=cast("str", store_mode)
-            )
+        # The 16-bit pair admits its own L2 grouping and N pairing; keep a
+        # sampled value the plan accepts instead of the family default.
+        sampled = {
+            key: config[key]
+            for key in ("l2_groupings", "tcgen05_cluster_n")
+            if key in config
+        }
+        surface = facts._dense_aligned_n_surface(
+            state, acc_stages=acc_stages, store_mode=cast("str", store_mode)
         )
+        config.update(surface)
+        facts._drop_inactive_direct_entry_controls(state, config)
         if config.get("pid_type") not in state.allowed_pid_types or config.get(
             "pid_type"
         ) not in ("persistent_interleaved", "persistent_blocked"):
             config["pid_type"] = facts._preferred_persistent_pid_type(state)
+        if facts._dense_aligned_n_sixteen_bit(state):
+            # A configured subtile that does not partition the physical
+            # width is dropped rather than leaving the family.
+            subtile = config.get(TCGEN05_EPI_SUBTILE_N_CONFIG_KEY)
+            if type(subtile) is int and subtile > 0 and width % subtile:
+                config[TCGEN05_EPI_SUBTILE_N_CONFIG_KEY] = None
+            for key, value in sampled.items():
+                trial = {**config, key: value}
+                if facts._dense_aligned_n_plan(state, trial) is not None:
+                    config[key] = value
     plan = facts._dense_aligned_n_plan(state, config)
     if plan is None:
         raise InvalidConfig(
-            "tcgen05_tile_n requires its proved full-M/N dense FP8 paired static schedule and unchanged tile bounds"
+            "tcgen05_tile_n requires a proved dense paired GEMM (dense_aligned_n_plan): "
+            "whole N tiles of the physical width, unchanged tile bounds, "
+            "whole M tiles for FP8 or whole K tiles under a 16-bit M tail, "
+            "and for 16-bit a row-major output, a width that is a multiple "
+            "of 32 and an epilogue subtile that divides it"
         )
-    for key, value in dense_aligned_n_defaults(
+    for key, value in facts._dense_aligned_n_surface(
+        state,
         acc_stages=cast("int", config.get("tcgen05_acc_stages", 2)),
         store_mode=cast("str", config.get("tcgen05_c_store_mode", "normal")),
     ).items():
@@ -3227,26 +3290,18 @@ def _normalize_multi_output_rings(
         for value in (bm, bn, bk, cluster_m, ab_stages, c_stages)
     ) or cluster_m not in (1, 2):
         return
-    stage_rows = smem._store_lowering_stages_rows(config)
-    epi_warps = epi_warps_knob(config)
-    acc_stages = acc_stages_knob(config)
 
     def fits(ab: int, c: int) -> bool:
-        return smem.default_layout_smem_fits(
+        return smem._config_arena_fits(
             state,
+            config,
             bm=cast("int", bm),
             bn=cast("int", bn),
             bk=cast("int", bk),
             cluster_m=cast("int", cluster_m),
             ab_stages=ab,
             c_stages=c,
-            stage_rows=stage_rows,
-            epi_warps=epi_warps,
-            acc_stages=acc_stages,
-            aux_load_mode=aux_load_mode_knob(config),
-            aux_stages=aux_stages_knob(config),
             epi_subtile_n=epi_subtile_n_knob(config),
-            epi_warp_groups=epi_warp_groups_knob(config),
         )
 
     if fits(cast("int", ab_stages), cast("int", c_stages)):
@@ -3745,7 +3800,8 @@ def _validate_direct_entry_ab_stage_envelope(
         raise InvalidConfig(f"tcgen05_ab_stages={ab_stages} {mismatch}")
     # After the grouped dynamic/worklist exceptions above, ab>3 is only valid
     # on the TVM-FFI direct-entry path and for its accepted (bk, ab, c) tuples
-    # (bk=64 admits (ab=6, c=4)). Everything else clamps or rejects to ab=3.
+    # (bk=64 admits (ab=6, c=2) and (ab=6, c=4)). Everything else clamps or
+    # rejects to ab=3.
     block_sizes = config.get("block_sizes")
     k_block_index = facts._direct_entry_k_block_index(state)
     bk = (
@@ -4163,7 +4219,19 @@ def _fix_cluster_m1_persistent_search_config(
         return
     bm = block_sizes[m_index]
     if isinstance(bm, int) and not isinstance(bm, bool):
-        block_sizes[m_index] = min(bm, TCGEN05_ONE_CTA_MAX_BLOCK_M)
+        block_sizes[m_index] = bm = min(bm, TCGEN05_ONE_CTA_MAX_BLOCK_M)
+    bn, bk = block_sizes[n_index], block_sizes[k_index]
+    if (
+        state.output_edge_persistent_admitted
+        and isinstance(bm, int)
+        and isinstance(bn, int)
+        and isinstance(bk, int)
+        and not facts._static_full_tiles(state, bm=bm, bn=bn, bk=bk)
+    ):
+        # The output-edge admission's persistent schedules belong to its
+        # CtaGroup.TWO pairs; one-CTA persistent kernels run whole tiles
+        # only (the host multi-tile guard), so partial tiles go flat.
+        config["pid_type"] = "flat"
 
 
 def _fix_target1_tvm_ffi_search_config(
@@ -5038,6 +5106,7 @@ def _validate_diagnostic_mode(
 
 def fix_search_config(state: CuteTcgen05Config, config: dict[str, object]) -> None:
     _fix_search_config_body(state, config)
+    _drop_unproved_n_edge_cluster_n(state, config)
     # These repairs read the repaired pid type, cluster and tile, so they
     # run last, on every path of the body (its early returns included:
     # the one-CTA pipeline, the dense-N tile, the materialized chains

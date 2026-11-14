@@ -215,6 +215,7 @@ def _lane_reduce_marker_expr(
     group_count: int = 1,
     group_cluster_n: int = 1,
     owner_lane: str | None = None,
+    broadcast_owner: bool = False,
     matmul_contribution: bool = False,
     strided_restore: bool = False,
     shared_lane_expr: str = "",
@@ -223,7 +224,7 @@ def _lane_reduce_marker_expr(
     for the fields); ``_LaneReduceMarker.to_call`` renders it."""
     if matmul_contribution:
         assert owner_lane is not None and reduction_type == "sum"
-    if strided_restore or shared_lane_expr:
+    if strided_restore or shared_lane_expr or broadcast_owner:
         assert owner_lane is not None
     return _LaneReduceMarker(
         result_var="",
@@ -238,6 +239,7 @@ def _lane_reduce_marker_expr(
         group_count=group_count,
         group_cluster_n=group_cluster_n,
         owner_lane=owner_lane,
+        broadcast_owner=broadcast_owner,
         matmul_contribution=matmul_contribution,
         strided_restore=strided_restore,
         shared_lane_expr=shared_lane_expr,
@@ -285,6 +287,10 @@ class _LaneReduceMarker:
     # Physical thread groups and equal loop extents do not identify a serial
     # lane: an unrelated nested tile can have either in common with this one.
     owner_lane: str | None = None
+    # An explicitly replicated input needs every synthetic lane even when
+    # its value never reads the coordinate. Other owners still need their
+    # ordinary data dependency or an independently proved reshape mapping.
+    broadcast_owner: bool = False
     # Emitted only for the product side of a scalar matmul contraction. The
     # accumulator/rescale is deliberately outside this complete sum.
     matmul_contribution: bool = False
@@ -362,6 +368,8 @@ class _LaneReduceMarker:
             raise exc.BackendUnsupported("cute", "invalid matmul contribution marker")
         if marker.strided_restore and marker.owner_lane is None:
             raise exc.BackendUnsupported("cute", "invalid strided restore marker")
+        if marker.broadcast_owner and marker.owner_lane is None:
+            raise exc.BackendUnsupported("cute", "invalid broadcast owner marker")
         return marker
 
 
@@ -385,6 +393,9 @@ _MARKER_KEYWORD_NAMES = frozenset(field.name for field in _MARKER_KEYWORD_FIELDS
 
 def set_marker_owner(call: ast.Call, owner_lane: str) -> None:
     """Bind ``call`` (a marker) to the serial lane ``owner_lane``."""
+    # The replication proof belonged to the original synthetic coordinate.
+    # A rebound source lane is kept by its ordinary data dependencies.
+    call.keywords = [kw for kw in call.keywords if kw.arg != "broadcast_owner"]
     for keyword in call.keywords:
         if keyword.arg == "owner_lane":
             keyword.value = ast.copy_location(
@@ -418,6 +429,24 @@ def has_lane_reduce_markers(body: Sequence[ast.AST]) -> bool:
         for statement in body
         for node in ast.walk(statement)
     )
+
+
+def required_lane_reduce_owners(body: Sequence[ast.AST]) -> set[str]:
+    """Lane owners referenced by broadcast_owner-marked reductions."""
+    owners: set[str] = set()
+    for statement in body:
+        for node in ast.walk(statement):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == _HELION_LANE_REDUCE_MARKER
+            ):
+                marker = _LaneReduceMarker.from_call(
+                    node, result_var="", wrap_template=""
+                )
+                if marker.owner_lane is not None and marker.broadcast_owner:
+                    owners.add(marker.owner_lane)
+    return owners
 
 
 class _ReplaceLaneReduceCall(ast.NodeTransformer):

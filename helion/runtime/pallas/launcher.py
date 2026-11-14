@@ -16,6 +16,7 @@ from dataclasses import dataclass
 import functools
 import inspect
 import os
+import struct
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Literal
@@ -715,7 +716,7 @@ def _pallas_check_dtypes(args: tuple[object, ...]) -> None:
 class _DirectCallKernel:
     """Pre-captured metadata for a direct ``call_custom_kernel`` invocation.
 
-    Built lazily on the first call of a static-shape Pallas kernel and
+    Built lazily on the first call of a Pallas launcher specialization and
     attached to the launcher cache so subsequent calls bypass
     ``JaxCallable.__call__``.  ``sig`` guards against shape changes (mismatch
     falls back to JaxCallable); ``sig_locked`` flips after the first match so
@@ -915,10 +916,12 @@ class _LauncherFastPath:
     """Precomputed per-call state stored on the cached launcher entry."""
 
     __slots__ = (
+        "specialization_key",  # actual argument metadata and scratch shapes
         "ds_pad_required",  # bool|None: any non-zero pad? (None til 1st call)
         "ds_pad_orig_output_arg_indices",  # padded outputs that are also inputs
         "output_only_count",  # number of write-only output tensors
         "output_only_descriptors",  # (out_idx, orig_pos) per output-only result
+        "inplace_output_descriptors",  # (orig_pos, tensor_pos) per aliased output
         "padded_output_arg_indices",  # output args that get padded
         "padded_output_dims_by_arg",  # {arg: [padded dims]} (to slice back)
         "tensor_arg_indices_tuple",  # tensor arg positions (tuple = fast iter)
@@ -930,7 +933,10 @@ class _LauncherFastPath:
         arg_to_tensor_pos: dict[int, int],
         _output_indices: list[int],
         _ds_pad_dims: list[tuple[int, int, int, int]] | None,
+        *,
+        specialization_key: tuple[object, ...] | None = None,
     ) -> None:
+        self.specialization_key = specialization_key
         # Tuple iteration is faster than list in the hot-path comprehension.
         self.tensor_arg_indices_tuple: tuple[int, ...] = tuple(tensor_arg_indices)
 
@@ -938,6 +944,11 @@ class _LauncherFastPath:
             _pallas_output_only_descriptors(_output_indices, arg_to_tensor_pos)
         )
         self.output_only_count: int = len(self.output_only_descriptors)
+        self.inplace_output_descriptors: tuple[tuple[int, int], ...] = tuple(
+            (orig_pos, arg_to_tensor_pos[orig_pos])
+            for orig_pos in _output_indices
+            if orig_pos in arg_to_tensor_pos
+        )
 
         # ``None`` sentinel: filled in on the first call once we know if any pad is non-zero.
         self.ds_pad_required: bool | None = None
@@ -968,6 +979,25 @@ def _pallas_slice_to_orig(
     for dim in dims:
         slices[dim] = slice(None, orig_shape[dim])
     return t[tuple(slices)]
+
+
+def _pallas_restore_output_metadata(
+    result: torch.Tensor, out_tensor: torch.Tensor
+) -> torch.Tensor:
+    # The meta placeholder records the authored allocation's layout and
+    # gradient flag. Keep a matching-layout result without a copy.
+    if result.stride() != out_tensor.stride():
+        restored = torch.empty_strided(
+            result.shape,
+            out_tensor.stride(),
+            dtype=result.dtype,
+            device=result.device,
+        )
+        restored.copy_(result)
+        result = restored
+    if out_tensor.requires_grad and not result.requires_grad:
+        result.requires_grad_(True)
+    return result
 
 
 def _pallas_collect_outputs(
@@ -1007,11 +1037,11 @@ def _pallas_collect_outputs(
     output_only_results: list[object] = []
     for out_idx, orig_pos in output_only_descriptors:
         result = results[out_idx]
+        out_tensor = cast("torch.Tensor", args[orig_pos])
         if not isinstance(result, torch.Tensor):
             # Interpret mode: pallas_call returns JAX arrays; convert to torch.
             # Output-only tensors are allocated on device='meta' to avoid HBM,
             # so route the converted tensor to CPU where interpret mode runs.
-            out_tensor = cast("torch.Tensor", args[orig_pos])
             device = out_tensor.device
             if device.type == "meta":
                 device = torch.device("cpu")
@@ -1021,7 +1051,8 @@ def _pallas_collect_outputs(
             dims = padded_dims_by_arg.get(orig_pos)
             if orig is not None and dims and isinstance(result, torch.Tensor):
                 result = _pallas_slice_to_orig(result, dims, orig.shape)
-        output_only_results.append(result)
+                out_tensor = orig
+        output_only_results.append(_pallas_restore_output_metadata(result, out_tensor))
 
     if not output_only_results:
         return None
@@ -1081,7 +1112,7 @@ def _pallas_invoke_and_return_fast(
         cast("torch.Tensor", args[i]).contiguous() for i in tensor_arg_indices
     ]
     if direct_call is not None:
-        # Once the sig matches once, grid-keyed cache + static_shapes makes
+        # Once the sig matches once, the launcher's argument signature makes
         # subsequent sig checks constant-True; skip them on the locked path
         # and call the pre-baked ``invoke`` closure directly.
         if direct_call.sig_locked:
@@ -1100,17 +1131,30 @@ def _pallas_invoke_and_return_fast(
     else:
         results = jax_callable(*input_tensors)  # type: ignore[operator]
 
+    # Alias handlers write into the contiguous launch inputs. Copy only declared
+    # in-place outputs back when contiguity required a temporary. For ds-padding,
+    # this updates the padded argument before the collector unpads it below.
+    for orig_pos, tensor_pos in fast_path.inplace_output_descriptors:
+        original = cast("torch.Tensor", args[orig_pos])
+        contiguous = input_tensors[tensor_pos]
+        if contiguous is not original:
+            original.copy_(contiguous)
+
     output_only_count = fast_path.output_only_count
     if output_only_count == 0 and _orig_output_tensors is None:
         # Hottest path: in-place outputs already written through donated aliases.
         return None
-    # Hot single-output (matmul) short-circuit: skip result post-processing.
+    # Hot single-output (matmul) short-circuit: no sequence or padding work,
+    # but native Torch results still need the authored output metadata.
     if (
         output_only_count == 1
         and _orig_output_tensors is None
         and isinstance(results, torch.Tensor)
     ):
-        return results
+        _, orig_pos = fast_path.output_only_descriptors[0]
+        return _pallas_restore_output_metadata(
+            results, cast("torch.Tensor", args[orig_pos])
+        )
 
     return _pallas_collect_outputs(
         results,
@@ -2295,7 +2339,23 @@ def _pallas_compile_jit_fn(
 
 
 _PALLAS_CACHE_ATTR = "_pallas_cache"
-_PALLAS_SCRATCH_KEY_ATTR = "_pallas_scratch_key"
+
+
+def _pallas_argument_key(args: tuple[object, ...]) -> tuple[object, ...]:
+    """Snapshot actual launcher metadata, including output-only placeholders."""
+    return tuple(
+        (
+            tuple(arg.shape),
+            arg.stride(),
+            arg.storage_offset(),
+            arg.dtype,
+            arg.device,
+            arg.requires_grad,
+        )
+        if isinstance(arg, torch.Tensor)
+        else (type(arg), struct.pack("!d", arg) if type(arg) is float else arg)
+        for arg in args
+    )
 
 
 def _pallas_jax_call(
@@ -2404,6 +2464,7 @@ def _pallas_install_launcher_cache(
     grid: tuple[int, ...],
     args: tuple[object, ...],
     *,
+    specialization_key: tuple[object, ...],
     _output_indices: list[int] | None,
     _inplace_indices: list[int] | None,
     _block_spec_info: _BlockSpecInfo | None,
@@ -2474,7 +2535,7 @@ def _pallas_install_launcher_cache(
         result.tensor_arg_indices,
         cache_attr=_PALLAS_CACHE_ATTR,
         call_aliases=result.pallas_aliases,
-        trace_key_suffix="",
+        trace_key_suffix=repr(specialization_key),
         interpret=interpret,
         uses_distributed=_uses_remote_copy or _collective_id is not None,
     )
@@ -2484,6 +2545,7 @@ def _pallas_install_launcher_cache(
         result.arg_to_tensor_pos,
         output_indices,
         _ds_pad_dims,
+        specialization_key=specialization_key,
     )
     cache = (
         grid,
@@ -2600,6 +2662,50 @@ def default_pallas_launcher(
         raise RuntimeError(
             "Pallas remote_barrier is not supported by compact_worklist kernels"
         )
+    if _compact_build_worklist is None and 0 in grid:
+        # No program executes. Preserve in-place buffers and materialize only
+        # empty output placeholders, whose contents require no initialization.
+        inplace_indices = set(
+            _output_indices or () if _inplace_indices is None else _inplace_indices
+        )
+        empty_outputs = [
+            args[index]
+            for index in (_output_indices or ())
+            if index not in inplace_indices
+        ]
+        if not empty_outputs:
+            return None
+        if all(
+            isinstance(output, torch.Tensor) and output.numel() == 0
+            for output in empty_outputs
+        ):
+            device = next(
+                (
+                    arg.device
+                    for arg in args
+                    if isinstance(arg, torch.Tensor) and arg.device.type != "meta"
+                ),
+                None,
+            )
+            interpret = (
+                _pallas_interpret
+                if _pallas_interpret is not None
+                else _pallas_interpret_enabled()
+            )
+            if device is None and interpret:
+                device = torch.device("cpu")
+            if device is not None:
+                outputs = tuple(
+                    torch.empty_strided(
+                        output.shape,
+                        output.stride(),
+                        dtype=output.dtype,
+                        device=device,
+                        requires_grad=output.requires_grad,
+                    )
+                    for output in cast("list[torch.Tensor]", empty_outputs)
+                )
+                return outputs[0] if len(outputs) == 1 else outputs
     if _compact_build_worklist is not None:
         # Resident-cache correctness backstop: runs EVERY call (the offset arrays are
         # runtime data even when the compiled kernel is cached for this grid), raising
@@ -2616,17 +2722,20 @@ def default_pallas_launcher(
     scratch_key = tuple(
         (tuple(shape), dtype, kind) for shape, dtype, kind in (_scratch_shapes or [])
     )
+    specialization_key = (_pallas_argument_key(args), scratch_key)
     cache = getattr(pallas_kernel, _PALLAS_CACHE_ATTR, None)
     if (
         cache is None
         or cache[0] != grid
-        or getattr(pallas_kernel, _PALLAS_SCRATCH_KEY_ATTR, None) != scratch_key
+        or cache[4] is None
+        or cast("_LauncherFastPath", cache[4]).specialization_key != specialization_key
     ):
         if _compact_build_worklist is not None:
             cache = _pallas_install_compact_launcher_cache(
                 pallas_kernel,
                 grid,
                 args,
+                specialization_key=specialization_key,
                 _output_indices=_output_indices,
                 _inplace_indices=_inplace_indices,
                 _block_spec_info=_block_spec_info,
@@ -2652,6 +2761,7 @@ def default_pallas_launcher(
                 pallas_kernel,
                 grid,
                 args,
+                specialization_key=specialization_key,
                 _output_indices=_output_indices,
                 _inplace_indices=_inplace_indices,
                 _block_spec_info=_block_spec_info,
@@ -2667,7 +2777,6 @@ def default_pallas_launcher(
                 _matmul_dot_general=_matmul_dot_general,
                 _pipeline_vmem_bytes=_pipeline_vmem_bytes,
             )
-        setattr(pallas_kernel, _PALLAS_SCRATCH_KEY_ATTR, scratch_key)
 
     return _pallas_invoke_cached_launcher(
         pallas_kernel,
@@ -3058,6 +3167,7 @@ def _pallas_install_compact_launcher_cache(
     grid: tuple[int, ...],
     args: tuple[object, ...],
     *,
+    specialization_key: tuple[object, ...],
     _output_indices: list[int] | None,
     _inplace_indices: list[int] | None,
     _block_spec_info: _BlockSpecInfo | None,
@@ -3140,7 +3250,7 @@ def _pallas_install_compact_launcher_cache(
         result.tensor_arg_indices,
         cache_attr=_PALLAS_CACHE_ATTR,
         call_aliases=result.pallas_aliases,
-        trace_key_suffix="",
+        trace_key_suffix=repr(specialization_key),
         interpret=interpret,
     )
     fast_path = _LauncherFastPath(
@@ -3148,6 +3258,7 @@ def _pallas_install_compact_launcher_cache(
         result.arg_to_tensor_pos,
         output_indices,
         _ds_pad_dims,
+        specialization_key=specialization_key,
     )
     cache = (
         grid,

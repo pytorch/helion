@@ -11,6 +11,7 @@ from helion._compiler.cute.persistent_branch_vec import _definition_snapshots
 from helion._compiler.cute.persistent_branch_vec import (
     _memory_address_definition_snapshots,
 )
+from helion._compiler.cute.persistent_branch_vec import _memory_definition_snapshots
 
 pytestmark = pytest.mark.cpu_only
 
@@ -60,6 +61,27 @@ def test_cached_dependencies_invalidate_aliases_on_reassignment() -> None:
     assert "alias" not in snapshots[-1]
     assert "address" not in snapshots[-1]
     assert ast.literal_eval(snapshots[-1]["source"]) == 0
+
+
+def test_memory_snapshot_closure_keeps_nested_masks_and_alias_mutations() -> None:
+    body = ast.parse(
+        "alias = source\n"
+        "address = source[0] + lane\n"
+        "active = address < limit\n"
+        "unused = other * 2\n"
+        "if active:\n    value = (x.iterator + address).load()\n"
+        "alias[0] = 9\n"
+        "if active:\n    (out.iterator + address).store(value)\n"
+    ).body
+    full = _definition_snapshots(body)
+    selected = _memory_definition_snapshots(body)
+    assert full is not None and selected is not None
+    assert "address" in selected[4] and "active" in selected[4]
+    assert "address" not in selected[-1] and "active" not in selected[-1]
+    for all_definitions, chosen in zip(full, selected, strict=True):
+        assert "unused" not in chosen
+        for name, expression in chosen.items():
+            assert ast.dump(expression) == ast.dump(all_definitions[name])
 
 
 def test_oversized_lane_dependency_cannot_justify_load_or_store_motion() -> None:

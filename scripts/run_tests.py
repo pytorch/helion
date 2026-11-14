@@ -15,9 +15,15 @@ filter unless ``--slow``, and afterwards every failure once more, alone in a
 fresh process, so order-dependent failures and flakes are told apart from
 real ones.
 
+``--multi-gpu`` instead runs one serial pytest process with all claimed GPUs
+visible, for tests that launch their own distributed workers. It requires one
+backend and ``--lane gpu``; both the initial job and isolation reruns retain
+the full device set without test sharding.
+
     scripts/run_tests.py --backend cute --gpus 2,5       # CuTe lanes; GPU lane over two GPUs
     scripts/run_tests.py --backend triton --lane cpu     # Triton CPU lane only; no GPU needed
     scripts/run_tests.py --backend triton,cute -n 2      # both backends on 2 GPUs from the board
+    scripts/run_tests.py --backend triton --lane gpu --multi-gpu -n 4 test/test_remote_copy.py::TestRemoteCopyGPU
     scripts/run_tests.py --changed                       # the modules touching the stack's files
     scripts/run_tests.py --changed --since HEAD~1        # ... touched by the last commit
     scripts/run_tests.py --slow test/test_autotuner.py   # one module, slow tier included
@@ -25,11 +31,15 @@ real ones.
 
 GPUs come from ``--gpus``, else from ``CUDA_VISIBLE_DEVICES``, else
 ``scripts/gpu_board.py`` picks ``-n`` free ones; the run holds a claim on the
-board while it lasts (on a machine with a single GPU, which is not shared,
-the board is skipped and GPU 0 is used), and GPUs named explicitly are refused when another
+board while it lasts (on a positively identified single-GPU machine, which is not
+shared, the board is skipped and that GPU is used). GPU discovery requires
+nvidia-smi. Failed or empty discovery aborts an invocation requesting GPU lanes
+before any CPU or GPU test job starts; use ``--lane cpu`` for checks that do not
+need NVIDIA discovery. GPUs named explicitly are refused when another
 account holds a live claim on them, they are busy, or another account's
 processes sit on them (``--shared`` allows idle ones, ``--force`` any). Test
-subprocesses get this tree on PYTHONPATH, so a worktree tests its own helion.
+subprocesses get this tree and its pytest-plugin directory on PYTHONPATH, so a
+worktree tests its own helion and loads the runner's node-identity plugin.
 A ``-m`` among the pytest options is combined with the lane's marker. Logs, junit
 reports, the exact commands and a summary go to
 ``.logs/tests/<timestamp>-<tag>/``; the junit files can feed
@@ -37,6 +47,10 @@ reports, the exact commands and a summary go to
 a failure reproduces alone or a job crashes, 2 when every failure passed
 alone, 3 when nothing was selected, 4 on a GPU board security alert, 130 when
 interrupted.
+
+Explicit test paths are checked relative to this checkout before any job starts.
+Pytest node-id suffixes are preserved; ``--pyargs`` package names are resolved
+by pytest. Missing paths are errors, not empty backend selections.
 """
 
 from __future__ import annotations
@@ -46,6 +60,7 @@ import contextlib
 from dataclasses import dataclass
 from dataclasses import field
 from datetime import datetime
+import inspect
 import os
 from pathlib import Path
 import re
@@ -55,13 +70,18 @@ import subprocess
 import sys
 import time
 from typing import TYPE_CHECKING
+from typing import Any
 import xml.etree.ElementTree as ET
 
 # scripts/gpu_board.py; run as a script, Python puts scripts/ on sys.path.
 import gpu_board
+from process_supervisor import CleanupError
+from process_supervisor import OwnedProcess
+from process_supervisor import ProcessError
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+    from collections.abc import Iterator
     from collections.abc import Mapping
     from collections.abc import Sequence
 
@@ -142,8 +162,14 @@ def job_environment(job: Job, base: Mapping[str, str] | None = None) -> dict[str
     env.update(job.env)
     # Subprocesses the tests start (python <script>, other cwds) import this
     # tree's helion, not the editable install's: they differ in a worktree.
+    # Expose only the flat pytest plugin, not unrelated scripts that could
+    # shadow dependencies. An unrelated package named scripts cannot hide it.
     env["PYTHONPATH"] = os.pathsep.join(
-        [str(REPO_ROOT), *filter(None, [source.get("PYTHONPATH")])]
+        [
+            str(REPO_ROOT),
+            str(REPO_ROOT / "scripts" / "pytest_plugins"),
+            *filter(None, [source.get("PYTHONPATH")]),
+        ]
     )
     return env
 
@@ -224,28 +250,51 @@ def lane_env(
 
 
 def pytest_argv(
-    junit: Path, marker: str, paths: Sequence[str], extra: Sequence[str], serial: bool
+    junit: Path,
+    marker: str,
+    paths: Sequence[str],
+    extra: Sequence[str],
+    serial: bool,
+    *,
+    timeout: int | None = None,
+    overrides_last: bool = False,
+    multi_gpu: bool = False,
+    basetemp_subdir: str | None = None,
 ) -> list[str]:
+    if timeout is None:
+        timeout = SERIAL_TIMEOUT if serial else TEST_TIMEOUT
+    timeout_args = [
+        f"--timeout={timeout}",
+        "--timeout-method=thread",
+    ]
     argv = [
         sys.executable,
         "-m",
         "pytest",
+        "-p",
+        "helion_pytest_nodeids",
         "-rf",
-        f"--timeout={SERIAL_TIMEOUT if serial else TEST_TIMEOUT}",
-        "--timeout-method=thread",
+        *(timeout_args if not overrides_last else []),
         "-o",
         "faulthandler_timeout=120",
         "-o",
         "junit_duration_report=total",
-        f"--junitxml={junit}",
     ]
     argv += [f"--ignore={path}" for path in IGNORED_PATHS]
-    if serial:
-        argv.append("-n0")
+    if serial and not (overrides_last or multi_gpu):
+        argv.append("--helion-serial")
     if marker:
         argv += ["-m", marker]
     argv += list(paths) or [TEST_DIR]
     argv += list(extra)
+    if serial and (overrides_last or multi_gpu):
+        argv.append("--helion-serial")
+    if overrides_last:
+        argv += timeout_args
+    # The runner reads this report to classify the job and select isolation runs.
+    if basetemp_subdir is not None:
+        argv += ["--helion-basetemp-subdir", basetemp_subdir]
+    argv.append(f"--junitxml={junit}")
     return argv
 
 
@@ -258,6 +307,8 @@ def build_jobs(
     extra: Sequence[str],
     run_dir: Path,
     marker: str = "",
+    *,
+    multi_gpu: bool = False,
 ) -> list[Job]:
     jobs = []
     for backend in backends:
@@ -268,9 +319,11 @@ def build_jobs(
         for job_lane in lanes:
             if job_lane == "gpu":
                 gpus = gpus_by_backend[backend]
+                if multi_gpu:
+                    gpus = [",".join(gpus)]
                 for index, gpu in enumerate(gpus):
-                    shard = (index, len(gpus))
-                    name = f"{backend}-gpu{gpu}"
+                    shard = None if multi_gpu else (index, len(gpus))
+                    name = f"{backend}-multigpu" if multi_gpu else f"{backend}-gpu{gpu}"
                     jobs.append(
                         Job(
                             name=name,
@@ -278,13 +331,7 @@ def build_jobs(
                             lane="gpu",
                             gpu=gpu,
                             shard=shard,
-                            argv=pytest_argv(
-                                run_dir / f"{name}.xml",
-                                lane_marker("gpu", slow, marker),
-                                paths,
-                                extra,
-                                False,
-                            ),
+                            argv=[],
                             env=lane_env(backend, "gpu", gpu, shard),
                             log=run_dir / f"{name}.log",
                             junit=run_dir / f"{name}.xml",
@@ -292,7 +339,6 @@ def build_jobs(
                     )
             else:
                 name = f"{backend}-{job_lane}"
-                serial = job_lane == "serial"
                 jobs.append(
                     Job(
                         name=name,
@@ -300,18 +346,22 @@ def build_jobs(
                         lane=job_lane,
                         gpu=None,
                         shard=None,
-                        argv=pytest_argv(
-                            run_dir / f"{name}.xml",
-                            lane_marker(job_lane, slow, marker),
-                            paths,
-                            extra,
-                            serial,
-                        ),
+                        argv=[],
                         env=lane_env(backend, job_lane, None, None),
                         log=run_dir / f"{name}.log",
                         junit=run_dir / f"{name}.xml",
                     )
                 )
+    for job in jobs:
+        job.argv = pytest_argv(
+            job.junit,
+            lane_marker(job.lane, slow, marker),
+            paths,
+            extra,
+            job.lane == "serial" or multi_gpu,
+            multi_gpu=multi_gpu,
+            basetemp_subdir=job.name if len(jobs) > 1 else None,
+        )
     return jobs
 
 
@@ -348,7 +398,12 @@ def read_junit(path: Path, root: Path = REPO_ROOT) -> Junit:
     for case in ET.parse(path).getroot().iter("testcase"):
         classname = case.get("classname", "")
         tags = {child.tag for child in case}
-        if not classname:
+        properties = {
+            prop.get("name"): prop.get("value", "")
+            for prop in case.findall("properties/property")
+        }
+        has_identity = "helion_run_tests_path" in properties
+        if not classname and not has_identity:
             # A collection error (the module did not import) or a
             # session-level entry.
             if tags & {"error", "failure"}:
@@ -366,7 +421,19 @@ def read_junit(path: Path, root: Path = REPO_ROOT) -> Junit:
             outcome = "skipped"
         else:
             outcome = "passed"
-        nodeid = node_id(classname, case.get("name", ""), root)
+        if has_identity:
+            # In mixed collections pytest can omit an external file from
+            # its nodeid. The item's actual path remains authoritative.
+            selector = properties["helion_run_tests_selector"]
+            # Preserve external locations while keeping repository IDs short.
+            source = Path(os.path.abspath(properties["helion_run_tests_path"]))
+            if source.is_relative_to(root):
+                source = source.relative_to(root)
+            nodeid = f"{source}{selector}"
+        else:
+            # Reports the plugin never sees, such as xdist worker crashes,
+            # lack item properties and need the legacy mapping.
+            nodeid = node_id(classname, case.get("name", ""), root)
         if severity[outcome] >= severity.get(outcomes.get(nodeid, "passed"), 0):
             outcomes[nodeid] = outcome
     return Junit(counts, outcomes, collection_errors)
@@ -505,14 +572,38 @@ def acquire_gpus(
     them, they are busy, or another account's processes sit on them without
     ``--shared``, unless ``--force``), else ``-n`` free GPUs picked and
     claimed under the board lock."""
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if not args.gpus and visible is not None and not visible.strip():
+        raise SystemExit(
+            "run_tests: CUDA_VISIBLE_DEVICES disables all GPUs; no tests started. "
+            "Use --lane cpu for CPU-only checks, or --gpus to select GPUs explicitly"
+        )
     explicit = explicit_gpus(args)
     if explicit and args.no_board:
         return explicit
     gpus = gpu_board.sample_gpus()
-    if gpus is None or len(gpus) < 2:
-        # A machine with one GPU (or none nvidia-smi can see) is not shared:
-        # no board, no claims.
-        return explicit or ["0"]
+    if gpus is None:
+        raise SystemExit(
+            "run_tests: GPU discovery failed (nvidia-smi unavailable or failed); "
+            "no tests started. Use --lane cpu for CPU-only checks; "
+            "GPU lanes require working NVIDIA discovery"
+        )
+    if not gpus:
+        raise SystemExit(
+            "run_tests: nvidia-smi reported no GPUs; no tests started. "
+            "Use --lane cpu for CPU-only checks"
+        )
+    if args.multi_gpu and len(gpus) < 2:
+        raise SystemExit("run_tests: --multi-gpu needs at least two GPUs")
+    if len(gpus) == 1:
+        # Only positive single-device discovery permits the unshared path.
+        available = str(gpus[0].index)
+        if explicit and explicit != [available]:
+            raise SystemExit(
+                f"run_tests: nvidia-smi reported only GPU {available}; "
+                f"requested {', '.join(explicit)}"
+            )
+        return [available]
     try:
         if explicit:
             board, claim, problems = gpu_board.claim_gpus(
@@ -539,15 +630,14 @@ def acquire_gpus(
             file=sys.stderr,
         )
         raise SystemExit(gpu_board.SECURITY_EXIT) from None
-    except gpu_board.LockTimeout as e:
-        # Not "board unavailable": whoever holds the lock may be keeping us
-        # from checking the GPUs, so never fall back to running unchecked.
-        raise SystemExit(f"run_tests: {e}") from None
     except gpu_board.GpuConflict as e:
-        raise SystemExit(
-            f"run_tests: {e}. Let the board choose (drop --gpus or "
-            "CUDA_VISIBLE_DEVICES and pass -n), ask on the board, or pass --force."
-        ) from None
+        hint = (
+            "Stop and inspect remaining processes before reusing these GPUs."
+            if e.has_unconfirmed_cleanup
+            else "Let the board choose (drop --gpus or CUDA_VISIBLE_DEVICES "
+            "and pass -n), ask on the board, or pass --force."
+        )
+        raise SystemExit(f"run_tests: {e}. {hint}") from None
     except gpu_board.NotEnoughGpus as e:
         print(
             gpu_board.render_status(
@@ -564,17 +654,18 @@ def acquire_gpus(
             f"run_tests: only {len(e.chosen)} of {e.count} GPUs are free; pass --gpus, "
             "--shared, or wait (ask on the board with scripts/gpu_board.py say)"
         ) from None
+    except gpu_board.LockTimeout as e:
+        raise SystemExit(f"run_tests: GPU board lock busy: {e}") from None
     except (gpu_board.BoardError, OSError) as e:
-        if not explicit:
-            raise SystemExit(
-                f"run_tests: GPU board unavailable ({e}); pass --gpus"
-            ) from None
-        print(
-            f"run_tests: GPU board unavailable ({e}); running without a claim",
-            file=sys.stderr,
+        raise SystemExit(
+            f"run_tests: GPU board unavailable ({e}); "
+            "stop and report this GPU board failure to the user"
+        ) from None
+    stack.enter_context(
+        gpu_board.hold_claim(
+            board.dir, claim, CLAIM_TTL, alerts, retain_on_error=(CleanupError,)
         )
-        return explicit
-    stack.enter_context(gpu_board.hold_claim(board.dir, claim, CLAIM_TTL, alerts))
+    )
     return [str(g) for g in claim.gpus]
 
 
@@ -610,8 +701,17 @@ def format_seconds(seconds: float) -> str:
 
 
 def shell_line(job: Job) -> str:
-    env = " ".join(f"{k}={shlex.quote(v)}" for k, v in sorted(job.env.items()))
-    return f"{env} {shlex.join(job.argv)}"
+    # Match the runner's controlled variables and import path without printing
+    # unrelated (potentially private) values from the inherited environment.
+    assignments = {**job.env, "PYTHONPATH": job_environment(job)["PYTHONPATH"]}
+    return shlex.join(
+        [
+            "env",
+            *(arg for key in RUNNER_ENV for arg in ("-u", key)),
+            *(f"{key}={value}" for key, value in sorted(assignments.items())),
+            *job.argv,
+        ]
+    )
 
 
 class Runner:
@@ -620,30 +720,29 @@ class Runner:
 
     def __init__(self, heartbeat: float) -> None:
         self.heartbeat = heartbeat
-        self.procs: dict[str, subprocess.Popen[bytes]] = {}
+        self.procs: dict[str, OwnedProcess] = {}
         self.interrupted = False
+        self.results: dict[str, JobResult] = {}
 
     def _interrupt(self, signum: int, _frame: object) -> None:
         self.interrupted = True
         for proc in self.procs.values():
-            if proc.returncode is not None:
-                continue  # reaped: its pid may belong to someone else by now
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(proc.pid, signum)
+            proc.request_stop(signum)
 
-    def _start(self, job: Job) -> tuple[subprocess.Popen[bytes], float]:
-        log = job.log.open("wb")
-        proc = subprocess.Popen(
-            job.argv,
-            cwd=REPO_ROOT,
-            env=job_environment(job),
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        log.close()  # the child holds its own descriptor
-        self.procs[job.name] = proc
+    def _start(self, job: Job) -> tuple[OwnedProcess, float]:
+        with job.log.open("wb") as log:
+            proc = OwnedProcess(
+                job.argv,
+                cwd=REPO_ROOT,
+                env=job_environment(job),
+                stdout=log,
+                label=job.name,
+            )
+            # Closing the parent's log can fail after the child has started.
+            # Register ownership before leaving the context so run() retires it.
+            self.procs[job.name] = proc
+        if self.interrupted:
+            proc.request_stop()
         where = f"GPU {job.gpu}" if job.gpu is not None else "no GPU"
         shard = (
             f", shard {job.shard[0] + 1} of {job.shard[1]}"
@@ -669,16 +768,52 @@ class Runner:
         previous = {
             signum: signal.signal(signum, self._interrupt) for signum in signums
         }
+        pending_error: BaseException | None = None
         try:
             return self._run(jobs, quiet)
+        except BaseException as error:
+            pending_error = error
+            raise
         finally:
-            for signum, handler in previous.items():
-                signal.signal(signum, handler)
+            # Even a log/JUnit/start failure must retire every already-started
+            # job before the outer board context can release its claim.
+            errors: list[tuple[str, BaseException]] = []
+            try:
+                for name, proc in self.procs.items():
+                    try:
+                        proc.close()
+                    except BaseException as error:
+                        errors.append((name, error))
+            finally:
+                for signum, handler in previous.items():
+                    signal.signal(signum, handler)
+            if errors:
+                # Preserve every affected job in diagnostics, and retain the
+                # claim if any cleanup failed to confirm process retirement.
+                error_type = (
+                    CleanupError
+                    if isinstance(pending_error, CleanupError)
+                    or any(
+                        isinstance(error, CleanupError)
+                        or not isinstance(error, ProcessError)
+                        for _, error in errors
+                    )
+                    else ProcessError
+                )
+                details = [
+                    f"[{name}] {str(error).removeprefix(f'[{name}] ')}"
+                    for name, error in errors
+                ]
+                if pending_error is not None:
+                    details.insert(0, f"original runner error: {pending_error}")
+                raise error_type("; ".join(details)) from (
+                    pending_error if pending_error is not None else errors[0][1]
+                )
 
     def _run(self, jobs: Sequence[Job], quiet: bool) -> dict[str, JobResult]:
         pending = list(jobs)
-        running: dict[str, tuple[Job, subprocess.Popen[bytes], float]] = {}
-        results: dict[str, JobResult] = {}
+        running: dict[str, tuple[Job, OwnedProcess, float]] = {}
+        results = self.results
         last_beat = time.monotonic()
         while pending or running:
             busy_groups = {job.group for job, _, _ in running.values() if job.group}
@@ -730,7 +865,12 @@ def failure_keys(results: Iterable[JobResult]) -> list[FailureKey]:
 
 
 def rerun_failures(
-    results: Sequence[JobResult], run_dir: Path, heartbeat: float
+    results: Sequence[JobResult],
+    run_dir: Path,
+    heartbeat: float,
+    pytest_extra: Sequence[str],
+    *,
+    runners: list[Runner] | None = None,
 ) -> tuple[dict[FailureKey, str], bool]:
     """Run every failed test again, each alone in a fresh pytest process, one
     at a time per backend and lane (on the first GPU that lane used). Returns
@@ -746,18 +886,29 @@ def rerun_failures(
     for index, (backend, lane, nodeid) in enumerate(keys):
         name = f"rerun-{backend}-{lane}-{index}"
         junit = run_dir / f"{name}.xml"
-        argv = [
-            sys.executable,
+        # Pytest keeps the last value for these options. Put isolation's
+        # overrides after caller/config options without parsing unknown plugins'
+        # argument arity or discarding their settings.
+        extra = [
+            *pytest_extra,
+            "-k",
+            "",
             "-m",
-            "pytest",
-            "-rf",
-            "-n0",
-            f"--timeout={RERUN_TIMEOUT}",
-            "--timeout-method=thread",
-            f"--junitxml={junit}",
+            "",
+            "--helion-isolated-nodeid",
             nodeid,
+            f"--basetemp={run_dir / (name + '-tmp')}",
         ]
         gpu = first_gpu[(backend, lane)]
+        argv = pytest_argv(
+            junit,
+            "",
+            [nodeid],
+            extra,
+            serial=True,
+            timeout=RERUN_TIMEOUT,
+            overrides_last=True,
+        )
         key_of_job[name] = (backend, lane, nodeid)
         jobs.append(
             Job(
@@ -774,6 +925,8 @@ def rerun_failures(
             )
         )
     runner = Runner(heartbeat)
+    if runners is not None:
+        runners.append(runner)
     outcomes: dict[FailureKey, str] = {}
     for name, result in runner.run(jobs, quiet=True).items():
         key = key_of_job[name]
@@ -803,7 +956,8 @@ def summarize(
     skipped_rerun: str | None,
 ) -> tuple[str, int]:
     lines = [f"run directory: {run_dir}"]
-    lines.append(f"{'job':<22} {'GPU':<5} {'shard':<6} {'time':<8} result")
+    gpu_width = max([5, *(len(r.job.gpu or "-") for r in results)])
+    lines.append(f"{'job':<22} {'GPU':<{gpu_width}} {'shard':<6} {'time':<8} result")
     for r in results:
         shard = (
             f"{r.job.shard[0] + 1}/{r.job.shard[1]}"
@@ -811,7 +965,7 @@ def summarize(
             else "-"
         )
         lines.append(
-            f"{r.job.name:<22} {r.job.gpu or '-':<5} {shard:<6} "
+            f"{r.job.name:<22} {r.job.gpu or '-':<{gpu_width}} {shard:<6} "
             f"{format_seconds(r.seconds):<8} {r.describe()}"
         )
     keys = failure_keys(results)
@@ -886,12 +1040,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--gpus", help="comma-separated GPU indices for the GPU lanes")
     parser.add_argument(
+        "--multi-gpu",
+        action="store_true",
+        help="one serial pytest process using all selected GPUs; requires one backend "
+        "and --lane gpu (for tests that launch their own distributed workers)",
+    )
+    parser.add_argument(
         "-n",
         "--count",
         type=int,
-        default=1,
+        default=None,
         help="GPUs to pick from the board when --gpus and CUDA_VISIBLE_DEVICES are "
-        "unset (default 1)",
+        "unset (default 2 with --multi-gpu, otherwise 1)",
     )
     parser.add_argument(
         "--shared",
@@ -949,7 +1109,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             args.gpus = [str(g) for g in gpu_board.parse_gpu_list(args.gpus)]
         except argparse.ArgumentTypeError as e:
             parser.error(f"--gpus: {e}")
+    if args.count is None:
+        args.count = 2 if args.multi_gpu else 1
     serial = [b for b in args.backends if b in SERIAL_BACKENDS]
+    if args.multi_gpu and (args.lane != "gpu" or len(args.backends) != 1 or serial):
+        parser.error("--multi-gpu requires one GPU backend and --lane gpu")
     if serial and args.lane != "all":
         parser.error(
             f"{', '.join(serial)} runs the whole suite serially; --lane does not apply"
@@ -996,9 +1160,98 @@ def unused_run_dir(tag: str, create: bool) -> Path:
     raise SystemExit(f"run_tests: cannot create a run directory under {LOGS_DIR}")
 
 
+def pytest_uses_pyargs(paths: Sequence[str], extra: Sequence[str]) -> bool:
+    """Read pytest's effective addopts without importing tests or plugins."""
+    parser = argparse.ArgumentParser(
+        add_help=False, allow_abbrev=False, exit_on_error=False
+    )
+    parser.add_argument("--pyargs", action="store_true")
+    parser.add_argument("-o", "--override-ini", action="append", default=[])
+    parser.add_argument("-c", "--config-file", dest="inifilename")
+    parser.add_argument("--rootdir")
+    try:
+        options = [*shlex.split(os.environ.get("PYTEST_ADDOPTS", "")), *extra]
+        parsed, _ = parser.parse_known_args(options)
+    except (ValueError, argparse.ArgumentError) as error:
+        raise SystemExit(f"run_tests: invalid pytest options: {error}") from error
+    if parsed.pyargs:
+        return True
+    addopts: object = None
+    for override in parsed.override_ini:
+        name, separator, value = override.partition("=")
+        if separator and name == "addopts":
+            addopts = value  # Last override wins, including an empty value.
+    if addopts is None:
+        # Lazy: filesystem selections and --help need no pytest import. This
+        # helper only reads config files; Config.parse would load user plugins.
+        from _pytest.config.exceptions import UsageError
+        from _pytest.config.findpaths import determine_setup
+
+        setup: dict[str, Any] = {
+            "inifile": str(REPO_ROOT / parsed.inifilename)
+            if parsed.inifilename is not None
+            else None,
+            "args": [str(REPO_ROOT / path.split("::", 1)[0]) for path in paths],
+            "rootdir_cmd_arg": str(REPO_ROOT / os.path.expandvars(parsed.rootdir))
+            if parsed.rootdir is not None
+            else None,
+            "invocation_dir": REPO_ROOT,
+        }
+        # pytest 9.2 added this keyword and wrapped config values; earlier
+        # supported pytest versions return plain strings/lists instead.
+        if "override_ini" in inspect.signature(determine_setup).parameters:
+            setup["override_ini"] = []
+        try:
+            config = determine_setup(**setup)[2]
+        except UsageError as error:
+            raise SystemExit(f"run_tests: invalid pytest options: {error}") from error
+        addopts = config.get("addopts", "")
+        addopts = getattr(addopts, "value", addopts)
+    try:
+        tokens = shlex.split(addopts) if isinstance(addopts, str) else addopts
+        return parser.parse_known_args([*tokens, *options])[0].pyargs
+    except (ValueError, argparse.ArgumentError) as error:
+        raise SystemExit(f"run_tests: invalid pytest options: {error}") from error
+
+
+@contextlib.contextmanager
+def record_runner_error(run_dir: Path, runners: Sequence[Runner]) -> Iterator[None]:
+    try:
+        yield
+    except Exception as error:
+        lines = [f"run directory: {run_dir}", "Completed jobs before runner error:"]
+        lines += [
+            f"{name}: {result.describe()}"
+            for runner in runners
+            for name, result in runner.results.items()
+        ]
+        lines += [f"VERDICT: RUNNER ERROR ({error})"]
+        summary = "\n".join(lines) + "\n"
+        try:
+            (run_dir / "summary.txt").write_text(summary)
+        except OSError as write_error:
+            print(f"cannot save partial summary: {write_error}", file=sys.stderr)
+        print(summary, file=sys.stderr, flush=True)
+        raise
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     paths = list(args.paths)
+    pyargs = None
+    for selector in paths:
+        path = selector.split("::", 1)[0]
+        if path.startswith("@"):
+            path = path[1:]  # pytest argument file, not a literal test path
+        elif not (REPO_ROOT / path).exists() and all(
+            part.isidentifier() for part in path.split(".")
+        ):
+            if pyargs is None:
+                pyargs = pytest_uses_pyargs(paths, args.extra)
+            if pyargs:
+                continue  # Package discovery belongs to pytest, without importing here.
+        if not (REPO_ROOT / path).exists():
+            raise SystemExit(f"run_tests: test path does not exist: {REPO_ROOT / path}")
     if args.changed:
         modules, notes, broad = select_modules(changed_files(args.since))
         for note in notes:
@@ -1027,6 +1280,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         b not in SERIAL_BACKENDS for b in args.backends
     )
     needing = sum(b not in SERIAL_BACKENDS for b in args.backends) if need_gpu else 0
+    # Validate multi-device requests before discovery or creating a claim.
+    if args.multi_gpu:
+        selected = explicit_gpus(args)
+        if (selected and len(selected) < 2) or (not selected and args.count < 2):
+            raise SystemExit("run_tests: --multi-gpu needs at least two GPUs")
     # Each backend's GPU lane needs a GPU of its own.
     args.count = max(args.count, needing)
     run_dir = unused_run_dir(tag, create=not args.dry_run)
@@ -1052,6 +1310,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.extra,
             run_dir,
             args.marker,
+            multi_gpu=args.multi_gpu,
         )
         if args.dry_run:
             for job in jobs:
@@ -1063,6 +1322,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             + "".join(f"# {job.name}\n{shell_line(job)}\n" for job in jobs)
         )
         runner = Runner(args.heartbeat)
+        runners = [runner]
+        stack.enter_context(record_runner_error(run_dir, runners))
         by_name = runner.run(jobs)
         if runner.interrupted:
             print(f"interrupted; partial logs in {run_dir}")
@@ -1076,7 +1337,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"rerunning {len(keys)} failures, each alone in a fresh process",
                 flush=True,
             )
-            outcomes, interrupted = rerun_failures(results, run_dir, args.heartbeat)
+            outcomes, interrupted = rerun_failures(
+                results, run_dir, args.heartbeat, args.extra, runners=runners
+            )
             if interrupted:
                 print(f"interrupted during the reruns; partial logs in {run_dir}")
                 return 130
@@ -1100,4 +1363,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except ProcessError as error:
+        print(f"run_tests: {error}", file=sys.stderr)
+        sys.exit(1)

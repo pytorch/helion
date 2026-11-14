@@ -1,22 +1,29 @@
 from __future__ import annotations
 
+from collections import deque
 import contextlib
 from datetime import timedelta
+import functools
+import gc
 import importlib.util
 import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import ClassVar
 from typing import TypeVar
+from typing import cast
 import unittest
 from unittest.mock import patch
+import weakref
 
 import numpy as np
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
+from torch.testing._internal.common_distributed import TEST_SKIPS
 from torch.testing._internal.common_distributed import MultiProcessTestCase
 
 import helion
@@ -26,9 +33,17 @@ _TORCH_TPU_RUNNER_ARG = "--torch-tpu-runner"
 _IS_TORCH_TPU_RUNNER = _TORCH_TPU_RUNNER_ARG in sys.argv
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from multiprocessing.connection import Connection
+    from multiprocessing.synchronize import Event
+
+    import pytest
+
     from helion._testing import TestCase
     from helion._testing import onlyBackends
     from helion._testing import skipIfPallasInterpret
+    from helion._testing.distributed_diagnostics import queued_copy_diagnostics
+    from helion.runtime.triton import launcher as triton_launcher
 elif _IS_TORCH_TPU_RUNNER:
     _Decorated = TypeVar("_Decorated")
 
@@ -44,9 +59,13 @@ elif _IS_TORCH_TPU_RUNNER:
     onlyBackends = _identity_test_decorator
     skipIfPallasInterpret = _identity_test_decorator
 else:
+    import pytest
+
     from helion._testing import TestCase
     from helion._testing import onlyBackends
     from helion._testing import skipIfPallasInterpret
+    from helion._testing.distributed_diagnostics import queued_copy_diagnostics
+    from helion.runtime.triton import launcher as triton_launcher
 
 
 _WIDTH = 128
@@ -619,6 +638,84 @@ class TestRemoteCopyGPU(TestCase, MultiProcessTestCase):
     def device(self) -> torch.device:
         return torch.device(f"cuda:{self.rank}")
 
+    @property
+    def destroy_pg_upon_exit(self) -> bool:
+        # Successful cleanup runs inside run_test's exception-reporting boundary.
+        return False
+
+    def run_test(self, test_name: str, parent_pipe: Connection) -> None:
+        # Torch calls the child method directly, without unittest tearDown or
+        # doCleanups. Keep collective allocations alive across that return.
+        self._symmetric_buffers: deque[torch.Tensor] = deque()
+        self._remote_cache_entries: list[
+            tuple[dict[object, object], object, object]
+        ] = []
+        self._cleanup_mark: Callable[[str], None] = lambda stage: None
+        test_method = getattr(self, test_name)
+        allocate = symm_mem.empty
+
+        def owned_allocation(*args: object, **kwargs: object) -> torch.Tensor:
+            tensor = allocate(*args, **kwargs)
+            # This includes compiler workspaces/state and failed rendezvous.
+            self._symmetric_buffers.append(tensor)
+            return tensor
+
+        def track_cache(helper_name: str, cache_name: str) -> Callable[..., object]:
+            helper = getattr(triton_launcher, helper_name)
+
+            @functools.wraps(helper)
+            def tracked(kernel: object, *args: object, **kwargs: object) -> object:
+                previous = dict(vars(kernel).get(cache_name, {}))
+                try:
+                    return helper(kernel, *args, **kwargs)
+                finally:
+                    cache = vars(kernel).get(cache_name, {})
+                    for key, entry in cache.items():
+                        if key not in previous or previous[key] is not entry:
+                            self._remote_cache_entries.append((cache, key, entry))
+
+            return tracked
+
+        def run_with_cleanup() -> None:
+            test_method()
+            # Do not run collective cleanup after a failed body: preserve its
+            # traceback and Torch's error/peer-termination path. Cleanup failures
+            # also reach that path, rather than being swallowed by doCleanups.
+            self._cleanup_process()
+
+        with (
+            contextlib.ExitStack() as stack,
+            patch.object(self, test_name, run_with_cleanup),
+            patch.object(symm_mem, "empty", owned_allocation),
+        ):
+            # Observe only the known remote cache helpers. Do not scan or clear
+            # unrelated JIT caches, scratch, or stream-local persistent state.
+            for helper_name, cache_name in (
+                ("_get_remote_copy_signal", "_helion_remote_copy_signal_cache"),
+                ("_get_remote_barrier_signal", "_helion_remote_barrier_signal_cache"),
+                ("_get_process_group_state", "_helion_persistent_state_cache"),
+            ):
+                stack.enter_context(
+                    patch.object(
+                        triton_launcher,
+                        helper_name,
+                        track_cache(helper_name, cache_name),
+                    )
+                )
+            try:
+                super().run_test(test_name, parent_pipe)
+            except SystemExit as error:
+                if error.code == MultiProcessTestCase.TEST_ERROR_EXIT_CODE:
+                    # Torch already sent the traceback and closed its pipe. Its
+                    # parent waits for exit 10 before reading the error; normal
+                    # interpreter GC could instead enter a collective free.
+                    try:
+                        sys.stdout.flush()
+                        sys.stderr.flush()
+                    finally:
+                        os._exit(MultiProcessTestCase.TEST_ERROR_EXIT_CODE)
+                raise
+
     def _init_process(self) -> dist.Store:
         torch.cuda.set_device(self.device)
         store = dist.FileStore(self.file_name, self.world_size)
@@ -629,7 +726,6 @@ class TestRemoteCopyGPU(TestCase, MultiProcessTestCase):
             store=store,
             device_id=self.device,
         )
-        self.addCleanup(self._cleanup_process)
         torch.distributed.distributed_c10d._set_pg_timeout(
             timedelta(seconds=60), dist.group.WORLD
         )
@@ -637,10 +733,31 @@ class TestRemoteCopyGPU(TestCase, MultiProcessTestCase):
         return store
 
     def _cleanup_process(self) -> None:
+        self._cleanup_mark("cleanup:synchronize")
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        self._cleanup_mark("cleanup:remote_caches")
+        self._drop_remote_cache_entries()
+        # Lazy compiler imports can retain tensor arguments in unreachable frame
+        # cycles. Collect those while all symmetric tensors still have owners,
+        # then free in allocation order: NVSHMEM free is collective.
+        self._cleanup_mark("cleanup:gc:start")
+        gc.collect()
+        self._cleanup_mark("cleanup:gc:end")
+        for index in range(len(self._symmetric_buffers)):
+            self._cleanup_mark(f"cleanup:release:{index}")
+            self._symmetric_buffers.popleft()
+        self._cleanup_mark("cleanup:destroy_process_group")
         if dist.is_initialized():
             dist.destroy_process_group()
+        self._cleanup_mark("cleanup:complete")
+
+    def _drop_remote_cache_entries(self) -> None:
+        for cache, key, entry in self._remote_cache_entries:
+            if cache.get(key) is entry:
+                del cache[key]
+        self._remote_cache_entries.clear()
+        # Return before GC/FIFO release: loop locals also own the last entry.
 
     def _make_symmetric_buffer(self, shape: tuple[int, ...]) -> torch.Tensor:
         dst = symm_mem.empty(*shape, dtype=torch.float32, device=self.device)
@@ -702,35 +819,50 @@ class TestRemoteCopyGPU(TestCase, MultiProcessTestCase):
             torch.testing.assert_close(result[0], expected)
 
     def test_queued_reused_descriptor_completions(self) -> None:
-        self._init_process()
-        src = torch.from_numpy(_rank_pipeline_values(self.rank)).to(self.device)
-        src = src.reshape(1, _PIPELINE_STEPS, _WIDTH)
-        dst = self._make_symmetric_buffer(src.shape)
-        gate_src = torch.full((1,), self.rank, dtype=torch.float32, device=self.device)
-        gate = self._make_symmetric_buffer((1,))
-        gate.fill_(self.rank)
-        peers = torch.tensor(
-            [
-                [
-                    (self.rank + 1) % self.world_size,
-                    (self.rank - 1) % self.world_size,
-                ]
-            ],
-            dtype=torch.int32,
-            device=self.device,
-        )
-        rank = torch.tensor([self.rank], dtype=torch.int32, device=self.device)
-        expected = torch.from_numpy(
-            _expected_pipeline_destination(self.world_size)[self.rank]
-        ).to(self.device)
-        for _invocation in range(2):
-            dst.fill_(-1)
-            dist.barrier()
-            result = _ordered_reused_descriptor_pipeline_copy(
-                src, dst, peers, gate_src, gate, rank
+        with queued_copy_diagnostics(self.rank) as mark:
+            self._cleanup_mark = mark
+            mark("init")
+            self._init_process()
+            mark("source_tensor")
+            src = torch.from_numpy(_rank_pipeline_values(self.rank)).to(self.device)
+            src = src.reshape(1, _PIPELINE_STEPS, _WIDTH)
+            mark("destination_allocation_rendezvous")
+            dst = self._make_symmetric_buffer(src.shape)
+            mark("gate_source")
+            gate_src = torch.full(
+                (1,), self.rank, dtype=torch.float32, device=self.device
             )
-            torch.cuda.synchronize()
-            torch.testing.assert_close(result[0], expected)
+            mark("gate_allocation_rendezvous")
+            gate = self._make_symmetric_buffer((1,))
+            mark("remaining_inputs")
+            gate.fill_(self.rank)
+            peers = torch.tensor(
+                [
+                    [
+                        (self.rank + 1) % self.world_size,
+                        (self.rank - 1) % self.world_size,
+                    ]
+                ],
+                dtype=torch.int32,
+                device=self.device,
+            )
+            rank = torch.tensor([self.rank], dtype=torch.int32, device=self.device)
+            expected = torch.from_numpy(
+                _expected_pipeline_destination(self.world_size)[self.rank]
+            ).to(self.device)
+            for invocation in range(2):
+                mark(f"invocation:{invocation}:fill")
+                dst.fill_(-1)
+                mark(f"invocation:{invocation}:barrier")
+                dist.barrier()
+                mark(f"invocation:{invocation}:kernel")
+                result = _ordered_reused_descriptor_pipeline_copy(
+                    src, dst, peers, gate_src, gate, rank
+                )
+                mark(f"invocation:{invocation}:synchronize")
+                torch.cuda.synchronize()
+                mark(f"invocation:{invocation}:assert")
+                torch.testing.assert_close(result[0], expected)
 
     def test_ring_all_gather(self) -> None:
         self._init_process()
@@ -968,6 +1100,402 @@ class TestRemoteCopyGPU(TestCase, MultiProcessTestCase):
             result = _peer_scoped_remote_barrier(peers, output, group.group_name)
             torch.cuda.synchronize()
         torch.testing.assert_close(result, torch.ones_like(result))
+
+
+if not _IS_TORCH_TPU_RUNNER:
+
+    class _BlockingFinalizer:
+        def __init__(self, entered: Event, release: Event) -> None:
+            self.entered = entered
+            self.release = release
+
+        def __del__(self) -> None:
+            self.entered.set()
+            self.release.wait(60)
+
+    def _run_cleanup_exit_probe(
+        parent_pipe: Connection, entered: Event, release: Event, failure_in: str
+    ) -> None:
+        case = TestRemoteCopyGPU("test_one_shot_remote_copy")
+        case.rank = 0
+
+        def body() -> None:
+            tensor = torch.empty(4)
+            tensor._test_finalizer = _BlockingFinalizer(entered, release)
+            case._symmetric_buffers.append(tensor)
+            if failure_in == "body":
+                raise ValueError("child body failed")
+
+        def cleanup() -> None:
+            raise RuntimeError("child cleanup failed")
+
+        with (
+            patch.object(case, "test_one_shot_remote_copy", body),
+            patch.object(case, "_cleanup_process", cleanup),
+            patch.object(torch._C, "_set_print_stack_traces_on_fatal_signal"),
+            patch("torch.testing._internal.common_utils.set_rng_seed"),
+        ):
+            # Run in an actual short-lived child. There is deliberately no
+            # interception of SystemExit or os._exit here.
+            case.run_test("test_one_shot_remote_copy", parent_pipe)
+
+    @pytest.mark.cpu_only
+    @onlyBackends(["triton", "cute"])
+    class TestRemoteCopyChildCleanup(TestCase):
+        """Exercise Torch's real child runner with CPU substitutes for CUDA/NCCL."""
+
+        def _run_child(
+            self,
+            body: Callable[[TestRemoteCopyGPU], None],
+            *,
+            synchronization_error: Exception | None = None,
+        ) -> tuple[list[str], list[bool], int | None, str]:
+            events: list[str] = []
+            refs: list[weakref.ReferenceType[torch.Tensor]] = []
+            case = TestRemoteCopyGPU("test_one_shot_remote_copy")
+            case.rank = 0
+            case.file_name = "unused-cpu-store"
+            parent, child = torch.multiprocessing.Pipe()
+
+            def allocate(*shape: int, **kwargs: object) -> torch.Tensor:
+                tensor = torch.empty(shape)
+                index = len(refs)
+                refs.append(weakref.ref(tensor))
+                weakref.finalize(tensor, events.append, f"released:{index}")
+                return tensor
+
+            def synchronize() -> None:
+                events.append("synchronized")
+                if synchronization_error is not None:
+                    raise synchronization_error
+
+            def destroy_process_group() -> None:
+                events.append("destroyed")
+
+            def exit_process(code: int) -> None:
+                events.append(f"exit:{code}")
+                raise SystemExit(code)
+
+            def run_body() -> None:
+                case._cleanup_mark = events.append
+                case._init_process()
+                body(case)
+                events.append("body:return")
+
+            # Plain functions avoid mock call histories retaining tensor inputs.
+            # Do not modify process-wide fatal-signal handlers in this CPU test.
+            with contextlib.ExitStack() as stack:
+                for context in (
+                    patch.dict(os.environ),
+                    patch.object(case, "test_one_shot_remote_copy", run_body),
+                    patch.object(torch._C, "_set_print_stack_traces_on_fatal_signal"),
+                    patch.object(os, "_exit", new=exit_process),
+                    patch("torch.testing._internal.common_utils.set_rng_seed"),
+                    patch.object(torch.cuda, "set_device"),
+                    patch.object(torch.cuda, "is_available", return_value=True),
+                    patch.object(torch.cuda, "synchronize", new=synchronize),
+                    patch.object(dist, "FileStore"),
+                    patch.object(dist, "init_process_group"),
+                    patch.object(dist, "is_initialized", return_value=True),
+                    patch.object(dist, "get_rank", return_value=0),
+                    patch.object(dist, "group", SimpleNamespace(WORLD=object())),
+                    patch.object(dist.distributed_c10d, "_set_pg_timeout"),
+                    patch.object(symm_mem, "set_backend"),
+                    patch.object(symm_mem, "empty", new=allocate),
+                    patch.object(
+                        symm_mem, "rendezvous", new=lambda tensor, **kwargs: case
+                    ),
+                    patch.object(
+                        dist, "destroy_process_group", new=destroy_process_group
+                    ),
+                    patch.object(
+                        dist.distributed_c10d,
+                        "destroy_process_group",
+                        new=destroy_process_group,
+                    ),
+                ):
+                    stack.enter_context(context)
+                stack.callback(parent.close)
+                stack.callback(child.close)
+                exit_code = None
+                try:
+                    case.run_test("test_one_shot_remote_copy", child)
+                except SystemExit as error:
+                    self.assertIsInstance(error.code, int)
+                    exit_code = error.code
+                error_text = (
+                    parent.recv()
+                    if exit_code == MultiProcessTestCase.TEST_ERROR_EXIT_CODE
+                    else ""
+                )
+                retained = [ref() is not None for ref in refs]
+                # Error paths intentionally retain allocations until worker exit.
+                # This test process stays alive, so retire its CPU substitutes.
+                case.__dict__.get("_symmetric_buffers", []).clear()
+                gc.collect()
+            return events, retained, exit_code, error_text
+
+        def test_child_releases_collective_allocations_before_process_group(
+            self,
+        ) -> None:
+            def body(case: TestRemoteCopyGPU) -> None:
+                first = case._make_symmetric_buffer((4,))
+                second = case._make_symmetric_buffer((1,))
+                self.assertEqual(first.numel(), 4)
+                self.assertEqual(second.numel(), 1)
+
+            events, retained, exit_code, error = self._run_child(body)
+            self.assertIsNone(exit_code, error)
+            self.assertEqual(retained, [False, False])
+            self.assertEqual(
+                events,
+                [
+                    "body:return",
+                    "cleanup:synchronize",
+                    "synchronized",
+                    "cleanup:remote_caches",
+                    "cleanup:gc:start",
+                    "cleanup:gc:end",
+                    "cleanup:release:0",
+                    "released:0",
+                    "cleanup:release:1",
+                    "released:1",
+                    "cleanup:destroy_process_group",
+                    "destroyed",
+                    "cleanup:complete",
+                ],
+            )
+
+        def test_cleanup_exception_reaches_torch_parent_error_channel(self) -> None:
+            def body(case: TestRemoteCopyGPU) -> None:
+                case._make_symmetric_buffer((4,))
+
+            events, retained, exit_code, error = self._run_child(
+                body, synchronization_error=RuntimeError("cleanup failed")
+            )
+            self.assertEqual(exit_code, MultiProcessTestCase.TEST_ERROR_EXIT_CODE)
+            self.assertEqual(
+                error.rstrip().splitlines()[-1], "RuntimeError: cleanup failed"
+            )
+            self.assertEqual(retained, [True])
+            self.assertNotIn("destroyed", events)
+            self.assertIn("exit:10", events)
+
+        def test_body_exception_is_not_masked_by_collective_cleanup(self) -> None:
+            def body(case: TestRemoteCopyGPU) -> None:
+                case._make_symmetric_buffer((4,))
+                raise ValueError("original body failed")
+
+            events, retained, exit_code, error = self._run_child(
+                body, synchronization_error=RuntimeError("must not run")
+            )
+            self.assertEqual(exit_code, MultiProcessTestCase.TEST_ERROR_EXIT_CODE)
+            self.assertEqual(
+                error.rstrip().splitlines()[-1], "ValueError: original body failed"
+            )
+            self.assertNotIn("must not run", error)
+            self.assertEqual(retained, [True])
+            self.assertNotIn("synchronized", events)
+            self.assertNotIn("destroyed", events)
+            self.assertIn("exit:10", events)
+
+        def test_failed_rendezvous_keeps_its_allocation_owned(self) -> None:
+            def fail_rendezvous(tensor: torch.Tensor, **kwargs: object) -> None:
+                raise ValueError("rendezvous failed")
+
+            def body(case: TestRemoteCopyGPU) -> None:
+                with patch.object(symm_mem, "rendezvous", new=fail_rendezvous):
+                    try:
+                        case._make_symmetric_buffer((4,))
+                    except ValueError:
+                        self.assertEqual(len(case._symmetric_buffers), 1)
+                        raise
+
+            events, retained, exit_code, error = self._run_child(body)
+            self.assertEqual(exit_code, MultiProcessTestCase.TEST_ERROR_EXIT_CODE)
+            self.assertEqual(
+                error.rstrip().splitlines()[-1], "ValueError: rendezvous failed"
+            )
+            self.assertEqual(retained, [True])
+            self.assertNotIn("synchronized", events)
+            self.assertNotIn("destroyed", events)
+            self.assertIn("exit:10", events)
+
+        def test_skip_keeps_torch_skip_exit_without_hard_exit(self) -> None:
+            def body(case: TestRemoteCopyGPU) -> None:
+                raise unittest.SkipTest("before allocation")
+
+            events, retained, exit_code, error = self._run_child(body)
+            self.assertEqual(exit_code, TEST_SKIPS["generic"].exit_code)
+            self.assertEqual(error, "")
+            self.assertEqual(retained, [])
+            self.assertFalse(any(event.startswith("exit:") for event in events))
+            self.assertNotIn("destroyed", events)
+
+        def test_binding_cycles_collect_before_ordered_allocation_release(self) -> None:
+            @helion.kernel(static_shapes=True, config=helion.Config(block_sizes=[]))
+            def copy(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+                for index in hl.grid(src.size(0)):
+                    dst[index] = src[index]
+                return dst
+
+            def body(case: TestRemoteCopyGPU) -> None:
+                first = case._make_symmetric_buffer((4,))
+                second = case._make_symmetric_buffer((4,))
+                with patch.object(torch.cuda, "is_available", return_value=False):
+                    copy.bind((first, second))
+                # Real binding may retain import/tracing frames until GC. Keep
+                # that lifetime deterministic even when compiler imports are warm.
+                cycle: list[object] = [first, second]
+                cycle.append(cycle)
+
+            gc.collect()
+            was_enabled = gc.isenabled()
+            gc.disable()
+            try:
+                events, retained, exit_code, error = self._run_child(body)
+            finally:
+                if was_enabled:
+                    gc.enable()
+            self.assertIsNone(exit_code, error)
+            self.assertEqual(retained, [False, False])
+            self.assertLess(events.index("cleanup:gc:end"), events.index("released:0"))
+            self.assertLess(events.index("released:0"), events.index("released:1"))
+            self.assertLess(events.index("released:1"), events.index("destroyed"))
+            self.assertEqual(len(copy._bound_kernels), 1)
+
+        def test_launcher_caches_release_only_owned_entries_before_allocations(
+            self,
+        ) -> None:
+            untouched = object()
+            kernel = SimpleNamespace(
+                __name__="cleanup_probe",
+                _helion_remote_barrier_signal_cache={"untouched": untouched},
+            )
+
+            def body(case: TestRemoteCopyGPU) -> None:
+                handle = SimpleNamespace(
+                    rank=0,
+                    world_size=4,
+                    buffer_ptrs=[1, 2, 3, 4],
+                    get_signal_pad=lambda rank, dtype: torch.empty(32, dtype=dtype),
+                )
+                tensor_constructor = torch.tensor
+                cpu_device = torch.device("cpu")
+
+                def cpu_pointer_table(data, **kwargs):
+                    return tensor_constructor(
+                        data, dtype=kwargs["dtype"], device=cpu_device
+                    )
+
+                def gather_fingerprints(output, fingerprint, **kwargs) -> None:
+                    output[:] = [fingerprint] * len(output)
+
+                with (
+                    patch.object(symm_mem, "rendezvous", new=lambda *a, **k: handle),
+                    patch.object(torch.cuda, "current_device", return_value=0),
+                    patch.object(
+                        torch.cuda,
+                        "device",
+                        new=lambda device: contextlib.nullcontext(),
+                    ),
+                    patch.object(
+                        torch.cuda, "get_device_capability", return_value=(9, 0)
+                    ),
+                    patch.object(
+                        torch.cuda, "is_current_stream_capturing", return_value=False
+                    ),
+                    patch.object(
+                        torch.cuda,
+                        "current_stream",
+                        new=lambda *a: SimpleNamespace(synchronize=lambda: None),
+                    ),
+                    patch.object(dist.distributed_c10d, "_resolve_process_group"),
+                    patch.object(dist, "get_world_size", return_value=4),
+                    patch.object(dist, "all_gather_object", new=gather_fingerprints),
+                    patch.object(torch, "tensor", new=cpu_pointer_table),
+                ):
+                    dst = case._make_symmetric_buffer((4,))
+                    # Only device metadata is read from this input; the real
+                    # launcher allocates/zeros its state through CPU substitutes.
+                    like = cast("torch.Tensor", SimpleNamespace(device=case.device))
+                    for _replay in range(2):
+                        triton_launcher._get_remote_copy_signal(kernel, dst, "group", 1)
+                        triton_launcher._get_remote_barrier_signal(kernel, "group", 1)
+                        state = triton_launcher._get_process_group_state(
+                            kernel,
+                            like,
+                            ("namespace",),
+                            0,
+                            4,
+                            torch.float32,
+                            symmetric=True,
+                            process_group_name="group",
+                        )
+                        self.assertEqual(state[0].numel(), 4)
+                    self.assertEqual(len(case._symmetric_buffers), 3)
+                    case._make_symmetric_buffer((1,))
+
+            events, retained, exit_code, error = self._run_child(body)
+            self.assertIsNone(exit_code, error)
+            self.assertEqual(retained, [False] * 4)
+            self.assertEqual(
+                [event for event in events if event.startswith("released:")],
+                [f"released:{index}" for index in range(4)],
+            )
+            self.assertLess(events.index("cleanup:gc:end"), events.index("released:0"))
+            self.assertLess(events.index("released:3"), events.index("destroyed"))
+            self.assertEqual(
+                kernel._helion_remote_barrier_signal_cache, {"untouched": untouched}
+            )
+            self.assertEqual(kernel._helion_remote_copy_signal_cache, {})
+            self.assertEqual(kernel._helion_persistent_state_cache, {})
+
+        @pytest.mark.slow
+        def test_reported_child_errors_exit_without_collective_finalizers(self) -> None:
+            context = torch.multiprocessing.get_context("spawn")
+            for failure_in in ("body", "cleanup"):
+                with self.subTest(failure_in=failure_in):
+                    parent, child = context.Pipe()
+                    entered, release = context.Event(), context.Event()
+                    process = context.Process(
+                        target=_run_cleanup_exit_probe,
+                        args=(child, entered, release, failure_in),
+                    )
+                    process.start()
+                    child.close()
+                    try:
+                        self.assertTrue(
+                            parent.poll(60), "child did not report its error"
+                        )
+                        error = parent.recv()
+                        expected = (
+                            "ValueError: child body failed"
+                            if failure_in == "body"
+                            else "RuntimeError: child cleanup failed"
+                        )
+                        self.assertEqual(error.rstrip().splitlines()[-1], expected)
+                        process.join(timeout=5)
+                        self.assertFalse(
+                            process.is_alive(),
+                            f"reported error did not exit; finalizer entered={entered.is_set()}",
+                        )
+                        self.assertEqual(
+                            process.exitcode, MultiProcessTestCase.TEST_ERROR_EXIT_CODE
+                        )
+                        self.assertFalse(entered.is_set())
+                    finally:
+                        release.set()
+                        process.join(timeout=5)
+                        if process.is_alive():
+                            process.terminate()
+                            process.join(timeout=5)
+                        if process.is_alive():
+                            process.kill()
+                            process.join(timeout=5)
+                        parent.close()
+                        self.assertFalse(process.is_alive(), "child cleanup failed")
+                        process.close()
 
 
 @onlyBackends(["pallas"])

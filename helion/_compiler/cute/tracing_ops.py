@@ -16,47 +16,18 @@ import torch
 from torch._inductor.codegen.simd import constant_repr
 
 from ...language import _decorators
-from ...language._tracing_ops import _get_symnode
 from ...language._tracing_ops import _if
 from ...language._tracing_ops import _mask_to
-from ...language._tracing_ops import _val_to_sympy
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..ast_read_writes import HELION_BLOCK_UNIFORM_ATTR
 from ..compile_environment import CompileEnvironment
 from ..dtype_utils import cast_ast
-from ..host_function import HostFunction
-from ..variable_origin import BlockSizeOrigin
 from .block_uniform import block_uniform
 from .synthetic_axes import branch_scope
 
 if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
-
-
-@_decorators.codegen(_get_symnode, "cute")
-def _(state: CodegenState) -> ast.AST:
-    # pyrefly: ignore [missing-attribute]
-    val = state.fx_node.meta["val"]
-    if isinstance(val, int):
-        return expr_from_string(str(val))
-
-    assert isinstance(val, (torch.SymInt, torch.SymFloat, torch.SymBool)), val
-    sym_expr = _val_to_sympy(val)
-    origin_info = HostFunction.current().expr_to_origin.get(sym_expr)
-    if origin_info is not None and isinstance(origin_info.origin, BlockSizeOrigin):
-        block_size_var = state.device_function.block_size_var(
-            origin_info.origin.block_id
-        )
-        if block_size_var is None:
-            return expr_from_string("1")
-        return expr_from_string(block_size_var)
-    return state.codegen.lift_symnode(
-        expr_from_string(state.sympy_expr(sym_expr)),
-        sym_expr,
-        dce=True,
-        prefix="symnode",
-    )
 
 
 @_decorators.codegen(_if, "cute")

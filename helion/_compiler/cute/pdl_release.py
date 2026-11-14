@@ -13,7 +13,12 @@ picks ``entry`` while the launch grid is known to fit in one wave of
 resident CTAs and ``last_wave`` past it or when the host sizes the grid at
 runtime (``passes.pdl._implicit_pdl_release``).  The placement follows
 the grid, so the search leaves it at ``auto``; the explicit values serve
-pins, seeds and users.  The tcgen05 GEMM kernels, whose lowering waits in
+pins, seeds and users. Proved paired capture overlap can explicitly request
+``loader_tail``: the audited loader releases four logical pages before its
+end, with an unconditional release after the loop for short/empty ranges.
+Ordinary search keeps release at ``auto`` and capture overlap disabled.
+Its dependency waits and capture-storage proof are unchanged.
+The tcgen05 GEMM kernels, whose lowering waits in
 its warp roles and releases after the MMA warp's last MMA, take the same
 placements: ``entry`` and ``last_wave`` add the (guarded) release right
 after each of those waits, ``exit`` and ``none`` keep the late release
@@ -50,8 +55,14 @@ CUTE_PDL_RELEASE_CHOICES: tuple[str, ...] = (
     "none",
     "exit",
     "last_wave",
+    "loader_tail",
 )
 CUTE_PDL_RELEASE_DEFAULT = CUTE_PDL_RELEASE_CHOICES[0]
+CUTE_PDL_CAPTURE_RELEASE_CHOICES: tuple[str, ...] = (
+    CUTE_PDL_RELEASE_DEFAULT,
+    "entry",
+    "loader_tail",
+)
 # The hardware limits every target with ``griddepcontrol`` (sm_90 and up)
 # shares: resident CTAs per SM and, when the device cannot be queried, the
 # resident threads per SM (H100, B200).
@@ -200,20 +211,39 @@ def generic_release_rendered(source: str) -> bool:
     the release once picked a CLC-persistent kernel 7% behind in the
     catalogue's regime.  The autotuner's final selection asks this of a
     finalist's rendered source (``CuteBackend.finalist_preference``).
+    The audited capture wrapper's conditional EARLY wait has the same entry
+    release ordering; its metadata identifies the exact mode parameter.
     """
     try:
         module = ast.parse(source)
     except SyntaxError:
         return False
+    capture_waits: dict[str, str] = {}
     for node in module.body:
         if (
             isinstance(node, ast.Assign)
             and len(node.targets) == 1
             and isinstance(node.targets[0], ast.Attribute)
             and node.targets[0].attr == "_helion_cute_wrapper_plans"
-            and "'use_pdl': True" in ast.unparse(node.value)
         ):
-            return False
+            if "'use_pdl': True" in ast.unparse(node.value):
+                return False
+            if not isinstance(node.targets[0].value, ast.Name):
+                continue
+            try:
+                plans = ast.literal_eval(node.value)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(plans, list):
+                continue
+            for plan in plans:
+                if (
+                    isinstance(plan, dict)
+                    and plan.get("kind") == "helion_paged_attention"
+                    and plan.get("capture_pdl_contract") == "paired-output-stores-v1"
+                    and isinstance(mode := plan.get("capture_pdl_mode_param"), str)
+                ):
+                    capture_waits[node.targets[0].value.id] = mode
     kernels = [
         node
         for node in module.body
@@ -222,7 +252,12 @@ def generic_release_rendered(source: str) -> bool:
         and not node.name.startswith(ZERO_FILL_KERNEL_PREFIX)
     ]
     for kernel in kernels:
-        waits = [i for i, statement in enumerate(kernel.body) if _is_wait(statement)]
+        waits = [
+            i
+            for i, statement in enumerate(kernel.body)
+            if _is_wait(statement)
+            or _is_capture_wait(statement, capture_waits.get(kernel.name))
+        ]
         if not waits:
             continue
         index = waits[0]
@@ -262,6 +297,26 @@ def generic_release_rendered(source: str) -> bool:
         ):
             return True
     return False
+
+
+def _is_capture_wait(statement: ast.stmt, mode: str | None) -> bool:
+    """Recognize only the audited wrapper's EARLY branch, not arbitrary waits."""
+    return (
+        mode is not None
+        and isinstance(statement, ast.If)
+        and not statement.orelse
+        and len(statement.body) == 1
+        and _is_wait(statement.body[0])
+        and isinstance(statement.test, ast.Compare)
+        and isinstance(statement.test.left, ast.Name)
+        and statement.test.left.id == mode
+        and len(statement.test.ops) == 1
+        and isinstance(statement.test.ops[0], ast.Eq)
+        and len(statement.test.comparators) == 1
+        and isinstance(statement.test.comparators[0], ast.Constant)
+        and type(statement.test.comparators[0].value) is int
+        and statement.test.comparators[0].value == 0
+    )
 
 
 def spread_rendered(source: str) -> bool:

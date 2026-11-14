@@ -76,7 +76,7 @@ class _Context:
 
 @dataclass
 class _Proof:
-    threads: tuple[int, int, int]
+    threads: tuple[int, int, int] | None
     grid: tuple[int, int, int] | None = None
     symbols: dict[object, int] = field(default_factory=dict)
     intervals: dict[int, tuple[int, int]] = field(default_factory=dict)
@@ -102,6 +102,8 @@ class _Proof:
             return context.values.get(node.id)
         axis = _axis_index(node, "thread_idx")
         if axis is not None:
+            if self.threads is None:
+                return None
             high = self.threads[axis] - 1
             return _Value(0, high, self.symbol(("thread", axis), 0, high))
         axis = _axis_index(node, "block_idx")

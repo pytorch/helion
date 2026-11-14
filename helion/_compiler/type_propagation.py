@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 from typing import NoReturn
 from typing import Protocol
 
+import sympy
 import torch
 from torch._dispatch.python import enable_python_dispatcher
 from torch._dynamo.convert_frame import compile_lock
@@ -26,6 +27,9 @@ from .ast_extension import create
 from .compile_environment import CompileEnvironment
 from .compile_environment import _constrain_unify
 from .compile_environment import warning
+from .fragment_comparison import guard_fragment_comparison
+from .fragment_comparison import guard_fragment_sequence_equality
+from .fragment_membership import guard_fragment_membership
 from .output_header import library_imports
 from .source_location import current_location
 from .tensor_utils import patch_tensor_factories
@@ -43,17 +47,29 @@ from .type_info import SliceType
 from .type_info import StackTensorType
 from .type_info import StringType
 from .type_info import SymBoolType
+from .type_info import SymFloatType
 from .type_info import SymIntType
 from .type_info import TensorType
 from .type_info import TileIndexType
 from .type_info import TypeInfo
 from .type_info import _eval_binary
 from .type_info import _eval_compare
+from .type_info import _guard_host_membership_protocol
+from .type_info import _has_untraced_host_protocol
+from .type_info import _is_discarded_host_result
+from .type_info import _is_known_host_format_value
+from .type_info import _is_size_backed_float
+from .type_info import _register_host_operator_allocation
+from .type_info import _reject_untraced_host_protocol
+from .type_info import _track_host_storage_effects
 from .variable_origin import ArgumentOrigin
 from .variable_origin import AttributeOrigin
 from .variable_origin import BuiltinOrigin
+from .variable_origin import CollectionLengthOrigin
 from .variable_origin import DeviceOrigin
+from .variable_origin import GetItemOrigin
 from .variable_origin import GlobalOrigin
+from .variable_origin import NameOrigin
 from .variable_origin import Origin
 from .variable_origin import SourceOrigin
 
@@ -332,7 +348,20 @@ class TypePropagation(ast.NodeVisitor):
             f"{type(op).__name__} not supported on {left!s} and {right!s}"
         )
 
+    def _compare_values(self, op: ast.cmpop, left: object, right: object) -> object:
+        if isinstance(op, (ast.Is, ast.IsNot)):
+            return _eval_compare(op, left, right)
+        with _track_host_storage_effects((left, right), self.origin()):
+            result = _eval_compare(op, left, right)
+        if self.origin().is_host():
+            _register_host_operator_allocation((left, right), result)
+        return result
+
     def _compare(self, op: ast.cmpop, left: TypeInfo, right: TypeInfo) -> TypeInfo:
+        if isinstance(op, CMP_IN):
+            guard_fragment_membership(left, right)
+            if self.origin().is_host():
+                _guard_host_membership_protocol(left, right)
         # Handle `tensor is None` and `tensor is not None` checks
         # When comparing a TensorType with LiteralType(None), we can determine the result
         if isinstance(op, (ast.Is, ast.IsNot)):
@@ -349,19 +378,27 @@ class TypePropagation(ast.NodeVisitor):
                 result = isinstance(op, ast.Is)
                 return LiteralType(origin=self.origin(), value=result)
         if isinstance(left, LiteralType) and isinstance(right, LiteralType):
+            result = self._compare_values(op, left.value, right.value)
+            guard_fragment_comparison(op, left, right, result)
             return LiteralType(
                 origin=self.origin(),
-                value=_eval_compare(op, left.value, right.value),
+                value=result,
             )
         if (
             isinstance(left, LiteralType)
             and isinstance(right, CollectionType)
             and isinstance(op, CMP_IN)
         ):
-            return LiteralType(
-                origin=self.origin(),
-                value=_eval_compare(op, left.value, right.element_types),
-            )
+            try:
+                values = right.membership_container()
+            except NotImplementedError:
+                # Representative or nonliteral elements do not prove absence.
+                pass
+            else:
+                return LiteralType(
+                    origin=self.origin(),
+                    value=self._compare_values(op, left.value, values),
+                )
         if isinstance(left, (NumericType, LiteralType)) and isinstance(
             right,
             (NumericType, LiteralType),
@@ -373,7 +410,7 @@ class TypePropagation(ast.NodeVisitor):
             # block-size-dependent control flow work on the host.
             if not isinstance(op, CMP_ALWAYS_BOOL):
                 try:
-                    result = _eval_compare(op, left.proxy(), right.proxy())
+                    result = self._compare_values(op, left.proxy(), right.proxy())
                 except NotImplementedError:
                     result = None
                 if isinstance(result, torch.SymBool):
@@ -389,10 +426,12 @@ class TypePropagation(ast.NodeVisitor):
                 pass
             else:
                 try:
-                    return TypeInfo.from_example(
-                        _eval_compare(op, left_example, right_example),
-                        self.origin(),
-                    )
+                    example = self._compare_values(op, left_example, right_example)
+                    if self.device_loop_depth == 0:
+                        CompileEnvironment.current().propagate_runtime_tensor_layout(
+                            (left_example, right_example), example
+                        )
+                    return TypeInfo.from_example(example, self.origin())
                 except exc.Base:
                     raise
                 except Exception as e:
@@ -402,8 +441,24 @@ class TypePropagation(ast.NodeVisitor):
             and isinstance(right, SequenceType)
             and isinstance(op, ast.Eq)
         ):
-            if len(left.element_types) != len(right.element_types):
+            guard_fragment_sequence_equality(left, right)
+            if self.origin().is_host() and any(
+                _has_untraced_host_protocol(value, nested=False)
+                for value in (left, right)
+            ):
+                _reject_untraced_host_protocol()
+            approximate = (
+                left.contains_approximate_contents()
+                or right.contains_approximate_contents()
+            )
+            if not approximate and len(left.element_types) != len(right.element_types):
                 return LiteralType(origin=self.origin(), value=False)
+            if self.origin().is_host() and any(
+                _has_untraced_host_protocol(value) for value in (left, right)
+            ):
+                _reject_untraced_host_protocol()
+            if approximate:
+                return SymBoolType.new_unbacked(self.origin())
 
             can_determine_statically = True
             all_elements_equal = True
@@ -413,7 +468,9 @@ class TypePropagation(ast.NodeVisitor):
                 if isinstance(left_elem, LiteralType) and isinstance(
                     right_elem, LiteralType
                 ):
-                    if left_elem.value != right_elem.value:
+                    if self._compare_values(
+                        ast.NotEq(), left_elem.value, right_elem.value
+                    ):
                         all_elements_equal = False
                         break
                 elif isinstance(left_elem, (NumericType, LiteralType)) and isinstance(
@@ -434,6 +491,29 @@ class TypePropagation(ast.NodeVisitor):
             f"{type(op).__name__} not supported on {left!s} and {right!s}"
         )
 
+    def _preserve_host_float(
+        self, value: TypeInfo, operands: tuple[object, ...] | None = None
+    ) -> TypeInfo:
+        if (
+            self.device_loop_depth == 0
+            and isinstance(value, SymFloatType)
+            and not isinstance(value.to_sympy(), sympy.Symbol)
+            and not _is_size_backed_float(value.value)
+        ):
+            # Preserve each host operation before a parent can algebraically
+            # cancel its dependencies. Codegen still evaluates the original
+            # Python expression in order; the fresh symbol describes its value.
+            env = CompileEnvironment.current()
+            previous = value.value
+            captured = env.resolve_fragment_global(previous)
+            value = value.new_unbacked(value.origin)
+            env.preserve_tunable_float_provenance(
+                value.value, operands if operands is not None else (previous,)
+            )
+            if captured is not None:
+                env.fragment_global_literals[id(value.value)] = (value.value, captured)
+        return value
+
     def _assign(self, lhs: ast.AST, rhs: TypeInfo) -> None:
         if isinstance(lhs, ast.Name):
             # Check if we're trying to modify a host variable inside a device loop
@@ -443,6 +523,7 @@ class TypePropagation(ast.NodeVisitor):
                 and rhs.origin.is_device()
             ):
                 raise exc.CannotModifyHostVariableOnDevice(lhs.id) from None
+            rhs = self._preserve_host_float(rhs)
             if isinstance(rhs, TileIndexType):
                 CompileEnvironment.current().block_sizes[rhs.block_id].add_debug_name(
                     lhs.id
@@ -471,7 +552,12 @@ class TypePropagation(ast.NodeVisitor):
             return self.scope.set(lhs.id, rhs)
         if isinstance(lhs, ast.Starred):
             try:
-                unpacked = SequenceType(self.origin(), rhs.unpack())
+                unpacked = SequenceType(
+                    self.origin(),
+                    rhs.unpack(),
+                    contents_exact=not isinstance(rhs, CollectionType)
+                    or rhs.contents_exact,
+                )
             except NotImplementedError:
                 raise exc.TypeInferenceError(
                     f"Failed to unpack starred assignment: {rhs!s}"
@@ -500,7 +586,12 @@ class TypePropagation(ast.NodeVisitor):
                     assert star_len >= 0, "wrong number of elements to unpack"
                     self._assign(
                         elt.value,
-                        SequenceType(self.origin(), elements[idx : idx + star_len]),
+                        SequenceType(
+                            self.origin(),
+                            elements[idx : idx + star_len],
+                            contents_exact=not isinstance(rhs, CollectionType)
+                            or rhs.contents_exact,
+                        ),
                     )
                     idx += star_len
                 else:
@@ -513,11 +604,20 @@ class TypePropagation(ast.NodeVisitor):
             lhs_base_type = self.visit(lhs.value)
             if isinstance(lhs_base_type, (TensorType, StackTensorType)):
                 self.visit(lhs)  # need to populate shape info
-            lhs_base_type = lhs_base_type.propagate_setitem(
+            updated_type = lhs_base_type.propagate_setitem(
                 self.visit(lhs.slice), rhs, self.origin()
             )
+            if (
+                isinstance(lhs.value, ast.Attribute)
+                and isinstance(lhs_base_type, (TensorType, StackTensorType))
+                and updated_type is lhs_base_type
+            ):
+                # Tensor storage changed, not the record field or its type.
+                # Keep the indexing/RHS validation above without assigning the
+                # attribute itself (which is not a supported assignment target).
+                return None
             # update the stored type for the container
-            return self._assign(lhs.value, lhs_base_type)
+            return self._assign(lhs.value, updated_type)
         raise AssertionError(f"unhandled lhs in assignment {type(lhs).__name__}")
 
     ################################################################
@@ -528,11 +628,20 @@ class TypePropagation(ast.NodeVisitor):
         return LiteralType(value=node.value, origin=self.origin())
 
     def visit_FormattedValue(self, node: ast.FormattedValue) -> TypeInfo:
-        # Visit the value expression for type checking, but ignore the result
-        self.visit(node.value)
+        value_type = self.visit(node.value)
         # Visit the format spec if present
         if node.format_spec is not None:
             self.visit(node.format_spec)
+        if self.origin().is_host() and not _is_known_host_format_value(value_type):
+            # Formatting executes only in the generated wrapper. Its hooks can
+            # change captured tensors' rank as well as storage/layout. Dropping
+            # alias proofs alone cannot make those untraced metadata changes
+            # safe. This applies equally to !s, !r and !a conversions.
+            raise exc.TypeInferenceError(
+                "Host formatting with custom protocols is unsupported because "
+                "formatting may mutate tensor storage or metadata; "
+                "pass declared fields explicitly"
+            )
         # Return StringType for unknown strings
         return StringType(origin=self.origin())
 
@@ -561,9 +670,12 @@ class TypePropagation(ast.NodeVisitor):
 
     def _list_or_tuple(self, node: ast.List | ast.Tuple) -> TypeInfo:
         elements = []
+        contents_exact = True
         for elt in node.elts:
             if isinstance(elt, ast.Starred):
                 to_unpack = self.visit(elt.value)
+                if isinstance(to_unpack, CollectionType):
+                    contents_exact &= to_unpack.contents_exact
                 try:
                     elements.extend(to_unpack.unpack())
                 except NotImplementedError:
@@ -576,6 +688,7 @@ class TypePropagation(ast.NodeVisitor):
         return SequenceType(
             self.origin(),
             cls(elements),
+            contents_exact=contents_exact,
         )
 
     # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
@@ -588,6 +701,7 @@ class TypePropagation(ast.NodeVisitor):
     def visit_Dict(self, node: ast.Dict) -> TypeInfo:
         assert len(node.keys) == len(node.values)
         element_types: dict[int | str, TypeInfo] = {}
+        contents_exact = True
         for key_node, value_node in zip(node.keys, node.values, strict=True):
             value = self.visit(value_node)
             if key_node is not None:
@@ -605,7 +719,12 @@ class TypePropagation(ast.NodeVisitor):
                         f"Only collection types are supported as dict** values, got {value!s}"
                     )
                 element_types.update(value.element_types)
-        return DictType(element_types=element_types, origin=self.origin())
+                contents_exact &= value.contents_exact
+        return DictType(
+            element_types=element_types,
+            origin=self.origin(),
+            contents_exact=contents_exact,
+        )
 
     def visit_Name(self, node: ast.Name) -> TypeInfo:
         result = self.scope.get(node.id)
@@ -638,14 +757,31 @@ class TypePropagation(ast.NodeVisitor):
     def visit_BinOp(self, node: ast.BinOp) -> TypeInfo:
         left = self.visit(node.left)
         right = self.visit(node.right)
+        if self.origin().is_host() and any(
+            _has_untraced_host_protocol(operand, nested=False)
+            for operand in (left, right)
+        ):
+            _reject_untraced_host_protocol()
+        if (
+            self.origin().is_host()
+            and isinstance(node.op, ast.Mod)
+            and (
+                isinstance(left, StringType)
+                or (isinstance(left, LiteralType) and type(left.value) in (str, bytes))
+            )
+            and not _is_known_host_format_value(right)
+        ):
+            _reject_untraced_host_protocol()
         if (
             isinstance(left, TensorType) or isinstance(right, TensorType)
         ) and self.device_loop_depth == 0:
             warning(exc.TensorOperationInWrapper)
 
         try:
-            left_example = left.proxy()
-            right_example = right.proxy()
+            # Collection arithmetic propagates representative element types;
+            # the result below retains their uncertain-content marker.
+            left_example = left.tree_map(lambda item: item.proxy())
+            right_example = right.tree_map(lambda item: item.proxy())
         except NotImplementedError:
             pass
         else:
@@ -665,10 +801,43 @@ class TypePropagation(ast.NodeVisitor):
                         self.origin(),
                     )
 
-                return TypeInfo.from_example(
-                    _eval_binary(node.op, left_example, right_example),
-                    self.origin(),
+                with _track_host_storage_effects(
+                    (left_example, right_example), self.origin()
+                ):
+                    example = _eval_binary(node.op, left_example, right_example)
+                if self.device_loop_depth == 0:
+                    env = CompileEnvironment.current()
+                    env.propagate_runtime_tensor_layout(
+                        (left_example, right_example), example
+                    )
+                    active_nodes = ExtendedAST.current()
+                    if not (
+                        len(active_nodes) > 1
+                        and isinstance(active_nodes[-2], ast.AugAssign)
+                    ):
+                        # AugAssign probes a synthetic BinOp, but Tensor +=
+                        # retains its runtime storage. Its probe allocation
+                        # cannot establish disjointness.
+                        _register_host_operator_allocation(
+                            (left_example, right_example), example
+                        )
+                result = self._preserve_host_float(
+                    TypeInfo.from_example(example, self.origin()),
+                    (left_example, right_example),
                 )
+                if isinstance(result, CollectionType) and any(
+                    isinstance(operand, CollectionType)
+                    and operand.contains_approximate_contents()
+                    for operand in (left, right)
+                ):
+                    result.mark_approximate_contents(
+                        length_projection_safe=all(
+                            operand.length_projection_safe
+                            for operand in (left, right)
+                            if isinstance(operand, CollectionType)
+                        )
+                    )
+                return result
             except exc.Base:
                 raise
             except TypeError as e:
@@ -766,10 +935,12 @@ class TypePropagation(ast.NodeVisitor):
         unhandled = []
         args = []
         kwargs = {}
+        approximate_expansion = False
         for arg in node.args:
             if isinstance(arg, ast.Starred):
                 arg_type = self.visit(arg.value)
                 if isinstance(arg_type, SequenceType):
+                    approximate_expansion |= arg_type.contains_approximate_contents()
                     args.extend(arg_type.element_types)
                 else:
                     unhandled.append(arg_type)
@@ -779,6 +950,7 @@ class TypePropagation(ast.NodeVisitor):
             if kwarg.arg is None:
                 kwarg_type = self.visit(kwarg.value)
                 if isinstance(kwarg_type, DictType):
+                    approximate_expansion |= kwarg_type.contains_approximate_contents()
                     kwargs.update(kwarg_type.element_types)
                 else:
                     unhandled.append(kwarg_type)
@@ -790,10 +962,44 @@ class TypePropagation(ast.NodeVisitor):
                 + ", ".join(map(str, unhandled))
             )
         if isinstance(func, NestedFunctionType):
-            return self._call_nested_function(func, args, kwargs)  # pyrefly: ignore [bad-argument-type]
-
-        # pyrefly: ignore [bad-argument-type, bad-return]
-        return func.propagate_call(tuple(args), kwargs, self.origin())
+            result = self._call_nested_function(func, args, kwargs)  # pyrefly: ignore [bad-argument-type]
+        else:
+            result = func.propagate_call(tuple(args), kwargs, self.origin())  # pyrefly: ignore [bad-argument-type]
+        if (
+            approximate_expansion
+            and not isinstance(result, CollectionType)
+            and not _is_discarded_host_result(self.origin())
+        ):
+            raise exc.TracedArgNotSupported(
+                "a non-collection result from representative argument expansion"
+            )
+        if approximate_expansion and isinstance(result, CollectionType):
+            # */** expansion removes the collection wrapper before the call,
+            # but its representative argument list still cannot prove contents.
+            # A nested function may return another variable's type object.
+            result = result.with_approximate_contents(length_projection_safe=False)
+            if isinstance(func, CallableType) and any(
+                func.value is builtin for builtin in (list, tuple, dict)
+            ):
+                result.length_projection_safe = True
+        if (
+            self.device_loop_depth == 0
+            and isinstance(func, CallableType)
+            and func.value is len
+            and len(node.args) == 1
+            and not kwargs
+            and isinstance(args[0], CollectionType)
+            and args[0].length_projection_safe
+            and not args[0].contents_exact
+            and isinstance(result, SymIntType)
+            and (collection_origin := self._host_collection_origin(node.args[0]))
+            is not None
+        ):
+            # A loop bound can consume len(vals) before any local assignment
+            # gives its fresh symbol a name. Read the existing host collection;
+            # never rerun its comprehension or producing helper.
+            result.populate_symbol_origins(CollectionLengthOrigin(collection_origin))
+        return result  # pyrefly: ignore [bad-return]
 
     def _call_nested_function(
         self,
@@ -858,6 +1064,28 @@ class TypePropagation(ast.NodeVisitor):
         self._assign(node.target, type_info)
         return type_info
 
+    def _host_collection_origin(self, node: ast.AST) -> Origin | None:
+        if isinstance(node, ast.Name):
+            info = self.scope.get(node.id)
+            if (
+                type(info) in (SequenceType, DictType)
+                and isinstance(info, CollectionType)
+                and info.origin.is_host()
+                and info.length_projection_safe
+            ):
+                return NameOrigin(node.id)
+        elif isinstance(node, ast.Subscript):
+            base = self._host_collection_origin(node.value)
+            assert isinstance(node.slice, ExtendedAST)
+            key = node.slice._type_info
+            if (
+                base is not None
+                and isinstance(key, LiteralType)
+                and isinstance(key.value, (int, str))
+            ):
+                return GetItemOrigin(base, key.value)
+        return None
+
     def visit_Subscript(self, node: ast.Subscript) -> TypeInfo:
         value_type = self.visit(node.value)
         # ellipsis expansion not yet supported for StackTensorType.
@@ -865,7 +1093,20 @@ class TypePropagation(ast.NodeVisitor):
             self._expand_ellipsis_in_subscript(node, value_type.fake_value.ndim)
             self._pad_trailing_dims(node, value_type.fake_value.ndim)
         slice_type = self.visit(node.slice)
-        return value_type.propagate_getitem(slice_type, self.origin())
+        result = value_type.propagate_getitem(slice_type, self.origin())
+        if (
+            self.device_loop_depth == 0
+            and isinstance(value_type, CollectionType)
+            and not value_type.contents_exact
+            and isinstance(slice_type, LiteralType)
+            and isinstance(slice_type.value, (int, str))
+            and (collection_origin := self._host_collection_origin(node.value))
+            is not None
+        ):
+            result.populate_symbol_origins(
+                GetItemOrigin(collection_origin, slice_type.value)
+            )
+        return result
 
     def _expand_ellipsis_in_subscript(self, node: ast.Subscript, ndim: int) -> None:
         """Expand ellipsis to full-dim slices, idempotent."""
@@ -1216,11 +1457,21 @@ class TypePropagation(ast.NodeVisitor):
             if generator.ifs and result_elements:
                 result_elements = [result_elements[0]]
 
-            return SequenceType(self.origin(), result_elements)
+            return SequenceType(
+                self.origin(),
+                result_elements,
+                contents_exact=not generator.ifs
+                and (
+                    not isinstance(iter_type, CollectionType)
+                    or iter_type.contents_exact
+                ),
+            )
 
         except NotImplementedError:
             # Fallback to generic list type
-            return SequenceType(self.origin(), [element_result_type])
+            return SequenceType(
+                self.origin(), [element_result_type], contents_exact=False
+            )
 
     def _visit_comprehension(
         self, node: ast.ListComp | ast.GeneratorExp, name: str
@@ -1236,7 +1487,10 @@ class TypePropagation(ast.NodeVisitor):
         return self._visit_comprehension(node, "list comprehension")
 
     def visit_GeneratorExp(self, node: ast.GeneratorExp) -> TypeInfo:
-        return self._visit_comprehension(node, "generator expression")
+        result = self._visit_comprehension(node, "generator expression")
+        assert isinstance(result, CollectionType)
+        result.length_projection_safe = False
+        return result
 
     def visit_DictComp(self, node: ast.DictComp) -> TypeInfo:
         """Type propagation for dict comprehensions."""
@@ -1287,11 +1541,34 @@ class TypePropagation(ast.NodeVisitor):
                     raise exc.StatementNotSupported(
                         f"Dict comprehension keys must be str or int, got {type(key).__name__}"
                     )
-                result_elements[key] = value_type
+                previous = result_elements.get(key)
+                if (
+                    generator.ifs
+                    or isinstance(iter_type, CollectionType)
+                    and not iter_type.contents_exact
+                ) and (
+                    isinstance(previous, TensorType)
+                    and isinstance(value_type, TensorType)
+                    or isinstance(previous, (LiteralType, NumericType))
+                    and isinstance(value_type, (LiteralType, NumericType))
+                    and previous.python_type is value_type.python_type
+                    and previous.python_type in (int, float, bool)
+                ):
+                    # A skipped assignment can leave an earlier value. Join
+                    # every possible scalar/tensor instead of baking the last
+                    # representative tensor into a later device argument.
+                    result_elements[key] = previous.merge(value_type)
+                else:
+                    result_elements[key] = value_type
             finally:
                 self.pop_scope()
 
-        return DictType(self.origin(), result_elements)
+        return DictType(
+            self.origin(),
+            result_elements,
+            contents_exact=not generator.ifs
+            and (not isinstance(iter_type, CollectionType) or iter_type.contents_exact),
+        )
 
     # TODO(jansel): need to implement these
     # pyrefly: ignore [bad-assignment, bad-param-name-override, bad-override-mutable-attribute]
@@ -1446,15 +1723,17 @@ def _place_pdl_ops(body: list[ast.stmt]) -> None:
         assert isinstance(op, PdlResultType) and isinstance(op.value, str)
         if seen_loop and op.value in ("wait", "code_warm"):
             raise exc.PdlPlacement
-        capability = env.ptx_capability
         if op.value == "code_warm":
             # The cubin pass resolves sm_90+ relocations (``.rela.nv.global.init``;
             # older targets emit ``.rel``): elsewhere the kernel is not marked.
+            capability = env.ptx_capability
             env.code_warm = capability is not None and capability >= (9, 0)
             continue
         # griddepcontrol needs sm_90; older targets run in plain stream order.
+        capability = env.backend.pdl_capability(env)
         if capability is not None and capability >= (9, 0):
             (env.pdl_exit if seen_loop else env.pdl_entry).append(op.value)
+            env.config_spec.has_explicit_pdl = True
 
 
 def propagate_types(func: HostFunction) -> None:

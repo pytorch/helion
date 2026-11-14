@@ -14,7 +14,6 @@ import pytest
 import torch
 
 from test.cute_population_contracts import tcgen05_mma_support
-from test.test_cute_tcgen05_ordinary_exploration import _ordinary_gemm
 
 import helion
 from helion._compiler.cute.tcgen05_config import surface
@@ -22,6 +21,8 @@ from helion._compiler.cute.tcgen05_lifecycle import Tcgen05LifecycleContext
 from helion._testing import DEVICE
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
+from helion._testing.cute_mma_dag import CPU_DEVICE
+from helion._testing.cute_mma_dag import bind_cpu_gemm as _bind_gemm
 import helion.language as hl
 
 # The B200 model with tcgen05 MMA support, CUDA hidden, the inputs traced
@@ -36,7 +37,6 @@ pytestmark = [
     ),
 ]
 
-CPU_DEVICE = "cpu"
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -118,15 +118,6 @@ def _bias_gemm(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor) -> torch.Te
             acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
         out[tile_m, tile_n] = (acc + bias[tile_m, tile_n]).to(out.dtype)
     return out
-
-
-def _bind_gemm(shape: tuple[int, int, int], dtype: torch.dtype) -> BoundKernel:
-    m, n, k = shape
-    args = (
-        torch.empty((m, k), dtype=dtype, device=CPU_DEVICE),
-        torch.empty((k, n), dtype=dtype, device=CPU_DEVICE),
-    )
-    return helion.kernel(_ordinary_gemm, backend="cute", static_shapes=True).bind(args)
 
 
 def _bind_bmm(shape: tuple[int, int, int, int], dtype: torch.dtype) -> BoundKernel:
@@ -695,8 +686,9 @@ def test_two_cta_cluster_keeps_the_cluster_init_protocol() -> None:
     assert relinquish < kernel.index("tcgen05_tmem_allocator.wait_for_alloc()")
     # This CPU-mocked bind is a multi-tile persistent kernel (the SM count
     # mock keeps it off the one-shot path), so the TMA-load role stays after
-    # the prefix wait and the teardown frees TMEM after the store drain; the
-    # one-shot hoist / epilogue free are covered on a real device by
+    # the prefix wait and the teardown frees TMEM before the store drain (the
+    # two-CTA order: free, then drain); the one-shot hoist / epilogue
+    # free are covered on a real device by
     # ``test_matmul_mma_tcgen05_two_cta_one_shot_prologue_teardown``.
     assert "advance_to_next_work()" in kernel
     assert (
@@ -718,8 +710,8 @@ def test_two_cta_cluster_keeps_the_cluster_init_protocol() -> None:
     assert kernel.index("cutlass.pipeline.pipeline_init_wait(") < kernel.index(
         "cute.arch.griddepcontrol_wait()"
     )
-    assert kernel.index("tcgen05_c_pipeline.producer_tail()") < kernel.index(
-        "tcgen05_tmem_allocator.free("
+    assert kernel.index("tcgen05_tmem_allocator.free(") < kernel.index(
+        "tcgen05_c_pipeline.producer_tail()"
     )
 
 
@@ -799,21 +791,18 @@ def test_lifecycle_epilogue_free_leaves_only_the_tails_in_the_teardown() -> None
 
 def test_lifecycle_mma_warp_free_drains_the_stores_once() -> None:
     # The two-CTA row-union teardown (MMA warp frees TMEM) issues the store
-    # drain exactly once: after the dealloc when ``drain_after_dealloc`` is
-    # set, else at the top as every other teardown does.
-    for drain_after_dealloc in (False, True):
-        lines = _lifecycle(
-            is_two_cta=True,
-            tmem_permit_released_early=True,
-            mma_warp_frees_tmem=True,
-            exec_acc_tmem_ptr="exec_ptr",
-            drain_after_dealloc=drain_after_dealloc,
-        ).render_store_post_loop_lines(tma_store_pipeline_tail="drain()")
-        assert lines.count("drain()") == 1
-        free = next(
-            i for i, line in enumerate(lines) if "tmem_alloc.free(exec_ptr)" in line
-        )
-        assert (lines.index("drain()") > free) is drain_after_dealloc
+    # drain exactly once, after the dealloc like every two-CTA teardown.
+    lines = _lifecycle(
+        is_two_cta=True,
+        tmem_permit_released_early=True,
+        mma_warp_frees_tmem=True,
+        exec_acc_tmem_ptr="exec_ptr",
+    ).render_store_post_loop_lines(tma_store_pipeline_tail="drain()")
+    assert lines.count("drain()") == 1
+    free = next(
+        i for i, line in enumerate(lines) if "tmem_alloc.free(exec_ptr)" in line
+    )
+    assert lines.index("drain()") > free
 
 
 def test_lifecycle_default_teardown_is_unchanged() -> None:

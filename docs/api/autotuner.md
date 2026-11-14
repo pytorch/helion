@@ -4,6 +4,23 @@ The `helion.autotuner` module provides automatic optimization of kernel configur
 
 Autotuning effort can be adjusted via :attr:`helion.Settings.autotune_effort`, which configures how much each algorithm explores (``"none"`` disables autotuning, ``"quick"`` runs a smaller search, ``"full"`` uses the full search budget). Users may still override individual autotuning parameters if they need finer control.
 
+Before final selection, full-effort CuTe population searches jointly try compiler
+pipeline and supported schedule choices on up to four distinct layouts found by
+the search. Paired attention includes early TMEM retirement when the layout
+supports it, along with the value-ring lag. Refinement adds at most 64 new trials:
+up to 16 joint choices for each of four retained layouts. It reuses matching
+measured results and preserves all other config values. It tries changes to one option
+before joint changes, alternating layouts so a short budget reaches multiple
+parents. Joint products larger than 16 values use only single-option changes.
+These trials compile and run sequentially within the remaining search budget;
+the time reserved for final selection stays reserved. Their results enter the
+same final comparison as the main search's candidates.
+
+This refinement is skipped when final selection or autotuner heuristics are
+disabled, and for custom benchmark functions, multiple-shape searches, and
+distributed searches. Explicit config overrides and restricted search domains
+remain in effect. Other backends retain their existing search behavior.
+
 Set `HELION_BENCHMARK_CUDAGRAPH=1` before starting autotuning to use Helion's
 CUDA graph benchmark mode.
 

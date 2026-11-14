@@ -14,6 +14,11 @@ from .pipeline_smem import Tcgen05PipelineSmemFacts
 from .pipeline_smem import deepest_fitting_ab_stages
 from .pipeline_smem import pipeline_smem_bytes
 from .strategies import TCGEN05_LAYOUT_OVERRIDES_KEYS
+from .tcgen05_constants import TCGEN05_EPI_SUBTILE_N_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_NS
+from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_N
+from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 
 if TYPE_CHECKING:
@@ -28,6 +33,25 @@ ALIGNED_N_CHOICES = tuple(n for n in range(64, 257, 16) if n & (n - 1))
 
 def carrier_n(physical_n: int) -> int:
     return 1 << (physical_n - 1).bit_length()
+
+
+def dense_aligned_n_block_m(input_dtype: torch.dtype) -> int | None:
+    """Pair M of the family: the paired M128 FP8 instruction (64 rows per
+    CTA), or the paired M256 instruction for 16-bit inputs (128 rows per CTA)."""
+    if input_dtype == torch.float8_e4m3fn:
+        return 128
+    if dense_aligned_n_sixteen_bit(input_dtype):
+        return TCGEN05_TWO_CTA_BLOCK_M
+    return None
+
+
+def dense_aligned_n_sixteen_bit(input_dtype: torch.dtype) -> bool:
+    """Whether the family runs the 16-bit paired M256 instruction."""
+    return input_dtype in (torch.bfloat16, torch.float16)
+
+
+# The 16-bit pair's short-K families run the deep 64-wide ring.
+DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K = 64
 
 
 def dense_aligned_n_defaults(
@@ -62,15 +86,16 @@ def dense_aligned_n_plan(
     *,
     bounds: tuple[tuple[int, int], tuple[int, int], tuple[int, int]],
 ) -> DenseAlignedNPlan | None:
-    """Reuse the strict ordinary native/fresh multiplicative-epilogue facts.
+    """Reuse the strict ordinary native multiplicative-epilogue facts.
 
     DenseGemmFacts describes the native graph in the frontend's coordinates;
     this family leaves every auxiliary expression and coordinate view unchanged.
     """
     width = config.get(TILE_N_KEY, 0)
+    block_m = None if facts is None else dense_aligned_n_block_m(facts.input_dtype)
     if (
         facts is None
-        or facts.input_dtype != torch.float8_e4m3fn
+        or block_m is None
         or facts.capacity_bytes <= 0
         or type(width) is not int
         or width not in ALIGNED_N_CHOICES
@@ -78,14 +103,18 @@ def dense_aligned_n_plan(
     ):
         return None
     bm, _bn, bk = tile
-    public = (128, carrier_n(width), bk)
-    physical = (128, width, bk)
+    public = (block_m, carrier_n(width), bk)
+    physical = (block_m, width, bk)
     m, n, k = facts.shape
     c_stages = config.get("tcgen05_c_stages", 2)
     acc_stages = config.get("tcgen05_acc_stages", 2)
     store_mode = config.get("tcgen05_c_store_mode", "normal")
+    sixteen_bit = dense_aligned_n_sixteen_bit(facts.input_dtype)
     if (
-        bm != 128
+        bm != block_m
+        # The 16-bit pair stores through the row-major epilogue only, and
+        # each CTA's half of a K-major B tile must be whole 16-row atoms.
+        or (sixteen_bit and (facts.output_column_major or width % 32))
         or bk not in (64, 128)
         or tile not in (public, physical)
         or any(
@@ -93,7 +122,9 @@ def dense_aligned_n_plan(
             for candidate in (public, physical)
             for value, (low, high) in zip(candidate, bounds, strict=True)
         )
-        or m % bm
+        # The 16-bit pair clips a partial last M tile in its TMA store; the
+        # M-edge schedule needs whole K tiles.
+        or (m % bm and not (sixteen_bit and k % bk == 0))
         or n % width
         or k < bk
         or (k + bk - 1) // bk > TCGEN05_TWO_CTA_MAX_K_TILES
@@ -104,32 +135,78 @@ def dense_aligned_n_plan(
         or store_mode not in ("normal", "direct")
         or config.get("pid_type")
         not in ("persistent_blocked", "persistent_interleaved")
-        or any(
-            config.get(key, value) != value
-            for key, value in dense_aligned_n_defaults(
-                acc_stages=acc_stages, store_mode=cast("str", store_mode)
-            ).items()
-        )
         or any(config.get(key) is not None for key in TCGEN05_LAYOUT_OVERRIDES_KEYS)
         or config.get("tcgen05_grouped_mode") is not None
         or config.get("cute_split_k_workspace")
     ):
         return None
-    # The physical tile is the paired M128 FP8 instruction with a 64-row,
-    # N-permuted per-CTA BF16 D ring; its allocations are exactly those of
-    # the native paired pipeline at this width.
+    # Values the family pins; the 16-bit pair keeps the persistent raster's L2
+    # grouping and may pair N tiles (A multicast) where they split evenly.
+    pinned = dense_aligned_n_defaults(
+        acc_stages=acc_stages, store_mode=cast("str", store_mode)
+    )
+    if sixteen_bit:
+        pinned.pop("l2_groupings")
+        if config.get("tcgen05_cluster_n") == 2 and (n // width) % 2 == 0:
+            pinned.pop("tcgen05_cluster_n")
+    if any(config.get(key, value) != value for key, value in pinned.items()):
+        return None
+    # The physical tile is a paired instruction: M128 FP8 with a 64-row,
+    # N-permuted per-CTA BF16 D ring, or 16-bit M256 with 128 rows per CTA.
+    # Its allocations are exactly those of the native paired pipeline at this
+    # width, with the configured epilogue subtile and warp groups; a plain
+    # 16-bit store on whole N and K tiles (a partial last M tile is clipped by
+    # the TMA store) at a width ``cute_mma``'s plain narrow rule covers takes
+    # the plan's (128, 32) subtile, any other C stage the model's own
+    # with-source tile.
     allocations = Tcgen05PipelineSmemFacts(
-        1, 2, facts.capacity_bytes, output_column_major=facts.output_column_major
+        facts.input_dtype.itemsize,
+        2,
+        facts.capacity_bytes,
+        output_column_major=facts.output_column_major,
+    )
+    epi_warp_groups = config.get(TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY, 1)
+    configured_subtile_n = config.get(TCGEN05_EPI_SUBTILE_N_CONFIG_KEY)
+    if type(epi_warp_groups) is not int or epi_warp_groups < 1:
+        return None
+    # The 16-bit pair's configured subtile partitions the physical width, not
+    # the carrier (the FP8 M128 epilogue ignores the knob); a non-positive one
+    # is left to the epilogue validation.
+    if (
+        not sixteen_bit
+        or type(configured_subtile_n) is not int
+        or configured_subtile_n <= 0
+    ):
+        configured_subtile_n = None
+    elif width % configured_subtile_n:
+        return None
+    # Mirrors ``cute_mma``'s ``tcgen05_plain_narrow_subtile`` decision (and
+    # ``_paired_pipeline_store_subtile_n`` for power-of-two pairs): pricing a
+    # (128, 32) ring that codegen then renders at (128, 64) would overflow
+    # the seven-stage ring (``test_cute_dense_aligned_n`` renders the
+    # 192-wide plain pair, whole and over an M tail, at the priced subtile).
+    store_subtile_n = (
+        configured_subtile_n
+        if configured_subtile_n is not None
+        else TCGEN05_PLAIN_NARROW_SUBTILE_N
+        if sixteen_bit
+        and width in TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_NS
+        and facts.plain_epilogue
+        and store_mode == "normal"
+        and k % bk == 0
+        else None
     )
     maximum = deepest_fitting_ab_stages(
         lambda stages: pipeline_smem_bytes(
             allocations,
-            bm=128,
+            bm=block_m,
             bn=width,
             bk=bk,
             ab_stages=stages,
             c_stages=c_stages,
             acc_stages=acc_stages,
+            epi_warp_groups=epi_warp_groups,
+            epi_subtile_n=store_subtile_n,
         ),
         facts.capacity_bytes,
         max_stages=min(TCGEN05_SMEM_AWARE_MAX_AB_STAGES, (k + bk - 1) // bk),

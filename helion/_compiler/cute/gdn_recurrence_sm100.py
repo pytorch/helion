@@ -1391,7 +1391,7 @@ def host_gdn_recurrence(
         stride_order=TMA_STRIDE_ORDER,
         swizzle=cuda.TensorMapSwizzle.none,
     )
-    gdn_recurrence_kernel(
+    launcher = gdn_recurrence_kernel(
         tma_desc_w,
         tma_desc_k,
         tma_desc_u,
@@ -1413,12 +1413,12 @@ def host_gdn_recurrence(
         ACC_COL,
         UPDATE_IMAGE_COL,
         TMEM_COLS,
-    ).launch(
+    )
+    launcher.launch(
         grid=((dstate + BLOCK_V - 1) // BLOCK_V, heads, batch),
         block=(THREADS_PER_WARP * gdn_cta_warps(BLOCK_V, EPI_WARPS, MMA_M), 1, 1),
         stream=stream,
         min_blocks_per_mp=1,
-        preferred_smem_carveout=100,
     )
 
 

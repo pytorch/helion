@@ -19,7 +19,7 @@ from ...compile_environment import CompileEnvironment
 from ...compile_environment import RuntimeInputSpecialization
 from ...device_ir import RootGraphInfo
 from ...host_function import HostFunction
-from ...runtime_tensor_guards import runtime_tensors_are_proven_disjoint
+from ...runtime_tensor_guards import tensors_have_proven_disjoint_storage
 from ...variable_origin import GridOrigin
 from .. import target_facts
 from ..fragment_storage import aligned_shared_bytes
@@ -821,13 +821,8 @@ def match_radix_selection_root(
             right = cast("torch.Tensor", _host_tensor(right_node))
             if left.untyped_storage() == right.untyped_storage():
                 return None
-            if (
-                left.untyped_storage() not in env._symbolically_exact_layout_storages
-                and right.untyped_storage()
-                not in env._symbolically_exact_layout_storages
-                and not runtime_tensors_are_proven_disjoint(
-                    env, left, right, allow_unbound=allow_unbound
-                )
+            if not tensors_have_proven_disjoint_storage(
+                env, left, right, allow_unbound=allow_unbound
             ):
                 return None
     return graph

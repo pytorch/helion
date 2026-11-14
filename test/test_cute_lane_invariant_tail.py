@@ -659,7 +659,12 @@ def test_generated_pure_inline_asm_runs_once_between_lane_passes() -> None:
 def test_generated_impure_inline_asm_rejects_the_lane_split() -> None:
     with mock_cuda_unavailable():
         bound = cpu_bind(_reduction_inline_asm, (*_ARGS, False))
-        with pytest.raises(exc.BackendUnsupported, match="between per-lane statements"):
+        # This opaque effect consumes the reduction result; the proved snapshot
+        # schedule admits only a producer before the reduction.
+        with pytest.raises(
+            exc.BackendUnsupported,
+            match="impure inline assembly has no proved snapshot/order schedule",
+        ):
             bound.to_code(helion.Config.from_dict(_CONFIG_FEW_THREADS))
 
 

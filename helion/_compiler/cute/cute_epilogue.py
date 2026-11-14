@@ -1788,14 +1788,14 @@ def _classify_comparison(
 def _carrier_tile_shape(node: torch.fx.Node) -> tuple[object, ...] | None:
     """Extract the carrier's tile shape from ``meta['val'].shape``.
 
-    Returns ``None`` when the meta is missing. The classifier uses
-    this shape to decide whether an auxiliary-tensor load matches
-    the carrier's rank/extents — only exact-shape aux loads are
-    accepted; broadcast / rank mismatches drop to the loud-failure
+    Returns ``None`` for missing or non-tensor metadata, including scalar
+    SSA values. The classifier uses this shape to decide whether an
+    auxiliary-tensor load matches the carrier's rank/extents — only exact-shape
+    aux loads are accepted; broadcast / rank mismatches drop to the loud-failure
     backstop.
     """
     val = node.meta.get("val")
-    if val is None:
+    if not isinstance(val, torch.Tensor):
         return None
     return tuple(val.shape)
 

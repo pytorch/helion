@@ -21,6 +21,8 @@ from typing import cast
 
 import torch
 
+from ...autotuner import config_fragment
+from ...autotuner.config_fragment import ConfigSpecFragment
 from ...autotuner.config_spec import L2GroupingSpec
 from ...autotuner.config_spec import LoopOrderSpec
 from ...language import _tracing_ops
@@ -43,9 +45,12 @@ from ..indexing_strategy import subscript_tile_info
 from ..inductor_lowering import codegen_call_with_graph
 from ..tile_dependency import TaskAxis
 from ..type_info import CallableType
+from ..type_info import ConfigFragmentType
 from ..type_info import GridIndexType
 from ..type_info import IterType
+from ..type_info import LiteralType
 from ..type_info import SequenceType
+from ..type_info import SymIntType
 from ..type_info import TensorAttributeType
 from ..type_info import TensorType
 from ..type_info import TileIndexType
@@ -220,17 +225,40 @@ def integer_metadata_callables() -> tuple[object, ...]:
     )
 
 
+_PURE_FRAGMENT_CONSTRUCTORS = tuple(
+    value
+    for value in vars(config_fragment).values()
+    if isinstance(value, type)
+    and issubclass(value, ConfigSpecFragment)
+    and value.__module__ == config_fragment.__name__
+)
+
+
+def _integer_metadata_sequence(info: TypeInfo | None) -> bool:
+    """Exact built-in sequences cannot hide overloaded iteration or values."""
+    return (
+        isinstance(info, SequenceType)
+        and info.python_type in (tuple, list)
+        and info.contents_exact
+        and all(
+            isinstance(item, SymIntType)
+            or isinstance(item, LiteralType)
+            and type(item.value) in (int, str)
+            or _integer_metadata_sequence(item)
+            for item in info.element_types
+        )
+    )
+
+
 def _integer_metadata_call(call: ast.Call, callee: CallableType) -> bool:
-    from ...autotuner.config_fragment import ConfigSpecFragment
-    from ..type_info import ConfigFragmentType
-    from ..type_info import LiteralType
-    from ..type_info import SymIntType
 
     function = callee.value
+    fragment_constructor = any(
+        function is constructor for constructor in _PURE_FRAGMENT_CONSTRUCTORS
+    )
     if not (
         any(function is candidate for candidate in integer_metadata_callables())
-        or isinstance(function, type)
-        and issubclass(function, ConfigSpecFragment)
+        or fragment_constructor
     ):
         return False
     return (
@@ -242,6 +270,8 @@ def _integer_metadata_call(call: ast.Call, callee: CallableType) -> bool:
                 isinstance(arg._type_info, (SymIntType, ConfigFragmentType))
                 or isinstance(arg._type_info, LiteralType)
                 and type(arg._type_info.value) in (int, str)
+                or fragment_constructor
+                and _integer_metadata_sequence(arg._type_info)
             )
             for arg in call.args
         )

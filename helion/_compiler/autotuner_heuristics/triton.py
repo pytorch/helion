@@ -4848,9 +4848,7 @@ class TritonReductionHeuristic(AutotunerHeuristic):
                 descriptors_by_block.setdefault(descriptor.block_id, []).append(
                     descriptor
                 )
-        rolled_ids = {
-            reduction_loop.block_ids[0] for reduction_loop in spec.reduction_loops
-        }
+        rolled_ids = spec.rollable_reduction_block_ids()
         raw_reduction_extents = {
             block_id: max(descriptor.size_hint for descriptor in descriptors)
             for block_id, descriptors in descriptors_by_block.items()
@@ -5206,26 +5204,21 @@ class TritonReductionHeuristic(AutotunerHeuristic):
         if _is_standard_reduction(pd):
             # Compiler-rolled reductions have no block_sizes slot. Full width is encoded as
             # ``None``; a materialized full reduction has no reduction_loops knob at all.
-            if pd.block_id not in spec.reduction_loops.valid_block_ids():
-                reduction_loops: list[int | None] = []
-            elif len(spec.reduction_loops) <= 1:
-                reduction_loops = [
-                    None
-                    if alloc.primary_r_block >= pd.size_hint
-                    else alloc.primary_r_block
-                ]
-            else:
-                reduction_loops = []
-                for rl_spec in spec.reduction_loops:
-                    block_id = rl_spec.block_ids[0]
-                    width = (
-                        alloc.primary_r_block
-                        if block_id == pd.block_id
-                        else alloc.rolled_loop_sizes[block_id]
-                    )
-                    reduction_loops.append(
-                        None if width >= rl_spec.size_hint else width
-                    )
+            rollable_ids = spec.rollable_reduction_block_ids()
+            reduction_loops: list[int | None] = []
+            for rl_spec in spec.reduction_loops:
+                block_id = rl_spec.block_id
+                if block_id not in rollable_ids:
+                    # Preserve the saved-config slot without proposing a chunk
+                    # that normalization would repair with a warning.
+                    reduction_loops.append(None)
+                    continue
+                width = (
+                    alloc.primary_r_block
+                    if block_id == pd.block_id
+                    else alloc.rolled_loop_sizes[block_id]
+                )
+                reduction_loops.append(None if width >= rl_spec.size_hint else width)
             seed["reduction_loops"] = reduction_loops
             if pd.row_reread and cls._has_floor_batched_nonresident_grid(env):
                 evict = cls._reread_eviction_policies(env, pd.reread_eviction_index)

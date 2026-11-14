@@ -16,6 +16,7 @@ from typing import cast
 import unittest
 from unittest.mock import patch
 
+import pytest
 import sympy
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -243,6 +244,7 @@ from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipUnlessTcgen05RuntimeNPtx
+from helion._testing.cute_repeated_axes import full_slice_tiled_dot
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 import helion.language as hl
@@ -14007,6 +14009,7 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("argreduce_valid_smem", emitted)
         self.assertIn("_cute_argreduce_index", emitted)
 
+    @pytest.mark.cpu_only
     def test_triton_argreduce_supports_dim_none_keepdim(self) -> None:
         graph = Graph()
         inp = graph.placeholder("inp")
@@ -14028,7 +14031,11 @@ class TestCuteLowerings(unittest.TestCase):
         emitted = ast.unparse(result)
         self.assertIn("tl.reshape(x, [16])", emitted)
         self.assertIn("axis=0", emitted)
-        self.assertIn("tl.full([1, 1]", emitted)
+        self.assertEqual(
+            emitted,
+            "helion_triton_helpers.integer_full([1, 1], "
+            "tl.argmax(tl.reshape(x, [16]), axis=0).to(tl.int64), tl.int64)",
+        )
 
     def test_triton_argreduce_preserves_keepdim(self) -> None:
         graph = Graph()
@@ -23446,35 +23453,26 @@ class TestCuteRepeatedBlockIdGuard(unittest.TestCase):
     path numerically against the full tensor, including off-diagonal values.
     """
 
-    def test_two_full_slice_dot_cc_tile_is_rejected(self) -> None:
-        @helion.kernel(
-            backend="cute",
-            config=helion.Config(block_sizes=[1, 16]),
-            static_shapes=True,
+    def test_two_full_slice_dot_cc_tile_values(self) -> None:
+        # Both full slices share a logical block id; every off-diagonal output
+        # must remain present with and without a pointwise epilogue.
+        q = (torch.arange(4 * 64 * 32, device=DEVICE).reshape(4, 64, 32) % 7).to(
+            torch.bfloat16
         )
-        def attn_cc(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-            B = q.size(0)
-            C = hl.specialize(q.size(1))
-            D = q.size(2)
-            out = torch.empty([B, C, C], dtype=torch.float32, device=q.device)
-            for tile_b in hl.tile(B):
-                # Both ':' slices have size C and dedup onto one reduction
-                # block, so attn is [tile_b, C, C] with that block on both axes.
-                attn = hl.zeros([tile_b, C, C], dtype=torch.float32)
-                for tile_d in hl.tile(D):
-                    qt = q[tile_b, :, tile_d]
-                    kt = k[tile_b, :, tile_d]
-                    attn = hl.dot(qt, kt.transpose(-2, -1), acc=attn)
-                out[tile_b, :, :] = attn
-            return out
+        k = (torch.arange(q.numel(), device=DEVICE).reshape(q.shape) % 5).to(
+            torch.bfloat16
+        )
+        expected = q.float() @ k.float().transpose(-2, -1)
+        for epilogue in (False, True):
+            with self.subTest(epilogue=epilogue):
+                bound = full_slice_tiled_dot.bind((q, k, epilogue))
+                config = helion.Config(block_sizes=[1, 16])
+                actual = bound.compile_config(config)(q, k, epilogue)
+                torch.testing.assert_close(
+                    actual, expected * (0.5 if epilogue else 1.0), rtol=0, atol=0
+                )
 
-        q = torch.randn(4, 64, 32, device=DEVICE, dtype=torch.bfloat16)
-        k = torch.randn(4, 64, 32, device=DEVICE, dtype=torch.bfloat16)
-        # Reference once supported: q.float() @ k.float().transpose(-2, -1)
-        with self.assertRaisesRegex(exc.BackendUnsupported, "two axes"):
-            attn_cc(q, k)
-
-    def test_arange_outer_compare_mask_is_rejected(self) -> None:
+    def test_arange_outer_compare_mask_selects_complete_coordinates(self) -> None:
         @helion.kernel(
             backend="cute",
             config=helion.Config(block_sizes=[1]),
@@ -23506,11 +23504,12 @@ class TestCuteRepeatedBlockIdGuard(unittest.TestCase):
         expected = torch.ones(64, 64, device=DEVICE).tril().expand(4, -1, -1)
         torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
-    def test_dot_with_k_equal_m_block_is_rejected(self) -> None:
+    def test_dot_with_k_equal_m_block_selects_complete_coordinates(self) -> None:
         """``T = t[tile_bhn, :, :]`` with M == K dedups both full slices onto
         one C block; the outer-loop load is consumed by the inner ``_for_loop``
-        rather than by ``hl.dot`` itself, so ``check_repeated_block_ids``
-        rejects the load.  The same kernel with M != K is the positive control.
+        rather than by ``hl.dot`` itself. It needs complete fragment coordinates;
+        the scalar guard still rejects it if that owner is disabled. M != K
+        retains the scalar path.
         """
 
         @helion.kernel(

@@ -403,18 +403,21 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_widened_default_stays_on_tcgen05_path(self) -> None:
+        # only the default and its source are read
         args = (
-            torch.randn([8192, 8192], device=DEVICE, dtype=HALF_DTYPE),
-            torch.randn([8192, 8192], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([8192, 8192], device=DEVICE, dtype=HALF_DTYPE),
+            torch.empty([8192, 8192], device=DEVICE, dtype=HALF_DTYPE),
         )
         with patch_cute_mma_support():
             bound = fresh(cute_matmul_mma).bind(args)
             config = bound.config_spec.default_config()
             code = bound.to_triton_code(config)
         # 16-bit 8192^3 is FFI-eligible (fp16 == bf16 parity); the default is the
-        # validated TVM-FFI full-tile envelope whose bk is 128, not the old
-        # non-persistent bk=16 default. It still codegens on the tcgen05 path.
-        self.assertEqual(config.config["block_sizes"][2], 128)
+        # validated TVM-FFI full-tile envelope with its deep 64x6 pipeline, not
+        # the old non-persistent bk=16 default. It still codegens on the tcgen05
+        # path.
+        self.assertEqual(config.config["block_sizes"][2], 64)
+        self.assertEqual(config.config["tcgen05_ab_stages"], 6)
         self.assertGreaterEqual(config.config["block_sizes"][0], 128)
         self.assertLessEqual(config.config["block_sizes"][0], 256)
         self.assertGreaterEqual(config.config["block_sizes"][1], 8)
@@ -473,7 +476,8 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 spec.normalize(config, _fix_invalid=True)
                 self.assertEqual(config["tcgen05_cluster_m"], 2)
                 self.assertEqual(config["pid_type"], "persistent_interleaved")
-                self.assertEqual(config["block_sizes"][:3], [256, 256, 128])
+                self.assertEqual(config["block_sizes"][:3], [256, 256, 64])
+                self.assertEqual(config["tcgen05_ab_stages"], 6)
                 self.assertEqual(config["l2_groupings"], [2])
                 self.assertIs(config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY], True)
 
@@ -1039,11 +1043,11 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
 
         # 16-bit 4096^3 is FFI-eligible (fp16 == bf16 parity), so the initial
         # population carries several cluster_m=2 seeds: the DEFAULT-layout
-        # cluster_m=2 ab=3 seed, the generalized TVM-FFI direct-entry seed,
-        # and the CLC / cluster_n=2 variants. Every seed on the canonical
-        # 256x256x128 tile must carry the ab=3 fast-config envelope (the point
-        # of this test — that ab=3 is seeded rather than discovered by
-        # mutation).
+        # cluster_m=2 ab=3 seed and the CLC / cluster_n=2 variants on the
+        # canonical 256x256x128 tile, which must carry the ab=3 fast-config
+        # envelope (the point of this test — that ab=3 is seeded rather than
+        # discovered by mutation), and the TVM-FFI direct-entry seed, which
+        # runs the deep 64x6 ring below.
         cluster_m2_seeds = [
             config.config
             for config in spec.compiler_seed_configs
@@ -1062,9 +1066,9 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             self.assertEqual(seed["tcgen05_ab_stages"], 3)
         # The same SMEM gate admits the deep-staged short-K variant, which must
         # be seeded alongside the canonical family: bk=64 with the ab=6
-        # pipeline (nvjet's 64x6 staging), once for the CLC cluster_n=1 seed
-        # and once each for the static-persistent 2x2 multicast seed and its
-        # 2x1 twin.
+        # pipeline (nvjet's 64x6 staging), once for the CLC cluster_n=1 seed,
+        # once each for the static-persistent 2x2 multicast seed and its 2x1
+        # twin, and once for the direct-entry (FFI) seed.
         deep_seeds = [
             seed
             for seed in cluster_m2_seeds
@@ -1072,7 +1076,8 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             and seed["block_sizes"][0] == TCGEN05_TWO_CTA_BLOCK_M
         ]
         self.assertEqual(
-            sorted(seed.get("tcgen05_cluster_n", 1) for seed in deep_seeds), [1, 1, 2]
+            sorted(seed.get("tcgen05_cluster_n", 1) for seed in deep_seeds),
+            [1, 1, 1, 2],
         )
         for seed in deep_seeds:
             self.assertEqual(seed["tcgen05_ab_stages"], 6)
@@ -1508,10 +1513,13 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertTrue(
             surface.paired_pipeline_search_enabled(spec._cute_tcgen05_config)
         )
+        # The compact paired family's seeds (the aligned-N family, which
+        # seeds its own physical tile and raster -- here the 96-wide tile
+        # behind the 128 carrier -- is left out).
         seeds = [
             seed
             for seed in spec.compiler_seed_configs
-            if seed.get("tcgen05_cta_group") == "two"
+            if seed.get("tcgen05_cta_group") == "two" and not seed.get("tcgen05_tile_n")
         ]
         self.assertTrue(seeds)
         generation = spec.create_config_generation()

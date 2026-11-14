@@ -20,7 +20,7 @@ import torch
 
 from ...._compat import target_device_capability as get_target_device_capability
 from ...._utils import prev_power_of_2
-from ....autotuner.block_id_sequence import BlockIdSequence
+from ....autotuner.compiler_refinement import compiler_refinement_policy
 from ....autotuner.config_fragment import BooleanFragment
 from ....autotuner.config_fragment import ConfigSpecFragment
 from ....autotuner.config_fragment import EnumFragment
@@ -46,17 +46,26 @@ from ..cute_flash_bwd_row_mma import flash_bwd_row_search_grid
 from ..cute_mma_dag import MMA_DAG_AUX_KEY
 from ..cute_mma_dag import MMA_DAG_CLUSTER_KEY
 from ..cute_mma_dag import MMA_DAG_DERIVED_KEY
+from ..cute_mma_dag import MMA_DAG_EARLY_TMEM_RETIREMENT_KEY
 from ..cute_mma_dag import MMA_DAG_EPILOGUE_KEY
 from ..cute_mma_dag import MMA_DAG_EXCHANGE_KEY
 from ..cute_mma_dag import MMA_DAG_KEY
 from ..cute_mma_dag import MMA_DAG_KEYS
 from ..cute_mma_dag import MMA_DAG_LOADS_KEY
 from ..cute_mma_dag import MMA_DAG_LOOKAHEAD_KEY
+from ..cute_mma_dag import MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
 from ..cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
 from ..cute_mma_dag import MMA_DAG_PERSISTENT_KEY
+from ..cute_mma_dag import MMA_DAG_PROBABILITY_SCHEDULE_KEY
+from ..cute_mma_dag import MMA_DAG_QUERY_TMA_KEY
+from ..cute_mma_dag import MMA_DAG_SLEEP_WAITS_KEY
 from ..cute_mma_dag import MMA_DAG_SPLIT_KEY
 from ..cute_mma_dag import MMA_DAG_STAGES_KEY
 from ..cute_mma_dag import MMA_DAG_STORE_KEY
+from ..cute_mma_dag import MMA_DAG_TCGEN05
+from ..cute_mma_dag import MMA_DAG_V_LAG_KEY
+from ..cute_mma_dag import MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY
+from ..cute_mma_dag import MMA_DAG_VALUE_METADATA_SKIP_KEY
 from ..cute_mma_dag import MMA_DAG_WARPS_KEY
 from ..cute_register_subblocks import COLSIDE_KEY as RSB_COLSIDE_KEY
 from ..cute_register_subblocks import KEY as RSB_KEY
@@ -71,6 +80,7 @@ from ..direct_affine_plan import direct_affine_schedule_choices
 from ..fragment_mma_dot import FRAGMENT_MMA_K_THREADS
 from ..fragment_mma_dot import FRAGMENT_MMA_KEY
 from ..fragment_mma_dot import FRAGMENT_MMA_ROW_THREADS
+from ..pdl_release import CUTE_PDL_CAPTURE_RELEASE_CHOICES
 from ..pdl_release import CUTE_PDL_RELEASE_CHOICES
 from ..pdl_release import CUTE_PDL_RELEASE_DEFAULT
 from ..pdl_release import CUTE_PDL_SPREAD_KEY
@@ -138,6 +148,8 @@ from .config_keys import CUTE_AFFINE_SCAN_SCHEDULE_KEY
 from .config_keys import CUTE_CHUNK_PREPARE_SCHEDULE_KEY
 from .config_keys import CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY
 from .config_keys import CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY
+from .config_keys import CUTE_COMPILER_PIPELINE_CHOICES
+from .config_keys import CUTE_COMPILER_PIPELINE_KEY
 from .config_keys import CUTE_CONFIG_KEYS
 from .config_keys import CUTE_DEBUG_KEYS
 from .config_keys import CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY
@@ -164,6 +176,7 @@ from .flash_surface import prepare_config_generation_overrides
 from .flash_surface import prepare_override_normalization
 from .mma_dag_surface import _normalize_cute_mma_dag
 from .mma_dag_surface import _normalize_cute_register_subblocks
+from .mma_dag_surface import normalize_value_metadata_options
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -229,6 +242,7 @@ _CUTE_MXFP8_ROOT_LOWERING_KEYS = frozenset(
         RING_STAGES_KEY,
         RING_SPLIT_KEY,
         "cute_pdl",
+        "cute_pdl_capture_overlap",
         "cute_pdl_release",
         "cute_pdl_spread",
         "cute_min_blocks_per_mp",
@@ -236,6 +250,9 @@ _CUTE_MXFP8_ROOT_LOWERING_KEYS = frozenset(
         "epilogue_subtile",
     }
 )
+
+
+_COMPILER_PIPELINE_FRAGMENT = EnumFragment(choices=CUTE_COMPILER_PIPELINE_CHOICES)
 
 
 def _fragment_threads(config: Mapping[str, object]) -> int:
@@ -310,7 +327,7 @@ _FRAGMENT_OPTIONS: dict[str, _FragmentOption] = {
     ),
     "cute_fragment_packet_loads": _FragmentOption(
         lambda spec, config: spec.cute_fragment_packet_load_root_ids,
-        "a complete fragment root with readonly Float32, Float16 or BFloat16 host loads",
+        "a complete fragment root with readonly Float32, Float16, BFloat16, Int8 or Uint8 host loads",
     ),
     "cute_fragment_padded_rows": _FragmentOption(
         lambda spec, config: spec.cute_fragment_padded_rows_root_ids,
@@ -345,6 +362,10 @@ _FRAGMENT_OPTIONS: dict[str, _FragmentOption] = {
         lambda spec, config: spec.cute_fp32_dot_root_ids,
         "an fp32 hl.dot in a computed fragment under tf32 dot precision",
         ("simt", "tf32_mma"),
+    ),
+    "cute_fragment_half_mma": _FragmentOption(
+        lambda spec, config: spec.cute_fragment_half_mma_root_ids,
+        "an FP16/BF16 hl.dot with FP32 accumulation in a computed fragment on SM80+",
     ),
     "cute_fragment_scan": _FragmentOption(
         lambda spec, config: spec.cute_fragment_scan_root_ids,
@@ -1363,6 +1384,55 @@ def _normalize_cute_pdl(
         config.pop(CUTE_PDL_SPREAD_KEY, None)
     elif CUTE_PDL_SPREAD_KEY in config:
         config[CUTE_PDL_SPREAD_KEY] = spread
+    if config_spec.has_explicit_pdl:
+        # Explicit markers own the wait/release; canonicalize all automatic
+        # policies to one identity so search does not retime identical code.
+        config["cute_pdl"] = False
+        config.pop("cute_pdl_release", None)
+        config.pop(CUTE_PDL_SPREAD_KEY, None)
+
+
+def _normalize_cute_pdl_capture_overlap(
+    config_spec: ConfigSpec, config: dict[str, object], *, fix_invalid: bool
+) -> None:
+    key = "cute_pdl_capture_overlap"
+    value = config.get(key, False)
+    if type(value) is not bool:
+        if not fix_invalid:
+            raise InvalidConfig(f"{key} must be a boolean")
+        value = False
+    eligible = (
+        config_spec.cute_pdl_capture_overlap_available
+        and not config_spec.has_explicit_pdl
+        and config.get("cute_pdl") is True
+        and not config.get(CUTE_PDL_SPREAD_KEY)
+        and config.get("cute_pdl_release", CUTE_PDL_RELEASE_DEFAULT)
+        in CUTE_PDL_CAPTURE_RELEASE_CHOICES
+        and config.get(MMA_DAG_KEY) == MMA_DAG_TCGEN05
+        and config.get(MMA_DAG_PASS_WARPS_KEY) == MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
+    )
+    if value and not eligible and not fix_invalid:
+        raise InvalidConfig(
+            f"{key}=True requires a supported paired attention kernel, "
+            "cute_pdl=True, cute_pdl_spread=False and automatic, entry or loader-tail release"
+        )
+    if config.get("cute_pdl_release") == "loader_tail" and not (eligible and value):
+        if not fix_invalid:
+            raise InvalidConfig(
+                "cute_pdl_release='loader_tail' requires eligible "
+                "cute_pdl_capture_overlap=True"
+            )
+        if config.get("cute_pdl") is True:
+            config["cute_pdl_release"] = CUTE_PDL_RELEASE_DEFAULT
+        else:
+            config.pop("cute_pdl_release", None)
+    if not eligible:
+        # Unsupported families keep their prior config/search identity; an
+        # explicit unused default must not leak into strict downstream plans.
+        config.pop(key, None)
+        return
+    if key in config or value:
+        config[key] = value
 
 
 def _normalize_cute_tiles_per_block(
@@ -1926,6 +1996,13 @@ def normalize_entry(
     config_spec: ConfigSpec, config: dict[str, object], *, fix_invalid: bool
 ) -> None:
     _normalize_cute_mxfp8_root_lowering(config_spec, config)
+    if CUTE_COMPILER_PIPELINE_KEY in config:
+        _normalize_enum_fragment(
+            config,
+            CUTE_COMPILER_PIPELINE_KEY,
+            _COMPILER_PIPELINE_FRAGMENT,
+            fix_invalid=fix_invalid,
+        )
 
     if config.get("cute_fragment_producer_cache") is True and (
         config.get("cute_fragment_register_loads") is True
@@ -1968,6 +2045,7 @@ def _require_family_enabled(
 def normalize_family_gates(
     config_spec: ConfigSpec, config: dict[str, object], *, fix_invalid: bool
 ) -> None:
+    normalize_value_metadata_options(config_spec, config, fix_invalid=fix_invalid)
     for keys, enabled, reason in (
         (
             (CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY,),
@@ -2091,6 +2169,9 @@ def normalize_knobs(
     )
     _normalize_fragment_option(
         config_spec, config, "cute_fp32_dot", fix_invalid=fix_invalid
+    )
+    _normalize_fragment_option(
+        config_spec, config, "cute_fragment_half_mma", fix_invalid=fix_invalid
     )
     _normalize_cute_fragment_threads(config_spec, config, fix_invalid=fix_invalid)
     _normalize_fragment_option(
@@ -2427,6 +2508,8 @@ def normalize_reduction_threads(
             for i, spec in enumerate(config_spec.reduction_loops):
                 if i >= len(new_loops):
                     break
+                if spec.persistent_reason is not None:
+                    continue
                 if new_loops[i] is None and spec.size_hint > available:
                     # When other_threads consumes the entire CuTe 1024 thread
                     # budget there is no thread budget left for the reduction
@@ -2640,6 +2723,7 @@ def normalize_recurrence_families(
                 )
     if config_spec.cute_mma_dag is not None:
         _normalize_cute_mma_dag(config_spec, config, fix_invalid=fix_invalid)
+    _normalize_cute_pdl_capture_overlap(config_spec, config, fix_invalid=fix_invalid)
     if config_spec.cute_register_subblocks is not None:
         _normalize_cute_register_subblocks(config_spec, config, fix_invalid=fix_invalid)
     prepare_schedule_fragment = config_spec.cute_chunk_prepare_schedule
@@ -2744,7 +2828,10 @@ def pdl_fields(
     sequence pays for a non-releasing pick (mamba2_ssd backward: dqkg
     alone reads 3.66 us under every placement; the sequence reads 11.2 us
     per call with dqkg at ``none`` and 10.3 at ``entry``).  The explicit
-    values stay valid for pins, seeds and users.
+    values stay valid for pins, seeds and users. Capture overlap and its
+    ``loader_tail`` release require an explicit opt-in: their storage proof
+    assumes captured topology and parameter addresses remain immutable, which
+    ordinary autotuning cannot establish for the application's future graphs.
     """
     if not config_spec.supports_config_key("cute_pdl"):
         return
@@ -2752,8 +2839,13 @@ def pdl_fields(
     fields["cute_pdl"] = EnumFragment(
         (False, True), search_choices=(False, True) if searched else (False,)
     )
+    if config_spec.cute_pdl_capture_overlap_available:
+        fields["cute_pdl_capture_overlap"] = EnumFragment(
+            (False, True), search_choices=(False,)
+        )
     fields["cute_pdl_release"] = EnumFragment(
-        CUTE_PDL_RELEASE_CHOICES, search_choices=(CUTE_PDL_RELEASE_DEFAULT,)
+        CUTE_PDL_RELEASE_CHOICES,
+        search_choices=(CUTE_PDL_RELEASE_DEFAULT,),
     )
     # Pad the kernel's shared memory to one wave's density so an early
     # launch cannot pack its CTAs onto the SMs its primary left idle
@@ -2783,11 +2875,13 @@ def cute_flat_fields(
         )
     if config_spec.cute_materialized_schedule_search_enabled:
         fields["cute_materialized_schedule"] = EnumFragment(
-            choices=config_spec.cute_materialized_schedule_choices
+            choices=config_spec.cute_materialized_schedule_choices,
+            search_choices=("off",) if config_spec.has_explicit_pdl else None,
         )
     if config_spec.cute_materialized_operand_schedule_search_enabled:
         fields["cute_materialized_operand_schedule"] = EnumFragment(
-            choices=("off", "warp_narrow4")
+            choices=("off", "warp_narrow4"),
+            search_choices=("off",) if config_spec.has_explicit_pdl else None,
         )
     if config_spec.cute_fragment_private_scalar_loops_search_enabled:
         fields["cute_fragment_private_scalar_loops"] = BooleanFragment()
@@ -2809,7 +2903,7 @@ def cute_flat_fields(
         fields["cute_fragment_padded_rows"] = BooleanFragment()
     if config_spec.cute_fragment_unrolled_loops_search_enabled:
         fields["cute_fragment_unrolled_loops"] = BooleanFragment()
-    # The tile transport knobs (one statement: this method sits at a
+    # Fragment MMA and tile transport booleans (one statement: this sits at a
     # size past which pyrefly drops its narrowing of the fields below).
     fields.update(
         {
@@ -2834,6 +2928,10 @@ def cute_flat_fields(
                 (
                     config_spec.cute_fragment_slab_loads_search_enabled,
                     "cute_fragment_slab_loads",
+                ),
+                (
+                    config_spec.cute_fragment_half_mma_search_enabled,
+                    "cute_fragment_half_mma",
                 ),
             )
             if enabled
@@ -3138,7 +3236,10 @@ def cute_flat_fields(
                     "resident",
                     "bounded",
                     "bounded_layout",
-                )
+                ),
+                search_choices=("scalar", "reload", "resident")
+                if config_spec.has_explicit_pdl
+                else None,
             )
         if config_spec.cute_resident_reduction_blocks:
             fields["cute_reduction_local_tree"] = BooleanFragment()
@@ -3211,10 +3312,16 @@ def cute_flat_fields(
                         (CUTE_MMA_F32_WARP_RAW,)
                         if config_spec.cute_grouped_warp_tf32_available
                         else ()
-                    )
+                    ),
+                    search_choices=(CUTE_MMA_F32_AUTO,)
+                    if config_spec.has_explicit_pdl
+                    else None,
                 )
             if config_spec.cute_grouped_rna_k_choices:
-                fields[GROUPED_RNA_WARPS_KEY] = EnumFragment(choices=GROUPED_RNA_WARPS)
+                fields[GROUPED_RNA_WARPS_KEY] = EnumFragment(
+                    choices=GROUPED_RNA_WARPS,
+                    search_choices=(0,) if config_spec.has_explicit_pdl else None,
+                )
                 fields[GROUPED_RNA_K_KEY] = EnumFragment(
                     choices=config_spec.cute_grouped_rna_k_choices
                 )
@@ -3230,7 +3337,12 @@ def cute_flat_fields(
                         choices=GROUPED_PREFIX_SCANS
                     )
             if config_spec.cute_split_k_cluster_facts is not None:
-                fields[SPLIT_K_SCHEDULE_KEY] = EnumFragment(SPLIT_K_SCHEDULES)
+                fields[SPLIT_K_SCHEDULE_KEY] = EnumFragment(
+                    SPLIT_K_SCHEDULES,
+                    search_choices=("legacy",)
+                    if config_spec.has_explicit_pdl
+                    else None,
+                )
                 fields[SPLIT_K_FINALIZER_KEY] = EnumFragment(FINALIZER_WARPS)
             if config_spec.cute_collective_knobs_enabled:
                 fields["cute_collective_mma"] = BooleanFragment()
@@ -3483,6 +3595,27 @@ def cute_flat_fields(
         fields[MMA_DAG_STORE_KEY] = config_spec.cute_mma_dag_store
         fields[MMA_DAG_EXCHANGE_KEY] = config_spec.cute_mma_dag_exchange
         fields[MMA_DAG_PASS_WARPS_KEY] = config_spec.cute_mma_dag_pass_warps
+        v_lag_fragment = config_spec.cute_mma_dag_v_lag
+        if v_lag_fragment is not None:
+            fields[MMA_DAG_V_LAG_KEY] = v_lag_fragment
+        sleep_fragment = config_spec.cute_mma_dag_sleep_waits
+        if sleep_fragment is not None:
+            fields[MMA_DAG_SLEEP_WAITS_KEY] = sleep_fragment
+        retirement_fragment = config_spec.cute_mma_dag_early_tmem_retirement
+        if retirement_fragment is not None:
+            fields[MMA_DAG_EARLY_TMEM_RETIREMENT_KEY] = retirement_fragment
+        query_fragment = config_spec.cute_mma_dag_query_tma
+        if query_fragment is not None:
+            fields[MMA_DAG_QUERY_TMA_KEY] = query_fragment
+        metadata_fragment = config_spec.cute_mma_dag_value_metadata_skip
+        if metadata_fragment is not None:
+            fields[MMA_DAG_VALUE_METADATA_SKIP_KEY] = metadata_fragment
+        overlap_fragment = config_spec.cute_mma_dag_value_metadata_read_overlap
+        if overlap_fragment is not None:
+            fields[MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY] = overlap_fragment
+        probability_fragment = config_spec.cute_mma_dag_probability_schedule
+        if probability_fragment is not None:
+            fields[MMA_DAG_PROBABILITY_SCHEDULE_KEY] = probability_fragment
         fields[MMA_DAG_LOADS_KEY] = config_spec.cute_mma_dag_loads
         # (Locals: the type checker's attribute narrowing does not
         # reach this far into the function.)
@@ -3554,12 +3687,18 @@ def cute_flat_fields(
     if (
         config_spec.supports_config_key("pid_type")
         and "pid_type" not in fields
-        and config_spec.allowed_pid_types[0] != "flat"
+        and (
+            config_spec.allowed_pid_types[0] != "flat"
+            or (
+                config_spec.cute_ordered_phase_pid_search
+                and len(config_spec.allowed_pid_types) > 1
+            )
+        )
     ):
         # SIMT normally omits this coordinate and defaults to flat.
-        # Barriers require a persistent launch in the reference and in
-        # every candidate, including after a flatten/unflatten round trip;
-        # CuTe may also search their ordered ``flat`` phase launches.
+        # Non-ordered barriers can disallow flat. Ordered barriers keep this
+        # coordinate even when captured reductions or CTA-local atomics need
+        # flat launches for the conservative reference.
         fields["pid_type"] = EnumFragment(config_spec.allowed_pid_types)
     if config_spec.cross_loop_pipeline is not None:
         fields["cross_loop_pipeline"] = config_spec.cross_loop_pipeline
@@ -3581,12 +3720,15 @@ def cute_flat_fields(
             (key, EnumFragment(choices=choices))
             for key, choices in RADIX_PIPELINE_CHOICES.items()
         )
+    fields[CUTE_COMPILER_PIPELINE_KEY] = _COMPILER_PIPELINE_FRAGMENT
     return fields
 
 
 def flatten_missing_field_default(
     config_spec: ConfigSpec, key: str, config: dict[str, object]
 ) -> tuple[bool, object]:
+    if key == CUTE_COMPILER_PIPELINE_KEY:
+        return True, CUTE_COMPILER_PIPELINE_CHOICES[0]
     if key == RADIX_ALGORITHM_KEY:
         return True, "legacy"
     if key == RADIX_HISTOGRAM_KEY:
@@ -3605,6 +3747,7 @@ def flatten_missing_field_default(
         return True, False
     if key in (
         "cute_fragment_register_loads",
+        "cute_fragment_half_mma",
         "cute_fragment_warp_scan",
         "cute_fragment_topk_network",
         "cute_fragment_cta_topk",
@@ -3766,6 +3909,14 @@ class CuteSearchSurface(BackendSearchSurface):
     config_keys = CUTE_CONFIG_KEYS
     debug_keys = CUTE_DEBUG_KEYS
     implicit_default_keys = CUTE_IMPLICIT_DEFAULT_KEYS
+    # Retirement and V lookbehind change the lifetime seen by the compiler
+    # pipeline. Their joint choices can win when individual changes lose;
+    # strict decoding keeps these coordinates active only on paired schedules.
+    compiler_refinement_keys = (
+        CUTE_COMPILER_PIPELINE_KEY,
+        MMA_DAG_EARLY_TMEM_RETIREMENT_KEY,
+        MMA_DAG_V_LAG_KEY,
+    )
 
     def explain_unavailable_key(self, key: str, config_spec: ConfigSpec) -> str | None:
         if key == "num_threads" and not config_spec.target_device_capability:
@@ -3900,7 +4051,12 @@ class CuteSearchSurface(BackendSearchSurface):
         prepare_flat_config(config_spec, config)
 
     def fingerprint_extra(self, config_spec: ConfigSpec) -> object | None:
-        return fingerprint_extra(config_spec)
+        return {
+            "target_policy": fingerprint_extra(config_spec),
+            "compiler_refinement": compiler_refinement_policy(
+                self.compiler_refinement_keys
+            ),
+        }
 
     def l2_evict_last_store_policy_supported(self, config_spec: ConfigSpec) -> bool:
         return fixed_l2_evict_last_store_policy_supported(

@@ -46,7 +46,16 @@ down (in your notes or the reply) rather than relying on `$old` later:
 ```
 git rev-parse HEAD                           # the rollback point: record it
 git merge-base origin/main HEAD              # the base of the stack
-git log --reverse --format='%h%x09%(trailers:key=stack-info,valueonly,separator=)%x09%s' <base>..HEAD
+git log --reverse --format='%h %s%n%B%x00' <base>..HEAD |
+  python -c 'import sys
+for entry in sys.stdin.read().split("\0"):
+    lines = entry.strip().splitlines()
+    if lines:
+        print(lines[0])
+        for line in lines[1:]:
+            if line.startswith("stack-info:"):
+                print("    " + line)
+'
 ```
 
 The top commit that has a `stack-info:` line is the submit head: every submit
@@ -55,8 +64,9 @@ below is `stack-pr submit -H <its current sha>` (check with `stack-pr view -H
 commit without stack-info below the submit head would become a new pull
 request, so if one exists, stop and report instead of submitting.
 
-Each line is a commit (bottom first), its `stack-info` pull request URL, and
-its subject. For each pull request:
+The inventory prints each commit and subject (bottom first), followed by its
+raw `stack-info:` line. Do not use Git's `%(trailers)` formatter here: the
+adjacent `autoreview passed:` record can make it omit an existing PR trailer. For each pull request:
 
 ```
 gh pr view <number> --repo pytorch/helion --json title,state,headRefOid,mergeable

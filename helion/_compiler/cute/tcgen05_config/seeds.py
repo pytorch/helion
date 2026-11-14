@@ -48,6 +48,9 @@ from ..strategies import TCGEN05_WARP_SPEC_STORE_WARPS_KEY
 from ..strategies import Tcgen05LayoutStrategy
 from ..strategies import Tcgen05PersistenceModel
 from ..strategies import Tcgen05Strategy
+from ..tcgen05.knobs import epi_subtile_n_knob
+from ..tcgen05_constants import TCGEN05_ALIGNED_N_TALL_L2_GROUPINGS
+from ..tcgen05_constants import TCGEN05_ALIGNED_N_TALL_PAIR_ROWS
 from ..tcgen05_constants import TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_AUX_LOAD_MODE_EPI_TMA
@@ -59,8 +62,10 @@ from ..tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
 from ..tcgen05_constants import TCGEN05_AUX_PREFETCH_SUBTILES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_C_STORE_MODE_DIRECT
+from ..tcgen05_constants import TCGEN05_CLUSTER_N2_SEED_L2_GROUPING
 from ..tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
+from ..tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_N
 from ..tcgen05_constants import TCGEN05_REGION_PID_TYPE_INHERIT
 from ..tcgen05_constants import TCGEN05_REGION_PID_TYPES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_SMALL_GRID_DIRECT_STORE_MAX_BN
@@ -351,6 +356,34 @@ def _paired_pipeline_parameters(
     ):
         return None
     return cast("tuple[int, int, int, int, int]", (bm, bn, bk, c_stages, acc_stages))
+
+
+def _paired_pipeline_store_subtile_n(
+    state: CuteTcgen05Config, config: dict[str, object], *, bm: int, bn: int, bk: int
+) -> int | None:
+    """The C-ring subtile width the 256-row pair's store codegen allocates.
+
+    A configured ``tcgen05_epi_subtile_n`` wins; otherwise the plain
+    narrow rule's 32 columns where codegen applies it: the epilogue facts
+    ``epilogue_subtile`` checks (``_plain_narrow_subtile_facts``) plus the
+    static full tiles, row-major output and TMA-store epilogue the plan
+    also asks for.  ``None`` keeps ``pipeline_smem_bytes``' with-source
+    tile, the only place that width is computed.
+    """
+    configured = epi_subtile_n_knob(config)
+    if configured is not None:
+        return configured
+    pipeline_facts = state.pipeline_smem_facts
+    if (
+        bm == TCGEN05_TWO_CTA_BLOCK_M
+        and pipeline_facts is not None
+        and not pipeline_facts.output_column_major
+        and config.get("tcgen05_c_store_mode", "normal") == "normal"
+        and facts._plain_narrow_subtile_facts(state, bm=bm, bn=bn, cluster_m=2)
+        and facts._static_full_tiles(state, bm=bm, bn=bn, bk=bk)
+    ):
+        return TCGEN05_PLAIN_NARROW_SUBTILE_N
+    return None
 
 
 def _region_two_cta_tile(
@@ -808,6 +841,29 @@ def _paired_pipeline_seed_configs(
                                         aux_mode
                                     )
                                 seeds.append(seed)
+                                if (
+                                    cluster_n == 2
+                                    and len(state.config_spec.l2_groupings) == 1
+                                ):
+                                    # The same twin on a grouped raster: the
+                                    # co-resident 2x2 wave then sweeps a band
+                                    # of pair rows across the cluster-N
+                                    # columns while those A rows are still
+                                    # in L2, instead of re-streaming A once
+                                    # per cluster-N column (bf16
+                                    # 16384x1024x4096: 0.91 -> 0.99 of
+                                    # cuBLAS, whose 2x2 nvjet tile it now
+                                    # matches).
+                                    seeds.append(
+                                        Config.from_dict(
+                                            {
+                                                **seed.config,
+                                                "l2_groupings": [
+                                                    TCGEN05_CLUSTER_N2_SEED_L2_GROUPING
+                                                ],
+                                            }
+                                        )
+                                    )
     return seeds
 
 
@@ -1516,7 +1572,9 @@ def cluster_m2_seed_bk_choices(state: CuteTcgen05Config) -> tuple[int, ...]:
 
 
 def full_tile_direct_entry_seed_bk(state: CuteTcgen05Config) -> int | None:
-    """Largest valid full-tile direct-entry K tile for the live shape.
+    """Largest valid full-tile direct-entry K tile for the live shape: the
+    ceiling ``full_tile_direct_entry_seed_pipeline`` picks the seed's K tile
+    below (often 64).
 
     Mirrors the full-tile branch of the heuristic bk selection: the highest
     power-of-two ``bk`` within the K block-size fragment that divides
@@ -1540,18 +1598,94 @@ def full_tile_direct_entry_seed_bk(state: CuteTcgen05Config) -> int | None:
     return None
 
 
+def full_tile_direct_entry_seed_pipeline(
+    state: CuteTcgen05Config,
+) -> tuple[int, int, int] | None:
+    """``(bk, ab_stages, c_stages)`` of the direct-entry seed.
+
+    Six 64-deep AB stages (nvjet's 64x6 staging, the same AB bytes as
+    three 128-deep stages) where the K fragment and ``static_k`` admit
+    64-deep tiles, validation admits the deep tuple and the arena with
+    every output's C ring fits, else three stages of the largest valid K
+    tile, else three 64-deep stages, whichever fits first, else ``None``
+    (each tuple one ``tcgen05_direct_entry_stage_tuple_allowed`` admits).
+    Device time vs cuBLAS, B200 bf16, same process: 16384x768x768 0.925 ->
+    0.957, 8192x1024x1024 0.915 -> 0.958,
+    16384x1024x1024 0.940 -> 0.980, 4096^3 0.969 -> 0.983 (against three
+    128-deep stages); 8192x4096x576 42.3 -> 37.2 us, 16384x2048x704 52.5
+    -> 42.6 us (against three 64-deep stages). A 4-stage C ring cost
+    0.4-1.7% more.
+    """
+    bk = full_tile_direct_entry_seed_bk(state)
+    if bk is None:
+        return None
+    deep_bk = TCGEN05_TWO_CTA_EDGE_K_TAIL_DEEP_BLOCK_K
+    deep_ab = TCGEN05_TWO_CTA_DEEP_AB_STAGES
+    constraints = state.cluster_m2_search_constraints
+    fragments = facts._matmul_block_fragments(state)
+    sixty_four_deep = (
+        bk >= deep_bk
+        and constraints is not None
+        and fragments is not None
+        and fragments[2].low <= deep_bk
+        and repair.cluster_m2_bk_is_valid(deep_bk, constraints)
+    )
+
+    def fits(tile_bk: int, ab_stages: int) -> bool:
+        # every output's (128, 32) C ring beside the AB ring
+        return smem.default_layout_smem_fits(
+            state,
+            bm=TCGEN05_TWO_CTA_BLOCK_M,
+            bn=TCGEN05_TWO_CTA_BLOCK_N,
+            bk=tile_bk,
+            cluster_m=2,
+            ab_stages=ab_stages,
+            c_stages=2,
+            stage_rows=False,
+            epi_subtile_n=32,
+        )
+
+    if (
+        sixty_four_deep
+        and state.deep_direct_entry_validation_enabled
+        and tcgen05_direct_entry_stage_tuple_allowed(
+            bk=deep_bk, ab_stage_count=deep_ab, c_stage_count=2
+        )
+        and fits(deep_bk, deep_ab)
+    ):
+        return deep_bk, deep_ab, 2
+
+    def three_stages(tile_bk: int) -> bool:
+        return tcgen05_direct_entry_stage_tuple_allowed(
+            bk=tile_bk, ab_stage_count=3, c_stage_count=2
+        ) and fits(tile_bk, 3)
+
+    # The three-stage rings are judged by the same arena: at bk=128 the ring
+    # holds the deep ring's AB bytes, so where several outputs' C rings
+    # overflowed that, they overflow it too (three outputs at
+    # 8192x4096x1024: 245,932 B against 232,448 B), and three 64-deep
+    # stages (147,628 B there) take its place.
+    if three_stages(bk):
+        return bk, 3, 2
+    if bk > deep_bk and sixty_four_deep and three_stages(deep_bk):
+        return deep_bk, 3, 2
+    return None
+
+
 def full_tile_direct_entry_seed_eligible(state: CuteTcgen05Config) -> bool:
     """Structural eligibility for the generalized TVM-FFI direct-entry seed.
 
     The direct-entry codegen + runtime validator build their A/B/D TMA
-    descriptors from the runtime tensor shapes, so the fast launch path is
-    shape-general; the constraints are purely structural: a full-tile (NOT
+    descriptors from the runtime tensor shapes, but the seed runs whole
+    256x256 tiles only (an output edge's partial tiles take the pair search
+    instead); the other constraints are structural: a full-tile (NOT
     edge+K-tail) CtaGroup.TWO 16-bit (bf16/fp16) GEMM, the 256x256 CTA tile
-    reachable, a direct-entry-valid ``bk``, and the ``(ab=3, c=2)`` stage
-    tuple admitted
-    and SMEM-fitting. Both ``optional_fragments`` (to add the FFI search
-    surface) and ``CuteTcgen05ClusterM2FfiHeuristic`` (to gate the seed) use
-    this so they cannot disagree.
+    reachable, a direct-entry-valid ``bk``, the ``(ab=3, c=2)`` stage tuple
+    admitted, and a seed ring that fits beside every output's C ring
+    (``full_tile_direct_entry_seed_pipeline``). Both ``optional_fragments``
+    (to add the FFI search surface) and
+    ``CuteTcgen05ClusterM2FfiHeuristic`` (to gate the seed) use this so they
+    cannot disagree.
     """
     # A non-tcgen05-native matmul operand (e.g. an int16 tensor cast to
     # bf16) forces the dot through the non-tcgen05 fallback, where the
@@ -1592,17 +1726,18 @@ def full_tile_direct_entry_seed_eligible(state: CuteTcgen05Config) -> bool:
     bk = full_tile_direct_entry_seed_bk(state)
     if bk is None:
         return False
+    # The flat-role coordinates and the FFI launch validator assume whole
+    # 256x256 tiles; output-edge shapes reach CtaGroup.TWO search too.
+    if not facts._static_full_tiles(
+        state, bm=TCGEN05_TWO_CTA_BLOCK_M, bn=TCGEN05_TWO_CTA_BLOCK_N, bk=bk
+    ):
+        return False
     if not tcgen05_direct_entry_stage_tuple_allowed(
         bk=bk, ab_stage_count=3, c_stage_count=2
     ):
         return False
-    return smem.ab_stages_three_fits(
-        state,
-        bm=TCGEN05_TWO_CTA_BLOCK_M,
-        bn=TCGEN05_TWO_CTA_BLOCK_N,
-        bk=bk,
-        cluster_m=2,
-    )
+    # the seed's ring and every output's C ring fit the arena
+    return full_tile_direct_entry_seed_pipeline(state) is not None
 
 
 def full_tile_direct_entry_seed_config(
@@ -1620,9 +1755,10 @@ def full_tile_direct_entry_seed_config(
     """
     if not full_tile_direct_entry_seed_eligible(state):
         return None
-    bk = full_tile_direct_entry_seed_bk(state)
-    if bk is None:
+    pipeline = full_tile_direct_entry_seed_pipeline(state)
+    if pipeline is None:
         return None
+    bk, ab_stages, c_stages = pipeline
     block_sizes = facts._matmul_seed_block_sizes(
         state,
         bm=TCGEN05_TWO_CTA_BLOCK_M,
@@ -1650,9 +1786,9 @@ def full_tile_direct_entry_seed_config(
         "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
         "tcgen05_cluster_m": 2,
         "tcgen05_cluster_n": 1,
-        "tcgen05_ab_stages": 3,
+        "tcgen05_ab_stages": ab_stages,
         "tcgen05_acc_stages": 2,
-        "tcgen05_c_stages": 2,
+        "tcgen05_c_stages": c_stages,
         TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY: 1,
         "tcgen05_num_epi_warps": 4,
         TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: (
@@ -1961,13 +2097,12 @@ def _m_pair_deep_seed_configs(state: CuteTcgen05Config) -> list[Config]:
 
 
 def _plain_edge_deep_ab_stages(state: CuteTcgen05Config, bk: int) -> int:
-    """Deepest AB pipeline that leaves room for the TMA-store epilogue's
-    C ring on the 256x256 cluster_m=2 tile.
-
-    Overflowing the C ring silently demotes the kernel to the much slower
-    all-SIMT store (ab=6 fits bare AB at bk=64 but not AB + C, and
-    measures far below ab=5 + TMA store), so walk down from the bare-AB
-    maximum until AB + C fits.
+    """Deepest AB pipeline whose TMA-store C ring the AB-gate budget also
+    holds (``c_stages_fits``) on the 256x256 cluster_m=2 tile: the measured
+    seed depth (bf16 5000^3: ab=5 with the TMA store, against the all-SIMT
+    store an overflowing C ring took). The arena model
+    (``output_edge_tma_store_smem_fits``) admits the TMA store one stage
+    deeper on some of these shapes; the seed keeps the measured depth.
     """
     ab_stages = smem.max_ab_stages_that_fit(
         state,
@@ -2504,7 +2639,7 @@ def autotune_seed_configs(state: CuteTcgen05Config) -> list[Config]:
             # 934 vs 898; fp16 16384^3 899 vs 881).
             clc_n2_seed_config: dict[str, Any] = dict(plain_clc_seed.config)
             clc_n2_seed_config["tcgen05_cluster_n"] = 2
-            clc_n2_seed_config["l2_groupings"] = [8]
+            clc_n2_seed_config["l2_groupings"] = [TCGEN05_CLUSTER_N2_SEED_L2_GROUPING]
             seeds.append(Config(**clc_n2_seed_config))
     # An expanded K ceiling must not evict earlier/default geometries'
     # pipeline/aux placement. Rebuild each family at each K tile so its
@@ -2519,7 +2654,7 @@ def autotune_seed_configs(state: CuteTcgen05Config) -> list[Config]:
             if alternate_n2 is not None:
                 clc_n2 = dict(alternate_clc.config)
                 clc_n2["tcgen05_cluster_n"] = 2
-                clc_n2["l2_groupings"] = [8]
+                clc_n2["l2_groupings"] = [TCGEN05_CLUSTER_N2_SEED_L2_GROUPING]
                 seeds.append(Config.from_dict(clc_n2))
     plain_m_pair_seed = _plain_m_pair_seed_config(state)
     if plain_m_pair_seed is not None:
@@ -2569,12 +2704,41 @@ def autotune_seed_configs(state: CuteTcgen05Config) -> list[Config]:
 
 
 def dense_aligned_n_seed_configs(state: CuteTcgen05Config) -> list[Config]:
+    dense_facts = state.dense_gemm_facts
+    sixteen_bit = facts._dense_aligned_n_sixteen_bit(state)
     seeds: list[Config] = [
         Config.from_dict(values | {"tcgen05_ab_stages": depth})
         for width in ALIGNED_N_CHOICES
         for values, plan in facts._dense_aligned_n_width_plans(state, width)
-        for depth in dict.fromkeys((min(2, plan.max_ab_stages), plan.max_ab_stages))
+        for depth in dict.fromkeys(
+            (plan.max_ab_stages,)
+            if sixteen_bit
+            else (min(2, plan.max_ab_stages), plan.max_ab_stages)
+        )
     ]
+    if sixteen_bit:
+        # Tall 16-bit GEMMs read every A row block once per N tile; the
+        # grouped persistent raster keeps a band of them L2-resident.
+        # 25216x768x768 at width 192: grouping 2 0.93, 8 0.96, 16 1.00 of
+        # cuBLAS; 32768x768x768: 8 0.98, 16 0.96.
+        assert dense_facts is not None
+        if (
+            dense_facts.shape[0]
+            >= TCGEN05_ALIGNED_N_TALL_PAIR_ROWS * TCGEN05_TWO_CTA_BLOCK_M
+            and "persistent_interleaved" in state.allowed_pid_types
+        ):
+            seeds.extend(
+                Config.from_dict(
+                    seed.config
+                    | {
+                        "pid_type": "persistent_interleaved",
+                        "l2_groupings": [group],
+                    }
+                )
+                for seed in tuple(seeds)
+                for group in TCGEN05_ALIGNED_N_TALL_L2_GROUPINGS
+            )
+        return seeds
     # Preserve the ranked normal-store prefix exactly. Direct stores use
     # the same conservative allocation bound and append only after their
     # complete graph/geometry proof succeeds.

@@ -33,6 +33,7 @@ from ..device_ir import RootGraphInfo
 from ..host_function import HostFunction
 from ..output_header import get_needed_import_lines
 from .host_zero_fills import lower_host_zero_fills
+from .phase_load_policies import project_load_policies
 from .state import cute_env_state
 from .tcgen05_config import facts
 from .tcgen05_constants import TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
@@ -145,6 +146,28 @@ def _stage_config(
     *,
     releases_dependents_at_entry: bool = False,
 ) -> Config:
+    from .cute_mma_dag import MMA_DAG_KEYS
+
+    # Ordinary materialized stages need no MMA owner or ambient environment.
+    # Even inactive MMA fields are projected when present, so siblings never
+    # inherit another phase's ownership-specific options.
+    if any(key in config.config for key in MMA_DAG_KEYS):
+        spec = CompileEnvironment.current().config_spec
+        mma_phase = spec.cute_mma_dag_phase_index
+        if mma_phase is not None:
+            from .autotune.mma_dag_surface import _normalize_mma_dag_owned_fields
+
+            config = copy.deepcopy(config)
+            if stage_index != mma_phase:
+                for key in MMA_DAG_KEYS:
+                    config.config.pop(key, None)
+            elif config.get("cute_mma_dag", "off") != "off":
+                policies = config.get("load_eviction_policies")
+                if isinstance(policies, list):
+                    config.config["load_eviction_policies"] = project_load_policies(
+                        policies, spec.cute_mma_dag_phase_eviction_map
+                    )
+                _normalize_mma_dag_owned_fields(spec, config.config)
     pointwise = stage_index in plan.pointwise_region_indices
     project_ffi = pointwise and config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
     has_region_stages = any(
@@ -257,7 +280,9 @@ def _stage_config(
     return result
 
 
-def _region_graph_ids(graphs: list[GraphInfo], root_id: int) -> frozenset[int]:
+def _region_graph_ids(
+    graphs: list[GraphInfo], root_id: int, *, allow_conditionals: bool = False
+) -> frozenset[int]:
     pending = [root_id]
     result: set[int] = set()
     while pending:
@@ -265,7 +290,16 @@ def _region_graph_ids(graphs: list[GraphInfo], root_id: int) -> frozenset[int]:
         assert graph_id not in result, "fission regions cannot share nested graphs"
         result.add(graph_id)
         for node in graphs[graph_id].graph.nodes:
-            assert node.target is not _tracing_ops._if
+            if node.target is _tracing_ops._if:
+                assert allow_conditionals, "unproved conditional fission region"
+                for child_id, slot in ((node.args[1], 3), (node.args[2], 4)):
+                    assert isinstance(child_id, int)
+                    captures = node.args[slot]
+                    assert isinstance(captures, (tuple, list))
+                    assert len(captures) == len(
+                        list(graphs[child_id].graph.find_nodes(op="placeholder"))
+                    ), "conditional capture arity changed"
+                    pending.append(child_id)
             if _tracing_ops.is_for_loop_target(node.target) or node.target in (
                 _reduce,
                 _associative_scan,
@@ -323,7 +357,10 @@ def _stage_host(
     ir.graphs[ir.root_ids[0]] = dataclasses.replace(root_info, phase_index=0)
     with stage:
         ir.codegen_active_block_ids = active_block_ids(
-            ir.graphs, ir.grid_block_ids[0], CompileEnvironment.current()
+            ir.graphs,
+            ir.grid_block_ids[0],
+            CompileEnvironment.current(),
+            include_literal_slices=True,
         )
     return stage
 
@@ -366,6 +403,7 @@ def generate_materialized_fission(
     store_transform: Callable[..., ast.AST] | None = None,
     load_transform: Callable[..., ast.AST] | None = None,
     extra_params: list[str] | None = None,
+    allow_conditionals: bool = False,
 ) -> ast.Module:
     from ..generate_ast import emit_main_def
     from ..generate_ast import generate_ast
@@ -431,7 +469,11 @@ def generate_materialized_fission(
 
     for stage_index, root in enumerate(roots):
         assert isinstance(root, ast.For)
-        graph_ids = _region_graph_ids(graphs, func.device_ir.root_ids[stage_index])
+        graph_ids = _region_graph_ids(
+            graphs,
+            func.device_ir.root_ids[stage_index],
+            allow_conditionals=allow_conditionals,
+        )
         assert not claimed_graphs.intersection(graph_ids)
         claimed_graphs.update(graph_ids)
         stage = _stage_host(func, root, stage_index, graphs, graph_ids, plan)
@@ -463,6 +505,17 @@ def generate_materialized_fission(
                 off_config,
                 stage_index,
                 releases_dependents_at_entry=releases_at_entry,
+            )
+        if (
+            stage_index == env.config_spec.cute_mma_dag_phase_index
+            and config.get("cute_mma_dag", "off") != "off"
+        ):
+            # MMA-DAG emits its loads directly, bypassing the ordinary
+            # lowering that advances this global counter. Reserve its slots
+            # so later SIMT stages read their own cache policies. The other
+            # memory counters have no consumers in CuTe's load/store lowering.
+            memory_counters["device_load_index"] += len(
+                env.config_spec.cute_mma_dag_phase_load_slots
             )
         if releases_at_entry:
             # Every launched CTA must release the dependent grid, including

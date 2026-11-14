@@ -31,6 +31,7 @@ from helion.autotuner import kernel_args
 from helion.autotuner.accuracy import assert_close
 from helion.autotuner.benchmark_job import AccuracyCheckJob
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
+from helion.autotuner.input_banks import InputBankError
 from helion.autotuner.kernel_args import PortableFunction
 from helion.autotuner.kernel_args import _clone_args
 from helion.autotuner.kernel_args import make_portable_args
@@ -156,12 +157,9 @@ def test_portable_function_is_a_plain_picklable_record() -> None:
     assert pickle.loads(pickle.dumps(portable[0])) == portable[0]
 
 
-def test_functions_whose_globals_are_not_their_module_are_refused() -> None:
-    # Globals are not shipped: the worker rebuilds the function with the
-    # namespace of ``fn.__module__``.  A ``functools.wraps`` wrapper carries
-    # the wrapped function's module but the decorator's globals (``ALPHA``
-    # here would resolve in the wrong module), an exec-created function has
-    # its own dict; both keep the in-process fallback.
+def test_registered_foreign_globals_preserve_module_metadata() -> None:
+    # A wraps decorator uses its defining module's globals while retaining
+    # the original function's public module/qualname metadata.
     foreign = types.ModuleType("test_kernel_args_portable_foreign")
     exec("def epilogue(acc, tile):\n    return acc", foreign.__dict__)
     sys.modules[foreign.__name__] = foreign
@@ -169,7 +167,12 @@ def test_functions_whose_globals_are_not_their_module_are_refused() -> None:
         wrapped = _decorated(foreign.epilogue)
         assert wrapped.__module__ == foreign.__name__
         assert wrapped.__globals__ is not vars(foreign)
-        assert make_portable_args((torch.ones(1), wrapped)) is None
+        foreign.ALPHA = 17.0
+        (rebuilt,) = _roundtrip((wrapped,))
+        assert rebuilt.__module__ == wrapped.__module__
+        assert rebuilt.__qualname__ == wrapped.__qualname__
+        assert rebuilt.__globals__ is wrapped.__globals__
+        torch.testing.assert_close(rebuilt(torch.ones(1), ()), torch.tensor([ALPHA]))
         # The module-level function itself is portable.
         assert make_portable_args((foreign.epilogue,)) is not None
     finally:
@@ -250,8 +253,15 @@ def test_accuracy_comparison_tolerates_function_leaves() -> None:
         assert_close(
             (torch.ones(2), epilogue), (torch.zeros(2), epilogue), atol=0, rtol=0
         )
-    with pytest.raises(AssertionError, match="(?i)leaf type mismatch"):
-        assert_close((torch.ones(2), epilogue), (torch.ones(2), 3.0), atol=0, rtol=0)
+    for actual, expected, kinds in (
+        (epilogue, 3.0, "actual is function, expected is float"),
+        (3.0, epilogue, "actual is float, expected is function"),
+    ):
+        with pytest.raises(AssertionError, match="(?i)leaf type mismatch") as error:
+            assert_close(
+                (torch.ones(2), actual), (torch.ones(2), expected), atol=0, rtol=0
+            )
+        assert kinds in str(error.value)
 
 
 def test_accuracy_job_checks_mutated_args_around_a_callable() -> None:
@@ -349,6 +359,58 @@ def test_setup_serializes_callable_args_for_the_subprocess() -> None:
         provider._precompile_tmpdir.cleanup()
 
 
+def test_setup_preserves_mixed_dtype_storage_in_args_outputs_and_closures() -> None:
+    allocation = torch.arange(256, dtype=torch.uint8)
+    cache = allocation.view(torch.int8).as_strided((4, 16), (32, 1), 8)
+    scales = allocation.as_strided((4, 4), (32, 2), 24)
+    epilogue = _make_closure(scales, 1.0, 1.0)
+    args = (cache, scales, cache, epilogue)
+    provider = _provider_for_setup(args)
+    provider._baseline_output = (cache, scales)
+    provider._baseline_post_args = args
+    provider.mutated_arg_indices = [0]
+    provider.setup()
+    try:
+        assert not provider._args_unpicklable
+        assert provider._precompile_args_path is not None
+        assert provider._precompile_baseline_path is not None
+        assert provider._precompile_baseline_post_args_path is not None
+        for path, loader, expected_length in (
+            (provider._precompile_args_path, kernel_args.load_trusted_kernel_args, 4),
+            (
+                provider._precompile_baseline_path,
+                benchmark_job._load_trusted_baseline_output,
+                2,
+            ),
+            (
+                provider._precompile_baseline_post_args_path,
+                benchmark_job._load_trusted_baseline_output,
+                4,
+            ),
+        ):
+            loaded = loader(path)
+            assert len(loaded) == expected_length
+            for original, restored in zip(args[:expected_length], loaded, strict=True):
+                if isinstance(original, torch.Tensor):
+                    torch.testing.assert_close(original, restored)
+                    assert restored.stride() == original.stride()
+                    assert restored.storage_offset() == original.storage_offset()
+            assert (
+                loaded[0].untyped_storage()._cdata == loaded[1].untyped_storage()._cdata
+            )
+            if expected_length == 4:
+                assert loaded[0] is loaded[2]
+                # The closure must refer to the very same restored scale tensor.
+                assert any(
+                    cell.cell_contents is loaded[1] for cell in loaded[3].__closure__
+                )
+        provider.log.warning.assert_not_called()
+    finally:
+        kernel_args.load_trusted_kernel_args.cache_clear()
+        benchmark_job._load_trusted_baseline_output.cache_clear()
+        provider._precompile_tmpdir.cleanup()
+
+
 def test_setup_serializes_the_baseline_post_args_of_a_mutating_kernel() -> None:
     # An in-place kernel with an epilogue (``matmul(x, y, out, epilogue=...)``):
     # the baseline's post-call arguments hold the same function leaf as the
@@ -418,3 +480,185 @@ def test_setup_keeps_the_in_process_fallback_for_other_unpicklable_args() -> Non
         provider.log.warning.assert_called_once()
     finally:
         provider._precompile_tmpdir.cleanup()
+
+
+@dataclasses.dataclass
+class _ProviderCallbackHolder:
+    callback: object
+
+
+def _provider_default_callback(value=None):
+    return value
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_provider_saves_picklable_callback_parent_state(wrapped, monkeypatch, tmp_path):
+    tensor = torch.arange(3, dtype=torch.float32)
+    if wrapped:
+        foreign = types.ModuleType("test_provider_foreign_callbacks")
+        foreign.tensor = tensor
+        exec("def epilogue(value=tensor):\n    return value", foreign.__dict__)
+        original = foreign.epilogue
+        callback = _decorated(original)
+        foreign.epilogue = callback
+        foreign.ALPHA = 17.0
+        monkeypatch.setitem(sys.modules, foreign.__name__, foreign)
+        factor = ALPHA
+    else:
+        original = _provider_default_callback
+        monkeypatch.setattr(original, "__defaults__", (tensor,))
+        callback = original
+        factor = 1.0
+    assert pickle.loads(pickle.dumps(callback)) is callback
+    provider = object.__new__(LocalBenchmarkProvider)
+    provider.log = Mock()
+    args = (tensor, callback, [callback], _ProviderCallbackHolder(callback))
+    path = str(tmp_path / "provider.pt")
+    assert provider._save_kernel_args(args, path) is None
+    monkeypatch.setattr(original, "__defaults__", (torch.full((3,), 99.0),))
+    try:
+        loaded = kernel_args.load_trusted_kernel_args(path)
+        private = kernel_args.load_private_kernel_args(path, 0)
+        for actual in (loaded, private):
+            value, fn, container, holder = actual
+            assert fn is container[0] is holder.callback
+            assert fn.__module__ == callback.__module__
+            assert fn.__qualname__ == callback.__qualname__
+            assert fn.__globals__ is callback.__globals__
+            inner = (
+                dict(zip(fn.__code__.co_freevars, fn.__closure__, strict=True))[
+                    "fn"
+                ].cell_contents
+                if wrapped
+                else fn
+            )
+            assert inner.__defaults__[0] is value
+            torch.testing.assert_close(fn(), tensor * factor)
+        private[0].add_(5)
+        torch.testing.assert_close(private[1](), (tensor + 5) * factor)
+        torch.testing.assert_close(loaded[1](), tensor * factor)
+        torch.testing.assert_close(tensor, torch.arange(3, dtype=torch.float32))
+    finally:
+        kernel_args.load_private_kernel_args.cache_clear()
+        kernel_args.load_trusted_kernel_args.cache_clear()
+
+
+def test_provider_rejects_picklable_unregistered_globals(monkeypatch, tmp_path):
+    module = types.ModuleType("test_provider_unregistered_namespace")
+    namespace = {"__name__": module.__name__}
+    exec("def callback(value=3):\n    return value", namespace)
+    module.callback = namespace["callback"]
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    callback = module.callback
+    assert pickle.loads(pickle.dumps(callback)) is callback
+    provider = object.__new__(LocalBenchmarkProvider)
+    provider.log = Mock()
+    provider._input_bank_count = 1
+    path = str(tmp_path / "unsupported.pt")
+    error = provider._save_kernel_args((callback,), path)
+    assert isinstance(error, Exception)
+    assert "globals" in str(error)
+    assert not os.path.exists(path)
+    provider._benchmark_in_process(error)
+    assert provider._args_unpicklable
+    provider.log.warning.assert_called_once()
+
+
+def test_provider_preserves_ordinary_save_without_callbacks(tmp_path):
+    provider = object.__new__(LocalBenchmarkProvider)
+    provider.log = Mock()
+    args = (torch.arange(3), {"scale": 2})
+    path = str(tmp_path / "ordinary.pt")
+    with patch("helion.autotuner.benchmark_provider.save_tensor_tree") as save:
+        assert provider._save_kernel_args(args, path) is None
+    save.assert_called_once_with(args, path)
+
+
+@pytest.mark.parametrize("banks", [1, 2])
+@pytest.mark.parametrize("error_type", [TypeError, AttributeError])
+def test_setup_propagates_unexpected_callback_conversion_errors(banks, error_type):
+    provider = _provider_for_setup((torch.ones(2), _provider_default_callback))
+    provider._input_bank_count = banks
+    error = error_type("callback conversion defect")
+    try:
+        with (
+            patch(
+                "helion.autotuner.benchmark_provider._make_portable_args",
+                side_effect=error,
+            ),
+            patch("helion.autotuner.benchmark_provider.save_tensor_tree") as save,
+            pytest.raises(error_type) as raised,
+        ):
+            provider.setup()
+        assert raised.value is error
+        save.assert_not_called()
+        assert not provider._args_unpicklable
+        assert provider._precompile_args_path is None
+        provider.log.warning.assert_not_called()
+    finally:
+        provider._precompile_tmpdir.cleanup()
+
+
+@pytest.mark.parametrize("banks", [1, 2])
+def test_setup_handles_anticipated_unsupported_callback_graphs(banks):
+    provider = _provider_for_setup((torch.ones(2), _provider_default_callback))
+    provider._input_bank_count = banks
+    error = kernel_args._NotPortable("unsupported callback globals")
+    try:
+        with (
+            patch(
+                "helion.autotuner.benchmark_provider._make_portable_args",
+                side_effect=error,
+            ),
+            patch("helion.autotuner.benchmark_provider.save_tensor_tree") as save,
+        ):
+            if banks == 1:
+                provider.setup()
+                assert provider._args_unpicklable
+                provider.log.warning.assert_called_once()
+                assert "subprocess" in provider.log.warning.call_args.args[0]
+            else:
+                with pytest.raises(InputBankError, match="subprocess") as raised:
+                    provider.setup()
+                assert raised.value.__cause__ is error
+                assert not provider._args_unpicklable
+                provider.log.warning.assert_not_called()
+        save.assert_not_called()
+        assert provider._precompile_args_path is None
+    finally:
+        provider._precompile_tmpdir.cleanup()
+
+
+@pytest.mark.parametrize(
+    "error_type", [pickle.PicklingError, TypeError, AttributeError]
+)
+def test_provider_keeps_expected_tensor_file_serialization_failures(
+    error_type, tmp_path
+):
+    provider = _provider_for_setup((torch.ones(2),))
+    error = error_type("cannot serialize argument")
+    with patch(
+        "helion.autotuner.benchmark_provider.save_tensor_tree", side_effect=error
+    ):
+        assert (
+            provider._save_kernel_args(provider.args, str(tmp_path / "args.pt"))
+            is error
+        )
+
+
+def test_seven_field_portable_payload_still_uses_its_module_globals():
+    portable = PortableFunction(
+        __name__,
+        _module_level.__qualname__,
+        _module_level.__name__,
+        kernel_args.marshal.dumps(_module_level.__code__),
+        None,
+        None,
+        None,
+    )
+    # Old pickle instance state has no optional globals namespace field.
+    vars(portable).pop("globals_module", None)
+    (rebuilt,) = resolve_portable_args(pickle.loads(pickle.dumps((portable,))))
+    assert rebuilt.__module__ == __name__
+    assert rebuilt.__globals__ is _module_level.__globals__
+    torch.testing.assert_close(rebuilt(torch.ones(1), ()), torch.tensor([ALPHA]))

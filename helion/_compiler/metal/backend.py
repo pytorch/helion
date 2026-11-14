@@ -9,6 +9,7 @@ from typing import Any
 from typing import ClassVar
 from typing import Sequence
 
+import sympy
 import torch
 
 from ... import exc
@@ -27,13 +28,12 @@ if TYPE_CHECKING:
     import ast
     from collections.abc import Callable
 
-    import sympy
     from torch._inductor.ops_handler import OpsHandler
 
     from ...runtime.config import Config
     from ...runtime.kernel import BoundKernel
-    from ..aten_lowering import Lowering
     from ..autotuner_heuristics.registry import AutotunerHeuristicType
+    from ..compile_environment import BlockSizeInfo
     from ..compile_environment import CompileEnvironment
     from ..device_function import Argument
     from ..device_function import DeviceFunction
@@ -49,22 +49,33 @@ if TYPE_CHECKING:
     InductorOpOverrides = OpsHandler[Any]
 
 
-def _reduction_contracted(block_id: int) -> bool:
-    """Whether a reduction combines values across *block_id*.
+def _contracted_reduction_blocks(device_ir: DeviceIR) -> set[int]:
+    """Blocks contracted by the original facts or the current lowered graph.
 
-    Read from the occurrence-built kernel facts: the reduction roller also
-    tags slice-only dimensions with reduction loops, so loop structure
-    cannot tell them apart.
+    Read both the original occurrence facts and the lowered reductions. A
+    synthetic broadcast can acquire a reduction block during rolling, after
+    the original fact recorded its registered tile block. Slice-only blocks
+    have no reduction lowering and must not gain a fold.
     """
     from ..compile_environment import CompileEnvironment
-    from .padded_twin import padded_twins
+    from ..inductor_lowering import ReductionLowering
 
     reductions = CompileEnvironment.current().config_spec.reduction_kernel_fact
     # Built for every kernel before codegen, empty when it has no reductions.
     assert reductions is not None
+    return {reduction.block_id for reduction in reductions.reductions} | {
+        lowering.block_index
+        for graph in device_ir.graphs
+        for node in graph.graph.nodes
+        if isinstance(lowering := node.meta.get("lowering"), ReductionLowering)
+    }
+
+
+def _reduction_contracted(block_id: int, contracted: set[int]) -> bool:
+    from .padded_twin import padded_twins
+
     # A twin's reductions run on its owner's lanes (``MetalPaddedTwinStrategy``).
-    blocks = {block_id, *padded_twins(block_id)}
-    return any(reduction.block_id in blocks for reduction in reductions.reductions)
+    return not contracted.isdisjoint((block_id, *padded_twins(block_id)))
 
 
 def threadgroup_budget(config: Config, device_ir: DeviceIR | None = None) -> int:
@@ -107,11 +118,42 @@ def indexed_reduction_blocks(device_ir: DeviceIR) -> set[int]:
     }
 
 
+def static_extent(size: object, config: Config | None = None) -> int | None:
+    """*size* as an int if codegen knows it: a literal, or a SymInt with no
+    free symbols left (a dim ``hl.specialize`` pinned under dynamic shapes).
+    With a config, also resolve registered block sizes; never use size hints.
+    """
+    from ..device_function import substitute_configured_block_sizes
+
+    if isinstance(size, int):
+        return size
+    if isinstance(size, torch.SymInt):
+        expr = size.node.expr
+        if not expr.free_symbols:
+            return int(size)
+        if config is not None and isinstance(expr, sympy.Expr):
+            expr = substitute_configured_block_sizes(expr, config)
+            if isinstance(expr, sympy.Integer):
+                return int(expr)
+    return None
+
+
+def _reduction_extent(
+    info: BlockSizeInfo, config: Config, rolled: int | None = None
+) -> tuple[int, bool]:
+    """Selected extent and whether the persistent extent is statically known."""
+    fixed = static_extent(info.size, config)
+    extent = rolled if rolled is not None else fixed
+    if extent is None:
+        extent = int(info.size_hint())
+    return extent, fixed is not None
+
+
 def _lane_floor(config: Config, device_ir: DeviceIR | None = None) -> int:
     """The fewest threads at which every persistent reduction dim fits its
     lane form beside the root tiles that walk no lanes: a fold walks at most
-    ``MAX_LANE_COPIES`` lanes, while an argmin/argmax and a symbolic
-    (non-int) extent walk none."""
+    ``MAX_LANE_COPIES`` lanes, while an argmin/argmax and an extent codegen
+    doesn't know (``static_extent``) walk none."""
     from torch._inductor.runtime.runtime_utils import next_power_of_2
 
     from ..compile_environment import CompileEnvironment
@@ -128,6 +170,7 @@ def _lane_floor(config: Config, device_ir: DeviceIR | None = None) -> int:
     else:
         scalar_dots = scalar_contraction_blocks(device_ir.graphs, live=False)
     indexed = indexed_reduction_blocks(device_ir)
+    contracted: set[int] | None = None
     # A literal-size root tile has no num_threads: it runs one thread per
     # element whatever the budget (_config_with_reduction_thread_budget).
     tunable = set(env.config_spec.num_threads.valid_block_ids())
@@ -147,11 +190,14 @@ def _lane_floor(config: Config, device_ir: DeviceIR | None = None) -> int:
             is not None
         ):
             continue  # a rolled chunk steps by its threads (create_reduction_strategy)
-        extent = int(info.size_hint())
-        if not isinstance(info.size, int) or block_id in indexed:
+        extent, fixed = _reduction_extent(info, config)
+        if not fixed or block_id in indexed:
             floor *= next_power_of_2(max(1, extent))
-        elif _reduction_contracted(block_id) or block_id in scalar_dots:
-            floor *= next_power_of_2(max(1, -(-extent // MAX_LANE_COPIES)))
+        else:
+            if contracted is None:
+                contracted = _contracted_reduction_blocks(device_ir)
+            if _reduction_contracted(block_id, contracted) or block_id in scalar_dots:
+                floor *= next_power_of_2(max(1, -(-extent // MAX_LANE_COPIES)))
     return floor
 
 
@@ -235,6 +281,8 @@ def _config_fixed_scalars() -> set[str]:
 
 class MetalBackend(Backend):
     """Metal Shading Language (MSL) code generation backend for macOS."""
+
+    _pre_inductor_squeeze = True
 
     def autotuner_heuristics(self) -> tuple[AutotunerHeuristicType, ...]:
         from .row_reduction_heuristic import MetalRowReductionHeuristic
@@ -456,15 +504,6 @@ class MetalBackend(Backend):
         # ``static_cast<T>(x)``), which is not Python.
         return convert(parse_msl_expression(text))
 
-    def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
-        from ..aten_lowering import squeeze_lowering
-
-        if node.target in (torch.ops.aten.squeeze.default, torch.ops.aten.squeeze.dims):
-            # Same semantics as squeeze.dim; routed before Inductor turns them
-            # into a ReinterpretView, which Helion's Inductor lowering refuses.
-            return squeeze_lowering
-        return None
-
     def full_expr(
         self, shape_dims: list[str], value_expr: str, dtype: torch.dtype
     ) -> str:
@@ -522,12 +561,14 @@ class MetalBackend(Backend):
         from ..compile_environment import CompileEnvironment
         from .free_arange import check_free_lanes
         from .free_arange import plan_free_aranges
+        from .literal_dims import reject_literal_dims
         from .mpp_matmul import plan_mpp_matmuls
         from .positional_rebind import reject_positional_rebinds
         from .reduction import plan_reduced_tile_axes
         from .repeated_blocks import plan_repeated_blocks
 
         reject_positional_rebinds(graphs)
+        reject_literal_dims(graphs, config)
         plan_repeated_blocks(graphs, tile_strategy)
         plan_reduced_tile_axes(graphs, tile_strategy)
         self._tid_axes = set()
@@ -770,6 +811,7 @@ class MetalBackend(Backend):
         from torch._inductor.runtime.runtime_utils import next_power_of_2
 
         from ..compile_environment import CompileEnvironment
+        from ..host_function import HostFunction
         from ..reduction_strategy import LoopedReductionStrategy
         from ..reduction_strategy import PersistentReductionStrategy
         from ..reduction_strategy import ReductionStrategy
@@ -787,9 +829,11 @@ class MetalBackend(Backend):
                     "(reduction_loops=None)",
                 )
             return MetalPaddedTwinStrategy(fn, block_id, owner)
+        extent: int | None = None
         if reduction_loop is None:
             size = CompileEnvironment.current().block_sizes[block_id].size
-            if isinstance(size, torch.SymInt) and size.node.expr.free_symbols:
+            extent = static_extent(size, fn.config)
+            if isinstance(size, torch.SymInt) and extent is None:
                 raise exc.BackendUnsupported(
                     self.name,
                     f"a ':' dimension of runtime extent {size}: Metal fixes the "
@@ -823,7 +867,9 @@ class MetalBackend(Backend):
 
         env = CompileEnvironment.current()
         if isinstance(strategy, PersistentReductionStrategy):
-            covered = env.block_sizes[block_id].size_hint()
+            covered = (
+                extent if extent is not None else env.block_sizes[block_id].size_hint()
+            )
             what = f"persistent reduction over {covered} elements"
             hint = (
                 "the tile axes left too few threads for it; give the reduction "
@@ -842,14 +888,17 @@ class MetalBackend(Backend):
 
         needed = self.static_rdim_size(covered)
         if needed > span:
-            size = env.block_sizes[block_id].size
-            if isinstance(strategy, MetalPersistentReductionStrategy) and isinstance(
-                size, int
+            if (
+                isinstance(strategy, MetalPersistentReductionStrategy)
+                and extent is not None
             ):
                 # Lanes cover the real extent: covering its power-of-two
                 # padding would only add fully masked lanes.
-                strategy.serialize_lanes(size)
-                if _reduction_contracted(block_id):
+                strategy.serialize_lanes(extent)
+                if _reduction_contracted(
+                    block_id,
+                    _contracted_reduction_blocks(HostFunction.current().device_ir),
+                ):
                     strategy.fold_lanes()
                 return strategy
             raise exc.BackendUnsupported(
@@ -1157,9 +1206,11 @@ class MetalBackend(Backend):
         from ..host_function import HostFunction
 
         env = CompileEnvironment.current()
-        device_ir = device_ir or HostFunction.current().device_ir
+        if device_ir is None:
+            device_ir = HostFunction.current().device_ir
         budget = threadgroup_budget(config, device_ir)
         indexed = indexed_reduction_blocks(device_ir)
+        contracted: set[int] | None = None
         reserved = 1
         for block_size_info in env.block_sizes:
             if not block_size_info.reduction:
@@ -1168,19 +1219,19 @@ class MetalBackend(Backend):
             rolled = env.config_spec.reduction_loops.config_get(
                 config.reduction_loops, block_id, None
             )
-            extent = int(rolled if rolled is not None else block_size_info.size_hint())
+            extent, fixed = _reduction_extent(block_size_info, config, rolled)
             # A rolled chunk steps by its threads (create_reduction_strategy), a
             # persistent dim walks lanes only over a static extent, and an
             # argmin/argmax has no lane form.
-            can_lane = (
-                rolled is not None or isinstance(block_size_info.size, int)
-            ) and block_id not in indexed
+            can_lane = (rolled is not None or fixed) and block_id not in indexed
             full = next_power_of_2(max(1, min(extent, budget)))
             if not combined or not can_lane:
                 reserved *= full
                 continue
+            if contracted is None:
+                contracted = _contracted_reduction_blocks(device_ir)
             if (
-                not _reduction_contracted(block_id)
+                not _reduction_contracted(block_id, contracted)
                 and block_id not in self._scalar_contraction_blocks
             ):
                 # A sliced dimension walks lanes as a tile does and takes what

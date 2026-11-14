@@ -14,6 +14,7 @@ import pytest
 import torch
 
 import helion
+from helion import exc
 from helion._compiler.cute.cache_policy_loads import _CUTE_NC_L2_FIRST_HELPERS
 from helion._compiler.cute.cutedsl_compat import (
     fixed_l2_evict_last_store_policy_supported,
@@ -69,6 +70,24 @@ def _rows_through_asm(
             pack=1,
         )
         output[row, column] = copied.view(torch.float32).to(output.dtype)
+    return output
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _pointwise_through_asm(
+    x: torch.Tensor, output: torch.Tensor, is_pure: hl.constexpr
+) -> torch.Tensor:
+    for tile in hl.tile(x.size(0)):
+        data = x[tile].to(torch.float32)
+        copied = hl.inline_asm_elementwise(
+            "mov.b32 $0, $1;",
+            "=r,r",
+            [data.view(torch.int32)],
+            dtype=torch.int32,
+            is_pure=is_pure,
+            pack=1,
+        )
+        output[tile] = copied.view(torch.float32).to(output.dtype)
     return output
 
 
@@ -139,8 +158,35 @@ def test_only_scalar_pure_inline_asm_keeps_the_readonly_load(is_pure: bool) -> N
     # Assembly the scalar-arithmetic proof cannot read might store anywhere.
     x = torch.empty((128, 32), dtype=torch.bfloat16)
     output = torch.empty((128, 32), dtype=torch.float8_e4m3fn)
+    if not is_pure:
+        # Per-column effect count is not a proof that an opaque epilogue leaves
+        # another column's reloaded input unchanged. No snapshot schedule has
+        # been proved for this epilogue; the pointwise test below still checks
+        # opaque assembly's read-only-load refusal in a supported schedule.
+        with pytest.raises(exc.BackendUnsupported, match="inline assembly"):
+            _generate(_rows_through_asm, (x, output, is_pure), _row_config(16))
+        return
     code = _generate(_rows_through_asm, (x, output, is_pure), _row_config(16))
     assert (f"{_NC_32B}(x.iterator" in code) is is_pure, code
+    assert f"is_pure={is_pure}" in code, code
+
+
+@pytest.mark.parametrize("is_pure", [True, False])
+def test_only_pure_pointwise_assembly_keeps_the_readonly_load(is_pure: bool) -> None:
+    x = torch.empty(512, dtype=torch.bfloat16)
+    output = torch.empty_like(x)
+    config = helion.Config(
+        block_sizes=[256],
+        num_threads=[32],
+        cute_vector_widths=[8],
+        load_eviction_policies="nc_l2_first",
+    )
+    code = _generate(_pointwise_through_asm, (x, output, is_pure), config)
+    assert (f"{_NC_16B}(x.iterator" in code) is is_pure, code
+    if not is_pure:
+        assert _NC_16B not in code and _NC_32B not in code, code
+        assert "cute.arch.load(x.iterator" in code, code
+    assert f"is_pure={is_pure}" in code, code
 
 
 def test_misaligned_input_view_keeps_the_ordinary_32_byte_load() -> None:

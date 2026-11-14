@@ -240,6 +240,7 @@ def test_row_tiles_take_the_row_program(head_dim: int) -> None:
             "cute_flash_kv_stage",
             "cute_flash_gate_warpgroups",
             "cute_flash_gated_row_warps",
+            "cute_compiler_pipeline",
         ]
         code = bound.to_code(_row_config(16, 16, 2, 4))
         assert ROW_KIND in code

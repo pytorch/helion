@@ -425,21 +425,7 @@ def match_flash_row_epilogue(
         return const(arg)
 
     def _operands(node: Node) -> tuple[str, ...]:
-        """Operands of a lowered pointwise node.
-
-        ``inductor_lowering.strip_unused_inputs`` masks every repeated operand
-        after its first occurrence with ``None`` (``x * x`` becomes
-        ``mul(x, None)``); the masked operand is the node's unique tensor input.
-        """
-        nodes = {arg for arg in node.args if isinstance(arg, Node)}
-        resolved = []
-        for arg in node.args:
-            if arg is None:
-                if len(nodes) != 1:
-                    raise _Unsupported
-                arg = next(iter(nodes))
-            resolved.append(_operand(arg))
-        return tuple(resolved)
+        return tuple(_operand(arg) for arg in node.args)
 
     try:
         output = visit(store.args[2])

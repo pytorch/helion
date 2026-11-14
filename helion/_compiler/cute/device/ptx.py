@@ -518,6 +518,26 @@ ldg_s32_pred = ptx_op(
     doc="``ld.global.s32`` under ``pred`` (0 when it is 0).",
 )
 
+ldg_s8_pred = ptx_op(
+    "ldg_s8_pred",
+    "{ .reg .pred p; setp.ne.s32 p, $2, 0; mov.s32 $0, 0; @p ld.global.s8 $0, [$1]; }",
+    (cutlass.Int64, cutlass.Int32),
+    (cutlass.Int32,),
+    side_effects=True,
+    memory=True,
+    doc="One signed byte widened to int32 under pred (zero when false).",
+)
+
+ldg_u8_pred = ptx_op(
+    "ldg_u8_pred",
+    "{ .reg .pred p; setp.ne.s32 p, $2, 0; mov.u32 $0, 0; @p ld.global.u8 $0, [$1]; }",
+    (cutlass.Int64, cutlass.Int32),
+    (cutlass.Uint32,),
+    side_effects=True,
+    memory=True,
+    doc="One unsigned byte widened to uint32 under pred (zero when false).",
+)
+
 ldg_b32_pred = ptx_op(
     "ldg_b32_pred",
     "{ .reg .pred p; setp.ne.s32 p, $2, 0; mov.b32 $0, 0; @p ld.global.b32 $0, [$1]; }",
@@ -678,8 +698,8 @@ l2_policy_evict_last = ptx_op(
     memory=False,
     doc=(
         "``createpolicy.fractional.L2::evict_last``: the cache-policy word of "
-        "the hinted operand packets (``cp_async_16_l2``), created once per "
-        "kernel."
+        "hinted operand packets (``cp_async_16_l2``) and TMA loads. Callers "
+        "may reuse the word across multiple issues."
     ),
 )
 
@@ -833,6 +853,16 @@ round_bf16_f32 = ptx_op(
         "``cvt.rn.bf16.f32`` the DSL's cast emits runs on the conversion "
         "unit (``F2F``, the MIO queue) and its widening is a shift behind it."
     ),
+)
+
+add_bf16x2 = ptx_op(
+    "add_bf16x2",
+    "add.rn.bf16x2 $0, $1, $2;",
+    (cutlass.Int32, cutlass.Int32),
+    (cutlass.Int32,),
+    side_effects=False,
+    memory=False,
+    doc="Packed BF16 add of two b32 registers, rounding each sum.",
 )
 
 mul_bf16x2 = ptx_op(

@@ -168,6 +168,73 @@ of overrun, together at most a quarter of the budget but never less than
 the phase's smallest plan) and the phase is sized to the time left (see
 [Settings](api/settings.md)).
 
+An explicit benchmark error or timeout during the primary thermal warmup,
+screen or steady rounds makes that finalist ineligible for fallback, even if
+it had a finite search measurement. If no eligible configuration remains,
+autotuning raises `NoConfigFound` instead of returning a configuration that
+failed final selection. This applies to every backend. An unavailable reading
+without an explicit failure still permits the search-best fallback when no
+finalist has complete steady readings. Failure in a secondary timing regime
+does not by itself discard an eligible primary-regime result.
+For benchmark providers, `None` denotes an unavailable reading;
+`IsolatedBenchmarkFailure("error")` and `IsolatedBenchmarkFailure("timeout")`
+denote explicit failures. Retaining their earlier samples for diagnostics does
+not make those failed candidates eligible for selection.
+
+### Rotating benchmark inputs
+
+`autotune_benchmark_input_banks=N` (or
+`HELION_AUTOTUNE_BENCHMARK_INPUT_BANKS=N`) uses independent, alias-preserving
+argument banks in the isolated CUDA benchmark worker. The default is one bank.
+For multiple banks, every sample times a complete cycle and reports milliseconds
+per call. `HELION_BENCHMARK_CUDAGRAPH=1` is required.
+
+With `HELION_AUTOTUNE_L2_FLUSH=replay`, each complete cycle starts after an L2
+clear. To measure a resident cycle instead, set `HELION_AUTOTUNE_L2_FLUSH=0`,
+`HELION_AUTOTUNE_FINAL_L2_FLUSH=0`, and `HELION_AUTOTUNE_TARGET_REGIME=0`.
+The resident graph runs one complete untimed cycle immediately before the timed
+cycle, with no L2 clear. Both cycles retain their outputs and count toward the
+memory budget. The primer invokes the kernel normally, including any mutations;
+bank cloning separates arguments between banks and benchmark jobs, not between
+successive calls within one bank. Per-call flushing remains unsupported for
+multiple banks, and final selection requires an explicit matching target regime.
+
+This option does not change the default timer or existing replay behavior.
+Resident bank searches have separate cache identities. Saved configurations
+remain valid, but older replay-only autotune cache entries are invalidated by
+the clone-semantics version described below. Bank count and cache regime are
+part of the measurement objective and should match the intended workload.
+
+These timing-policy cache identities apply to all kernels using input banks,
+not only attention kernels. Non-attention kernels with an explicitly changed
+final-selection policy also get distinct local and AOT cache identities.
+The clone-semantics version invalidates older loose local, remote and AOT
+autotune cache entries across backends, including one-bank searches. Those
+entries may have been validated with changed metadata identity or incorrect
+callback tensor aliases. Version `input_clone.v6` also detects writes to tensors
+held only in function closures and defaults, keeps candidate storage private,
+and checks those operands after each call. Shared closure cells remain shared
+within each private copy and across serialization to the benchmark worker,
+including callbacks connected only through those cells. Unrelated callbacks
+retain their identity during private copying. This version applies even with
+a custom accuracy checker; `AccuracyCheck` itself uses version 3.
+Alias-preserving copies use the callback's original argument position before
+creating input banks. AOT users may need to regenerate their tuning data. Saved
+`Config` syntax, equality and loading remain unchanged, as do explicitly fixed
+configurations and the timing/search policy itself.
+
+Benchmark argument files are private, trusted worker messages. The parent and
+worker must use matching Helion versions for the cell records in new payloads.
+The reader still accepts older closure-value payloads, but those files do not
+contain the cell identities needed to recover sharing. Direct recursive
+function closures and empty closure cells retain the in-process fallback.
+
+If optional private finalist copies exhaust the bank memory budget, the worker
+logs the reason and restarts the entire selection phase once without those
+copies. Readings from the abandoned phase are discarded. An unsupported timing
+context remains an error; a memory-budget failure is reported as resource
+exhaustion rather than API misuse.
+
 ### Initial Population Strategies
 
 The initial population strategy determines how the autotuner generates
@@ -649,6 +716,12 @@ def routed_my_kernel(x, y):
 input types. You can pre-compile as many configs as you need using
 `BoundKernel.compile_config`.  **Warning:** `kernel.bind()` specializes,
 and the result will only work with the same input types you passed.
+
+The callable returned by `compile_config` does not rebind its arguments. Manual
+routing must preserve all specialization facts, including storage-disjointness
+predicates when the compiler reorders input loads around output stores. Call the
+`Kernel` or configured `BoundKernel` when these relationships can change: their
+dispatch guards select a separately compiled binding for overlapping inputs.
 
 - With `static_shapes=True` (default) the bound kernel only works for the
 exact shape/stride signature of the example inputs.  The generated code

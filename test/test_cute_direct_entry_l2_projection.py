@@ -35,7 +35,9 @@ def _metadata(
     monkeypatch.setattr(
         seeds, "full_tile_direct_entry_seed_eligible", lambda state: True
     )
-    monkeypatch.setattr(seeds, "full_tile_direct_entry_seed_bk", lambda state: 128)
+    monkeypatch.setattr(
+        seeds, "full_tile_direct_entry_seed_pipeline", lambda state: (128, 3, 2)
+    )
     monkeypatch.setattr(
         facts, "_matmul_seed_block_sizes", lambda state, **kwargs: [256, 256, 128]
     )

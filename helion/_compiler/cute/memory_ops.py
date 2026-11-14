@@ -513,15 +513,13 @@ def cute_known_multiple(env: CompileEnvironment, extent: object, multiple: int) 
 def stores_into_input_storage(
     graphs: Sequence[GraphInfo], env: CompileEnvironment
 ) -> bool:
-    """Whether a device store or atomic targets storage owned by a kernel input.
+    """Whether a device store or atomic may target a kernel input's storage.
 
-    A store into a fresh host allocation cannot alias an input, so grid
-    kernels that only write such outputs need no storage-overlap dispatch
-    guards.  Writing into an external tensor (an ``out`` argument or a view
-    of one) does: vector memory passes move input loads across that store
-    only under a cache-specialized disjointness proof.
+    Only stores with entirely proved fresh origins can skip storage-overlap
+    dispatch guards. A host join can include an input despite its synthetic
+    storage. Unknown or invalidated origins also require registration, but
+    registering a guard cannot repair invalidated provenance.
     """
-    input_storages = {id(tensor.untyped_storage()) for tensor in env.input_sources}
     for graph_info in graphs:
         for node in graph_info.graph.nodes:
             if node.op != "call_function" or (
@@ -532,11 +530,10 @@ def stores_into_input_storage(
             if not isinstance(target, torch.fx.Node):
                 continue
             value = target.meta.get("val")
-            if (
-                isinstance(value, torch.Tensor)
-                and id(value.untyped_storage()) in input_storages
-            ):
-                return True
+            if isinstance(value, torch.Tensor):
+                origins = env.tensor_storage_provenance(value)
+                if not origins or any(not fresh for _storage, fresh in origins):
+                    return True
     return False
 
 

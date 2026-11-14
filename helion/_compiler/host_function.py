@@ -3,6 +3,8 @@ from __future__ import annotations
 import ast
 import contextlib
 import dataclasses
+import math
+import struct
 import sys
 import threading
 import typing
@@ -12,7 +14,10 @@ from typing import Protocol
 
 import sympy
 import torch
+from torch._inductor.codegen.simd import constant_repr
 from torch._inductor.codegen.wrapper import pexpr
+from torch.utils._sympy.interp import sympy_interp
+from torch.utils._sympy.reference import PythonReferenceAnalysis
 from torch.utils._sympy.symbol import SymT
 from torch.utils._sympy.symbol import symbol_is_type
 
@@ -31,6 +36,7 @@ if TYPE_CHECKING:
     import inspect
     import types
 
+    from ..runtime.config import Config
     from .device_ir import DeviceIR
     from .source_location import SourceLocation
     from .type_info import TypeInfo
@@ -40,6 +46,22 @@ if TYPE_CHECKING:
 
 
 tls: _TLS = typing.cast("_TLS", threading.local())
+
+
+class _ScalarReferenceAnalysis(PythonReferenceAnalysis):
+    @staticmethod
+    def int_truediv(a: int, b: int) -> float:
+        # Older PyTorch versions inherit the symbolic implementation here.
+        # Concrete config arithmetic must retain Python scalar result types.
+        return a / b
+
+    @staticmethod
+    # The inherited symbolic return annotation does not describe concrete evaluation.
+    # pyrefly: ignore [bad-override]
+    def trunc_to_int(x: float, dtype: torch.dtype) -> int:
+        # The inherited implementation returns a SymPy integer even for a
+        # concrete selection; code generation requires a Python scalar.
+        return int(x)
 
 
 class GlobalImport(NamedTuple):
@@ -59,6 +81,44 @@ class GlobalImport(NamedTuple):
         if self.alias is not None:
             return f"import {self.module} as {self.alias}"
         return f"import {self.module}"
+
+
+def _torch_literal(value: object) -> str | None:
+    if type(value) is torch.dtype:
+        return str(value)
+    if type(value) is torch.device:
+        return f"torch.device({str(value)!r})"
+    return None
+
+
+def _portable_default_expr(value: object, host: HostFunction) -> ast.expr | None:
+    """Emit captured immutable values, never the user's default-expression AST."""
+    if type(value) is float:
+        return typing.cast(
+            "ast.expr", expr_from_string(host._float_literal_expr(value))
+        )
+    if type(value) in (type(None), bool, int, str, bytes):
+        return ast_extension.create(ast.Constant, value=value)
+    if (literal := _torch_literal(value)) is not None:
+        return typing.cast("ast.expr", expr_from_string(literal))
+    if type(value) is complex:
+        # repr(complex) can lose signed-zero components when parsed as arithmetic.
+        # This built-in conversion uses the captured components, not a user call.
+        return typing.cast(
+            "ast.expr",
+            expr_from_string(
+                "complex({real}, {imag})",
+                real=expr_from_string(host._float_literal_expr(value.real)),
+                imag=expr_from_string(host._float_literal_expr(value.imag)),
+            ),
+        )
+    if type(value) is tuple:
+        parts = [_portable_default_expr(item, host) for item in value]
+        if all(part is not None for part in parts):
+            return ast_extension.create(
+                ast.Tuple, elts=typing.cast("list[ast.expr]", parts), ctx=ast.Load()
+            )
+    return None
 
 
 class SymbolOrigin(NamedTuple):
@@ -318,11 +378,67 @@ class HostFunction:
             for symbol in expr.free_symbols
         )
 
-    def sympy_expr(self, expr: sympy.Expr) -> str:
+    def resolve_tunable_expr(
+        self, expr: sympy.Expr, config: Config
+    ) -> sympy.Expr | int | float | bool:
+        """Substitute config values whose declarations have no host origin."""
+        replacements: dict[sympy.Symbol, int | float | bool] = {}
+        for (name, _), value in CompileEnvironment.current().tunable_values.items():
+            symbol = value._sympy_()
+            if symbol in self.expr_to_origin or expr.free_symbols.isdisjoint(
+                symbol.free_symbols
+            ):
+                continue
+            selected = config[name]
+            assert isinstance(selected, (int, float, bool))
+            if expr == symbol:
+                # A direct read uses the selected scalar, even when the
+                # default was Boolean and its symbol is encoded as Eq(u, 1).
+                return selected
+            if isinstance(value, torch.SymBool):
+                # PyTorch represents a fresh symbolic bool as Eq(u, 1), with
+                # u in {0, 1}. Substitute u so Ne(u, 1) and other Boolean
+                # expressions use the same selected value as the declaration.
+                (underlying,) = symbol.free_symbols
+                assert symbol == sympy.Eq(underlying, 1)
+                symbol = underlying
+                selected = int(selected)
+            if symbol not in self.expr_to_origin and expr.has(symbol):
+                assert isinstance(symbol, sympy.Symbol)
+                replacements[symbol] = selected
+        if replacements and expr.free_symbols <= replacements.keys():
+            # SymPy numbers cannot represent negative zero. Evaluate a fully
+            # selected expression with Python scalars, including its arithmetic,
+            # before any sympification can discard that sign bit.
+            result = sympy_interp(_ScalarReferenceAnalysis, replacements, expr)
+            assert isinstance(result, (int, float, bool))
+            return result
+        # pyrefly: ignore [bad-return]
+        return (
+            expr.xreplace(
+                {
+                    key: sympy.sympify(value)
+                    for key, value in replacements.items()
+                    # Keep floats symbolic until exact literal printing.
+                    # SymPy can round nonzero values and erase arithmetic
+                    # involving zero, including its observable sign bit.
+                    if not isinstance(value, float)
+                }
+            )
+            if replacements
+            else expr
+        )
+
+    def sympy_expr(self, expr: sympy.Expr, config: Config | None = None) -> str:
         env = CompileEnvironment.current()
         with contextlib.suppress(Exception):
             expr = env.shape_env.simplify(expr)
         expr = env.specialize_expr(expr)
+        if config is not None:
+            resolved = self.resolve_tunable_expr(expr, config)
+            if isinstance(resolved, (int, float, bool)):
+                return constant_repr(resolved)
+            expr = resolved
         if not expr.free_symbols:
             return pexpr(expr)
         if expr in self.expr_to_origin:
@@ -330,27 +446,81 @@ class HostFunction:
         replacements = {}
         for sym in sorted(expr.free_symbols, key=lambda x: x.name):
             assert isinstance(sym, sympy.Symbol)
+            if config is not None and sym not in self.expr_to_origin:
+                selected = self.resolve_tunable_expr(sym, config)
+                assert isinstance(selected, (int, float, bool))
+                replacements[sym] = sympy.Symbol(f"({constant_repr(selected)})")
+                continue
             origin = self.expr_to_origin[sym].origin
             replacements[sym] = sympy.Symbol(origin.host_str(), integer=True)
         # pyrefly: ignore [bad-argument-type]
         return pexpr(expr.xreplace(replacements))
 
-    def literal_expr(self, expr: object) -> str:
+    def literal_expr(self, expr: object, config: Config | None = None) -> str:
+        if (literal := _torch_literal(expr)) is not None:
+            return literal
         if isinstance(expr, (torch.SymInt, torch.SymFloat, torch.SymBool)):
             # SymBool's `_sympy_()` is a boolean, not an Expr that sympy_expr wants.
             # pyrefly: ignore [bad-argument-type]
-            return self.sympy_expr(expr._sympy_())
+            return self.sympy_expr(expr._sympy_(), config)
         if isinstance(expr, sympy.Expr):
-            return self.sympy_expr(expr)
+            return self.sympy_expr(expr, config)
         if isinstance(expr, list):
-            return "[" + ", ".join(self.literal_expr(x) for x in expr) + "]"
+            return "[" + ", ".join(self.literal_expr(x, config) for x in expr) + "]"
         if isinstance(expr, tuple):
             if not expr:
                 return "()"
             if len(expr) == 1:
-                return f"({self.literal_expr(expr[0])},)"
-            return "(" + ", ".join(self.literal_expr(x) for x in expr) + ")"
+                return f"({self.literal_expr(expr[0], config)},)"
+            return "(" + ", ".join(self.literal_expr(x, config) for x in expr) + ")"
         return repr(expr)
+
+    def _float_literal_expr(self, value: float) -> str:
+        if not math.isfinite(value):
+            # repr emits bare nan/inf names; float('nan') also loses its sign
+            # and payload, which are part of the constexpr specialization key.
+            # This is a compiler-owned standard-library import, not a captured
+            # value from the user's module (which standalone export rejects).
+            key = "<float-literal-unpack>"
+            if key not in self.global_imports:
+                code = self.definition.fn.__code__
+                used = {
+                    self.name,
+                    *code.co_varnames,
+                    *code.co_names,
+                    *(item.alias for item in self.global_imports.values()),
+                }
+                alias = "_float_unpack"
+                while alias in used:
+                    alias += "_"
+                self.global_imports[key] = GlobalImport(
+                    struct.unpack, "struct", alias, "unpack"
+                )
+            unpack = self.global_imports[key].alias
+            return f"{unpack}('!d', {struct.pack('!d', value)!r})[0]"
+        return repr(value)
+
+    def constexpr_literal_expr(self, value: object) -> str:
+        """Render a captured host constant without changing custom repr semantics."""
+        if type(value) is float:
+            return self._float_literal_expr(value)
+        if type(value) is tuple:
+            items = ", ".join(self.constexpr_literal_expr(item) for item in value)
+            return f"({items}{',' if len(value) == 1 else ''})"
+        if type(value) is list:
+            return "[" + ", ".join(map(self.constexpr_literal_expr, value)) + "]"
+        if type(value) is dict:
+            return (
+                "{"
+                + ", ".join(
+                    f"{self.constexpr_literal_expr(key)}: {self.constexpr_literal_expr(item)}"
+                    for key, item in value.items()
+                )
+                + "}"
+            )
+        if (literal := _torch_literal(value)) is not None:
+            return literal
+        return repr(value)
 
     def host_debug_str(self) -> str:
         return print_ast(
@@ -377,24 +547,34 @@ class HostFunction:
         extra_params: list[str] | None = None,
         removed_args: set[str] | None = None,
     ) -> ast.FunctionDef:
-        # Rebuild defaults: Python aligns defaults to the *end* of args,
-        # so removing an arg shifts alignment.
-        if removed_args:
-            old_args = self.args.args
-            old_defaults = self.args.defaults
-            n_no_default = len(old_args) - len(old_defaults)
-            new_defaults = [
-                old_defaults[i - n_no_default]
-                for i, a in enumerate(old_args)
-                if a.arg not in removed_args and i >= n_no_default
-            ]
-        else:
-            new_defaults = self.args.defaults
+        positional = [
+            arg
+            for arg in (*self.args.posonlyargs, *self.args.args)
+            if not removed_args or arg.arg not in removed_args
+        ]
+        # Source defaults have already run in the user's module. Replaying their
+        # AST can call constructors again or refer to names absent from this
+        # generated module. Immutable literal values are portable; compile_config
+        # attaches the original evaluated defaults to its private entrypoint.
+        # Python aligns defaults with the trailing positional parameters.
+        new_defaults = []
+        for arg in positional:
+            default = self.params.signature.parameters[arg.arg].default
+            if (expression := _portable_default_expr(default, self)) is not None:
+                new_defaults.append(expression)
+            else:
+                new_defaults.clear()
+        if extra_params:
+            new_defaults.clear()
 
         # Create a new arguments structure with _launcher kwarg-only parameter
         new_args = ast_extension.create(
             ast.arguments,
-            posonlyargs=self.args.posonlyargs,
+            posonlyargs=[
+                a
+                for a in self.args.posonlyargs
+                if not removed_args or a.arg not in removed_args
+            ],
             args=[
                 *(
                     a
@@ -416,7 +596,7 @@ class HostFunction:
                 ),
             ],
             kw_defaults=[
-                *self.args.kw_defaults,
+                *(None for _ in self.args.kwonlyargs),
                 expr_from_string(
                     CompileEnvironment.current().backend.get_launcher_name()
                 ),

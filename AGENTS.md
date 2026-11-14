@@ -129,8 +129,8 @@ runtime uses Triton's launcher. The paths you changed say which lanes matter:
 | --- | --- |
 | one `test/test_*.py` | that module, on the backends it targets |
 | `helion/_compiler/cute/**`, `helion/runtime/cute/**` | the CuTe CPU lane first (no GPU; catches most codegen regressions), then the CuTe GPU lane |
-| `helion/_compiler/triton/**`, `helion/runtime/triton/**` | the Triton and CuTe lanes (CuTe builds on them; Pallas and Metal run only in CI) |
-| `helion/_compiler/{pallas,metal,flydsl}/**`, `helion/runtime/pallas/**` | that backend's suite (`pallas-interpret` locally; the rest in CI) |
+| `helion/_compiler/triton/**`, `helion/runtime/triton/**` | the Triton and CuTe lanes (CuTe builds on them); affected Pallas interpreter and Metal CPU-only checks can also run locally |
+| `helion/_compiler/{pallas,metal,flydsl}/**`, `helion/runtime/pallas/**` | that backend's suite (`pallas-interpret` and Metal CPU-only checks locally; native Metal/MPS and FlyDSL in CI) |
 | core: `helion/_compiler/*.py`, `helion/language/**`, `helion/autotuner/**`, `helion/runtime/*.py`, `helion/_testing/**`, `test/conftest.py` | the Triton and CuTe lanes |
 | `examples/**` | `test/test_examples.py` under the affected backends |
 | `scripts/*.py` | the test modules that name the script (`--changed` finds them) |
@@ -146,17 +146,38 @@ runtime uses Triton's launcher. The paths you changed say which lanes matter:
   with `HELION_TEST_SHARD`), claims its GPUs on the board, reruns failures in
   isolation and ends with a `VERDICT` line; logs and junit files land under
   `.logs/tests/`. `--backend triton,cute -n 2` covers a core change on two GPUs.
+  With empty `CUDA_VISIBLE_DEVICES`, GPU lanes refuse automatic selection;
+  use `--lane cpu` for CPU-only checks. An explicit `--gpus` takes precedence
+  over the environment's GPU selection.
   It refuses GPUs another account has claimed or is using (`--shared` allows
   another account's idle GPU; `--force` overrides, for GPUs you know are
   yours).
+- Tests that launch their own distributed workers can use
+  `scripts/run_tests.py --backend triton --lane gpu --multi-gpu -n 4 test/test_remote_copy.py::TestRemoteCopyGPU`.
+  This claims the complete device set through the board and runs one serial
+  pytest process, with the same visibility for isolation reruns. It requires
+  one backend and at least two GPUs; normal runs keep one pytest job per GPU.
+- On POSIX every runner job keeps its process group until bounded worker
+  cleanup completes; Linux also adopts that job's detached descendants. If
+  cleanup cannot be confirmed, the runner stops and retains its GPU claim
+  until expiry for inspection. An updated board blocks reuse of this claim
+  even by the same session or with `--shared`. Stop, report the error, and
+  inspect remaining processes before reusing any GPU. Once cleanup is
+  confirmed, release the retained claim with
+  `scripts/gpu_board.py release --id CLAIM_ID`. `--force` is a deliberate
+  override, not evidence of cleanup. Older board scripts can read the claim
+  but cannot enforce this added restriction; use the updated script. Expiry
+  does not prove the device is safe to use.
 - The slow tier (`@pytest.mark.slow`) is skipped on pull requests. Run slow
   tests you touched, and when changing autotune search or interpreter-spawning
   code (`--slow`).
 - A failure that passes in isolation is order dependence (usually state hung on
   a cached compiled kernel), not a flake to retry: fix the dependence.
 - Locally runnable backends: `triton`, `cute`, and `pallas-interpret` (CPU,
-  serial, slow). TileIR, Metal, TPU, ROCm and XPU run only in CI; read their job
-  logs rather than guessing.
+  serial, slow). Metal CPU-only codegen and host tests also run locally through
+  `scripts/run_tests.py --backend metal <test paths> -- -m "cpu_only and not cuda" -n 0`.
+  Metal runs serially, so do not pass `--lane`. Native Metal/MPS, TileIR, TPU,
+  ROCm and XPU run only in CI; read their job logs rather than guessing.
 - Never run two suites on one GPU (each sizes itself to fill it), and never edit
   source or rewrite history in a checkout while a run reads it: Helion reads
   kernel source from disk by line number. Long runs belong in a worktree.
@@ -186,11 +207,15 @@ tests and parametrization grids, so new tests must follow these rules:
 - Mark tests that spawn interpreters, run a real autotune search, or need more
   than ~20s with `@pytest.mark.slow`; pull requests skip them.
 - Check `pytest --durations=20 <file>` before landing a new test file.
-- The CuTe CI jobs split test modules across shards by the seconds recorded in
-  `test/shard_durations.json`; re-record a module that is new or changed by
-  more than a minute with `scripts/shard_durations.py` (see its docstring),
-  otherwise it is weighed as the median module; after deleting or renaming a
-  test module, run the script without reports to drop its entry.
+- The CuTe CI jobs balance PR-tier test modules using `test/shard_durations.json`.
+  For modules with tests in the CuTe GPU PR lane (`not slow and (not cpu_only
+  or cuda)`), record new modules and re-record those whose duration changes by
+  more than a minute with `scripts/shard_durations.py` (see its docstring);
+  otherwise a participating module uses the median weight. Omit modules entirely
+  deselected from that lane, including slow-only modules and CPU-only modules without
+  `cuda`-marked tests: marker deselection runs before sharding. Do not add zero
+  placeholders or import CPU-only or slow-run durations. After deleting or
+  renaming a test module, run the script without reports to drop its entry.
 
 ### PyTest Debugging Tips
 
@@ -281,7 +306,7 @@ the pull request description.
 
 - Title: `[area] Imperative summary`, at most about 80 characters. Areas in
   use: `cutedsl`, `autotuner`, `compiler`, `runtime`, `language`, `examples`,
-  `testing`, `ci`, `scripts`, `metal`, `pallas`, `triton`, `benchmarks`, `docs`.
+  `testing`, `ci`, `scripts`, `metal`, `pallas`, `triton`, `autodiff`, `benchmarks`, `docs`.
 - Body: why, then what changed (bullets when there are several things), then a
   `Testing:` paragraph naming the lanes or commands run, the GPUs, the pass and
   fail counts, and anything you could not run. Flag compatibility-relevant
@@ -383,6 +408,9 @@ at effort `xhigh`; `--claude-model`, `--claude-effort`, `--codex-model` and
 A run that fails (a non-zero exit, a reviewer's `ERROR:` line, a timeout) is a
 broken tool: report it rather than skipping the review or reviewing it
 yourself instead.
+A recognized Codex sandbox startup failure is retried once with the same
+settings. `HELION_AUTOREVIEW_TIMEOUT` applies per attempt, so a retry can take
+twice that timeout plus bounded cleanup.
 Either reviewer is enough: when only one of the `claude` and `codex` CLIs is
 installed, the script runs that one and prints a `WARNING` saying so. Tell the
 user in your reply that the review ran with one reviewer.

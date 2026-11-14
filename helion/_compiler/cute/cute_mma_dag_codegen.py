@@ -56,6 +56,7 @@ import ast
 import contextlib
 import functools
 import itertools
+import math
 import textwrap
 from typing import TYPE_CHECKING
 from typing import cast
@@ -104,11 +105,13 @@ from .cute_mma_dag_emitter_base import _TMA_SWIZZLE
 from .cute_mma_dag_emitter_base import Coords
 from .cute_mma_dag_emitter_base import MmaDagEmitterBase
 from .cute_mma_dag_emitter_base import _Evaluator
+from .cute_mma_dag_emitter_base import _float_literal
 from .cute_mma_dag_emitter_base import _frag_dtype
 from .cute_mma_dag_emitter_base import _Hoist
 from .cute_mma_dag_emitter_base import _Lane
 from .cute_mma_dag_emitter_base import _Layout
 from .cute_mma_dag_emitter_base import _Packet
+from .cute_mma_dag_emitter_base import _reduce_combine
 from .cute_mma_dag_emitter_base import _ring_alias
 from .cute_mma_dag_emitter_base import _RingAlias
 from .cute_mma_dag_emitter_base import _shape
@@ -155,6 +158,11 @@ def codegen_mma_dag(cg: GenerateAST) -> bool:
     # This render's exact fp32 widenings (``MmaDagEmitterBase.retyped``): fresh per
     # kernel, the names recur from one render of a bound kernel to the next.
     df.cute_state.root_plans.mma_dag_exact_f32 = {}
+    if plan.attention is not None:
+        from .paged_attention_codegen import codegen_paged_attention
+
+        codegen_paged_attention(cg, plan.attention)
+        return True
     if plan.compute == MMA_DAG_TCGEN05:
         from .cute_mma_dag_tcgen05 import codegen_mma_dag_tcgen05
 
@@ -231,8 +239,8 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
         # L2 cache policy ("evict_last" / "evict_first") -> the register
         # holding its policy word (see ``render``).
         self.policy_vars: dict[str, str] = {}
-        # Loop bounds read from tensors (``program.scalar_loads``) -> the
-        # Int32 holding the value (defined with the root iteration bases).
+        # Uniform tensor loads and composed integer loop bounds, keeping
+        # Int64 width for loads feeding a bound (defined with the root bases).
         self.scalar_vars: dict[Node, str] = {}
         # Global stores deferred past the next fragment loads, each under
         # its row guard (None: unguarded).
@@ -1218,6 +1226,51 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
 
         self.own_packets(tile, body)
 
+    def emit_byte_convert_pass(self, dot: Dot, operand: Operand, stage: str) -> None:
+        """Expand a 16-byte source packet into two packed 16-bit packets."""
+        load = operand.load
+        assert load is not None and load.dtype in (torch.int8, torch.uint8)
+        assert operand.dtype in (torch.float16, torch.bfloat16)
+        assert not operand.transposed_tile
+        tile = self.tiles[(dot.node, operand.role)]
+        raw = tile.raw
+        assert raw is not None
+        smem = tile.base(stage)
+        raw_smem = raw.base(self.raw_stages.get(dot.loop, "0"))
+        self.hoist_scalars(operand.value)
+
+        def body(pk: _Packet) -> None:
+            words = [self.df.new_var("md_w") for _ in range(4)]
+            self.emit(
+                f"{', '.join(words)} = {_RUNTIME}.lds_v4_b32({raw_smem} + {pk.offset(raw.row_bytes)} + {pk.swz} * 16)"
+            )
+            self.set_byte_packet(load, words)
+            packed = []
+            for q in range(8):
+                lanes = tuple(
+                    _Lane(
+                        self.tile_coords(operand, pk.prow, f"({pk.pch} * 16 + {e})"),
+                        e,
+                        None,
+                    )
+                    for e in (2 * q, 2 * q + 1)
+                )
+                values = self.evaluator.unrounded_pair(operand.value, lanes)
+                self.evaluator.element = None
+                values = [
+                    self.masked(dot, operand, lane.coords, value)
+                    for lane, value in zip(lanes, values, strict=True)
+                ]
+                packed.append(self.pack(values[0], values[1], operand.dtype))
+            for half in range(2):
+                dst = _swizzled_chunk(pk.srow, f"({pk.pch} * 2 + {half})", tile.cpr)
+                self.emit(
+                    f"{_RUNTIME}.sts_v4_b32({smem} + {pk.offset(tile.row_bytes)} + {dst} * 16, "
+                    f"{', '.join(packed[4 * half : 4 * half + 4])})"
+                )
+
+        self.own_packets(raw, body)
+
     def emit_convert_pass(self, dot: Dot, operand: Operand, stage: str) -> None:
         """Rewrite the thread's own packets of the raw source tile through
         the operand's pointwise DAG into the operand tile of the other width:
@@ -1226,6 +1279,9 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
         packets (a tf32 operand)."""
         load = operand.load
         assert load is not None
+        if load.dtype in (torch.int8, torch.uint8):
+            self.emit_byte_convert_pass(dot, operand, stage)
+            return
         tile = self.tiles[(dot.node, operand.role)]
         raw = tile.raw
         assert raw is not None
@@ -2608,6 +2664,21 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
             f"{k} < {end}", f"cutlass.Float32({value})", "cutlass.Float32(0.0)"
         )
 
+    def ring_ordinal(
+        self, loop: Loop, ring: list[tuple[_Tile, Access, int]]
+    ) -> str | None:
+        """A bounded ordinal only where a ring slot consumes the wide offset."""
+        stages = self.plan.stages
+        if not ring or stages <= 1 or not self.wide_loop_bounds(loop):
+            return None
+        if loop.index in self.tma_tx and not (
+            stages > 2 and any(tile.is_raw for tile, _load, _pos in ring)
+        ):
+            # TMA already has its own bounded phase count. Only its shorter
+            # raw ring needs a separate ordinal relative to this loop entry.
+            return None
+        return f"md_ring{loop.index}"
+
     def emit_loop(
         self, loop: Loop, region: int, written: set[tuple[object, ...]]
     ) -> None:
@@ -2645,6 +2716,9 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
         )
         if loop.innermost:
             ring = self.ring_items(loop.index)
+            ordinal = self.ring_ordinal(loop, ring)
+            if ordinal is not None:
+                self.emit(f"{ordinal} = cutlass.Int32(0)")
             if ring and self.plan.stages > 1:
                 if (
                     loop.index in self.early_prologues.values()
@@ -2670,6 +2744,20 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
             with self.nest(f"for {var} in cutlass.range({begin}, {end}):"):
                 self.values[loop.index] = var
                 self.emit_iteration(loop, begin, end, ring, body_written)
+                if ordinal is not None:
+                    self.advance_ring_counter(
+                        ordinal,
+                        math.lcm(self.plan.stages, self.plan.stages - 1),
+                    )
+                if loop.index in self.tma_tx:
+                    # Int32 TMA phase count; empty loops consume no slots,
+                    # and the potentially Int64 induction is never narrowed.
+                    count = self.tma_count(loop.index)
+                    if self.wide_loop_bounds(loop):
+                        self.advance_ring_counter(count, 2 * self.plan.stages)
+                    else:
+                        # Preserve the existing static/Int32 loop instruction path.
+                        self.emit(f"{count} = {count} + 1")
                 del self.values[loop.index]
             self.aux_shared_stage.pop(loop.index, None)
             assert self.loop_entries.pop() is entry
@@ -2702,9 +2790,6 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
                     self.sync,
                 ):
                     self.insert_line(entry, line)
-            if loop.index in self.tma_tx:
-                count = self.tma_count(loop.index)
-                self.emit(f"{count} = {count} + ({end} - {begin})")
         else:
             nested = self.early_prologues.get(loop.index)
             if nested is not None and trip_static != 0:
@@ -2797,7 +2882,7 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
         var = self.loop_index_var(loop.index)
         for axis in loop.axes:
             offset = self.axis_offset(axis, var)
-            self.emit(f"{self.axis_base(axis)} = {offset} * {self.plan.size(axis)}")
+            self.emit(f"{self.axis_base(axis)} = {self.axis_product(axis, offset)}")
         self.forget_iteration_bases(loop.index)
 
     def emit_outer_iteration(
@@ -2842,11 +2927,13 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
         self.aux_waited = False
         self.aux_synced = False
         self.raw_stages[index] = "0"
-        offset = f"{var}" if begin == "0" else f"({var} - {begin})"
+        offset = self.ring_ordinal(loop, ring) or (
+            f"{var}" if begin == "0" else f"({var} - {begin})"
+        )
         if index in self.tma_tx:
             # Slot and barrier phase of this iteration from the loop's
             # running count (see ``emit_ring_prologue``).
-            count = f"({self.tma_count(index)} + {offset})"
+            count = self.tma_count(index)
             self.emit(f"{stage} = {count} % {stages}")
             self.tma_parity[index] = self.bind("md_par", f"({count} // {stages}) & 1")
         elif ring and stages > 1:
@@ -3085,6 +3172,7 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
         carry itself) move into the carry's registers for the next
         iteration."""
         program = self.program
+        fragment_copies: list[tuple[str, str]] = []
         for carry in loop.carries:
             out = program.resolve(carry.output)
             if out is carry.placeholder:
@@ -3094,9 +3182,24 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
                 continue
             layout = self.slot_layouts[carry.slot]
             for am, an, j in layout.registers():
-                self.emit(
-                    f"{self.reg(carry.slot, am, an, j)} = {self.reg(source, am, an, j)}"
-                )
+                value = self.bind("md_cnext", self.reg(source, am, an, j))
+                fragment_copies.append((self.reg(carry.slot, am, an, j), value))
+        for target, value in fragment_copies:
+            self.emit(f"{target} = {value}")
+
+        # Read all outputs before overwriting any carry: vector results may
+        # exchange slots, and the assignments must happen simultaneously.
+        vector_copies: list[tuple[str, str]] = []
+        for carry in loop.vec_carries:
+            if carry.identity:
+                continue
+            source = program.vec_leaves[program.resolve(carry.output)]
+            if source != carry.slot:
+                for atom, half in self.vec_regs(carry.slot):
+                    value = self.bind("md_vnext", self.vreg(source, atom, half))
+                    vector_copies.append((self.vreg(carry.slot, atom, half), value))
+        for target, value in vector_copies:
+            self.emit(f"{target} = {value}")
 
     def hoistable_accs(self, loop: Loop) -> list[Dot]:
         """The loop dots whose accumulator may be materialized at the
@@ -3106,6 +3209,7 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
         program = self.program
         result = []
         steps = loop.steps
+        entry_vectors = {carry.placeholder for carry in loop.vec_carries}
         for index, step in enumerate(steps):
             if not isinstance(step, Dot):
                 continue
@@ -3113,6 +3217,15 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
                 result.append(step)
                 continue
             if step.acc_frag not in loop.carry_placeholders:
+                continue
+            if any(
+                program.frag_regions.get(vec, -1) == loop.index
+                and vec not in entry_vectors
+                for vec in step.acc_vecs
+            ):
+                # A vector computed this iteration (e.g. an online softmax
+                # rescale) is unavailable at loop entry, even when its slot
+                # reuses a carry's registers.
                 continue
             if any(
                 access.node in self.ring_aliases
@@ -3175,7 +3288,7 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
         return tuple(coords)
 
     def emit_vec_init(self, loop: Loop) -> None:
-        """Zero the loop's vector carries, or copy an earlier loop's vector
+        """Fill the loop's vector carries, or copy an earlier loop's vector
         carried on into a different slot."""
         for carry in loop.vec_carries:
             if carry.identity:
@@ -3189,16 +3302,19 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
                         )
                 continue
             for atom, half in self.vec_regs(carry.slot):
-                self.emit(f"{self.vreg(carry.slot, atom, half)} = cutlass.Float32(0.0)")
+                self.emit(
+                    f"{self.vreg(carry.slot, atom, half)} = "
+                    f"cutlass.Float32({_float_literal(carry.init_fill)})"
+                )
 
     def emit_reduce(self, step: Reduce) -> None:
-        """Sums of a pointwise value over a fragment along its columns (row
+        """Reductions of a pointwise value over a fragment along its columns (row
         vector) or rows (column vector), or of a vector into a scalar.
 
-        Each lane adds its own registers, the shuffles add the lanes of the
+        Each lane reduces its own registers, the shuffles combine the lanes of the
         warp sharing the result (the quad, xor 1 / 2, for rows; the octet,
         xor 4 / 8 / 16, for columns) and the warps along the other split
-        meet in the scratch tile (one vector per warp, summed in a fixed
+        meet in the scratch tile (one vector per warp, combined in a fixed
         order: launches are bit-identical)."""
         program = self.program
         if step.vec is not None:
@@ -3232,8 +3348,8 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
                 ]
             total = terms[0]
             for term in terms[1:]:
-                total = self.bind("md_s", f"{total} + {term}")
-            shuffle = "lane_group_sum" if rows else "octet_sum"
+                total = self.bind("md_s", _reduce_combine(step.kind, total, term))
+            shuffle = f"{'lane_group' if rows else 'octet'}_{step.kind}"
             args = f"{total}, 4" if rows else total
             partials[(atom, half)] = self.bind("md_s", f"{_RUNTIME}.{shuffle}({args})")
         other = layout.wn if rows else layout.wm
@@ -3259,7 +3375,7 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
                     total = (
                         value
                         if total is None
-                        else self.bind("md_s", f"{total} + {value}")
+                        else self.bind("md_s", _reduce_combine(step.kind, total, value))
                     )
                 assert total is not None
                 partials[(atom, half)] = total
@@ -3270,9 +3386,9 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
             self.emit(f"{self.vreg(step.slot, atom, half)} = {partial}")
 
     def emit_scalar_reduce(self, step: Reduce) -> None:
-        """A vector summed into a scalar: each lane adds its registers, the
+        """A vector reduced into a scalar: each lane combines its registers, the
         lanes of the warp holding distinct elements (the octet for a row
-        vector, the quad for a column vector) add theirs, and the warps
+        vector, the quad for a column vector) combine theirs, and the warps
         along the vector's split meet in the scratch tile."""
         program = self.program
         assert step.vec is not None
@@ -3280,11 +3396,18 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
         layout = self.vec_layouts[source]
         assert layout is not None
         rows = program.vec_slots[source].orient == "rows"
-        regs = [self.vreg(source, atom, half) for atom, half in self.vec_regs(source)]
+        # Preserve the frontend's padding mask on the reduction input. The
+        # source registers can hold non-identity values outside a ragged tile.
+        regs = []
+        for atom, half in self.vec_regs(source):
+            self.evaluator.vec_reg = (atom, half)
+            coords = self.vec_coords(step.value, source, atom, half)
+            regs.append(self.evaluator.evaluate(step.value, coords))
+        self.evaluator.vec_reg = None
         total = regs[0]
         for term in regs[1:]:
-            total = self.bind("md_s", f"{total} + {term}")
-        shuffle = "octet_sum" if rows else "lane_group_sum"
+            total = self.bind("md_s", _reduce_combine(step.kind, total, term))
+        shuffle = f"{'octet' if rows else 'lane_group'}_{step.kind}"
         args = total if rows else f"{total}, 4"
         total = self.bind("md_s", f"{_RUNTIME}.{shuffle}({args})")
         split = layout.wm if rows else layout.wn
@@ -3299,7 +3422,9 @@ class WarpMmaDagEmitter(MmaDagEmitterBase):
             for index in range(split):
                 value = self.bind("md_s", f"{_RUNTIME}.lds_f32({base} + {index * 4})")
                 total = (
-                    value if total is None else self.bind("md_s", f"{total} + {value}")
+                    value
+                    if total is None
+                    else self.bind("md_s", _reduce_combine(step.kind, total, value))
                 )
             self.emit(self.sync)
         self.emit(f"{self.vreg(step.slot, 0, 0)} = {total}")

@@ -16,8 +16,6 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.utils._sympy.functions import FloorDiv
 
-from test.cute_population_contracts import _target
-
 import helion
 from helion import exc
 from helion._compiler.cute.computed_fragment import Fragment
@@ -32,11 +30,77 @@ from helion._testing import skipUnlessCuteAvailable
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_native_compile
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_codegen import tcgen05_target as _target
+from helion._testing.cute_fragment_arena import (
+    resident_while_recurrence as _resident_while_recurrence,
+)
+from helion._testing.cute_fragment_branch_lifetimes import branch_scans
+from helion._testing.cute_fragment_layout import _fragment_singleton_scan
+from helion._testing.cute_fragment_loop_captures import loop_tensor_bound
+from helion._testing.cute_output_addresses import generated_output_address_coverage
+from helion._testing.cute_repeated_axes import full_slice_add
+from helion._testing.cute_repeated_axes import full_slice_row_sum
+from helion._testing.cute_repeated_axes import grid_full_slice_add
+from helion._testing.tunable_fragments import load_host_function
 import helion.language as hl
 from helion.runtime.ref_mode import RefMode
 
 if TYPE_CHECKING:
     from helion._compiler.generate_ast import GenerateAST
+
+
+@pytest.mark.parametrize("size", [16, 40])
+def test_full_slice_pointwise_strided_native_values(size):
+    backing = torch.arange(
+        3 * size * (2 * size + 3), dtype=torch.float32, device=DEVICE
+    ).reshape(3, size, 2 * size + 3)
+    before = backing.clone()
+    x = backing[:, :, 1 : 2 * size + 1 : 2]
+    assert x.shape == (3, size, size) and not x.is_contiguous()
+    bound = full_slice_add.bind((x,))
+    config = bound.config_spec.default_config()
+    assert "fragment_thread" in bound.to_code(config)
+    actual = bound.compile_config(config)(x)
+    torch.testing.assert_close(actual, x + 1.0, rtol=0, atol=0)
+    assert torch.equal(backing, before)
+
+
+@pytest.mark.parametrize("size", [16, 40])
+def test_repeated_axis_row_sum_dynamic_strided_native_values(size):
+    backing = (torch.arange(3 * size * (2 * size + 3), device=DEVICE) % 97 - 48).to(
+        torch.float32
+    ).reshape(3, size, 2 * size + 3) * 0.25
+    x = backing[:, :, 1 : 2 * size + 1 : 2]
+    bound = full_slice_row_sum.bind((x,))
+    assert "input_tensor_metadata" in bound.env.compiler_fact_specialization_facts
+    config = bound.config_spec.default_config()
+    assert "fragment_thread" in bound.to_code(config)
+    compiled = bound.compile_config(config)
+    for increment in (0.0, 0.375):
+        backing.add_(increment)
+        before = backing.clone()
+        actual = compiled(x)
+        torch.testing.assert_close(actual, (x * 2.0).sum(-1), rtol=0, atol=0)
+        assert torch.equal(backing, before)
+
+
+@pytest.mark.parametrize(
+    "threads,register_loads", [(64, False), (256, False), (128, True)]
+)
+def test_grid_full_slice_pointwise_config_native_values(threads, register_loads):
+    backing = torch.arange(3 * 16 * 35, device=DEVICE, dtype=torch.float32).reshape(
+        3, 16, 35
+    )
+    before = backing.clone()
+    x = backing[:, :, 1:33:2]
+    bound = grid_full_slice_add.bind((x,))
+    config = bound.config_spec.default_config()
+    config.config.update(
+        cute_fragment_threads=threads, cute_fragment_register_loads=register_loads
+    )
+    actual = bound.compile_config(config)(x)
+    torch.testing.assert_close(actual, x + 1.0, rtol=0, atol=0)
+    assert torch.equal(backing, before)
 
 
 @helion.kernel(backend="cute", autotune_effort="none")
@@ -86,6 +150,57 @@ def test_static_fragment_axes_transpose_and_loop_carry(size, steps):
     actual, mask = _fragment_recurrence(x, steps)
     torch.testing.assert_close(mask, expected_mask.expand_as(mask))
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_runtime_loop_bounds(
+    x: torch.Tensor, bounds: torch.Tensor, step: hl.constexpr
+):
+    out = torch.empty_like(x)
+    for row in hl.grid(x.size(0)):
+        value = hl.dot(x[row, :, :], x[row, :, :].T)
+        begin = bounds[row, 0] + 1
+        end = torch.minimum(bounds[row, 1], bounds[row, 2])
+        for index in hl.grid(begin, end, step):
+            value = value + x[row, :, :] * (index + 1)
+        out[row, :, :] = value
+    return out
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.parametrize("step", [1, 2])
+def test_fragment_runtime_loop_bounds_native_replay(step):
+    # Both range bounds are tensor-derived recipes. A zero-trip row
+    # and changed metadata on graph replay also rule out evaluating the end
+    # inside the body or caching the first invocation's range.
+    bounds_cpu = torch.tensor([[0, 8, 6], [5, 3, 9], [-1, 7, 5]])
+    bounds = bounds_cpu.to(DEVICE)
+    x = torch.arange(3 * 4 * 4, device=DEVICE).reshape(3, 4, 4).float()
+    bound = _fragment_runtime_loop_bounds.bind((x, bounds, step))
+    config = bound.config_spec.default_config()
+    source = bound.to_code(config)
+    assert "fragment_smem" in source
+    compiled = bound.compile_config(config)
+
+    def reference():
+        factors = [
+            sum(index + 1 for index in range(start + 1, min(end, cap), step))
+            for start, end, cap in bounds_cpu.tolist()
+        ]
+        return (
+            x @ x.transpose(-2, -1)
+            + x * torch.tensor(factors, device=DEVICE)[:, None, None]
+        )
+
+    torch.testing.assert_close(compiled(x, bounds, step), reference(), rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = compiled(x, bounds, step)
+    bounds_cpu.copy_(torch.tensor([[8, 2, 4], [-1, 9, 8], [0, 5, 7]]))
+    bounds.copy_(bounds_cpu)
+    x.add_(1)
+    graph.replay()
+    torch.testing.assert_close(actual, reference(), rtol=0, atol=0)
 
 
 @helion.kernel(backend="cute", autotune_effort="none")
@@ -823,114 +938,6 @@ def test_fragment_dynamic_capacity_replay(kind):
         torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
-def _generated_output_address_coverage(
-    source: str, output_name: str, blocks: int, threads: int
-):
-    tree = ast.parse(source)
-    function = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name.startswith("_helion_")
-    )
-    assignments = {
-        node.targets[0].id: node.value
-        for node in ast.walk(
-            ast.Module(
-                body=[n for n in tree.body if isinstance(n, ast.Assign)]
-                + function.body,
-                type_ignores=[],
-            )
-        )
-        if isinstance(node, ast.Assign)
-        and len(node.targets) == 1
-        and isinstance(node.targets[0], ast.Name)
-    }
-    stores = []
-
-    def visit(node, loops=(), guards=()):
-        if isinstance(node, ast.For):
-            for child in node.body:
-                visit(child, (*loops, node), guards)
-            return
-        if isinstance(node, ast.If):
-            for child in node.body:
-                visit(child, loops, (*guards, node.test))
-            for child in node.orelse:
-                visit(
-                    child,
-                    loops,
-                    (*guards, ast.UnaryOp(op=ast.Not(), operand=node.test)),
-                )
-            return
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "store"
-            and any(
-                isinstance(n, ast.Name) and n.id == output_name
-                for n in ast.walk(node.func.value)
-            )
-        ):
-            stores.append((node.func.value, loops, guards))
-        for child in ast.iter_child_nodes(node):
-            visit(child, loops, guards)
-
-    visit(function)
-    assert len(stores) == 1
-    pointer, loops, guards = stores[0]
-    assert len(loops) == 1
-    loop = loops[0]
-    assert isinstance(loop.target, ast.Name)
-    result = Counter()
-    for block in range(blocks):
-        for thread in range(threads):
-            env = {
-                "cutlass": SimpleNamespace(
-                    Int32=int, Int64=int, Uint32=int, Uint64=int
-                ),
-                "cute": SimpleNamespace(
-                    arch=SimpleNamespace(
-                        thread_idx=lambda thread=thread: (thread, 0, 0),
-                        block_idx=lambda block=block: (block, 0, 0),
-                    )
-                ),
-                "range": range,
-                output_name: SimpleNamespace(
-                    iterator=0, layout=SimpleNamespace(stride=(1,))
-                ),
-            }
-
-            def value(expression, env=env):
-                for node in ast.walk(expression):
-                    if (
-                        isinstance(node, ast.Name)
-                        and isinstance(node.ctx, ast.Load)
-                        and node.id not in env
-                    ):
-                        assert node.id in assignments, node.id
-                        env[node.id] = value(assignments[node.id])
-                return eval(
-                    compile(
-                        ast.fix_missing_locations(ast.Expression(expression)),
-                        "<generated-address>",
-                        "eval",
-                    ),
-                    {"__builtins__": {}},
-                    env,
-                )
-
-            iterations = value(loop.iter)
-            for position in iterations:
-                # Local scalar assignments must be re-evaluated at every loop
-                # iteration; retain only the external primitive environment.
-                for name in assignments:
-                    env.pop(name, None)
-                env[loop.target.id] = position
-                if all(value(guard) for guard in guards):
-                    result[int(value(pointer))] += 1
-    return dict(sorted(result.items()))
-
-
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def _fragment_grid_origin_scan(x: torch.Tensor, begin: hl.constexpr):
     out = torch.full((x.size(0),), -1, dtype=torch.int64, device=x.device)
@@ -959,7 +966,7 @@ def test_fragment_grid_origins_cover_each_output_once(block_rows, begin, mode):
         config.config["block_sizes"][0] = block_rows
         config.config["cute_fragment_scan"] = mode
         source = bound.to_code(config)
-    counts = _generated_output_address_coverage(
+    counts = generated_output_address_coverage(
         source, "out", (37 - begin + block_rows - 1) // block_rows, 128
     )
     assert counts == dict.fromkeys(range(begin, 37), 1)
@@ -1192,6 +1199,9 @@ def _simulate_independent_fragment(source, inputs, outputs, blocks):
     return packets
 
 
+# Width pairs distinguish independent/equal reductions, row offsets exercise
+# scalar versus tensor launch arguments, and row blocks cover predicated tails.
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("widths", [(17, 65), (31, 19), (17, 17)])
 @pytest.mark.parametrize("row_offset", [False, True])
 @pytest.mark.parametrize("block_rows", [1, 4])
@@ -1225,9 +1235,28 @@ def test_independent_full_reduction_fragment_codegen_and_values(
         config.config["block_sizes"][:] = [block_columns, block_rows]
         config.config["reduction_loops"] = [None]
         source = bound.to_code(config)
+        device = next(
+            node
+            for node in ast.parse(source).body
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("_helion_")
+        )
+        launches = []
+
+        def capture_launch(kernel, grid, *args, **kwargs):
+            launches.append(
+                dict(zip((arg.arg for arg in device.args.args), args, strict=True))
+            )
+
+        # Observe the actual host allocation and launch ABI. Layout facts may
+        # conservatively require runtime strides even for a fresh allocation;
+        # the simulator must consume those emitted arguments too.
+        actual = load_host_function(bound, config, capture_launch)(*inputs)
     assert "fragment_max" in source and "fragment_sum" in source
     parts = (value_width + block_columns - 1) // block_columns
-    actual = torch.full((rows, parts), float("nan"))
+    assert actual.shape == (rows, parts)
+    (runtime_args,) = launches
+    assert runtime_args["out"] is actual
+    actual.fill_(float("nan"))
     threshold = stats.amax(-1) + offset
     filtered = torch.where(values >= threshold[:, None], values, 0.0)
     expected = torch.stack(
@@ -1239,8 +1268,8 @@ def test_independent_full_reduction_fragment_codegen_and_values(
     )
     _simulate_independent_fragment(
         source,
-        {"stats": stats, "values": values, "offset": offset},
-        {"out": actual},
+        runtime_args,
+        {},
         ((rows + block_rows - 1) // block_rows) * parts,
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -1539,26 +1568,6 @@ def test_fragment_singleton_view_logical_coordinates(
     )
 
 
-@helion.kernel(backend="cute", autotune_effort="none")
-def _fragment_singleton_scan(x: torch.Tensor, steps: hl.constexpr):
-    out = torch.empty_like(x)
-    for row in hl.tile(x.size(0), block_size=1):
-        value = (x[row, :, :] + 1).transpose(-2, -1)
-        value = value.unsqueeze(-1).squeeze(-1)
-        value = value.unsqueeze(1).unsqueeze(-1).squeeze((1, -1))
-        # Restore the logical shape after testing singleton and non-singleton
-        # last axes. Default squeeze also removes the temporary leading one.
-        shape = value.shape
-        value = value.squeeze(-1).reshape(shape)
-        value = value.unsqueeze(0).squeeze().reshape(shape)
-        value = value.unsqueeze(0).squeeze(0)
-        carry = hl.cumsum(value, dim=-1)
-        for _ in range(steps):
-            carry = hl.cumsum(carry.unsqueeze(-2).squeeze(-2) + 1, dim=-1)
-        out[row, :, :] = carry.transpose(-2, -1)
-    return out
-
-
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def _fragment_singleton_native_path(x: torch.Tensor):
     out = torch.empty_like(x)
@@ -1566,59 +1575,6 @@ def _fragment_singleton_native_path(x: torch.Tensor):
         value = x[row, column].unsqueeze(-1).squeeze(-1)
         out[row, column] = value + 1
     return out
-
-
-@pytest.mark.parametrize("static_shapes", [False, True])
-@pytest.mark.parametrize("steps", [0, 2])
-def test_fragment_singleton_scan_codegen_and_rebind(static_shapes, steps):
-    kernel = helion.kernel(
-        _fragment_singleton_scan.fn,
-        backend="cute",
-        static_shapes=static_shapes,
-        autotune_effort="none",
-        disable_autotuner_heuristics=True,
-    )
-    shapes = [(3, 5, 7), (3, 9, 3), (3, 1, 4)]
-    inputs = [
-        torch.randn(shape).transpose(-2, -1).contiguous().transpose(-2, -1)
-        for shape in shapes
-    ]
-    with (
-        mock_cuda_unavailable(),
-        _target(),
-        forbid_native_compile(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
-        patch("helion.runtime.kernel.target_device_capability", return_value=(10, 0)),
-        patch(
-            "helion._compiler.compile_environment.target_device_capability",
-            return_value=(10, 0),
-        ),
-        patch("helion.runtime.get_num_sm", return_value=148),
-        patch(
-            "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
-            return_value=232448,
-        ),
-    ):
-        bounds = [kernel.bind((value, steps)) for value in inputs]
-        assert len({id(bound) for bound in bounds}) == len(inputs)
-        for value, bound in zip(inputs, bounds, strict=True):
-            assert (
-                kernel.bind((value.clone(memory_format=torch.preserve_format), steps))
-                is bound
-            )
-            if not static_shapes:
-                assert (
-                    "input_tensor_metadata"
-                    in bound.env.compiler_fact_specialization_facts
-                )
-            code = bound.to_code(bound.config_spec.default_config())
-            assert "fragment_index" in code and "SmemAllocator" in code
-        with ExitStack() as stack:
-            for index, bound in enumerate(bounds):
-                stack.enter_context(patch.object(bound, "_run", return_value=index))
-                stack.enter_context(patch.object(bound, "_prepare_direct_call"))
-            for index, value in enumerate(inputs):
-                assert bounds[0](value, steps) == index
 
 
 def test_fragment_singleton_views_alone_preserve_native_codegen():
@@ -2832,6 +2788,7 @@ def _fragment_conditional_cross_branch_capture(x: torch.Tensor, flag: int):
     return out
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("flag", [-1, 1])
 def test_fragment_conditional_cross_branch_capture_preserves_branch_effects(flag):
     x = (torch.arange(3 * 17).reshape(3, 17) % 7).float()
@@ -2859,6 +2816,7 @@ def _fragment_conditional_capture_effects(x: torch.Tensor, flag: int):
     return out, effect
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("flag", [-1, 1])
 def test_fragment_conditional_capture_preserves_all_effects(flag):
     x = (torch.arange(3 * 17).reshape(3, 17) % 7).float()
@@ -2877,6 +2835,32 @@ def test_fragment_conditional_capture_preserves_all_effects(flag):
     torch.testing.assert_close(outputs["effect"], effect, rtol=0, atol=0)
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("escape", [False, True])
+def test_fragment_branch_return_lifetimes_preserve_stores_and_escape(escape):
+    x = (torch.arange(3 * 17).reshape(3, 17) % 7).float()
+    source = _tensor_index_source(branch_scans, (x, 1, escape))
+    for flag in (-1, 1):
+        outputs = {
+            name: torch.full_like(x, -999)
+            for name in ("out", "first_out", "second_out", "third_out")
+        }
+        _simulate_independent_fragment(source, {"x": x, "flag": flag}, outputs, 3)
+        for index, name in enumerate(("first_out", "second_out", "third_out"), 1):
+            expected = torch.cumsum(x + index, -1) if flag > 0 else -index * x
+            torch.testing.assert_close(outputs[name], expected, rtol=0, atol=0)
+        expected = (
+            torch.cumsum(x + 1, -1) + 3
+            if flag > 0 and escape
+            else x + (10 if flag > 0 or not escape else -7)
+        )
+        torch.testing.assert_close(outputs["out"], expected, rtol=0, atol=0)
+    # The capture stays live; branch-local loads/scans can recycle their slots.
+    # An escaping lazy result also retains its first scan until the merge.
+    assert source.count(".allocate_tensor(") <= (6 if escape else 5), source
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("kind", ["missing", "conflicting"])
 def test_fragment_conditional_outer_capture_proof_rejects_invalid_ir(kind):
     original = FragmentCompiler.conditional
@@ -3053,7 +3037,7 @@ def test_free_iota_reduction_complete_producer_values(chunk, reduction, kind):
     _simulate_independent_fragment(source, {"x": x}, {"out": actual}, actual.numel())
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     torch.testing.assert_close(x, before, rtol=0, atol=0)
-    coverage = _generated_output_address_coverage(source, "out", actual.numel(), 128)
+    coverage = generated_output_address_coverage(source, "out", actual.numel(), 128)
     assert coverage == dict.fromkeys(range(actual.numel()), 1)
 
 
@@ -4596,22 +4580,28 @@ def test_fragment_packet_loads_preserves_old_population_rng(strategy_name):
         assert actual[-1]["cute_fragment_packet_loads"] is True
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_fragment_packet_loads_half_types_take_eight_byte_packets(dtype):
-    # Four 16-bit scalars per packet: the same loop body as the fp32 packet
-    # (the DSL's AST preprocessing of its conditionals stays bounded) over an
-    # 8-byte vector copy.
+@pytest.mark.parametrize(
+    "dtype,scalar",
+    [
+        (torch.float16, "cutlass.Float16"),
+        (torch.bfloat16, "cutlass.BFloat16"),
+        (torch.int8, "cutlass.Int8"),
+        (torch.uint8, "cutlass.Uint8"),
+    ],
+)
+def test_fragment_packet_loads_narrow_types_take_four_lane_packets(dtype, scalar):
+    # Four scalars per packet keep the DSL's AST preprocessing bounded.
     with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound = cpu_bind(_fragment_uncached_cheap, (torch.ones(3, 17, dtype=dtype),))
         assert bound.config_spec.cute_fragment_packet_load_root_ids
         config = bound.config_spec.default_config()
         config.config["cute_fragment_packet_loads"] = True
         code = bound.to_code(config)
-    scalar = "cutlass.Float16" if dtype is torch.float16 else "cutlass.BFloat16"
+    packet_bytes = 4 * dtype.itemsize
     assert f"cute.make_rmem_tensor(cute.make_layout((4,)), {scalar})" in code
-    assert ".align(8), cute.make_layout((4,))" in code
+    assert f".align({packet_bytes}), cute.make_layout((4,))" in code
     assert (
-        f"cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), {scalar}, num_bits_per_copy=64)"
+        f"cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), {scalar}, num_bits_per_copy={8 * packet_bytes})"
         in code
     )
     assert "fragment_packet_address % 4 == 0" in code
@@ -4842,83 +4832,6 @@ def test_fragment_packet_shared_address_generated(width, layout, offset):
         if code == codes[1] and layout == "dense" and width == 65 and offset == 0:
             assert stats["vector"] > 0
     torch.testing.assert_close(x, before, rtol=0, atol=0)
-
-
-def _packet_shared_proof_fixture():
-    from helion._compiler.cute.packet_loads import _published_dependencies
-
-    slot = Fragment((), torch.float32, lambda _: "slot[0]", True, storage="slot")
-    view = Fragment((), torch.float32, lambda _: "slot[0]", True, (slot,))
-    # A lazy view is not register-backed: it has transitive shared storage.
-    lazy = Fragment((), torch.float32, lambda _: "slot[0]", dependencies=(slot,))
-    compiler = object.__new__(FragmentCompiler)
-    compiler.thread = "thread"
-    compiler.threads = 128
-    compiler.buffers = [("slot", torch.float32, 1), ("unused", torch.float32, 1)]
-    compiler.scopes = [{"lazy": lazy}]
-    compiler.held = []
-    compiler.pending_local_atomics = set()
-    compiler.cg = SimpleNamespace(
-        statements_stack=[
-            ast.parse(
-                "for owner in range(thread, 1, 128):\n    slot[0] = cutlass.Float32(3)\ncute.arch.sync_threads()\n"
-            ).body
-        ]
-    )
-    return compiler, slot, view, lazy, _published_dependencies
-
-
-def test_fragment_packet_shared_publication_and_transitive_lifetime():
-    compiler, slot, view, lazy, proof = _packet_shared_proof_fixture()
-    assert proof(compiler, (lazy,)) == frozenset({"slot"})
-    assert proof(compiler, (view,)) == frozenset({"slot"})
-    result = Fragment((4,), torch.float32, lambda _: "0")
-    compiler.held.append((result, lazy))
-    compiler.scopes.clear()
-    compiler.smem_bytes = 0
-    selected = compiler.allocate(result)
-    assert selected.storage == "unused" and selected.storage != slot.storage
-    assert compiler.live_buffers() == {"slot"}
-
-
-@pytest.mark.parametrize(
-    "bad",
-    [
-        "pending",
-        "alias",
-        "later_write",
-        "multiple",
-        "missing_publication",
-        "unknown_storage",
-        "register",
-    ],
-)
-def test_fragment_packet_shared_publication_declines(bad):
-    compiler, slot, _view, lazy, proof = _packet_shared_proof_fixture()
-    dependencies = (lazy,)
-    body = compiler.cg.statements_stack[-1]
-    if bad == "pending":
-        compiler.pending_local_atomics.add("slot")
-    elif bad == "alias":
-        body.extend(ast.parse("alias = slot").body)
-    elif bad == "later_write":
-        body.extend(
-            ast.parse(
-                "for owner in range(thread, 1, 128):\n    slot[0] = cutlass.Float32(9)"
-            ).body
-        )
-    elif bad == "multiple":
-        body.extend(
-            ast.parse("slot[0] = cutlass.Float32(9)\ncute.arch.sync_threads()").body
-        )
-    elif bad == "missing_publication":
-        body.pop()
-    elif bad == "unknown_storage":
-        compiler.buffers.clear()
-    else:
-        register = Fragment((), torch.float32, lambda _: "private", True)
-        dependencies = (lazy, register)
-    assert not proof(compiler, dependencies)
 
 
 @pytest.mark.parametrize("index", ["0", "0 * 1", "2 - 2"])
@@ -5445,26 +5358,6 @@ def test_resident_while_plan_rejects_projection_phi_signature(value, change):
         resident_while_plan(call, graphs)
 
 
-@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def _resident_while_recurrence(x, limits, steps: hl.constexpr, capacity: hl.constexpr):
-    out = torch.empty_like(x)
-    counts = torch.empty((x.size(0),), device=x.device, dtype=torch.int32)
-    for row in hl.grid(x.size(0)):
-        lane = hl.arange(capacity)
-        left = hl.load(x, [row, lane], extra_mask=lane < x.size(1))
-        right = left + 1
-        iteration = hl.full([], 0, dtype=torch.int32)
-        limit = limits[row]
-        while iteration < limit:
-            left, right = left + right, left - right
-            for _packet in range(steps):
-                left = torch.gather(left + 1, 0, ((lane * 3 + 1) % x.size(1)).long())
-            iteration = iteration + 1
-        hl.store(out, [row, lane], left + right, extra_mask=lane < x.size(1))
-        counts[row] = iteration
-    return out, counts
-
-
 def _resident_while_codegen(x, limits, steps, threads):
     with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound = cpu_bind(
@@ -5482,6 +5375,7 @@ def _resident_while_codegen(x, limits, steps, threads):
     "width,steps,threads", [(1, 0, 128), (17, 2, 128), (32, 1, 128), (65, 2, 128)]
 )
 @pytest.mark.parametrize("dtype", [torch.int32, torch.float32])
+@pytest.mark.cpu_only
 def test_resident_while_emitted_shared_epochs(width, steps, threads, dtype):
     from test.test_atomic_ops import _simulate_register_load_program
 
@@ -5513,6 +5407,7 @@ def test_resident_while_emitted_shared_epochs(width, steps, threads, dtype):
         assert torch.equal(x, before[0]) and torch.equal(limits, before[1])
 
 
+@pytest.mark.cpu_only
 def test_resident_while_predicate_publication_and_reader_barriers():
     from test.test_atomic_ops import _simulate_register_load_program
 
@@ -7676,3 +7571,19 @@ def test_grid_row_loop_carries_native_values(block_sizes):
     torch.testing.assert_close(
         out, torch.logsumexp(x.float(), dim=-1), rtol=1e-4, atol=1e-4
     )
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+def test_mutable_tensor_bound_native_replay():
+    # One compiled shape replays zero, partial and full bounds in both orders.
+    x = (torch.arange(3 * 17, device=DEVICE).reshape(3, 17) % 5).float()
+    counts = torch.zeros(4, device=DEVICE, dtype=torch.int64)
+    for count in (0, 1, 5, 17, 5, 0):
+        counts[0] = count
+        expected = torch.cumsum(x, dim=-1)
+        for iteration, begin in enumerate(range(0, count, 4)):
+            increment = x[:, begin : min(begin + 4, count)].sum(-1, keepdim=True)
+            expected = torch.cumsum(expected + increment + count + iteration, dim=-1)
+        torch.testing.assert_close(
+            loop_tensor_bound(x, counts), expected, rtol=0, atol=0
+        )

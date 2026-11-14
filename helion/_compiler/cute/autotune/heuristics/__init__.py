@@ -42,6 +42,7 @@ from ..fragment_knobs import CuteFragmentAtomicAggregationHeuristic
 from ..fragment_knobs import CuteFragmentAtomicConsumerFusionHeuristic
 from ..fragment_knobs import CuteFragmentBatchedLoadsHeuristic
 from ..fragment_knobs import CuteFragmentBoundedGatherHeuristic
+from ..fragment_knobs import CuteFragmentHalfMmaHeuristic
 from ..fragment_knobs import CuteFragmentIntegerAtomicEpochsHeuristic
 from ..fragment_knobs import CuteFragmentLocalAtomicRegistersHeuristic
 from ..fragment_knobs import CuteFragmentMmaRowsHeuristic
@@ -71,6 +72,7 @@ from ..fragment_knobs import register_fragment_atomic_consumer_fusion_coverage
 from ..fragment_knobs import register_fragment_batched_loads_coverage
 from ..fragment_knobs import register_fragment_bounded_gather_coverage
 from ..fragment_knobs import register_fragment_cta_topk_coverage
+from ..fragment_knobs import register_fragment_half_mma_coverage
 from ..fragment_knobs import register_fragment_integer_atomic_epochs_coverage
 from ..fragment_knobs import register_fragment_local_atomic_registers_coverage
 from ..fragment_knobs import register_fragment_mma_rows_coverage
@@ -180,6 +182,7 @@ from .cute_split_k_cluster import CuteSplitKClusterHeuristic
 from .cute_split_k_cluster import cluster_carrier
 from .cute_split_k_cluster import register_cluster_coverage
 from .cute_split_k_workspace import CuteSplitKWorkspaceHeuristic
+from .cute_tcgen05_default import CuteTcgen05DefaultTileHeuristic
 from .cute_tcgen05_schedule import CuteTcgen05ScheduleHeuristic
 from .cute_tile_packing import CuteTilePackWarpPerRowHeuristic
 from .cute_topk_coarse_keys import register_topk_coarse_keys_coverage
@@ -220,6 +223,7 @@ _CUTE_HEURISTIC_CLASSES: tuple[AutotunerHeuristicType, ...] = (
     CuteTcgen05ClusterM2FfiHeuristic,
     CuteTcgen05ScheduleHeuristic,
     CuteTcgen05ClusterM2Heuristic,
+    CuteTcgen05DefaultTileHeuristic,
     CuteTcgen05GroupedWorklistHeuristic,
     CuteTcgen05GroupedStaticCommonKHeuristic,
     CuteTcgen05GroupedDynamicBk64Heuristic,
@@ -286,6 +290,7 @@ _CUTE_HEURISTIC_CLASSES: tuple[AutotunerHeuristicType, ...] = (
     CuteFragmentBoundedGatherHeuristic,
     CuteFragmentPureProducerRegionsHeuristic,
     CuteRadixSelectionHeuristic,
+    CuteFragmentHalfMmaHeuristic,
 )
 
 
@@ -741,6 +746,9 @@ def register_coverage_groups(env: CompileEnvironment, device_ir: DeviceIR) -> No
     )
     register_fragment_scan_exports_coverage(env, device_ir)
     register_fragment_warp_producer_regions_coverage(env, device_ir)
+    register_fragment_half_mma_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
     register_radix_selection_coverage(env, device_ir)
 
     register_mxfp8_epilogue_coverage(env)

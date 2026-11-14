@@ -58,8 +58,17 @@ from helion._testing import TestCase
 from helion._testing import cpu_render_target
 from helion._testing import import_example
 from helion._testing import onlyBackends
+from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_pdl import CONTROL_DELAY as _CONTROL_DELAY
+from helion._testing.cute_pdl import PRODUCER_BLOCK as _BLOCK
+from helion._testing.cute_pdl import PRODUCER_GRID as _PRODUCER_GRID
+from helion._testing.cute_pdl import WAIT_CALL as _WAIT
+from helion._testing.cute_pdl import attribute_only_control as _attribute_only_control
+from helion._testing.cute_pdl import kernel_definition as _kernel_def
+from helion._testing.cute_pdl import produce as _produce
+from helion._testing.cute_pdl import triton_kernels as _tk
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 import helion.language as hl
 
@@ -70,7 +79,6 @@ rms_norm_batched = import_example("aot_example").rms_norm_batched
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
-    from types import ModuleType
 
 cutlass = pytest.importorskip("cutlass")
 
@@ -112,7 +120,6 @@ _COLUMN_SUM = {
     "cute_lane_unroll": 8,
 }
 
-_WAIT = "cute.arch.griddepcontrol_wait()"
 _RELEASE = "cute.arch.griddepcontrol_launch_dependents()"
 _ATTRIBUTE = "._helion_cute_use_pdl = True"
 # Attribute names of calls that touch memory or take part in dependent launch.
@@ -150,19 +157,6 @@ def _launch(code: str) -> tuple[str, int]:
         assert isinstance(element, ast.Constant)
         threads *= int(element.value)
     return ast.unparse(call.args[1]), threads
-
-
-def _kernel_def(code: str) -> ast.FunctionDef:
-    """The kernel proper (the module may also hold zero-fill kernels)."""
-    module = ast.parse(code)
-    (kernel,) = [
-        node
-        for node in module.body
-        if isinstance(node, ast.FunctionDef)
-        and any(ast.unparse(d) == "cute.kernel" for d in node.decorator_list)
-        and not node.name.startswith(ZERO_FILL_KERNEL_PREFIX)
-    ]
-    return kernel
 
 
 def _fill_kernels(code: str) -> list[ast.FunctionDef]:
@@ -597,6 +591,7 @@ def test_the_release_knob_rides_on_cute_pdl(cpu_only: None) -> None:
         "none",
         "exit",
         "last_wave",
+        "loader_tail",
     )
     assert spec._flat_fields()["cute_pdl_release"].search_choices == ("auto",)
     # The nested-row seeds turn the knob on, leave the placement to its
@@ -1218,61 +1213,12 @@ _COLUMN = {
 }
 
 
-_PRODUCER_GRID = 128
-_BLOCK = 1024
-# The positive control's producer spins this many rounds ahead of every store
-# (about a millisecond per run) so a dependent launched without the wait is
-# certain to read ``x`` before the producer rewrites it; at the default 64
-# rounds the producer can finish inside the consumer's host launch latency
-# and the control is a coin flip.
-_CONTROL_DELAY = 4096
-
-
-def _tk() -> ModuleType:
-    """The Triton reference kernels, imported on first use: this module is
-    imported by ``test_autotuner_final_preference`` on CPU rows without Triton."""
-    import test._cute_pdl_triton_kernels as kernels
-
-    return kernels
-
-
-def _produce(
-    src: torch.Tensor, dst: torch.Tensor, *, delay: int = 64, release: bool = True
-) -> None:
-    n = dst.numel()
-    programs = (n + _PRODUCER_GRID - 1) // _PRODUCER_GRID
-    per_program = (programs + _BLOCK - 1) // _BLOCK * _BLOCK
-    _tk()._late_writer[(_PRODUCER_GRID,)](
-        src.view(-1),
-        dst.view(-1),
-        n,
-        per_program,
-        delay,
-        RELEASE=release,
-        BLOCK=_BLOCK,
-    )
-
-
 def _build(
     kernel: helion.Kernel, x: torch.Tensor, **config: object
 ) -> tuple[helion.runtime.kernel.BoundKernel, Callable[..., torch.Tensor], str]:
     bound = kernel.bind((x,))
     normalized = bound.config_spec.normalized_config(helion.Config(**config))
     return bound, bound.compile_config(normalized), bound.to_code(normalized)
-
-
-def _attribute_only_control(
-    bound: helion.runtime.kernel.BoundKernel, on: str
-) -> Callable[..., torch.Tensor]:
-    """The knob-on module minus its wait: a programmatic dependent launch
-    that reads its input right away."""
-    lines = on.splitlines()
-    kept = [line for line in lines if _WAIT not in line]
-    assert len(kept) == len(lines) - 1
-    source = "\n".join(kept) + "\n"
-    module = PyCodeCache.load(source)
-    bound.env.backend.annotate_compiled_module(module, source, bound.kernel.name)
-    return getattr(module, bound.kernel.name)
 
 
 def _stale_runs(
@@ -1305,6 +1251,74 @@ def _stale_runs(
 @skipIfNotCUDA()
 @onlyBackends(["cute"])
 class TestCutePdl(TestCase):
+    @skipIfCudaCapabilityLessThan((9, 0), reason="PDL needs sm90")
+    def test_explicit_api_chain_eager_and_graph_replay(self) -> None:
+        @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+        def entry_release(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            hl.pdl_launch_dependents()
+            hl.pdl_wait()
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + 1
+            return out
+
+        @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+        def exit_release(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            hl.pdl_wait()
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + 1
+            hl.pdl_launch_dependents()
+            return out
+
+        x = torch.empty(1 << 18, dtype=torch.float32, device=DEVICE)
+        sources = [torch.full_like(x, value) for value in (3, 17)]
+        references = [source + 1 for source in sources]
+        bound, entry, code = _build(
+            entry_release, x, block_sizes=[256], num_threads=128
+        )
+        _bound, finish, _code = _build(
+            exit_release,
+            x,
+            block_sizes=[256],
+            num_threads=128,
+            cute_pdl=True,
+            cute_pdl_release="entry",
+        )
+        self.assertEqual(
+            _stale_runs(entry, x, sources, references, 8, delay=_CONTROL_DELAY), 0
+        )
+        standalone_code = bound.to_code(
+            helion.Config(block_sizes=[256], num_threads=128),
+            options=helion.OutputCodeOptions(allow_helion_deps=False),
+        )
+        self.assertIn("use_pdl=True", standalone_code)
+        standalone = PyCodeCache.load(standalone_code).entry_release
+        self.assertEqual(
+            _stale_runs(standalone, x, sources, references, 8, delay=_CONTROL_DELAY),
+            0,
+        )
+        # The same programmatic launch without its wait must see stale input:
+        # this proves the delayed producer exercises the dependency edge.
+        control = _attribute_only_control(bound, code)
+        self.assertGreater(
+            _stale_runs(control, x, sources, references, 8, delay=_CONTROL_DELAY), 0
+        )
+        side = torch.cuda.Stream()
+        with torch.cuda.stream(side):
+            _produce(sources[0], x, delay=_CONTROL_DELAY)
+            finish(standalone(x))
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            _produce(sources[0], x, delay=_CONTROL_DELAY)
+            out = finish(standalone(x))
+        for value in (5, 29, -11):
+            sources[0].fill_(value)
+            graph.replay()
+            torch.cuda.synchronize()
+            self.assertTrue(torch.equal(out, torch.full_like(out, value + 2)))
+
     def test_knob_on_matches_knob_off_behind_a_producer_that_releases_at_entry(
         self,
     ) -> None:
@@ -1399,7 +1413,7 @@ class TestCutePdl(TestCase):
         self,
     ) -> None:
         # One CTA sums 2^18 rows of zeros serially (hundreds of microseconds)
-        # on a machine with every other SM idle.  A dependent launched behind
+        # leaving room for a dependent kernel. A dependent launched behind
         # it with ``launch_pdl`` and no wait of its own writes ones over the
         # last rows the moment it is released: at ``entry`` that is while the
         # sum still has those rows ahead of it, so the sum reads them (the
@@ -1428,13 +1442,14 @@ class TestCutePdl(TestCase):
                     BLOCK=_BLOCK,
                     launch_pdl=True,
                 )
-                torch.cuda.synchronize()
                 return out
 
-            # The first call of either kernel compiles on the host, which can
-            # outlast the sum; count only warm launches.
-            run()
-            return sum(int(bool((run() != 0).any())) for _ in range(iterations))
+            # Even warm eager calls can be separated by CPU scheduling long
+            # enough for the reduction to finish before the dependent launches.
+            # Capture both launches so the GPU observes the release ordering
+            # without an intervening host launch gap.
+            replay = _make_cudagraph_replay(run)
+            return sum(int(bool((replay() != 0).any())) for _ in range(iterations))
 
         self.assertEqual(dirty_runs("none"), 0)
         self.assertEqual(dirty_runs("exit"), 0)

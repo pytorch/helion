@@ -21,7 +21,7 @@ from ...device_ir import GraphInfo
 from ...device_ir import ReductionLoopGraphInfo
 from ...device_ir import RootGraphInfo
 from ...host_function import HostFunction
-from ...runtime_tensor_guards import runtime_tensors_are_proven_disjoint
+from ...runtime_tensor_guards import tensors_have_proven_disjoint_storage
 from .ordered_selection import is_ordered_selection
 from .ordered_selection import selection_args
 
@@ -338,16 +338,10 @@ def topk_tensors_are_proven_disjoint(
     for left, right in pairs:
         if left.untyped_storage()._cdata == right.untyped_storage()._cdata:
             return False
-        # Fresh wrapper allocations cannot overlap another live storage.
-        # Distinct runtime StorageImpls are insufficient: DLPack can wrap
-        # the same memory twice. Use the cache-specialized span proof,
-        # which becomes available after structural matching and binding.
-        if (
-            left.untyped_storage() not in env._symbolically_exact_layout_storages
-            and right.untyped_storage() not in env._symbolically_exact_layout_storages
-            and not runtime_tensors_are_proven_disjoint(
-                env, left, right, allow_unbound=allow_unbound
-            )
+        # Synthetic joins may alias an allocation despite distinct fake
+        # storage. Bound input facts must cover every possible origin pair.
+        if not tensors_have_proven_disjoint_storage(
+            env, left, right, allow_unbound=allow_unbound
         ):
             return False
     return True

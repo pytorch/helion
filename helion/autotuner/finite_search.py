@@ -51,8 +51,6 @@ class FiniteSearch(BaseSearch):
             raise exc.NotEnoughConfigs(len(self.configs))
 
     def _algorithm_cache_policy(self) -> dict[str, object] | None:
-        if self._benchmark_provider_cls is not LocalBenchmarkProvider:
-            return None
         return {
             "finite_version": 1,
             "configs": tuple(self.configs),

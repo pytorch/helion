@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import unittest
 
+import pytest
+
 from helion._compiler.cute.passes.pipeline import DEVICE_BODY_PASSES
 from helion._compiler.cute.passes.pipeline import DEVICE_BODY_PROLOGUE
 from helion._compiler.cute.passes.pipeline import KERNEL_DEF_PASSES
 from helion._compiler.cute.passes.pipeline import DeviceBodyPass
 from helion._compiler.cute.passes.pipeline import PassContext
 from helion._compiler.cute.passes.pipeline import _check_pass_order
+
+pytestmark = pytest.mark.cpu_only
 
 # The inline call sequence of ``DeviceFunction.codegen_function_def`` as it was
 # when the pipeline moved to its tables.  Later passes recognize the shapes
@@ -81,6 +85,7 @@ KERNEL_DEF_PASS_NAMES = [
     "validate_thread_axis_accesses",
     "lower_scalar_policy_loads",
     "lower_packet_store_policy",
+    "validate_shared_arenas",
 ]
 
 

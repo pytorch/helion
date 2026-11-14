@@ -100,6 +100,20 @@ def prepare_device_body(
         with SyntheticLocation():
             wait = statement_from_string("cute.arch.griddepcontrol_wait()")
             dependent_launch = [wait]
+            capture_mode = next(
+                (
+                    plan["capture_pdl_mode_param"]
+                    for plan in cute_codegen_state(fn.codegen).wrapper_plans
+                    if "capture_pdl_mode_param" in plan
+                ),
+                None,
+            )
+            if capture_mode is not None:
+                dependent_launch = [
+                    statement_from_string(
+                        f"if {capture_mode} == 0:\n    cute.arch.griddepcontrol_wait()"
+                    )
+                ]
             # Behind the fill kernels of this kernel's own zero fills the
             # wait may move down to the first statement that touches a
             # filled tensor (``_place_late_pdl_wait``, on the lowered
@@ -117,6 +131,10 @@ def prepare_device_body(
                 if fn.cute_state.tcgen05.pdl_entry_wait
                 else fn.config.config.get("cute_pdl_release", CUTE_PDL_RELEASE_DEFAULT)
             )
+            if placement == "loader_tail" and capture_mode is None:
+                # A later effect proof can decline the normalized capture
+                # route. Keep an ordinary entry wait and automatic release.
+                placement = "auto"
             if placement == "auto":
                 placement = _implicit_pdl_release(fn, "entry")
             release = statement_from_string(
@@ -128,6 +146,10 @@ def prepare_device_body(
                 dependent_release = [release]
             elif placement == "last_wave":
                 dependent_launch.extend(_last_wave_release(fn, release))
+            elif placement == "loader_tail":
+                # Only the proved paired body owns this release. Its EARLY
+                # anchor waits before inputs; a late call waits before stores.
+                assert capture_mode is not None
             if late_wait_names:
                 late = LateWait(wait, list(dependent_launch), late_wait_names)
     body = [
@@ -478,9 +500,10 @@ def _implicit_pdl_release(fn: DeviceFunction, default: str) -> str:
     The CTA count is the one the launcher receives: the program-id
     strategy's static grid (``ProgramIDs.static_grid_size``: the sum
     over the roots of a multi-root kernel, the parent of an L2-grouped
-    one, ``num_sm * num_sm_multiplier`` for a persistent one) times the
-    fused-body or split-K grid multiplier and the cluster size.  The resident
-    capacity is the SM count times the CTAs an SM holds, estimated from
+    one, ``num_sm * num_sm_multiplier`` for a persistent one), divided by the
+    paired-attention item group, then times the fused-body or split-K grid
+    multiplier and the cluster size. The resident capacity is the SM count
+    times the CTAs an SM holds, estimated from
     the launch block (``resident_ctas_per_sm``: the thread limit, or
     ``cute_min_blocks_per_mp`` when the config asked for an occupancy).
     A launch shape or SM count codegen cannot know takes ``default``.
@@ -513,9 +536,10 @@ def _pdl_launch_is_persistent(fn: DeviceFunction) -> bool:
 
 def _pdl_launch_ctas(fn: DeviceFunction) -> int | None:
     """The CTA count of this kernel's launch when it is static: the
-    program-id strategy's grid (``ProgramIDs.static_grid_size``) times the
-    fused-body or split-K grid multiplier and the cluster size, or the
-    count a wrapper plan launches (``cute_state.launch_ctas``) where the
+    program-id strategy's grid (``ProgramIDs.static_grid_size``) divided by
+    the attention item group, then times the fused-body or split-K grid
+    multiplier and the cluster size, or the count a wrapper plan launches
+    (``cute_state.lanes.launch_ctas``) where the
     launcher sizes the grid from the plan; ``None`` for a grid the host
     sizes at runtime."""
     if fn.cute_state.lanes.launch_ctas is not None:
@@ -527,6 +551,7 @@ def _pdl_launch_ctas(fn: DeviceFunction) -> int | None:
         return None
     return (
         grid
+        // fn.cute_state.lanes.attention_item_group
         * fn.cute_state.lanes.launch_grid_multiplier
         * max(fn.cute_state.lanes.simt_cluster_n, fn.cute_state.lanes.grid_cluster_n)
     )

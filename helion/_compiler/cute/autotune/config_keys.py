@@ -17,6 +17,10 @@ tables they replaced.
 from __future__ import annotations
 
 from ..block_scaled_config import BLOCK_SCALED_CONFIG_KEYS
+from ..compile_options import (
+    CUTE_COMPILER_PIPELINE_CHOICES as CUTE_COMPILER_PIPELINE_CHOICES,
+)
+from ..compile_options import CUTE_COMPILER_PIPELINE_KEY
 from ..cute_flash import FLASH_CONFIG_KEYS
 from ..cute_mma_dag import MMA_DAG_KEYS
 from ..cute_register_subblocks import KEYS as RSB_KEYS
@@ -123,6 +127,7 @@ CUTE_FRAGMENT_KEYS: tuple[str, ...] = (
     "cute_fragment_scan",
     "cute_fragment_reduction",
     "cute_fp32_dot",
+    "cute_fragment_half_mma",
     "cute_fragment_threads",
     "cute_fragment_register_loads",
     "cute_fragment_producer_cache",
@@ -210,6 +215,7 @@ CUTE_MISC_SCHEDULE_KEYS: tuple[str, ...] = (
     "cute_dot_ring_stages",
     "cute_dot_ring_split",
     "cute_pdl",
+    "cute_pdl_capture_overlap",
     "cute_pdl_release",
     "cute_pdl_spread",
     "cute_warp_aggregated_atomics",
@@ -229,6 +235,7 @@ CUTE_LAUNCH_KEYS: tuple[str, ...] = (
 CUTE_CONFIG_KEYS: frozenset[str] = frozenset(
     {
         "cross_loop_pipeline",
+        CUTE_COMPILER_PIPELINE_KEY,
         *CUTE_TCGEN05_TUNABLE_KEYS,
         *CUTE_TCGEN05_GROUPED_CONFIG_KEYS,
         *CUTE_TCGEN05_CODEGEN_PROOF_CONFIG_KEYS,
@@ -265,6 +272,7 @@ CUTE_DEBUG_KEYS: frozenset[str] = CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS
 CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
     {
         *RADIX_CONFIG_KEYS,
+        CUTE_COMPILER_PIPELINE_KEY,
         "loop_orders",
         "flatten_loops",
         "l2_groupings",

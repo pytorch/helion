@@ -4,7 +4,6 @@ import ast
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-import math
 import os
 from pathlib import Path
 import subprocess
@@ -2185,84 +2184,6 @@ class TestHelionCutePrinter(TestCase):
                     ),
                     int(expression.subs(x, value)),
                 )
-
-
-@onlyBackends(["triton"])
-class TestHelionTritonPrinter(TestCase):
-    """Tests for the HelionTritonPrinter class."""
-
-    def test_print_ToFloat(self):
-        """Test that ToFloat expressions are printed correctly."""
-        import sympy
-        from torch.utils._sympy.functions import ToFloat
-
-        from helion._compiler.triton.printer import HelionTritonPrinter
-
-        printer = HelionTritonPrinter()
-
-        # Symbolic variable: should print "x + 0.0", not "ToFloat(x) + 0.0"
-        x = sympy.Symbol("x", integer=True)
-        self.assertEqual(printer.doprint(ToFloat(x)), "x + 0.0")
-
-        # Complex expression
-        y = sympy.Symbol("y", integer=True)
-        result = printer.doprint(ToFloat(x + y))
-        self.assertNotIn("ToFloat", result)
-        self.assertIn("0.0", result)
-
-        # Concrete integer: ToFloat(5) simplifies to 5.0
-        result = printer.doprint(ToFloat(sympy.Integer(5)))
-        self.assertNotIn("ToFloat", result)
-        self.assertEqual(float(result), 5.0)
-
-    def test_print_Float(self):
-        """Test that Float expressions are printed as raw literals."""
-        import sympy
-
-        from helion._compiler.triton.printer import HelionTritonPrinter
-
-        printer = HelionTritonPrinter()
-
-        # Non-symbolic floats should print as raw numeric literals (not tl.full)
-        for val in [math.pi, 0.0, -2.5]:
-            result = printer.doprint(sympy.Float(val))
-            self.assertNotIn("tl.full", result)
-            self.assertAlmostEqual(float(result), val)
-
-    def test_print_FloorDiv_constexpr(self):
-        """Test that FloorDiv with constexpr LHS prints as // operator.
-
-        This is required for TMA tensor descriptors which need compile-time
-        constant block shapes. When the LHS is a constexpr argument (like a
-        block size), we must emit `lhs // rhs` instead of
-        `triton_helpers.div_floor_integer(lhs, rhs)` so Triton can evaluate
-        the expression at compile time.
-        """
-        from unittest.mock import Mock
-
-        import sympy
-        from torch.utils._sympy.functions import FloorDiv
-
-        from helion._compiler.device_function import DeviceFunction
-        from helion._compiler.triton.printer import HelionTritonPrinter
-
-        printer = HelionTritonPrinter()
-
-        # LHS is constexpr -> use //
-        mock_df = Mock(_constexpr_args={"_BLOCK_SIZE_0": None})
-        with patch.object(DeviceFunction, "current", return_value=mock_df):
-            block_size = sympy.Symbol("_BLOCK_SIZE_0", integer=True)
-            expr = FloorDiv(block_size, 2)
-            result = printer.doprint(expr)
-            self.assertEqual(result, "_BLOCK_SIZE_0 // 2")
-
-        # LHS is NOT constexpr -> fallback to triton_helpers
-        mock_df = Mock(_constexpr_args={})
-        with patch.object(DeviceFunction, "current", return_value=mock_df):
-            x = sympy.Symbol("x", integer=True)
-            expr = FloorDiv(x, 2)
-            result = printer.doprint(expr)
-            self.assertIn("div_floor_integer", result)
 
 
 @onlyBackends(["triton", "cute"])

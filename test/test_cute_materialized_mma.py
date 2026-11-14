@@ -8,7 +8,6 @@ import torch
 
 from test.cute_population_contracts import with_flat_min_blocks_default
 from test.test_cute_full_slice_matmul import _bind
-from test.test_cute_materialized_fission import _se_args
 from test.test_cute_materialized_fission import _sources
 
 import helion
@@ -18,6 +17,7 @@ from helion._compiler.cute.autotune.heuristics.cute_materialized import (
 from helion._compiler.cute.mma_support import CuteMmaSupport
 from helion._testing import cpu_render_target
 from helion._testing import import_example
+from helion._testing.cute_structural_kernels import _se_args
 from helion.autotuner.config_generation import ConfigGeneration
 
 pytestmark = pytest.mark.cpu_only

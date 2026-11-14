@@ -19,12 +19,18 @@ typed ``sum(0).to(dtype)`` recognizer (:func:`sum_cast_value`), the
 temporary-naming helpers and the :class:`HostSumSite` record one guarded
 rewrite is emitted from.  The device kernels stay separate
 (:mod:`helion.runtime.cute.paired_sum`, ``single_sum``, ``full_sum``).
+These runtime helpers choose fixed kernel plans from the actual tensor metadata;
+their calls do not carry a Config or its compiler options. They retain the SDK
+defaults independently of the enclosing generated kernel's pipeline choice.
 """
 
 from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
+from dataclasses import fields
+from dataclasses import is_dataclass
+import operator
 from typing import TYPE_CHECKING
 from typing import cast
 
@@ -182,29 +188,42 @@ def _keyed_expression(
 
 def _keyed_origin(origin: Origin, value: object, host: HostFunction) -> bool:
     """Whether a literal's provenance is a keyed argument or keyed tensor metadata."""
-    keys: list[str] = []
+    projections: list[Origin] = []
     while isinstance(
         origin, (AttributeOrigin, GetItemOrigin, TensorSizeOrigin, TensorStrideOrigin)
     ):
-        if isinstance(origin, AttributeOrigin):
-            keys.append(origin.key)
-        elif isinstance(origin, TensorSizeOrigin):
-            keys.append("size")
-        elif isinstance(origin, TensorStrideOrigin):
-            keys.append("stride")
+        projections.append(origin)
         origin = origin.value
     if not isinstance(origin, ArgumentOrigin):
         return False
     if origin.name in host.constexpr_args:
         return True
     argument = host.params.arguments.get(origin.name)
-    if isinstance(argument, torch.Tensor):
-        # ``x.shape[0]``, ``x.dtype``, ``x.size(0)``; the leading key names the
-        # metadata, deeper keys index it (``shape[0]``) or read its own
-        # attributes (``dtype.itemsize``).
-        return bool(keys) and keys[-1] in _KEYED_TENSOR_ATTRS | _KEYED_TENSOR_METHODS
-    if keys:
-        return isinstance(argument, _KEYED_ARGUMENT_TYPES)
+    for projection in reversed(projections):
+        if isinstance(argument, torch.Tensor):
+            # Tensor keys omit device even when the tensor is a class field.
+            return isinstance(projection, (TensorSizeOrigin, TensorStrideOrigin)) or (
+                isinstance(projection, AttributeOrigin)
+                and projection.key in _KEYED_TENSOR_ATTRS | _KEYED_TENSOR_METHODS
+            )
+        if isinstance(projection, AttributeOrigin):
+            if (
+                is_dataclass(argument)
+                and not isinstance(argument, type)
+                and projection.key in {field.name for field in fields(argument)}
+            ) or (
+                isinstance(argument, tuple)
+                and projection.key in getattr(argument, "_fields", ())
+            ):
+                argument = getattr(argument, projection.key)
+            else:
+                return isinstance(argument, _KEYED_ARGUMENT_TYPES)
+        elif isinstance(projection, GetItemOrigin) and isinstance(
+            argument, (dict, list, tuple)
+        ):
+            argument = operator.getitem(argument, projection.key)
+        else:
+            return False
     return isinstance(value, _KEYED_ARGUMENT_TYPES)
 
 

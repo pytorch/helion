@@ -64,6 +64,7 @@ from .markers import _static_lane_loop_extent
 from .owner_guards import _clone_expr
 from .owner_guards import _clone_stmt
 from .owner_guards import _guard_stmt_with_owner
+from .owner_guards import _has_impure_inline_asm
 from .owner_guards import _has_observable_memory_write
 from .owner_guards import _has_side_effect
 from .owner_guards import _is_persistent_branch_vec_store
@@ -98,6 +99,7 @@ def split_lane_loop_reductions(
     rename_groups: dict[str, str] | None = None,
     running_sums: set[str] | None = None,
     register_tile_options: RegisterTileOptions | None = None,
+    cta_uniform: bool = True,
 ) -> list[ast.AST]:
     """Rewrite single-pass lane loops that contain ``_helion_lane_reduce``
     markers into the two-pass accumulate / finalize / consume structure.
@@ -124,6 +126,7 @@ def split_lane_loop_reductions(
         rename_groups=rename_groups,
         running_sums=running_sums,
         register_tile_options=register_tile_options,
+        cta_uniform=cta_uniform,
     )
     pin_atomics_left_in_lane_loops(result)
     return result
@@ -140,9 +143,18 @@ def _split_lane_loop_reductions(
     rename_groups: dict[str, str] | None = None,
     running_sums: set[str] | None = None,
     register_tile_options: RegisterTileOptions | None = None,
+    cta_uniform: bool = True,
 ) -> list[ast.AST]:
     if not any(_find_lane_reduce_call(stmt) is not None for stmt in body):
         return body
+
+    # A preceding conditional exit can remove CTA participants even when the
+    # snapshot itself is not nested under that condition.
+    cta_uniform = cta_uniform and not any(
+        isinstance(node, (ast.Break, ast.Continue, ast.Return))
+        for stmt in body
+        for node in ast.walk(stmt)
+    )
 
     proven_uniform = set(_CUTE_UNIFORM_GLOBAL_NAMES)
     if uniform_names is not None:
@@ -162,6 +174,7 @@ def _split_lane_loop_reductions(
                 rename_groups or {},
                 running_sums or set(),
                 register_tile_options,
+                cta_uniform,
             )
         )
         _update_proven_uniform_names(stmt, proven_uniform)
@@ -180,6 +193,7 @@ def _split_stmt_lane_reductions(
     rename_groups: dict[str, str],
     running_sums: set[str] | None = None,
     register_tile_options: RegisterTileOptions | None = None,
+    cta_uniform: bool = True,
 ) -> list[ast.AST]:
     # Recurse into any statement-list-bearing fields first so nested lane
     # loops are rewritten before the enclosing one.
@@ -189,6 +203,8 @@ def _split_stmt_lane_reductions(
     exit_definitions = _loop_invariant_scalar_definitions(
         stmt, scalar_definitions, rename_groups
     )
+    child_uniform = cta_uniform and _uniform_lane_scope(stmt, uniform_names)
+    child_names = set(uniform_names)
     for field in ("body", "orelse", "finalbody"):
         old = getattr(stmt, field, None)
         if isinstance(old, list) and all(isinstance(s, ast.stmt) for s in old):
@@ -197,7 +213,7 @@ def _split_stmt_lane_reductions(
                 field,
                 _split_lane_loop_reductions(
                     old,
-                    uniform_names=set(uniform_names),
+                    uniform_names=child_names,
                     proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
                     proven_tensor_stride_values=proven_tensor_stride_values,
                     thread_axis_names=dict(thread_axis_names),
@@ -207,6 +223,7 @@ def _split_stmt_lane_reductions(
                     rename_groups=rename_groups,
                     running_sums=running_sums,
                     register_tile_options=register_tile_options,
+                    cta_uniform=child_uniform,
                 ),
             )
     lane_var = getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None)
@@ -228,6 +245,7 @@ def _split_stmt_lane_reductions(
         rename_groups,
         running_sums,
         register_tile_options,
+        cta_uniform,
     )
 
 
@@ -458,6 +476,292 @@ def _lane_invariant_tail_after_consume(
     return after
 
 
+def _uniform_lane_scope(stmt: ast.AST, uniform_names: set[str]) -> bool:
+    """Whether a nested snapshot barrier is reached by the entire CTA."""
+    from ...ast_read_writes import ReadWrites
+
+    if isinstance(stmt, ast.If):
+        return bool(getattr(stmt, HELION_BLOCK_UNIFORM_ATTR, False)) or (
+            not any(isinstance(node, ast.Call) for node in ast.walk(stmt.test))
+            and all(
+                _is_proven_uniform_name(name, uniform_names)
+                for name in ReadWrites.from_ast(stmt.test).reads
+            )
+        )
+    # An enclosing lane has unsnapshotted elements; a device loop needs a
+    # separate backedge memory-order proof. Neither enters this bounded path.
+    return False
+
+
+def _split_impure_producer(
+    loop: ast.For,
+    lane_var: str,
+    markers: list[tuple[int, _LaneReduceMarker]],
+    impure_indices: set[int],
+    rename_groups: dict[str, str],
+    thread_axis_names: dict[str, frozenset[int]],
+    scalar_definitions: dict[str, ast.AST],
+    *,
+    cta_uniform: bool,
+) -> list[ast.AST] | None:
+    """Snapshot a pure input prefix before a single opaque reduction producer.
+
+    All CTA threads finish their loads before any opaque call can overwrite a
+    later lane's input. Each call then runs once, followed by a second CTA join
+    before the tail may store. Typed constexpr lists retain inputs and live-outs
+    without guessing a scalar or packet dtype. No opaque epilogue,
+    dependent reduction, loop carry, or post-effect memory read is admitted.
+    """
+    from ...ast_read_writes import ReadWrites
+
+    extent = _static_lane_loop_extent(loop)
+    if (
+        not cta_uniform
+        or extent is None
+        or not 1 <= extent <= 256
+        or loop.orelse
+        or len(markers) != 1
+        or len(impure_indices) != 1
+    ):
+        return None
+    marker_index, marker = markers[0]
+    effect_index = next(iter(impure_indices))
+    if effect_index >= marker_index or marker.owner_lane != lane_var:
+        return None
+    body: list[ast.AST] = list(loop.body)
+    effect = body[effect_index]
+    if (
+        assigned_name(effect) is None
+        or not isinstance(effect, ast.Assign)
+        or not isinstance(effect.value, ast.Call)
+        or call_path_str(effect.value.func) != "_cute_inline_asm_elementwise"
+        # The generated operands are materialized scalar values. A nested load
+        # here would bypass the prefix snapshot and run after the CTA join.
+        or len(effect.value.args) != 1
+        or not isinstance(effect.value.args[0], ast.Tuple)
+        or not all(
+            isinstance(operand, (ast.Name, ast.Constant))
+            for operand in effect.value.args[0].elts
+        )
+        or sum(
+            _has_impure_inline_asm(node)
+            for node in ast.walk(effect.value)
+            if isinstance(node, ast.Call)
+        )
+        != 1
+    ):
+        return None
+    prefix = body[:effect_index]
+    middle = body[effect_index + 1 : marker_index]
+    tail = body[marker_index + 1 :]
+    dtype = next(kw.value for kw in effect.value.keywords if kw.arg == "dtype")
+    for stmt in (*middle, *tail):
+        for node in ast.walk(stmt):
+            if not isinstance(node, ast.Subscript):
+                continue
+            # Tuple extraction from this assembly result and immutable tensor
+            # layout metadata are known register/host facts. An arbitrary
+            # tensor subscript could instead load shared memory after the write.
+            path = call_path_str(node.value)
+            tuple_result = (
+                isinstance(node.value, ast.Name)
+                and node.value.id == assigned_name(effect)
+                and isinstance(dtype, ast.Tuple)
+                and isinstance(node.slice, ast.Constant)
+                and type(node.slice.value) is int
+                and 0 <= node.slice.value < len(dtype.elts)
+            )
+            metadata = path is not None and path.endswith(
+                (".layout.stride", ".layout.shape")
+            )
+            thread_index = isinstance(node.value, ast.Call) and call_path_str(
+                node.value.func
+            ) in {"cute.arch.thread_idx", "cute.arch.block_idx"}
+            if not (tuple_result or metadata or thread_index):
+                return None
+    if not all(
+        _is_proven_relocatable_assignment(stmt, allow_load=True) for stmt in prefix
+    ):
+        return None
+    if not all(
+        _is_proven_relocatable_assignment(stmt, allow_load=False) for stmt in middle
+    ):
+        return None
+
+    # Single definitions, including the final rename groups, exclude loop
+    # carries and source values replaced by a later spelling of the same name.
+    defined: set[str] = set()
+    read_before_write: set[str] = set()
+    for stmt in body[:marker_index]:
+        name = assigned_name(stmt)
+        assert name is not None
+        canonical = rename_groups.get(name, name)
+        read_before_write.update(
+            {rename_groups.get(read, read) for read in ReadWrites.from_ast(stmt).reads}
+            - defined
+        )
+        if canonical in defined:
+            return None
+        defined.add(canonical)
+    if defined & read_before_write:
+        return None
+    if marker.result_var in defined:
+        return None
+    # This bounded path preserves the actual scalar names in its lists. Phi
+    # aliases need an explicit carried-value schedule, not a list-name guess.
+    if any(
+        rename_groups.get(node.id, node.id) != node.id
+        for stmt in body
+        for node in ast.walk(stmt)
+        if isinstance(node, ast.Name)
+    ):
+        return None
+    varying = {lane_var} | _lane_varying_names(
+        body[:marker_index], lane_var, rename_groups
+    )
+    if not (
+        {
+            rename_groups.get(name, name)
+            for arg in effect.value.args
+            for name in ReadWrites.from_ast(arg).reads
+        }
+        & varying
+    ):
+        return None
+    stores = []
+    for stmt in tail:
+        if not (
+            _is_proven_relocatable_assignment(stmt, allow_load=False)
+            or _validated_idempotent_store(stmt) is not None
+        ):
+            return None
+        if _validated_idempotent_store(stmt) is not None:
+            stores.append(stmt)
+        if (name := assigned_name(stmt)) is not None:
+            if name in defined or name == marker.result_var:
+                return None
+            defined.add(name)
+            if set(ReadWrites.from_ast(stmt).reads) & varying:
+                varying.add(name)
+    if len(stores) != 1:
+        return None
+    tail_reads = set().union(*(ReadWrites.from_ast(stmt).reads for stmt in tail))
+    per_lane_tail = bool(tail_reads & varying)
+    if per_lane_tail:
+        store_reads = _store_value_and_addr_reads(stores[0])
+        if store_reads is None or not store_reads[1] & varying:
+            return None
+    input_slice, _ = _backward_slice(
+        body[:marker_index], {marker.input_name}, rename_groups
+    )
+    if effect_index not in input_slice:
+        return None
+
+    occupied = {node.id for node in ast.walk(loop) if isinstance(node, ast.Name)}
+    occupied.update(rename_groups)
+    occupied.update(rename_groups.values())
+    try:
+        function = DeviceFunction.current()
+    except NoCurrentFunction:
+        function = None
+
+    def fresh(hint: str) -> str:
+        while True:
+            name = (
+                function.new_var(hint)
+                if function is not None
+                else f"{hint}_{_next_lane_stash_uid()}"
+            )
+            if name not in occupied:
+                occupied.add(name)
+                return name
+
+    later_reads = set().union(
+        *(ReadWrites.from_ast(stmt).reads for stmt in body[effect_index:])
+    )
+    stashes = {
+        name: fresh("opaque_input_stash")
+        for stmt in prefix
+        if (name := assigned_name(stmt)) in later_reads
+    }
+    produced_stashes = {
+        name: fresh("opaque_result_stash")
+        for stmt in body[effect_index:marker_index]
+        if (name := assigned_name(stmt)) in tail_reads
+    }
+    result: list[ast.AST] = [
+        statement_from_string(f"{stash} = []")
+        for stash in (*stashes.values(), *produced_stashes.values())
+    ]
+
+    def unrolled(statements: list[ast.AST]) -> ast.For:
+        clone = _clone_lane_loop_with_body(loop, statements)
+        clone.iter = cast(
+            "ast.expr", expr_from_string(f"cutlass.range_constexpr({extent})")
+        )
+        return clone
+
+    snapshot = [_clone_stmt(stmt) for stmt in prefix]
+    snapshot.extend(
+        statement_from_string(f"{stash}.append({name})")
+        for name, stash in stashes.items()
+    )
+    result.extend(
+        [unrolled(snapshot), statement_from_string("cute.arch.sync_threads()")]
+    )
+    acc = fresh("opaque_lane_acc")
+    result.append(statement_from_string(f"{acc} = {marker.identity_expr}"))
+    produce: list[ast.AST] = [
+        statement_from_string(f"{name} = {stash}[{lane_var}]")
+        for name, stash in stashes.items()
+    ]
+    produce.extend(_clone_stmt(stmt) for stmt in body[effect_index:marker_index])
+    produce.extend(
+        statement_from_string(f"{stash}.append({name})")
+        for name, stash in produced_stashes.items()
+    )
+    ctor = _dtype_ctor_from_identity(marker.identity_expr)
+    value = f"{ctor}({marker.input_name})" if ctor else marker.input_name
+    produce.append(
+        statement_from_string(
+            f"{acc} = {_combine_expr(marker.reduction_type, acc, value, ctor)}"
+        )
+    )
+    result.extend(
+        [unrolled(produce), statement_from_string("cute.arch.sync_threads()")]
+    )
+    result.extend(_finalize_lane_reduce_marker(marker, acc))
+    marker_dependencies = [(marker, _forward_live_names(body, {marker.result_var}))]
+    axes_before, definitions_before = _statement_provenance_before(
+        body, thread_axis_names, scalar_definitions, rename_groups
+    )
+    consume: list[ast.AST] = (
+        [
+            statement_from_string(f"{name} = {stash}[{lane_var}]")
+            for name, stash in (stashes | produced_stashes).items()
+            if name in tail_reads
+        ]
+        if per_lane_tail
+        else []
+    )
+    for stmt in tail:
+        owners = _lane_reduction_owner_exprs_for_statement(
+            stmt,
+            markers,
+            marker_dependencies,
+            axes_before[id(stmt)],
+            definitions_before[id(stmt)],
+        )
+        consume.append(
+            _guard_stmt_with_owner(stmt, owners) if owners else _clone_stmt(stmt)
+        )
+    if per_lane_tail:
+        result.append(unrolled(consume))
+    else:
+        result.extend(consume)
+    return result
+
+
 def _split_one_lane_loop(
     loop: ast.For,
     lane_var: str,
@@ -469,6 +773,7 @@ def _split_one_lane_loop(
     rename_groups: dict[str, str],
     running_sums: set[str] | None = None,
     register_tile_options: RegisterTileOptions | None = None,
+    cta_uniform: bool = True,
 ) -> list[ast.AST]:
     from ...ast_read_writes import ReadWrites
 
@@ -478,6 +783,23 @@ def _split_one_lane_loop(
         parsed = _is_lane_reduce_marker_assign(stmt)
         if parsed is not None:
             markers.append((idx, parsed))
+    impure_indices = {i for i, stmt in enumerate(body) if _has_impure_inline_asm(stmt)}
+    if impure_indices and _find_lane_reduce_call(loop) is not None:
+        producer = _split_impure_producer(
+            loop,
+            lane_var,
+            markers,
+            impure_indices,
+            rename_groups,
+            thread_axis_names,
+            scalar_definitions,
+            cta_uniform=cta_uniform,
+        )
+        if producer is not None:
+            return producer
+        raise exc.BackendUnsupported(
+            "cute", "impure inline assembly has no proved snapshot/order schedule"
+        )
     if not markers:
         nested_owners = {
             marker.owner_lane
@@ -529,6 +851,7 @@ def _split_one_lane_loop(
                 rename_groups=rename_groups,
                 running_sums=running_sums,
                 register_tile_options=register_tile_options,
+                cta_uniform=cta_uniform,
             )
         if register_tile_failure is not None:
             # ``generate_ast`` regenerates the kernel with the rolled lane
@@ -3661,6 +3984,14 @@ def _interchange_one_lane_loop(
             keep_prefix_a.append(stmt)
             needed |= set(rw.reads)
     keep_prefix_a.reverse()
+
+    if _has_impure_inline_asm(loop):
+        # Both nests can retain the original producers. The in-place restore
+        # and register-tile fallback above do not clone these effects.
+        raise exc.BackendUnsupported(
+            "cute",
+            "impure inline assembly cannot be interchanged with a lane reduction",
+        )
 
     # Partition kept statements into lane-invariant (run once per mb iteration)
     # vs lane-varying (recomputed per lane inside the inner lane loop).

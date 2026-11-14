@@ -265,12 +265,7 @@ def graph_memory_access_storage_ids(
             if_info = graphs[subgraph_id]
             assert isinstance(if_info, IfGraphInfo)
             if if_info.else_branch is not None:
-                else_graph_id = (
-                    if_info.else_branch
-                    if isinstance(if_info.else_branch, int)
-                    else if_info.else_branch.graph_id
-                )
-                update_from_subgraph(else_graph_id)
+                update_from_subgraph(if_info.else_branch)
             continue
         if node.target is _while_loop:
             subgraph_id = node.args[1]
@@ -414,13 +409,8 @@ class _IntraLoopRawBarrierMarker:
                 if if_info.else_branch is None:
                     pending |= if_pending
                 else:
-                    else_graph_id = (
-                        if_info.else_branch
-                        if isinstance(if_info.else_branch, int)
-                        else if_info.else_branch.graph_id
-                    )
                     else_pending = self.run_graph(
-                        else_graph_id, pending, divergent=True
+                        if_info.else_branch, pending, divergent=True
                     )
                     pending = if_pending | else_pending
                 continue

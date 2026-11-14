@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import functools
 import hashlib
 import inspect
 import json
@@ -13,18 +14,20 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from torch._dynamo.source import GetItemSource
 from torch._inductor.codecache import PyCodeCache
 from torch.utils._pytree import tree_leaves
 
-from test.test_cute_repro_settings import _case
-from test.test_cute_structural_aot import _function
-from test.test_cute_structural_aot import _module
-from test.test_cute_structural_cache import _cpu_only  # noqa: F401
-
 import helion
+from helion._testing.cute_structural import _case
+from helion._testing.cute_structural import _cpu_only  # noqa: F401
+from helion._testing.cute_structural import _function
+from helion._testing.cute_structural import _module
 from helion.autotuner.aot_cache import AOTAutotuneCache
 from helion.autotuner.aot_compile import generate_standalone_file
+from helion.autotuner.aot_structural_export import _export_call_key
 from helion.autotuner.aot_structural_export import _export_classifiers
+from helion.autotuner.aot_structural_export import _export_guard_key
 from helion.autotuner.aot_structural_export import export_runtime_guards
 from helion.autotuner.aot_structural_policy import attach_model_policy
 from helion.autotuner.aot_structural_policy import policy_path
@@ -540,8 +543,6 @@ def test_compile_deduplication_includes_original_source_bytes(tmp_path: Path) ->
 def test_unrelocatable_bound_guard_cannot_replace_an_existing_export(
     kind: str, tmp_path: Path
 ) -> None:
-    from torch._dynamo.source import AttrSource
-
     function = _function(tmp_path)
     policy = CuteStructuralPolicy()
     kernel = helion.aot_kernel(
@@ -558,7 +559,11 @@ def test_unrelocatable_bound_guard_cannot_replace_an_existing_export(
         cache._maybe_run_compile()
     path = policy_path(tmp_path / f"original_{kernel.name}_standalone.py", policy)
     previous = path.read_bytes()
-    key, specialization = next(iter(bound.env.runtime_input_specializations.items()))
+    key, specialization = next(
+        (key, value)
+        for key, value in bound.env.runtime_input_specializations.items()
+        if value.reusable_tensor_properties
+    )
     if kind == "content":
         invalid = dataclasses.replace(
             specialization, reusable_tensor_properties=frozenset()
@@ -567,7 +572,8 @@ def test_unrelocatable_bound_guard_cannot_replace_an_existing_export(
         invalid = dataclasses.replace(specialization, classifier=lambda values: None)
     elif kind == "projection":
         invalid = dataclasses.replace(
-            specialization, sources=(AttrSource(specialization.sources[0], "data"),)
+            specialization,
+            sources=(GetItemSource(specialization.sources[0], slice(None)),),
         )
     else:
         args[0].set_(torch.empty(38)[1:])
@@ -579,6 +585,336 @@ def test_unrelocatable_bound_guard_cannot_replace_an_existing_export(
     ):
         cache._maybe_run_compile()
     assert path.read_bytes() == previous
+
+
+def _canonical_copy(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for i, j in hl.tile(x.shape):
+        out[i, j] = x[i, j] + 1
+    return out
+
+
+def _stride_extent_copy(x: torch.Tensor) -> torch.Tensor:
+    intermediate = torch.empty((x.stride(0), 2), device=x.device, dtype=x.dtype)
+    out = torch.empty_like(intermediate)
+    for i, j in hl.tile(out.shape):
+        out[i, j] = 1
+    return out
+
+
+def _optional_output_copy(
+    x: torch.Tensor, out: torch.Tensor, allocate: hl.constexpr
+) -> torch.Tensor:
+    if allocate:
+        result = torch.empty_like(x)
+    else:
+        result = out
+    for i, j in hl.tile(x.shape):
+        result[i, j] = x[i, j] + 1
+    return result
+
+
+@functools.cache
+def _legacy_export_case() -> tuple[Any, ...]:
+    policy = CuteStructuralPolicy()
+    kernel = helion.aot_kernel(
+        _optional_output_copy,
+        backend="cute",
+        static_shapes=True,
+        cute_structural_policy=policy,
+    )
+    args = (torch.empty(4, 8), torch.empty(4, 8), False)
+    bound = kernel._bind_isolated(args)
+    config = bound.config_spec.default_config()
+    code = bound.to_triton_code(config)
+    guards, observed = export_runtime_guards(bound, args)
+    assert guards and all(len(guard) == 7 for guard in guards)
+    return policy, kernel.name, args, config, code, guards, observed
+
+
+@pytest.mark.parametrize("mode", ["static", "dynamic", "model"])
+def test_legacy_guard_export_dispatch_and_no_match_diagnostic(
+    mode: str, tmp_path: Path
+) -> None:
+    policy, name, args, config, code, guards, observed = _legacy_export_case()
+    options: dict[str, Any] = {}
+    if mode == "static":
+        options["dispatch_keys"] = [(_export_call_key(args), observed)]
+    elif mode == "dynamic":
+        options["dynamic_groups"] = [
+            (("dynamic", (_export_call_key(args, dynamic=True), observed)), [0])
+        ]
+    path = generate_standalone_file(
+        name,
+        [code],
+        _model(name, [config], policy, 100),
+        tmp_path,
+        structural_policy=policy,
+        runtime_guards=guards,
+        **options,
+    )
+    exported = _module(path)
+    wrapper = getattr(exported, name)
+    expected_result, expected_calls = _call(getattr(PyCodeCache.load(code), name), args)
+    result, calls = _call(wrapper, args)
+    assert _metadata(result) == _metadata(expected_result)
+    assert [{k: v for k, v in call.items() if k != "kernel"} for call in calls] == [
+        {k: v for k, v in call.items() if k != "kernel"} for call in expected_calls
+    ]
+    assert exported._helion_aot_sources == (code,)
+    if mode != "model":
+        incompatible = (torch.empty(8), torch.empty(8), False)
+        launcher = Mock()
+        with pytest.raises(ValueError, match="No standalone variant") as error:
+            wrapper(*incompatible, _launcher=launcher)
+        assert repr(_export_call_key(incompatible)) in str(error.value)
+        launcher.assert_not_called()
+
+
+def test_conflicting_guard_arguments_do_not_replace_export(tmp_path: Path) -> None:
+    policy = CuteStructuralPolicy()
+    guard = ("dummy", "module", "classifier", "hash", "fact", (), ())
+    path = policy_path(tmp_path / "demo_standalone.py", policy)
+    path.write_text("prior artifact")
+    with pytest.raises(
+        StructuralPolicyError, match="runtime_guards.*runtime_guard_plans"
+    ):
+        generate_standalone_file(
+            "demo",
+            ["def demo(x):\n    return x\n"],
+            _model("demo", [helion.Config()], policy, 100),
+            tmp_path,
+            dispatch_keys=[((), (), ())],
+            structural_policy=policy,
+            runtime_guards=(guard,),
+            runtime_guard_plans=((),),
+        )
+    assert path.read_text() == "prior artifact"
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_unlisted_guard_plan_does_not_replace_export(
+    dynamic: bool, tmp_path: Path
+) -> None:
+    policy = CuteStructuralPolicy()
+    unlisted = (("dummy", "module", "classifier", "hash", "fact", (), ()),)
+    keys = [((), (), ()), (unlisted, (), ())]
+    options: dict[str, Any] = {}
+    if dynamic:
+        options["dynamic_groups"] = [
+            (("dynamic", key), [index]) for index, key in enumerate(keys)
+        ]
+    else:
+        options["dispatch_keys"] = keys
+    path = policy_path(tmp_path / "demo_standalone.py", policy)
+    path.write_text("prior artifact")
+    with pytest.raises(StructuralPolicyError, match="plan.*runtime_guard_plans"):
+        generate_standalone_file(
+            "demo",
+            ["def demo(x):\n    return x\n"] * 2,
+            _model("demo", [helion.Config()], policy, 100),
+            tmp_path,
+            structural_policy=policy,
+            runtime_guard_plans=((),),
+            **options,
+        )
+    assert path.read_text() == "prior artifact"
+
+
+def test_guard_only_no_match_reports_observed_plan_keys(tmp_path: Path) -> None:
+    policy, name, args, config, code, guards, observed = _legacy_export_case()
+    path = generate_standalone_file(
+        name,
+        [code],
+        _model(name, [config], policy, 100),
+        tmp_path,
+        dispatch_keys=[(guards, _export_call_key(args), observed)],
+        structural_policy=policy,
+        runtime_guard_plans=(guards,),
+    )
+    wrapper = getattr(_module(path), name)
+    _call(wrapper, args)
+    alias_args = (args[0], args[0].view_as(args[0]), False)
+    assert _export_call_key(alias_args) == _export_call_key(args)
+    changed_guards = _export_guard_key(alias_args, guards, _export_classifiers(guards))
+    assert changed_guards != observed
+    launcher = Mock()
+    with pytest.raises(ValueError, match="No standalone variant") as error:
+        wrapper(*alias_args, _launcher=launcher)
+    assert repr(changed_guards) in str(error.value)
+    launcher.assert_not_called()
+
+
+@pytest.mark.parametrize("static", [False, True])
+@pytest.mark.parametrize("canonical_first", [False, True])
+def test_export_retains_different_layout_guard_plans_in_both_orders(
+    static: bool, canonical_first: bool, tmp_path: Path
+) -> None:
+    function = _relocate(_optional_output_copy if static else _canonical_copy, tmp_path)
+    policy = CuteStructuralPolicy()
+    kernel = helion.aot_kernel(
+        function, backend="cute", static_shapes=static, cute_structural_policy=policy
+    )
+    inputs = [(torch.empty(4, 8),), (torch.empty_strided((4, 8), (16, 1)),)]
+    if static:
+        # Static dimensions need no canonical classifier. An external output
+        # introduces a distinct storage plan through the same public exporter.
+        inputs = [
+            (torch.empty(4, 8), torch.empty(4, 8), True),
+            (torch.empty(4, 8), torch.empty(4, 8), False),
+        ]
+    if not canonical_first:
+        inputs.reverse()
+    bound = kernel._bind_isolated(inputs[0])
+    model = tmp_path / "model.py"
+    model.write_text(
+        _model(kernel.name, [bound.config_spec.default_config()], policy, 100)
+    )
+    generated = []
+    plans = []
+    for args in inputs:
+        current = kernel._bind_isolated(args)
+        cache = AOTAutotuneCache(BaseSearch(current, args))
+        original_codegen = current.to_triton_code
+
+        def capture(
+            config: helion.Config, generate: Callable[..., str] = original_codegen
+        ) -> str:
+            code = generate(config)
+            generated.append(code)
+            return code
+
+        with (
+            patch.object(cache, "_find_heuristic_file", return_value=model),
+            patch.object(current, "to_triton_code", side_effect=capture),
+        ):
+            cache._maybe_run_compile()
+        plans.append(export_runtime_guards(current, args)[0])
+    assert len(generated) == 2 and plans[0] != plans[1]
+    path = policy_path(tmp_path / f"original_{kernel.name}_standalone.py", policy)
+    exported = _module(path)
+    assert sorted(exported._helion_aot_sources) == sorted(generated)
+    utility_source = Path(exported._helion_aot_utilities.__file__).read_text()
+    assert (
+        "from helion._compiler.runtime_tensor_guards import _CanonicalLayoutClassifier"
+        in utility_source
+    )
+    for args, code in zip(inputs, generated, strict=True):
+        direct = getattr(PyCodeCache.load(code), kernel.name)
+        expected_result, expected_calls = _call(direct, args)
+        actual_result, actual_calls = _call(getattr(exported, kernel.name), args)
+        assert _metadata(actual_result) == _metadata(expected_result)
+        assert len(actual_calls) == len(expected_calls) == 1
+        assert {k: v for k, v in actual_calls[0].items() if k != "kernel"} == {
+            k: v for k, v in expected_calls[0].items() if k != "kernel"
+        }
+
+
+@pytest.mark.parametrize("stride_extent", [False, True])
+def test_export_rank_mismatch_refuses_before_launch(
+    stride_extent: bool, tmp_path: Path
+) -> None:
+    function = _relocate(
+        _stride_extent_copy if stride_extent else _canonical_copy, tmp_path
+    )
+    policy = CuteStructuralPolicy()
+    kernel = helion.aot_kernel(
+        function, backend="cute", static_shapes=False, cute_structural_policy=policy
+    )
+    args = (
+        (torch.empty_strided((3, 2), (5, 1)),)
+        if stride_extent
+        else (torch.empty(4, 6),)
+    )
+    bound = kernel._bind_isolated(args)
+    model = tmp_path / "model.py"
+    model.write_text(
+        _model(kernel.name, [bound.config_spec.default_config()], policy, 100)
+    )
+    cache = AOTAutotuneCache(BaseSearch(bound, args))
+    with patch.object(cache, "_find_heuristic_file", return_value=model):
+        cache._maybe_run_compile()
+    path = policy_path(tmp_path / f"original_{kernel.name}_standalone.py", policy)
+    wrapper = getattr(_module(path), kernel.name)
+    _call(wrapper, args)
+    incompatible = torch.empty(()) if stride_extent else torch.empty(6)
+    launcher = Mock()
+    with pytest.raises(ValueError, match="No standalone variant"):
+        wrapper(incompatible, _launcher=launcher)
+    launcher.assert_not_called()
+
+
+@pytest.mark.parametrize("stride_extent", [False, True])
+def test_canonical_metadata_export_replays_live_layout_and_extent_classes(
+    stride_extent: bool, tmp_path: Path
+) -> None:
+    function = _relocate(
+        _stride_extent_copy if stride_extent else _canonical_copy, tmp_path
+    )
+    policy = CuteStructuralPolicy()
+    kernel = helion.aot_kernel(
+        function, backend="cute", static_shapes=False, cute_structural_policy=policy
+    )
+    args = (
+        (torch.empty_strided((3, 2), (5, 1)),)
+        if stride_extent
+        else (torch.empty(4, 6),)
+    )
+    bound = kernel._bind_isolated(args)
+    guards, observed = export_runtime_guards(bound, args)
+    metadata_guards = [guard for guard in guards if len(guard) == 8]
+    assert metadata_guards and all(guard[5] == () for guard in metadata_guards)
+    assert any(
+        step[0] == ("stride" if stride_extent else "size")
+        for guard in metadata_guards
+        for _index, path in guard[6]
+        for step in path
+        if isinstance(step, tuple)
+    )
+    assert observed
+    config = bound.config_spec.default_config()
+    model = tmp_path / "model.py"
+    model.write_text(_model(kernel.name, [config], policy, 100))
+    cache = AOTAutotuneCache(BaseSearch(bound, args))
+    with patch.object(cache, "_find_heuristic_file", return_value=model):
+        cache._maybe_run_compile()
+    path = policy_path(tmp_path / f"original_{kernel.name}_standalone.py", policy)
+    wrapper = getattr(_module(path), kernel.name)
+    _call(wrapper, args)
+    _call(wrapper, (torch.empty_strided(args[0].size(), args[0].stride()),))
+    utilities = wrapper.__globals__["_helion_aot_utilities"]
+    metadata_plan = tuple(metadata_guards)
+    classifiers = utilities._export_classifiers(metadata_plan)
+    metadata_key = utilities._export_guard_key(args, metadata_plan, classifiers)
+    compatible = (
+        torch.empty_strided((3, 2), (7, 1)) if stride_extent else torch.empty(8, 6)
+    )
+    # The independent vector-alignment guard also records exact shapes/strides.
+    # Exercise canonical metadata replay without weakening that existing guard.
+    assert (
+        utilities._export_guard_key((compatible,), metadata_plan, classifiers)
+        == metadata_key
+    )
+    incompatible = (
+        [torch.empty_strided((3, 2), (1, 1))]
+        if stride_extent
+        else [torch.empty(4, 1), torch.empty(6, 4).t()]
+    )
+    for value in incompatible:
+        assert (
+            utilities._export_guard_key((value,), metadata_plan, classifiers)
+            != metadata_key
+        )
+        launcher = Mock()
+        with pytest.raises(ValueError, match="No standalone variant"):
+            wrapper(value, _launcher=launcher)
+        launcher.assert_not_called()
+    # Mutating the original argument cannot rewrite the binding snapshot.
+    snapshot = bound.env.bound_metadata_specialization_results.copy()
+    args[0].set_(incompatible[0])
+    with pytest.raises(StructuralPolicyError, match="changed their bound"):
+        export_runtime_guards(bound, args)
+    assert bound.env.bound_metadata_specialization_results == snapshot
 
 
 def test_export_classifier_identity_and_input_projection_match_bound_kernel(

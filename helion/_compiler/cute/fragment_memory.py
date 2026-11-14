@@ -8,6 +8,7 @@ writes staged tiles back: scalar element walks, 16-byte row packets
 from __future__ import annotations
 
 import ast
+import dataclasses
 import math
 from typing import TYPE_CHECKING
 from typing import cast
@@ -36,6 +37,7 @@ from .register_snapshots import snapshot_logical_shape
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from .fragment_domain import OwnershipMask
     from .fragment_slab_loads import ScalarLoad
     from .fragment_slab_loads import SlabGroup
 
@@ -467,7 +469,7 @@ class FragmentMemoryEmitter(FragmentContext):
         def read(coords: tuple[str, ...]) -> str:
             result = self.df.new_var("fragment_local_load")
             self.emit(f"{result} = {self.cast('0', source.dtype)}")
-            domains = list(output_domain(coords))
+            domains: list[OwnershipMask] = list(output_domain(coords))
             if isinstance(index, Fragment):
                 domains.extend(index.broadcast_domain(coords))
             if isinstance(mask, Fragment):
@@ -519,6 +521,8 @@ class FragmentMemoryEmitter(FragmentContext):
         deferred_updates: list[tuple[Callable[[tuple[str, ...]], None], bool]]
         | None = None,
         direct: DirectStoreSink | None = None,
+        *,
+        defer_load: bool = False,
     ) -> object:
         if store and node in self.direct_stores:
             # Written by the tf32 mma lanes of the dot it stores.
@@ -609,7 +613,7 @@ class FragmentMemoryEmitter(FragmentContext):
 
         def address(coords: tuple[str, ...]) -> tuple[str, str]:
             tensor_indices: list[str] = []
-            masks: list[str] = []
+            masks: list[OwnershipMask] = []
             dim = 0
             for ordinal, index in enumerate(indices):
                 if index is None:
@@ -776,7 +780,7 @@ class FragmentMemoryEmitter(FragmentContext):
                         )
             dim += 1
 
-        def logical_domain(coords: tuple[str, ...]) -> tuple[str, ...]:
+        def logical_domain(coords: tuple[str, ...]) -> tuple[OwnershipMask, ...]:
             return (
                 *(
                     f"({selected_coordinates(ordinal, coords)[0]}) < ({bound})"
@@ -797,6 +801,22 @@ class FragmentMemoryEmitter(FragmentContext):
             load,
             logical_domain=logical_domain if index_domains or domain_bounds else None,
         )
+        if defer_load:
+            # A complete owner may consume this same guarded address recipe
+            # directly. Retain every index/mask dependency until that read.
+            if not host_load_is_readonly(node, self.env, self.graphs):
+                raise exc.InvalidConfig(
+                    "deferred fragment load requires readonly storage"
+                )
+            dependencies = tuple(
+                value
+                for value in (
+                    *(values[index] for index in indices if isinstance(index, Node)),
+                    mask_value,
+                )
+                if isinstance(value, Fragment)
+            )
+            return dataclasses.replace(loaded_fragment, dependencies=dependencies)
         if node in self.snapshot_loads:
             slots = (math.prod(shape) + self.threads - 1) // self.threads
             name = self.df.new_var("fragment_snapshot")

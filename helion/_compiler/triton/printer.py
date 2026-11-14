@@ -41,8 +41,9 @@ class HelionTritonPrinter(TritonPrinter):
 
     def _print_ToFloat(self, expr: sympy.Expr) -> str:
         assert expr.func.__name__ == "ToFloat" and len(expr.args) == 1
+        # Keep this conversion inside its parent arithmetic expression.
         # pyrefly: ignore [missing-attribute]
-        return f"{self._print(expr.args[0])} + 0.0"
+        return f"(({self._print(expr.args[0])}) + 0.0)"
 
     def _print_FloorDiv(self, expr: sympy.Expr) -> str:
         from ..device_function import DeviceFunction

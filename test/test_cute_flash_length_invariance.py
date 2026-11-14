@@ -30,6 +30,7 @@ from helion._compiler.cute.autotune.flash_surface import _cute_flash_autotune_fr
 from helion._compiler.cute.autotune.flash_surface import _resolve_cute_flash_config
 from helion._compiler.cute.autotune.flash_surface import enable_cute_flash_search
 from helion._compiler.cute.backend import CuteBackend
+from helion._compiler.cute.compile_options import CUTE_COMPILER_PIPELINE_CHOICES
 from helion._testing.cute_flash import flash_config_spec
 from helion._testing.cute_flash import memoized_flash_fragments
 from helion.autotuner.base_search import PopulationMember
@@ -37,6 +38,7 @@ from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
+from helion.autotuner.surrogate_pattern_search import FLASH_EXACT_SPACE_RAW_FLOOR
 from helion.autotuner.surrogate_pattern_search import LFBOPatternSearch
 from helion.exc import InvalidConfig
 
@@ -1068,11 +1070,18 @@ def test_flash_full_population_is_length_invariant(
                     for flat in generation.random_population_flat(100)
                 ]
             assert len(configs) == 100
-            exact = generation.extension.exact_effective_search_space_configs(100)
-            if exact is None:
+            # A raw product larger than the requested population can still
+            # normalize to fewer than 100 configs (34 schedules x 2 pipelines).
+            # Use the same bounded proof budget as structural qualification.
+            exact = generation.extension.exact_effective_search_space_configs(
+                FLASH_EXACT_SPACE_RAW_FLOOR
+            )
+            if exact is None or len(exact) > 100:
                 assert len(set(configs)) == 100
             else:
                 assert set(configs) == set(exact)
+            if exact is not None:
+                assert set(configs) <= set(exact)
             populations[num_kv] = tuple(
                 json.dumps(config.config, sort_keys=True, separators=(",", ":"))
                 for config in configs
@@ -1586,23 +1595,43 @@ def test_small_flash_search_spaces_are_exhaustive(
     # the distinct rows: the three-tile d64 ws_overlap family multiplies the
     # kv_stage triple by six binary knobs (192 raw rows for 102 distinct) once
     # the single-tile body searches its issue-stream knobs; d128 is 64 raw
-    # rows for 34.  The autotuner's own floor is ``FLASH_EXACT_SPACE_RAW_FLOOR``
-    # (1024); this test's is its own, kept at the next power of two above d64.
-    exact = generation.extension.exact_effective_search_space_configs(256)
+    # rows for 34. Every structural row has each compiler pipeline choice;
+    # scale the next-power-of-two raw bound by that independent coordinate.
+    raw_bound = 256 * len(CUTE_COMPILER_PIPELINE_CHOICES)
+    exact = generation.extension.exact_effective_search_space_configs(raw_bound)
     assert exact is not None
-    assert len(exact) == expected_by_shape[(head_dim, is_causal)]
+    expected_structural_count = expected_by_shape[(head_dim, is_causal)]
+    assert len(exact) == expected_structural_count * len(CUTE_COMPILER_PIPELINE_CHOICES)
+    by_pipeline = {
+        choice: {
+            helion.Config.from_dict(
+                {
+                    key: value
+                    for key, value in config.config.items()
+                    if key != "cute_compiler_pipeline"
+                }
+            )
+            for config in exact
+            if config.cute_compiler_pipeline == choice
+        }
+        for choice in CUTE_COMPILER_PIPELINE_CHOICES
+    }
+    assert all(
+        len(configs) == expected_structural_count for configs in by_pipeline.values()
+    )
+    assert all(configs == by_pipeline["default"] for configs in by_pipeline.values())
 
     # The population passes its own size as that raw bound, so a population
     # at least the raw product holds every distinct row (the fill repeats
-    # them; 100 draws would sample the 192-row d64 families instead).
+    # them; 100 draws would sample the expanded d64 families instead).
     random_state = random.getstate()
     try:
         random.seed(20260815)
-        population = generation.random_population_flat(256)
+        population = generation.random_population_flat(raw_bound)
     finally:
         random.setstate(random_state)
     population_configs = {generation.unflatten(flat) for flat in population}
-    assert len(population) == 256
+    assert len(population) == raw_bound
     assert population_configs == set(exact)
 
 

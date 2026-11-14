@@ -538,9 +538,9 @@ def test_replay_regime_flushes_once_per_back_to_back_batch(monkeypatch) -> None:
     assert flushes["count"] >= 10
 
 
+@pytest.mark.cpu_only
 def test_interleaved_bench_of_nothing_is_empty() -> None:
-    # even an empty bench allocates the driver's flush buffer
-    pytest.importorskip("triton")
+    # An empty benchmark needs neither a GPU driver nor a flush buffer.
     assert benchmarking.interleaved_bench([], repeat=3) == []
 
 

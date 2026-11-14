@@ -38,6 +38,7 @@ from ..tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
 from ..tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
 from ..tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from ..tcgen05_constants import TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS
+from ..tcgen05_constants import TCGEN05_WHOLE_K_TILE_MIN
 
 if TYPE_CHECKING:
     import sympy
@@ -491,19 +492,66 @@ def enable_cute_tcgen05_search(
         # and the SIMT epilogue masks their stores). bf16 16x14336x4096 ran
         # the SIMT fallback at 358 us against cuBLAS's 25 us without it.
         spec.block_sizes.block_id_lookup(m_block_id).allow_overshoot(plan.min_search_m)
+    edge_k_tail_shape = False
+    # 16-bit output edges (M or N not a multiple of the widest tile, K whole)
+    # that the persistent schedules run: TMA zero-fills the A/B rows past the
+    # extent and clips the D store. A ragged M runs only through CtaGroup.TWO
+    # pairs (persistent cluster_m=1 needs whole tiles: the host multi-tile
+    # guard rejects it, so those samples are flattened by
+    # ``_fix_cluster_m1_persistent_search_config``), so it needs the 256-row
+    # pair tile; shapes ragged in both M and N stay on the flat pipeline.
+    output_edge_shape = False
+    if static_m is not None and static_n is not None and static_k is not None:
+        edge_k_tail_shape = (
+            not has_leading_passthrough
+            and plan.max_tcgen05_m >= TCGEN05_TWO_CTA_BLOCK_M
+            and plan.max_tcgen05_n >= TCGEN05_TWO_CTA_BLOCK_N
+            and min(static_m, static_n, static_k) >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
+            and static_m % TCGEN05_TWO_CTA_BLOCK_M != 0
+            and static_n % TCGEN05_TWO_CTA_BLOCK_N != 0
+        )
+        m_edge = static_m % max_search_m != 0
+        n_edge = static_n % max_search_n != 0
+        output_edge_shape = (
+            not has_leading_passthrough
+            and input_dtype.itemsize == 2
+            and m_edge != n_edge
+            and (not m_edge or max_search_m >= TCGEN05_TWO_CTA_BLOCK_M)
+        )
+        whole_k_tile = static_k & -static_k
+        if (
+            input_dtype.itemsize == 2
+            and static_k % max_search_k != 0
+            and not edge_k_tail_shape
+            and (output_edge_shape or not (m_edge or n_edge))
+            and whole_k_tile >= TCGEN05_WHOLE_K_TILE_MIN
+        ):
+            # Only the double-output-edge family clamps a 16-bit K tail box
+            # (FP8 keeps its K128 tiles and the proved paired K-tail
+            # protocol); any other K tail confines the search to the flat
+            # one-CTA pipeline. Whole K tiles cost nothing there (bk=64 is the
+            # deep-pipeline tile anyway), so where whole K tiles admit the
+            # persistent and CtaGroup.TWO schedules, cap the K tile at the
+            # largest power of two dividing K: bf16 1000x4096x2880 ran its
+            # 64-deep two-CTA tile at 26.9 us against cuBLAS's 26.6 and the
+            # flat winner's 30.7.
+            max_search_k = whole_k_tile
     max_cluster_m2_search_k = TCGEN05_TWO_CTA_MAX_K_TILES * max_search_k
     if static_m is None or static_n is None or static_k is None:
-        allow_full_tile_persistent_pid_types = False
+        allow_whole_k_persistent_pid_types = False
         allow_small_n_persistent_pid_types = False
         allow_full_tile_cluster_m2_search = False
         allow_edge_cluster_m2_search = False
         allow_fp8_small_grid_cluster_m2_search = False
         allow_one_wave_cluster_m2_search = False
     else:
-        allow_full_tile_persistent_pid_types = (
-            static_m % max_search_m == 0
-            and static_n % max_search_n == 0
-            and static_k % max_search_k == 0
+        # Whole tiles, or a 16-bit output edge (``output_edge_shape``) with K
+        # whole: only a K tail needs the edge family's clamped K box, and FP8
+        # keeps its proved exact-tile restoration. (25216x768x3072 and
+        # 4096x8008x2560 came out exact on the two-CTA tile as well.)
+        allow_whole_k_persistent_pid_types = static_k % max_search_k == 0 and (
+            output_edge_shape
+            or (static_m % max_search_m == 0 and static_n % max_search_n == 0)
         )
         allow_small_n_persistent_pid_types = (
             plan.is_small_n
@@ -513,28 +561,21 @@ def enable_cute_tcgen05_search(
             and static_k % max_search_k == 0
         )
         allow_full_tile_cluster_m2_search = (
-            allow_full_tile_persistent_pid_types
+            allow_whole_k_persistent_pid_types
             and max_search_m >= TCGEN05_TWO_CTA_BLOCK_M
             and max_search_n >= TCGEN05_TWO_CTA_BLOCK_N
             and static_k <= max_cluster_m2_search_k
         )
         allow_edge_cluster_m2_search = (
-            not has_leading_passthrough
-            and not allow_full_tile_persistent_pid_types
-            and plan.max_tcgen05_m >= TCGEN05_TWO_CTA_BLOCK_M
-            and plan.max_tcgen05_n >= TCGEN05_TWO_CTA_BLOCK_N
-            and static_m >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
-            and static_n >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
-            and static_k >= TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
+            edge_k_tail_shape
+            and not allow_whole_k_persistent_pid_types
             and static_k <= max_cluster_m2_search_k
-            and static_m % TCGEN05_TWO_CTA_BLOCK_M != 0
-            and static_n % TCGEN05_TWO_CTA_BLOCK_N != 0
             and static_k % max_search_k != 0
         )
         allow_fp8_small_grid_cluster_m2_search = (
             not has_leading_passthrough
             and plan.is_fp8
-            and allow_full_tile_persistent_pid_types
+            and allow_whole_k_persistent_pid_types
             and max_search_m >= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
             and max_search_n >= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
             and static_k <= max_cluster_m2_search_k
@@ -573,6 +614,9 @@ def enable_cute_tcgen05_search(
     spec._cute_tcgen05_config.warp_mma_admitted = warp_mma_admitted
     spec._cute_tcgen05_config.tcgen05_family_admitted = plan.tcgen05_family_admitted
     spec._cute_tcgen05_config.tcgen05_min_search_m = plan.min_search_m
+    spec._cute_tcgen05_config.output_edge_persistent_admitted = (
+        output_edge_shape and allow_whole_k_persistent_pid_types
+    )
     spec._cute_tcgen05_config.tcgen05_min_search_n = plan.min_search_n
     spec._cute_tcgen05_config.matmul_leading_block_id = leading_block_id
     if allow_cluster_m2_search:
@@ -626,7 +670,7 @@ def enable_cute_tcgen05_search(
     surface.narrow_autotune_to_validated_configs(
         spec.tcgen05,
         allow_persistent_pid_types=(
-            allow_full_tile_persistent_pid_types or allow_small_n_persistent_pid_types
+            allow_whole_k_persistent_pid_types or allow_small_n_persistent_pid_types
         ),
         enable_cluster_m2_search=allow_cluster_m2_search,
         cluster_m2_static_k=static_k if allow_cluster_m2_search else None,

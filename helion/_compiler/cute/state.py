@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     from .cute_mma_dag import MmaDagPlan
     from .cute_register_subblocks import RegisterSubblockPlan
     from .cute_warp_mma_gemm import CuteWarpMmaGemmMatch
+    from .dependent_phases import DependentPhasePlan
     from .device_state import CuteDeviceFunctionState
     from .device_state import CuteTcgen05MatmulPlan
     from .device_state import CuteTcgen05StoreValue
@@ -109,6 +110,7 @@ class CuteEnvState:
         default_factory=set
     )
     fission_plan: MaterializedFissionPlan | None = None
+    dependent_phase_plan: DependentPhasePlan | None = None
     half_atomic_output_promotions: dict[str, torch.dtype] = dataclasses.field(
         default_factory=dict
     )
@@ -599,6 +601,10 @@ class CuteLaneState:
     # grid is the PID strategy's grid times this factor (``tcgen05_split_k``
     # sets it to the split as well).
     launch_grid_multiplier: int = 1
+    # A proved paired attention root groups adjacent items in one CTA. This
+    # is distinct from split-K/fused-grid expansion and never applies to a
+    # materialized multi-root phase.
+    attention_item_group: int = 1
     # SASS-level checks the launcher runs on the compiled kernel before
     # its first launch (``helion.runtime.cute.sass_check``), declared by
     # the emitters whose instruction forms the DSL's assembler has

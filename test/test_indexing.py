@@ -4421,10 +4421,8 @@ class TestIndexing(RefEagerTestBase, TestCase):
                 )
 
     @onlyBackends(["cute"])
-    def test_topk_feeding_a_computation_is_refused(self):
-        """Top-k output sits on the lanes of the sorted input dim, which only
-        a store addresses; a reduction of it would fold the wrong lanes, and a
-        store index other than a slice or an affine arange cannot address it."""
+    def test_topk_values_feed_a_row_reduction(self):
+        """A complete row owner can reduce selected values into fresh storage."""
 
         @helion.kernel(autotune_effort="none", static_shapes=True)
         def topk_sum(x: torch.Tensor) -> torch.Tensor:
@@ -4435,6 +4433,15 @@ class TestIndexing(RefEagerTestBase, TestCase):
                 out[tile] = top_vals.sum(-1)
             return out
 
+        x = torch.randn([40, 64], device=DEVICE)
+        _code, result = code_and_output(topk_sum, (x,), block_sizes=[8])
+        expected = torch.topk(x, 4, dim=-1).values.sum(-1)
+        torch.testing.assert_close(result, expected)
+
+    @onlyBackends(["cute"])
+    def test_topk_gathered_store_is_refused(self):
+        """A gathered store index cannot address the selected values' lanes."""
+
         @helion.kernel(autotune_effort="none", static_shapes=True)
         def topk_gathered(x: torch.Tensor, cols: torch.Tensor) -> torch.Tensor:
             out = torch.zeros([x.size(0), 8], dtype=x.dtype, device=x.device)
@@ -4444,9 +4451,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
             return out
 
         x = torch.randn([40, 64], device=DEVICE)
-        with self.assertRaisesRegex(exc.BackendUnsupported, "torch.topk output"):
-            code_and_output(topk_sum, (x,), block_sizes=[8])
-        # A gathered store index is no affine arange of the output position.
         cols = torch.tensor([7, 2, 5, 0], device=DEVICE)
         with self.assertRaisesRegex(exc.BackendUnsupported, "affine hl.arange"):
             code_and_output(topk_gathered, (x, cols), block_sizes=[8])

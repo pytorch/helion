@@ -28,6 +28,7 @@ from helion._compiler.cute.target_facts import TargetFacts
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._testing import cpu_render_target
 from helion._testing import import_example
+from helion._testing.cute_structural_kernels import _se_args
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.precompile_future import SerializedCompiledFunction
 from helion.autotuner.precompile_future import _load_compiled_fn
@@ -434,17 +435,6 @@ def _bind(
     )(kernel.fn)
     with _cpu_target():
         return kernel._bind_isolated(tuple(args))
-
-
-def _se_args(
-    shape: tuple[int, int, int] = (32, 64, 16), dtype: torch.dtype = torch.bfloat16
-) -> tuple[torch.Tensor, ...]:
-    m, n, k = shape
-    generator = torch.Generator(device=CPU_DEVICE).manual_seed(27)
-    return tuple(
-        torch.randn(dimensions, generator=generator, dtype=dtype) * 0.25
-        for dimensions in ((m, n), (n, k), (k, n))
-    )
 
 
 def _sources(source: str) -> list[str]:

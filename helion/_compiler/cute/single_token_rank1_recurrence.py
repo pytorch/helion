@@ -500,11 +500,7 @@ def _match_normalized_vector(
             continue
         if square.target not in _MUL_TARGETS or len(square.args) < 2:
             continue
-        # Device-IR reduction extraction replaces the repeated second operand
-        # of ``x * x`` by ``None``.  Before extraction both operands may still
-        # be present, so accept exactly those two equivalent encodings.
-        square_args = square.args[:2]
-        if square_args not in ((raw, raw), (raw, None), (None, raw)):
+        if square.args[:2] != (raw, raw):
             continue
         return cast("torch.fx.Node", node), raw, norm_sum
     return None

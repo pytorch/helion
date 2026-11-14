@@ -18,6 +18,7 @@ from helion._compiler.cute.row_resident import _matrix
 from helion._compiler.cute.row_resident import prove_row_resident
 from helion._compiler.cute.row_resident_codegen import _scalar_epilogue
 from helion._testing import import_example
+from helion._testing.cute_codegen import check_config_compile_options
 from helion.exc import InvalidConfig
 import helion.language as hl
 from helion.language import _tracing_ops
@@ -146,6 +147,8 @@ def test_two_row_tails_are_a_general_static_domain(rows: int) -> None:
     assert "_helion_row_resident" in code
     assert f"({(rows + 1) // 2}, 1, 1)" in code
     assert len(found.stages[0].stores) == 1 and len(found.stages[1].stores) == 2
+    if rows == 2:
+        check_config_compile_options(bound, row_config(bound))
 
 
 @pytest.mark.parametrize(

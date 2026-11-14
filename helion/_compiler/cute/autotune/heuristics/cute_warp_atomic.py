@@ -17,7 +17,7 @@ class CuteWarpAtomicHeuristic(AutotunerHeuristic):
 
     name = "cute_warp_atomic"
     backend = "cute"
-    priority = 52
+    priority = 53
 
     @classmethod
     def register_facts(

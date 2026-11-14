@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from .cute_mma import _Tcgen05SchedPipelinePlan
     from .epilogue_fanout import FanoutStore
     from .fragment_epilogue import Tcgen05FragmentEpiloguePlan
+    from .fragment_shared_arena import SharedArenaRequest
     from .grouped_balanced_workers import GroupedBalancedWorkersPlan
     from .grouped_full_coverage import Tcgen05GroupedFullCoveragePlan
     from .grouped_row_union import GroupedRowUnionPlan
@@ -739,6 +740,7 @@ class CuteDeviceFunctionState:
         self.reshape_elements_in_place: dict[Node, bool] = {}
         self.published_scalar_requests: list[PublishedScalarRequest] = []
         self.register_producer_requests: list[RegisterProducerRequest] = []
+        self.shared_arena_requests: list[SharedArenaRequest] = []
 
     # -- tcgen05 registries -----------------------------------------------------
 

@@ -19,8 +19,6 @@ from ...language import tile_ops
 from ...language.atomic_ops import ATOMIC_OPS
 from ..compile_environment import CompileEnvironment
 from ..host_function import HostFunction
-from ..loop_dependency_checker import HOST_UNKNOWN_ROOT
-from ..loop_dependency_checker import collect_host_tensor_roots
 from ..variable_origin import BlockSizeOrigin
 from ..variable_origin import GridOrigin
 from ..variable_origin import TileBeginOrigin
@@ -133,18 +131,13 @@ def _uniform_load(load: torch.fx.Node) -> bool:
     The index is literals and uniform scalars only (a tile in it is the
     thread's own index), there is no extra mask, and no store or atomic in
     any graph of the kernel can target the tensor's storage: every written
-    tensor's host value is provably distinct by its allocation roots
-    (``collect_host_tensor_roots``: a fresh allocation is apart from the
-    arguments, while all arguments share one root since the caller may pass
-    one tensor twice), or the two storages are inputs the bound kernel's
-    cache-key disjointness fact proves apart
-    (``runtime_tensors_are_proven_disjoint``; a host view counts as the
-    input whose storage it shares).  Then every thread reads the same value
+    tensor's possible host-storage origins are proved disjoint from every
+    loaded origin. Fresh allocations and bound input-span guards count only
+    while their provenance remains valid. Then every thread reads the same value
     whenever it loads it.  A distributed kernel is refused: a peer may write
     the tensor during the kernel.
     """
-    from ..runtime_tensor_guards import runtime_tensors_are_proven_disjoint
-    from .view_ops import _host_tensor_root_name
+    from ..runtime_tensor_guards import tensors_have_proven_disjoint_storage
 
     tensor, index, extra_mask, *_ = load.args
     if (
@@ -159,23 +152,9 @@ def _uniform_load(load: torch.fx.Node) -> bool:
     if env.process_group_name is not None:
         return False
     host_function = HostFunction.current()
-    roots = collect_host_tensor_roots(
-        host_function.body, set(host_function.params.arguments)
-    )
-    unknown = frozenset({HOST_UNKNOWN_ROOT})
-
-    def tensor_roots(node: torch.fx.Node) -> frozenset[str]:
-        name = node.args[0]
-        assert isinstance(name, str)
-        return roots.get(_host_tensor_root_name(name), unknown)
-
-    input_storages = {id(value.untyped_storage()): value for value in env.input_sources}
-
-    def storage_input(node: torch.fx.Node) -> torch.Tensor | None:
-        return input_storages.get(id(node.meta["val"].untyped_storage()))
-
-    loaded = tensor_roots(tensor)
-    loaded_input = storage_input(tensor)
+    loaded = tensor.meta.get("val")
+    if not isinstance(loaded, torch.Tensor):
+        return False
     for graph_info in host_function.device_ir.graphs:
         for node in graph_info.graph.nodes:
             if node.op != "call_function" or (
@@ -188,17 +167,10 @@ def _uniform_load(load: torch.fx.Node) -> bool:
                 and target.target is _tracing_ops._host_tensor
             ):
                 return False
-            written = tensor_roots(target)
-            if HOST_UNKNOWN_ROOT not in loaded | written and not loaded & written:
-                continue
-            written_input = storage_input(target)
-            if (
-                loaded_input is None
-                or written_input is None
-                or not runtime_tensors_are_proven_disjoint(
-                    env, loaded_input, written_input
-                )
-            ):
+            written = target.meta.get("val")
+            if not isinstance(
+                written, torch.Tensor
+            ) or not tensors_have_proven_disjoint_storage(env, loaded, written):
                 return False
     return True
 

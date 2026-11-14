@@ -26,6 +26,10 @@ Reviewer models and efforts (flags, or the environment variables in brackets):
     codex:  --codex-model [HELION_AUTOREVIEW_CODEX_MODEL], unset by default so the
             model configured in ~/.codex/config.toml (or Codex's default) is used,
             and --codex-effort xhigh [HELION_AUTOREVIEW_CODEX_EFFORT]
+
+A recognized Codex sandbox startup failure is retried once unchanged.
+HELION_AUTOREVIEW_TIMEOUT applies to each attempt, so a retry can take twice
+the configured timeout, plus bounded cleanup.
 """
 
 from __future__ import annotations
@@ -34,22 +38,33 @@ import argparse
 from concurrent.futures import FIRST_EXCEPTION
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import wait
-from contextlib import suppress
+from contextlib import contextmanager
 from datetime import datetime
 import json
 import os
 from pathlib import Path
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 from typing import TYPE_CHECKING
+import uuid
+
+import process_supervisor
+from process_supervisor import ProcessError as ReviewAbort
+from process_supervisor import finish_proc
+from process_supervisor import require_default_sigchld
+from process_supervisor import supervised_command
+from process_supervisor import wait_proc
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterator
+    from concurrent.futures import Future
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LOGS_BASE = REPO_ROOT / ".logs" / "autoreview"
@@ -85,7 +100,6 @@ def _timeout_default() -> float:
 SUBPROCESS_TIMEOUT_SECONDS = _timeout_default()
 SESSION_MARKER = "HELION_AUTOREVIEW_SESSION"
 
-
 PROMPT_DIFF_PREFIX = (
     "Review the staged and uncommitted changes since HEAD, if there are no "
     'meaningful changes print only "ERROR: no changes, use --head to review '
@@ -112,11 +126,24 @@ Review target:
 
 PROMPT_REVIEW_BODY = """\
 You are the reviewer: report findings, and do not edit, commit, rebase or run
-scripts/autoreview.py. The repository's AGENTS.md workflow rules (committing,
-fixing, rebasing, sharing GPUs) are for the author; its coding, compatibility
-and testing rules are what you check against. An `autoreview passed: ...` line
-or a `stack-info:` trailer in a commit message is bookkeeping, not something
-to review.
+scripts/autoreview.py. The repository's AGENTS.md workflow rules for committing,
+fixing and rebasing are for the author; its coding, compatibility and testing
+rules are what you check against. Follow workspace and GPU-sharing instructions
+for any checks you run. Do not expand inherited CUDA_VISIBLE_DEVICES: an empty
+value permits CPU-only checks; do not override it with --gpus. For Triton and
+CuTe, pass --lane cpu to run_tests.py. For the CPU Pallas interpreter, use
+--backend pallas-interpret without --lane (that backend runs serially).
+Metal CPU-only codegen and host tests also use run_tests.py: pass --backend metal
+without --lane, select cpu_only and not cuda, and use -n 0. Native Metal/MPS
+checks require CI; do not substitute plain pytest for the repository runner.
+Put runner options before test paths and pytest options after --, for example:
+```
+scripts/run_tests.py --backend triton,cute --lane cpu test/test_agent_scripts.py -- -n 2
+scripts/run_tests.py --backend pallas-interpret test/test_pallas_memory_access.py -- -n 0
+```
+Leave checks needing another GPU to the author.
+An `autoreview passed: ...` line or a `stack-info:` trailer in a commit message
+is bookkeeping, not something to review.
 
 Check for:
 - Correctness issues, including bugs you notice in the code around the change
@@ -164,6 +191,11 @@ Do *NOT* make any code changes, on success respond only with the review. If ther
 PROMPT_COMBINE = """\
 Another agent using a different model produced the following review (between the BEGIN/END markers below). Combine your review (above) with the other agent's review into a single review. De-duplicate any common issues and resolve any disagreements/conflicts using your best judgment:
 
+Preserve verification provenance. Do not claim commands, tests, hardware execution
+or results that neither input review states and that you did not observe. Keep
+source inspection and inferred behavior distinct from executed checks; a CPU
+binding or generated-code reproduction is not a GPU execution.
+
 ===== BEGIN OTHER REVIEW =====
 {codex_review}
 ===== END OTHER REVIEW =====
@@ -181,8 +213,8 @@ PROMPT_FIX_ADD_SUFFIX = (
 )
 
 
-class ReviewAbort(Exception):
-    """Raised by review workers when they hit an unrecoverable condition."""
+class ReviewCancelled(ReviewAbort):
+    """A peer failed, so this otherwise healthy review was stopped."""
 
 
 def format_review_args(review_args: list[str]) -> str:
@@ -235,63 +267,132 @@ def stderr_tail(stderr: str, *, max_lines: int = 5) -> str:
     return "\n".join(tail)
 
 
-_active_procs: list[subprocess.Popen[str]] = []
-_active_procs_lock = threading.Lock()
-
-
-def _register_proc(proc: subprocess.Popen[str]) -> None:
-    with _active_procs_lock:
-        _active_procs.append(proc)
-
-
-def _unregister_proc(proc: subprocess.Popen[str]) -> None:
-    with _active_procs_lock:
-        if proc in _active_procs:
-            _active_procs.remove(proc)
-
-
-def kill_active_procs() -> None:
-    """Kill every subprocess currently tracked by run_subprocess so that a
-    failure in one parallel worker does not block on the others completing."""
-    with _active_procs_lock:
-        procs = list(_active_procs)
-    for p in procs:
-        with suppress(ProcessLookupError, OSError):
-            p.kill()
-
-
 def run_subprocess(
-    cmd: list[str], *, label: str, timeout: float = SUBPROCESS_TIMEOUT_SECONDS
+    cmd: list[str],
+    *,
+    label: str,
+    timeout: float = SUBPROCESS_TIMEOUT_SECONDS,
+    log_path: Path | None = None,
+    log_prompt: str | None = None,
+    cancelled: threading.Event | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run cmd, converting launch failures and timeouts into ReviewAbort and
-    registering the live process so it can be killed on parallel-worker abort."""
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=subprocess_env(),
-            cwd=REPO_ROOT,
-        )
-    except FileNotFoundError as e:
-        raise ReviewAbort(f"[{label}] binary not found: {e}") from None
-    except PermissionError as e:
-        raise ReviewAbort(f"[{label}] permission error: {e}") from None
-    except OSError as e:
-        raise ReviewAbort(f"[{label}] launch failed: {e}") from None
-    _register_proc(proc)
-    try:
+    """Run a reviewer with retained output and bounded cancellation cleanup.
+
+    POSIX callers must keep SIGCHLD at its default disposition and leave child
+    reaping to this helper for the duration of the call. Signal handlers are
+    never changed here; SIGPIPE may have any disposition.
+
+    Unlike interactive test jobs, reviewer cancellation is an event or a
+    command timeout, not forwarded SIGINT. The public supervision primitives
+    preserve that policy, separate stdout/stderr, and partial-output logging;
+    the finally block enters bounded cleanup as soon as cancellation is seen.
+    """
+    if cancelled is not None and cancelled.is_set():
+        raise ReviewCancelled(f"[{label}] cancelled")
+    if os.name == "posix":
+        require_default_sigchld()
+    if log_path is not None:
+        with log_path.open("a") as log:
+            display_cmd = [
+                "<see prompt below>" if arg == log_prompt else arg for arg in cmd
+            ]
+            log.write(f"\n=== cmd ===\n{display_cmd}\n")
+            if log_prompt is not None:
+                log.write(f"\n=== prompt ===\n{log_prompt}\n")
+    # A nonblocking CLI stderr writer can hit EAGAIN on a full pipe. Regular
+    # files have no pipe capacity and also retain partial output on timeout.
+    with (
+        supervised_command(cmd) as (launch_cmd, pass_fds, status_file, control),
+        tempfile.TemporaryFile(mode="w+b") as stdout_file,
+        tempfile.TemporaryFile(mode="w+b") as stderr_file,
+    ):
         try:
-            stdout, stderr = proc.communicate(timeout=timeout)
+            proc = subprocess.Popen(
+                launch_cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                env={**subprocess_env(), **(extra_env or {})},
+                cwd=REPO_ROOT,
+                start_new_session=True,
+                pass_fds=pass_fds,
+            )
+        except OSError as e:
+            message = f"[{label}] launch failed: {e}"
+            if log_path is not None:
+                with log_path.open("a") as log:
+                    log.write(f"\n=== error ===\n{message}\n")
+            raise ReviewAbort(message) from None
+        launch_error = None
+        pending_error: BaseException | None = None
+        try:
+            if control is not None:
+                control.close_parent_writer()
+                # Only the child owns this end after spawn. Its death must
+                # break the stop pipe rather than leave a parent-held reader.
+                control.close_parent_reader()
+            deadline = time.monotonic() + timeout
+            while True:
+                if cancelled is not None and cancelled.is_set():
+                    raise ReviewCancelled(f"[{label}] cancelled")
+                try:
+                    wait_proc(
+                        proc, max(0, min(0.1, deadline - time.monotonic())), control
+                    )
+                    break
+                except subprocess.TimeoutExpired:
+                    if time.monotonic() >= deadline:
+                        raise
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.communicate()
-            raise ReviewAbort(f"[{label}] timed out after {timeout:.0f}s") from None
-        return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
-    finally:
-        _unregister_proc(proc)
+            pending_error = ReviewAbort(f"[{label}] timed out after {timeout:.0f}s")
+            raise pending_error from None
+        except BaseException as error:
+            pending_error = error
+            raise
+        finally:
+            # Capture output even when bounded cleanup itself fails.
+            returncode = proc.returncode
+            try:
+                finish_proc(proc, label, control)
+                try:
+                    returncode = process_supervisor.read_result(
+                        proc,
+                        status_file,
+                        label,
+                        cmd,
+                        stopped_ok=pending_error is not None,
+                    )
+                except process_supervisor.LaunchError as error:
+                    launch_error = error.error
+            except ReviewAbort as cleanup_error:
+                if pending_error is not None:
+                    reason = str(pending_error) or type(pending_error).__name__
+                    cleanup_error = ReviewAbort(f"{reason}; {cleanup_error}")
+                if log_path is not None:
+                    with log_path.open("a") as log:
+                        log.write(f"\n=== cleanup error ===\n{cleanup_error}\n")
+                raise cleanup_error from None
+            finally:
+                stdout_file.seek(0)
+                stderr_file.seek(0)
+                stdout_bytes = stdout_file.read()
+                stderr_bytes = stderr_file.read()
+                if log_path is not None:
+                    with log_path.open("ab") as log:
+                        log.write(
+                            f"\n=== supervisor returncode === {proc.returncode}\n".encode()
+                        )
+                        log.write(b"\n=== stderr ===\n" + stderr_bytes + b"\n")
+                        log.write(b"\n=== stdout ===\n" + stdout_bytes + b"\n")
+                        log.write(f"\n=== returncode === {returncode}\n".encode())
+            # Preserve raw bytes before decoding: a killed writer can
+            # leave a partial UTF-8 sequence, including on timeout.
+            stdout = stdout_bytes.decode(errors="replace")
+            stderr = stderr_bytes.decode(errors="replace")
+        if launch_error is not None:
+            raise ReviewAbort(f"[{label}] launch failed: {launch_error}")
+        return subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
 
 
 class Spinner:
@@ -407,14 +508,50 @@ class ClaudeSession:
             cmd += ["--resume", self.session_id]
         return cmd
 
-    def send(self, prompt: str) -> str:
+    def send(
+        self,
+        prompt: str,
+        *,
+        phase: str = "review",
+        cancelled: threading.Event | None = None,
+    ) -> str:
+        # A background task can end the requested turn with progress text, then
+        # make `--output-format json` return only its task-notification result.
+        # Keep tools in the foreground and require this turn's completion token;
+        # neither a notification nor unmarked progress is a completed response.
+        completion = f"[AUTOREVIEW_COMPLETE_{uuid.uuid4().hex}]"
+        prompt += (
+            "\n\nResponse completion protocol (the only addition to the response "
+            "format above): keep tool work in the foreground and wait for its "
+            "results before completing this request. Do not end the turn with "
+            "progress text or a promise to report later. When the requested "
+            "review, combination, or fix is complete, append the following "
+            "exact line after the substantive response (also after an ERROR "
+            "response). Never append it to an interim update.\n"
+            f"{completion}"
+        )
+        # Allow an explicitly long tool command within the send budget. Keep
+        # Claude's normal per-command default and any user-supplied timeout cap;
+        # the outer deadline still bounds all work.
+        foreground_timeout = str(max(1, int(SUBPROCESS_TIMEOUT_SECONDS * 1000)))
+        foreground_env = {
+            "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+            "BASH_MAX_TIMEOUT_MS": os.environ.get(
+                "BASH_MAX_TIMEOUT_MS", foreground_timeout
+            ),
+        }
+        with self.log_path.open("a") as log:
+            log.write(f"\n=== foreground tools ===\n{json.dumps(foreground_env)}\n")
         cmd = self._build_cmd(prompt)
-        proc = run_subprocess(cmd, label="claude")
-        with self.log_path.open("a") as f:
-            f.write(f"\n=== prompt ===\n{prompt}\n")
-            f.write(f"\n=== returncode === {proc.returncode}\n")
-            f.write(f"\n=== stderr ===\n{proc.stderr}\n")
-            f.write(f"\n=== stdout ===\n{proc.stdout}\n")
+        proc = run_subprocess(
+            cmd,
+            label="claude",
+            timeout=SUBPROCESS_TIMEOUT_SECONDS,
+            log_path=self.log_path,
+            log_prompt=prompt,
+            cancelled=cancelled,
+            extra_env=foreground_env,
+        )
         if proc.returncode != 0:
             raise ReviewAbort(
                 f"[claude] non-zero exit {proc.returncode}: {stderr_tail(proc.stderr)}"
@@ -425,19 +562,40 @@ class ClaudeSession:
             raise ReviewAbort(
                 f"[claude] failed to parse JSON ({e}): {proc.stdout[:500]!r}"
             ) from None
+        if not isinstance(data, dict):
+            raise ReviewAbort("[claude] response must be a JSON object")
         if data.get("is_error"):
             raise ReviewAbort(
                 f"[claude] error result: subtype={data.get('subtype')!r} "
                 f"api_error_status={data.get('api_error_status')!r}"
             )
         sid = data.get("session_id")
+        if sid is not None and not isinstance(sid, str):
+            raise ReviewAbort("[claude] session_id must be a string")
         if sid:
             self.session_id = sid
-        result = data.get("result", "") or ""
+        origin = data.get("origin")
+        if isinstance(origin, dict) and origin.get("kind") == "task-notification":
+            raise ReviewAbort(
+                "[claude] received a task-notification instead of the requested "
+                f"response; the requested result is unavailable (see {self.log_path})"
+            )
+        result = data.get("result")
+        if not isinstance(result, str) or not result.strip():
+            raise ReviewAbort("[claude] result must be a nonempty string")
         err = is_error_response(result)
         if err is not None:
             raise ReviewAbort(f"[claude] {err}")
-        return result
+        result = result.rstrip()
+        if not result.endswith(completion) or not (
+            body := result[: -len(completion)].rstrip()
+        ):
+            detail = "working-tree edits may be present; " if phase == "fix" else ""
+            raise ReviewAbort(
+                f"[claude] {phase} response did not confirm completion; "
+                f"{detail}result is unconfirmed (see {self.log_path})"
+            )
+        return body
 
 
 def run_codex_review(
@@ -448,6 +606,9 @@ def run_codex_review(
     sandbox: str = "read-only",
     model: str = CODEX_MODEL,
     effort: str = CODEX_REASONING_EFFORT,
+    *,
+    log: Callable[[str], None],
+    cancelled: threading.Event | None = None,
 ) -> str:
     """Run codex one-shot, return the last message text. Codex only ever
     reviews — fixes are performed by the claude session — so by default the
@@ -484,32 +645,68 @@ def run_codex_review(
     ]
     if model:
         cmd += ["-m", model]
-    with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as tf:
-        out_path = Path(tf.name)
-    try:
-        cmd += [prompt, "-o", str(out_path)]
-        proc = run_subprocess(cmd, label="codex")
-        log_path.write_text(
-            f"=== cmd ===\n{cmd}\n\n"
-            f"=== returncode === {proc.returncode}\n\n"
-            f"=== stderr ===\n{proc.stderr}\n\n"
-            f"=== stdout ===\n{proc.stdout}\n"
-        )
-        if proc.returncode != 0:
-            raise ReviewAbort(
-                f"[codex] non-zero exit {proc.returncode}: {stderr_tail(proc.stderr)}"
-            )
-        result = out_path.read_text() if out_path.exists() else ""
-        if not result.strip():
-            raise ReviewAbort(
-                "[codex] produced an empty review (use --no-codex to skip)"
-            )
-        err = is_error_response(result)
-        if err is not None:
-            raise ReviewAbort(f"[codex] {err}")
-        return result
-    finally:
-        out_path.unlink(missing_ok=True)
+    log_path.write_text("")
+    for attempt in range(2):
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as tf:
+            out_path = Path(tf.name)
+        try:
+            try:
+                proc = run_subprocess(
+                    [*cmd, prompt, "-o", str(out_path)],
+                    label="codex",
+                    log_path=log_path,
+                    log_prompt=prompt,
+                    cancelled=cancelled,
+                )
+            finally:
+                # Preserve the separate result file on timeout/abort too,
+                # before the outer finally removes the temporary path.
+                result_bytes = out_path.read_bytes() if out_path.exists() else b""
+                with log_path.open("ab") as log_file:
+                    log_file.write(b"\n=== result ===\n" + result_bytes + b"\n")
+            try:
+                result = result_bytes.decode()
+            except UnicodeDecodeError:
+                if proc.returncode != 0:
+                    raise ReviewAbort(
+                        f"[codex] non-zero exit {proc.returncode}: "
+                        f"{stderr_tail(proc.stderr)}"
+                    ) from None
+                raise ReviewAbort("[codex] produced an invalid UTF-8 review") from None
+            err = is_error_response(result)
+            if attempt == 0 and _sandbox_mount_failed(proc, err):
+                notice = (
+                    "[codex] sandbox mount failed; retrying once with unchanged "
+                    f"settings (first attempt saved in {log_path})"
+                )
+                log(notice)
+                continue
+            if proc.returncode != 0:
+                raise ReviewAbort(
+                    f"[codex] non-zero exit {proc.returncode}: {stderr_tail(proc.stderr)}"
+                )
+            if not result.strip():
+                raise ReviewAbort(
+                    "[codex] produced an empty review (use --no-codex to skip)"
+                )
+            if err is not None:
+                raise ReviewAbort(f"[codex] {err}")
+            return result
+        finally:
+            out_path.unlink(missing_ok=True)
+    raise AssertionError("exhausted Codex attempts without a result or error")
+
+
+def _sandbox_mount_failed(
+    proc: subprocess.CompletedProcess[str], error: str | None
+) -> bool:
+    # Retry only the observed initialization failure, never review findings or
+    # arbitrary errors. Permissions and reviewer configuration stay unchanged.
+    diagnostic = "Unable to remount recursively with correct flags: Invalid argument"
+    return (proc.returncode != 0 or error is not None) and any(
+        line.startswith("bwrap: Can't bind mount ") and diagnostic in line
+        for line in proc.stderr.splitlines()
+    )
 
 
 def passed_line(reviewers: list[str]) -> str:
@@ -529,51 +726,107 @@ def fmt_seconds(seconds: float) -> str:
     return f"{seconds:.0f}s"
 
 
-def run_with_timing(label: str, spinner: Spinner, fn: Callable[[], str]) -> str:
+def run_with_timing(
+    label: str,
+    spinner: Spinner,
+    fn: Callable[[threading.Event], str],
+    cancelled: threading.Event,
+) -> str:
     spinner.add(label)
     start = time.monotonic()
-    success = False
+    outcome = "failed"
     try:
-        result = fn()
-        success = True
+        result = fn(cancelled)
+        outcome = "finished"
         return result
+    except ReviewCancelled:
+        outcome = "cancelled"
+        raise
     finally:
         spinner.remove(label)
         elapsed = fmt_seconds(time.monotonic() - start)
-        outcome = "finished" if success else "failed"
         spinner.log(f"{label} {outcome} in {elapsed}")
 
 
 def run_parallel(
-    spinner: Spinner, jobs: dict[str, Callable[[], str]]
+    spinner: Spinner, jobs: dict[str, Callable[[threading.Event], str]]
 ) -> dict[str, str]:
     """Submit each (label -> callable) to a thread pool, raise the first
     ReviewAbort if any worker raises one, otherwise return a dict of results.
+    Each job receives the shared cancellation event explicitly.
 
-    On first failure, any still-running subprocess registered via run_subprocess
-    is killed so the surviving workers unblock immediately."""
+    On first failure, surviving workers enter bounded cleanup. Report secondary
+    failures after joining them without replacing the original exception.
+
+    Single-job followups use this too: Popen must stay off the main thread,
+    where a signal handler can raise before startup has installed cleanup."""
     pool = ThreadPoolExecutor(max_workers=len(jobs))
-    futs = {
-        label: pool.submit(run_with_timing, label, spinner, fn)
-        for label, fn in jobs.items()
-    }
+    cancelled = threading.Event()
+    futs: dict[str, Future[str]] = {}
+    primary_error = None
     try:
+        for label, fn in jobs.items():
+            futs[label] = pool.submit(run_with_timing, label, spinner, fn, cancelled)
         # FIRST_EXCEPTION returns when any future raises (or all complete).
         # Inspect only the `done` set so we never block on a still-running
-        # future inside fut.exception() before killing the surviving workers.
-        done, not_done = wait(futs.values(), return_when=FIRST_EXCEPTION)
+        # future inside fut.exception() before cancelling the surviving workers.
+        done, _not_done = wait(futs.values(), return_when=FIRST_EXCEPTION)
         for fut in done:
             exc = fut.exception()
             if exc is not None:
-                kill_active_procs()
-                wait(not_done)
                 raise exc
         return {label: fut.result() for label, fut in futs.items()}
+    except BaseException as error:
+        primary_error = error
+        cancelled.set()
+        raise
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
+        if primary_error is not None:
+            for label, future in futs.items():
+                if future.cancelled():
+                    continue
+                secondary_error = future.exception()
+                if (
+                    secondary_error is not None
+                    and secondary_error is not primary_error
+                    and not isinstance(secondary_error, ReviewCancelled)
+                ):
+                    spinner.log(
+                        f"{label} failed during cancellation: {secondary_error}"
+                    )
+
+
+@contextmanager
+def _termination_handlers() -> Iterator[None]:
+    """Unwind and kill reviewer groups when the CLI's parent session ends."""
+
+    def terminate(signum: int, frame: object) -> None:
+        raise SystemExit(128 + signum)
+
+    signals = (signal.SIGTERM, signal.SIGHUP) if os.name == "posix" else ()
+    previous = {}
+    for sig in signals:
+        # nohup deliberately ignores SIGHUP; keep that inherited contract.
+        if signal.getsignal(sig) != signal.SIG_IGN:
+            previous[sig] = signal.signal(sig, terminate)
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
 
 
 def main() -> int:
+    # SIG_IGN survives exec and would auto-reap the supervisors. The CLI owns
+    # its children; library callers retain their own disposition and checks.
+    if os.name == "posix" and signal.getsignal(signal.SIGCHLD) == signal.SIG_IGN:
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    with _termination_handlers():
+        return _main()
+
+
+def _main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -721,11 +974,13 @@ def main() -> int:
     combined = ""
 
     try:
-        jobs: dict[str, Callable[[], str]] = {}
+        jobs: dict[str, Callable[[threading.Event], str]] = {}
         if use_claude:
-            jobs["claude review"] = lambda: claude.send(review_prompt)
+            jobs["claude review"] = lambda cancelled: claude.send(
+                review_prompt, cancelled=cancelled
+            )
         if use_codex:
-            jobs["codex review"] = lambda: run_codex_review(
+            jobs["codex review"] = lambda cancelled: run_codex_review(
                 review_prompt,
                 log_dir / "codex.log",
                 args.meta,
@@ -733,6 +988,8 @@ def main() -> int:
                 sandbox=args.codex_sandbox,
                 model=args.codex_model,
                 effort=args.codex_effort,
+                log=spinner.log,
+                cancelled=cancelled,
             )
         results = run_parallel(spinner, jobs)
         claude_review = results.get("claude review")
@@ -747,9 +1004,14 @@ def main() -> int:
             combined = codex_review
         elif codex_review and codex_review.strip() != "LGTM":
             combine_prompt = PROMPT_COMBINE.format(codex_review=codex_review)
-            combined = run_with_timing(
-                "combining", spinner, lambda: claude.send(combine_prompt)
-            )
+            combined = run_parallel(
+                spinner,
+                {
+                    "combining": lambda cancelled: claude.send(
+                        combine_prompt, phase="combination", cancelled=cancelled
+                    )
+                },
+            )["combining"]
             # Only written when an actual combine round produced new text.
             (log_dir / "combined-review.txt").write_text(combined)
         else:
@@ -758,9 +1020,14 @@ def main() -> int:
 
         if args.fix and combined.strip() != "LGTM":
             fix_prompt = PROMPT_FIX + (PROMPT_FIX_ADD_SUFFIX if args.add else "")
-            fix_result = run_with_timing(
-                "fixing", spinner, lambda: claude.send(fix_prompt)
-            )
+            fix_result = run_parallel(
+                spinner,
+                {
+                    "fixing": lambda cancelled: claude.send(
+                        fix_prompt, phase="fix", cancelled=cancelled
+                    )
+                },
+            )["fixing"]
             (log_dir / "fix-result.txt").write_text(fix_result)
     except ReviewAbort as e:
         spinner.stop()

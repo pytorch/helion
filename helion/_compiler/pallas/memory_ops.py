@@ -38,6 +38,9 @@ def _(state: CodegenState) -> None:
     assert isinstance(subscript, (list, tuple))
     value = state.ast_arg(2)
     assert isinstance(tensor, torch.Tensor)
+    value = pallas_codegen.broadcast_value_for_store(
+        state, tensor, subscript, value, state.proxy_arg(2)
+    )
     arg_name = state.device_function.tensor_arg(tensor).name
     name = state.device_function.pallas_tensor_ref_name(tensor)
     name = pallas_codegen.vmem_name(state, name)
@@ -56,7 +59,14 @@ def _(state: CodegenState) -> None:
         if emit_carry_store(state, tensor, name, idx_str, value):
             return
     value = pallas_codegen.sliced_value_for_store(
-        state, tensor, subscript, parts, value
+        state,
+        tensor,
+        subscript,
+        parts,
+        value,
+        ref_name=(
+            None if isinstance(plan, (DmaScatterPlan, OneHotScatterPlan)) else name
+        ),
     )
     if isinstance(plan, DmaScatterPlan):
         dma_ref = pallas_codegen.memory_op_dma_scratch(state)

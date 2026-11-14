@@ -23,6 +23,7 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .device_function import find_block_size_symbols
+from .device_function import substitute_configured_block_sizes
 from .host_function import HostFunction
 from .inductor_lowering import install_inductor_kernel_handlers
 from .roll_reduction import FREE_IOTA_REDUCTION_META
@@ -773,13 +774,7 @@ class PersistentReductionStrategy(ReductionStrategy):
             # Reduction extents can refer to tile sizes. Resolve those symbols
             # from this config before planning physical threads or lane loops;
             # the tracing hint can be larger or smaller than the chosen tile.
-            block_symbols, _ = find_block_size_symbols(numel)
-            configured_sizes = {
-                symbol: sympy.Integer(size)
-                for symbol, block_id in block_symbols.items()
-                if isinstance(size := fn.resolved_block_size(block_id), int)
-            }
-            resolved_numel = numel.xreplace(configured_sizes)
+            resolved_numel = substitute_configured_block_sizes(numel, fn.config)
             size_hint = shape_env_size_hint(env.shape_env, resolved_numel)
         else:
             size_hint = env.size_hint(numel)

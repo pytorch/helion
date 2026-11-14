@@ -14,6 +14,7 @@ from typing import Callable
 from typing import cast
 
 import torch
+from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 
 from ... import exc
 from ..._compat import num_compute_units
@@ -280,9 +281,13 @@ class PallasBackend(Backend):
         super().__init__()
         # Filled by ``build_launcher_args``; the launcher returns these tensors.
         self._output_only_names: list[str] = []
+        self._cacheable_output_only_names: list[str] = []
 
     def output_only_names(self) -> list[str]:
         return self._output_only_names
+
+    def cacheable_output_only_names(self) -> list[str]:
+        return self._cacheable_output_only_names
 
     @property
     def supports_autotune_multi(self) -> bool:
@@ -316,9 +321,9 @@ class PallasBackend(Backend):
 
     @property
     def requires_shape_specialized_module(self) -> bool:
-        # Pallas modules hold monomorphic, shape-specific cached state
-        # (output-meta descriptor, launcher cache, ds-pad decision, signature
-        # lock), so each static-shape specialization needs its own module.
+        # Static-shape output-meta slots are fixed for an input specialization,
+        # so those bindings need separate modules. Other output metadata is
+        # rebuilt per call; launcher entries separately key actual geometry.
         return True
 
     def max_reduction_threads(self) -> int | None:
@@ -557,10 +562,26 @@ class PallasBackend(Backend):
             return f"{host_str}.reshape(1)"
         if isinstance(arg, (SymbolArgument, TensorSizeArg, TensorStrideArg)):
             from ..compile_environment import CompileEnvironment
+            from ..device_function import DeviceFunction
 
-            if tensor_host_args:
-                device_expr = f"{tensor_host_args[0]}.device"
-            elif CompileEnvironment.current().settings.pallas_interpret:
+            env = CompileEnvironment.current()
+            input_storages = {id(t.untyped_storage()) for t in env.input_sources}
+            # Body outputs can be retargeted to meta placeholders after this
+            # call. Use the same input-storage provenance as output classification
+            # so scalar data is allocated on a real input's device instead.
+            input_arg = next(
+                (
+                    candidate
+                    for candidate in DeviceFunction.current().sorted_args()
+                    if isinstance(candidate, TensorArg)
+                    and candidate.host_str() in tensor_host_args
+                    and id(candidate.fake_value.untyped_storage()) in input_storages
+                ),
+                None,
+            )
+            if input_arg is not None:
+                device_expr = f"{input_arg.host_str()}.device"
+            elif env.settings.pallas_interpret:
                 device_expr = "'cpu'"
             else:
                 device_expr = "'tpu'"
@@ -572,9 +593,7 @@ class PallasBackend(Backend):
             # The kernel dereferences the scalar with ``name[0]`` (see
             # ``scalar_arg_preamble``).
             if isinstance(arg, (TensorSizeArg, TensorStrideArg)):
-                from ..compile_environment import CompileEnvironment
-
-                idx_dtype = CompileEnvironment.current().index_dtype
+                idx_dtype = env.index_dtype
                 return f"torch.tensor([{host_str}], dtype={idx_dtype!r}, device={device_expr})"
             return f"torch.tensor([{host_str}], dtype=torch.float32 if isinstance({host_str}, float) else torch.int32, device={device_expr})"
         return host_str
@@ -1635,6 +1654,7 @@ class PallasBackend(Backend):
         from ..device_function import DeviceFunction
         from ..device_function import TensorArg
         from ..host_function import HostFunction
+        from ..variable_origin import BlockSizeOrigin
 
         device_fn = DeviceFunction.current()
 
@@ -1698,13 +1718,39 @@ class PallasBackend(Backend):
         # allocations to ``device='meta'`` and capture the launcher return.
         output_only_set = set(output_indices) - set(inplace_indices)
         output_only_names: list[str] = []
+        cacheable_output_only_names: list[str] = []
         if sorted_args is not None:
+            env = CompileEnvironment.current()
+            host_fn = HostFunction.current()
+            configured_symbols = {
+                symbol
+                for symbol, info in host_fn.expr_to_origin.items()
+                if isinstance(info.origin, BlockSizeOrigin)
+            }
             for i in output_indices:
                 if i in output_only_set:
                     arg = sorted_args[i]
                     assert isinstance(arg, TensorArg)
+                    # Backed input dimensions and configured block sizes are
+                    # fixed by a static-shape binding. Other metadata must be
+                    # recomputed before the launcher selects its specialization.
+                    metadata = (
+                        *arg.fake_value.shape,
+                        *arg.fake_value.stride(),
+                        arg.fake_value.storage_offset(),
+                    )
+                    if not any(
+                        isinstance(value, torch.SymInt)
+                        and free_unbacked_symbols(
+                            env.specialize_expr(env.shape_env.replace(value._sympy_()))
+                        )
+                        - configured_symbols
+                        for value in metadata
+                    ):
+                        cacheable_output_only_names.append(arg.host_str())
                     output_only_names.append(arg.host_str())
         self._output_only_names = output_only_names
+        self._cacheable_output_only_names = cacheable_output_only_names
 
         launcher_args = [*args]
         if has_rng_ops:

@@ -42,6 +42,7 @@ from ... import exc
 from ...language.matmul_ops import dot
 from ..compile_environment import CompileEnvironment
 from ..compile_environment import FixedBlockSizeSource
+from ..utils import is_full_slice
 from .autotune.config_keys import CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY
 from .autotune.config_keys import CUTE_GDN_RECURRENCE_MMA_M_KEY
 from .autotune.config_keys import CUTE_GDN_RECURRENCE_STAGES_KEY
@@ -52,7 +53,6 @@ from .fx_matcher import _binary_args
 from .fx_matcher import _canonical_root_axis_ids
 from .fx_matcher import _is_call
 from .fx_matcher import _is_convert
-from .fx_matcher import _is_full_slice
 from .fx_matcher import _linear_offsets_fit_i32
 from .fx_matcher import _load_ref
 from .fx_matcher import _memory_indices
@@ -177,7 +177,7 @@ def _indices_are(node: torch.fx.Node, expected: Sequence[object]) -> bool:
         return False
     for actual, wanted in zip(indices, expected, strict=True):
         if wanted == "full":
-            if not _is_full_slice(actual):
+            if not is_full_slice(actual):
                 return False
         elif actual is not wanted:
             return False
@@ -274,19 +274,62 @@ def _match_gdn_recurrence_graphs(
             torch.ops.aten.permute.default: 1,
         }
     )
-    if _call_counts(root_nodes) != expected_root:
+    loop_call = _single(root_nodes, _for_loop)
+    placeholders = [node for node in inner if node.op == "placeholder"]
+    if (
+        loop_call is None
+        or len(loop_call.args) != 4
+        or not isinstance(loop_call.args[3], (list, tuple))
+        or len(loop_call.args[3]) != len(placeholders)
+    ):
+        return None
+    # Scalar SSA captures can remain in the loop interface after their last
+    # use disappears. Ignore only unused float placeholders and their pure
+    # symbol reads/SSA copies used exclusively by this call. Keep tensor
+    # carriers and any scalar that reaches arithmetic, effects or outputs
+    # in the proof.
+    unused_float_reads: set[torch.fx.Node] = set()
+    used_inputs = []
+    for index, (node, argument) in enumerate(
+        zip(placeholders, loop_call.args[3], strict=True)
+    ):
+        if not node.users and isinstance(node.meta.get("val"), torch.SymFloat):
+            user = loop_call
+            while isinstance(argument, torch.fx.Node):
+                if not isinstance(argument.meta.get("val"), torch.SymFloat) or set(
+                    argument.users
+                ) != {user}:
+                    return None
+                unused_float_reads.add(argument)
+                if _is_call(argument, _get_symnode):
+                    break
+                if (
+                    not _is_call(argument, _new_var)
+                    or len(argument.args) != 1
+                    or argument.kwargs
+                ):
+                    return None
+                user, argument = argument, argument.args[0]
+            else:
+                return None
+        else:
+            used_inputs.append((index, node))
+    if len(used_inputs) != 1:
+        return None
+    state_index, state_in = used_inputs[0]
+    if not isinstance(state_in.meta.get("val"), torch.Tensor):
+        return None
+    if (
+        _call_counts([n for n in root_nodes if n not in unused_float_reads])
+        != expected_root
+    ):
         return None
     if _call_counts(inner) != expected_inner:
         return None
-    placeholders = [node for node in inner if node.op == "placeholder"]
-    if len(placeholders) != 1:
-        return None
-    state_in = placeholders[0]
 
     # Root: zero-initialized [dhead, block_v] fp32 carrier, one chunk loop over
     # [0, seqlen), nothing else.
     full_node = _single(root_nodes, full)
-    loop_call = _single(root_nodes, _for_loop)
     getitem = _single(root_nodes, operator.getitem)
     phi = _single(root_nodes, _phi)
     root_outputs = list(root.graph.find_nodes(op="output"))
@@ -330,8 +373,8 @@ def _match_gdn_recurrence_graphs(
         or not isinstance(loop_call.args[2], (list, tuple))
         or len(loop_call.args[2]) != 1
         or not isinstance(loop_call.args[3], (list, tuple))
-        or len(loop_call.args[3]) != 1
-        or loop_call.args[3][0] is not full_node
+        or len(loop_call.args[3]) != len(placeholders)
+        or loop_call.args[3][state_index] is not full_node
     ):
         return None
     seqlen = _static_int(loop_call.args[2][0])
@@ -481,7 +524,7 @@ def _match_gdn_recurrence_graphs(
     batch_coord, w_chunk, head_coord, w_feature = w_indices
     if (
         w_chunk is not chunk_sym
-        or not _is_full_slice(w_feature)
+        or not is_full_slice(w_feature)
         or not _is_call(batch_coord, _get_symnode)
         or not _is_call(head_coord, _get_symnode)
         or batch_coord is head_coord

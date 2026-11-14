@@ -48,6 +48,7 @@ from ..fx_load_trace import trace_to_load_tensor
 from ..host_function import HostFunction
 from ..indexing_strategy import exact_tile_block_ids
 from ..indexing_strategy import subscript_tile_info
+from ..runtime_tensor_guards import tensors_have_proven_disjoint_storage
 from ..tile_strategy import DeviceLoopState
 from ..variable_origin import TileBeginOrigin
 from ..variable_origin import TileEndOrigin
@@ -206,7 +207,8 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
 from .tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
-from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N
+from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_NS
+from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_N
 from .tcgen05_constants import TCGEN05_SPLIT_K_BARRIER_ID
 from .tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
@@ -239,6 +241,7 @@ if TYPE_CHECKING:
     from ..generate_ast import GenerateAST
     from ..inductor_lowering import CodegenState
     from ..tile_strategy import DeviceGridState
+    from .dense_aligned_n import DenseAlignedNPlan
     from .strategies import Tcgen05WarpSpec
     from .tcgen05.search_plan import CuteTcgen05SearchPlan
 
@@ -1106,15 +1109,14 @@ def _grouped_ab_k_loop_supported(
         isinstance(output, torch.Tensor)
         and output.is_contiguous()
         and env.tensor_storage_is_compiler_allocated(output)
-        and id(output.untyped_storage())
-        not in {
-            id(tensor.untyped_storage())
+        and all(
+            tensors_have_proven_disjoint_storage(env, output, tensor)
             for tensor in (
                 *env.input_sources,
                 proof.lhs.source_fake,
                 proof.rhs.source_fake,
             )
-        }
+        )
         and all(
             0 < env.size_hint(tensor.numel()) <= (1 << 31) - 1
             for tensor in (proof.lhs.source_fake, rhs, output)
@@ -7789,6 +7791,7 @@ class Tcgen05PipelinePlan:
     tcgen05_pid_is_persistent: bool
     tcgen05_static_output_tiles: bool
     tcgen05_static_full_tiles: bool
+    tcgen05_aligned_n_plan: DenseAlignedNPlan | None
     tcgen05_flat_edge_tma: bool
     tcgen05_edge_scalar_fallback_needs_inter_smem_a: bool
     tcgen05_sync_before_scalar_fallback: bool
@@ -9470,9 +9473,21 @@ def plan_tcgen05_pipeline(
     # (128, 32) tile whose ring fits comfortably next to a 3-stage AB
     # pipeline, and a deeper AB pipeline is worth ~15-25% on edge shapes.
     # ``c_stages_fits`` fails CLOSED (False without a recorded budget), so
-    # keep the legacy cap as the fallback admission.
+    # keep the legacy cap as the fallback admission. The measured arena model
+    # (``output_edge_tma_store_smem_fits``) admits the deepest rings that
+    # really fit, e.g. ab=6 beside a (128, 64) C ring on 256x256x64.
+    # The aligned-N family prices its C ring with its AB ring
+    # (``dense_aligned_n_plan``); its physical width is outside the
+    # power-of-two arena models below.
+    tcgen05_aligned_n_plan = facts._dense_aligned_n_plan(
+        env.config_spec._cute_tcgen05_config, df.config.config
+    )
     tcgen05_output_edge_tma_store_fits_smem = (
         tcgen05_ab_stage_count_value <= TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
+        or (
+            tcgen05_aligned_n_plan is not None
+            and tcgen05_ab_stage_count_value <= tcgen05_aligned_n_plan.max_ab_stages
+        )
         or smem.c_stages_fits(
             env.config_spec._cute_tcgen05_config,
             bm=tcgen05_source_bm,
@@ -9482,6 +9497,16 @@ def plan_tcgen05_pipeline(
             ab_stages=tcgen05_ab_stage_count_value,
             c_stages=tcgen05_c_stage_count_value,
             has_source_c=True,
+        )
+        or smem.output_edge_tma_store_smem_fits(
+            env.config_spec._cute_tcgen05_config,
+            df.config.config,
+            bm=tcgen05_source_bm,
+            bn=tcgen05_source_bn,
+            bk=bk,
+            cluster_m=tcgen05_cluster_m,
+            ab_stages=tcgen05_ab_stage_count_value,
+            c_stages=tcgen05_c_stage_count_value,
         )
     )
     # ``tcgen05_is_two_cta`` below gates only the hybrid output-store protocol,
@@ -11162,6 +11187,7 @@ def plan_tcgen05_pipeline(
         tcgen05_pid_is_persistent=tcgen05_pid_is_persistent,
         tcgen05_static_output_tiles=tcgen05_static_output_tiles,
         tcgen05_static_full_tiles=tcgen05_static_full_tiles,
+        tcgen05_aligned_n_plan=tcgen05_aligned_n_plan,
         tcgen05_flat_edge_tma=tcgen05_flat_edge_tma,
         tcgen05_edge_scalar_fallback_needs_inter_smem_a=tcgen05_edge_scalar_fallback_needs_inter_smem_a,
         tcgen05_sync_before_scalar_fallback=tcgen05_sync_before_scalar_fallback,
@@ -12585,8 +12611,9 @@ def _emit_mma_pipeline(
             tcgen05_explicit_d_store_box_n = 32
         # Plain 16-bit epilogues (no auxiliary GMEM operand: the accumulator
         # is converted and stored once, static full tiles) take the same
-        # (128, 32) subtile on the two-CTA 256-wide tile, where CuTe's
-        # with-source rule would give (128, 64): halving the subtile doubles
+        # (128, 32) subtile on the two-CTA 256-wide tile (and the aligned-N
+        # family's 192-wide physical tile), where CuTe's with-source rule
+        # would give (128, 64): halving the subtile doubles
         # the T2R/R2S/TMA-store iterations but shortens each and lets the C
         # ring turn over twice as often. Same-process A/B under flushed graph
         # replay (device time), 2x1 256x256x64 ab6 c2 persistent fp16: plain
@@ -12603,7 +12630,16 @@ def _emit_mma_pipeline(
             and plan.row_union_plan is None
             and plan.tcgen05_grouped_plan is None
             and plan.tcgen05_use_tma_store_epilogue
-            and plan.tcgen05_static_full_tiles
+            and (
+                plan.tcgen05_static_full_tiles
+                # The aligned-N family's physical tile stores whole N and K
+                # tiles and clips a partial last M tile in its TMA store.
+                or (
+                    plan.tcgen05_aligned_n_plan is not None
+                    and plan.n_size % plan.tcgen05_mma_bn == 0
+                    and plan.k_total_size % plan.bk == 0
+                )
+            )
             and plan.tcgen05_is_two_cta
             and not plan.output_column_major
             and not aux_tensor_descriptors_value
@@ -12611,18 +12647,22 @@ def _emit_mma_pipeline(
             and len(tcgen05_output_stores_value) == 1
             and plan.input_dtype_str in ("cutlass.Float16", "cutlass.BFloat16")
             and plan.epi_elem_dtype_str in ("cutlass.Float16", "cutlass.BFloat16")
-            and plan.tcgen05_mma_bn == TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N
+            and plan.tcgen05_mma_bn in TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_NS
             and tcgen05_explicit_epilogue_tile_supported(
                 is_two_cta=plan.tcgen05_is_two_cta,
                 bm=plan.tcgen05_mma_bm,
                 bn=plan.tcgen05_mma_bn,
-                tile_shape=(128, 32, 32),
+                tile_shape=(
+                    128,
+                    TCGEN05_PLAIN_NARROW_SUBTILE_N,
+                    TCGEN05_PLAIN_NARROW_SUBTILE_N,
+                ),
             )
         )
         if tcgen05_plain_narrow_subtile:
             tcgen05_explicit_epi_tile_m = 128
-            tcgen05_explicit_epi_tile_n = 32
-            tcgen05_explicit_d_store_box_n = 32
+            tcgen05_explicit_epi_tile_n = TCGEN05_PLAIN_NARROW_SUBTILE_N
+            tcgen05_explicit_d_store_box_n = TCGEN05_PLAIN_NARROW_SUBTILE_N
         # Both narrow subtiles also take the explicit-store family's no-unroll
         # K loop (``cutlass.range(..., unroll=1)`` on the TMA and MMA warps,
         # ``tcgen05_use_nounroll_k_loop`` below), decided here by name rather
@@ -15954,8 +15994,8 @@ def _emit_mma_pipeline(
             # BK128; other explicit-store families keep their BK64 envelope.
             # The narrow-subtile epilogues opt in by name
             # (``tcgen05_narrow_subtile_nounroll_k_loop``: promoted row-vector
-            # rows and plain 16-bit stores on the 256-wide two-CTA tile,
-            # decided with their subtile). Column-major paired stores also
+            # rows and plain 16-bit stores on the 192- and 256-wide two-CTA
+            # tiles, decided with their subtile). Column-major paired stores also
             # use this loop form; every other kernel keeps the unrolled ``range``.
             tcgen05_use_nounroll_k_loop = (
                 (
@@ -16632,8 +16672,6 @@ def _emit_mma_pipeline(
             tmem_allocator_warp=tcgen05_tmem_allocator_warp,
             free_tmem_in_epilogue=tcgen05_free_tmem_in_epilogue,
             pdl_release=plan.tcgen05_pdl and plan.tcgen05_use_role_local_mma_exec,
-            drain_after_dealloc=plan.tcgen05_is_two_cta
-            and plan.row_union_plan is not None,
             mma_warp_frees_tmem=tcgen05_mma_warp_frees_tmem,
             exec_acc_tmem_ptr=plan.tcgen05_exec_acc_tmem_ptr,
         )
@@ -17102,11 +17140,7 @@ def _tcgen05_candidate_exceeds_smem(
         state = CompileEnvironment.current().config_spec._cute_tcgen05_config
         values = cast("dict[str, object]", config)
         aligned_n = facts._dense_aligned_n_plan(state, values)
-        if (
-            aligned_n is not None
-            and input_dtype == torch.float8_e4m3fn
-            and aligned_n.physical_tile == (bm, bn, bk)
-        ):
+        if aligned_n is not None and aligned_n.physical_tile == (bm, bn, bk):
             stages = int_knob(config, "tcgen05_ab_stages", 2)
             return not 1 <= stages <= aligned_n.max_ab_stages
         parameters = seeds._paired_pipeline_parameters(state, values)
@@ -17168,11 +17202,7 @@ def _choose_mma_impl(
         aligned_n = facts._dense_aligned_n_plan(
             state, cast("dict[str, object]", config)
         )
-        if (
-            aligned_n is not None
-            and input_dtype == torch.float8_e4m3fn
-            and (bm, bn, bk) == aligned_n.public_tile
-        ):
+        if aligned_n is not None and (bm, bn, bk) == aligned_n.public_tile:
             bm, bn, bk = aligned_n.physical_tile
     tcgen05_cluster_m = 1
     if config is not None:
@@ -17185,7 +17215,6 @@ def _choose_mma_impl(
         # Falling back would reuse that layout with unrelated scalar threads.
         if (
             env_choice not in ("auto", "tcgen05")
-            or input_dtype != torch.float8_e4m3fn
             or (bm, bn, bk) != aligned_n.physical_tile
             or not tcgen05_supports_input_dtype(support, input_dtype)
             or not _mma_impl_matches_problem_shape(

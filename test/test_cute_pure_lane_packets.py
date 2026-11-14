@@ -794,3 +794,18 @@ def test_default_philox4_arbitrary_offsets(width: int, layout: str) -> None:
             [_oracle(-1, offset) for offset in current[0]], device=CUDA_DEVICE
         ),
     )
+
+
+@pytest.mark.parametrize(
+    "instruction",
+    [
+        "ld.global::nc.u32 $0, [$1];",
+        "fence.proxy::async;",
+        "label: add.u32 $0, $1, 1;",
+        "@p bra label;",
+    ],
+)
+def test_predicate_declarations_do_not_admit_effects_or_control_flow(instruction):
+    assert not is_pure_scalar_assembly(
+        "{ .reg .pred p; " + instruction + " }", "=r,r", True
+    )

@@ -2,30 +2,49 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import copy
 import dataclasses
 import functools
+from inspect import getattr_static
+from itertools import starmap
+import math
 import re
 import types
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import NoReturn
 from typing import TypeVar
 from typing import cast
 from unittest.mock import patch
 
 import sympy
 import torch
+from torch._dynamo.source import TensorProperty
+from torch._dynamo.source import TensorPropertySource
+from torch._subclasses.fake_tensor import FakeTensor
 from torch.fx.experimental import proxy_tensor
 from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils._pytree import tree_leaves
 from torch.utils._pytree import tree_map_only
+from torch.utils._sympy.functions import FloatTrueDiv
 from torch.utils._sympy.functions import FloorDiv
+from torch.utils._sympy.functions import IntTrueDiv
+from torch.utils._sympy.functions import ToFloat
 
 from .. import exc
+from .._utils import cdiv
+from .._utils import next_power_of_2
+from ..autotuner.config_fragment import _BUILTIN_TUNABLE_FRAGMENTS
+from ..autotuner.config_fragment import _FRAGMENT_CHANGED_MESSAGE
 from ..autotuner.config_fragment import ConfigSpecFragment
+from ..autotuner.config_fragment import _plain_builtin_fragment_key
+from ..autotuner.config_fragment import _same_scalar
 from ..autotuner.config_spec import BlockSizeSpec
 from ..autotuner.config_spec import NumThreadsSpec
 from ..language._decorators import _TENSOR_METHOD_REPLACEMENTS
 from ..language._decorators import get_device_func_replacement
 from ..language._decorators import is_api_func
+from ..language.constexpr import ConstExpr
 from ..language.stack_tensor import StackTensor
 from ..language.tile_proxy import Tile
 from ..language.tile_proxy import _CheckForIndexCalls
@@ -36,16 +55,24 @@ from .compile_environment import ConfigValueExpression
 from .compile_environment import FixedBlockSizeSource
 from .compile_environment import LoopSpecBlockSizeSource
 from .compile_environment import RuntimeInputSpecialization
+from .compile_environment import _ContainerIdentity
 from .compile_environment import _symint_expr
+from .compile_environment import _symint_free_symbols
 from .compile_environment import warning
+from .container_identity import record_opaque_container_result
 from .device_function import contains_only_block_size_symbols
+from .fragment_call import guard_fragment_call_input
 from .host_function import HostFunction
+from .host_function import NoCurrentFunction
 from .host_function import SymbolOrigin
 from .utils import compute_slice_size
+from .utils import host_subscript_geometry
+from .utils import is_basic_host_subscript
 from .variable_origin import AttributeOrigin
 from .variable_origin import GetItemOrigin
 from .variable_origin import GridOrigin
 from .variable_origin import Origin
+from .variable_origin import ScalarArithmeticOrigin
 from .variable_origin import TensorSizeOrigin
 from .variable_origin import TensorStrideOrigin
 from .variable_origin import TileBeginOrigin
@@ -53,6 +80,7 @@ from .variable_origin import TileEndOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterable
     from collections.abc import Iterator
     from collections.abc import Sequence
     from typing_extensions import Self
@@ -67,6 +95,464 @@ regexp_allowed_host_ops: re.Pattern[str] = re.compile(
     r"like|new|broadcast|promote|view|reshape|expand|permute|strided|"
     r"transpose|contiguous|unsqueeze|squeeze|zero|rand|full|fill"
 )
+
+
+def _is_known_host_value(value: object) -> bool:
+    """Whether Python protocols can only reach builtin or compiler proxy code.
+
+    Do not flatten arbitrary pytrees or inspect user attributes here: those
+    operations can themselves call Python that changes tensor storage.
+    """
+    active: set[int] = set()
+
+    def known(item: object) -> bool:
+        kind = type(item)
+        if CompileEnvironment.has_current():
+            original = CompileEnvironment.current().container_identity(item)
+            if type(original) is not kind and not any(
+                type(original) is container
+                for container in (tuple, list, dict, set, frozenset, torch.Size, slice)
+            ):
+                # Declared-field records are represented by plain dictionaries
+                # during tracing. Their runtime protocols are not dict's.
+                return False
+        if (
+            any(
+                kind is safe
+                for safe in (
+                    type(None),
+                    bool,
+                    int,
+                    float,
+                    complex,
+                    str,
+                    bytes,
+                    range,
+                    torch.SymInt,
+                    torch.SymFloat,
+                    torch.SymBool,
+                    torch.dtype,
+                    torch.device,
+                    torch.layout,
+                    torch.memory_format,
+                    FakeTensor,
+                )
+            )
+            or item is Ellipsis
+        ):
+            return True
+        if not any(
+            kind is container
+            for container in (tuple, list, dict, set, frozenset, torch.Size, slice)
+        ):
+            return False
+        identity = id(item)
+        if identity in active:
+            return False
+        active.add(identity)
+        try:
+            if kind is dict:
+                return all(
+                    known(key) and known(value)
+                    for key, value in cast("dict[object, object]", item).items()
+                )
+            if kind is slice:
+                item = cast("slice", item)
+                return all(known(part) for part in (item.start, item.stop, item.step))
+            return all(known(part) for part in cast("Iterable[object]", item))
+        finally:
+            active.remove(identity)
+
+    return known(value)
+
+
+# Capture Python-library identities before user code can replace module attrs.
+_NATIVE_TENSOR_CLASS = torch.Tensor
+_KNOWN_HOST_CONSTRUCTORS = (
+    abs,
+    all,
+    any,
+    bool,
+    complex,
+    dict,
+    divmod,
+    float,
+    frozenset,
+    len,
+    list,
+    min,
+    max,
+    int,
+    pow,
+    range,
+    repr,
+    round,
+    set,
+    sorted,
+    str,
+    sum,
+    tuple,
+    torch.device,
+    torch.finfo,
+    torch.iinfo,
+    ConstExpr,
+    *_BUILTIN_TUNABLE_FRAGMENTS,
+)
+_KNOWN_HOST_SPLITS = (torch.split, torch.Tensor.split)
+_KNOWN_HOST_INT_METHODS = (int.bit_length, int.bit_count)
+try:
+    import triton as _host_triton
+except ImportError:
+    _KNOWN_HOST_SIZE_HELPERS = (cdiv, next_power_of_2)
+else:
+    _KNOWN_HOST_SIZE_HELPERS = (
+        cdiv,
+        next_power_of_2,
+        _host_triton.cdiv,
+        _host_triton.next_power_of_2,
+    )
+
+
+def _is_known_host_call(
+    fn: object, args: Sequence[object], kwargs: dict[str, object]
+) -> bool:
+    """Recognize pure Python builtins and native effects the tracker can see."""
+    if (
+        any(fn is builtin for builtin in (len, bool, list, tuple))
+        and len(args) == 1
+        and not kwargs
+    ):
+        value = args[0]
+        containers = (list, tuple, dict, set, frozenset, range, torch.Size)
+        original = (
+            CompileEnvironment.current().container_identity(value)
+            if CompileEnvironment.has_current()
+            else value
+        )
+        if any(type(value) is kind for kind in containers) and any(
+            type(original) is kind for kind in containers
+        ):
+            # Native outer iteration/length/truth cannot invoke the elements'
+            # protocols. A list containing a record is still a native list.
+            return True
+    if not _is_known_host_value((args, kwargs)):
+        return False
+    if any(fn is builtin for builtin in _KNOWN_HOST_CONSTRUCTORS):
+        return True
+    if any(fn is helper for helper in _KNOWN_HOST_SIZE_HELPERS):
+        return True
+    if any(fn is split for split in _KNOWN_HOST_SPLITS):
+        return bool(args) and type(args[0]) is FakeTensor
+    if type(fn) is types.MethodType:
+        return fn.__func__ is _KNOWN_HOST_SPLITS[1] and type(fn.__self__) is FakeTensor
+    if type(fn) is types.MethodDescriptorType:
+        if any(fn is method for method in _KNOWN_HOST_INT_METHODS):
+            return bool(args) and type(args[0]) is int
+        return (
+            bool(args)
+            and type(args[0]) is FakeTensor
+            and getattr(torch.Tensor, fn.__name__, None) is fn
+        )
+    if type(fn) is not types.BuiltinFunctionType:
+        return False
+    receiver = fn.__self__
+    if type(receiver) is int:
+        # Both sides are native builtin methods: equality cannot invoke a
+        # user protocol, unlike comparing an arbitrary callable by name.
+        return any(fn == method.__get__(receiver) for method in _KNOWN_HOST_INT_METHODS)
+    if type(receiver) is FakeTensor:
+        return (
+            type(getattr(torch.Tensor, fn.__name__, None)) is types.MethodDescriptorType
+        )
+    if fn.__module__ == "math" and getattr(math, fn.__name__, None) is fn:
+        return True
+    if receiver is not None and receiver is not torch._C:
+        return False
+    return (
+        getattr(torch._C._VariableFunctions, fn.__name__, None) is fn
+        or getattr(torch._C, fn.__name__, None) is fn
+    )
+
+
+@contextlib.contextmanager
+def _track_host_storage_effects(inputs: object, origin: Origin) -> Iterator[None]:
+    """Guard existing storage proofs around host protocols and operators."""
+    if CompileEnvironment.has_current() and origin.is_host():
+        with CompileEnvironment.current().track_runtime_layout_mutations(
+            inputs, opaque=not _is_known_host_value(inputs)
+        ):
+            yield
+    else:
+        yield
+
+
+def _is_known_host_format_value(value: TypeInfo) -> bool:
+    """Prove formatting cannot invoke user-defined conversion protocols."""
+    if type(value) is StringType:
+        return True
+    if isinstance(value, (LiteralType, NumericType, TensorType)):
+        return _is_known_host_value(value.proxy())
+    if type(value) not in (SequenceType, DictType, SliceType):
+        # ClassType's proxy is a dictionary of fields, but the runtime object
+        # can have its own __format__, __str__ or __repr__ implementation.
+        return False
+    assert isinstance(value, CollectionType)
+    if not value.contents_exact:
+        return False
+    if value._original_identity is not None and not _is_known_host_value(
+        value._original_identity.value
+    ):
+        return False
+    elements = value.element_types
+    if isinstance(elements, dict):
+        children = elements.values()
+    elif isinstance(elements, slice):
+        children = (elements.start, elements.stop, elements.step)
+    else:
+        children = elements
+    return all(_is_known_host_format_value(child) for child in children)
+
+
+def _has_untraced_host_protocol(value: TypeInfo, *, nested: bool = True) -> bool:
+    """A structural proxy cannot stand in for a record's Python methods."""
+    if not isinstance(value, CollectionType):
+        return False
+    if type(value) not in (SequenceType, DictType, SliceType):
+        return True
+    identity = value._original_identity
+    if (
+        identity is not None
+        and identity.value is not None
+        and not any(
+            type(identity.value) is kind
+            for kind in (list, tuple, dict, slice, torch.Size)
+        )
+    ):
+        return True
+    # An uncertain builtin collection is not a known structural record. Its
+    # existing projection checks decide whether it can be read on the device;
+    # preserve their error contract instead of classifying it as a custom hook.
+    if not nested:
+        return False
+    elements = value.element_types
+    if isinstance(elements, dict):
+        children = elements.values()
+    elif isinstance(elements, slice):
+        children = (elements.start, elements.stop, elements.step)
+    else:
+        children = elements
+    return any(_has_untraced_host_protocol(child) for child in children)
+
+
+def _reject_untraced_host_protocol(operation: str | None = None) -> NoReturn:
+    context = f" ({operation})" if operation is not None else ""
+    raise exc.TypeInferenceError(
+        f"Host operations with custom record or container protocols are unsupported{context} "
+        "because tracing their structural proxies cannot track tensor mutations; "
+        "pass declared fields explicitly"
+    )
+
+
+def _native_record_length(value: TypeInfo, *, truth: bool) -> int | None:
+    """Preserve the native tuple protocols of ordinary namedtuple records."""
+    if type(value) is not ClassType or value._original_identity is None:
+        return None
+    original = value._original_identity.value
+    if (
+        isinstance(original, tuple)
+        and getattr_static(type(original), "__len__", None) is tuple.__len__
+        and (not truth or getattr_static(type(original), "__bool__", None) is None)
+    ):
+        return tuple.__len__(original)
+    return None
+
+
+def _native_record_call(
+    fn: object, args: tuple[TypeInfo, ...], kwargs: dict[str, TypeInfo], origin: Origin
+) -> TypeInfo | None:
+    if not args or kwargs or type(args[0]) is not ClassType:
+        return None
+    value = args[0]
+    if value._original_identity is None:
+        return None
+    original = value._original_identity.value
+    kind = type(original)
+    if fn is type and len(args) == 1:
+        return CallableType(origin, kind)
+    if any(fn is constructor for constructor in (tuple, list)) and len(args) == 1:
+        if (
+            _native_record_length(value, truth=False) is not None
+            and getattr_static(kind, "__iter__", None) is tuple.__iter__
+            and value.contents_exact
+        ):
+            assert isinstance(original, tuple)
+            items = tuple(tuple.__iter__(original))
+            return TypeInfo.from_example(items if fn is tuple else list(items), origin)
+        return None
+    # Ordinary attribute lookup is needed even for isinstance: Python can
+    # consult an object's custom __class__ when the concrete type differs.
+    if (
+        getattr_static(kind, "__getattribute__", None) is not object.__getattribute__
+        or getattr_static(kind, "__getattr__", None) is not None
+        or getattr_static(kind, "__class__", None) is not object.__dict__["__class__"]
+    ):
+        return None
+    if fn is isinstance and len(args) == 2 and isinstance(args[1], LiteralType):
+        classes = args[1].value
+        if type(classes) is type:
+            return LiteralType(origin, isinstance(original, classes))
+    if (
+        fn is hasattr
+        and len(args) == 2
+        and isinstance(args[1], LiteralType)
+        and type(args[1].value) is str
+        and args[1].value in value.element_types
+    ):
+        descriptor = getattr_static(kind, args[1].value, None)
+        missing_descriptor = object()
+        if (
+            descriptor is None
+            or type(descriptor) is types.MemberDescriptorType
+            or getattr_static(type(descriptor), "__get__", missing_descriptor)
+            is missing_descriptor
+        ):
+            # Declared fields were already read to construct this structural
+            # proxy. Arbitrary missing attributes have no such dispatch guard.
+            # Ordinary class defaults are values, not attribute lookup hooks.
+            return LiteralType(origin, True)
+    return None
+
+
+def _guard_host_membership_protocol(left: TypeInfo, right: TypeInfo) -> None:
+    """Membership may invoke container hooks or equality on its elements."""
+    native_tuple_length = None
+    if _has_untraced_host_protocol(right, nested=False):
+        native_tuple_length = _native_record_length(right, truth=False)
+        if native_tuple_length is None:
+            _reject_untraced_host_protocol()
+        assert isinstance(right, ClassType) and right._original_identity is not None
+        original = right._original_identity.value
+        assert isinstance(original, tuple)
+        if (
+            getattr_static(type(original), "__contains__", None)
+            is not tuple.__contains__
+            or not right.contents_exact
+            or not all(_is_known_host_value(item) for item in tuple.__iter__(original))
+        ):
+            _reject_untraced_host_protocol()
+    # Empty native sequences do not compare the query. Dictionary membership
+    # still hashes it, even when empty; dictionary values are never compared.
+    if native_tuple_length == 0 or (
+        type(right) is SequenceType and right.contents_exact and not right.element_types
+    ):
+        return
+    if _has_untraced_host_protocol(left) or (
+        isinstance(right, SequenceType) and _has_untraced_host_protocol(right)
+    ):
+        _reject_untraced_host_protocol()
+
+
+def _register_host_operator_allocation(inputs: object, result: object) -> None:
+    """Native operators require exact arguments, without user flatten hooks."""
+    if not _is_known_host_value(inputs):
+        return
+    tensors: list[FakeTensor] = []
+
+    def collect(value: object) -> None:
+        if type(value) is FakeTensor:
+            tensors.append(value)
+        elif type(value) is dict:
+            for key, item in value.items():
+                collect(key)
+                collect(item)
+        elif type(value) in (tuple, list, set, frozenset, torch.Size):
+            for item in cast("Iterable[object]", value):
+                collect(item)
+        elif type(value) is slice:
+            collect((value.start, value.stop, value.step))
+
+    collect(inputs)
+    CompileEnvironment.current().register_host_tensor_allocation(tensors, result)
+
+
+@functools.cache
+def _native_schema_allocates(name: str) -> bool:
+    # Exclude conditional-copy/view schemas even when their traced result copied.
+    schemas = [
+        schema
+        for schema in torch._C._jit_get_schemas_for_operator(f"aten::{name}")
+        if not any(argument.is_out for argument in schema.arguments)
+    ]
+    return bool(schemas) and all(
+        result.alias_info is None for schema in schemas for result in schema.returns
+    )
+
+
+def _register_native_host_allocation(
+    fn: object, args: list[object], kwargs: dict[str, object], result: object
+) -> None:
+    receiver = None
+    if type(fn) is types.MethodDescriptorType:
+        if getattr(torch.Tensor, fn.__name__, None) is not fn:
+            return
+        # Unbound Tensor methods receive their receiver as the first argument.
+        receiver = args[0] if args else None
+    elif type(fn) is types.BuiltinFunctionType:
+        owner = fn.__self__
+        if type(owner) is FakeTensor:
+            descriptor = getattr(torch.Tensor, fn.__name__, None)
+            if type(descriptor) is not types.MethodDescriptorType:
+                return
+            receiver = owner
+        elif getattr(torch._C._VariableFunctions, fn.__name__, None) is not fn:
+            return
+    else:
+        return
+    if receiver is not None and type(receiver) is not FakeTensor:
+        return
+    if not _native_schema_allocates(fn.__name__):
+        # These native casts can alias for an unchanged dtype. A changed dtype
+        # necessarily allocates; it supplies no exact-layout or zero-fill fact.
+        if not (
+            type(receiver) is FakeTensor
+            and type(result) is FakeTensor
+            and receiver.dtype != result.dtype
+            and fn.__name__
+            in {
+                "float",
+                "double",
+                "half",
+                "bfloat16",
+                "bool",
+                "byte",
+                "char",
+                "short",
+                "int",
+                "long",
+                "cfloat",
+                "cdouble",
+                "to",
+                "type_as",
+            }
+        ):
+            return
+    _register_host_operator_allocation((receiver, args, kwargs), result)
+
+
+def _is_symbolic_numeric(value: object) -> bool:
+    return isinstance(value, (torch.SymInt, torch.SymFloat, torch.SymBool)) and bool(
+        value._sympy_().free_symbols
+    )
+
+
+def _is_discarded_host_result(origin: Origin) -> bool:
+    nodes = ExtendedAST.current()
+    return (
+        origin.is_host()
+        and len(nodes) > 1
+        and isinstance(nodes[-2], ast.Expr)
+        and nodes[-2].value is nodes[-1]
+    )
 
 
 def tile_spanned_by_slice(lower: object, upper: object) -> torch.SymInt | None:
@@ -102,8 +588,6 @@ class TypeInfo:
 
     @classmethod
     def from_example(cls, value: object, origin: Origin) -> TypeInfo:
-        from ..language.constexpr import ConstExpr
-
         if isinstance(value, ConstExpr):
             # hl.constexpr(...) used inside a kernel body marks its argument as a
             # compile-time constant.  It is transparent to control flow and
@@ -140,12 +624,17 @@ class TypeInfo:
             return CallableType(origin, value)
         if type(value) is list:
             # TODO(jansel): track specializations
-            return SequenceType(origin, cls._unpack_example(enumerate(value), origin))
+            return SequenceType(
+                origin,
+                cls._unpack_example(enumerate(value), origin),
+                original_value=value,
+            )
         if type(value) is tuple:
             # TODO(jansel): track specializations
             return SequenceType(
                 origin,
                 tuple(cls._unpack_example(enumerate(value), origin)),
+                original_value=value,
             )
         if type(value) is torch.Size:
             return cls.from_example(tuple(value), origin)
@@ -161,6 +650,7 @@ class TypeInfo:
                 dict(
                     zip(value.keys(), cls._unpack_example(items, origin), strict=False)
                 ),
+                original_value=value,
             )
         if isinstance(value, tuple) and hasattr(type(value), "__match_args__"):
             # namedtuple or torch.return_types structseq (e.g., sort, topk)
@@ -177,15 +667,17 @@ class TypeInfo:
                         cls._unpack_example(
                             [(name, getattr(value, name)) for name in field_names],
                             origin,
+                            attributes=True,
                         ),
                         strict=False,
                     )
                 ),
+                original_value=value,
             )
         if isinstance(value, ConfigSpecFragment):
             return ConfigFragmentType(origin, value)
         if dataclasses.is_dataclass(value):
-            keys = value.__dataclass_fields__.keys()
+            keys = [field.name for field in dataclasses.fields(value)]
             return ClassType(
                 origin,
                 dict(
@@ -194,10 +686,12 @@ class TypeInfo:
                         cls._unpack_example(
                             tuple((k, getattr(value, k)) for k in keys),
                             origin,
+                            attributes=True,
                         ),
                         strict=False,
                     )
                 ),
+                original_value=value,
             )
         if isinstance(value, zip):
             # Handle zip objects by converting to tuple of tuples
@@ -234,11 +728,18 @@ class TypeInfo:
     def _unpack_example(
         values: Sequence[tuple[int | str, object]] | enumerate[object],
         origin: Origin,
+        *,
+        attributes: bool = False,
     ) -> list[TypeInfo]:
-        return [
-            TypeInfo.from_example(value, GetItemOrigin(origin, key))
-            for key, value in values
-        ]
+        result = []
+        for key, value in values:
+            if attributes:
+                assert isinstance(key, str)
+                item_origin = AttributeOrigin(origin, key)
+            else:
+                item_origin = GetItemOrigin(origin, key)
+            result.append(TypeInfo.from_example(value, item_origin))
+        return result
 
     def __str__(self) -> str:
         return type(self).__name__
@@ -363,6 +864,10 @@ class TensorType(TypeInfo):
 
     def __init__(self, origin: Origin, fake_value: torch.Tensor) -> None:
         super().__init__(origin)
+        if origin.is_host() and CompileEnvironment.has_current():
+            env = CompileEnvironment.current()
+            if env.tensor_has_runtime_layout(fake_value):
+                fake_value = env.runtime_layout_tensor(fake_value)
         self.fake_value = fake_value
         if origin.is_device():
             CompileEnvironment.current().add_kernel_tensor_size(
@@ -394,7 +899,14 @@ class TensorType(TypeInfo):
                 )
             return SymBoolType.new_unbacked(origin)
         try:
-            return TypeInfo.from_example(_eval_unary(op, self.fake_value), origin)
+            with _track_host_storage_effects(self.fake_value, origin):
+                result = _eval_unary(op, self.fake_value)
+            if origin.is_host():
+                CompileEnvironment.current().propagate_runtime_tensor_layout(
+                    self.fake_value, result
+                )
+                _register_host_operator_allocation(self.fake_value, result)
+            return TypeInfo.from_example(result, origin)
         except exc.Base:
             raise
         except Exception as e:
@@ -471,8 +983,12 @@ class TensorType(TypeInfo):
                     # buffers (e.g. host-allocated accumulators via hl.zeros).
                     # Allocating a reduction-dim block here would introduce a
                     # fresh unbacked symbol that does not unify with the int
-                    # even when the hint matches.
-                    if not env.backend.pad_factory_tensors_to_power_of_2:
+                    # even when the hint matches.  A tunable extent has no
+                    # int to unify with and needs a reduction dim like below.
+                    if (
+                        not env.backend.pad_factory_tensors_to_power_of_2
+                        and not env.is_tunable_extent(output_size)
+                    ):
                         output_sizes.append(env.try_concretize_symint(output_size))
                         continue
                     rdim = CompileEnvironment.current().allocate_reduction_dimension(
@@ -555,9 +1071,49 @@ class TensorType(TypeInfo):
             try:
                 # Suppress shape guards to prevent symbolic variables from
                 # being specialized to concrete values during type inference.
-                with CompileEnvironment.current().shape_env.suppress_guards():
-                    # pyrefly: ignore [bad-index]
-                    return TypeInfo.from_example(self.fake_value[key.proxy()], origin)
+                env = CompileEnvironment.current()
+                with env.shape_env.suppress_guards():
+                    index = key.proxy()
+                    with _track_host_storage_effects((self.fake_value, index), origin):
+                        if (
+                            isinstance(index, (tuple, list))
+                            and sum(item is Ellipsis for item in index) > 1
+                        ):
+                            raise exc.TypeInferenceError(
+                                "Host tensor indexing supports at most one ellipsis"
+                            )
+
+                        def example_index(item: object) -> object:
+                            if isinstance(item, slice) and isinstance(
+                                item.step, torch.SymInt
+                            ):
+                                # aten.slice takes a concrete step. Passing the
+                                # original SymInt would specialize it through
+                                # __index__; only its example execution needs a hint.
+                                return slice(
+                                    item.start, item.stop, env.size_hint(item.step)
+                                )
+                            return item
+
+                        example = index
+                        if is_basic_host_subscript(index):
+                            example = (
+                                tuple(map(example_index, index))
+                                if isinstance(index, tuple)
+                                else example_index(index)
+                            )
+                        # pyrefly: ignore [bad-index]
+                        result = self.fake_value[example]
+                        geometry = host_subscript_geometry(self.fake_value, index)
+                        if geometry is not None:
+                            with torch.no_grad():
+                                result = torch.as_strided(result, *geometry)
+                        # Advanced indexing can allocate instead of sharing the
+                        # source storage, so its result needs the same provenance.
+                        env.propagate_runtime_tensor_layout(
+                            (self.fake_value, index), result
+                        )
+                        return TypeInfo.from_example(result, origin)
             except NotImplementedError:
                 raise exc.TypeInferenceError(
                     f"Subscript not supported on {self!s} with key={key!s}"
@@ -587,12 +1143,14 @@ class TensorType(TypeInfo):
                     var=var_name,
                     details=f"rank {self.fake_value.dim()} != {other.fake_value.dim()}",
                 )
-            if self.fake_value.size() != other.fake_value.size():
+            shape = self.fake_value.size()
+            same_shape = shape == other.fake_value.size()
+            if not same_shape:
                 # A static size and the reduction dimension allocated for it
                 # later (e.g. by a ``:`` slice) name the same dim; compare the
                 # shapes in their block-variable form.
                 env = CompileEnvironment.current()
-                shape = env._normalize_shape_to_block_vars([*self.fake_value.size()])
+                shape = env._normalize_shape_to_block_vars([*shape])
                 if shape != env._normalize_shape_to_block_vars(
                     [*other.fake_value.size()]
                 ):
@@ -600,10 +1158,46 @@ class TensorType(TypeInfo):
                         var=var_name,
                         details=f"size {self.fake_value.size()} != {other.fake_value.size()}",
                     )
-                return TensorType(other.origin, self.fake_value.new_empty(shape))
-            # TODO(jansel): handle symbolic shapes
-            # TODO(jansel): stride check?
-            return TensorType(other.origin, torch.empty_like(self.fake_value))
+            host = other.origin.is_host()
+            env = CompileEnvironment.current()
+            common_strides = False
+            if host:
+                common_strides = all(
+                    starmap(
+                        env.known_equal,
+                        zip(
+                            self.fake_value.stride(),
+                            other.fake_value.stride(),
+                            strict=True,
+                        ),
+                    )
+                )
+            if common_strides:
+                # empty_like compacts non-dense layouts. Preserve a proven
+                # common stride tuple on synthetic fake storage, without
+                # selecting either branch's alias or origin as the join.
+                merged = torch.empty_strided(
+                    shape,
+                    self.fake_value.stride(),
+                    dtype=self.fake_value.dtype,
+                    device=self.fake_value.device,
+                )
+            elif same_shape:
+                merged = torch.empty_like(self.fake_value)
+            else:
+                merged = self.fake_value.new_empty(shape)
+            if host:
+                env.register_tensor_storage_join(
+                    merged, (self.fake_value, other.fake_value)
+                )
+                if not common_strides:
+                    # A host branch may select different layouts even when
+                    # both inputs have statically known shapes and strides.
+                    env.mark_runtime_tensor_layout(merged)
+                env.propagate_runtime_tensor_layout(
+                    (self.fake_value, other.fake_value), merged
+                )
+            return TensorType(other.origin, merged)
         return super().merge(other, var_name=var_name)
 
     def populate_symbol_origins(self, origin: Origin) -> None:
@@ -619,6 +1213,17 @@ class TensorType(TypeInfo):
             if isinstance(size, torch.SymInt):
                 expr = shape_env.simplify(size._sympy_())
                 sub_origin = TensorSizeOrigin(origin, i)
+                if (
+                    expr not in expr_to_origin
+                    or sub_origin.depth() < expr_to_origin[expr].depth()
+                ):
+                    expr_to_origin[expr] = SymbolOrigin(
+                        sub_origin, fake_value=self.fake_value
+                    )
+        for i, stride in enumerate(self.fake_value.stride()):
+            if isinstance(stride, torch.SymInt):
+                expr = shape_env.simplify(stride._sympy_())
+                sub_origin = TensorStrideOrigin(origin, i)
                 if (
                     expr not in expr_to_origin
                     or sub_origin.depth() < expr_to_origin[expr].depth()
@@ -676,12 +1281,35 @@ class TensorAttributeType(TypeInfo):
                 literal_kwargs = {
                     key: value.as_literal() for key, value in kwargs.items()
                 }
-                result = fn(*literal_args, **literal_kwargs)
+                with _track_host_storage_effects(
+                    (self.tensor.fake_value, literal_args, literal_kwargs), origin
+                ):
+                    result = fn(*literal_args, **literal_kwargs)
             except NotImplementedError:
                 raise exc.TypeInferenceError(
                     f"Tensor.{attr}() args must be literals"
                 ) from None
             if attr == "stride":
+
+                def stride_type(value: int | torch.SymInt, dim: int) -> TypeInfo:
+                    stride_origin = TensorStrideOrigin(self.tensor.origin, dim)
+                    if not CompileEnvironment.current().settings.static_shapes:
+                        try:
+                            source = stride_origin.to_source()
+                        except NotImplementedError:
+                            # Host-created layouts can also vary between
+                            # calls. Their stride is replayed by the host,
+                            # rather than extracted from a kernel argument.
+                            value = CompileEnvironment.current().cached_create_unbacked_symint(
+                                ("host_tensor_stride", id(self.tensor.fake_value), dim),
+                                CompileEnvironment.current().size_hint(value),
+                            )
+                        else:
+                            value = CompileEnvironment.current().input_symint(
+                                value, source
+                            )
+                    return TypeInfo.from_example(value, stride_origin)
+
                 if literal_args or literal_kwargs:
                     dim = cast(
                         "int",
@@ -689,33 +1317,11 @@ class TensorAttributeType(TypeInfo):
                     )
                     if dim < 0:
                         dim += self.tensor.fake_value.ndim
-                    stride_origin = TensorStrideOrigin(self.tensor.origin, dim)
-                    if (
-                        isinstance(result, (int, torch.SymInt))
-                        and not CompileEnvironment.current().settings.static_shapes
-                    ):
-                        result = CompileEnvironment.current().input_symint(
-                            result,
-                            stride_origin.to_source(),
-                        )
-                    return TypeInfo.from_example(
-                        result,
-                        stride_origin,
-                    )
+                    return stride_type(result, dim)
                 return SequenceType(
                     origin,
                     tuple(
-                        TypeInfo.from_example(
-                            CompileEnvironment.current().input_symint(
-                                stride,
-                                TensorStrideOrigin(self.tensor.origin, dim).to_source(),
-                            )
-                            if isinstance(stride, (int, torch.SymInt))
-                            and not CompileEnvironment.current().settings.static_shapes
-                            else stride,
-                            TensorStrideOrigin(self.tensor.origin, dim),
-                        )
-                        for dim, stride in enumerate(cast("tuple[int, ...]", result))
+                        stride_type(stride, dim) for dim, stride in enumerate(result)
                     ),
                 )
             return TypeInfo.from_example(result, origin)
@@ -737,16 +1343,28 @@ class TensorAttributeType(TypeInfo):
         proxy_kwargs = {k: v.tree_map(_to_proxy) for k, v in kwargs.items()}
         try:
             fn = getattr(self.tensor.fake_value, attr)
-            result = _CheckForIndexCalls.retry_call(fn, proxy_args, proxy_kwargs)
+            with (
+                CompileEnvironment.current().track_runtime_layout_mutations(
+                    (self.tensor.fake_value, proxy_args, proxy_kwargs),
+                    opaque=not _is_known_host_call(fn, proxy_args, proxy_kwargs),
+                )
+                if origin.is_host()
+                else contextlib.nullcontext()
+            ):
+                result = _CheckForIndexCalls.retry_call(fn, proxy_args, proxy_kwargs)
             if origin.is_host():
                 # ``Tensor.new_*`` allocate like the ``torch.*`` factories;
                 # the receiver is the method's first argument.
+                CompileEnvironment.current().propagate_runtime_tensor_layout(
+                    (self.tensor.fake_value, proxy_args, proxy_kwargs), result
+                )
                 CompileEnvironment.current().register_tensor_factory_layout(
                     getattr(torch.Tensor, attr, None),
                     (self.tensor.fake_value, *proxy_args),
                     proxy_kwargs,
                     result,
                 )
+                _register_native_host_allocation(fn, proxy_args, proxy_kwargs, result)
             output_type = TypeInfo.from_example(result, origin)
         except exc.Base:
             raise
@@ -777,47 +1395,118 @@ class LiteralType(TypeInfo):
         return self.value
 
     def propagate_unary(self, op: ast.unaryop, origin: Origin) -> TypeInfo:
-        return TypeInfo.from_example(
-            _eval_unary(op, self.value),
-            origin,
-        )
+        with _track_host_storage_effects(self.value, origin):
+            result = _eval_unary(op, self.value)
+        return TypeInfo.from_example(result, origin)
 
     def propagate_attribute(self, attr: str, origin: AttributeOrigin) -> TypeInfo:
-        return TypeInfo.from_example(getattr(self.value, attr), origin)
+        if type(self.value) is types.ModuleType and attr in vars(self.value):
+            # An existing exact-module entry cannot call module __getattr__.
+            result = vars(self.value)[attr]
+        elif (
+            self.value is _NATIVE_TENSOR_CLASS
+            and type(descriptor := getattr_static(self.value, attr, None))
+            is types.MethodDescriptorType
+        ):
+            # Native Tensor method lookup does not invoke a user descriptor.
+            # Python replacements still go through opaque effect tracking.
+            result = descriptor
+        else:
+            with _track_host_storage_effects(self.value, origin):
+                result = getattr(self.value, attr)
+        return TypeInfo.from_example(result, origin)
 
     def propagate_getitem(self, key: TypeInfo, origin: Origin) -> TypeInfo:
         try:
-            # pyrefly: ignore [bad-index]
-            return TypeInfo.from_example(self.value[key.as_literal()], origin)
+            literal_key = key.as_literal()
+            with _track_host_storage_effects((self.value, literal_key), origin):
+                # pyrefly: ignore [bad-index]
+                result = self.value[literal_key]
+            return TypeInfo.from_example(result, origin)
         except NotImplementedError:
             pass
         return super().propagate_getitem(key, origin)
 
     def truth_value(self) -> bool:
-        return bool(self.value)
+        with _track_host_storage_effects(self.value, self.origin):
+            return bool(self.value)
 
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
-        if type(other) is type(self) and self.value == other.value:
-            return self
-        if isinstance(other, (LiteralType, NumericType)):
-            if NumericType.known_equal(other.value, self.value):
-                return self
-            if self.python_type == other.python_type and self.python_type in (
-                int,
-                float,
-                bool,
+        compared = other.value if isinstance(other, LiteralType) else None
+        # Native function/module/Tensor-class equality has no user hook. Keep
+        # them forbidden as call arguments, where they could be callbacks.
+        inputs = tuple(
+            value
+            for value in (self.value, compared)
+            if value is not _NATIVE_TENSOR_CLASS
+            and not any(
+                type(value) is kind
+                for kind in (
+                    types.FunctionType,
+                    types.BuiltinFunctionType,
+                    types.MethodDescriptorType,
+                    types.ModuleType,
+                    type,
+                )
+            )
+        )
+        with _track_host_storage_effects(inputs, self.origin):
+            if type(other) is type(self) and (
+                self.value is _NATIVE_TENSOR_CLASS
+                and other.value is _NATIVE_TENSOR_CLASS
+                or self.value == other.value
             ):
-                # pyrefly: ignore [bad-argument-type]
-                return NumericType.subtype(self.python_type).new_unbacked(self.origin)
-        return super().merge(other, var_name=var_name)
+                if (
+                    type(self.value) in (bool, int, float)
+                    and type(other.value) in (bool, int, float)
+                    and not _same_scalar(self.value, other.value)
+                ):
+                    # Python equality alone cannot prove a declared domain across
+                    # branches: zero signs and equal int/float/bool values differ.
+                    # Keep the runtime branch valid without certifying either arm.
+                    kind = (
+                        float if float in (self.python_type, other.python_type) else int
+                    )
+                    return NumericType.subtype(kind).new_unbacked(self.origin)
+                return self
+            if isinstance(other, (LiteralType, NumericType)):
+                if NumericType.known_equal(other.value, self.value):
+                    if isinstance(other, NumericType):
+                        captured = CompileEnvironment.current().resolve_fragment_global(
+                            other.value
+                        )
+                        if (
+                            captured is None
+                            and other.python_type is float
+                            or captured is not None
+                            and not _same_scalar(captured, self.value)
+                        ):
+                            # A symbolic float can have rounded differently from
+                            # its simplified expression. Do not let a literal arm
+                            # certify the other runtime branch's domain value.
+                            return NumericType.subtype(other.python_type).new_unbacked(
+                                self.origin
+                            )
+                    return self
+                if self.python_type == other.python_type and self.python_type in (
+                    int,
+                    float,
+                    bool,
+                ):
+                    # pyrefly: ignore [bad-argument-type]
+                    return NumericType.subtype(self.python_type).new_unbacked(
+                        self.origin
+                    )
+            return super().merge(other, var_name=var_name)
 
     def unpack(self) -> list[TypeInfo]:
         try:
-            # pyrefly: ignore [no-matching-overload]
-            it = iter(self.value)
+            with _track_host_storage_effects(self.value, self.origin):
+                # pyrefly: ignore [no-matching-overload]
+                values = list(iter(self.value))
         except TypeError:
             return super().unpack()
-        return [TypeInfo.from_example(x, self.origin) for x in it]
+        return [TypeInfo.from_example(x, self.origin) for x in values]
 
     def as_literal(self) -> object:
         return self.value
@@ -876,6 +1565,57 @@ class ConfigFragmentType(LiteralType):
     def __init__(self, origin: Origin, fragment: ConfigSpecFragment) -> None:
         assert isinstance(fragment, ConfigSpecFragment)
         super().__init__(origin, fragment)
+        self._captured_domain = self._revisit_domain()
+
+    def propagate_attribute(self, attr: str, origin: AttributeOrigin) -> TypeInfo:
+        with _track_host_storage_effects(self.value, origin):
+            value = getattr(self.value, attr)
+        if (
+            self.origin.is_global()
+            and dataclasses.is_dataclass(self.value)
+            and any(field.name == attr for field in dataclasses.fields(self.value))
+        ):
+            # A captured declaration is literal metadata, but ordinary reads of
+            # its dataclass fields retain the original runtime scalar behavior.
+            value = CompileEnvironment.current().to_fake(value, origin)
+        return TypeInfo.from_example(value, origin)
+
+    def _revisit_domain(self) -> tuple[object, ...] | None:
+        # These two built-ins compare by identity, but their complete domain
+        # can be snapshotted immutably. The original fields remain mutable and
+        # are rechecked on merge. Exclude subclasses and opaque search state.
+        value = self.value
+
+        def resolve(field: object) -> object:
+            if isinstance(field, torch.SymInt):
+                # A helper can store a traced literal global before registration
+                # normalizes its snapshot. Use the same exact recorded value for
+                # this private key, without mutating the original or using hints.
+                return CompileEnvironment.current().resolve_fragment_global(field)
+            return field
+
+        key = _plain_builtin_fragment_key(
+            value, resolve=resolve, for_identity_equality=True
+        )
+        return (type(value), key) if key is not None else None
+
+    def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
+        for value in (self, other):
+            if (
+                isinstance(value, ConfigFragmentType)
+                and value._captured_domain is not None
+                and value._captured_domain != value._revisit_domain()
+            ):
+                # An identical object may have changed since the first visit.
+                # LiteralType's identity/equality fallback must not erase that.
+                raise exc.TypeInferenceError(_FRAGMENT_CHANGED_MESSAGE)
+        if (
+            isinstance(other, ConfigFragmentType)
+            and self._captured_domain is not None
+            and self._captured_domain == other._captured_domain
+        ):
+            return self
+        return super().merge(other, var_name=var_name)
 
 
 def _starts_symmetric_allocation(values: Sequence[object]) -> bool:
@@ -1000,6 +1740,47 @@ class CallableType(LiteralType):
                 return ExtendedAST.current()[-1]._type_info
             assert fn._type_function is not None
             return fn._type_function(*args, **kwargs, origin=origin)
+        if origin.is_host():
+            native_record_result = _native_record_call(self.value, args, kwargs, origin)
+            if native_record_result is not None:
+                return native_record_result
+            if (
+                any(self.value is fn for fn in (len, bool))
+                and len(args) == 1
+                and not kwargs
+            ):
+                length = _native_record_length(args[0], truth=self.value is bool)
+                if length is not None:
+                    return LiteralType(
+                        origin, bool(length) if self.value is bool else length
+                    )
+            if any(self.value is fn for fn in (str, repr, ascii, format)):
+                if any(
+                    not _is_known_host_format_value(arg)
+                    for arg in (*args, *kwargs.values())
+                ):
+                    _reject_untraced_host_protocol(
+                        self.value.__name__
+                        if type(self.value)
+                        in (types.BuiltinFunctionType, types.FunctionType)
+                        else "host call"
+                    )
+            else:
+                # These operations inspect only the outer collection. In
+                # particular, len([record]) need not invoke record.__bool__.
+                # Other calls can invoke arbitrary record protocols, including
+                # str.format or a Python helper that performs the conversion.
+                nested = not any(self.value is fn for fn in (len, bool, list, tuple))
+                if any(
+                    _has_untraced_host_protocol(arg, nested=nested)
+                    for arg in (*args, *kwargs.values())
+                ):
+                    _reject_untraced_host_protocol(
+                        self.value.__name__
+                        if type(self.value)
+                        in (types.BuiltinFunctionType, types.FunctionType)
+                        else "host call"
+                    )
         if self.value is slice:
             if kwargs or not (1 <= len(args) <= 3):
                 raise exc.TypeInferenceError(
@@ -1013,6 +1794,25 @@ class CallableType(LiteralType):
             else:
                 elements = slice(args[0], args[1], args[2])
             return SliceType(origin, elements)
+        if (
+            any(self.value is builtin for builtin in (len, bool))
+            and len(args) == 1
+            and not kwargs
+            and isinstance(args[0], CollectionType)
+            and type(args[0]) in (SequenceType, DictType)
+            and args[0].contains_approximate_contents()
+        ):
+            collection = args[0]
+            if not collection.contents_exact:
+                return (
+                    SymIntType.new_unbacked(origin)
+                    if self.value is len
+                    else SymBoolType.new_unbacked(origin)
+                )
+            if collection.length_projection_safe:
+                # Filtered children do not change the length of a proved
+                # outer builtin collection. Do not inspect their proxies.
+                return LiteralType(origin, self.value(collection.element_types))
         # TODO(jansel): add no-tracing mode
 
         def warn_wrong_device(arg: TypeInfo) -> None:
@@ -1022,22 +1822,51 @@ class CallableType(LiteralType):
             ):
                 warning(exc.WrongDevice(self.value, arg.fake_value.device, env.device))
 
+        fragment_constructor = isinstance(self.value, type) and issubclass(
+            self.value, ConfigSpecFragment
+        )
+
         def to_proxy(arg: TypeInfo) -> object:
             if isinstance(arg, TensorType):
                 nonlocal input_contains_tensor
                 input_contains_tensor = True
                 warn_wrong_device(arg)
-            return _to_proxy(arg)
+            value = _to_proxy(arg)
+            if fragment_constructor and isinstance(
+                value, (torch.SymInt, torch.SymFloat, torch.SymBool)
+            ):
+                literal = env.resolve_fragment_global(value)
+                if literal is not None:
+                    return literal
+            return value
 
         input_contains_tensor: bool = False
         env: CompileEnvironment = CompileEnvironment.current()
         proxy_args = [x.tree_map(to_proxy) for x in args]
         proxy_kwargs = {k: v.tree_map(to_proxy) for k, v in kwargs.items()}
 
+        if (
+            origin.is_host()
+            and self.value is int
+            and len(proxy_args) == 1
+            and not proxy_kwargs
+            and _is_size_backed_float(proxy_args[0])
+        ):
+            # Python int(SymFloat) guards and specializes its current hint.
+            # Keep truncation symbolic so a reused binding computes its size.
+            return TypeInfo.from_example(
+                torch.sym_int(cast("torch.SymFloat", proxy_args[0])), origin
+            )
+
+        if fragment_constructor and any(
+            _is_symbolic_numeric(value)
+            for value in tree_leaves((proxy_args, proxy_kwargs))
+        ):
+            env.warn_symbolic_fragment_domain()
+
         # special handling for symint arguments
         if any(
-            (isinstance(x, torch.SymInt) and not isinstance(x._sympy_(), sympy.Integer))
-            for x in proxy_args
+            isinstance(x, torch.SymInt) and _is_symbolic_numeric(x) for x in proxy_args
         ):
             if self.value in self._new_symint_on_host_fns() and origin.is_host():
                 result = SymIntType.new_unbacked(origin)
@@ -1067,11 +1896,6 @@ class CallableType(LiteralType):
                             ConfigValueExpression(operation, tuple(derived_args))
                         )
                 return result
-            if isinstance(self.value, type) and issubclass(
-                self.value, ConfigFragmentType
-            ):
-                raise exc.ConfigSpecFragmentWithSymInt(args)
-
         try:
             with (
                 patch.object(torch.SymInt, "__index__", _raise_shape_specializing),
@@ -1079,17 +1903,92 @@ class CallableType(LiteralType):
                 if env.process_group_name is not None
                 else contextlib.nullcontext(),
             ):
-                result = _CheckForIndexCalls.retry_call(
-                    self.value, proxy_args, proxy_kwargs
-                )
+                # Exit before constructing result provenance: a resized input
+                # must already have its runtime strides if the result aliases it.
+                with (
+                    env.track_runtime_layout_mutations(
+                        (proxy_args, proxy_kwargs),
+                        opaque=not _is_known_host_call(
+                            self.value, proxy_args, proxy_kwargs
+                        ),
+                    )
+                    if origin.is_host()
+                    else contextlib.nullcontext()
+                ):
+                    result = _CheckForIndexCalls.retry_call(
+                        self.value, proxy_args, proxy_kwargs
+                    )
                 if origin.is_host():
+                    env.propagate_runtime_tensor_layout(
+                        (proxy_args, proxy_kwargs), result
+                    )
                     env.register_tensor_factory_layout(
                         self.value,
                         proxy_args,
                         proxy_kwargs,
                         result,
                     )
-                output_type = TypeInfo.from_example(result, origin)
+                    _register_native_host_allocation(
+                        self.value, proxy_args, proxy_kwargs, result
+                    )
+                output_origin = origin
+                if (
+                    self.value is tuple
+                    and len(proxy_args) == 1
+                    and not proxy_kwargs
+                    and type(result) is tuple
+                    and result is proxy_args[0]
+                ):
+                    # tuple(exact_tuple) preserves the operand's identity and
+                    # provenance, including a capture aliased by this input.
+                    output_origin = args[0].origin
+                output_type = TypeInfo.from_example(result, output_origin)
+                if any(
+                    isinstance(arg, CollectionType)
+                    and arg.contains_approximate_contents()
+                    for arg in (*args, *kwargs.values())
+                ):
+                    if isinstance(output_type, CollectionType):
+                        # Host calls execute with representative proxy elements;
+                        # their result cannot establish exact collection contents.
+                        output_type.mark_approximate_contents(
+                            length_projection_safe=False
+                        )
+                        output_type.length_projection_safe = any(
+                            self.value is builtin
+                            for builtin in (list, tuple, dict, sorted)
+                        )
+                    else:
+                        numeric_type = (
+                            type(output_type)
+                            if isinstance(output_type, NumericType)
+                            else _numeric_types.get(type(result))
+                        )
+                        if _is_discarded_host_result(origin):
+                            # The original host call still executes. Its unused
+                            # representative result cannot affect device code.
+                            output_type = NoType(origin)
+                        elif not origin.is_host() or numeric_type is None:
+                            raise exc.TracedArgNotSupported(
+                                "a non-numeric result from representative collection contents"
+                            )
+                        # The host computes this scalar from the actual collection.
+                        # A fresh symbol passes that value instead of specializing
+                        # the representative result or its symbolic expression.
+                        else:
+                            output_type = numeric_type.new_unbacked(origin)
+                if not any(self.value is cls for cls in _BUILTIN_TUNABLE_FRAGMENTS):
+                    if not any(self.value is fn for fn in (tuple, list, dict)):
+                        record_opaque_container_result(result)
+                    guard_fragment_call_input(self.origin)
+
+                    def guard_input(arg: TypeInfo) -> TypeInfo:
+                        if isinstance(arg, (ConfigFragmentType, CallableType)):
+                            guard_fragment_call_input(arg.origin)
+                        return arg
+
+                    for arg in (*args, *kwargs.values()):
+                        arg.tree_map(guard_input)
             output_type.tree_map(warn_wrong_device)
             if (
                 origin.is_host()
@@ -1106,7 +2005,13 @@ class CallableType(LiteralType):
                 proxy_args, proxy_kwargs = tree_map_only(
                     torch.SymInt, env.size_hint, (proxy_args, proxy_kwargs)
                 )
-                example = self.value(*proxy_args, **proxy_kwargs)
+                with env.track_runtime_layout_mutations(
+                    (proxy_args, proxy_kwargs),
+                    opaque=not _is_known_host_call(
+                        self.value, proxy_args, proxy_kwargs
+                    ),
+                ):
+                    example = self.value(*proxy_args, **proxy_kwargs)
                 # We can handle many functions like math.sqrt by introducing unbacked values
                 if isinstance(example, bool):
                     return SymBoolType.new_unbacked(origin)
@@ -1211,6 +2116,18 @@ class NumericType(TypeInfo):
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if isinstance(other, (LiteralType, NumericType)):
             if NumericType.known_equal(self.value, other.value):
+                env = CompileEnvironment.current()
+                left = env.resolve_fragment_global(self.value)
+                right = (
+                    env.resolve_fragment_global(other.value)
+                    if isinstance(other, NumericType)
+                    else other.value
+                )
+                if left is not None and not _same_scalar(left, right):
+                    # Equal simplified symbols do not prove equal captured
+                    # values across a runtime branch (notably -0 versus +0).
+                    # Keep the ordinary symbolic type but drop domain proof.
+                    return self.new_unbacked(self.origin)
                 return self
             if self.python_type == other.python_type:
                 return self.new_unbacked(self.origin)
@@ -1611,9 +2528,89 @@ class CollectionType(TypeInfo):
         | tuple[TypeInfo, ...]
         | dict[str | int, TypeInfo]
         | slice,
+        *,
+        contents_exact: bool = True,
+        original_value: object = None,
     ) -> None:
         super().__init__(origin)
         self.element_types = element_types
+        self._original_identity = (
+            original_value
+            if isinstance(original_value, _ContainerIdentity)
+            else CompileEnvironment.current().container_identity_witness(original_value)
+            if original_value is not None
+            else None
+        )
+        # An opaque call can return a different collection subclass for the
+        # actual contents. Only proved builtin collections permit a pure
+        # host-length projection into device code.
+        self.length_projection_safe = self._original_identity is None or type(
+            self._original_identity.value
+        ) in (list, tuple, dict)
+        # Comprehension propagation may retain only representative elements.
+        # Those describe element types, not the runtime collection contents.
+        self.contents_exact = contents_exact
+        if not contents_exact:
+            self.mark_approximate_contents()
+
+    def membership_container(self) -> object:
+        """Return literal membership operands only when contents are proved."""
+        raise NotImplementedError
+
+    def _nested_collections(self) -> list[CollectionType]:
+        elements = self.element_types
+        # Slice bounds are scalar; only list/tuple/dict values can contain
+        # another collection.
+        if isinstance(elements, slice):
+            return []
+        children = elements.values() if isinstance(elements, dict) else elements
+        return [child for child in children if isinstance(child, CollectionType)]
+
+    def contains_approximate_contents(self) -> bool:
+        return not self.contents_exact or any(
+            child.contains_approximate_contents()
+            for child in self._nested_collections()
+        )
+
+    def mark_approximate_contents(
+        self, *, length_projection_safe: bool | None = None
+    ) -> None:
+        # Representative contents cannot prove a nested collection's values.
+        self.contents_exact = False
+        if length_projection_safe is not None:
+            self.length_projection_safe = length_projection_safe
+        self.element_types = tree_map_only(
+            CollectionType,
+            lambda child: child.with_approximate_contents(
+                length_projection_safe=length_projection_safe
+            ),
+            self.element_types,
+        )
+
+    def with_approximate_contents(
+        self, *, length_projection_safe: bool | None = None
+    ) -> CollectionType:
+        # Keep origins and subclass metadata while isolating shared children:
+        # extracting an uncertain item must not taint an exact source alias.
+        result = copy.copy(self)
+        result.mark_approximate_contents(length_projection_safe=length_projection_safe)
+        return result
+
+    def _preserve_identity(self, proxy: _T) -> _T:
+        # Output-spec consumers reconstruct proxies after binding has left its
+        # environment. The identity side table is only needed during tracing.
+        if self._original_identity is not None and CompileEnvironment.has_current():
+            CompileEnvironment.current().record_container_proxy(
+                proxy, self._original_identity
+            )
+        return proxy
+
+    def _merged_original(self, other: CollectionType) -> object:
+        return (
+            self._original_identity
+            if self._original_identity is other._original_identity
+            else None
+        )
 
     @property
     def python_type(self) -> type[object]:
@@ -1621,6 +2618,15 @@ class CollectionType(TypeInfo):
 
     def propagate_unary(self, op: ast.unaryop, origin: Origin) -> TypeInfo:
         if isinstance(op, ast.Not):
+            if (
+                origin.is_host()
+                and (length := _native_record_length(self, truth=True)) is not None
+            ):
+                return LiteralType(origin, not length)
+            if origin.is_host() and _has_untraced_host_protocol(self, nested=False):
+                _reject_untraced_host_protocol()
+            if not self.contents_exact:
+                return SymBoolType.new_unbacked(origin)
             return LiteralType(origin, not self.element_types)
         return super().propagate_unary(op, origin)
 
@@ -1642,23 +2648,78 @@ class CollectionType(TypeInfo):
 
     def propagate_getitem(self, key: TypeInfo, origin: Origin) -> TypeInfo:
         try:
+            # A slice with uncertain provenance still supplies representative
+            # bounds for element types, but cannot prove the result's contents.
             literal_key = key.as_literal()
         except NotImplementedError:
             pass
         else:
+            element_key = (
+                0
+                if not self.contents_exact
+                and isinstance(self, SequenceType)
+                and isinstance(literal_key, int)
+                else literal_key
+            )
             try:
                 # pyrefly: ignore [bad-index]
-                result = self.element_types[literal_key]
+                result = self.element_types[element_key]
             except (KeyError, IndexError) as e:
                 raise exc.TypeInferenceError(f"{type(e).__name__}: {e}") from None
             if isinstance(result, TypeInfo):
+                if not self.contents_exact and origin.is_host():
+                    return self._runtime_item(result, origin)
                 return result
             if type(result) is self.python_type:  # sliced!
-                # pyrefly: ignore [bad-argument-type]
-                return type(self)(origin=origin, element_types=result)
+                output = type(self)(
+                    origin=origin,
+                    element_types=result,  # pyrefly: ignore [bad-argument-type]
+                    contents_exact=self.contents_exact
+                    and (not isinstance(key, SliceType) or key.contents_exact),
+                )
+                output.length_projection_safe = self.length_projection_safe
+                return output
         return super().propagate_getitem(key, origin)
 
+    @staticmethod
+    def _runtime_item(item: TypeInfo, origin: Origin) -> TypeInfo:
+        # Each read selects an actual runtime value, not the representative
+        # element's scalar or tensor identity. In particular, positive and
+        # negative indices must not share one unbacked symbol.
+        if isinstance(item, (NumericType, LiteralType)) and item.python_type in (
+            int,
+            float,
+            bool,
+        ):
+            return NumericType.subtype(item.python_type).new_unbacked(origin)
+        if isinstance(item, TensorType):
+            value = item.fake_value
+            env = CompileEnvironment.current()
+            # Keep this selection independent of the representative's storage.
+            # Host allocations derived from it inherit runtime layout metadata.
+            selected = torch.empty_strided(
+                value.size(), value.stride(), dtype=value.dtype, device=value.device
+            )
+            env.mark_runtime_tensor_layout(selected)
+            return TensorType(origin, selected)
+        if isinstance(item, CollectionType):
+            # Nested collections already carry approximate contents. Preserve
+            # their source alias without treating those contents as constants.
+            return item
+        raise exc.TracedArgNotSupported(
+            "a non-numeric result from representative collection contents"
+        )
+
     def truth_value(self) -> bool:
+        if (
+            self.origin.is_host()
+            and (length := _native_record_length(self, truth=True)) is not None
+        ):
+            return bool(length)
+        if self.origin.is_host() and _has_untraced_host_protocol(self, nested=False):
+            _reject_untraced_host_protocol()
+        if not self.contents_exact:
+            raise NotImplementedError
         return bool(self.element_types)
 
     def tree_map(self, fn: Callable[[TypeInfo], object]) -> object:
@@ -1682,10 +2743,21 @@ class SequenceType(CollectionType):
         return x
 
     def proxy(self) -> list[object] | tuple[object, ...]:
-        return self._maybe_tuple([x.proxy() for x in self.element_types])
+        if self.contains_approximate_contents():
+            raise NotImplementedError
+        return self._preserve_identity(
+            self._maybe_tuple([x.proxy() for x in self.element_types])
+        )
+
+    def membership_container(self) -> object:
+        return self.as_literal()
 
     def as_literal(self) -> list[object] | tuple[object, ...]:
-        return self._maybe_tuple([x.as_literal() for x in self.element_types])
+        if not self.contents_exact:
+            raise NotImplementedError
+        return self._preserve_identity(
+            self._maybe_tuple([x.as_literal() for x in self.element_types])
+        )
 
     def unpack(self) -> list[TypeInfo]:
         return [*self.element_types]
@@ -1697,6 +2769,14 @@ class SequenceType(CollectionType):
     def propagate_getitem(self, key: TypeInfo, origin: Origin) -> TypeInfo:
         # Tuple/List indexing with non-literal indices (e.g., from hl.static_range)
         if self.python_type in (tuple, list) and isinstance(key, SymIntType):
+            env = CompileEnvironment.current()
+            if _symint_free_symbols(key.value) <= env.specialized_vars:
+                # hl.specialize already guards these symbols. Retain the actual
+                # selected element's value, identity and origin rather than the
+                # representative type used for a genuinely dynamic index.
+                return super().propagate_getitem(
+                    LiteralType(key.origin, int(key.value)), origin
+                )
             if not self.element_types:
                 raise exc.TypeInferenceError("Cannot index empty sequence")
             first_type = self.element_types[0]
@@ -1704,6 +2784,18 @@ class SequenceType(CollectionType):
                 raise exc.TypeInferenceError(
                     "Sequence indexing with non-literal index requires all elements to have the same type"
                 )
+            if origin.is_host():
+                if not self.contents_exact:
+                    return self._runtime_item(first_type, origin)
+                # A runtime index can select any element. Merge their values,
+                # layouts and storage owners just as for a host control-flow
+                # join, instead of borrowing the first element's identity.
+                selected = functools.reduce(
+                    lambda left, right: left.merge(right), self.element_types
+                )
+                selected = copy.copy(selected)
+                selected.origin = origin
+                return selected
             return first_type
 
         return super().propagate_getitem(key, origin)
@@ -1715,7 +2807,14 @@ class SequenceType(CollectionType):
             if not self.element_types:
                 raise exc.TypeInferenceError("Cannot index empty sequence")
             new_elements = [elem.merge(value) for elem in self.element_types]
-            return SequenceType(origin=origin, element_types=new_elements)
+            result = SequenceType(
+                origin=origin,
+                element_types=new_elements,
+                contents_exact=self.contents_exact,
+                original_value=self._original_identity,
+            )
+            result.length_projection_safe = self.length_projection_safe
+            return result
         return super().propagate_setitem(key, value, origin)
 
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
@@ -1723,8 +2822,10 @@ class SequenceType(CollectionType):
             self_elements = self.element_types
             other_elements = other.element_types
             if len(self_elements) == len(other_elements):
-                return SequenceType(
+                result = SequenceType(
                     origin=other.origin,
+                    contents_exact=self.contents_exact and other.contents_exact,
+                    original_value=self._merged_original(other),
                     element_types=self._maybe_tuple(
                         [
                             self_elements[i].merge(other_elements[i], var_name=var_name)
@@ -1732,12 +2833,18 @@ class SequenceType(CollectionType):
                         ]
                     ),
                 )
+                result.length_projection_safe = (
+                    self.length_projection_safe and other.length_projection_safe
+                )
+                return result
         return super().merge(other, var_name=var_name)
 
     def tree_map(
         self, fn: Callable[[TypeInfo], object]
     ) -> list[object] | tuple[object, ...]:
-        return self._maybe_tuple([x.tree_map(fn) for x in self.element_types])
+        return self._preserve_identity(
+            self._maybe_tuple([x.tree_map(fn) for x in self.element_types])
+        )
 
 
 class DictType(CollectionType):
@@ -1749,10 +2856,23 @@ class DictType(CollectionType):
         return f"{type(self).__name__}({{{items}}})"
 
     def proxy(self) -> dict[str | int, object]:
-        return {k: v.proxy() for k, v in self.element_types.items()}
+        if self.contains_approximate_contents():
+            raise NotImplementedError
+        return self._preserve_identity(
+            {k: v.proxy() for k, v in self.element_types.items()}
+        )
+
+    def membership_container(self) -> object:
+        if not self.contents_exact:
+            raise NotImplementedError
+        return self.element_types.keys()
 
     def as_literal(self) -> dict[str | int, object]:
-        return {k: v.as_literal() for k, v in self.element_types.items()}
+        if not self.contents_exact:
+            raise NotImplementedError
+        return self._preserve_identity(
+            {k: v.as_literal() for k, v in self.element_types.items()}
+        )
 
     def unpack(self) -> list[TypeInfo]:
         return [TypeInfo.from_example(k, self.origin) for k in self.element_types]
@@ -1767,8 +2887,10 @@ class DictType(CollectionType):
             self_elements = self.element_types
             other_elements = other.element_types
             if set(self_elements.keys()) == set(other_elements.keys()):
-                return type(self)(
+                result = type(self)(
                     origin=other.origin,
+                    contents_exact=self.contents_exact and other.contents_exact,
+                    original_value=self._merged_original(other),
                     element_types={
                         key: self_elements[key].merge(
                             other_elements[key], var_name=var_name
@@ -1776,13 +2898,45 @@ class DictType(CollectionType):
                         for key in self_elements
                     },
                 )
+                result.length_projection_safe = (
+                    self.length_projection_safe and other.length_projection_safe
+                )
+                return result
         return super().merge(other, var_name=var_name)
 
     def tree_map(self, fn: Callable[[TypeInfo], object]) -> dict[str | int, object]:
-        return {k: v.tree_map(fn) for k, v in self.element_types.items()}
+        return self._preserve_identity(
+            {k: v.tree_map(fn) for k, v in self.element_types.items()}
+        )
 
 
 class ClassType(DictType):
+    def membership_container(self) -> object:
+        # Record fields are not membership keys. Only default tuple containment
+        # over the same proved positional values can be evaluated here.
+        identity = self._original_identity
+        original = identity.value if identity is not None else None
+        if (
+            not self.contents_exact
+            or not isinstance(original, tuple)
+            or type(original).__contains__ is not tuple.__contains__
+        ):
+            raise NotImplementedError
+        values = tuple(value.as_literal() for value in self.element_types.values())
+        if len(values) != tuple.__len__(original) or any(
+            value is not item
+            for value, item in zip(values, tuple.__iter__(original), strict=True)
+        ):
+            # Custom field layouts or reconstructed contents do not establish
+            # the tuple's actual positional values or their equality behavior.
+            raise NotImplementedError
+        return values
+
+    def populate_symbol_origins(self, origin: Origin) -> None:
+        for key, subtype in self.element_types.items():
+            assert isinstance(key, str)
+            subtype.populate_symbol_origins(AttributeOrigin(origin, key))
+
     def unpack(self) -> list[TypeInfo]:
         """Unpack a ClassType into its values (not field name strings).
 
@@ -1962,6 +3116,9 @@ class SliceType(CollectionType):
         return slice(self.lower.proxy(), self.upper.proxy(), self.step.proxy())
 
     def as_literal(self) -> slice:
+        # These bounds may be representative. Collection slicing separately
+        # carries contents_exact; literal Python descriptors retain their
+        # existing type-propagation behavior.
         return slice(
             self.lower.as_literal(), self.upper.as_literal(), self.step.as_literal()
         )
@@ -1975,6 +3132,7 @@ class SliceType(CollectionType):
             other_elements = other.element_types
             return SliceType(
                 origin=other.origin,
+                contents_exact=self.contents_exact and other.contents_exact,
                 element_types=slice(
                     self_elements.start.merge(other_elements.start, var_name=var_name),
                     self_elements.stop.merge(other_elements.stop, var_name=var_name),
@@ -1996,7 +3154,88 @@ def tensor_may_have_many_elements(tensor: torch.Tensor) -> bool:
     return not all(env.known_equal(size, 1) for size in tensor.shape)
 
 
+def _is_size_backed_float(value: object) -> bool:
+    """Retain shape expressions without treating runtime float data as a size."""
+    if not isinstance(value, torch.SymFloat) or not CompileEnvironment.has_current():
+        return False
+    expression = value._sympy_()
+    # These nodes preserve Python conversion/division instead of algebraically
+    # simplifying ordered IEEE arithmetic. Add/Sub/Mul must retain their host
+    # value: even size-derived floats can round before cancellation.
+    if not isinstance(expression, (ToFloat, IntTrueDiv, FloatTrueDiv)):
+        return False
+    symbols = expression.free_symbols
+    sources = CompileEnvironment.current().shape_env.var_to_sources
+    return bool(symbols) and all(
+        isinstance(symbol, sympy.Symbol)
+        and any(
+            isinstance(source, TensorPropertySource)
+            and source.prop is TensorProperty.SIZE
+            for source in sources.get(symbol, ())
+        )
+        for symbol in symbols
+    )
+
+
+def _preserve_host_float_operation(
+    result: object, op: ast.AST, operands: tuple[object, ...]
+) -> object:
+    # These operations cannot raise for exact float operands. Integer literals
+    # also need a finite float conversion; symbolic integers have no such proof.
+    # Do not hoist division/powers out of a potentially untaken device branch.
+    operator = next(
+        (
+            kind
+            for kind in (ast.Add, ast.Sub, ast.Mult, ast.UAdd, ast.USub)
+            if isinstance(op, kind)
+        ),
+        None,
+    )
+    if (
+        operator is None
+        or _is_size_backed_float(result)
+        or not any(isinstance(value, torch.SymFloat) for value in operands)
+        or not CompileEnvironment.has_current()
+    ):
+        return result
+    try:
+        host = HostFunction.current()
+    except NoCurrentFunction:
+        return result
+    origins: list[Origin | int | float | bool] = []
+    for value in operands:
+        if isinstance(value, torch.SymFloat):
+            info = host.expr_to_origin.get(value._sympy_())
+            if info is None or not info.origin.is_host():
+                return result
+            origins.append(info.origin)
+        elif type(value) in (float, int, bool):
+            if type(value) is int:
+                try:
+                    float(value)
+                except OverflowError:
+                    return result
+            origins.append(cast("int | float | bool", value))
+        else:
+            return result
+    origin = ScalarArithmeticOrigin(operator, tuple(origins))
+    result = SymFloatType.new_unbacked(origin).value
+    CompileEnvironment.current().preserve_tunable_float_provenance(result, operands)
+    host.expr_to_origin[result._sympy_()] = SymbolOrigin(origin)
+    return result
+
+
 def _eval_unary(op: ast.unaryop, value: object) -> object:
+    result = _eval_unary_impl(op, value)
+    result = _preserve_host_float_operation(result, op, (value,))
+    if CompileEnvironment.has_current():
+        return CompileEnvironment.current().record_fragment_global_operation(
+            result, _eval_unary_impl, op, (value,)
+        )
+    return result
+
+
+def _eval_unary_impl(op: ast.unaryop, value: object) -> object:
     if isinstance(op, ast.Not):
         # ``not`` would call bool() and guard a symbolic value on its hint.
         if isinstance(value, torch.SymBool):
@@ -2017,6 +3256,16 @@ def _eval_unary(op: ast.unaryop, value: object) -> object:
 
 
 def _eval_binary(op: ast.operator, left: object, right: object) -> object:
+    result = _eval_binary_impl(op, left, right)
+    result = _preserve_host_float_operation(result, op, (left, right))
+    if CompileEnvironment.has_current():
+        return CompileEnvironment.current().record_fragment_global_operation(
+            result, _eval_binary_impl, op, (left, right)
+        )
+    return result
+
+
+def _eval_binary_impl(op: ast.operator, left: object, right: object) -> object:
     if isinstance(op, ast.Add):
         # pyrefly: ignore [unsupported-operation]
         return left + right
@@ -2060,6 +3309,17 @@ def _eval_binary(op: ast.operator, left: object, right: object) -> object:
 
 
 def _eval_compare(op: ast.cmpop, left: object, right: object) -> object:
+    result = _eval_compare_impl(op, left, right)
+    if CompileEnvironment.has_current() and isinstance(
+        op, (ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE)
+    ):
+        return CompileEnvironment.current().record_fragment_global_operation(
+            result, _eval_compare_impl, op, (left, right)
+        )
+    return result
+
+
+def _eval_compare_impl(op: ast.cmpop, left: object, right: object) -> object:
     if isinstance(op, ast.Eq):
         return left == right
     if isinstance(op, ast.NotEq):

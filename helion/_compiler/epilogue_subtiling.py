@@ -32,6 +32,7 @@ from torch.fx import map_arg
 from ..autotuner.config_fragment import integer_power_of_two
 from ..language.view_ops import split as hl_split
 from .compile_environment import CompileEnvironment
+from .fx_side_effects import is_impure_node
 from .indexing_strategy import subscript_tile_info
 from .inductor_lowering import APIFuncLowering
 
@@ -93,7 +94,7 @@ def apply_epilogue_subtiling(
         changed = True
 
     if changed:
-        graph.eliminate_dead_code()
+        graph.eliminate_dead_code(is_impure_node=is_impure_node)
     return changed
 
 

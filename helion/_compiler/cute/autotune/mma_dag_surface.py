@@ -17,6 +17,7 @@ from ....exc import InvalidConfig
 from ..cute_mma_dag import AXIS_LEAD
 from ..cute_mma_dag import AXIS_LOOP
 from ..cute_mma_dag import AXIS_ROOT
+from ..cute_mma_dag import MMA_DAG_ATTENTION_PASS_WARPS
 from ..cute_mma_dag import MMA_DAG_AUX_CHOICES
 from ..cute_mma_dag import MMA_DAG_AUX_KEY
 from ..cute_mma_dag import MMA_DAG_AUX_RING
@@ -28,6 +29,7 @@ from ..cute_mma_dag import MMA_DAG_DEFAULT_WARPS
 from ..cute_mma_dag import MMA_DAG_DERIVED_CHOICES
 from ..cute_mma_dag import MMA_DAG_DERIVED_KEY
 from ..cute_mma_dag import MMA_DAG_DERIVED_PASS
+from ..cute_mma_dag import MMA_DAG_EARLY_TMEM_RETIREMENT_KEY
 from ..cute_mma_dag import MMA_DAG_EPILOGUE_CHOICES
 from ..cute_mma_dag import MMA_DAG_EPILOGUE_KEY
 from ..cute_mma_dag import MMA_DAG_EPILOGUE_ROW
@@ -48,12 +50,18 @@ from ..cute_mma_dag import MMA_DAG_LOOKAHEAD_OFF
 from ..cute_mma_dag import MMA_DAG_LOOKAHEAD_ON
 from ..cute_mma_dag import MMA_DAG_MODES
 from ..cute_mma_dag import MMA_DAG_OFF
+from ..cute_mma_dag import MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
 from ..cute_mma_dag import MMA_DAG_PASS_WARPS_CHOICES
 from ..cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
 from ..cute_mma_dag import MMA_DAG_PASS_WARPS_MMA
 from ..cute_mma_dag import MMA_DAG_PASS_WARPS_OFF
 from ..cute_mma_dag import MMA_DAG_PERSISTENT_CHOICES
 from ..cute_mma_dag import MMA_DAG_PERSISTENT_KEY
+from ..cute_mma_dag import MMA_DAG_PROBABILITY_SCHEDULE_CHOICES
+from ..cute_mma_dag import MMA_DAG_PROBABILITY_SCHEDULE_KEY
+from ..cute_mma_dag import MMA_DAG_PROBABILITY_SCHEDULE_SERIAL
+from ..cute_mma_dag import MMA_DAG_QUERY_TMA_KEY
+from ..cute_mma_dag import MMA_DAG_SLEEP_WAITS_KEY
 from ..cute_mma_dag import MMA_DAG_SPLIT_CHOICES
 from ..cute_mma_dag import MMA_DAG_SPLIT_CLUSTER
 from ..cute_mma_dag import MMA_DAG_SPLIT_FIXUP
@@ -64,6 +72,10 @@ from ..cute_mma_dag import MMA_DAG_STORE_ACCEPTED
 from ..cute_mma_dag import MMA_DAG_STORE_CHOICES
 from ..cute_mma_dag import MMA_DAG_STORE_KEY
 from ..cute_mma_dag import MMA_DAG_TCGEN05
+from ..cute_mma_dag import MMA_DAG_V_LAG_CHOICES
+from ..cute_mma_dag import MMA_DAG_V_LAG_KEY
+from ..cute_mma_dag import MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY
+from ..cute_mma_dag import MMA_DAG_VALUE_METADATA_SKIP_KEY
 from ..cute_mma_dag import MMA_DAG_WARP
 from ..cute_mma_dag import MMA_DAG_WARP_CHOICES
 from ..cute_mma_dag import MMA_DAG_WARPS_KEY
@@ -78,6 +90,7 @@ from ..cute_mma_dag import mma_dag_pass_warps_reason
 from ..cute_mma_dag import mma_dag_persistent_reason
 from ..cute_mma_dag import mma_dag_ragged_ceilings
 from ..cute_mma_dag import mma_dag_seed_configs
+from ..cute_mma_dag import paged_attention_pass_warp_choices
 from ..cute_register_subblocks import COLSIDE_CHOICES as RSB_COLSIDE_CHOICES
 from ..cute_register_subblocks import COLSIDE_KEY as RSB_COLSIDE_KEY
 from ..cute_register_subblocks import COLSIDE_RMW as RSB_COLSIDE_RMW
@@ -98,6 +111,8 @@ from ..cute_register_subblocks import RegisterSubblockFacts
 from ..cute_register_subblocks import register_subblocks_config_reason
 from ..cute_register_subblocks import register_subblocks_repair
 from ..cutedsl_compat import hinted_cp_async_available
+from ..phase_load_policies import project_load_policies
+from ..phase_load_policies import scatter_load_policies
 
 if TYPE_CHECKING:
     from ....autotuner.config_spec import ConfigSpec
@@ -226,6 +241,14 @@ def enable_cute_mma_dag_search(config_spec: ConfigSpec, facts: CuteMmaDagFacts) 
     targets, the promoted default) selects ``warp``.
     """
     config_spec.cute_mma_dag_facts = facts
+    ordered_phase = config_spec.cute_mma_dag_phase_index is not None
+    if ordered_phase:
+        # MMA modes normalize to separate flat launches. Keep that default,
+        # but the off mode can still use the ordinary persistent barrier
+        # lowering and must retain its existing search choices.
+        config_spec.allowed_pid_types = tuple(
+            sorted(config_spec.allowed_pid_types, key=lambda pid: pid != "flat")
+        )
     # A ragged root axis below its MMA atom (M = 8 under the 16-row atom)
     # is computed at the atom on the warp path, and the seeds walk that
     # tile: its search ceiling, the extent where the frontend left it,
@@ -235,6 +258,12 @@ def enable_cute_mma_dag_search(config_spec: ConfigSpec, facts: CuteMmaDagFacts) 
     for block_id, atom in mma_dag_ragged_ceilings(facts).items():
         if block_id in block_ids:
             config_spec.block_sizes.block_id_lookup(block_id).allow_overshoot(atom)
+    if facts.attention is not None:
+        query_axis = facts.axes[facts.attention.query_axis]
+        if query_axis.block_id in block_ids:
+            config_spec.block_sizes.block_id_lookup(
+                query_axis.block_id
+            ).allow_overshoot(facts.attention.query_block)
     modes = MMA_DAG_MODES
     if facts.tcgen05 is not None:
         modes = (*modes, MMA_DAG_TCGEN05)
@@ -255,6 +284,11 @@ def enable_cute_mma_dag_search(config_spec: ConfigSpec, facts: CuteMmaDagFacts) 
         if not mma_dag_seed_configs(facts):
             skipped.add(MMA_DAG_WARP)
         search = tuple(mode for mode in modes if mode not in skipped)
+    if facts.native_s2f6_operands and facts.attention is None:
+        # Native decode has no admitted MMA schedule without its proved
+        # attention transport. Keep explicit-config validation and ordinary
+        # lowering, but do not sample modes that always normalize to off.
+        search = (MMA_DAG_OFF,)
     config_spec.cute_mma_dag = EnumFragment(
         choices=modes, search_choices=search if search != modes else None
     )
@@ -272,9 +306,41 @@ def enable_cute_mma_dag_search(config_spec: ConfigSpec, facts: CuteMmaDagFacts) 
     )
     config_spec.cute_mma_dag_store = EnumFragment(choices=MMA_DAG_STORE_CHOICES)
     config_spec.cute_mma_dag_exchange = EnumFragment(choices=MMA_DAG_EXCHANGE_CHOICES)
+    attention_choices = paged_attention_pass_warp_choices(facts)
     config_spec.cute_mma_dag_pass_warps = EnumFragment(
-        choices=MMA_DAG_PASS_WARPS_CHOICES
+        choices=tuple(
+            choice
+            for choice in MMA_DAG_PASS_WARPS_CHOICES
+            if choice not in MMA_DAG_ATTENTION_PASS_WARPS or choice in attention_choices
+        )
     )
+    # Facts can be re-registered on an existing spec after a proof changes.
+    config_spec.cute_mma_dag_v_lag = None
+    config_spec.cute_mma_dag_sleep_waits = None
+    config_spec.cute_mma_dag_early_tmem_retirement = None
+    config_spec.cute_mma_dag_query_tma = None
+    config_spec.cute_mma_dag_probability_schedule = None
+    config_spec.cute_mma_dag_value_metadata_skip = None
+    config_spec.cute_mma_dag_value_metadata_read_overlap = None
+    if facts.attention is not None and facts.attention.paired_items:
+        config_spec.cute_mma_dag_v_lag = EnumFragment(choices=MMA_DAG_V_LAG_CHOICES)
+        config_spec.cute_mma_dag_sleep_waits = EnumFragment(choices=(False, True))
+        config_spec.cute_mma_dag_early_tmem_retirement = EnumFragment(
+            choices=(False, True)
+        )
+        if facts.attention.reference_scores:
+            config_spec.cute_mma_dag_probability_schedule = EnumFragment(
+                choices=MMA_DAG_PROBABILITY_SCHEDULE_CHOICES
+            )
+        if facts.attention.query_tma_available:
+            config_spec.cute_mma_dag_query_tma = EnumFragment(choices=(False, True))
+        if facts.attention.value_metadata_skip_available:
+            config_spec.cute_mma_dag_value_metadata_skip = EnumFragment(
+                choices=(False, True)
+            )
+            config_spec.cute_mma_dag_value_metadata_read_overlap = EnumFragment(
+                choices=(False, True)
+            )
     config_spec.cute_mma_dag_loads = EnumFragment(choices=MMA_DAG_LOADS_CHOICES)
     if facts.aux_candidates:
         config_spec.cute_mma_dag_aux = EnumFragment(choices=MMA_DAG_AUX_CHOICES)
@@ -291,8 +357,10 @@ def enable_cute_mma_dag_search(config_spec: ConfigSpec, facts: CuteMmaDagFacts) 
         )
     )
     config_spec.cute_mma_dag_lookahead = EnumFragment(choices=MMA_DAG_LOOKAHEAD_CHOICES)
-    if facts.tcgen05 is not None and (
-        not facts.tcgen05.regions or facts.tcgen05.persistent_reason is None
+    if (
+        not ordered_phase
+        and facts.tcgen05 is not None
+        and (not facts.tcgen05.regions or facts.tcgen05.persistent_reason is None)
     ):
         # The persistent launch: the single-loop renderer's tile loop,
         # or a region program's (``cute_mma_dag_tcgen05_regions``;
@@ -300,7 +368,12 @@ def enable_cute_mma_dag_search(config_spec: ConfigSpec, facts: CuteMmaDagFacts) 
         config_spec.cute_mma_dag_persistent = EnumFragment(
             choices=MMA_DAG_PERSISTENT_CHOICES
         )
-    if facts.tcgen05 is not None and facts.tcgen05.regions and facts.split_axis >= 0:
+    if (
+        not ordered_phase
+        and facts.tcgen05 is not None
+        and facts.tcgen05.regions
+        and facts.split_axis >= 0
+    ):
         # The split count: a portable cluster's (<= 8), and the fixup
         # grid's wider ones where the program admits the fixup form.
         admitted = fixup_admitted(facts)
@@ -394,6 +467,7 @@ def _normalize_cute_register_subblocks(
     # search does not sample inert variations of one kernel.
     for key in (
         "cute_fp32_dot",
+        "cute_fragment_half_mma",
         "cute_fragment_padded_rows",
         "cute_fragment_unrolled_loops",
         "cute_fragment_vector_io",
@@ -437,6 +511,58 @@ def _normalize_cute_register_subblocks(
         config["cute_store_policy"] = "default"
 
 
+def normalize_value_metadata_options(
+    config_spec: ConfigSpec, config: dict[str, object], *, fix_invalid: bool
+) -> None:
+    """Validate before family gates; overlap also requires metadata to be enabled."""
+    for key, fragment in (
+        (MMA_DAG_VALUE_METADATA_SKIP_KEY, config_spec.cute_mma_dag_value_metadata_skip),
+        (
+            MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY,
+            config_spec.cute_mma_dag_value_metadata_read_overlap,
+        ),
+    ):
+        if fragment is None and key not in config:
+            continue
+        value = config.setdefault(key, False)
+        if type(value) is not bool or (fragment is None and value):
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{key} requires a bool and supported metadata transport, got {value!r}"
+                )
+            config[key] = False
+        if fragment is None:
+            # Source/layout specialization can remove this proof. Missing and
+            # explicit defaults retain one identity, including on generic roots.
+            config.pop(key, None)
+    if (
+        config_spec.cute_mma_dag_value_metadata_read_overlap is not None
+        and config.get(MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY) is True
+        and config.get(MMA_DAG_VALUE_METADATA_SKIP_KEY) is not True
+    ):
+        if not fix_invalid:
+            raise InvalidConfig(
+                f"{MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY}=True requires "
+                f"{MMA_DAG_VALUE_METADATA_SKIP_KEY}=True"
+            )
+        config[MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY] = False
+
+
+def _pin_paired_knobs(config: dict[str, object]) -> None:
+    """Bodies that ignore these knobs keep one autotune identity."""
+    for key, default in (
+        (MMA_DAG_V_LAG_KEY, 0),
+        (MMA_DAG_SLEEP_WAITS_KEY, False),
+        (MMA_DAG_EARLY_TMEM_RETIREMENT_KEY, False),
+        (MMA_DAG_QUERY_TMA_KEY, False),
+        (MMA_DAG_VALUE_METADATA_SKIP_KEY, False),
+        (MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY, False),
+        (MMA_DAG_PROBABILITY_SCHEDULE_KEY, MMA_DAG_PROBABILITY_SCHEDULE_SERIAL),
+    ):
+        if key in config:
+            config[key] = default
+
+
 def _normalize_cute_mma_dag(
     config_spec: ConfigSpec, config: dict[str, object], *, fix_invalid: bool
 ) -> None:
@@ -444,6 +570,7 @@ def _normalize_cute_mma_dag(
     and pin the knobs the replaced body ignores to one identity."""
     from ..cute_mma_dag import mma_dag_config_reason
     from ..cute_mma_dag import mma_dag_repair
+    from ..paged_attention_config import paged_attention_config_reason
 
     facts = config_spec.cute_mma_dag_facts
     assert facts is not None
@@ -483,6 +610,43 @@ def _normalize_cute_mma_dag(
                 raise InvalidConfig(
                     f"{key} must be one of {fragment.choices!r}, got {value!r}"
                 )
+    for key, fragment, default in (
+        (MMA_DAG_V_LAG_KEY, config_spec.cute_mma_dag_v_lag, 0),
+        (
+            MMA_DAG_PROBABILITY_SCHEDULE_KEY,
+            config_spec.cute_mma_dag_probability_schedule,
+            MMA_DAG_PROBABILITY_SCHEDULE_SERIAL,
+        ),
+    ):
+        if fragment is not None or key in config:
+            value = config.setdefault(key, default)
+            allowed = (default,) if fragment is None else fragment.choices
+            if type(value) is not type(default) or value not in allowed:
+                if not fix_invalid:
+                    raise InvalidConfig(
+                        f"{key} must be one of {allowed!r}, got {value!r}"
+                    )
+                config[key] = default
+            if fragment is None:
+                config.pop(key, None)
+    for key, fragment in (
+        (MMA_DAG_SLEEP_WAITS_KEY, config_spec.cute_mma_dag_sleep_waits),
+        (
+            MMA_DAG_EARLY_TMEM_RETIREMENT_KEY,
+            config_spec.cute_mma_dag_early_tmem_retirement,
+        ),
+        (MMA_DAG_QUERY_TMA_KEY, config_spec.cute_mma_dag_query_tma),
+    ):
+        if fragment is not None or key in config:
+            value = config.setdefault(key, False)
+            if type(value) is not bool or (fragment is None and value):
+                if not fix_invalid:
+                    raise InvalidConfig(
+                        f"{key} needs a bool and a supported paired transport, got {value!r}"
+                    )
+                config[key] = False
+            if fragment is None:
+                config.pop(key, None)
     persistent_fragment = config_spec.cute_mma_dag_persistent
     persistent = config.setdefault(MMA_DAG_PERSISTENT_KEY, 0)
     allowed = (0,) if persistent_fragment is None else persistent_fragment.choices
@@ -547,6 +711,7 @@ def _normalize_cute_mma_dag(
         config[MMA_DAG_STORE_KEY] = MMA_DAG_STORE_CHOICES[0]
         config[MMA_DAG_EXCHANGE_KEY] = MMA_DAG_EXCHANGE_CHOICES[0]
         config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
+        _pin_paired_knobs(config)
         config[MMA_DAG_LOADS_KEY] = MMA_DAG_LOADS_CHOICES[0]
         config[MMA_DAG_AUX_KEY] = MMA_DAG_AUX_CHOICES[0]
         config[MMA_DAG_DERIVED_KEY] = MMA_DAG_DERIVED_CHOICES[0]
@@ -611,6 +776,8 @@ def _normalize_cute_mma_dag(
     ):
         config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
     pass_warps = cast("str", config[MMA_DAG_PASS_WARPS_KEY])
+    if pass_warps != MMA_DAG_PASS_WARPS_ATTENTION_PAIRED:
+        _pin_paired_knobs(config)
     # The split epilogue has a subject only in the tensor-memory region
     # programs without reductions, at eight warps; elsewhere the knob is
     # inert and pinned to the row layout.
@@ -647,6 +814,15 @@ def _normalize_cute_mma_dag(
     ):
         config[MMA_DAG_PERSISTENT_KEY] = 0
     persistent = cast("int", config[MMA_DAG_PERSISTENT_KEY])
+    if config[MMA_DAG_PASS_WARPS_KEY] in MMA_DAG_ATTENTION_PASS_WARPS:
+        attention_reason = paged_attention_config_reason(
+            facts, sizes_by_block, config, before_inert_globals=True
+        )
+        if attention_reason is not None:
+            if not fix_invalid:
+                raise InvalidConfig(attention_reason)
+            config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
+            pass_warps = MMA_DAG_PASS_WARPS_OFF
     reason = mma_dag_config_reason(
         facts,
         sizes_by_block,
@@ -715,6 +891,7 @@ def _normalize_cute_mma_dag(
             repaired = mma_dag_repair(facts, sizes_by_block, warps, stages)
         if repaired is None:
             config[MMA_DAG_KEY] = MMA_DAG_OFF
+            _pin_paired_knobs(config)
             config[MMA_DAG_WARPS_KEY] = MMA_DAG_DEFAULT_WARPS
             config[MMA_DAG_STAGES_KEY] = MMA_DAG_DEFAULT_STAGES
             config[MMA_DAG_STORE_KEY] = MMA_DAG_STORE_CHOICES[0]
@@ -740,6 +917,7 @@ def _normalize_cute_mma_dag(
             config[MMA_DAG_PERSISTENT_KEY] = 0
         for block_id, index in indices.items():
             block_sizes[index] = new_sizes[block_id]
+        sizes_by_block = dict(new_sizes)
         # The repaired split axis slice names the split count (1 when
         # the repair kept the whole axis, or fell back to the warp mode);
         # beyond a portable cluster it is the fixup grid's.
@@ -811,6 +989,8 @@ def _normalize_cute_mma_dag(
         is not None
     ):
         config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
+    if config[MMA_DAG_PASS_WARPS_KEY] != MMA_DAG_PASS_WARPS_ATTENTION_PAIRED:
+        _pin_paired_knobs(config)
     # The loads route has a subject in the tensor-memory region programs
     # whose derived values read tiles, and in the warp mode when a ring
     # tile's source is one a tensor map can fetch or an epilogue value
@@ -837,6 +1017,93 @@ def _normalize_cute_mma_dag(
         config[MMA_DAG_PERSISTENT_KEY] = 0
         config["pid_type"] = "flat"
         config.pop("num_sm_multiplier", None)
+    policies = config.get("load_eviction_policies")
+    if config[MMA_DAG_PASS_WARPS_KEY] in MMA_DAG_ATTENTION_PASS_WARPS and isinstance(
+        policies, str
+    ):
+        config["load_eviction_policies"] = [
+            policies
+        ] * config_spec.load_eviction_policies.length
+    if config_spec.cute_mma_dag_phase_index is not None:
+        _normalize_mma_dag_phase_owned_fields(config_spec, config)
+    else:
+        _normalize_mma_dag_owned_fields(config_spec, config)
+    if config[MMA_DAG_PASS_WARPS_KEY] in MMA_DAG_ATTENTION_PASS_WARPS:
+        attention_config = config
+        policies = config.get("load_eviction_policies")
+        if config_spec.cute_mma_dag_phase_index is not None and isinstance(
+            policies, list
+        ):
+            # Sibling launches retain their own policies. Only this phase's
+            # projected slots belong to the attention schedule's contract.
+            attention_config = {
+                **config,
+                "load_eviction_policies": project_load_policies(
+                    policies, config_spec.cute_mma_dag_phase_eviction_map
+                ),
+            }
+        attention_reason = paged_attention_config_reason(
+            facts, sizes_by_block, attention_config
+        )
+        if attention_reason is not None:
+            if not fix_invalid:
+                raise InvalidConfig(attention_reason)
+            config[MMA_DAG_PASS_WARPS_KEY] = MMA_DAG_PASS_WARPS_OFF
+            # The ordinary layout has a different resource budget. A late
+            # topology repair must validate that body before returning it.
+            _normalize_cute_mma_dag(config_spec, config, fix_invalid=True)
+            return
+
+
+def _normalize_mma_dag_phase_owned_fields(
+    config_spec: ConfigSpec, config: dict[str, object]
+) -> None:
+    """Canonicalize only knobs no sibling launch consumes."""
+    owned = config_spec.cute_mma_dag_phase_owned_blocks
+    for key, sequence in (
+        ("num_threads", config_spec.num_threads),
+        ("loop_orders", config_spec.loop_orders),
+        ("l2_groupings", config_spec.l2_groupings),
+        ("cute_vector_widths", config_spec.cute_vector_widths),
+        ("cute_lane_layouts", config_spec.cute_lane_layouts),
+        ("cute_reduction_reloads", config_spec.cute_reduction_reloads),
+        ("reduction_loops", config_spec.reduction_loops),
+        ("flatten_loops", config_spec.flatten_loops),
+        ("range_unroll_factors", config_spec.range_unroll_factors),
+        ("range_warp_specializes", config_spec.range_warp_specialize),
+        ("range_num_stages", config_spec.range_num_stages),
+        ("range_multi_buffers", config_spec.range_multi_buffers),
+        ("range_flattens", config_spec.range_flattens),
+        ("static_ranges", config_spec.static_ranges),
+    ):
+        values = config.get(key)
+        if isinstance(values, list):
+            config[key] = [
+                item._fill_missing() if set(item.block_ids) <= owned else value
+                for item, value in zip(sequence, values, strict=True)
+            ]
+    policies = config.get("load_eviction_policies")
+    if isinstance(policies, list):
+        mapping = config_spec.cute_mma_dag_phase_eviction_map
+        local_policies = project_load_policies(policies, mapping)
+        projected = {**config, "load_eviction_policies": local_policies}
+        _normalize_mma_dag_owned_fields(config_spec, projected)
+        canonical = cast("list[str]", projected["load_eviction_policies"])
+        policies = list(policies)
+        for global_slot in config_spec.cute_mma_dag_phase_load_slots:
+            policies[global_slot] = ""
+        config["load_eviction_policies"] = scatter_load_policies(
+            canonical, mapping, policies
+        )
+        config[MMA_DAG_LOADS_KEY] = projected[MMA_DAG_LOADS_KEY]
+
+
+def _normalize_mma_dag_owned_fields(
+    config_spec: ConfigSpec, config: dict[str, object]
+) -> None:
+    """Pin layout knobs only for a launch whose body MMA-DAG replaces."""
+    facts = config_spec.cute_mma_dag_facts
+    assert facts is not None
     if "loop_orders" in config:
         config["loop_orders"] = [
             item._fill_missing() for item in config_spec.loop_orders
@@ -856,8 +1123,8 @@ def _normalize_cute_mma_dag(
             config[key] = [default for _ in value]
     # The warp mode's staged tiles carry the L2 policy of their slot
     # (``MMA_DAG_L2_HINTS``) on their cp.async packets, one canonical
-    # value per packet form; every other slot (the side loads, every load
-    # of the tensor-memory mode) is inert.  The hinted packets exist only
+    # value per packet form; other slots are inert, except the explicit
+    # attention schedule's TMA raw/scale loads handled below. Hinted packets exist only
     # where the launcher can verify their assembly
     # (``hinted_cp_async_available``): elsewhere every slot pins to "".
     policies = config.get("load_eviction_policies")
@@ -867,6 +1134,15 @@ def _normalize_cute_mma_dag(
             if config[MMA_DAG_KEY] == MMA_DAG_WARP and hinted_cp_async_available()
             else set()
         )
+        if (
+            config.get(MMA_DAG_PASS_WARPS_KEY) in MMA_DAG_ATTENTION_PASS_WARPS
+            and facts.attention is not None
+        ):
+            # This schedule issues TMA directly; only its original raw/scale
+            # load slots consume cache hints. Phase projection stays local.
+            staged = {
+                slot for slot in facts.attention.tma_load_slots if slot is not None
+            }
         canonical = [
             MMA_DAG_L2_CANONICAL.get(
                 MMA_DAG_L2_HINTS.get(policy, "") if isinstance(policy, str) else "",

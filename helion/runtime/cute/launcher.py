@@ -13,6 +13,7 @@ from collections import OrderedDict
 import ctypes
 from dataclasses import dataclass
 from dataclasses import field
+import hashlib
 import importlib
 import linecache
 import logging
@@ -82,6 +83,7 @@ from .arg_signature import (
     schema_with_pointer_alignment as _cute_schema_with_pointer_alignment,
 )
 from .arg_signature import validate_launcher_tensor as _validate_cute_launcher_tensor
+from .capture_pdl_launch import prepare_capture_launch
 from .compile_cache import CompiledCuteLauncher as _CompiledCuteLauncher
 from .compile_cache import disk_cache_key as _cute_disk_cache_key
 from .compile_cache import function_globals
@@ -435,19 +437,6 @@ def _create_cute_wrapper(
     cluster_shape = _cute_cluster_shape(cute_kernel, wrapper_plans)
     if cluster_shape is not None:
         launch_suffix += f", cluster={list(cluster_shape)!r}"
-    preferred_smem_carveout = getattr(
-        cast("Any", cute_kernel), "_helion_cute_preferred_smem_carveout", None
-    )
-    if preferred_smem_carveout is not None:
-        if (
-            type(preferred_smem_carveout) is not int
-            or not 0 <= preferred_smem_carveout <= 100
-        ):
-            raise ValueError(
-                "invalid _helion_cute_preferred_smem_carveout: "
-                f"{preferred_smem_carveout!r}"
-            )
-        launch_suffix += f", preferred_smem_carveout={preferred_smem_carveout}"
     # G2-H (cute_plan.md, see plan: G2-H CLC): CLC kernels need PDL
     # enabled at the host launch so ``nvvm.clusterlaunchcontrol_try_cancel``
     # returns valid responses. ``use_pdl`` is set on the per-matmul
@@ -528,7 +517,17 @@ def _create_cute_wrapper(
     except BaseException:
         linecache.cache.pop(filename, None)
         raise
-    return namespace[func_name]
+    jit_func = namespace[func_name]
+    # The SDK's default mangler includes runtime values such as "1e+16",
+    # which are not valid in its unquoted TVM FFI symbols. Generic Pointer
+    # annotations omit dtype and alignment, so include the full schema along
+    # with the source's kernel identity and launch geometry.
+    symbol_key = repr((source, schema_key)).encode()
+    jit_func.set_name_prefix(
+        f"_helion_cute_launch_{hashlib.sha256(symbol_key).hexdigest()}",
+        keep_mangled_name=False,
+    )
+    return jit_func
 
 
 _CUTE_NUM_SM_CACHE: dict[tuple[str, int | None], int] = {}
@@ -3707,6 +3706,19 @@ def _set_cute_last_launch_cache_entry(
 
 
 def default_cute_launcher(
+    cute_kernel: object,
+    grid: tuple[int, ...],
+    *args: object,
+    **kwargs: object,
+) -> object:
+    pending = prepare_capture_launch(cute_kernel, args, grid)
+    result = _default_cute_launcher_untracked(cute_kernel, grid, *args, **kwargs)
+    if pending is not None:
+        pending.finish()
+    return result
+
+
+def _default_cute_launcher_untracked(
     cute_kernel: object,
     grid: tuple[int, ...],
     *args: object,

@@ -5722,7 +5722,7 @@ def _codegen_cute_store_tcgen05_tile(
         # Role-local persistent epilogues reuse the C-store pipeline across
         # scheduler-recycled work tiles. Draining it inside each tile would
         # serialize the next tile's epilogue against this tile's TMA stores.
-        # The tail must run before TMEM dealloc setup below.
+        # The lifecycle teardown places the tail against the TMEM dealloc.
         tma_store_post_loop_tail = tma_store_pipeline_tail
     if is_secondary_store:
         # The matmul drain + TMEM-free teardown is one-shot and owned by the

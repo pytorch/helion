@@ -239,14 +239,30 @@ def _collect_assigns_in_body(
 
     _walk(body, True)
 
-    def _reads(node: ast.AST, canon: str) -> int:
-        return sum(
-            1
-            for sub in ast.walk(node)
-            if isinstance(sub, ast.Name)
-            and isinstance(sub.ctx, ast.Load)
-            and _canonical(sub.id) == canon
-        )
+    read_summaries: dict[int, tuple[dict[str, int], dict[str, int]]] = {}
+
+    def _read_summary(stmts: list[ast.stmt]) -> tuple[dict[str, int], dict[str, int]]:
+        """Count reads and their first statement once per lexical body.
+
+        Testing every assignment by walking the whole body and its suffix
+        costs quadratic time for large unrolled kernels. Equal body/total
+        counts and a first read after the write prove the same dominance.
+        """
+        cached = read_summaries.get(id(stmts))
+        if cached is not None:
+            return cached
+        counts: dict[str, int] = {}
+        first: dict[str, int] = {}
+        for position, statement in enumerate(stmts):
+            for sub in ast.walk(statement):
+                if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+                    name = _canonical(sub.id)
+                    counts[name] = counts.get(name, 0) + 1
+                    first.setdefault(name, position)
+        read_summaries[id(stmts)] = counts, first
+        return counts, first
+
+    total_reads, _ = _read_summary(body)
 
     assigns_by_target: dict[str, list[ast.expr]] = {}
     for canon, entries in bindings.items():
@@ -262,9 +278,11 @@ def _collect_assigns_in_body(
         ):
             continue
         # Every read of the name must follow the write in its own list.
-        total_reads = sum(_reads(top, canon) for top in body)
-        dominated_reads = sum(_reads(later, canon) for later in stmts[idx + 1 :])
-        if total_reads != dominated_reads:
+        local_reads, first_read = _read_summary(stmts)
+        if (
+            total_reads.get(canon, 0) != local_reads.get(canon, 0)
+            or first_read.get(canon, len(stmts)) <= idx
+        ):
             continue
         assigns_by_target[canon] = [stmt.value]
     return assigns_by_target, all_written

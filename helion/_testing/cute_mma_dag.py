@@ -1,4 +1,4 @@
-"""Shared runners for the ``cute_mma_dag`` runtime tests.
+"""Shared kernels, config helpers and runners for CuTe MMA tests.
 
 ``test/test_cute_mma_dag_gpu.py`` (the warp mode) and
 ``test/test_cute_mma_dag_tcgen05_gpu.py`` (the tensor-memory mode) compile
@@ -16,10 +16,13 @@ from typing import TYPE_CHECKING
 import torch
 
 import helion
+import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Sequence
+
+    from helion.runtime.kernel import BoundKernel
 
 LAUNCHES = 2
 """Launches per cute compile whose outputs must agree bitwise: a race or an
@@ -158,3 +161,83 @@ def assert_close(
         else:
             atol = 2e-2 * max(1.0, ref.float().abs().max().item()) if scaled else 2e-2
             torch.testing.assert_close(out.float(), ref.float(), atol=atol, rtol=2e-2)
+
+
+def assert_tf32_bf16_dot(
+    left: torch.Tensor, right: torch.Tensor, *outputs: torch.Tensor
+) -> None:
+    """Check BF16 dots independently of the FP32 accumulation order.
+
+    Warp ``mma_tf32`` consumes FP32 bit patterns with the low 13 mantissa
+    bits truncated. Compute those products and their sum in FP64. A chain
+    of K FP32 accumulations has forward error at most gamma_K * sum(abs
+    products). Use one relative FP32 ulp per step, conservatively allowing
+    directed as well as nearest accumulation rounding. The BF16 rounding
+    interval of each result must intersect that reference interval; merely
+    being one BF16 ulp from another backend is not sufficient.
+    """
+    assert left.dtype == right.dtype == torch.float32
+    assert left.shape[-1] == right.shape[-2]
+    assert torch.isfinite(left).all() and torch.isfinite(right).all()
+    left64 = (left.contiguous().view(torch.int32) & -8192).view(torch.float32).double()
+    right64 = (
+        (right.contiguous().view(torch.int32) & -8192).view(torch.float32).double()
+    )
+    reference = left64 @ right64
+    magnitude = left64.abs() @ right64.abs()
+    steps = left.shape[-1]
+    relative_error = steps * torch.finfo(torch.float32).eps
+    assert relative_error < 1
+    error = relative_error / (1 - relative_error) * magnitude
+    for output in outputs:
+        assert output.dtype == torch.bfloat16 and output.shape == reference.shape
+        assert torch.isfinite(output).all()
+        previous = torch.nextafter(output, torch.full_like(output, -torch.inf))
+        following = torch.nextafter(output, torch.full_like(output, torch.inf))
+        lower = (previous.double() + output.double()) / 2
+        upper = (following.double() + output.double()) / 2
+        valid = (lower <= reference + error) & (upper >= reference - error)
+        assert valid.all(), (
+            "BF16 rounding interval misses the TF32 accumulation bound",
+            (~valid).nonzero()[:8].tolist(),
+        )
+
+
+CPU_DEVICE = "cpu"
+
+
+def _ordinary_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    m, k = a.shape
+    _, n = b.shape
+    out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+    for tile_m, tile_n in hl.tile((m, n)):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
+        out[tile_m, tile_n] = acc.to(out.dtype)
+    return out
+
+
+def bind_cpu_gemm(shape: tuple[int, int, int], dtype: torch.dtype) -> BoundKernel:
+    m, n, k = shape
+    args = (
+        torch.empty((m, k), dtype=dtype, device=CPU_DEVICE),
+        torch.empty((k, n), dtype=dtype, device=CPU_DEVICE),
+    )
+    return helion.kernel(_ordinary_gemm, backend="cute", static_shapes=True).bind(args)
+
+
+def normalize_config(
+    bound: BoundKernel, config: helion.Config, *, fix: bool
+) -> dict[str, object]:
+    """Normalize a detached config, optionally repairing invalid MMA choices."""
+    copied = helion.Config(
+        **{k: list(v) if isinstance(v, list) else v for k, v in config.config.items()}  # pyrefly: ignore[bad-argument-type]
+    )
+    with bound.env:
+        bound.config_spec.normalize(copied, _fix_invalid=fix)
+    return copied.config
+
+
+def repaired_config(bound: BoundKernel, config: helion.Config) -> dict[str, object]:
+    return normalize_config(bound, config, fix=True)

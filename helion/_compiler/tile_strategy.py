@@ -442,6 +442,8 @@ def _live_lane_setup(
     body: list[ast.AST],
     setup: list[ast.AST],
     wrappers: dict[str, VecLaneWrapper],
+    *,
+    semantic_reads: Iterable[str] = (),
 ) -> tuple[set[str], list[ast.AST], set[str]]:
     """The names ``body`` needs, the lane setup statements defining them and
     the vec wrappers whose lane bodies received splices.
@@ -457,7 +459,10 @@ def _live_lane_setup(
     """
     from .ast_read_writes import ReadWrites
 
-    needed: set[str] = set()
+    # A reduction's owner is a semantic dependency even when its value does
+    # not read the lane coordinate (for example, sum over an expanded axis).
+    # Proved reshape aliases remain prunable by the owner resolver.
+    needed = set(semantic_reads)
     for stmt in body:
         needed |= set(ReadWrites.from_ast(stmt).reads)
     # A vec wrapper whose lane body received memory_ops splices (hoisted vec
@@ -887,7 +892,12 @@ class DeviceGridState(DeviceLoopOrGridState):
         self, body: list[ast.AST]
     ) -> tuple[set[str], list[ast.AST], set[str]]:
         return _live_lane_setup(
-            body, self.lane_setup_statements, self.vec_lane_wrappers
+            body,
+            self.lane_setup_statements,
+            self.vec_lane_wrappers,
+            semantic_reads=CompileEnvironment.current().backend.lane_loop_semantic_reads(
+                body
+            ),
         )
 
     def lane_index_definitions(self) -> tuple[list[ast.AST], frozenset[str]]:

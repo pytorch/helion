@@ -27,6 +27,7 @@ import contextlib
 import functools
 import hashlib
 from itertools import starmap
+import math
 import operator
 import os
 import re
@@ -60,6 +61,7 @@ from .analysis.specialized_mma import _kernel_specialized_mma_plan
 from .analysis.specialized_mma import _specialized_mma_root_mn_block_ids
 from .attention_plan import flash_head_dims_supported
 from .cache_policy_loads import PACKET_LOAD_HELPERS
+from .compile_options import config_compile_options
 from .direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
 from .launch_shape import LaunchShapeFlags
 from .launch_shape import check_launch_shape
@@ -77,7 +79,6 @@ from .state import new_codegen_state
 from .state import new_device_state
 from .state import new_env_state
 from .tcgen05.knobs import launch_epi_warp_groups_knob
-from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from .thread_budget import MAX_THREADS_PER_BLOCK
@@ -140,6 +141,10 @@ if TYPE_CHECKING:
 
 # Integer dtypes narrower than the Int32 the DSL gives a Python int.
 _NARROW_INTEGER_DTYPES = (torch.int8, torch.int16, torch.uint8)
+
+
+def _is_negative_zero(value: float | bool) -> bool:
+    return type(value) is float and value == 0.0 and math.copysign(1.0, value) < 0
 
 
 def validate_thread_axis_accesses(statements: Sequence[ast.AST]) -> None:
@@ -1434,6 +1439,8 @@ class CuteBackend(Backend):
     default in ``Backend``, never behind a backend-name comparison in core.
     """
 
+    _pre_inductor_squeeze = True
+
     @classmethod
     def finalist_preference(cls, config: Config, source: Callable[[], str]) -> int:
         """A kernel that renders the generic early release of its programmatic
@@ -1514,8 +1521,13 @@ class CuteBackend(Backend):
 
     def codegen_config(self, config: Config) -> Config:
         from ..compile_environment import CompileEnvironment
+        from .pdl_ops import has_explicit_pdl
         from .tcgen05_config import facts
 
+        if has_explicit_pdl():
+            # Explicit markers own the launch and release placement. Project
+            # away automatic PDL for every ordinary/specialized body renderer.
+            config = type(config).from_dict({**config.config, "cute_pdl": False})
         state = CompileEnvironment.current().config_spec._cute_tcgen05_config
         return facts.project_dense_aligned_n_codegen(
             state, facts.project_row_union_codegen(state, config)
@@ -1590,6 +1602,13 @@ class CuteBackend(Backend):
                 "tcgen05 GEMM pipeline, which this kernel did not take"
             )
         grid_multiplier = fn.cute_state.lanes.launch_grid_multiplier
+        item_group = fn.cute_state.lanes.attention_item_group
+        if item_group != 1:
+            assert item_group == 2 and grid_multiplier == 1
+            assert isinstance(grid_expr, ast.Tuple) and len(grid_expr.elts) == 1
+            grid_expr = expr_from_string(
+                f"(({{grid}}[0]) // {item_group},)", grid=grid_expr
+            )
         if grid_multiplier != 1:
             # A fused body running one CTA per (grid index, lane).
             assert isinstance(grid_expr, ast.Tuple) and len(grid_expr.elts) == 1
@@ -1632,6 +1651,13 @@ class CuteBackend(Backend):
     @property
     def requires_merged_reduction_dims(self) -> bool:
         return True
+
+    def defer_unmerged_reduction_chain(
+        self, result: torch.fx.Node, source: torch.fx.Node, dims: tuple[int, ...]
+    ) -> bool:
+        from .full_reduction_owner import defer_full_logical_reduction
+
+        return defer_full_logical_reduction(result, source, dims)
 
     @property
     def warns_fast_math_unused(self) -> bool:
@@ -1770,6 +1796,7 @@ class CuteBackend(Backend):
         from .cute_mma_dag import AXIS_LEAD
         from .cute_mma_dag import AXIS_LOOP
         from .cute_mma_dag import AXIS_ROOT
+        from .cute_mma_dag import MMA_DAG_ATTENTION_PASS_WARPS
         from .cute_mma_dag import MMA_DAG_AUX_KEY
         from .cute_mma_dag import MMA_DAG_AUX_REGISTER
         from .cute_mma_dag import MMA_DAG_CLUSTER_KEY
@@ -1780,13 +1807,19 @@ class CuteBackend(Backend):
         from .cute_mma_dag import MMA_DAG_KEY
         from .cute_mma_dag import MMA_DAG_LOOKAHEAD_KEY
         from .cute_mma_dag import MMA_DAG_LOOKAHEAD_OFF
+        from .cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
+        from .cute_mma_dag import MMA_DAG_PASS_WARPS_OFF
         from .cute_mma_dag import MMA_DAG_SPLIT_CLUSTER
         from .cute_mma_dag import MMA_DAG_SPLIT_KEY
         from .cute_mma_dag import MMA_DAG_TCGEN05
         from .cute_mma_dag import MMA_DAG_WARP
         from .cute_mma_dag import apply_mma_dag_cluster
         from .cute_mma_dag import mma_dag_config_reason
+        from .paged_attention_config import paged_attention_config_reason
+        from .pdl_ops import config_conflicts_with_explicit_pdl
 
+        if config_spec.has_explicit_pdl and config_conflicts_with_explicit_pdl(config):
+            return False
         facts = config_spec.cute_mma_dag_facts
         mode = config.config.get(MMA_DAG_KEY)
         if facts is None or mode not in (MMA_DAG_WARP, MMA_DAG_TCGEN05):
@@ -1830,6 +1863,14 @@ class CuteBackend(Backend):
             is not None
         ):
             return False
+        if (
+            config.config.get(MMA_DAG_PASS_WARPS_KEY) in MMA_DAG_ATTENTION_PASS_WARPS
+            and paged_attention_config_reason(
+                facts, sizes, config.config, before_inert_globals=True
+            )
+            is not None
+        ):
+            return False
         return (
             mma_dag_config_reason(
                 facts,
@@ -1852,14 +1893,21 @@ class CuteBackend(Backend):
                     "str",
                     config.config.get(MMA_DAG_AUX_KEY, MMA_DAG_AUX_REGISTER),
                 ),
+                pass_warps=(
+                    cast("str", config.config[MMA_DAG_PASS_WARPS_KEY])
+                    if config.config.get(MMA_DAG_PASS_WARPS_KEY)
+                    in MMA_DAG_ATTENTION_PASS_WARPS
+                    else MMA_DAG_PASS_WARPS_OFF
+                ),
             )
             is None
         )
 
     def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
         from ..aten_lowering import sort_lowering
-        from ..aten_lowering import squeeze_lowering
         from .aten_lowering import NumericExtremumLowering
+        from .static_indexing import StaticIndexLowering
+        from .static_indexing import static_tensor_index
         from .uniform_comparison import UniformComparisonLowering
         from .uniform_comparison import match_uniform_float_gt
 
@@ -1867,13 +1915,12 @@ class CuteBackend(Backend):
             # CuTe's rank/fragment sorting already breaks ties by input index.
             # Keep other backends' existing Inductor stable-sort lowering.
             return sort_lowering
-        if node.target in (torch.ops.aten.squeeze.default, torch.ops.aten.squeeze.dims):
-            # These overloads have the same logical-view semantics as squeeze.dim.
-            # Register them before Inductor turns them into a ReinterpretView;
-            # the CuTe handler uses the traced output shape, not a scalar dim.
-            return squeeze_lowering
+        if (lowering := super().pre_inductor_lowering(node)) is not None:
+            return lowering
         if node.target in (torch.ops.aten.fmin.default, torch.ops.aten.fmax.default):
             return NumericExtremumLowering()
+        if static_tensor_index(node) is not None:
+            return StaticIndexLowering()
         if match_uniform_float_gt(node) is not None:
             return UniformComparisonLowering()
         return None
@@ -1944,7 +1991,7 @@ class CuteBackend(Backend):
         # completed_matmul_sum -> device_ir -> ``from helion import Config``
         # fails while helion/__init__ is still importing.
         from ..inductor_lowering import PointwiseLowering
-        from .cute_reshape import REBOUND_CHECK_TARGETS
+        from ..rebound_dims import REBOUND_CHECK_TARGETS
         from .cute_reshape import check_pointwise_rebound_block_ids
         from .repeated_block_ids import check_repeated_block_ids
         from .view_subtile import check_view_coord_consumers
@@ -2385,7 +2432,10 @@ class CuteBackend(Backend):
         device_function.cute_state.root_plans.mma_dag_plan = plan_mma_dag(
             graphs, config
         )
-        if device_function.cute_state.root_plans.mma_dag_plan is not None:
+        mma_plan = device_function.cute_state.root_plans.mma_dag_plan
+        if mma_plan is not None:
+            if mma_plan.attention is not None and mma_plan.attention.paired_items:
+                device_function.cute_state.lanes.attention_item_group = 2
             return
         plan_single_token_rank1_recurrence(graphs, tile_strategy)
         if (
@@ -2406,6 +2456,15 @@ class CuteBackend(Backend):
         annotate_view_subtiles(graphs, config)
         annotate_literal_dims(graphs, config)
         plan_execution(graphs, tile_strategy)
+
+    def pdl_capability(self, env: CompileEnvironment) -> tuple[int, int] | None:
+        return env.config_spec.target_device_capability
+
+    def pdl_instruction(self, operation: str) -> str:
+        return {
+            "wait": "cute.arch.griddepcontrol_wait()",
+            "launch_dependents": "cute.arch.griddepcontrol_launch_dependents()",
+        }[operation]
 
     def finalize_device_body(
         self, body: list[ast.stmt], ctx: DeviceBodyContext
@@ -2434,20 +2493,29 @@ class CuteBackend(Backend):
         from .passes import launch_attributes
         from .passes import pdl
         from .passes.pipeline import run_kernel_def_passes
+        from .pdl_ops import validate_explicit_launch
 
         run_kernel_def_passes(fn_def, prefix, ctx)
         fn = ctx.device_function
         pdl.insert_spread_pad(fn, fn_def)
+        validate_explicit_launch(fn, fn_def)
         statements = launch_attributes.module_statements(fn)
         launch_attributes.project_launch_block(fn)
         return statements
 
     def tensors_proven_disjoint(
-        self, env: CompileEnvironment, left: torch.Tensor, right: torch.Tensor
+        self,
+        env: CompileEnvironment,
+        left: torch.Tensor,
+        right: torch.Tensor,
+        *,
+        allow_unbound: bool = False,
     ) -> bool:
         from ..runtime_tensor_guards import runtime_tensors_are_proven_disjoint
 
-        return runtime_tensors_are_proven_disjoint(env, left, right)
+        return runtime_tensors_are_proven_disjoint(
+            env, left, right, allow_unbound=allow_unbound
+        )
 
     def new_env_state(self) -> CuteEnvState:
         return new_env_state()
@@ -2465,8 +2533,9 @@ class CuteBackend(Backend):
 
     def kernel_generators(self) -> tuple[KernelGenerator, ...]:
         from .kernel_generators import KERNEL_GENERATORS
+        from .pdl_ops import guard_kernel_generators
 
-        return KERNEL_GENERATORS
+        return guard_kernel_generators(KERNEL_GENERATORS)
 
     def retry_policy(self) -> RetryPolicy:
         from .kernel_generators import REGENERATION
@@ -2513,8 +2582,21 @@ class CuteBackend(Backend):
         self, env: CompileEnvironment, device_ir: DeviceIR, configs: list[Config]
     ) -> list[Config]:
         from .autotune.heuristics import postprocess_seed_configs
+        from .pdl_ops import config_conflicts_with_explicit_pdl
 
-        return postprocess_seed_configs(env, device_ir, configs)
+        configs = postprocess_seed_configs(env, device_ir, configs)
+        if env.config_spec.has_explicit_pdl:
+            # Promotion precedes this hook; the no-autotuning path consumes
+            # that default without calling autotune_config_is_viable.
+            default = env.config_spec.compiler_default_config
+            if default is not None and config_conflicts_with_explicit_pdl(default):
+                env.config_spec.compiler_default_config = None
+            configs = [
+                config
+                for config in configs
+                if not config_conflicts_with_explicit_pdl(config)
+            ]
+        return configs
 
     def register_coverage_groups(
         self, env: CompileEnvironment, device_ir: DeviceIR
@@ -2709,19 +2791,11 @@ class CuteBackend(Backend):
         compile-cache entries are kept so the winner launches without
         recompiling.
         """
-        from ...runtime.config import Config
-
-        compiled_fn = bound_kernel._compile_cache.get(config)
-        if compiled_fn is None:
-            # The autotuner may return a minimized config (default values
-            # stripped); the compiled entry is keyed by the full config.
-            default = bound_kernel.config_spec.default_config()
-            # pyrefly: ignore [bad-argument-type]
-            full_config = Config(**(default.config | config.config))
-            compiled_fn = bound_kernel._compile_cache.get(full_config)
-        if compiled_fn is None:
-            return
-        kernels = self._compiled_kernels(compiled_fn, bound_kernel.kernel.name)
+        kernels = tuple(
+            kernel
+            for _, compiled_fn in bound_kernel._matching_compiled_configs(config)
+            for kernel in self._compiled_kernels(compiled_fn, bound_kernel.kernel.name)
+        )
         if not kernels:
             return
         device_index = (
@@ -3035,6 +3109,13 @@ class CuteBackend(Backend):
 
         class HelionCuteDSLOpOverrides(CuteDSLOpOverrides):
             @staticmethod
+            # pyrefly: ignore [bad-override]
+            def isnan(x: CuteDSLArg) -> CuteDSLArg:
+                # Ordered values, including infinities and signed zeros, equal
+                # themselves. Reuse the typed unordered comparison for NaNs.
+                return CuteDSLOpOverrides.ne(x, x)
+
+            @staticmethod
             def _ftz_safe_current_node() -> bool:
                 from torch._inductor.virtualized import V
 
@@ -3084,12 +3165,15 @@ class CuteBackend(Backend):
             def constant(value: bool | float, dtype: torch.dtype) -> str:
                 from ..inductor_lowering_extra import keeps_negative_nan_literal
 
-                # The DSL types a Python int as Int32, which widens 8- and
-                # 16-bit integer math so it never wraps, and takes a negative
-                # one as signed next to an unsigned value.  Eager converts the
-                # scalar to the tensor's dtype, wrapping it (x_uint8 % -7
-                # divides by 249).
-                if isinstance(value, int) and dtype in _NARROW_INTEGER_DTYPES:
+                # The DSL types a Python int as Int32, or Int64 outside that
+                # range. Eager first converts the scalar to the tensor dtype,
+                # wrapping it (x_uint8 % -7 divides by 249). Comparisons need
+                # this before promotion: int32(0) < 2**31 compares against
+                # -2**31, rather than widening both operands to Int64.
+                if isinstance(value, int) and (
+                    dtype in _NARROW_INTEGER_DTYPES
+                    or (dtype == torch.int32 and not -(2**31) <= value < 2**31)
+                ):
                     bits = torch.iinfo(dtype).bits
                     value &= (1 << bits) - 1
                     if dtype.is_signed and value >= 1 << (bits - 1):
@@ -3097,6 +3181,10 @@ class CuteBackend(Backend):
                     return CuteDSLOpOverrides._cast_expr(repr(value), dtype)
                 if keeps_negative_nan_literal(value):
                     return "-float('nan')"
+                if _is_negative_zero(value):
+                    return CuteDSLOpOverrides._cast_expr(
+                        self.scalar_literal_expr(value), dtype
+                    )
                 return CuteDSLOpOverrides.constant(value, dtype)
 
             @staticmethod
@@ -3487,6 +3575,13 @@ class CuteBackend(Backend):
                 ):
                     return x
         return super().cast_ast(x, target_dtype)
+
+    def scalar_literal_expr(self, value: float | bool) -> str:
+        if _is_negative_zero(value):
+            # SDK arith.const caches by Python equality, aliasing +/-0. Emit
+            # the sign bit as an integer so no negative float enters that cache.
+            return "cutlass.Int32(-2147483648).bitcast(cutlass.Float32)"
+        return super().scalar_literal_expr(value)
 
     def scalar_float_operand_ast(
         self, x: ast.AST, value: torch.SymFloat, *, computes_in_float64: bool
@@ -3992,7 +4087,6 @@ class CuteBackend(Backend):
                 else None
             )
             launcher_args = [block_arg]
-            compile_options: list[str] = []
             # One --ptxas-options flag carries them all (a second would
             # replace the first).
             ptxas_options: list[str] = []
@@ -4019,14 +4113,6 @@ class CuteBackend(Backend):
                 "split_alias_cpc"
             ):
                 ptxas_options.append("--override-directive-values --maxrregcount=48")
-            if config.advanced_controls_file:
-                ptxas_options.append(
-                    f"--apply-controls {config.advanced_controls_file}"
-                )
-            if ptxas_options:
-                compile_options.append(f"--ptxas-options='{' '.join(ptxas_options)}'")
-            if config.get(TCGEN05_CUBIN_LINEINFO_CONFIG_KEY) is True:
-                compile_options.append("--generate-line-info")
             # ``--enable-tvm-ffi`` is emitted in codegen only when the
             # autotune flag is True so the generated code reflects which
             # configs deliberately requested FFI. The runtime
@@ -4046,11 +4132,11 @@ class CuteBackend(Backend):
                         f"{TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY}=True requires "
                         "tcgen05 CuTe lowering",
                     )
-                compile_options.append("--enable-tvm-ffi")
+            compile_options = config_compile_options(
+                config, ptxas_options=ptxas_options
+            )
             if compile_options:
-                launcher_args.append(
-                    f"cute_compile_options={' '.join(compile_options)!r}"
-                )
+                launcher_args.append(f"cute_compile_options={compile_options!r}")
             return launcher_args
 
         # A whole-root plan that owns the body owns its launch (the
@@ -4705,7 +4791,19 @@ class CuteBackend(Backend):
     def tile_begin_expr(self, codegen: GenerateAST, block_idx: int) -> str | None:
         from .tile_ops import cute_tile_begin_expr
 
-        return cute_tile_begin_expr(codegen, block_idx)
+        result = cute_tile_begin_expr(codegen, block_idx)
+        plan = codegen.device_function.cute_state.root_plans.mma_dag_plan
+        item_group = codegen.device_function.cute_state.lanes.attention_item_group
+        if (
+            plan is not None
+            and plan.attention is not None
+            and item_group != 1
+            and block_idx == plan.program.lead_axes[0].block_id
+        ):
+            # All origins (tile.id/begin and uniform FX/SymInt expressions)
+            # see the first original item owned by this paired grid index.
+            return f"({result} * {item_group})"
+        return result
 
     def rewrite_lowered_root(
         self, codegen: GenerateAST, grid_state: DeviceGridState, body: list[ast.AST]
@@ -4829,7 +4927,11 @@ class CuteBackend(Backend):
             # dependent fill kernels ahead of this (``cute_pdl``)
             # kernel instead of memset nodes.
             statements, fill_kernels = lower_host_zero_fill_launches(
-                host, statements, env=env, kernel_name=fn.name
+                host,
+                statements,
+                env=env,
+                kernel_name=fn.name,
+                compile_options=config_compile_options(fn.config),
             )
         return statements, [*metadata, *fill_kernels]
 
@@ -4870,6 +4972,13 @@ class CuteBackend(Backend):
 
     def roots_fissioned(self, env: CompileEnvironment) -> bool:
         return cute_env_state(env).fission_plan is not None
+
+    def lower_dependency_phases_as_ordered_launches(
+        self, host: HostFunction, ir: DeviceIR
+    ) -> bool:
+        from .dependent_phases import confirm_dependency_phases
+
+        return confirm_dependency_phases(host, ir)
 
     def split_persistent_post_loop(
         self, fn: DeviceFunction, body: list[ast.AST]
@@ -4985,6 +5094,11 @@ class CuteBackend(Backend):
         from .lane_cluster_split import apply_cluster_split
 
         apply_cluster_split(strategy, CompileEnvironment.current(), state)
+
+    def lane_loop_semantic_reads(self, body: list[ast.AST]) -> set[str]:
+        from .lane_loops.markers import required_lane_reduce_owners
+
+        return required_lane_reduce_owners(body)
 
     def check_lane_loop_nest(self, state: DeviceLoopState) -> None:
         from .lane_loops.nest_check import check_lane_loop_nest

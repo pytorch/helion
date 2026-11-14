@@ -1148,12 +1148,14 @@ def _(
 
     # Convert all arguments to SequenceType
     sequences = []
+    contents_exact = True
     for arg in args:
         if not isinstance(arg, SequenceType):
             raise exc.TypeInferenceError(
                 f"zip() argument must be a sequence, got {arg}"
             )
         sequences.append(arg.unpack())
+        contents_exact &= arg.contents_exact
 
     # Check all sequences have the same length
     length = 0
@@ -1173,7 +1175,7 @@ def _(
         tuple_type = SequenceType(GetItemOrigin(origin, i), tuple_elements)
         result_elements.append(tuple_type)
 
-    return SequenceType(origin, tuple(result_elements))
+    return SequenceType(origin, tuple(result_elements), contents_exact=contents_exact)
 
 
 @_decorators.register_to_device_ir(_zip_replacement)
@@ -1252,7 +1254,9 @@ def _(
         tuple_type = SequenceType(GetItemOrigin(origin, i), tuple_elements)
         result_elements.append(tuple_type)
 
-    return SequenceType(origin, tuple(result_elements))
+    return SequenceType(
+        origin, tuple(result_elements), contents_exact=iterable.contents_exact
+    )
 
 
 @_decorators.register_to_device_ir(_enumerate_replacement)

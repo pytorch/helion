@@ -338,6 +338,14 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
    Enable automatic native-source optimization after configuration search with ``HELION_AUTOTUNE_HANDOFF=1``. Off by default. Uses the existing search budget or search completion, then runs one continuous Codex session and saves standalone kernels beside the autotune logs. Each candidate submission records a round.
 
+   Standalone handoff input files reject Python callbacks in the supported
+   argument tree, including declared record fields, on both save and load.
+   This also rejects older files that pickled callbacks by name: replay cannot
+   preserve their captured tensors and alignment. Pass tensor and scalar
+   operands explicitly. Tensor-only files retain their existing alias and
+   alignment behavior. This restriction does not apply to the autotuner's
+   benchmark subprocess callback transport.
+
 .. autoattribute:: Settings.autotune_handoff_budget_seconds
 
    Time budget for native-source rounds, excluding search and export. Defaults to 1500 seconds. Controlled by ``HELION_AUTOTUNE_HANDOFF_BUDGET_SECONDS``.
@@ -463,6 +471,46 @@ See :class:`helion.autotuner.LocalAutotuneCache` for details on cache keys and b
    Override the callable that constructs autotuner instances. Accepts the same signature as :func:`helion.runtime.settings.default_autotuner_fn`.
    Pass a replacement callable via ``@helion.kernel(..., autotuner_fn=...)`` or ``helion.kernel(autotuner_fn=...)`` at definition time.
 
+.. autoattribute:: Settings.autotune_benchmark_input_banks
+
+   Number of independent argument banks per benchmark graph cycle (default ``1``).
+   Set ``HELION_AUTOTUNE_BENCHMARK_INPUT_BANKS`` or pass the setting to
+   ``@helion.kernel``. Values above one require the built-in isolated CUDA
+   benchmark provider, ``HELION_BENCHMARK_CUDAGRAPH=1``, and a ``replay`` or
+   ``off`` L2 regime for search and final selection. The final target must match
+   the final regime explicitly: ``HELION_AUTOTUNE_TARGET_REGIME=replay`` for
+   replay, or ``HELION_AUTOTUNE_TARGET_REGIME=0`` for off. To select resident
+   timing throughout, also set ``HELION_AUTOTUNE_L2_FLUSH=0`` and
+   ``HELION_AUTOTUNE_FINAL_L2_FLUSH=0``. Custom benchmark callbacks and
+   ``autotune_multi`` and autotune handoff are unsupported with multiple banks.
+
+   Each bank preserves tensor values, shapes, strides, storage offsets and
+   aliases while using independent storage. Setup and cloning happen before
+   timing. Replay captures one cold bank cycle; off captures an untimed full
+   bank cycle followed by a timed full cycle. Results are reported per kernel
+   call. The usual graph memory budget includes the cloned input storages and
+   retained outputs of every captured cycle (both cycles in off mode);
+   an unaffordable bank count fails rather than changing the requested count.
+   The bank count changes the autotune cache identity, not the kernel config.
+   Resident searches also distinguish their search and final L2 regimes.
+   The ``input_clone.v6`` clone-semantics key invalidates earlier loose,
+   remote and AOT autotune cache entries on every backend, including default
+   one-bank replay searches and searches with custom accuracy callbacks. This
+   version detects callback-only tensor mutations and isolates their candidate
+   copies while preserving shared closure cells across callbacks, including
+   serialization to the benchmark worker. The parent and worker must use
+   matching Helion versions. Saved ``Config`` values still load unchanged;
+   autotune caches may need retuning and AOT data may need regeneration.
+   GPU event nodes time
+   exactly one complete cycle inside the graph. Replay's L2 flush or off's
+   untimed primer precedes the start event; host submission time is excluded.
+   Failed captures cannot substitute another timing mode.
+   Final verification uses the isolated worker even on backends whose default
+   policy interleaves finalists. Mirrored refinement preserves forward/reverse
+   sample ordering while measuring complete bank cycles in that worker.
+   Long kernels still execute complete warmup, capture and timed cycles; the
+   single-call early-probe shortcut does not apply to this explicit graph mode.
+
 .. autoattribute:: Settings.autotune_benchmark_fn
 
    Custom benchmark function for rebenchmarking during autotuning. Should have the signature
@@ -502,6 +550,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_CUTE_PROMOTE_HALF_ATOMIC_OUTPUTS`` | ``cute_promote_half_atomic_outputs`` | Set to ``1`` to accumulate a fresh float16 ``hl.atomic_add`` output in float32 and cast once on return (more accurate, one extra kernel per call, differs from the Triton backend). Default ``0``: add into the float16 storage with native packed half reductions. |
 | ``HELION_AUTOTUNE_RANDOM_SEED`` | ``autotune_random_seed`` | Seed used for randomized autotuning searches. |
 | ``HELION_AUTOTUNE_MAX_GENERATIONS`` | ``autotune_max_generations`` | Upper bound on generations for Pattern Search and Differential Evolution. |
+| ``HELION_AUTOTUNE_BENCHMARK_INPUT_BANKS`` | ``autotune_benchmark_input_banks`` | Independent argument banks per benchmark graph cycle (default ``1``). Multiple banks require the built-in isolated CUDA provider and matching replay/off search and final timing regimes; reported latency is per kernel call. |
 | ``HELION_AUTOTUNE_BUDGET_SECONDS`` | ``autotune_budget_seconds`` | Wall-clock budget for an autotune run. |
 | ``HELION_AUTOTUNE_HANDOFF`` | ``autotune_handoff`` | Automatically hand configuration search to a native-source agent (default off). |
 | ``HELION_AUTOTUNE_HANDOFF_BUDGET_SECONDS`` | ``autotune_handoff_budget_seconds`` | Native-source session budget in seconds (default 1500). |

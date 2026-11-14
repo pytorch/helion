@@ -146,6 +146,7 @@ from ..config_keys import CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY
 from ..config_keys import _cute_chunk_recurrence_config_is_safe
 from ..flash_surface import cute_flash_gated_seed_configs
 from ..flash_surface import cute_flash_seed_configs
+from ..flash_surface import pdl_searched
 from ..search_surface import enable_cute_affine_scan_search
 from ..search_surface import enable_cute_async_load_pipeline
 from ..search_surface import enable_cute_bf16x2_recurrence
@@ -855,7 +856,7 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
 
     name = "cute_reduction_tile"
     backend = "cute"
-    priority = 28
+    priority = 29
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
@@ -1235,7 +1236,7 @@ class CuteRegisterTileHeuristic(AutotunerHeuristic):
 
     name = "cute_register_tile"
     backend = "cute"
-    priority = 29
+    priority = 30
     promote_seed_to_default = True
     VECTOR_THREADS = 8
 
@@ -1610,7 +1611,7 @@ class CutePersistentSubwarpRowsHeuristic(AutotunerHeuristic):
 
     name = "cute_persistent_subwarp_rows"
     backend = "cute"
-    priority = 33
+    priority = 34
     CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
     FULL_ROW_BLOCK_SIZE = 128
     RECURRENT_STYLE_REDUCTION_SIZE = 128
@@ -1927,7 +1928,7 @@ class CuteAsyncPersistentSubwarpRowsHeuristic(AutotunerHeuristic):
 
     name = "cute_async_persistent_subwarp_rows"
     backend = "cute"
-    priority = 34
+    priority = 35
     CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
 
     @classmethod
@@ -2100,7 +2101,7 @@ class CuteTileVecHeuristic(AutotunerHeuristic):
 
     name = "cute_tile_vec"
     backend = "cute"
-    priority = 39
+    priority = 40
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
@@ -2159,7 +2160,7 @@ class CuteScanTileHeuristic(AutotunerHeuristic):
 
     name = "cute_scan_tile"
     backend = "cute"
-    priority = 38
+    priority = 39
     SCAN_ROWS = 16
     ALTERNATE_SCAN_ROWS = 32
     # Column strips per CTA (one warp of 16-byte strips).
@@ -2384,7 +2385,7 @@ class CuteTileVecWarpReduceHeuristic(AutotunerHeuristic):
 
     name = "cute_tile_vec_warp_reduce"
     backend = "cute"
-    priority = 40
+    priority = 41
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
@@ -3136,7 +3137,7 @@ class CuteSiblingRowHeuristic(AutotunerHeuristic):
 
     name = "cute_sibling_row"
     backend = "cute"
-    priority = 46
+    priority = 47
     CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
 
     @classmethod
@@ -3336,12 +3337,7 @@ def _dependent_launch(spec: ConfigSpec) -> dict[str, bool]:
     idle (vanilla linear attention forward: 7.45 us per call packed, 4.1
     spread); a tie in isolation, it is searched and preferred among ties.
     """
-    capability = spec.target_device_capability
-    if (
-        spec.supports_config_key("cute_pdl")
-        and capability is not None
-        and capability >= (9, 0)
-    ):
+    if pdl_searched(spec):
         return {"cute_pdl": True, CUTE_PDL_SPREAD_KEY: True}
     return {}
 
@@ -3373,7 +3369,7 @@ class CuteNestedRowHeuristic(AutotunerHeuristic):
 
     name = "cute_nested_row"
     backend = "cute"
-    priority = 47
+    priority = 48
     CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
     promote_seed_to_default = True
 
@@ -3639,7 +3635,7 @@ class CuteResidentRowHeuristic(AutotunerHeuristic):
 
     name = "cute_resident_row"
     backend = "cute"
-    priority = 48
+    priority = 49
 
     @classmethod
     def _plan(
@@ -3745,7 +3741,7 @@ class CuteResidentRowWideClusterHeuristic(AutotunerHeuristic):
 
     name = "cute_resident_row_wide_cluster"
     backend = "cute"
-    priority = 49
+    priority = 50
 
     @classmethod
     def _plan(
@@ -3822,7 +3818,7 @@ class CuteResidentMultiRowHeuristic(AutotunerHeuristic):
 
     name = "cute_resident_multi_row"
     backend = "cute"
-    priority = 50
+    priority = 51
 
     _ROWS_PER_CTA = 4
     _THREADS_PER_ROW = 32
@@ -3921,7 +3917,7 @@ class CuteTileVecWarpPerRowHeuristic(AutotunerHeuristic):
 
     name = "cute_tile_vec_warp_per_row"
     backend = "cute"
-    priority = 41
+    priority = 42
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
@@ -3985,7 +3981,7 @@ class CuteColumnReductionHeuristic(AutotunerHeuristic):
 
     name = "cute_column_reduction"
     backend = "cute"
-    priority = 45
+    priority = 46
     # Vector loads over a dynamic extent need the exact input metadata: the
     # extent and the row strides must be proven multiples of the vector width.
     CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
@@ -4240,7 +4236,7 @@ class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
 
     name = "cute_reduction_wide_chunk"
     backend = "cute"
-    priority = 30
+    priority = 31
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
@@ -4290,7 +4286,7 @@ class CuteRolledRowLadderHeuristic(AutotunerHeuristic):
 
     name = "cute_rolled_row_ladder"
     backend = "cute"
-    priority = 35
+    priority = 36
     MAX_CHUNK = 65536
 
     @classmethod
@@ -4362,7 +4358,7 @@ class CuteRolledClusterLadderHeuristic(AutotunerHeuristic):
 
     name = "cute_rolled_cluster_ladder"
     backend = "cute"
-    priority = 36
+    priority = 37
 
     _SLICE_TARGET = 16384
     _MAX_CLUSTER = 16
@@ -4499,7 +4495,7 @@ class CuteMaskedRolledClusterHeuristic(AutotunerHeuristic):
 
     name = "cute_masked_rolled_cluster"
     backend = "cute"
-    priority = 37
+    priority = 38
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
@@ -5822,7 +5818,7 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
 
     name = "cute_tcgen05_grouped_worklist"
     backend = "cute"
-    priority = 24
+    priority = 25
     promote_seed_to_default = True
     PROMOTE_TARGETS = (("cuda", "sm100"), ("cuda", "sm103"))
     CACHE_NAMED_TARGETS = _TCGEN05_GROUPED_TARGET_IDENTITIES
@@ -6481,7 +6477,7 @@ class CuteTcgen05GroupedSource64Heuristic(AutotunerHeuristic):
 
     name = "cute_tcgen05_grouped_source64"
     backend = "cute"
-    priority = 56
+    priority = 57
     CACHE_SPECIALIZATION_FACTS = frozenset({"config_num_sm", "input_tensor_metadata"})
 
     @classmethod
@@ -6507,7 +6503,7 @@ class CuteTcgen05GroupedStaticCommonKHeuristic(AutotunerHeuristic):
 
     name = "cute_tcgen05_grouped_static_common_k"
     backend = "cute"
-    priority = 25
+    priority = 26
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
@@ -6559,7 +6555,7 @@ class CuteTcgen05GroupedDynamicBk64Heuristic(AutotunerHeuristic):
 
     name = "cute_tcgen05_grouped_dynamic_bk64"
     backend = "cute"
-    priority = 26
+    priority = 27
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
@@ -7318,7 +7314,7 @@ class CuteTcgen05ThreadLocalEpilogueHeuristic(AutotunerHeuristic):
 
     name = "cute_tcgen05_thread_local_epilogue"
     backend = "cute"
-    priority = 27
+    priority = 28
     promote_seed_to_default = True
 
     @classmethod
@@ -7782,7 +7778,7 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
 
     name = "cute_pointwise_vec"
     backend = "cute"
-    priority = 51
+    priority = 52
 
     NT = 256  # threads per CTA
     UNROLL = 2  # vectors per thread (outer lane iters)

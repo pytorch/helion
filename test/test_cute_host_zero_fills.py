@@ -8,21 +8,23 @@ import pytest
 import torch
 
 import helion
+from helion._testing import cpu_render_target
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner import PowerOfTwoFragment
 import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
-pytestmark = skipUnlessBackends("cute")
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends("cute")]
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _cpu_only() -> Iterator[None]:
-    with mock_cuda_unavailable():
+    with cpu_render_target(
+        fake_device_sm_count=148, reduction_smem_budget_bytes=232448
+    ):
         yield
 
 

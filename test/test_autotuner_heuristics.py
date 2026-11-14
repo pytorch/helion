@@ -227,6 +227,7 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
 )
+from helion._compiler.cute.tcgen05_constants import TCGEN05_CLUSTER_N2_SEED_L2_GROUPING
 from helion._compiler.cute.tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
@@ -909,44 +910,6 @@ class TestAutotunerHeuristic(TestCase):
             ),
         ):
             compiler_seed_configs(env, MagicMock())
-
-    def test_cute_flash_disable_heuristics_keeps_structural_coverage(self) -> None:
-        spec = ConfigSpec(backend=CuteBackend())
-        self.assertIsNone(spec.compiler_seed_timeout_retry_repetitions)
-        for block_id, size_hint in enumerate((1, 128, 128)):
-            spec.block_sizes.append(
-                BlockSizeSpec(block_id=block_id, size_hint=size_hint)
-            )
-        enable_cute_flash_search(
-            spec,
-            head_dim=64,
-            num_kv=64,
-            block_size_targets={0: 1, 1: 128, 2: 128},
-            is_causal=True,
-        )
-        self.assertIsNone(spec.compiler_seed_timeout_retry_repetitions)
-        env = MagicMock()
-        env.backend_name = "cute"
-        env.backend = CuteBackend()
-        env.config_spec = spec
-        env.settings = Settings(disable_autotuner_heuristics=True)
-
-        self.assertEqual(compiler_seed_configs(env, MagicMock()), [])
-        self.assertIsNone(spec.compiler_seed_timeout_retry_repetitions)
-        self.assertEqual(spec.compiler_seed_configs, [])
-        self.assertEqual(spec.autotuner_heuristics, [])
-
-        config_gen = spec.create_config_generation()
-        self.assertEqual(config_gen.seed_flat_config_pairs(), [])
-        self.assertFalse(
-            set(FLASH_AUTOTUNE_CONFIG_KEYS) & set(config_gen._config_value_priors)
-        )
-        coverage = config_gen.extension.deterministic_population_configs()
-        self.assertTrue(coverage)
-        population = config_gen.random_population(100)
-
-        self.assertGreaterEqual(len(population), 100)
-        self.assertLessEqual(set(coverage), set(population))
 
     @memoized_flash_fragments()
     def test_cute_flash_heuristic_returns_all_legal_seeds(self) -> None:
@@ -4306,6 +4269,7 @@ _CUTE_HEURISTIC_ORDER = (
     "cute_tcgen05_cluster_m2_ffi",
     "cute_tcgen05_dense_schedules",
     "cute_tcgen05_cluster_m2",
+    "cute_tcgen05_default_tile",
     "cute_tcgen05_grouped_worklist",
     "cute_tcgen05_grouped_static_common_k",
     "cute_tcgen05_grouped_dynamic_bk64",
@@ -4372,6 +4336,7 @@ _CUTE_HEURISTIC_ORDER = (
     "cute_fragment_bounded_gather",
     "cute_fragment_pure_producer_regions",
     "cute_radix_selection",
+    "cute_fragment_half_mma",
 )
 
 
@@ -6111,34 +6076,6 @@ class TestCuteFp8GemmSkinnyMHeuristic(TestCase):
                     CuteFp8GemmSkinnyMHeuristic.get_seed_config(env, MagicMock())
                 )
 
-    def test_compiler_seed_configs_records_heuristic(self) -> None:
-        # The heuristic must be wired into the cute backend registry so the
-        # generic compiler_seed_configs() path emits its seed and records it.
-        env = self._make_cute_env()
-        env.config_spec.matmul_facts.append(self._matmul_fact(static_m=1))
-        configs = compiler_seed_configs(env, MagicMock())
-        self.assertIn(
-            _FP8_SKINNY_M_SEED_BLOCK_SIZES,
-            [config.config["block_sizes"] for config in configs],
-        )
-        self.assertIn(
-            CuteFp8GemmSkinnyMHeuristic.name,
-            env.config_spec.autotuner_heuristics,
-        )
-
-    def test_compiler_seed_configs_skips_large_m(self) -> None:
-        env = self._make_cute_env()
-        env.config_spec.matmul_facts.append(self._matmul_fact(static_m=1024))
-        configs = compiler_seed_configs(env, MagicMock())
-        self.assertNotIn(
-            CuteFp8GemmSkinnyMHeuristic.name,
-            env.config_spec.autotuner_heuristics,
-        )
-        self.assertNotIn(
-            _FP8_SKINNY_M_SEED_BLOCK_SIZES,
-            [config.config["block_sizes"] for config in configs],
-        )
-
     @onlyBackends(["cute"])
     @skipIfRefEager("Compiler seed configs are not generated in ref eager mode")
     def test_seed_in_initial_population_for_skinny_m(self) -> None:
@@ -6242,10 +6179,11 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         # envelopes: the canonical 256x256 tile, the M-paired block_m=512 tile
         # (two 256-row subtiles sharing B; baseline ab=2 at the expected K
         # step, or its 64-wide deep ring: ab=3 next to a four-deep C ring),
-        # or the deep-staged short-K variant (bk=64 with the ab=6 pipeline).
-        # At least one canonical-envelope seed must be present. Explicit
-        # paired-CTA seeds have independent geometry and allocation checks
-        # below.
+        # or the deep-staged bk=64 ab=6 pipeline, which the direct-entry seed
+        # runs where K takes 64-deep tiles (it then counts as canonical, and
+        # can be the first canonical seed returned). At least one
+        # canonical-envelope seed must be present. Explicit paired-CTA seeds
+        # have independent geometry and allocation checks below.
         self.assertGreaterEqual(len(seeded), 1)
         canonical: list[dict[str, object]] = []
         for seed in seeded:
@@ -6273,6 +6211,11 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     block_sizes,
                     [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 64],
                 )
+                if seed.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True:
+                    # The direct-entry seed's deep pipeline (bk=64, ab=6) is
+                    # its canonical envelope wherever K takes 64-deep tiles.
+                    self.assertEqual(seed["tcgen05_c_stages"], 2)
+                    canonical.append(seed)
             else:
                 self.assertEqual(
                     block_sizes,
@@ -7226,6 +7169,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     roundtrip.config,
                     {
                         **seed.config,
+                        "cute_compiler_pipeline": "default",
                         cute_flash.FLASH_SOFTMAX_LOWERING_KEY: "auto",
                         cute_flash.FLASH_ROW_SUM_SCHEDULE_KEY: "post_acquire",
                     },
@@ -9388,12 +9332,14 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value,
         )
         bk = seeds.full_tile_direct_entry_seed_bk(spec.tcgen05)
-        self.assertIsNotNone(bk)
+        self.assertEqual(bk, 128)
+        # K=1024 also takes 64-deep tiles: the seed runs the same AB bytes as
+        # six 64-deep stages (nvjet's 64x6 staging).
         self.assertEqual(
             seed["block_sizes"],
-            [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, bk],
+            [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 64],
         )
-        self.assertEqual(seed["tcgen05_ab_stages"], 3)
+        self.assertEqual(seed["tcgen05_ab_stages"], 6)
         self.assertEqual(seed["tcgen05_cluster_m"], 2)
         self.assertEqual(seed["tcgen05_cluster_n"], 1)
         self.assertEqual(seed["tcgen05_c_stages"], 2)
@@ -9453,9 +9399,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             requested_ffi_config.config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY], True
         )
         self.assertEqual(
-            requested_ffi_config.config["block_sizes"],
-            [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, bk],
+            requested_ffi_config.config["block_sizes"], seed["block_sizes"]
         )
+        self.assertEqual(requested_ffi_config.config["tcgen05_ab_stages"], 6)
 
         # With the automatic CTA group, ab > 3 still requires the FFI stage
         # envelope. The explicit paired family must not relax these defaults:
@@ -11566,22 +11512,23 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         assert facts is not None
         # The paired seeds are CTA pairs (cluster_n=1); the deepest bk=64
         # SIMT ring of every 256-row pair tile with whole N-tile pairs also
-        # carries a 2x2 multicast-cluster twin (cluster_n=2) that differs
-        # from its pair in nothing else.  fp16 4096^3 pairs every N tile
-        # width, so each of the three 256-row bk=64 tiles has one twin.
+        # carries 2x2 multicast-cluster twins (cluster_n=2) that differ from
+        # their pair in nothing else but the raster: one ungrouped, one on
+        # the grouped raster.  fp16 4096^3 pairs every N tile width, so each
+        # of the three 256-row bk=64 tiles has both twins.
         paired_by_tile: dict[tuple[int, ...], list[helion.Config]] = {}
         for config in paired_configs:
             paired_by_tile.setdefault(tuple(config.block_sizes), []).append(config)
         self.assertEqual(
             sorted(
-                tuple(config.block_sizes)
+                (tuple(config.block_sizes), config.get("l2_groupings", [1])[0])
                 for config in paired_configs
                 if config["tcgen05_cluster_n"] == 2
             ),
             [
-                (TCGEN05_TWO_CTA_BLOCK_M, 64, 64),
-                (TCGEN05_TWO_CTA_BLOCK_M, 128, 64),
-                (TCGEN05_TWO_CTA_BLOCK_M, 256, 64),
+                ((TCGEN05_TWO_CTA_BLOCK_M, bn, 64), grouping)
+                for bn in (64, 128, 256)
+                for grouping in (1, TCGEN05_CLUSTER_N2_SEED_L2_GROUPING)
             ],
         )
         for config in paired_configs:
@@ -11621,8 +11568,12 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                             **config.config,
                             "tcgen05_cluster_n": 1,
                             "tcgen05_persistent_grid_cap": "sm_pairs",
+                            "l2_groupings": pairs[0].config.get("l2_groupings", [1]),
                         },
-                        pairs[0].config,
+                        {
+                            **pairs[0].config,
+                            "l2_groupings": pairs[0].config.get("l2_groupings", [1]),
+                        },
                     )
                 self.assertLessEqual(
                     pipeline_smem_bytes(

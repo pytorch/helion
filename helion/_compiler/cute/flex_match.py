@@ -41,9 +41,9 @@ import torch
 import torch.fx
 from torch.utils._sympy.functions import FloorDiv
 
+from ..utils import is_full_slice
 from .analysis.match_common import host_tensor_name as _host_tensor_name
 from .analysis.match_common import is_call as _is_call
-from .analysis.match_common import is_full_slice as _is_full_slice
 from .analysis.match_common import is_neg_inf
 from .analysis.match_common import scalar_value
 from .analysis.match_common import strip_new_var as _strip_new_var
@@ -344,7 +344,7 @@ def _is_identity_view(node: object) -> bool:
     assert isinstance(node, torch.fx.Node)
     indices = node.args[1] if len(node.args) > 1 else None
     return isinstance(indices, (list, tuple)) and all(
-        index is None or _is_full_slice(index) for index in indices
+        index is None or is_full_slice(index) for index in indices
     )
 
 
@@ -1327,7 +1327,7 @@ def _match_inner_body(ctx: _Ctx, inner: _InnerLoop) -> _Body | None:
         or not ctx.unit_axis_index(q_indices[0], ctx.b_id)
         or not ctx.unit_axis_index(q_indices[1], ctx.h_id)
         or ctx.block_symnode_id(q_indices[2]) != ctx.m_id
-        or not _is_full_slice(q_indices[3])
+        or not is_full_slice(q_indices[3])
     ):
         ctx.decline("flex: the Q load is not query[b, h, tile_m, :]")
         return None
@@ -1502,7 +1502,7 @@ def _kv_load_facts(ctx: _Ctx, load: object) -> tuple[str, torch.Tensor, int] | N
         return None
     if ctx.kv_id is None or ctx.block_symnode_id(indices[2]) != ctx.kv_id:
         return None
-    if not _is_full_slice(indices[3]):
+    if not is_full_slice(indices[3]):
         return None
     return name, value, head.div
 
@@ -2643,7 +2643,7 @@ def _match_epilogue(
             return None
         stored = _strip_identity(value)
         if host.ndim == 4:
-            if len(indices) != 4 or not _is_full_slice(indices[3]):
+            if len(indices) != 4 or not is_full_slice(indices[3]):
                 ctx.decline("flex: the O store needs a trailing full slice")
                 return None
             if _is_call(stored, _prims.convert_element_type.default):

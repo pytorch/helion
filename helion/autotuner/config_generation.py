@@ -17,6 +17,11 @@ from typing import cast
 from .._compat import warps_to_threads
 from ..exc import AutotuneError
 from ..exc import InvalidConfig
+from ..runtime.config import Config
+from ..runtime.config import _config_key
+from ..runtime.config import _config_value_key
+from ..runtime.config import _copy_config_structure
+from ..runtime.config_cache import ConfigSet
 from .block_id_sequence import BlockIdSequence
 from .compiler_coverage import same_value
 from .config_fragment import Category
@@ -29,9 +34,9 @@ from helion._dist_utils import sync_seed
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+    from collections.abc import MutableSet
     from collections.abc import Sequence
 
-    from .. import Config
     from . import ConfigSpec
     from .config_priors import ValuePrior
     from .search_surface import ConfigGenerationExtension
@@ -41,7 +46,11 @@ FlatConfig = list[object]
 
 @dataclasses.dataclass(frozen=True)
 class CoordinateNeighborProjection:
-    """One deterministic raw coordinate change and its normalized result."""
+    """One coordinate change, its request with prerequisites, and normalized result.
+
+    The request retains the originating generation's layout even when the result
+    is later recanonicalized against another search surface.
+    """
 
     flat_index: int
     key: str
@@ -51,9 +60,11 @@ class CoordinateNeighborProjection:
     outcome: Literal["candidate", "incumbent_alias", "candidate_alias", "invalid"]
     flat_values: FlatConfig | None
     config: Config | None
+    requested_flat_values: FlatConfig
 
 
 TRITON_MAX_TENSOR_NUMEL = 1048576
+_MAX_COORDINATE_VALUES = 10_000
 
 
 def _value_or(value: object, fallback: Callable[[], object]) -> object:
@@ -177,6 +188,29 @@ class ConfigGeneration:
             self._flash_pipeline_family_override
         )
 
+    def _copy_field_view(
+        self, fields: Mapping[str, BlockIdSequence[Any] | ConfigSpecFragment]
+    ) -> dict[str, BlockIdSequence[Any] | ConfigSpecFragment]:
+        # Own mutable field metadata, but copy enum payloads by the same rule
+        # as configs. In particular, never invoke an opaque value's copy hook
+        # or replace the owner used by its exact config identity.
+        memo: dict[int, object] = {}
+        pending = list(self.flat_spec)
+        while pending:
+            field = pending.pop()
+            if isinstance(field, ListOf):
+                pending.append(field.inner)
+            elif isinstance(field, EnumFragment):
+                for values in (
+                    field.choices,
+                    field.search_choices or (),
+                    field.coverage_choices or (),
+                ):
+                    for value in values:
+                        if id(value) not in memo:
+                            memo[id(value)] = _copy_config_structure(value)
+        return copy.deepcopy(dict(fields), memo)
+
     def initial_population_view(self) -> ConfigGeneration:
         """Own a full-layout view whose random draws use only old coordinates."""
         if not self.config_spec.compiler_coverage_groups:
@@ -184,12 +218,12 @@ class ConfigGeneration:
         self.config_spec.validate_compiler_coverage_groups()
         return ConfigGeneration(
             self.config_spec,
-            overrides=copy.deepcopy(self._override_values),
+            overrides=_copy_config_structure(self._override_values),
             _flash_pipeline_family_override=self._flash_pipeline_family_override,
             advanced_controls_files=copy.deepcopy(self._advanced_controls_files),
             process_group_name=self.process_group_name,
             compiler_coverage_enabled=self.compiler_coverage_enabled,
-            _field_view=MappingProxyType(copy.deepcopy(dict(self._flat_fields()))),
+            _field_view=MappingProxyType(self._copy_field_view(self._flat_fields())),
             _initial_sampling=True,
         )
 
@@ -203,7 +237,7 @@ class ConfigGeneration:
             return None
         return ConfigGeneration(
             self.config_spec,
-            overrides=copy.deepcopy(
+            overrides=_copy_config_structure(
                 {
                     key: value
                     for key, value in self._override_values.items()
@@ -214,7 +248,7 @@ class ConfigGeneration:
             advanced_controls_files=copy.deepcopy(self._advanced_controls_files),
             process_group_name=self.process_group_name,
             _field_view=MappingProxyType(
-                copy.deepcopy(
+                self._copy_field_view(
                     {key: value for key, value in fields.items() if key not in owned}
                 )
             ),
@@ -240,13 +274,13 @@ class ConfigGeneration:
             if old_sequence != is_sequence or len(old_indices) != len(indices):
                 raise ValueError("Compiler coverage changed old flat slots")
             for index, old_index in zip(indices, old_indices, strict=True):
-                result[index] = copy.deepcopy(flat[old_index])
+                result[index] = _copy_config_structure(flat[old_index])
         return result
 
     def projected_cache_flat_pair(self, flat: FlatConfig) -> tuple[FlatConfig, Config]:
         sampler = self._compiler_coverage_sampler
         assert self._initial_sampling and sampler is not None
-        old_flat = copy.deepcopy(flat)
+        old_flat = _copy_config_structure(flat)
         # Decode only with the old layout. Preserve the same raw slots the old
         # best-available builder retains after its normal unflatten call.
         sampler.unflatten(old_flat)
@@ -294,7 +328,7 @@ class ConfigGeneration:
         if not self._override_values:
             return config
         for key, value in self._override_values.items():
-            config.config[key] = copy.deepcopy(value)
+            config.config[key] = _copy_config_structure(value)
         self.config_spec.prepare_override_normalization(
             config.config,
             self._override_values,
@@ -326,19 +360,19 @@ class ConfigGeneration:
                 assert isinstance(field, BlockIdSequence)
                 encoded_values = field._encode_flat_values(self.config_spec, value)
                 for idx, encoded_value in zip(indices, encoded_values, strict=True):
-                    result[idx] = copy.deepcopy(encoded_value)
+                    result[idx] = _copy_config_structure(encoded_value)
             else:
                 assert len(indices) == 1
                 field = self.flat_spec[indices[0]]
                 if isinstance(field, ListOf) and not isinstance(value, list):
-                    value = [copy.deepcopy(value) for _ in range(field.length)]
-                result[indices[0]] = copy.deepcopy(value)
+                    value = [_copy_config_structure(value) for _ in range(field.length)]
+                result[indices[0]] = _copy_config_structure(value)
         self.extension.repair_flat_config(result)
         return result
 
     def canonicalize_flat(self, flat_values: FlatConfig) -> tuple[FlatConfig, Config]:
         """Normalize a flat config and return an owned matching flat/config pair."""
-        config = self.unflatten(copy.deepcopy(flat_values))
+        config = self.unflatten(_copy_config_structure(flat_values))
         return self.flatten(config), config
 
     def _flat_coordinate_identities(self) -> list[tuple[str, int | None]]:
@@ -367,7 +401,7 @@ class ConfigGeneration:
         )
 
     def coordinate_surface_catalog(self, *, radius: int = 1) -> dict[str, object]:
-        """Describe every deterministic pattern-neighbor row for this surface."""
+        """Describe raw coordinate moves before backend prerequisites/normalization."""
         if type(radius) is not int or radius < 1:
             raise ValueError(f"Expected positive int radius, got {radius!r}")
 
@@ -375,7 +409,7 @@ class ConfigGeneration:
         overridden = self.overridden_flat_indices
         coordinates: list[dict[str, object]] = []
         for flat_index, spec in enumerate(self.flat_spec):
-            active_values = spec.search_values(limit=10_000)
+            active_values = spec.search_values(limit=_MAX_COORDINATE_VALUES)
             if active_values is None:
                 raise AutotuneError(
                     "terminal coordinate surface is not finitely enumerable for "
@@ -418,6 +452,44 @@ class ConfigGeneration:
             "coordinates": coordinates,
         }
 
+    def conditional_neighbor(
+        self,
+        base: FlatConfig,
+        requested: FlatConfig,
+        *,
+        frozen_indices: Sequence[int] = (),
+    ) -> FlatConfig:
+        """Complete a neighbor's backend prerequisites without changing pins.
+
+        A refused transition keeps its original raw proposal, so ordinary
+        normalization still reports its alias or invalid outcome. Neither the
+        incumbent nor the caller's proposal is mutated.
+        """
+        updates = self.extension.conditional_neighbor_updates(base, requested)
+        changes = {
+            index: value
+            for index, value in updates.items()
+            if _config_value_key(requested[index]) != _config_value_key(value)
+        }
+        if not changes:
+            return requested
+        frozen = self.overridden_flat_indices | set(frozen_indices)
+        for index, value in changes.items():
+            choices = self.flat_spec[index].search_values(limit=_MAX_COORDINATE_VALUES)
+            if (
+                index in frozen
+                or choices is None
+                or not any(
+                    _config_value_key(value) == _config_value_key(choice)
+                    for choice in choices
+                )
+            ):
+                return requested
+        result = _copy_config_structure(requested)
+        for index, value in changes.items():
+            result[index] = _copy_config_structure(value)
+        return result
+
     def coordinate_neighbor_projections(
         self,
         base: FlatConfig,
@@ -426,7 +498,7 @@ class ConfigGeneration:
         limit: int | None = None,
         frozen_indices: Sequence[int] = (),
     ) -> list[CoordinateNeighborProjection]:
-        """Enumerate normalized one-coordinate pattern neighbors in order.
+        """Enumerate normalized coordinate moves with backend prerequisites.
 
         The returned order follows the flat ConfigSpec layout and each fragment's
         own deterministic ``pattern_neighbors`` order. Invalid and normalized
@@ -437,7 +509,7 @@ class ConfigGeneration:
         canonical_base, base_config = self.canonicalize_flat(base)
         flat_identities = self._flat_coordinate_identities()
 
-        seen = {base_config}
+        seen = ConfigSet([base_config])
         result: list[CoordinateNeighborProjection] = []
         overridden = self.overridden_flat_indices | set(frozen_indices)
         for flat_index, spec in enumerate(self.flat_spec):
@@ -448,8 +520,11 @@ class ConfigGeneration:
             for value in spec.pattern_neighbors(current, radius):
                 if limit is not None and len(result) >= limit:
                     return result
-                requested = copy.deepcopy(canonical_base)
-                requested[flat_index] = copy.deepcopy(value)
+                requested = _copy_config_structure(canonical_base)
+                requested[flat_index] = _copy_config_structure(value)
+                requested = self.conditional_neighbor(
+                    canonical_base, requested, frozen_indices=frozen_indices
+                )
                 try:
                     normalized_flat, config = self.canonicalize_flat(requested)
                 except InvalidConfig:
@@ -458,16 +533,17 @@ class ConfigGeneration:
                             flat_index,
                             key,
                             sequence_index,
-                            copy.deepcopy(current),
-                            copy.deepcopy(value),
+                            _copy_config_structure(current),
+                            _copy_config_structure(value),
                             "invalid",
                             None,
                             None,
+                            requested,
                         )
                     )
                     continue
 
-                if config == base_config:
+                if _config_key(config) == _config_key(base_config):
                     outcome = "incumbent_alias"
                 elif config in seen:
                     outcome = "candidate_alias"
@@ -479,11 +555,12 @@ class ConfigGeneration:
                         flat_index,
                         key,
                         sequence_index,
-                        copy.deepcopy(current),
-                        copy.deepcopy(value),
+                        _copy_config_structure(current),
+                        _copy_config_structure(value),
                         outcome,
                         normalized_flat,
                         config,
+                        requested,
                     )
                 )
         return result
@@ -501,7 +578,7 @@ class ConfigGeneration:
         identities aligned with the configs that are actually benchmarked.
         """
         _, canonical_base = self.canonicalize_flat(self.flatten(base_config))
-        seen = {canonical_base}
+        seen = ConfigSet([canonical_base])
         result: list[CoordinateNeighborProjection] = []
         for projection in projections:
             if projection.config is None:
@@ -528,7 +605,7 @@ class ConfigGeneration:
                     )
                 )
                 continue
-            if config == canonical_base:
+            if _config_key(config) == _config_key(canonical_base):
                 outcome = "incumbent_alias"
             elif config in seen:
                 outcome = "candidate_alias"
@@ -600,7 +677,9 @@ class ConfigGeneration:
 
     def strict_config_pair(self, config: Config) -> tuple[FlatConfig, Config]:
         """Validate a complete effective coverage config before repair can hide it."""
-        prepared = self._apply_overrides(copy.deepcopy(config))
+        prepared = self._apply_overrides(
+            Config.from_dict(_copy_config_structure(config.config))
+        )
         self.config_spec.normalize(prepared.config)
         for group in self.config_spec.compiler_coverage_groups:
             value = prepared.config.get(group.key, group.legacy)
@@ -609,19 +688,25 @@ class ConfigGeneration:
                     f"Invalid compiler coverage mode {group.key}={value!r}"
                 )
         flat = self.flatten(prepared)
-        strict = self._unflatten(copy.deepcopy(flat), fix_invalid=False, repair=False)
+        strict = self._unflatten(
+            _copy_config_structure(flat), fix_invalid=False, repair=False
+        )
         for key, value in prepared.config.items():
-            if key not in strict.config or strict.config[key] != value:
+            if key not in strict.config or _config_value_key(
+                strict.config[key]
+            ) != _config_value_key(value):
                 raise InvalidConfig(f"Coverage transfer changed supplied field {key!r}")
         normalized_flat, normalized = self.canonicalize_flat(flat)
-        if strict != normalized:
+        if _config_key(strict) != _config_key(normalized):
             raise InvalidConfig("Coverage transfer requires config repair")
         self.config_spec.normalize(normalized.config)
         return normalized_flat, normalized
 
     def strict_unflatten(self, flat: FlatConfig) -> Config:
         """Decode an expanded warm witness without first repairing its mode."""
-        return self._unflatten(copy.deepcopy(flat), fix_invalid=False, repair=False)
+        return self._unflatten(
+            _copy_config_structure(flat), fix_invalid=False, repair=False
+        )
 
     def block_numel(self, flat_config: FlatConfig) -> int:
         return functools.reduce(
@@ -719,7 +804,7 @@ class ConfigGeneration:
         are skipped with the same transfer policy as user-provided seed configs.
         """
         result: list[tuple[FlatConfig, Config]] = []
-        seen: set[Config] = set()
+        seen: MutableSet[Config] = ConfigSet()
         for i, config in enumerate(self.config_spec.compiler_seed_configs):
             try:
                 flat, normalized = self.canonicalize_flat(self.flatten(config))
@@ -746,7 +831,7 @@ class ConfigGeneration:
     ) -> list[tuple[FlatConfig, Config]]:
         """Return user-provided seed configs as flat and normalized configs."""
         result: list[tuple[FlatConfig, Config]] = []
-        seen: set[Config] = set()
+        seen: MutableSet[Config] = ConfigSet()
         for i, config in enumerate(user_seed_configs):
             try:
                 flat, normalized = self.canonicalize_flat(self.flatten(config))

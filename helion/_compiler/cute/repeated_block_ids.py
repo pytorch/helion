@@ -1,12 +1,9 @@
-"""Reject device tensors that bind one block id to two axes (CuTe SIMT lowering).
+"""Detect repeated block axes that require complete coordinate ownership.
 
-The CuTe scalar backend gives every block id exactly one per-thread lane
-coordinate.  A tensor whose shape carries the same block id on two axes - for
-example the ``[C, C]`` result of ``hl.dot(q[b, :, d], k[b, :, d].T)`` where both
-full slices dedup onto one reduction dim, or ``idx[:, None] >= idx[None, :]``
-over one ``hl.arange(C)`` - therefore collapses onto its diagonal and silently
-produces wrong numbers.  Until the lowering can hand a second lane coordinate
-to the repeated block, refuse such tensors loudly at codegen time.
+The scalar backend gives each block id one lane coordinate. Unexempted
+repeated axes therefore require a complete fragment owner; this guard rejects
+them if no such owner accepts the root. Explicit view coordinates, broadcasts
+and the separately proved scalar/matmul paths retain their existing behavior.
 """
 
 from __future__ import annotations
@@ -28,6 +25,7 @@ from .matmul_utils import _CUTE_RHS_VIEW_PASSTHROUGH_TARGETS
 if TYPE_CHECKING:
     from torch.fx.node import Node
 
+    from ..device_ir import GraphInfo
     from ..helper_function import CodegenInterface
 
 
@@ -74,36 +72,48 @@ def repeated_block_id(
     return None
 
 
-def check_repeated_block_ids(cg: CodegenInterface, node: Node) -> None:
-    """Raise ``BackendUnsupported`` when *node*'s value repeats a block id.
+def scalar_repeated_block_id(
+    env: CompileEnvironment,
+    node: Node,
+) -> int | None:
+    """Return a scalar-coordinate conflict after the existing exemptions.
 
-    Exempt, because they never index with the repeated lane coordinate: host
-    tensors (whole arrays whose static dims only coincide with a block size by
-    value), stack-tensor accesses and their device-pointer table loads (which
-    lower through ``_cute_stack_tensor_offset_expr``), plain loads consumed only
-    as matmul lhs/rhs operands (see ``_is_matmul_operand_load``), and the
-    proven static-M==N baddbmm carry whose N axis is folded away by
-    ``_emit_cute_matmul_n_collapse`` / ``completed_matmul_sum``.  Every other
-    repeated id is a silent diagonal collapse.
+    Host arrays, stack accesses, matmul operand loads, explicit view coordinates
+    and broadcasts do not require a second scalar lane. Callers separately
+    exempt baddbmm carries proved to be consumed only by their N sum.
     """
     # Host tensors are whole arrays, not per-thread tiles; their static dims
     # only coincide with a block size by value.
     if node.target is _host_tensor:
-        return
+        return None
     # Stack tensors address their device-pointer table and each stacked tile
     # through their own offset lowering (``_cute_stack_tensor_offset_expr``),
     # not through one lane coordinate per block id.
     if _is_stack_tensor_access(node):
-        return
+        return None
     value = node.meta.get("val")
     if not isinstance(value, torch.Tensor) or value.ndim < 2:
-        return
-    env = CompileEnvironment.current()
+        return None
     block_id = repeated_block_id(env, value, node.meta.get(CUTE_DIM_LOCAL_COORD_META))
     if block_id is None or _is_matmul_operand_load(node):
+        return None
+    return block_id
+
+
+def check_repeated_block_ids(cg: CodegenInterface, node: Node) -> None:
+    """Refuse repeated scalar coordinates when no complete owner handled them."""
+    env = CompileEnvironment.current()
+    # Keep the graph proof off the common non-repeated-node path.
+    block_id = scalar_repeated_block_id(env, node)
+    if block_id is None:
         return
-    if node in _matmul_sum_collapse_nodes(cg):
+    from ..generate_ast import GenerateAST
+
+    if isinstance(cg, GenerateAST) and node in matmul_sum_collapse_nodes(
+        env, cg.codegen_graphs
+    ):
         return
+    value = node.meta["val"]
     raise exc.BackendUnsupported(
         "cute",
         f"tile shape {list(value.shape)} binds block id {block_id} to two axes "
@@ -179,15 +189,12 @@ def _is_matmul_operand_load(node: Node) -> bool:
     return True
 
 
-def _matmul_sum_collapse_nodes(cg: CodegenInterface) -> set[Node]:
+def matmul_sum_collapse_nodes(
+    env: CompileEnvironment, graphs: list[GraphInfo]
+) -> set[Node]:
     """Every node of a proven zero-initialized baddbmm carry summed over N."""
-    from ..generate_ast import GenerateAST
-
-    if not isinstance(cg, GenerateAST):
-        return set()
-    env = CompileEnvironment.current()
     nodes: set[Node] = set()
-    for graph_info in cg.codegen_graphs:
+    for graph_info in graphs:
         for producer in graph_info.graph.nodes:
             if (
                 producer.op != "call_function"
@@ -201,7 +208,7 @@ def _matmul_sum_collapse_nodes(cg: CodegenInterface) -> set[Node]:
             if n_block_id is None:
                 continue
             path = match_matmul_sum_path(
-                cg, producer, n_block_id, env.size_hint(value.shape[-1])
+                graphs, producer, n_block_id, env.size_hint(value.shape[-1])
             )
             if path is None:
                 continue
