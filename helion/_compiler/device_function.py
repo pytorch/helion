@@ -860,6 +860,11 @@ class DeviceFunction:
     def variable_aliases(self, name: str) -> tuple[str, ...]:
         return tuple(self._variable_renames.get(name, [name]))
 
+    def variable_renames(self) -> dict[str, str]:
+        """Each merged variable name -> the name the final rename emits it as
+        (the first of its group)."""
+        return {name: aliases[0] for name, aliases in self._variable_renames.items()}
+
     @property
     def cute_state(self) -> CuteDeviceFunctionState:
         return cast("CuteDeviceFunctionState", self.backend_state)
@@ -1567,7 +1572,7 @@ class DeviceFunction:
                 decorator_list=decorators,
                 type_params=[],
             ),
-            {k: v[0] for k, v in self._variable_renames.items()},
+            self.variable_renames(),
         )
         trailing = backend.finalize_kernel_def(definition, prefix, body_context)
         if not in_body:
@@ -1756,9 +1761,7 @@ class DeviceFunction:
         Remove variables that are not used in the function body.
         """
 
-        rename_groups = {
-            name: aliases[0] for name, aliases in self._variable_renames.items()
-        }
+        rename_groups = self.variable_renames()
         rw = ReadWrites.from_list([*self.preamble, *self.body])
         while True:
             # An unchanged body reads and writes exactly what ``rw`` recorded,
@@ -1918,7 +1921,7 @@ class DeviceFunction:
             if name not in existing_module_assignments
         ]
         helpers.extend(self.helper_manager.codegen_helper_functions())
-        renames = {name: values[0] for name, values in self._variable_renames.items()}
+        renames = self.variable_renames()
         argument_by_name = {argument.name: argument for argument in self.arguments}
         decorator = CompileEnvironment.current().backend.helper_decorator
         for name, argument_names, body, noinline in self.triton_outlined_helpers:
