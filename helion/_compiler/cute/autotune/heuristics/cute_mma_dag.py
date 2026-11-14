@@ -12,6 +12,7 @@ from ...cute_mma_dag_seeds import SEED_TILES
 from ...cute_mma_dag_seeds import MmaDagSeedPlanner
 from ...cute_mma_dag_seeds import streaming_regions
 from ...cute_mma_dag_seeds import wide_epilogue_rows
+from ...phase_load_policies import scatter_load_policies
 from ..mma_dag_surface import enable_cute_mma_dag_search
 from .cute_launch_bounds import MIN_BLOCKS_KEY
 
@@ -73,9 +74,21 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
             ):
                 stack.enter_context(env)
             stack.enter_context(host_function)
-            program = match_mma_dag(device_ir.graphs)
+            graphs = device_ir.graphs
+            program = match_mma_dag(graphs)
+            phase_index = None
+            phase_owned_blocks: frozenset[int] = frozenset()
             if program is None:
-                return None
+                from ...ordered_mma_dag import project_ordered_mma_phase
+
+                phase = project_ordered_mma_phase(device_ir)
+                if phase is None:
+                    return None
+                stage, graphs, phase_index, phase_owned_blocks = phase
+                stack.enter_context(stage)
+                program = match_mma_dag(graphs)
+                if program is None:
+                    return None
             # The facts read the bound inputs' alignment (the side tiles of
             # the loops whose cp.async ring stages a tile for them:
             # ``mma_dag_ring_loops``), and seed registration precedes the
@@ -90,7 +103,45 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
                     env.snapshot_runtime_input_specialization_results(
                         env.runtime_arg_values_by_name
                     )
-                return mma_dag_facts(program)
+                # Schedule facts must see this projection, not a previous
+                # registration's phase: paired attention owns a whole root.
+                env.config_spec.cute_mma_dag_phase_index = phase_index
+                env.config_spec.cute_mma_dag_phase_owned_blocks = phase_owned_blocks
+                facts = mma_dag_facts(program)
+                env.config_spec.cute_pdl_capture_overlap_available = (
+                    len(device_ir.root_ids) == 1
+                    and facts.attention is not None
+                    and facts.attention.paired_items
+                )
+                if phase_index is not None:
+                    from .....language import memory_ops
+                    from ....device_ir_analysis import _load_needs_eviction_tunable
+
+                    loads = (
+                        node
+                        for graph in device_ir.graphs
+                        for node in graph.graph.nodes
+                        if node.op == "call_function"
+                        and node.target is memory_ops.load
+                        and _load_needs_eviction_tunable(node)
+                    )
+                    global_slots = {node: slot for slot, node in enumerate(loads)}
+                    # The matcher can merge equivalent loads into one access,
+                    # but every original site still occupies a global slot.
+                    phase_nodes = {
+                        node for graph in graphs for node in graph.graph.nodes
+                    }
+                    env.config_spec.cute_mma_dag_phase_load_slots = frozenset(
+                        slot
+                        for node, slot in global_slots.items()
+                        if node in phase_nodes
+                    )
+                    env.config_spec.cute_mma_dag_phase_eviction_map = {
+                        access.eviction_slot: global_slots[access.node]
+                        for access in program.accesses
+                        if access.eviction_slot is not None
+                    }
+                return facts
             finally:
                 env.bound_runtime_input_specialization_results = saved
 
@@ -110,11 +161,14 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
 
     @classmethod
     def should_promote(cls, env: CompileEnvironment) -> bool:
-        # A kernel another whole-root owner lowers (the gdn recurrence's
-        # tcgen05 schedule) keeps that owner's promoted default: the dag is
+        # A kernel another whole-root owner lowers (fused flash or the GDN
+        # recurrence's tcgen05 schedule) keeps that owner's default: the dag is
         # one of the search's choices there (its seeds and the
         # ``cute_mma_dag`` knob), not the autotune-off lowering.
-        if env.config_spec.cute_gdn_recurrence_stages is not None:
+        if (
+            env.config_spec.cute_gdn_recurrence_stages is not None
+            or env.config_spec.cute_flash_search_enabled
+        ):
             return False
         return super().should_promote(env)
 
@@ -127,7 +181,26 @@ class CuteMmaDagHeuristic(AutotunerHeuristic):
         if facts is None or spec.cute_mma_dag is None:
             return None
         planner = MmaDagSeedPlanner(facts, spec, occupancy_key=MIN_BLOCKS_KEY)
-        return planner.configs(planner.ranked()) or None
+        ranked = planner.ranked()
+        if spec.cute_mma_dag_phase_index is not None:
+            # Global persistence and clustered launches need a separate
+            # per-phase projection before they can participate in a bundle.
+            ranked = [
+                seed
+                for seed in ranked
+                if not seed.persistent and facts.cluster_of(seed.sizes) == 1
+            ]
+        configs = planner.configs(ranked)
+        if spec.cute_mma_dag_phase_index is not None:
+            for config in configs:
+                policies = config.config.get("load_eviction_policies")
+                if isinstance(policies, list):
+                    config.config["load_eviction_policies"] = scatter_load_policies(
+                        policies,
+                        spec.cute_mma_dag_phase_eviction_map,
+                        [""] * len(policies),
+                    )
+        return configs or None
 
     @classmethod
     def wide_epilogue_rows(

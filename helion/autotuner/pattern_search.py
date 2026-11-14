@@ -5,6 +5,7 @@ import math
 from typing import TYPE_CHECKING
 
 from .. import exc
+from ..runtime.config_cache import ConfigSet
 from .base_search import PopulationBasedSearch
 from .base_search import PopulationMember
 from .base_search import performance
@@ -13,6 +14,7 @@ from .effort_profile import PATTERN_SEARCH_DEFAULTS
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from collections.abc import MutableSet
     from collections.abc import Sequence
 
     from ..autotuner.effort_profile import AutotuneEffortProfile
@@ -198,7 +200,7 @@ class PatternSearch(PopulationBasedSearch):
         # invalid-seed handling. It performs no sampling or cache lookup.
         pairs = self.config_gen.seed_flat_config_pairs(log_func=self.log)
         self.pin_finalist_configs([config for _, config in pairs])
-        seen: set[Config] = set()
+        seen: MutableSet[Config] = ConfigSet()
         for flat in population:
             try:
                 _, config = self.config_gen.canonicalize_flat(flat)
@@ -290,7 +292,7 @@ class PatternSearch(PopulationBasedSearch):
                             config_gen.flatten(config) for config in exact_space
                         )
                 ordered: list[FlatConfig] = []
-                seen: set[Config] = set()
+                seen: MutableSet[Config] = ConfigSet()
 
                 def append_unique(flat: FlatConfig) -> None:
                     try:
@@ -362,7 +364,7 @@ class PatternSearch(PopulationBasedSearch):
         self.log(
             f"Starting PatternSearch with initial_population={initial_population_name}, copies={self.copies}, max_generations={self.max_generations}"
         )
-        visited: set[Config] = set()
+        visited: MutableSet[Config] = ConfigSet()
         self.population = []
         for flat_config in self._generate_initial_population_flat():
             member = self.make_unbenchmarked(flat_config)
@@ -440,7 +442,7 @@ class PatternSearch(PopulationBasedSearch):
         return self._finalize()
 
     def _pattern_search_from(
-        self, current: PopulationMember, visited: set[Config]
+        self, current: PopulationMember, visited: MutableSet[Config]
     ) -> Iterator[list[PopulationMember]]:
         """
         Run a single copy of pattern search from the given starting point.
@@ -530,4 +532,6 @@ class PatternSearch(PopulationBasedSearch):
                         new_flat[second] = second_value
                         neighbors.append(new_flat)
 
-        return self.shrink_neighbors(neighbors)
+        return self.shrink_neighbors(
+            [self.config_gen.conditional_neighbor(base, row) for row in neighbors]
+        )

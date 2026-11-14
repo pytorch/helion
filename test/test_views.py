@@ -26,6 +26,8 @@ from helion._testing import skipUnlessChunkLowering
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
+from helion._testing.squeeze_overloads import squeeze_overloads
+from helion._testing.tensor_views import chunk_unbind_axes
 import helion.language as hl
 from helion.runtime.settings import _get_backend
 
@@ -93,6 +95,16 @@ class TestViews(RefEagerTestBase, TestCase):
         torch.testing.assert_close(
             result, torch.nn.functional.softmax(x, dim=1), rtol=1e-2, atol=1e-1
         )
+
+    @skipIfPallas("Pallas has no pre-Inductor squeeze overload lowering")
+    def test_squeeze_default_and_dims(self):
+        x = torch.randn(19, 23, device=DEVICE)
+        for mode in range(4):
+            with self.subTest(mode=mode):
+                _code, actual = code_and_output(
+                    squeeze_overloads, (x, mode), block_sizes=[8, 16]
+                )
+                torch.testing.assert_close(actual, x.sin())
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_squeeze(self):
@@ -563,29 +575,7 @@ class TestViews(RefEagerTestBase, TestCase):
 
     @skipUnlessChunkLowering
     def test_torch_chunk_unbind_axes(self):
-        @helion.kernel(autotune_effort="none")
-        def fn(
-            x: torch.Tensor, leading_axis: hl.constexpr
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            n, d, k = x.shape
-            d, k = hl.specialize((d, k))
-            lo = x.new_empty((n, d // 2, k))
-            hi = torch.empty_like(lo)
-            for tile in hl.tile(n):
-                values = x[tile, :, :].reshape(tile, d, k)
-                if leading_axis:
-                    # Default dim=0 and the unbound Tensor method form.
-                    transposed = values.permute(1, 0, 2)
-                    left, right = torch.Tensor.chunk(transposed, 2)
-                    a = left.permute(1, 0, 2)
-                    b = right.permute(1, 0, 2)
-                else:
-                    a, b = values.chunk(2, dim=-2)
-                grouped = torch.stack((a, b), dim=0)
-                c, e = grouped.unbind()
-                lo[tile, :, :] = c
-                hi[tile, :, :] = e
-            return lo, hi
+        fn = helion.kernel(chunk_unbind_axes, autotune_effort="none")
 
         x = torch.arange(65 * 8 * 4, device=DEVICE, dtype=torch.float32).reshape(
             65, 8, 4
@@ -1354,6 +1344,28 @@ class TestViews(RefEagerTestBase, TestCase):
                 ".to(tl.int16)" in code or "tl.cast(" in code,
                 "Expected bitcast to int16 via .to() or tl.cast()",
             )
+
+    @skipIfRefEager("ref eager does not support view dtype")
+    @xfailIfPallas("view dtype reinterpret not supported on pallas")
+    def test_view_dtype_masked_lanes(self):
+        """A view of a value whose masked lanes hold -0.0 (bits 0x8000) isn't
+        zero there, so the integer sum over a 100-wide row keeps its mask."""
+
+        @helion.kernel(static_shapes=True)
+        def negated_row_bit_sums(t: torch.Tensor) -> torch.Tensor:
+            m, _ = t.shape
+            out = torch.empty([m], dtype=torch.int32, device=t.device)
+            for tile_m in hl.tile(m):
+                bits = (-t[tile_m, :]).view(dtype=torch.int16).to(torch.int32)
+                out[tile_m] = bits.sum(-1)
+            return out
+
+        t = torch.rand(8, 100, dtype=torch.float16, device=DEVICE) + 0.5
+        _, result = code_and_output(negated_row_bit_sums, (t,), block_sizes=[4])
+        expected = (
+            (-t).view(dtype=torch.int16).to(torch.int32).sum(-1, dtype=torch.int32)
+        )
+        torch.testing.assert_close(result, expected, atol=0, rtol=0)
 
     @onlyBackends(["cute"])
     @skipIfRefEager("checks generated numeric bitcasts")

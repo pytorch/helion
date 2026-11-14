@@ -94,9 +94,9 @@ from ..device_ir import NodeArgsGraphInfo
 from ..device_ir import ReductionLoopGraphInfo
 from ..device_ir import RootGraphInfo
 from ..emitter_protocols import statements_and_reads_adapter
+from ..utils import is_full_slice
 from . import target_facts
 from .analysis.match_common import host_tensor_name
-from .analysis.match_common import is_full_slice
 from .cute_flash import FLASH_KV_STAGE_KEY
 from .cute_flash import _flash_graph_host_tensors
 from .cute_flash import _flash_ws_qk_ahead

@@ -10,6 +10,8 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 from helion._testing.cute_codegen import forbid_cuda_work
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.mark.parametrize("initialized", (False, True))
 def test_cuda_work_guard_preserves_existing_context_state(initialized: bool) -> None:
@@ -21,6 +23,7 @@ def test_cuda_work_guard_preserves_existing_context_state(initialized: bool) -> 
 
 
 @pytest.mark.parametrize("initialized", (False, True))
+# Both context states must reject each entry point, including an already-live stream.
 @pytest.mark.parametrize(
     "entry_point", ("_lazy_init", "init", "synchronize", "current_stream", "Stream")
 )
@@ -98,3 +101,43 @@ def test_cuda_work_guard_disables_fallback_for_fake_used_outside_its_mode() -> N
             assert (fake + 1).device.type == "cuda"
         assert observed and not any(observed)
         assert mode.allow_fallback_kernels
+
+
+def test_offline_compile_option_preserves_the_compiler_call() -> None:
+    cutlass = pytest.importorskip("cutlass")
+    result = object()
+    with (
+        patch("torch.cuda.is_initialized", return_value=True),
+        patch.object(cutlass.cute, "compile", return_value=result) as compile_call,
+        forbid_cuda_work(forbid_native=False),
+    ):
+        assert cutlass.cute.compile(None, no_jit_engine=True) is result
+        compile_call.assert_called_once_with(None, no_jit_engine=True)
+
+
+@pytest.mark.parametrize("entry_point", ("_lazy_init", "current_stream", "Event"))
+def test_offline_compile_option_still_rejects_cuda_work(entry_point) -> None:
+    with (
+        patch("torch.cuda.is_initialized", return_value=True),
+        pytest.raises(AssertionError, match="CUDA work forbidden"),
+        forbid_cuda_work(forbid_native=False),
+    ):
+        getattr(torch.cuda, entry_point)()
+
+
+def test_offline_compile_option_still_rejects_real_tensor_allocation() -> None:
+    with (
+        patch("torch.cuda.is_initialized", return_value=True),
+        pytest.raises(AssertionError, match="CUDA device forbidden by dispatch guard"),
+        forbid_cuda_work(forbid_native=False),
+    ):
+        torch.ops.aten.empty.memory_format([4], device=torch.device("cuda:0"))
+
+
+def test_offline_compile_option_still_detects_context_state_change() -> None:
+    with (
+        patch("torch.cuda.is_initialized", side_effect=(False, True)),
+        pytest.raises(AssertionError),
+        forbid_cuda_work(forbid_native=False),
+    ):
+        pass

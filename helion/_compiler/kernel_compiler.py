@@ -77,15 +77,18 @@ class KernelCompiler:
         ``rewrite_ast=False`` skips the backend AST customizations and traces
         the kernel as written.
         """
-        hf = self.parse(fn, fake_args, constexpr_args)
-        with hf, self._compilation_context():
-            self.unroll(hf)
-            if rewrite_ast:
-                hf.backend_rewrote_ast = self.customize_ast(hf)
-            self.propagate_types(hf)
-            self.finalize_config()
-            self.lower(hf)
-        return hf
+        try:
+            hf = self.parse(fn, fake_args, constexpr_args)
+            with hf, self._compilation_context():
+                self.unroll(hf)
+                if rewrite_ast:
+                    hf.backend_rewrote_ast = self.customize_ast(hf)
+                self.propagate_types(hf)
+                self.finalize_config()
+                self.lower(hf)
+            return hf
+        finally:
+            self.env.clear_container_identities()
 
     def parse(
         self,

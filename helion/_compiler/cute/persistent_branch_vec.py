@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 from ..ast_read_writes import ReadWrites
 from ._ast_pass_utils import loop_extent
+from ._ast_pass_utils import names_read
 from ._ast_pass_utils import reparse_expr as _clone_expr
 from ._ast_pass_utils import replace_call
 from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
@@ -411,6 +412,59 @@ def _plain_scalar_store_pointer(call: ast.Call) -> ast.expr | None:
     ):
         return call.func.value
     return None
+
+
+def _memory_definition_names(statements: list[ast.stmt]) -> set[str]:
+    """Select addresses and their predicates, never unrelated value arithmetic."""
+    names: set[str] = set()
+
+    def visit(node: ast.AST, guards: tuple[ast.expr, ...]) -> None:
+        if isinstance(node, (ast.If, ast.IfExp)):
+            visit(node.test, guards)
+            branches = (
+                [*node.body, *node.orelse]
+                if isinstance(node, ast.If)
+                else [node.body, node.orelse]
+            )
+            for child in branches:
+                visit(child, (*guards, node.test))
+            return
+        if isinstance(node, ast.For):
+            names.update(names_read(node.iter))
+        if isinstance(node, ast.Call):
+            pointer = _plain_scalar_load_pointer(node)
+            if pointer is None:
+                pointer = _plain_scalar_store_pointer(node)
+            if pointer is not None:
+                names.update(names_read(pointer))
+                for guard in guards:
+                    names.update(names_read(guard))
+        for child in ast.iter_child_nodes(node):
+            visit(child, guards)
+
+    for statement in statements:
+        visit(statement, ())
+    # A nested address can refer to an enclosing definition through its local
+    # aliases. Close over every definition version before selecting each
+    # scope's snapshots; their ordinary write invalidation remains unchanged.
+    return _needed_definition_names(
+        [
+            node
+            for statement in statements
+            for node in ast.walk(statement)
+            if isinstance(node, ast.stmt)
+        ],
+        names,
+    )
+
+
+def _memory_definition_snapshots(
+    statements: list[ast.stmt],
+) -> list[dict[str, ast.expr]] | None:
+    """Freeze only the definitions needed by scalar addresses and their guards."""
+    return _definition_snapshots(
+        statements, required_names=_memory_definition_names(statements)
+    )
 
 
 # Widest element count one 16-byte flush helper can write.

@@ -28,6 +28,7 @@ from typing import Sequence
 
 import torch
 
+from ...utils import is_full_slice
 from ..attention_plan import ALIBI_BIAS_KIND
 from ..attention_plan import CAUSAL_MASK_KIND
 from ..attention_plan import DOCUMENT_MASK_KIND
@@ -44,7 +45,6 @@ from .match_common import FlattenedRowOffset
 from .match_common import flattened_row_offset
 from .match_common import host_tensor_name
 from .match_common import is_call
-from .match_common import is_full_slice
 from .match_common import is_neg_inf
 from .match_common import new_var_source
 from .match_common import packed_f32x2_multiply
@@ -203,6 +203,7 @@ def _attention_is_block_symnode(node: torch.fx.Node, block_id: int) -> bool:
         node.op == "call_function"
         and node.target is _get_symnode
         and len(node.args) >= 1
+        and isinstance(node.args[0], str)
         and node.args[0] == f"block_size_{block_id}"
     )
 

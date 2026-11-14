@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ast
 import dataclasses
 import itertools
+from types import SimpleNamespace
 from typing import Any
 from typing import Literal
 from typing import cast
@@ -9,8 +11,10 @@ from unittest import mock
 
 import pytest
 import sympy
+import torch
 
 from helion import exc
+from helion._compiler import cross_loop_codegen
 from helion._compiler import cross_loop_scheduler
 from helion._compiler.cross_loop_scheduler import ReadinessConsumer
 from helion._compiler.cross_loop_scheduler import ReadinessCounterPlan
@@ -24,6 +28,7 @@ from helion._compiler.cross_loop_scheduler import build_static_pipeline_plan
 from helion._compiler.cross_loop_scheduler import choose_final_arrival_continuations
 from helion._compiler.cross_loop_scheduler import choose_readiness_counters
 from helion._compiler.cross_loop_scheduler import derive_final_arrival_continuations
+from helion._compiler.program_id import PIDInfo
 from helion._compiler.tile_dependency import CoordinateDomain
 from helion._compiler.tile_dependency import CoordinateRelation
 from helion._compiler.tile_dependency import DenseTaskOrder
@@ -36,9 +41,89 @@ from helion._compiler.tile_dependency import _CoordinateRelationPiece
 from helion._compiler.tile_dependency import build_tile_dependency_graph
 from helion._compiler.tile_dependency import coordinate_axis_symbol
 from helion._compiler.tile_dependency import instantiate_coordinate_domains
+from helion._compiler.triton.backend import TritonBackend
 from helion._testing import TestCase
 
 pytestmark = pytest.mark.cpu_only
+
+
+def test_integer_fill_task_bound_preserves_hoisted_execution() -> None:
+    fill = TritonBackend().full_expr(["4"], "3.75", torch.int32)
+    source = (
+        "pid_0 = virtual_pid\n"
+        "offset_0 = pid_0\n"
+        f"values = {fill}\n"
+        "bound = tl.sum(values, 0)\n"
+        "predicate = bound > offset_0\n"
+        "if predicate:\n"
+        "    out[offset_0] = int(bound)\n"
+    )
+
+    def extent(body: list[ast.stmt]) -> cross_loop_codegen._GuardedExtent | None:
+        return cross_loop_codegen._guarded_extent(
+            body,
+            slowest=PIDInfo("pid_0", "1", "16", 0),
+            block_size=1,
+            inner_tasks=1,
+            variant_names=frozenset({"virtual_pid"}),
+            read_only_tensors=frozenset(),
+            tensor_names=frozenset(),
+        )
+
+    result = extent(ast.parse(source).body)
+    assert result is not None
+    assert result.live_tasks == "bound"
+
+    def integer_full(
+        shape: list[int], value: float, dtype: torch.dtype
+    ) -> torch.Tensor:
+        return torch.full(shape, int(value), dtype=dtype)
+
+    def namespace() -> dict[str, Any]:
+        return {
+            "out": [None] * 16,
+            "tl": SimpleNamespace(int32=torch.int32, sum=torch.sum),
+            "helion_triton_helpers": SimpleNamespace(integer_full=integer_full),
+        }
+
+    original = namespace()
+    for pid in range(16):
+        exec(
+            compile(source, "<original-task-bound>", "exec"),
+            original | {"virtual_pid": pid},
+        )
+    transformed = namespace()
+    hoisted = ast.fix_missing_locations(ast.Module(result.hoisted, type_ignores=[]))
+    task = ast.fix_missing_locations(ast.Module(result.body, type_ignores=[]))
+    exec(compile(hoisted, "<hoisted-task-bound>", "exec"), transformed)
+    for pid in range(int(transformed[result.live_tasks])):
+        exec(
+            compile(task, "<hoisted-task>", "exec"), transformed | {"virtual_pid": pid}
+        )
+    assert original["out"] == transformed["out"] == [12] * 12 + [None] * 4
+
+    # Other compiler helpers can poll or publish; naming that module is not proof.
+    for name in ("triton_wait_signal", "unknown_helper"):
+        assert extent(ast.parse(source.replace("integer_full", name)).body) is None
+
+
+def test_integer_fill_dry_pass_keeps_the_bound_available() -> None:
+    fill = TritonBackend().full_expr(["4"], "3.75", torch.int32)
+    source = f"values = {fill}\nbound = tl.sum(values, 0)\ntl.store(out, bound)\n"
+    guards: list[ast.If] = []
+    result = cross_loop_codegen._dry_pass_rewrite(
+        ast.parse(source).body, "live", frozenset(), guards
+    )
+    assert cross_loop_codegen._dry_pass_binds(result, guards, set())
+    for name in ("triton_wait_signal", "unknown_helper"):
+        guards = []
+        result = cross_loop_codegen._dry_pass_rewrite(
+            ast.parse(source.replace("integer_full", name)).body,
+            "live",
+            frozenset(),
+            guards,
+        )
+        assert not cross_loop_codegen._dry_pass_binds(result, guards, set())
 
 
 def _domain(

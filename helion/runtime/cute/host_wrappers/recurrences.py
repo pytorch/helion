@@ -1008,6 +1008,7 @@ EMITTERS = (
         namespace=chunk_recurrence_warp_dv4_namespace,
         host_call=append_sm100_warp_dv4_host_call,
         source_dependencies=(
+            "runtime/cute/tensor_maps.py",
             "_compiler/cute/affine_recurrence_primitives.py",
             "_compiler/cute/chunk_recurrence_dv4_sm100.py",
             "_compiler/cute/device/ptx.py",

@@ -13,7 +13,6 @@ from torch._inductor.ir import Reduction
 from torch._inductor.virtualized import OpsValue
 from torch._inductor.virtualized import V
 import torch.fx
-from torch.fx import map_arg
 from torch.fx.experimental import proxy_tensor
 from torch.utils import _pytree as pytree
 from torch.utils._sympy.value_ranges import ValueRanges
@@ -472,35 +471,40 @@ def getitem_masked_value(
     node, index = getitem_node.args
     assert isinstance(node, torch.fx.Node)
     assert isinstance(index, int)
-    if node.target is _if:
-        # The if's values: each branch output (``branches_outputs``), then
-        # each else output; an entry naming an outer value passes it through.
-        pairs = cast(
-            "IfGraphInfo", DeviceIR.current().graphs[cast("int", node.args[1])]
-        ).branches_outputs
-        if not pairs:
-            return None
-        side, pair = divmod(index, len(pairs))
-        entry = pairs[pair][side]
-        if not isinstance(entry, int):
-            return None
-        graph = DeviceIR.current().graphs[cast("int", node.args[1 + side])].graph
-        output = graph.find_nodes(op="output")[0].args[0][entry]
-        return (
-            cached_masked_value(output) if isinstance(output, torch.fx.Node) else None
-        )
     if is_for_loop_target(node.target):
-        graph_ids = [node.args[0]]
+        graph_id = node.args[0]
+    elif node.target is _if:
+        info = DeviceIR.current().graphs[cast("int", node.args[1])]
+        assert isinstance(info, IfGraphInfo)
+        assert info.branches_outputs
+        branch, position = divmod(index, len(info.branches_outputs))
+        assert branch in (0, 1)
+        selected = info.branches_outputs[position][branch]
+        # _if returns every joined variable for each side, including values
+        # that side did not assign. Raw branch output lists omit those values
+        # and may have a different order from the joined result slots.
+        if isinstance(selected, str):
+            assert info.if_arg_names is not None
+            assert info.else_arg_names is not None
+            inputs = dict(
+                zip(info.if_arg_names, cast("list[object]", node.args[3]), strict=True)
+            ) | dict(
+                zip(
+                    info.else_arg_names, cast("list[object]", node.args[4]), strict=True
+                )
+            )
+            outer = inputs[selected]
+            return (
+                cached_masked_value(outer) if isinstance(outer, torch.fx.Node) else None
+            )
+        index = selected
+        graph_id = node.args[1 + branch]
     else:
         return None
-    assert isinstance(graph_ids, list)
-    assert all(isinstance(graph_id, int) for graph_id in graph_ids)
-    graphs = [
-        DeviceIR.current().graphs[cast("int", graph_id)].graph for graph_id in graph_ids
-    ]
-    output_nodes = [graph.find_nodes(op="output") for graph in graphs]
-    outputs_all = [output[0].args for output in output_nodes]
-    outputs, _ = pytree.tree_flatten(outputs_all)
+    assert isinstance(graph_id, int)
+    graph = DeviceIR.current().graphs[graph_id].graph
+    output_node = graph.find_nodes(op="output")[0]
+    outputs, _ = pytree.tree_flatten(output_node.args)
     assert isinstance(outputs, (list, tuple))
     output = outputs[index]
     if isinstance(output, torch.fx.Node):
@@ -551,16 +555,16 @@ def inductor_masked_value(
 
     pointwise = not isinstance(lowering.buffer.data, Reduction)
 
-    def visit(n: torch.fx.Node) -> torch.fx.Node:
+    def visit(n: torch.fx.Node) -> None:
         val = cached_masked_value(n)
         if val is None or (pointwise and broadcasts_onto_masked_lanes(n, node)):
             input_ranges.append(ValueRanges.unknown())
         else:
             input_ranges.append(ValueRanges(val, val))
-        return n
 
     input_ranges: list[ValueRangesAny] = []
-    map_arg((node.args, node.kwargs), visit)
+    for source in lowering.input_nodes(node):
+        visit(source)
     val = node.meta.get("val")
     strict_float = (
         isinstance(val, torch.Tensor)

@@ -13,6 +13,9 @@ import pytest
 import torch
 
 import helion
+from helion._compiler.cute.autotune.heuristics.cute_tcgen05_default import (
+    CuteTcgen05DefaultTileHeuristic,
+)
 from helion._compiler.cute.autotune.heuristics.cute_tcgen05_schedule import (
     CuteTcgen05ScheduleHeuristic,
 )
@@ -22,6 +25,8 @@ from helion._compiler.cute.tcgen05_config import _TWO_CTA_PERSISTENT_PID_VETO
 from helion._compiler.cute.tcgen05_config import facts
 from helion._compiler.cute.tcgen05_config import repair
 from helion._compiler.cute.tcgen05_config import seeds
+from helion._compiler.cute.tcgen05_config import smem
+from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from helion._compiler.cute.tcgen05_schedule_facts import Tcgen05FullTileScheduleFacts
 from helion._compiler.cute.tcgen05_schedule_facts import analyze_native_gemm
 from helion._compiler.cute.tcgen05_schedule_facts import full_tile_schedule_supported
@@ -35,10 +40,13 @@ from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_dense_tcgen05 import blackwell_capability
 from helion._testing.cute_dense_tcgen05 import cpu_codegen_target
 from helion._testing.cute_dense_tcgen05 import extra_store_mm
+from helion._testing.cute_dense_tcgen05 import plain_mm
 from helion._testing.cute_dense_tcgen05 import scaled_args
 from helion._testing.cute_dense_tcgen05 import scaled_mm
+from helion._testing.cute_dense_tcgen05 import user_bound_mm
 from helion._testing.cute_dense_tcgen05 import vector_scaled_mm
 from helion.autotuner.config_generation import ConfigGeneration
+import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -376,3 +384,338 @@ def test_k_tail_does_not_widen_other_instruction_families() -> None:
         assert not native_tma_schedule_supported(
             replace(facts, dtype=dtype), (128, 128, 128), cluster_m=2, cluster_n=1
         )
+
+
+def _plain_bind(
+    m: int, n: int, k: int, dtype: torch.dtype = torch.bfloat16
+) -> BoundKernel:
+    return plain_mm._bind_isolated(
+        (torch.empty((m, k), dtype=dtype), torch.empty((n, k), dtype=dtype).T)
+    )
+
+
+def _k_block_max(bound: BoundKernel) -> int:
+    fragments = facts._matmul_block_fragments(bound.config_spec._cute_tcgen05_config)
+    assert fragments is not None
+    return fragments[2].high
+
+
+def test_output_edge_admits_two_cta_pairs_and_flattens_one_cta_partial_tiles() -> None:
+    """Ragged M, whole K: persistent and CtaGroup.TWO search on 64-deep K tiles.
+
+    One-CTA persistent kernels run whole tiles only (the host multi-tile
+    guard), so the search flattens their partial-tile samples while the
+    two-CTA pairs keep their persistent schedule.
+    """
+    bound = _plain_bind(1000, 4096, 2880)
+    state = bound.config_spec._cute_tcgen05_config
+    assert "persistent_interleaved" in bound.config_spec.allowed_pid_types
+    constraints = state.cluster_m2_search_constraints
+    assert constraints is not None and not constraints.allow_edge_k_tail_family
+    assert state.output_edge_persistent_admitted
+    assert _k_block_max(bound) == 64
+    # the FFI direct-entry seed assumes whole 256x256 tiles
+    assert not seeds.full_tile_direct_entry_seed_eligible(state)
+    one_cta = {
+        "block_sizes": [128, 256, 64],
+        "pid_type": "persistent_interleaved",
+        "tcgen05_cluster_m": 1,
+    }
+    repair._fix_cluster_m1_persistent_search_config(state, one_cta)
+    assert one_cta["pid_type"] == "flat"
+    pair = {
+        "block_sizes": [256, 256, 64],
+        "pid_type": "persistent_interleaved",
+        "tcgen05_cluster_m": 2,
+    }
+    repair._fix_cluster_m1_persistent_search_config(state, pair)
+    assert pair["pid_type"] == "persistent_interleaved"
+
+
+@pytest.mark.parametrize(
+    ("shape", "dtype"),
+    (
+        # Ragged M below the 256-row pair tile.
+        ((16, 14336, 4096), torch.bfloat16),
+        # Ragged in both M and N.
+        ((3000, 3000, 3072), torch.bfloat16),
+        # FP8 keeps its exact-tile restoration.
+        ((1000, 4096, 2880), torch.float8_e4m3fn),
+    ),
+)
+def test_output_edge_admission_excludes_unpaired_and_double_edge_shapes(
+    shape: tuple[int, int, int], dtype: torch.dtype
+) -> None:
+    bound = _plain_bind(*shape, dtype=dtype)
+    assert not bound.config_spec._cute_tcgen05_config.output_edge_persistent_admitted
+
+
+def test_n_edge_cluster_n_seeds_take_one_n_cluster() -> None:
+    """4096x1000x4096 with an N-major B: the CtaGroup.TWO seeds' cluster_n=2
+    variants (L2 grouped, or with a scheduler warp) fall outside the proved
+    N-edge multicast schedule, which codegen requires; normalization takes
+    them to one N cluster, and they render."""
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound = plain_mm._bind_isolated(
+            (
+                torch.empty((4096, 4096), dtype=torch.bfloat16),
+                torch.empty((4096, 1000), dtype=torch.bfloat16),
+            )
+        )
+        spec = bound.config_spec
+        generation = spec.create_config_generation()
+        paired = [
+            generation.unflatten(generation.flatten(seed))
+            for seed in spec.compiler_seed_configs
+            if seed.config.get("tcgen05_cluster_n") == 2
+        ]
+        assert paired
+        assert all(seed.config["tcgen05_cluster_n"] == 1 for seed in paired)
+        bound.to_code(paired[0])
+
+
+def test_k_cap_applies_only_where_whole_k_tiles_admit_persistence() -> None:
+    """200x1000x2880 is ragged in both M and N: no persistent schedule, no cap."""
+    capped = _plain_bind(1000, 4096, 2880)
+    uncapped = _plain_bind(200, 1000, 2880)
+    assert _k_block_max(capped) == 64
+    assert _k_block_max(uncapped) > 64
+
+
+def test_m_edge_two_cta_ab6_keeps_tma_store_and_drains_after_dealloc() -> None:
+    """1000x4096x2880 bf16 at 2x1 256x256x64 ab=6 keeps the TMA-store epilogue.
+
+    The arena (192 KiB AB ring, 32 KiB (128, 64) C ring and the barriers) fits
+    the opt-in capacity, which the AB-gate-budget check refused, and the two-CTA
+    teardown frees TMEM before draining the bulk stores.
+    """
+    bound = plain_mm._bind_isolated(
+        (
+            torch.empty((1000, 2880), dtype=torch.bfloat16),
+            torch.empty((4096, 2880), dtype=torch.bfloat16).T,
+        )
+    )
+    source = bound.to_code(
+        helion.Config(
+            block_sizes=[256, 256, 64],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=6,
+            tcgen05_c_stages=2,
+        )
+    )
+    assert "'kind': 'tcgen05_d_tma'" in source
+    assert "'ab_stage_count': 6" in source
+    assert "cute.copy(tcgen05_tma_store_atom" in source
+    assert source.count("tcgen05_c_pipeline.producer_tail()") == 1
+    assert source.rindex("tcgen05_tmem_allocator.free(") < source.index(
+        "tcgen05_c_pipeline.producer_tail()"
+    )
+
+
+def _default_with_sms(shape: tuple[int, int, int], num_sms: int) -> helion.Config:
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=num_sms,
+    ):
+        return _plain_bind(*shape).config_spec.default_config()
+
+
+def test_default_tile_one_cta_tile_quantizes_m_into_whole_waves() -> None:
+    """25216 rows: 197 one-CTA 128x256 rows of tiles fill 4 waves of 148 SMs;
+    the 256-row pair tile leaves a fifth, nearly empty wave."""
+    config = _default_with_sms((25216, 768, 3072), 148)
+    assert config.block_sizes == [128, 256, 64]
+    assert config.config["tcgen05_cluster_m"] == 1
+    assert config.config["pid_type"] == "persistent_interleaved"
+
+
+def test_default_tile_pair_replaces_ffi_on_a_partial_wave() -> None:
+    """8192x768x3072: 96 FFI pair tiles are 1.3 waves; the 256x128 pair wins,
+    with the FFI controls off and the grouped raster for its several waves."""
+    config = _default_with_sms((8192, 768, 3072), 148)
+    assert config.block_sizes == [256, 128, 64]
+    assert config.config["tcgen05_cluster_m"] == 2
+    assert not config.config.get("tcgen05_tvm_ffi_launch")
+    assert config.config.get("tcgen05_layout_strategy") == "default"
+    assert config.config["l2_groupings"] == [TCGEN05_TWO_CTA_SEED_L2_GROUPING]
+
+
+def test_default_tile_keeps_ffi_on_whole_waves() -> None:
+    """The direct-entry default runs six 64-deep AB stages."""
+    config = _default_with_sms((4096, 4096, 4096), 148)
+    assert config.config.get("tcgen05_tvm_ffi_launch") is True
+    assert config.block_sizes == [256, 256, 64]
+    assert config.config["tcgen05_ab_stages"] == 6
+    assert config.config["tcgen05_c_stages"] == 2
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _mm_k128(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    m, k = a.shape
+    n = b.shape[1]
+    out = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
+    block_k = hl.register_block_size(128, 128)
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k, block_size=block_k):
+            acc = hl.dot(a[rows, inner], b[inner, cols], acc=acc)
+        out[rows, cols] = acc.to(torch.bfloat16)
+    return out
+
+
+def test_direct_entry_seed_deepens_64_deep_k_tiles() -> None:
+    """K=576 takes only 64-deep tiles: six stages instead of three."""
+    seed = seeds.full_tile_direct_entry_seed_config(
+        _plain_bind(8192, 4096, 576).config_spec.tcgen05
+    )
+    assert seed is not None
+    assert seed.block_sizes == [256, 256, 64]
+    assert seed.config["tcgen05_ab_stages"] == 6
+    assert seed.config["tcgen05_c_stages"] == 2
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _mm_three_outputs(
+    a: torch.Tensor, b: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    m, k = a.shape
+    n = b.shape[1]
+    out0 = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
+    out1 = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
+    out2 = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = hl.dot(a[rows, inner], b[inner, cols], acc=acc)
+        out0[rows, cols] = acc.to(torch.bfloat16)
+        out1[rows, cols] = (acc * 2.0).to(torch.bfloat16)
+        out2[rows, cols] = (acc + 1.0).to(torch.bfloat16)
+    return out0, out1, out2
+
+
+def test_direct_entry_seed_stays_shallow_when_the_c_rings_do_not_fit() -> None:
+    """K=576 with three outputs: 192 KiB of AB plus three 16 KiB C rings
+    overflow the arena, so the 64-deep seed keeps three stages."""
+    bound = _mm_three_outputs._bind_isolated(
+        (
+            torch.empty((8192, 576), dtype=torch.bfloat16),
+            torch.empty((4096, 576), dtype=torch.bfloat16).T,
+        )
+    )
+    seed = seeds.full_tile_direct_entry_seed_config(bound.config_spec.tcgen05)
+    assert seed is not None
+    assert seed.block_sizes == [256, 256, 64]
+    assert seed.config["tcgen05_ab_stages"] == 3
+
+
+def test_direct_entry_seed_takes_three_64_deep_stages_past_the_128_deep_ring() -> None:
+    """K=1024 with three outputs: the three 128-deep stages hold the deep
+    ring's 192 KiB of AB, beside which three C rings overflow the arena as
+    well, so the seed runs three 64-deep stages."""
+    bound = _mm_three_outputs._bind_isolated(
+        (
+            torch.empty((8192, 1024), dtype=torch.bfloat16),
+            torch.empty((4096, 1024), dtype=torch.bfloat16).T,
+        )
+    )
+    state = bound.config_spec.tcgen05
+    seed = seeds.full_tile_direct_entry_seed_config(state)
+    assert seed is not None
+    assert seed.block_sizes == [256, 256, 64]
+    assert seed.config["tcgen05_ab_stages"] == 3
+    assert seeds.full_tile_direct_entry_seed_eligible(state)
+
+
+def test_direct_entry_seed_keeps_a_declared_k_block_size() -> None:
+    """A K fragment pinned to 128 keeps the three-stage 128-deep seed."""
+    bound = _mm_k128._bind_isolated(
+        (
+            torch.empty((4096, 1024), dtype=torch.bfloat16),
+            torch.empty((4096, 1024), dtype=torch.bfloat16).T,
+        )
+    )
+    seed = seeds.full_tile_direct_entry_seed_config(bound.config_spec.tcgen05)
+    assert seed is not None
+    # The registered K block size is block 0; the M/N tile follows.
+    assert seed.block_sizes == [128, 256, 256]
+    assert seed.config["tcgen05_ab_stages"] == 3
+
+
+def test_default_tile_one_cta_tile_keeps_a_registered_k_block() -> None:
+    """A K block size registered at 32 keeps the default inside it: the
+    one-CTA 128x256x64 candidate is left out at 25216x768x3072, where it is
+    the pick otherwise."""
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        config = user_bound_mm._bind_isolated(
+            (
+                torch.empty((25216, 3072), dtype=torch.bfloat16),
+                torch.empty((3072, 768), dtype=torch.bfloat16),
+                32,
+            )
+        ).config_spec.default_config()
+    # block 0 is the registered K block size
+    assert config.block_sizes[0] == 32
+
+
+def test_default_tile_promotion_survives_ffi_normalization() -> None:
+    """A one-CTA pick over an FFI-eligible shape keeps its tile: the promoted
+    values turn the FFI controls off instead of relying on the winning seed.
+    On 147 SMs the 147 FFI pair tiles take three waves of 73 pairs, where the
+    294 one-CTA tiles take two; on 148 the pair would stay."""
+    config = _default_with_sms((5376, 1792, 4096), 147)
+    assert config.block_sizes == [128, 256, 64]
+    assert not config.config.get("tcgen05_tvm_ffi_launch")
+
+
+def test_default_tile_leaves_small_grids_to_their_seeds() -> None:
+    """Fewer 128x128 tiles than SMs: per-CTA latency decides, no promotion."""
+    bound = _plain_bind(1024, 1024, 4096)
+    with bound.env:
+        assert CuteTcgen05DefaultTileHeuristic._pick(bound.env) is None
+
+
+def test_plain_pair_prices_the_narrow_store_subtile() -> None:
+    """A plain 16-bit 256x256 pair stores through (128, 32) C subtiles, so a
+    six-deep 64-wide AB ring keeps a four-deep C ring (192 + 32 KiB).  Pricing
+    the C ring at CuTe's with-source (128, 64) subtile capped the ring at five
+    stages and rejected the config."""
+    bound = _plain_bind(16384, 768, 768)
+    values = {
+        "block_sizes": [256, 256, 64],
+        "pid_type": "persistent_blocked",
+        "tcgen05_cta_group": "two",
+        "tcgen05_cluster_m": 2,
+        "tcgen05_cluster_n": 1,
+        "tcgen05_ab_stages": 6,
+        "tcgen05_c_stages": 4,
+        "tcgen05_tvm_ffi_launch": False,
+    }
+    state = bound.config_spec._cute_tcgen05_config
+    assert smem._paired_pipeline_stage_limit(state, values) == 6
+    # Each epilogue warp group owns its own ring: two groups of four (128, 32)
+    # stages take 64 KiB, which leaves room for five AB stages, not six.
+    assert (
+        smem._paired_pipeline_stage_limit(
+            state, values | {"tcgen05_epi_warp_groups": 2}
+        )
+        == 5
+    )
+    # A K tail leaves the static-full-tile rule: codegen keeps the with-source
+    # (128, 64) subtile, so four C stages again cap the AB ring at five.
+    k_tail = _plain_bind(16384, 768, 800).config_spec._cute_tcgen05_config
+    assert smem._paired_pipeline_stage_limit(k_tail, values) == 5
+    config = helion.Config(**values)
+    bound.config_spec.normalize(config)
+    assert config["tcgen05_ab_stages"] == 6
+    assert config["tcgen05_c_stages"] == 4
+    source = bound.to_code(config)
+    assert "PipelineTmaStore.create(num_stages=4" in source
+    assert "(cute.make_layout(128), cute.make_layout(32))" in source

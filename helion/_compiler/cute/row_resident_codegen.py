@@ -16,6 +16,8 @@ import torch
 
 from ... import exc
 from ._ast_pass_utils import _bound_names
+from .compile_options import compile_options_keyword
+from .compile_options import config_compile_options
 from .row_matrix_transport import ROW_MATRIX_MODE
 from .row_matrix_transport import prove_row_matrix_transport
 from .row_resident import ROW_RESIDENT_KEY
@@ -345,8 +347,9 @@ def generate_row_resident(
         source = row_resident_module(plan, min_blocks)
     kernel = f"{module_name}._helion_row_resident"
     argument_text = ", ".join(plan.arguments)
+    options = compile_options_keyword(config_compile_options(config))
     replacement = ast.parse(
-        f"_launcher({kernel}, ({(plan.rows + 1) // 2}, 1, 1), {argument_text}, block=(256, 1, 1))"
+        f"_launcher({kernel}, ({(plan.rows + 1) // 2}, 1, 1), {argument_text}, block=(256, 1, 1){options})"
     ).body[0]
     start = host.body.index(calls[0])
     host.body[start : start + 2] = [replacement]

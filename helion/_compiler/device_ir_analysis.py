@@ -36,11 +36,13 @@ from .compile_environment import FixedBlockSizeSource
 from .compile_environment import _has_unbacked
 from .compile_environment import _symint_free_symbols
 from .compile_environment import _symint_sympy_expr
+from .fx_side_effects import is_impure_node
 from .indexing_strategy import _contiguous_integer_tensor_index
 from .indexing_strategy import subscript_index_scale
 from .indexing_strategy import subscript_tile_info
 from .tile_dependency import TILE_ACCESS_META
 from .tile_dependency import _relation_product_is_within_budget
+from .utils import is_full_slice
 from .variable_origin import GridOrigin
 from .variable_origin import TileBeginOrigin
 from .variable_origin import TileIdOrigin
@@ -230,7 +232,9 @@ def _may_access_memory_unseen(node: torch.fx.Node, state: CompilerState) -> bool
         return False
     # Peer views, and the local copies other ranks reach through theirs.
     symmetric = {*state.peer_views, *(v[0] for v in state.peer_views.values() if v)}
-    return (is_api_func(node.target) and node.is_impure(impure_random=False)) or any(
+    return (
+        is_api_func(node.target) and is_impure_node(node, impure_random=False)
+    ) or any(
         not symmetric.isdisjoint(state.ssa_storages(value))
         for arg in node.all_input_nodes
         if isinstance(value := arg.meta.get("val"), torch.Tensor)
@@ -360,9 +364,7 @@ def _subscript_affine(
                 target is hl.subscript
                 and len(args) == 2
                 and isinstance(args[1], (list, tuple))
-                and all(
-                    item is None or _subscript_is_full_slice(item) for item in args[1]
-                )
+                and all(item is None or is_full_slice(item) for item in args[1])
             )
         ):
             node = args[0]
@@ -462,11 +464,6 @@ def _subscript_dense_span(
     ):
         return None
     return axis, int(coefficient), int(remainder)
-
-
-def _subscript_is_full_slice(subscript: object) -> bool:
-    """Return whether a tensor subscript covers its complete dimension."""
-    return isinstance(subscript, slice) and subscript == slice(None)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -586,7 +583,7 @@ def _broadcast_only_index_shape(
     for item in index:
         if item is None:
             result.append(1)
-        elif _subscript_is_full_slice(item) and source_dimension < len(source_shape):
+        elif is_full_slice(item) and source_dimension < len(source_shape):
             result.append(source_shape[source_dimension])
             source_dimension += 1
         else:
@@ -725,7 +722,7 @@ def _affine_subscript_ranges(
         elif target is view_ops.subscript and args:
             index = args[1] if len(args) >= 2 else None
             if isinstance(index, (list, tuple)) and all(
-                item is None or _subscript_is_full_slice(item) for item in index
+                item is None or is_full_slice(item) for item in index
             ):
                 base = evaluate(args[0])
                 if base is not None:
@@ -738,9 +735,7 @@ def _affine_subscript_ranges(
             if (
                 extra_mask is None
                 and isinstance(index, (list, tuple))
-                and all(
-                    item is None or _subscript_is_full_slice(item) for item in index
-                )
+                and all(item is None or is_full_slice(item) for item in index)
             ):
                 base = evaluate(args[0])
                 if base is not None:
@@ -1196,6 +1191,11 @@ class GraphAnalysis:
             if isinstance(lowering, ReductionLowering):
                 block_id = getattr(lowering, "block_index", None)
                 if isinstance(block_id, int):
+                    # Codegen gives an untiled registered extent its own
+                    # reduction alias. Facts retain the registered owner: its
+                    # extent is still unknown until a configuration is chosen.
+                    if (owner := env.registered_extent_owner(block_id)) is not None:
+                        block_id = owner
                     reduction_axis_by_node_id[id(node)] = block_id
                     if block_id not in seen_reductions:
                         seen_reductions.add(block_id)
@@ -1532,7 +1532,9 @@ class DeviceIRAnalysis:
             matches = [
                 info.block_id
                 for info in env.block_sizes
-                if info.reduction and next_power_of_2(info.size_hint()) == extent
+                if info.reduction
+                and env.registered_extent_owner(info.block_id) is None
+                and next_power_of_2(info.size_hint()) == extent
             ]
             if len(matches) == 1:
                 return matches[0]
@@ -1841,7 +1843,7 @@ class DeviceIRAnalysis:
                         subscript_offsets = tuple(item[2] for item in affine)
                         subscript_is_scalar = tuple(item[3] for item in affine)
                         subscript_is_full_slice = tuple(
-                            _subscript_is_full_slice(index_list[position])
+                            is_full_slice(index_list[position])
                             for position in subscript_dims
                         )
                         subscript_static_extents = tuple(

@@ -3,12 +3,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from typing import cast
 
-import sympy
 import torch
 
 from .. import exc
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.utils import is_full_slice
 from ..exc import NotInsideKernel
 from . import _decorators
 
@@ -28,20 +28,11 @@ def _split_dim(tensor: torch.Tensor, dim: int, op: str) -> tuple[int, int]:
     dim %= tensor.ndim
     size = tensor.shape[dim]
     if isinstance(size, torch.SymInt):
-        env = CompileEnvironment.current()
-        expr = env.specialize_expr(env.shape_env.simplify(size._sympy_()))
-        block_id = env.resolve_block_id(size)
-        if not isinstance(expr, sympy.Integer) and block_id is not None:
-            block = env.block_sizes[block_id]
-            if block.reduction:
-                # A full-axis load has a block symbol even when its logical
-                # extent is constant. Do not use the extent of a tiled axis.
-                expr = env.specialize_expr(env.shape_env.simplify(block.numel))
-        if not isinstance(expr, sympy.Integer):
+        size = CompileEnvironment.current().static_kernel_tensor_extent(size)
+        if size is None:
             raise exc.UnsupportedSplitConfiguration(
                 op=op, requirement="a compile-time constant split dimension size"
             )
-        size = int(expr)
     return dim, size
 
 
@@ -180,7 +171,7 @@ def _(state: CodegenState) -> ast.AST:
     for val in state.proxy_arg(1):
         if val is None:
             output_keys.append("None")
-        elif isinstance(val, slice) and repr(val) == "slice(None, None, None)":
+        elif is_full_slice(val):
             output_keys.append(":")
         else:
             raise exc.InvalidIndexingType(repr(val))

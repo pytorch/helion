@@ -12,6 +12,9 @@ from ...language import _tracing_ops
 from ...language import atomic_ops
 from ..device_ir import ForLoopGraphInfo
 from .local_atomic import atomic_target_origins
+from .scalar_ast import SCALAR_CALLS
+from .scalar_ast import SCALAR_CAST_CALLS
+from .scalar_ast import is_flat_scalar_access
 
 if TYPE_CHECKING:
     from ..device_ir import GraphInfo
@@ -93,46 +96,7 @@ def can_defer_integer_epoch(
         atomics.add(node)
     if not atomics:
         return False
-    casts = {
-        f"cutlass.{name}"
-        for name in (
-            "Boolean",
-            "Int8",
-            "Int16",
-            "Int32",
-            "Int64",
-            "Uint8",
-            "Uint16",
-            "Uint32",
-            "Uint64",
-            "Float16",
-            "BFloat16",
-            "Float32",
-            "Float64",
-        )
-    }
-    pure = {"range", "abs", "min", "max", "_cute_python_mod"} | {
-        f"operator.{name}"
-        for name in (
-            "lt",
-            "le",
-            "eq",
-            "ne",
-            "gt",
-            "ge",
-            "and_",
-            "or_",
-            "xor",
-            "neg",
-            "add",
-            "sub",
-            "mul",
-            "floordiv",
-            "mod",
-            "lshift",
-            "rshift",
-        )
-    }
+    pure = SCALAR_CALLS | {"range", "abs"}
     for node in ast.walk(tree):
         if isinstance(node, ast.stmt) and not isinstance(
             node, (ast.Assign, ast.AugAssign, ast.For, ast.If, ast.Pass, ast.Expr)
@@ -157,22 +121,22 @@ def can_defer_integer_epoch(
         ):
             parent = parents.get(node)
             if not (
-                isinstance(parent, ast.Subscript)
-                and parent.value is node
+                is_flat_scalar_access(parent, node)
+                and isinstance(parent, ast.Subscript)
                 and isinstance(parent.ctx, ast.Load)
                 and node.id not in targets
             ):
                 return False
         if isinstance(node, ast.Call) and node not in atomics:
             name = ast.unparse(node.func)
-            if name in casts | pure:
+            if name in SCALAR_CAST_CALLS | pure:
                 continue
             if (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr == "bitcast"
                 and len(node.args) == 1
                 and not node.keywords
-                and ast.unparse(node.args[0]) in casts
+                and ast.unparse(node.args[0]) in SCALAR_CAST_CALLS
             ):
                 continue
             if (

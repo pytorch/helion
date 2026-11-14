@@ -990,6 +990,8 @@ def kernel_output_index_remapping(
 
     Iterates over the combined batch*heads dimension and the seq_len dimension.
     """
+    batch = hl.specialize(batch)
+    heads = hl.specialize(heads)
     batch_heads, seq_len, head_dim = x.size()
     out = torch.empty([batch, heads, seq_len, head_dim], dtype=x.dtype, device=x.device)
     for bh in hl.grid(batch_heads):
@@ -1598,7 +1600,7 @@ class TestPallas(TestCase):
         with self.subTest(name="shrunken_blockspec"):
             self.assertIn(
                 "pl.BlockSpec((1, 1, _BLOCK_SIZE_1, 128), "
-                "lambda _j: (offset_0 // heads, offset_0 % heads, _j, 0)",
+                f"lambda _j: (offset_0 // {heads}, offset_0 % {heads}, _j, 0)",
                 code,
             )
 
@@ -6007,6 +6009,65 @@ class TestPallas(TestCase):
         self.assertIn("device='meta'", code)
         # Launcher return captured into output variable.
         self.assertIn("out = _launcher(", code)
+
+    def test_output_first_scalar_device_uses_input(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=False)
+        def stride_from_container(values):
+            out = torch.empty_like(values[0])
+            for row, column in hl.tile(out.shape):
+                out[row, column] = values[0][row, column] + values[0].stride(0)
+            return out
+
+        x = torch.arange(12, device=DEVICE, dtype=torch.float32).reshape(3, 4)
+        code, result = code_and_output(
+            stride_from_container, ([x],), block_sizes=[4, 4]
+        )
+        torch.testing.assert_close(result, x + x.stride(0))
+        self.assertIn("_output_indices=[0]", code)
+        self.assertIn("device='meta'", code)
+        self.assertIn("device=values[0].device", code)
+
+    @parametrize("size", [8, 5])
+    def test_scalar_store_broadcast(self, size: int) -> None:
+        @helion.kernel(backend="pallas", static_shapes=False)
+        def filled_output(value: float, size: hl.constexpr, device: torch.device):
+            out = torch.empty((size,), device=device)
+            for tile in hl.tile(out.shape):
+                out[tile] = value
+            return out
+
+        _, result = code_and_output(
+            filled_output, (2.5, size, torch.device(DEVICE)), block_sizes=[8]
+        )
+        torch.testing.assert_close(result, torch.full((size,), 2.5, device=DEVICE))
+
+    def test_singleton_store_broadcast(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=False)
+        def repeat_rows(x: torch.Tensor):
+            out = torch.empty((3, x.numel()), device=x.device, dtype=x.dtype)
+            for rows, columns in hl.tile(out.shape):
+                out[rows, columns] = x[None, columns]
+            return out
+
+        x = torch.arange(8, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(repeat_rows, (x,), block_sizes=[4, 8])
+        torch.testing.assert_close(result, x.expand(3, 8))
+
+    def test_output_only_scalar_device_uses_backend_default(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=False)
+        def filled_output(value: float, device: torch.device):
+            out = torch.empty((8,), device=device)
+            for tile in hl.tile(out.numel()):
+                out[tile] = hl.full((tile,), value)
+            return out
+
+        code, result = code_and_output(
+            filled_output, (2.5, torch.device(DEVICE)), block_sizes=[8]
+        )
+        torch.testing.assert_close(result, torch.full((8,), 2.5, device=DEVICE))
+        self.assertIn("_output_indices=[0]", code)
+        self.assertIn("device='meta'", code)
+        self.assertNotIn("device=out.device", code)
 
     def test_new_empty_output_only(self) -> None:
         """new_empty allocations should also be recognized as output-only."""

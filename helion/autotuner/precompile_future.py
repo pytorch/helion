@@ -384,8 +384,6 @@ def _prepare_precompiler_for_fork(
     args: Sequence[object],
     config: Config,
     kernel: _AutotunableKernel,
-    decorator: str,
-    logger: AutotuningLogger,
 ) -> Callable[[], bool] | None:
     def extract_launcher(
         triton_kernel: object,
@@ -407,21 +405,6 @@ def _prepare_precompiler_for_fork(
         if precompiler is already_compiled:
             return None
         return precompiler
-    except Exception as e:
-        maybe_dump_triton_failure(kernel, config, e)
-        log_generated_triton_code_debug(
-            logger,
-            kernel,
-            config,
-            prefix=f"Generated Triton code for {decorator}:",
-        )
-        logger.warning(
-            "Helion autotuner precompile error for %s. %s",
-            decorator,
-            SUPPRESSED_TRITON_CODE_MSG,
-            exc_info=True,
-        )
-        raise
 
 
 def _run_kernel_in_subprocess_fork(
@@ -589,13 +572,27 @@ class PrecompileFuture:
         else:
             try:
                 precompiler = _prepare_precompiler_for_fork(
-                    fn, args, config, ctx.kernel, decorator, ctx.log
+                    fn, args, config, ctx.kernel
                 )
             except Exception as e:
+                maybe_dump_triton_failure(ctx.kernel, config, e)
+                action = classify_triton_exception(e)
+                if not ctx.settings.autotune_ignore_errors:
+                    log_generated_triton_code_debug(
+                        ctx.log,
+                        ctx.kernel,
+                        config,
+                        prefix=f"Generated Triton code for {decorator}:",
+                    )
+                    log = ctx.log.debug if action == "debug" else ctx.log.warning
+                    log(
+                        f"Helion autotuner precompile error for {decorator}.",
+                        SUPPRESSED_TRITON_CODE_MSG,
+                        exc_info=True,
+                    )
                 e.__traceback__ = None
                 if match_unrecoverable_runtime_error(e):
                     raise
-                action = classify_triton_exception(e)
                 if action == "raise" and not ctx.settings.autotune_ignore_errors:
                     raise
                 return PrecompileFuture.skip(ctx, config, False)

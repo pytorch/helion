@@ -17,6 +17,7 @@ from helion._testing import TestCase
 from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import output_only
 from helion._testing import skipIfCute
 from helion._testing import skipIfMetal
 from helion._testing import skipIfNotCUDA
@@ -28,6 +29,8 @@ from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessCuteAvailable
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallasTpu
+from helion._testing.reduction_inputs import exact_fp32_sum_input
+from helion.autotuner import IntegerFragment
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -270,7 +273,15 @@ class TestReductions(RefEagerTestBase, TestCase):
         ),
     )
     def test_reduction_over_multiple_dims(self, shape, dtype, transpose, op, chunk):
-        x = torch.randn(shape, device=DEVICE, dtype=dtype)
+        exact_sum = dtype == torch.float32 and op in ("sum", "bounded_sum")
+        # This test checks dimension merging and loop carries. Signed fixed-point
+        # data keeps their sums exact without making the inputs all one sign:
+        # at most 1536 * 2048 integer units < 2**24, with 1/1024-unit values.
+        x = (
+            exact_fp32_sum_input(shape).to(device=DEVICE, dtype=dtype)
+            if exact_sum
+            else torch.randn(shape, device=DEVICE, dtype=dtype)
+        )
         if x.size(1) == 1:
             x = x.as_strided(x.shape, (x.stride(0), 999, x.stride(2)))
         if transpose:
@@ -302,16 +313,25 @@ class TestReductions(RefEagerTestBase, TestCase):
         self.assertEqual(
             "flatten(1, 2)" in bound.to_triton_code(spec.default_config()), merged
         )
-        expected = (
-            (x - x.mean((1, 2), keepdim=True)).amax((1, 2))
-            if op == "centered"
-            else getattr(torch, "sum" if op == "bounded_sum" else op)(x, dim=(1, 2))
-        )
+        if exact_sum:
+            expected = (
+                x.cpu().to(torch.float64).sum((1, 2)).to(device=DEVICE, dtype=dtype)
+            )
+        elif op == "centered":
+            expected = (x - x.mean((1, 2), keepdim=True)).amax((1, 2))
+        else:
+            expected = getattr(torch, "sum" if op == "bounded_sum" else op)(
+                x, dim=(1, 2)
+            )
         for loop in (None, chunk) if chunk is not None else (None,):
-            actual = bound.compile_config(
-                helion.Config(block_sizes=[2], reduction_loops=[loop] * n_loops)
-            )(x, op)
-            torch.testing.assert_close(actual, expected)
+            with self.subTest(reduction_loop=loop):
+                actual = bound.compile_config(
+                    helion.Config(block_sizes=[2], reduction_loops=[loop] * n_loops)
+                )(x, op)
+                if exact_sum:
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                else:
+                    torch.testing.assert_close(actual, expected)
 
     @onlyBackends(["triton", "cute"])
     @skipIfRefEager("checks the generated code")
@@ -510,8 +530,19 @@ class TestReductions(RefEagerTestBase, TestCase):
                     out[tile, step] = total[:, None]
             return out
 
-        x = torch.randn(6, 24, 40, device=DEVICE)
-        scale = torch.randn(6, device=DEVICE)
+        # Generate the same data on every backend without changing global RNG
+        # state. Positive values make each nonempty reduction chunk nonzero,
+        # while the signed row scales below still exercise both signs.
+        # Every FP32 sum is exact: the absolute sum in quarter-units is bounded
+        # by 960 * 16 * 8 * 4 = 491520 < 2**24.
+        cpu_device = torch.device("cpu")
+        cpu_generator = torch.Generator(device=cpu_device).manual_seed(0)
+        x = torch.randint(
+            1, 17, (6, 24, 40), generator=cpu_generator, device=cpu_device
+        ).to(device=DEVICE, dtype=torch.float32)
+        scale = torch.tensor(
+            [-4.0, -2.0, -0.5, 0.25, 1.0, 8.0], device=DEVICE, dtype=torch.float32
+        )
         # Without static_shapes kernels aren't specialized on strides, so a
         # later input might not flatten into a view: the dims stay chained.
         for static_shapes in (True, False):
@@ -540,6 +571,8 @@ class TestReductions(RefEagerTestBase, TestCase):
                     torch.testing.assert_close(
                         output,
                         (x * scale[:, None, None]).sum((1, 2))[:, None].expand(-1, 3),
+                        rtol=0,
+                        atol=0,
                     )
 
     @onlyBackends(["triton", "cute"])
@@ -1251,6 +1284,32 @@ class TestReductions(RefEagerTestBase, TestCase):
         x = torch.randn([32, 2], device=DEVICE)
         code, out = code_and_output(sum_const_inner, (x,), block_size=16)
         torch.testing.assert_close(out, x.sum(-1), rtol=1e-4, atol=1e-4)
+
+    def test_sum_tunable_extent(self):
+        """Reduce a full slice over a host dim sized by hl.register_tunable.
+
+        The extent is fixed per config but is not a block size, so the slice
+        needs a reduction dim, also on backends that do not pad factory
+        tensors (Pallas).  Width 37 covers the tail mask.
+        """
+
+        @helion.kernel(static_shapes=True)
+        def host_factory(x: torch.Tensor) -> torch.Tensor:
+            extent = hl.register_tunable("width", IntegerFragment(1, 64, 16))
+            tmp = torch.ones((x.size(0), 2 * extent), dtype=x.dtype, device=x.device)
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = tmp[tile, :].sum(-1) + x[tile]
+            return out
+
+        x = torch.randn(17, device=DEVICE)
+        configs = [{"width": 16}, {"width": 37}]
+        if _get_backend() == "triton":
+            configs.append({"width": 37, "reduction_loops": [16]})
+        for config in configs:
+            with self.subTest(**config):
+                out = output_only(host_factory, (x,), block_size=16, **config)
+                torch.testing.assert_close(out, x + 2 * config["width"])
 
     @skipIfPallas("complex layernorm with fp16, not relevant to Pallas")
     @skipIfRefEager("Does not call assert_close")
@@ -2553,8 +2612,7 @@ class TestReductions(RefEagerTestBase, TestCase):
 
     @skipUnlessBackends(["triton", "cute"])
     @skipIfRefEager(
-        "checks the rolled loop's fp32 accumulator; ref mode has no rolled loop and"
-        " rounds the fp16 elementwise result as eager does"
+        "checks the rolled loop's fp32 accumulator; ref mode has no rolled loop"
     )
     def test_rolled_half_precision_prod(self):
         """A rolled fp16 prod keeps its fp32 loop-carried accumulator."""
@@ -2571,7 +2629,10 @@ class TestReductions(RefEagerTestBase, TestCase):
         _, result = code_and_output(
             row_prod, (x,), block_sizes=[1], reduction_loops=[64]
         )
-        expected = (1.0 + x.float() * 0.001).prod(-1).half()
+        # Eager rounds the two pointwise operations to half. Only the rolled
+        # product's accumulator stays float32 across reduction chunks.
+        values = 1.0 + x * 0.001
+        expected = values.float().prod(-1).half()
         torch.testing.assert_close(result, expected, rtol=2e-3, atol=0)
 
     @skipIfMetal("Metal gives only one reduction dimension per kernel a thread axis")

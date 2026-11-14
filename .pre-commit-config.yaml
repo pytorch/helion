@@ -12,7 +12,6 @@ repos:
     - id: check-toml
     - id: check-ast
     - id: check-added-large-files
-    - id: check-merge-conflict
     - id: check-executables-have-shebangs
     - id: check-shebang-scripts-are-executable
     - id: requirements-txt-fixer
@@ -38,6 +37,11 @@ repos:
 
 -   repo: local
     hooks:
+      - id: check-merge-conflict
+        name: check unresolved conflict markers
+        entry: python scripts/check_conflict_markers.py
+        language: system
+        types: [text]
       - id: check-main-in-examples
         name: ensure all example scripts have main()
         entry: python scripts/lint_examples_main.py

@@ -370,8 +370,7 @@ class FlyDSLBackend(Backend):
         candidates: list[Config] = []
         seen: set[tuple[object, ...]] = set()
 
-        rl_ids = spec.reduction_loops.valid_block_ids()
-        n_rl = len(rl_ids)
+        rl_ids = spec.rollable_reduction_block_ids()
 
         # V=8 (128-bit BufferCopy) is valid only for 16-bit dtypes; fp32 tops out
         # at V=4 (a V=8 fp32 copy is 256-bit -> BackendUnsupported). Reduction
@@ -387,10 +386,10 @@ class FlyDSLBackend(Backend):
             for i in range(1, ndim):
                 block_sizes[i] = 256
 
-        # Numel of the first looped-reduction dim (used to filter OOB chunks).
-        rl_numel: int | None = None
-        if len(spec.reduction_loops):
-            rl_numel = spec.reduction_loops[0].size_hint
+        # Every rollable axis receives the same chunk, so each extent must fit.
+        rl_numels = [
+            loop.size_hint for loop in spec.reduction_loops if loop.block_id in rl_ids
+        ]
 
         def _add(bs: list[int], rl: int | None, v: int | None = None) -> None:
             # Safety: for user-tiled reductions all column dims must be multiples
@@ -405,23 +404,30 @@ class FlyDSLBackend(Backend):
             # memory_ops derives V = chunk // 64, so use that here too rather than
             # V=1 -- otherwise this models the undivided element space and the
             # bound diverges from the codegen it guards.
-            if rl is not None and rl_numel is not None and rl_numel > 0:
+            if rl is not None:
                 v_eff = v if v is not None else max(1, rl // 64)
                 tc = rl // v_eff
-                last_offset = ((rl_numel + rl - 1) // rl - 1) * rl
-                max_div_idx = last_offset // v_eff + tc - 1
-                n_div = (rl_numel + v_eff - 1) // v_eff
-                if max_div_idx >= n_div:
-                    return
+                for rl_numel in rl_numels:
+                    if rl_numel > 0:
+                        last_offset = ((rl_numel + rl - 1) // rl - 1) * rl
+                        max_div_idx = last_offset // v_eff + tc - 1
+                        n_div = (rl_numel + v_eff - 1) // v_eff
+                        if max_div_idx >= n_div:
+                            return
             key = (tuple(bs), rl, v)
             if key in seen:
                 return
             seen.add(key)
             kw: dict[str, Any] = {"block_sizes": list(bs)}
             if rl is not None:
-                kw["reduction_loops"] = [rl] * n_rl
+                # Mandatory persistent axes keep their legacy Config positions,
+                # but have no rolling/vector-width search slot.
+                kw["reduction_loops"] = [
+                    rl if loop.block_id in rl_ids else None
+                    for loop in spec.reduction_loops
+                ]
                 if v is not None:
-                    kw["cute_vector_widths"] = [v] * n_rl
+                    kw["cute_vector_widths"] = [v] * len(spec.cute_vector_widths)
             candidates.append(Config(**kw))
 
         for bm in (1, 2, 4, 8, 16):
@@ -473,7 +479,7 @@ class FlyDSLBackend(Backend):
         # a temporary per-autotune override, so restore it in the finally so it
         # does not leak into a later explicit compile_config on the same bind.
         prev_baseline_fn = bound_kernel.settings.autotune_baseline_fn
-        if prev_baseline_fn is None and rl_numel is not None:
+        if prev_baseline_fn is None and rl_numels:
             safe_bs = (
                 [block_sizes[0]] + ([256] * (ndim - 1))
                 if ndim >= 2

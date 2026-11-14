@@ -24,6 +24,10 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessBlockPtr
 from helion._testing import slowIfBackends
+from helion._testing.tensor_container_guards import TensorField
+from helion._testing.tensor_container_guards import TensorTuple
+from helion._testing.tensor_container_guards import container_bias_case
+from helion._testing.tensor_container_guards import field_increment
 from helion.autotuner.benchmark_provider import _searching_candidates
 from helion.exc import ShapeSpecializingAllocation
 import helion.language as hl
@@ -366,20 +370,42 @@ class TestSpecialize(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, x + x.stride(0))
         self.assertIn("stride = x.stride(0)", code)
 
-        # CuTe guards the unit-stride axes and byte-alignment class needed by
-        # vector copies. Exact stride values within that class stay dynamic.
+        # empty_like separates canonical and noncanonical input layouts.
+        # Exact strides within the noncanonical class remain runtime values.
         padded = torch.empty_strided(
             x.size(), (2 * x.stride(0), 1), dtype=x.dtype, device=x.device
         )
         padded.copy_(x)
-        self.assertIs(fn.bind((x,)), fn.bind((padded,)))
+        self.assertIsNot(fn.bind((x,)), fn.bind((padded,)))
         torch.testing.assert_close(fn(padded), padded + padded.stride(0))
+        more_padded = torch.empty_strided(
+            x.size(), (3 * x.stride(0), 1), dtype=x.dtype, device=x.device
+        )
+        more_padded.copy_(x)
+        self.assertIs(fn.bind((padded,)), fn.bind((more_padded,)))
+        torch.testing.assert_close(fn(more_padded), more_padded + more_padded.stride(0))
         transposed = x.T
         if fn.settings.backend == "cute":
-            self.assertIsNot(fn.bind((x,)), fn.bind((transposed,)))
+            self.assertIsNot(fn.bind((padded,)), fn.bind((transposed,)))
         else:
-            self.assertIs(fn.bind((x,)), fn.bind((transposed,)))
+            self.assertIs(fn.bind((padded,)), fn.bind((transposed,)))
         torch.testing.assert_close(fn(transposed), transposed + transposed.stride(0))
+
+    def test_unspecialized_device_stride_uses_current_layout(self):
+        @helion.kernel(static_shapes=False, autotune_effort="none")
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for row, column in hl.tile(x.shape):
+                out[row, column] = x[row, column] + x.stride(0) + x.stride(-1)
+            return out
+
+        x = torch.randn((8, 8), device=DEVICE)
+        padded = torch.empty_strided(x.shape, (16, 1), device=DEVICE)
+        padded.copy_(x)
+        for tensor in (x, padded, x.T):
+            torch.testing.assert_close(
+                fn(tensor), tensor + tensor.stride(0) + tensor.stride(-1)
+            )
 
     def test_unspecialized_stride_host_control_flow(self):
         """Host control flow reads an unspecialized stride at runtime."""
@@ -407,12 +433,18 @@ class TestSpecialize(RefEagerTestBase, TestCase):
             x.size(), (2 * x.stride(0), 1), dtype=x.dtype, device=x.device
         )
         padded.copy_(x)
-        self.assertIs(fn.bind((x,)), fn.bind((padded,)))
+        self.assertIsNot(fn.bind((x,)), fn.bind((padded,)))
         torch.testing.assert_close(fn(padded), padded + 3)
+        more_padded = torch.empty_strided(
+            x.size(), (3 * x.stride(0), 1), dtype=x.dtype, device=x.device
+        )
+        more_padded.copy_(x)
+        self.assertIs(fn.bind((padded,)), fn.bind((more_padded,)))
+        torch.testing.assert_close(fn(more_padded), more_padded + 3)
         if fn.settings.backend == "cute":
-            self.assertIsNot(fn.bind((x,)), fn.bind((transposed,)))
+            self.assertIsNot(fn.bind((padded,)), fn.bind((transposed,)))
         else:
-            self.assertIs(fn.bind((x,)), fn.bind((transposed,)))
+            self.assertIs(fn.bind((padded,)), fn.bind((transposed,)))
         torch.testing.assert_close(fn(transposed), transposed + 1)
 
     def test_specialize_stride_basic(self):
@@ -575,6 +607,30 @@ class TestSpecialize(RefEagerTestBase, TestCase):
                 )
                 torch.testing.assert_close(fn(*contiguous_args), x + 1)
                 torch.testing.assert_close(fn(*transposed_args), transposed + 64)
+
+    def test_record_tensor_assignment_matches_local_alias(self):
+        for holder_type in (TensorField, TensorTuple):
+            for direct in (False, True):
+                with self.subTest(holder_type=holder_type.__name__, direct=direct):
+                    backing = torch.full((43,), -101.0, device=DEVICE)
+                    values = backing[1:39:2]
+                    values.copy_(torch.arange(values.numel(), device=DEVICE))
+                    holder = holder_type(values)
+                    args = (holder, direct, values.device)
+                    kernel = helion.kernel(
+                        field_increment.fn,
+                        static_shapes=False,
+                        autotune_effort="none",
+                    )
+                    bound = kernel.bind(args)
+                    bound.set_config(helion.Config(block_sizes=[32]))
+                    expected = backing.clone()
+                    for _call in range(2):
+                        result = bound(*args)
+                        expected[1:39:2].add_(2)
+                        self.assertIs(result, values)
+                        self.assertIs(holder.weight, values)
+                        torch.testing.assert_close(backing, expected, rtol=0, atol=0)
 
     def test_specialize_concrete_stride_dataclass(self):
         """Attribute-like container fields retain their input source path."""
@@ -1008,6 +1064,37 @@ class TestSpecialize(RefEagerTestBase, TestCase):
                     torch.testing.assert_close(
                         masked_copy(x, mask), torch.where(mask, x, 0.0)
                     )
+
+    def test_container_broadcast_transitions_use_current_shape(self):
+        # Direct fields and composed dict/list/namedtuple projections exercise
+        # generated argument replay. The CPU module covers every container kind.
+        for kind in ("dataclass", "nested"):
+            for first_size in (1, 4):
+                with self.subTest(kind=kind, first_size=first_size):
+                    x = torch.arange(32, device=DEVICE).reshape(4, 8).float()
+                    first_bias = (
+                        torch.arange(first_size * 8, device=DEVICE)
+                        .reshape(first_size, 8)
+                        .float()
+                    )
+                    second_size = 5 - first_size
+                    second_bias = (
+                        torch.arange(second_size * 8, device=DEVICE)
+                        .reshape(second_size, 8)
+                        .float()
+                    )
+                    kernel, original = container_bias_case(kind, x, first_bias)
+                    _, changed = container_bias_case(kind, x, second_bias)
+                    kernel.reset()
+                    bound = kernel.bind(original)
+                    bound.set_config(helion.Config(block_sizes=[4, 8]))
+                    torch.testing.assert_close(kernel(*original), x + first_bias)
+                    replacement = kernel.bind(changed)
+                    self.assertIsNot(replacement, bound)
+                    replacement.set_config(helion.Config(block_sizes=[4, 8]))
+                    for args, bias in ((changed, second_bias), (original, first_bias)):
+                        torch.testing.assert_close(kernel(*args), x + bias)
+                    self.assertIs(kernel.bind(original), bound)
 
     def test_size_one_broadcast_dim_is_keyed_with_omitted_default(self):
         """A call omitting a default binds through an alias of the full-args

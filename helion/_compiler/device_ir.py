@@ -12,16 +12,20 @@ import operator
 import re
 import textwrap
 import threading
+import types
 from typing import TYPE_CHECKING
 from typing import Callable
 from typing import Iterator
 from typing import NamedTuple
 from typing import Protocol
+from typing import TypeAlias
 from typing import cast
 from unittest.mock import patch
 
 import torch
 from torch._dynamo.convert_frame import compile_lock
+from torch._dynamo.source import TensorProperty
+from torch._dynamo.source import TensorPropertySource
 from torch._inductor.decomposition import select_decomp_table
 from torch.fx._lazy_graph_module import _LazyGraphModule
 from torch.fx.experimental import proxy_tensor
@@ -31,6 +35,8 @@ from torch.utils import _pytree as pytree
 from .. import Config
 from .. import exc
 from .. import language as hl
+from ..autotuner.config_fragment import _BUILTIN_TUNABLE_FRAGMENTS
+from ..autotuner.config_fragment import ConfigSpecFragment
 from ..autotuner.config_spec import FULL_EXTENT_CATEGORIES
 from ..autotuner.config_spec import SIZED_REDUCTION_CATEGORIES
 from ..autotuner.config_spec import VALID_CROSS_LOOP_PIPELINES
@@ -43,6 +49,7 @@ from ..language import _tracing_ops
 from ..language._decorators import _TENSOR_METHOD_REPLACEMENTS
 from ..language._decorators import args_to_proxies
 from ..language._decorators import get_device_func_replacement
+from ..language._decorators import is_api_func
 from ..language._tracing_ops import _new_var
 from ..language.tile_proxy import Tile
 from ..language.tile_proxy import _CheckForIndexCalls
@@ -57,11 +64,18 @@ from .aten_lowering import resolve_reduction_sizes
 from .backend import DeviceIRStage
 from .compile_environment import CompileEnvironment
 from .compile_environment import warning
+from .container_identity import compare_container_identity
+from .container_identity import record_opaque_container_result
+from .fragment_call import guard_fragment_call_input
+from .fragment_comparison import guard_fragment_comparison
+from .fx_side_effects import is_impure_node
 from .host_function import HostFunction
+from .host_function import SymbolOrigin
 from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
 from .inductor_lowering import prepare_graph_lowerings
+from .logical_reduction_dims import install_logical_reduction_decompositions
 from .matmul_utils import tensor_matmul_replacement
 from .matmul_utils import torch_matmul_replacement
 from .merge_reduction_dims import _MERGE_OPS
@@ -69,9 +83,14 @@ from .merge_reduction_dims import chain_reduction_dims
 from .merge_reduction_dims import merge_reduction_dims
 from .node_masking import defer_pallas_load_masks
 from .node_masking import remove_unnecessary_masking
+from .roll_reduction import EffectfulReductionReplay
 from .roll_reduction import ReductionRoller
 from .source_location import current_location
+from .tuple_constants import TupleConstants
 from .type_info import CallableType
+from .type_info import ClassType
+from .type_info import CollectionType
+from .type_info import ConfigFragmentType
 from .type_info import DictType
 from .type_info import GridIndexType
 from .type_info import IterType
@@ -90,12 +109,22 @@ from .type_info import _eval_compare
 from .type_info import _eval_unary
 from .type_info import tensor_may_have_many_elements
 from .type_info import tile_spanned_by_slice
+from .variable_origin import AttributeOrigin
+from .variable_origin import CollectionLengthOrigin
+from .variable_origin import DeviceOrigin
+from .variable_origin import GetItemOrigin
+from .variable_origin import NameOrigin
+from .variable_origin import Origin
+from .variable_origin import TensorStrideOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterable
     from collections.abc import Mapping
     from collections.abc import Sequence
+    from types import BuiltinMethodType
+
+    from torch._guards import Source
 
     from ..autotuner.config_spec import AccumulatorFact
     from ..autotuner.config_spec import MemoryOpFact
@@ -125,6 +154,37 @@ def _lerp_scalar_decomp(
     return start + weight * (end - start)
 
 
+def _host_tensor_stride(
+    tensor: torch.Tensor, origin: Origin, source: Source | None, dim: int | None = None
+) -> int | torch.SymInt | tuple[int | torch.SymInt, ...]:
+    host = HostFunction.current()
+    env = CompileEnvironment.current()
+
+    def symbolic(value: int | torch.SymInt, axis: int) -> int | torch.SymInt:
+        stride_origin = TensorStrideOrigin(origin, axis)
+        result = (
+            env.input_symint(
+                value, TensorPropertySource(source, TensorProperty.STRIDE, axis)
+            )
+            if source is not None
+            else env.cached_create_unbacked_symint(
+                ("host_tensor_stride", id(tensor), axis), env.size_hint(value)
+            )
+        )
+        if isinstance(result, torch.SymInt):
+            host.expr_to_origin[result._sympy_()] = SymbolOrigin(
+                stride_origin, fake_value=tensor
+            )
+        return result
+
+    if dim is None:
+        return tuple(
+            symbolic(value, axis) for axis, value in enumerate(tensor.stride())
+        )
+    value = tensor.stride(dim)
+    return symbolic(value, dim % tensor.ndim)
+
+
 def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., object]]:
     from ..language._gelu_tanh_approx import install_gelu_decomp
 
@@ -141,6 +201,7 @@ def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., obje
     # node so the cute epilogue chain analyzer can fuse it; the inductor
     # default decomp expands the polynomial form and breaks the chain.
     install_gelu_decomp(decomp_table)
+    install_logical_reduction_decompositions(decomp_table)
     for op in _MERGE_OPS.values():
         decomp_table[op] = chain_reduction_dims(op, decomp_table.get(op))
     return decomp_table
@@ -329,7 +390,8 @@ class NodeArgsGraphInfo(GraphInfo):
         raise KeyError("Placeholder not found in node_args")
 
     def kwargs(self) -> dict[str, object]:
-        # TODO(jansel): do we need to map these to the new graph in the case of a copy?
+        # A single graph copy cannot remap its external captures. Collection
+        # copies rebind these once all parent and child graphs exist.
         return {
             "node_args": [*self.node_args],
         }
@@ -564,7 +626,7 @@ class ReductionLoopGraphInfo(ForLoopGraphInfo):
 @dataclasses.dataclass
 class IfGraphInfo(NodeArgsGraphInfo):
     predicate_is_tensor: bool = False
-    else_branch: ElseGraphInfo | None = None
+    else_branch: int | None = None
 
     if_arg_names: list[str] | None = None
     else_arg_names: list[str] | None = None
@@ -973,7 +1035,7 @@ class DeviceIR:
         graph_info_cls: type[GraphInfo] = GraphInfo,
         **kwargs: object,
     ) -> int:
-        graph.eliminate_dead_code()
+        graph.eliminate_dead_code(is_impure_node=is_impure_node)
         graph_id = len(self.graphs)
         self.graphs.append(graph_info_cls(graph_id=graph_id, graph=graph, **kwargs))
         return graph_id
@@ -1114,38 +1176,74 @@ class DeviceIR:
             graph_to_info: dict[int, RolledReductionInfo] = {}
             allow_loop = False
 
-            # Check if any graph contains matmul, a gather or dev_prts
+            # Check if any graph contains matmul, fixed indexing or dev_prts
             # stacking with rdim, or reduces over rdim along a non-tile
             # (hl.arange) axis that cannot be sliced inside the reduction loop.
             can_roll_graphs = True
             for graph_info in self.graphs[:num_original_graphs]:
-                roller = ReductionRoller(self, rdim, {})
+                roller = ReductionRoller(self, rdim, {}, allow_unbound_alias_facts=True)
                 if (
                     roller.has_matmul_with_rdim(graph_info.graph)
-                    or roller.has_gather_along_rdim(graph_info.graph)
+                    or roller.has_indexing_along_rdim(graph_info.graph)
                     or roller.has_stack_tensor_with_rdim(graph_info.graph)
                     or roller.has_unrollable_reduction(graph_info.graph)
                 ):
                     can_roll_graphs = False
                     break
 
-            if ReductionRoller(self, rdim, {}).has_pinned_rdim():
+            roller = ReductionRoller(self, rdim, {}, allow_unbound_alias_facts=True)
+            # Registered aliases still load through their owner's symbol.
+            # Rolling just the alias would leave full-domain loads unsliced.
+            if roller.has_pinned_rdim() or (
+                isinstance(rdim.size, torch.SymInt)
+                and env.registered_extent_owner(rdim.block_id) is not None
+            ):
                 can_roll_graphs = False
 
             if not can_roll_graphs:
-                rdim_results.append((rdim, False, set()))
+                rdim_results.append((rdim, False, set(), None))
                 continue
 
             used_graphs: set[int] = set()
             all_graphs_processed = True
+            persistent_reason = None
             for graph_id in range(num_original_graphs):
                 graph_info = self.graphs[graph_id]
                 assert graph_id == graph_info.graph_id
-                roller = ReductionRoller(self, rdim, graph_to_info)
+                roller = ReductionRoller(
+                    self, rdim, graph_to_info, allow_unbound_alias_facts=True
+                )
                 try:
                     roller.process(graph_info.graph)
-                except NotImplementedError:
+                except NotImplementedError as error:
                     all_graphs_processed = False
+                    if isinstance(error, EffectfulReductionReplay):
+                        reason = str(error)
+                        persistent_reason = (
+                            reason
+                            if persistent_reason is None
+                            else min(persistent_reason, reason)
+                        )
+                        # Keep this child persistent while analyzing later
+                        # graphs, including its callers. The axis cannot roll,
+                        # but a plain refusal elsewhere must still veto its
+                        # compatibility slot regardless of graph order.
+                        reduction_info = RolledReductionInfo(
+                            rolled_block_ids=[rdim.block_id],
+                            original_graph_id=graph_id,
+                            used_rdim=len(roller.graphs_added) > 0,
+                            can_be_rolled_by_caller=roller.outer_count == 0
+                            and len(roller.graphs_added) == 1,
+                        )
+                        graph_to_info[graph_id] = reduction_info
+                        self.rolled_reductions.append(reduction_info)
+                        # The failed replay follows an already emitted sweep.
+                        # Retiring it must not give a later overlapping axis
+                        # the slot this graph occupied in saved configs.
+                        if reduction_info.used_rdim:
+                            used_graphs.add(graph_id)
+                        continue
+                    persistent_reason = None
                     break
                 reduction_info = RolledReductionInfo(
                     rolled_block_ids=[rdim.block_id],
@@ -1172,7 +1270,7 @@ class DeviceIR:
                 graph_to_info[graph_id] = reduction_info
             if not all_graphs_processed:
                 allow_loop = False
-            rdim_results.append((rdim, allow_loop, used_graphs))
+            rdim_results.append((rdim, allow_loop, used_graphs, persistent_reason))
 
         env.backend.rewrite_device_ir(
             DeviceIRStage.REDUCTION_ROLLING_ANALYZED, self.host_function, self
@@ -1181,8 +1279,8 @@ class DeviceIR:
         # Second pass: register reduction loop specs, ensuring that each
         # original graph is only rolled for one reduction dim at a time.
         graphs_with_rolled_rdim: set[int] = set()
-        for rdim, allow_loop, used_graphs in rdim_results:
-            if not allow_loop:
+        for rdim, allow_loop, used_graphs, persistent_reason in rdim_results:
+            if not allow_loop and persistent_reason is None:
                 continue
             if used_graphs & graphs_with_rolled_rdim:
                 continue
@@ -1195,11 +1293,13 @@ class DeviceIR:
                             env.backend.reduction_loops_allow_non_power_of_two
                         ),
                         allow_full_extent=env.backend.reduction_loops_allow_full_extent,
+                        persistent_reason=persistent_reason,
                     )
                 )
-                env.backend.register_reduction_loop_config_slots(
-                    env, rdim.block_id, rdim.size_hint()
-                )
+                if allow_loop:
+                    env.backend.register_reduction_loop_config_slots(
+                        env, rdim.block_id, rdim.size_hint()
+                    )
             graphs_with_rolled_rdim |= used_graphs
 
         env.backend.rewrite_device_ir(
@@ -1505,11 +1605,47 @@ class DeviceIR:
 
         temp = copy.copy(self)
         temp.graphs = [g.copy() for g in self.graphs]
+        temp._rebind_control_flow_captures()
+        if self.host_function is not None:
+            from .selected_tunable_types import specialize_selected_tunable_types
+
+            specialize_selected_tunable_types(self.host_function, temp.graphs, config)
         if roll_reductions:
             temp._apply_rolling(config)
         temp._apply_epilogue_subtiling(config)
         temp._hoist_inband_polls()
+        temp._rebind_control_flow_captures()
         return temp.graphs
+
+    def _rebind_control_flow_captures(self) -> None:
+        # The current call operands are authoritative. Earlier graph rewrites
+        # may already have removed the nodes recorded in node_args, and copies
+        # retain those old references. Helper graphs without a control-flow
+        # capture slot keep their separate argument convention unchanged.
+        parents: dict[int, tuple[torch.fx.Node, int]] = {}
+        graphs = {info.graph_id: info.graph for info in self.graphs}
+        pending = list(reversed(self.root_ids))
+        visited: set[int] = set()
+        while pending:
+            graph_id = pending.pop()
+            if graph_id in visited:
+                continue
+            visited.add(graph_id)
+            for node in graphs[graph_id].nodes:
+                for child_id, slot in _control_flow_graph_entries(node):
+                    # While arguments are mutable state, not invariant
+                    # captures, but still need the copied initial operands.
+                    capture_slot = 2 if slot is None else slot
+                    parents.setdefault(child_id, (node, capture_slot))
+                    pending.append(child_id)
+        # Reduction analysis appends unreachable copies of parent graphs.
+        # They must not replace the operands of a root-reachable call.
+        for info in self.graphs:
+            if isinstance(info, NodeArgsGraphInfo) and info.graph_id in parents:
+                parent, slot = parents[info.graph_id]
+                info.node_args = list(
+                    cast("Sequence[torch.fx.Node]", parent.args[slot])
+                )
 
     def _hoist_inband_polls(self) -> None:
         """Move each inband peer load, with its pure inputs, up to the previous
@@ -1534,7 +1670,7 @@ class DeviceIR:
             )
 
         def reorderable(node: torch.fx.Node) -> bool:
-            # Impure asm (e.g. clock reads) is not marked side effecting.
+            # Poll hoisting conservatively leaves all inline assembly in place.
             return (
                 node.op == "call_function"
                 and node.target not in (memory_ops.load, inline_asm_elementwise)
@@ -1588,6 +1724,15 @@ class DeviceIR:
                 if info.rolled_block_ids == [block_id]:
                     graph_to_info[info.original_graph_id] = info
 
+            # A child that fits entirely in one sweep can run in its caller's
+            # sweep. Keep its original body for that context: the standalone
+            # entry below still needs its own reduction loop.
+            caller_bodies = {
+                graph_id: self.graphs[graph_id].copy()
+                for graph_id, info in graph_to_info.items()
+                if info.used_rdim and info.can_be_rolled_by_caller
+            }
+            inner_graph_ids: list[int] = []
             for graph_id in range(num_original_graphs):
                 info = graph_to_info.get(graph_id)
                 if info is None or not info.used_rdim:
@@ -1600,12 +1745,71 @@ class DeviceIR:
                     self, rdim, graph_to_info, enable_fusion=enable_fusion
                 )
                 new_graph = roller.process(graph_info.graph)
+                inner_graph_ids.extend(roller.graphs_added)
                 new_graph_id = self.add_graph(
                     new_graph, type(graph_info), **graph_info.kwargs()
                 )
                 # Replace only the graph payload to preserve root metadata
                 # (e.g., phase_index used for barrier phase splitting).
                 graph_info.graph = self.graphs[new_graph_id].graph
+
+            self._bind_caller_rolled_graphs(caller_bodies, inner_graph_ids)
+
+    def _bind_caller_rolled_graphs(
+        self, caller_bodies: dict[int, GraphInfo], inner_graph_ids: list[int]
+    ) -> None:
+        """Bind nested calls to bodies owned by this reduction sweep."""
+        caller_entries: dict[int, int] = {}
+
+        def caller_entry(graph_id: int, *, copy_branch_descriptor: bool = False) -> int:
+            if graph_id in caller_entries:
+                return caller_entries[graph_id]
+            if graph_id in caller_bodies:
+                body = caller_bodies[graph_id]
+            elif copy_branch_descriptor:
+                # Even an unchanged then body owns the paired else edge in
+                # IfGraphInfo. Give this caller its own descriptor when only
+                # the else body changes; standalone users keep the old pair.
+                assert isinstance(self.graphs[graph_id], IfGraphInfo)
+                body = self.graphs[graph_id].copy()
+            else:
+                return graph_id
+            new_id = self.add_graph(body.graph, type(body), **body.kwargs())
+            caller_entries[graph_id] = new_id
+            rebind_calls(body.graph)
+            entry = self.graphs[new_id]
+            if isinstance(entry, IfGraphInfo) and entry.else_branch is not None:
+                # If codegen also follows this edge through GraphInfo.
+                entry.else_branch = caller_entry(entry.else_branch)
+            return new_id
+
+        def rebind_calls(graph: torch.fx.Graph) -> None:
+            for node in graph.nodes:
+                if _tracing_ops.is_for_loop_target(node.target):
+                    slots = (0,)
+                elif node.target is _tracing_ops._if:
+                    slots = (1, 2)
+                else:
+                    continue
+                args = list(node.args)
+                for slot in slots:
+                    child_id = args[slot]
+                    assert isinstance(child_id, int)
+                    args[slot] = caller_entry(child_id)
+                if node.target is _tracing_ops._if:
+                    branch = self.graphs[args[1]]
+                    assert isinstance(branch, IfGraphInfo)
+                    if branch.else_branch != args[2]:
+                        original_if = node.args[1]
+                        assert isinstance(original_if, int)
+                        args[1] = caller_entry(original_if, copy_branch_descriptor=True)
+                node.args = tuple(args)
+
+        # Only calls already inside a sweep use these entries. Calls from
+        # outside it retain their independently rolled graph, including
+        # when the same child is reached in both contexts.
+        for graph_id in inner_graph_ids:
+            rebind_calls(self.graphs[graph_id].graph)
 
     def _apply_epilogue_subtiling(self, config: Config) -> None:
         """Apply epilogue subtiling on the graph copies if enabled."""
@@ -1689,17 +1893,74 @@ def _is_static_slice_bound(bound: object) -> bool:
     return False
 
 
+@dataclasses.dataclass
+class _SequenceOrigin:
+    """Element paths and allocation provenance, shared by static aliases."""
+
+    items: list[_StaticOrigin]
+    constructed: bool = False
+    captured: bool = False
+
+
+@dataclasses.dataclass
+class _MappingOrigin:
+    """Paths of constructed dictionary values, including nested mappings."""
+
+    items: dict[object, _StaticOrigin]
+    constructed: bool = False
+
+
+_StaticOrigin: TypeAlias = Origin | _SequenceOrigin | _MappingOrigin | None
+
+
+def _item_origin(origin: _StaticOrigin, index: int | str) -> _StaticOrigin:
+    if isinstance(origin, _SequenceOrigin):
+        assert isinstance(index, int)
+        return origin.items[index]
+    if isinstance(origin, _MappingOrigin):
+        return origin.items[index]
+    return GetItemOrigin(origin, index) if origin is not None else None
+
+
 class WalkDeviceAST(NodeVisitor):
     def __init__(self, device_ir: DeviceIR) -> None:
         super().__init__()
         self.device_ir = device_ir
+        hf = device_ir.host_function
+        self.tuple_constants = (
+            TupleConstants(hf.fn.__code__) if hf is not None else None
+        )
         self.scope: dict[str, object] = {}
+        # Static unrolling changes values without changing the shared AST types.
+        # Preserve their actual input paths for folded comparison guards.
+        self.scope_origins: dict[str, _StaticOrigin] = {}
+        self.expression_origins: dict[ast.AST, _StaticOrigin] = {}
+
+    def _value_origin(self, node: ast.AST) -> _StaticOrigin:
+        if isinstance(node, ast.Name) and node.id in self.scope_origins:
+            return self.scope_origins[node.id]
+        if node in self.expression_origins:
+            return self.expression_origins[node]
+        assert isinstance(node, ExtendedAST)
+        return node._type_info.origin if node._type_info is not None else None
+
+    def _index_origin(self, node: ast.AST, index: int | str) -> _StaticOrigin:
+        return _item_origin(self._value_origin(node), index)
 
     def generic_visit(self, node: ast.AST) -> None:
         raise exc.StatementNotSupported(type(node).__name__)
 
-    def _assign(self, target: ast.AST, value: object) -> None:
+    def _assign(
+        self, target: ast.AST, value: object, origin: _StaticOrigin = None
+    ) -> None:
         if isinstance(target, ast.Name):
+            if isinstance(
+                value, torch.SymFloat
+            ) and HostFunction.current().is_host_scalar_expr(value.node.expr):
+                # A host expression may be a kernel argument. Loop/branch phi
+                # outputs can overwrite their input's generated name, so each
+                # device binding needs its own SSA value at the assignment.
+                value = _new_var(value)
             if isinstance(value, torch.Tensor):
                 # rename the node to match the variable name
                 mode = proxy_tensor.get_proxy_mode()
@@ -1713,13 +1974,18 @@ class WalkDeviceAST(NodeVisitor):
                             target.id, None
                         )
             self.scope[target.id] = value
+            self.scope_origins[target.id] = origin
         elif isinstance(target, (ast.Tuple, ast.List)):
             for i, n in enumerate(target.elts):
                 if isinstance(n, ast.Starred):
                     raise exc.StarredArgsNotSupportedOnDevice
 
-                # pyrefly: ignore [bad-index]
-                self._assign(n, value[i])
+                self._assign(
+                    n,
+                    # pyrefly: ignore [bad-index]
+                    value[i],
+                    _item_origin(origin, i),
+                )
         elif isinstance(target, ast.Subscript):
             dst = self.visit(target.value)
             assert isinstance(value, torch.Tensor)
@@ -1741,8 +2007,8 @@ class WalkDeviceAST(NodeVisitor):
     def _static_scope(self) -> dict[str, object]:
         return {k: v for k, v in self.scope.items() if not self.should_become_arg(v)}
 
-    def _lift_inputs(self, names: Iterable[str]) -> LiftTensorArgs:
-        return LiftTensorArgs(
+    def _lift_inputs(self, names: Iterable[str]) -> LiftGraphArgs:
+        return LiftGraphArgs(
             {
                 name: self.scope[name]
                 for name in names
@@ -1755,8 +2021,8 @@ class WalkDeviceAST(NodeVisitor):
         subgraph_scope: dict[str, object],
         writes: dict[str, int],
         include_new: bool = False,
-    ) -> LiftTensorArgs:
-        return LiftTensorArgs(
+    ) -> LiftGraphArgs:
+        return LiftGraphArgs(
             {
                 k: v
                 for k, v in subgraph_scope.items()
@@ -1780,21 +2046,22 @@ class WalkDeviceAST(NodeVisitor):
 
     def _trace_graph(
         self,
-        inputs: LiftTensorArgs,
-        build_fn: Callable[[WalkDeviceAST], tuple[object, LiftTensorArgs]],
+        inputs: LiftGraphArgs,
+        build_fn: Callable[[WalkDeviceAST], tuple[object, LiftGraphArgs]],
         *,
         graph_info_cls: type[NodeArgsGraphInfo],
         copy_tensor_args: bool = True,
         **graph_kwargs: object,
-    ) -> tuple[int, LiftTensorArgs]:
-        outputs_holder: LiftTensorArgs | None = None
+    ) -> tuple[int, LiftGraphArgs]:
+        outputs_holder: LiftGraphArgs | None = None
 
         def runner(*args: object) -> object:
             nonlocal outputs_holder
             subgraph_walker = WalkDeviceAST(self.device_ir)
             subgraph_walker.scope.update(self._static_scope())
+            subgraph_walker.scope_origins.update(self.scope_origins)
             subgraph_walker.scope.update(
-                inputs.replace_tensor_args(args, copy_tensors=copy_tensor_args)
+                inputs.replace_graph_args(args, copy_tensors=copy_tensor_args)
             )
             result, outputs_holder = build_fn(subgraph_walker)
             return result
@@ -1802,7 +2069,7 @@ class WalkDeviceAST(NodeVisitor):
         with self.disable_tracing() as tracer:
             graph = proxy_tensor.make_fx(
                 runner, decomposition_table=_get_custom_decomp_table()
-            )(*inputs.get_tensor_args()).graph
+            )(*inputs.get_graph_args()).graph
             graph_id = self.device_ir.add_graph(
                 graph,
                 graph_info_cls=graph_info_cls,
@@ -1830,7 +2097,12 @@ class WalkDeviceAST(NodeVisitor):
         return _eval_binary(node.op, left, right)
 
     def visit_UnaryOp(self, node: ast.UnaryOp) -> object:
-        operand = self.visit(node.operand)
+        length = (
+            self._host_collection_length(node.operand)
+            if isinstance(node.op, ast.Not)
+            else None
+        )
+        operand = length if length is not None else self.visit(node.operand)
         if isinstance(node.op, ast.Not):
             return self._trace_not(operand)
         return _eval_unary(node.op, operand)
@@ -1851,15 +2123,109 @@ class WalkDeviceAST(NodeVisitor):
         return _eval_unary(ast.Not(), operand)
 
     def visit_Compare(self, node: ast.Compare) -> object:
-        lhs = self.visit(node.left)
+        lhs_node = node.left
+        # Identity classification uses the existing input/capture provenance
+        # guards, including unproved origins. It does not interpret contents.
+        # Keep that path separate from equality or other value operations.
+        visit_operand = (
+            self._identity_operand
+            if all(isinstance(op, (ast.Is, ast.IsNot)) for op in node.ops)
+            else self.visit
+        )
+        lhs = visit_operand(lhs_node)
         results = []
-        for op, rhs in zip(node.ops, node.comparators, strict=True):
-            rhs = self.visit(rhs)
-            results.append(result := _eval_compare(op, lhs, rhs))
+        for op, rhs_node in zip(node.ops, node.comparators, strict=True):
+            rhs = visit_operand(rhs_node)
+            if isinstance(op, (ast.Is, ast.IsNot)) and (
+                type(lhs) in (tuple, list, dict) or type(rhs) in (tuple, list, dict)
+            ):
+                left_origin = self._value_origin(lhs_node)
+                right_origin = self._value_origin(rhs_node)
+                result = compare_container_identity(
+                    op,
+                    lhs,
+                    left_origin if isinstance(left_origin, Origin) else None,
+                    rhs,
+                    right_origin if isinstance(right_origin, Origin) else None,
+                    left_constructed=isinstance(
+                        left_origin, (_SequenceOrigin, _MappingOrigin)
+                    )
+                    and left_origin.constructed,
+                    right_constructed=isinstance(
+                        right_origin, (_SequenceOrigin, _MappingOrigin)
+                    )
+                    and right_origin.constructed,
+                    left_captured=isinstance(left_origin, _SequenceOrigin)
+                    and left_origin.captured,
+                    right_captured=isinstance(right_origin, _SequenceOrigin)
+                    and right_origin.captured,
+                )
+            else:
+                result = _eval_compare(op, lhs, rhs)
+            results.append(result)
+            assert isinstance(lhs_node, ExtendedAST)
+            assert isinstance(rhs_node, ExtendedAST)
+            left_type, right_type = lhs_node._type_info, rhs_node._type_info
+            if (
+                isinstance(op, ast.Eq)
+                and isinstance(left_type, SequenceType)
+                and isinstance(right_type, SequenceType)
+            ):
+                self._guard_sequence_equality(
+                    lhs, self._value_origin(lhs_node), rhs, self._value_origin(rhs_node)
+                )
+            if (
+                isinstance(left_type, LiteralType)
+                and isinstance(right_type, LiteralType)
+                and (
+                    isinstance(lhs, ConfigSpecFragment)
+                    or isinstance(rhs, ConfigSpecFragment)
+                )
+            ):
+                left_origin = self._value_origin(lhs_node)
+                right_origin = self._value_origin(rhs_node)
+                if isinstance(left_origin, Origin) and isinstance(right_origin, Origin):
+                    guard_fragment_comparison(
+                        op,
+                        LiteralType(left_origin, lhs),
+                        LiteralType(right_origin, rhs),
+                        result,
+                    )
             if not isinstance(result, _tracing_ops._symbolic_types) and not result:
                 break
             lhs = rhs
+            lhs_node = rhs_node
         return functools.reduce(_tracing_ops._and, results)
+
+    def _guard_sequence_equality(
+        self,
+        left: object,
+        left_origin: _StaticOrigin,
+        right: object,
+        right_origin: _StaticOrigin,
+    ) -> None:
+        if isinstance(left, (tuple, list)) and isinstance(right, (tuple, list)):
+            for index, (a, b) in enumerate(zip(left, right, strict=False)):
+                self._guard_sequence_equality(
+                    a,
+                    _item_origin(left_origin, index),
+                    b,
+                    _item_origin(right_origin, index),
+                )
+        elif (
+            isinstance(left_origin, Origin)
+            and isinstance(right_origin, Origin)
+            and (
+                isinstance(left, ConfigSpecFragment)
+                or isinstance(right, ConfigSpecFragment)
+            )
+        ):
+            guard_fragment_comparison(
+                ast.Eq(),
+                LiteralType(left_origin, left),
+                LiteralType(right_origin, right),
+                _eval_compare(ast.Eq(), left, right),
+            )
 
     def visit_BoolOp(self, node: ast.BoolOp) -> object:
         if isinstance(node.op, ast.And):
@@ -1967,23 +2333,26 @@ class WalkDeviceAST(NodeVisitor):
         )
 
         results = []
-        for element_value in sequence_value:
+        for index, element_value in enumerate(sequence_value):
+            element_origin = self._index_origin(sequence_iter, index)
             if preserve_scope:
                 # For loops: don't create new scope, allow state to persist
-                self._assign(target, element_value)
+                self._assign(target, element_value, element_origin)
                 result = element_processor()
                 if result is not None:
                     results.append(result)
             else:
                 # For comprehensions: create isolated scope for each iteration
                 old_scope = self.scope.copy()
+                old_origins = self.scope_origins.copy()
                 try:
-                    self._assign(target, element_value)
+                    self._assign(target, element_value, element_origin)
                     result = element_processor()
                     if result is not None:
                         results.append(result)
                 finally:
                     self.scope = old_scope
+                    self.scope_origins = old_origins
 
         return results
 
@@ -2068,11 +2437,11 @@ class WalkDeviceAST(NodeVisitor):
 
             def build_subgraph(
                 subgraph_walker: WalkDeviceAST,
-            ) -> tuple[list[object], LiftTensorArgs]:
+            ) -> tuple[list[object], LiftGraphArgs]:
                 subgraph_walker._assign(node.target, inner_type.proxy())
                 subgraph_walker._body(node.body)
                 loop_outputs = self._collect_outputs(subgraph_walker.scope, rw.writes)
-                return loop_outputs.get_tensor_args(), loop_outputs
+                return loop_outputs.get_graph_args(), loop_outputs
 
             block_ids: list[int] = []
             for var in iter_vars:
@@ -2104,7 +2473,7 @@ class WalkDeviceAST(NodeVisitor):
                     graph_idx,
                     begin,
                     end,
-                    inputs.get_tensor_args(),
+                    inputs.get_graph_args(),
                 )
                 loop_target = _tracing_ops._for_loop
             else:
@@ -2112,7 +2481,7 @@ class WalkDeviceAST(NodeVisitor):
                     graph_idx,
                     begin,
                     end,
-                    inputs.get_tensor_args(),
+                    inputs.get_graph_args(),
                     step_list,
                 )
                 loop_target = _tracing_ops._for_loop_step
@@ -2126,7 +2495,7 @@ class WalkDeviceAST(NodeVisitor):
                 *args_to_proxies(tracer, args),
             )
             proxy_tensor.track_tensor_tree(
-                outputs.get_tensor_args(),
+                outputs.get_graph_args(),
                 proxy_out,
                 constant=None,
                 tracer=tracer,
@@ -2160,9 +2529,9 @@ class WalkDeviceAST(NodeVisitor):
 
         def build_condition(
             subgraph_walker: WalkDeviceAST,
-        ) -> tuple[list[object], LiftTensorArgs]:
+        ) -> tuple[list[object], LiftGraphArgs]:
             result = subgraph_walker.visit(node.test)
-            return [result], LiftTensorArgs({})
+            return [result], LiftGraphArgs({})
 
         cond_graph_id, _ = self._trace_graph(
             inputs,
@@ -2173,10 +2542,10 @@ class WalkDeviceAST(NodeVisitor):
 
         def build_body(
             subgraph_walker: WalkDeviceAST,
-        ) -> tuple[list[object], LiftTensorArgs]:
+        ) -> tuple[list[object], LiftGraphArgs]:
             subgraph_walker._body(node.body)
             loop_outputs = self._collect_outputs(subgraph_walker.scope, body_rw.writes)
-            return loop_outputs.get_tensor_args(), loop_outputs
+            return loop_outputs.get_graph_args(), loop_outputs
 
         body_graph_id, outputs = self._trace_graph(
             inputs,
@@ -2189,7 +2558,7 @@ class WalkDeviceAST(NodeVisitor):
         args = (
             cond_graph_id,
             body_graph_id,
-            inputs.get_tensor_args(),
+            inputs.get_graph_args(),
             None,
         )
         mode = proxy_tensor.get_proxy_mode()
@@ -2202,7 +2571,7 @@ class WalkDeviceAST(NodeVisitor):
             *args_to_proxies(tracer, args),
         )
         proxy_tensor.track_tensor_tree(
-            outputs.get_tensor_args(),
+            outputs.get_graph_args(),
             proxy_out,
             constant=None,
             tracer=tracer,
@@ -2224,7 +2593,8 @@ class WalkDeviceAST(NodeVisitor):
     def visit_If(self, node: ast.If) -> object:
         test = node.test
         if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
-            operand = self.visit(test.operand)
+            length = self._host_collection_length(test.operand)
+            operand = length if length is not None else self.visit(test.operand)
             if isinstance(operand, torch.Tensor) and tensor_may_have_many_elements(
                 operand
             ):
@@ -2234,7 +2604,8 @@ class WalkDeviceAST(NodeVisitor):
                 return
             test_proxy = self._trace_not(operand)
         else:
-            test_proxy = self.visit(test)
+            length = self._host_collection_length(test)
+            test_proxy = length if length is not None else self.visit(test)
         if not isinstance(test_proxy, _tracing_ops._symbolic_types):
             body = node.body if test_proxy else node.orelse
             if body:
@@ -2243,7 +2614,8 @@ class WalkDeviceAST(NodeVisitor):
         self._create_if_subgraph(test_proxy, node.body, node.orelse)
 
     def visit_IfExp(self, node: ast.IfExp) -> object:
-        test_proxy = self.visit(node.test)
+        length = self._host_collection_length(node.test)
+        test_proxy = length if length is not None else self.visit(node.test)
         if isinstance(test_proxy, _tracing_ops._symbolic_types):
             raise exc.StatementNotSupported("dynamic conditional expression")
         return self.visit(node.body if test_proxy else node.orelse)
@@ -2269,12 +2641,12 @@ class WalkDeviceAST(NodeVisitor):
             subgraph_walker: WalkDeviceAST,
             stmts: list[ast.stmt],
             rw: ReadWrites,
-        ) -> tuple[list[object], LiftTensorArgs]:
+        ) -> tuple[list[object], LiftGraphArgs]:
             subgraph_walker._body(stmts)
             outputs_local = self._collect_outputs(
                 subgraph_walker.scope, rw.writes, include_new=True
             )
-            return outputs_local.get_tensor_args(), outputs_local
+            return outputs_local.get_graph_args(), outputs_local
 
         else_graph_idx, else_outputs = self._trace_graph(
             else_branch_inputs,
@@ -2292,9 +2664,9 @@ class WalkDeviceAST(NodeVisitor):
         if_graph = cast("IfGraphInfo", self.device_ir.graphs[if_graph_idx])
 
         def get_arg_values_and_names(
-            inputs: LiftTensorArgs,
+            inputs: LiftGraphArgs,
         ) -> tuple[list[object], list[str]]:
-            input_tensor_arg_values = inputs.get_tensor_args()
+            input_tensor_arg_values = inputs.get_graph_args()
 
             def is_tensor_arg_value(v: object) -> bool:
                 return any(v is t for t in input_tensor_arg_values)
@@ -2404,6 +2776,44 @@ class WalkDeviceAST(NodeVisitor):
 
         return if_graph_idx
 
+    def _identity_operand(self, node: ast.AST) -> object:
+        if isinstance(node, ast.Name) and node.id not in self.scope:
+            assert isinstance(node, ExtendedAST)
+            info = node._type_info
+            if (
+                type(info) in (SequenceType, DictType)
+                and isinstance(info, CollectionType)
+                and info.origin.is_host()
+            ):
+                return info.tree_map(lambda item: item.proxy())
+        return self.visit(node)
+
+    def _host_collection_length(self, node: ast.AST) -> int | torch.SymInt | None:
+        if not isinstance(node, ast.Name) or node.id in self.scope:
+            return None
+        assert isinstance(node, ExtendedAST)
+        info = node._type_info
+        if (
+            type(info) not in (SequenceType, DictType)
+            or not isinstance(info, CollectionType)
+            or not info.contains_approximate_contents()
+            or not info.length_projection_safe
+            or not info.origin.is_host()
+        ):
+            return None
+        if info.contents_exact:
+            # Type propagation folds truth from the outer collection alone;
+            # approximate children must not turn that into a dynamic branch.
+            assert isinstance(info.element_types, (list, tuple, dict))
+            return len(info.element_types)
+        # Read the named host value already produced by the original code.
+        # Do not rerun its comprehension or an arbitrary producing helper.
+        value = CompileEnvironment.current().create_unbacked_symint()
+        HostFunction.current().expr_to_origin[value._sympy_()] = SymbolOrigin(
+            CollectionLengthOrigin(NameOrigin(node.id))
+        )
+        return value
+
     def visit_Name(self, node: ast.Name) -> object:
         if node.id in self.scope:
             return self.scope[node.id]
@@ -2425,10 +2835,36 @@ class WalkDeviceAST(NodeVisitor):
         return [result]
 
     def visit_Tuple(self, node: ast.Tuple) -> tuple[object, ...]:
-        return tuple([self.visit(x) for x in node.elts])
+        values = tuple([self.visit(x) for x in node.elts])
+        if (
+            self.tuple_constants is not None
+            and (constant := self.tuple_constants.resolve(node, values)) is not None
+        ):
+            self.expression_origins[node] = self._constant_tuple_origin(constant)
+            return constant
+        self.expression_origins[node] = _SequenceOrigin(
+            [self._value_origin(x) for x in node.elts], constructed=True
+        )
+        return values
+
+    @staticmethod
+    def _constant_tuple_origin(value: tuple[object, ...]) -> _SequenceOrigin:
+        return _SequenceOrigin(
+            [
+                WalkDeviceAST._constant_tuple_origin(item)
+                if type(item) is tuple
+                else None
+                for item in value
+            ],
+            captured=True,
+        )
 
     def visit_List(self, node: ast.List) -> list[object]:
-        return [self.visit(x) for x in node.elts]
+        values: list[object] = [self.visit(x) for x in node.elts]
+        self.expression_origins[node] = _SequenceOrigin(
+            [self._value_origin(x) for x in node.elts], constructed=True
+        )
+        return values
 
     def _visit_comprehension(
         self, node: ast.ListComp | ast.GeneratorExp, name: str
@@ -2446,7 +2882,7 @@ class WalkDeviceAST(NodeVisitor):
 
         # Check if we're iterating over a sequence (similar to tuple unrolling)
         if isinstance(iter_type, SequenceType):
-            return self._handle_comprehension_unrolling(node.elt, generator)
+            return self._handle_comprehension_unrolling(node, generator)
 
         # For non-sequence iterables, we could extend this later
         raise exc.StatementNotSupported(
@@ -2460,13 +2896,16 @@ class WalkDeviceAST(NodeVisitor):
         return self._visit_comprehension(node, "generator expression")
 
     def _handle_comprehension_unrolling(
-        self, elt: ast.expr, generator: ast.comprehension
+        self, node: ast.ListComp | ast.GeneratorExp, generator: ast.comprehension
     ) -> tuple[object, ...]:
         """Handle unrolling of comprehensions (list comp or generator exp) over sequences."""
+        elt = node.elt
+        origins = []
 
         def evaluate_expression() -> object:
             # Evaluate the comprehension expression
             result = self.visit(elt)
+            origins.append(self._value_origin(elt))
             # If the result is a SymInt that can be evaluated to a concrete value, do so
             if isinstance(result, torch.SymInt):
                 try:
@@ -2478,6 +2917,7 @@ class WalkDeviceAST(NodeVisitor):
         results = self._handle_sequence_unrolling(
             generator.iter, generator.target, evaluate_expression, preserve_scope=False
         )
+        self.expression_origins[node] = _SequenceOrigin(origins)
         # Return as tuple to match the expected type for tuple unrolling
         return tuple(results)
 
@@ -2500,20 +2940,33 @@ class WalkDeviceAST(NodeVisitor):
             )
 
         result: dict[object, object] = {}
+        origins: dict[object, _StaticOrigin] = {}
 
         def evaluate_key_value() -> None:
             key = self.visit(node.key)
             value = self.visit(node.value)
             result[key] = value
+            origins[key] = self._value_origin(node.value)
 
         self._handle_sequence_unrolling(
             generator.iter, generator.target, evaluate_key_value, preserve_scope=False
         )
+        self.expression_origins[node] = _MappingOrigin(origins)
         return result
 
     def visit_Dict(self, node: ast.Dict) -> dict[object, object]:
         keys = [self.visit(key) if key is not None else None for key in node.keys]
         values = [self.visit(value) for value in node.values]
+        self.expression_origins[node] = _MappingOrigin(
+            dict(
+                zip(
+                    keys,
+                    (self._value_origin(value) for value in node.values),
+                    strict=True,
+                )
+            ),
+            constructed=True,
+        )
         return dict(zip(keys, values, strict=False))
 
     def visit_Slice(self, node: ast.Slice) -> slice | torch.Tensor | torch.SymInt:
@@ -2556,10 +3009,11 @@ class WalkDeviceAST(NodeVisitor):
             # For simple variable assignments like `a = b`, we need to create a new
             # variable to avoid phi node issues when the source variable gets mutated
             if isinstance(node.value, ast.Name) and (
-                isinstance(value, torch.Tensor) and not isinstance(value, Tile)
+                isinstance(value, (torch.Tensor, torch.SymFloat))
+                and not isinstance(value, Tile)
             ):
                 value = _new_var(value)
-            self._assign(target, value)
+            self._assign(target, value, self._value_origin(node.value))
             return None
         if isinstance(target, ast.Tuple):
             # Handle tuple unpacking
@@ -2568,9 +3022,9 @@ class WalkDeviceAST(NodeVisitor):
                 raise exc.InvalidAssignment
             if len(target.elts) != len(value):
                 raise exc.InvalidAssignment
-            for t, v in zip(target.elts, value, strict=True):
+            for index, (t, v) in enumerate(zip(target.elts, value, strict=True)):
                 if isinstance(t, ast.Name):
-                    self._assign(t, v)
+                    self._assign(t, v, self._index_origin(node.value, index))
                 elif isinstance(t, ast.Subscript):
                     # Handle subscript targets in tuple unpacking (e.g., a[i], b[j] = tuple)
                     self._assign_subscript(t, v)
@@ -2591,6 +3045,9 @@ class WalkDeviceAST(NodeVisitor):
             base_list = self.visit(target.value)
             assert isinstance(base_list, list)
             base_list[index_value] = val
+            origin = self._value_origin(target.value)
+            if isinstance(origin, _SequenceOrigin):
+                origin.items[index_value] = self._value_origin(node.value)
             return None
         assert isinstance(node.value, ExtendedAST)
         rhs_type = node.value._type_info
@@ -2662,6 +3119,7 @@ class WalkDeviceAST(NodeVisitor):
         self._assign(
             node.target,
             _eval_binary(node.op, self.visit(node.target), self.visit(node.value)),
+            DeviceOrigin(current_location()),
         )
 
     def visit_Subscript(self, node: ast.Subscript) -> object:
@@ -2671,8 +3129,10 @@ class WalkDeviceAST(NodeVisitor):
         if isinstance(type_info, SequenceType):
             index_value = self.visit(node.slice)
             if isinstance(index_value, int):
+                sequence = self.visit(value)
+                self.expression_origins[node] = self._index_origin(value, index_value)
                 # pyrefly: ignore [bad-index]
-                return self.visit(value)[index_value]
+                return sequence[index_value]
             raise exc.InvalidSequenceSubscription(node.slice)
         # Check StackTensorType before DictType since StackTensorType inherits from DictType
         if isinstance(type_info, StackTensorType):
@@ -2681,8 +3141,10 @@ class WalkDeviceAST(NodeVisitor):
         if isinstance(type_info, DictType):
             key_value = self.visit(node.slice)
             if isinstance(key_value, (str, int)):
+                mapping = self.visit(value)
+                self.expression_origins[node] = self._index_origin(value, key_value)
                 # pyrefly: ignore [bad-index]
-                return self.visit(value)[key_value]
+                return mapping[key_value]
             raise exc.TypeInferenceError(
                 f"Dict subscript must be a literal str or int, got {type(key_value).__name__}"
             )
@@ -2693,38 +3155,143 @@ class WalkDeviceAST(NodeVisitor):
         return hl.subscript(self.visit(value), self._subscript_slice_proxy(node.slice))
 
     def visit_Call(self, node: ast.Call) -> object:
-        args = []
-        kwargs = {}
-        for arg in node.args:
-            if isinstance(arg, ast.Starred):
-                # pyrefly: ignore [bad-argument-type]
-                args.extend(self.visit(arg.value))
-            else:
-                args.append(self.visit(arg))
-        for kwarg in node.keywords:
-            if kwarg.arg is None:
-                # pyrefly: ignore [no-matching-overload]
-                kwargs.update(self.visit(kwarg.value))
-            else:
-                kwargs[kwarg.arg] = self.visit(kwarg.value)
-
+        assert isinstance(node, ExtendedAST)
         # pyrefly: ignore [missing-attribute]
         func_type_info = node.func._type_info
+        if (
+            isinstance(func_type_info, CallableType)
+            and any(func_type_info.value is builtin for builtin in (len, bool))
+            and len(node.args) == 1
+            and not node.keywords
+            and (length := self._host_collection_length(node.args[0])) is not None
+        ):
+            return length if func_type_info.value is len else length != 0
+        builtin_fragment_constructor = isinstance(func_type_info, CallableType) and any(
+            func_type_info.value is cls for cls in _BUILTIN_TUNABLE_FRAGMENTS
+        )
+        if (
+            isinstance(node._type_info, ConfigFragmentType)
+            and builtin_fragment_constructor
+        ):
+            # Type propagation already constructed and validated this metadata,
+            # including recovery of recorded global literals. Custom constructors
+            # and helpers must still evaluate each iteration's actual values.
+            return node._type_info.as_literal()
+        args = []
+        arg_origins = []
+        kwargs = {}
+        kwarg_origins = {}
+        for arg in node.args:
+            if isinstance(arg, ast.Starred):
+                start = len(args)
+                # pyrefly: ignore [bad-argument-type]
+                args.extend(self.visit(arg.value))
+                arg_origins.extend(
+                    self._index_origin(arg.value, index)
+                    for index in range(len(args) - start)
+                )
+            else:
+                args.append(self.visit(arg))
+                arg_origins.append(self._value_origin(arg))
+        for kwarg in node.keywords:
+            if kwarg.arg is None:
+                mapping = self.visit(kwarg.value)
+                assert isinstance(mapping, dict)
+                kwargs.update(mapping)
+                kwarg_origins.update(
+                    (key, self._index_origin(kwarg.value, key)) for key in mapping
+                )
+            else:
+                kwargs[kwarg.arg] = self.visit(kwarg.value)
+                kwarg_origins[kwarg.arg] = self._value_origin(kwarg.value)
+
         if isinstance(func_type_info, NestedFunctionType):
-            return self._call_nested_function(func_type_info, args, kwargs)
+            return self._call_nested_function(
+                func_type_info, args, kwargs, arg_origins, node
+            )
         if isinstance(func_type_info, CallableType) and (
             replacement := get_device_func_replacement(func_type_info.value)
         ):
             func = replacement
+            opaque_call = False
         else:
             func = self.visit(node.func)
+            # Tensor methods have dedicated type propagation and operate on
+            # tracing proxies; they do not inspect opaque fragment state.
+            opaque_call = (
+                not builtin_fragment_constructor
+                and not isinstance(func_type_info, TensorAttributeType)
+                and not is_api_func(func)
+            )
+        if (
+            isinstance(func_type_info, TensorAttributeType)
+            and func_type_info.attr() == "stride"
+            and not CompileEnvironment.current().settings.static_shapes
+        ):
+            tensor = cast("torch.Tensor", cast("BuiltinMethodType", func).__self__)
+            origin = HostFunction.current().tensor_to_origin.get(tensor)
+            source = CompileEnvironment.current().tensor_stride_input_source(tensor)
+            if origin is not None and origin.is_host():
+                # Re-evaluate the actual receiver and dimension. The raw fake
+                # stride can be a size expression or lack a host symbol origin.
+                func = functools.partial(_host_tensor_stride, tensor, origin, source)
+
         # pyrefly: ignore [bad-argument-type]
-        return _CheckForIndexCalls.retry_call(func, args, kwargs)
+        result = _CheckForIndexCalls.retry_call(func, args, kwargs)
+        if (
+            func is tuple
+            and len(args) == 1
+            and not kwargs
+            and type(result) is tuple
+            and result is args[0]
+        ):
+            self.expression_origins[node] = arg_origins[0]
+        if opaque_call:
+            if not any(func is fn for fn in (tuple, list, dict)):
+                record_opaque_container_result(result)
+            callee_origin = self._value_origin(node.func)
+            if isinstance(callee_origin, Origin):
+                guard_fragment_call_input(callee_origin)
+            for arg, origin in zip(args, arg_origins, strict=True):
+                self._guard_fragment_call_inputs(arg, origin)
+            for key, arg in kwargs.items():
+                self._guard_fragment_call_inputs(arg, kwarg_origins[key])
+        return result
+
+    def _guard_fragment_call_inputs(self, value: object, origin: _StaticOrigin) -> None:
+        if isinstance(
+            value, (ConfigSpecFragment, types.FunctionType, types.MethodType)
+        ):
+            if isinstance(origin, Origin):
+                guard_fragment_call_input(origin)
+        elif isinstance(value, (tuple, list)):
+            for index, item in enumerate(value):
+                self._guard_fragment_call_inputs(item, _item_origin(origin, index))
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                self._guard_fragment_call_inputs(item, _item_origin(origin, key))
 
     def visit_Attribute(self, node: ast.Attribute) -> object:
         value = self.visit(node.value)
         # Apply the replacement here so saved bound methods use it too.
         assert isinstance(node, ExtendedAST)
+        assert isinstance(node.value, ExtendedAST)
+        if isinstance(node.value._type_info, ClassType):
+            origin = self._value_origin(node.value)
+            if isinstance(origin, _SequenceOrigin):
+                # Constructed field values retain their individual input paths.
+                index = list(node.value._type_info.element_types).index(node.attr)
+                field_origin = _item_origin(origin, index)
+            else:
+                field_origin = (
+                    AttributeOrigin(origin, node.attr)
+                    if isinstance(origin, Origin)
+                    else None
+                )
+            self.expression_origins[node] = field_origin
+            if isinstance(value, dict):
+                # ClassType models dataclass/namedtuple fields as a mapping.
+                return value[node.attr]
         if (
             isinstance(node._type_info, TensorAttributeType)
             and node.attr in _TENSOR_METHOD_REPLACEMENTS
@@ -2745,6 +3312,8 @@ class WalkDeviceAST(NodeVisitor):
         func: NestedFunctionType,
         args: list[object],
         kwargs: dict[str, object],
+        arg_origins: list[_StaticOrigin],
+        call_node: ast.Call,
     ) -> object:
         func_node = func.func_node
         params = func_node.args
@@ -2755,15 +3324,22 @@ class WalkDeviceAST(NodeVisitor):
             )
         func.find_effective_return()
         old_scope = self.scope.copy()
-        for param, arg_val in zip(params.args, args, strict=True):
+        old_origins = self.scope_origins.copy()
+        for param, arg_val, origin in zip(params.args, args, arg_origins, strict=True):
             self.scope[param.arg] = arg_val
+            self.scope_origins[param.arg] = origin
         try:
             for stmt in func_node.body:
                 if isinstance(stmt, ast.Return):
-                    return self.visit(stmt.value) if stmt.value is not None else None
+                    if stmt.value is None:
+                        return None
+                    value = self.visit(stmt.value)
+                    self.expression_origins[call_node] = self._value_origin(stmt.value)
+                    return value
                 self.visit(stmt)
         finally:
             self.scope = old_scope
+            self.scope_origins = old_origins
         return None
 
     def visit_Expr(self, node: ast.Expr) -> object:
@@ -2773,40 +3349,42 @@ class WalkDeviceAST(NodeVisitor):
         return node.value
 
 
-class LiftTensorArgs:
+class LiftGraphArgs:
     values: dict[str, object]
     flat_values: list[object]
     spec: pytree.TreeSpec
-    tensor_indices: list[int]
+    graph_indices: list[int]
 
     def __init__(self, values: dict[str, object]) -> None:
         self.values = values
         self.flat_values, self.spec = pytree.tree_flatten(values)
-        self.tensor_indices = [
+        # Host float expressions crossing a device branch need scalar SSA
+        # inputs/outputs, even though they do not have tensor metadata.
+        self.graph_indices = [
             i
             for i, v in enumerate(self.flat_values)
-            if isinstance(v, torch.Tensor) and not isinstance(v, Tile)
+            if isinstance(v, (torch.Tensor, torch.SymFloat)) and not isinstance(v, Tile)
         ]
 
     def unflatten(self) -> dict[str, object]:
         return pytree.tree_unflatten(self.flat_values, self.spec)
 
-    def replace_tensor_args(
+    def replace_graph_args(
         self, args: Sequence[object], *, copy_tensors: bool = True
     ) -> dict[str, object]:
         flat_values = [*self.flat_values]
-        assert len(self.tensor_indices) == len(args)
-        for i, v in zip(self.tensor_indices, args, strict=False):
+        assert len(self.graph_indices) == len(args)
+        for i, v in zip(self.graph_indices, args, strict=False):
             flat_values[i] = _new_var(v) if copy_tensors else v
         return pytree.tree_unflatten(flat_values, self.spec)
 
-    def get_tensor_args(self) -> list[object]:
-        return [self.flat_values[i] for i in self.tensor_indices]
+    def get_graph_args(self) -> list[object]:
+        return [self.flat_values[i] for i in self.graph_indices]
 
     def get_node_args(
         self, tracer: proxy_tensor.PythonKeyTracer
     ) -> list[torch.fx.Node]:
-        proxy_args = args_to_proxies(tracer, self.get_tensor_args())[0]
+        proxy_args = args_to_proxies(tracer, self.get_graph_args())[0]
         result = []
         for proxy in proxy_args:
             assert isinstance(proxy, torch.fx.Proxy)
@@ -3418,7 +3996,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 device_ir.tile_dependency_graph,
                 source_phase_starts,
             )
-            if device_ir.implicit_dependency_starts:
+            if device_ir.implicit_dependency_starts and not (
+                env.backend.lower_dependency_phases_as_ordered_launches(func, device_ir)
+            ):
                 if env.device.type != "cuda" or not config_spec.supports_config_key(
                     "cross_loop_pipeline"
                 ):
@@ -3464,8 +4044,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 config_spec.enable_cross_loop_pipeline(choices=choices)
         config_spec.multi_phase = len(device_ir.phases) > 1
         if config_spec.supports_config_key("pallas_load_buffer_count"):
-            config_spec.pallas_load_buffer_count.length = len(
-                LiftTensorArgs(dict(func.params.arguments)).get_tensor_args()
+            config_spec.pallas_load_buffer_count.length = sum(
+                isinstance(arg, torch.Tensor)
+                for arg in LiftGraphArgs(dict(func.params.arguments)).get_graph_args()
             )
         if config_spec.supports_config_key("pallas_indirect_access_mode"):
             from .pallas.tensorcore_plan import indirect_access_modes

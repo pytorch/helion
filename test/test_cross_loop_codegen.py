@@ -3894,17 +3894,22 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         cache_keys: list[str | None] = []
         cubin_hashes: set[str] = set()
         bounds = []
+        config = helion.Config(
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="static",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
         for numerator, denominator in ((8, 2), (12, 3)):
             code, out = code_and_output(
                 specialized_quotient_chain,
                 (x, numerator, denominator),
-                pid_type="persistent_blocked",
-                cross_loop_pipeline="static",
-                num_sm_multiplier=1,
-                num_warps=1,
+                **config.config,
             )
             bound = specialized_quotient_chain.bind((x, numerator, denominator))
-            config, compiled = next(iter(bound._compile_cache.items()))
+            self.assertEqual(len(bound._compile_cache), 1)
+            normalized = bound._normalized_config_copy(config)
+            compiled = bound._compile_cache[normalized]
             triton_kernel = compiled.__globals__[f"_helion_{bound.kernel.name}"]
             cubin_hashes.update(
                 compiled_kernel.hash

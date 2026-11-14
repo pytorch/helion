@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import contextlib
 from dataclasses import dataclass
+import functools
 import hashlib
 import importlib.util
 import inspect
@@ -16,6 +17,7 @@ import threading
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import ClassVar
+from typing import cast
 
 from torch._functorch.aot_autograd import aot_module_simplified
 import torch._functorch.config as functorch_config
@@ -27,6 +29,7 @@ from torch.fx.node import Node
 from torch.fx.node import map_arg
 
 from .. import exc
+from .._compiler.fx_side_effects import is_impure_node
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -45,6 +48,25 @@ if TYPE_CHECKING:
 # AOT-autograd compilation, which has internal mutable state that is not
 # thread-safe.
 _backward_cache_lock: threading.Lock = threading.Lock()
+
+
+def _validate_required_tensor_arguments(
+    target: object, args: tuple[object, ...], kwargs: Mapping[str, object]
+) -> None:
+    if not isinstance(target, torch._ops.OpOverload):
+        return
+    for index, argument in enumerate(target._schema.arguments):
+        if index < len(args):
+            value = args[index]
+        elif argument.name in kwargs:
+            value = kwargs[argument.name]
+        else:
+            continue
+        if value is None and isinstance(argument.type, torch.TensorType):
+            raise exc.AutodiffNotSupported(
+                f"{target}: required Tensor argument {argument.name} "
+                "was pruned by lowering"
+            )
 
 
 @dataclass
@@ -266,10 +288,8 @@ class GraphAnalyzer:
 
             elif target_name == "dot":
                 # Lower hl.dot -> a rank-appropriate aten matmul, mirroring the
-                # scan-path lowering. Crucially this consumes only the two operand
-                # args, so hl.dot's `acc=None`/`out_dtype=None` defaults never
-                # reach the None-coalescing fixup below (which would otherwise
-                # replace `out_dtype=None` with a tensor and break AOT diff).
+                # scan-path lowering. Consume only the two operands; hl.dot's
+                # optional out_dtype/acc arguments are not aten matmul inputs.
                 a0, a1 = node.args[0], node.args[1]
                 assert isinstance(a0, Node) and isinstance(a1, Node)
                 lhs = node_map[a0]
@@ -313,14 +333,10 @@ class GraphAnalyzer:
                 node_map[node] = new_node
 
             elif target_name != "_host_tensor":
-                # Restore None placeholders from strip_unused_inputs (duplicate
-                # arg coalescing) and reinject `_extra_args` kwargs.
-                # Inject extra_args FIRST: the first_node_arg fill consumes all
-                # Nones and leaves no slots for extra_args injection.  Order:
-                # 1. fill known extra_args into their specific None slots
-                # 2. fill any remaining Nones with first_node_arg (strip_unused
-                #    coalescing always uses the first non-None node arg as a
-                #    placeholder for the duplicated arg)
+                # Preserve the legacy multi-buffer convention: _extra_args
+                # fills positional None holes. It does not identify original
+                # schema slots or distinguish optional None from pruned inputs.
+                # Repeated semantic operands already remain in node.args.
                 args = node.args
                 kwargs = dict(node.kwargs)
                 extra_args = kwargs.pop("_extra_args", None)
@@ -335,11 +351,7 @@ class GraphAnalyzer:
                             extra_idx += 1
                     args = tuple(args_list)
 
-                # After extra_args injection, fill any remaining Nones caused
-                # by strip_unused_inputs coalescing with first_node_arg.
-                first_node_arg = next((a for a in args if isinstance(a, Node)), None)
-                if first_node_arg is not None:
-                    args = tuple(first_node_arg if a is None else a for a in args)
+                _validate_required_tensor_arguments(target, args, kwargs)
 
                 _assert_all_mapped(node, args, kwargs, node_map)
                 new_args = map_arg(args, node_map.get)
@@ -1534,6 +1546,7 @@ class GraphAnalyzer:
             else a
             for a in n.args
         )
+        _validate_required_tensor_arguments(n.target, args, n.kwargs)
         new_args = map_arg(args, sub_node_map.get)  # pyrefly: ignore [bad-specialization]
         new_kwargs = map_arg(dict(n.kwargs), sub_node_map.get)
         if n.target in matmul_ops:
@@ -2940,7 +2953,7 @@ def differentiate_graph(
         if _rewrite_reverse_cumsum(gm.graph):
             # Drop the now-orphaned rev/cumsum nodes the rewrite left behind so
             # they aren't emitted as dead `torch.flip`/`torch.cumsum` lines.
-            gm.graph.eliminate_dead_code()
+            gm.graph.eliminate_dead_code(is_impure_node=is_impure_node)
         gm.recompile()
         backward_graph = gm.graph
         if bw_module_holder is not None:
@@ -2997,6 +3010,197 @@ def differentiate_graph(
     return backward_graph
 
 
+def _has_scan_nodes(graph: torch.fx.Graph) -> bool:
+    return any(
+        node.op == "call_function" and getattr(node.target, "__name__", "") == "scan"
+        for node in graph.nodes
+    )
+
+
+def _expand_singleton_views(
+    graph: torch.fx.Graph,
+    same_shape_inputs: Callable[[Node], tuple[Node, ...] | None],
+    iteration_shape: tuple[int, ...],
+) -> torch.fx.Graph:
+    """Express singleton-only rank changes through unsqueeze/squeeze nodes.
+
+    This gives recomputed primals and tangents the same shape-effect proof.
+    Any reshape that merges, splits, or reorders data dimensions keeps the
+    whole graph unchanged: partial normalization before or after an arbitrary
+    view can otherwise misalign aliased primals and tangents. The caller's
+    AOT graph is preserved. Views connected to an unproven alias stay unchanged;
+    independent branches can normalize after a proven return to the iteration
+    shape. Local singleton replications are tagged ``helion_local_expand`` for
+    explicit emission; selecting one also requires a copied graph.
+    """
+    blocked: set[Node] = set()
+    # Rollback is monotone: removing a rewrite can invalidate a downstream
+    # restoration boundary, so recompute the alias facts before choosing more.
+    while True:
+        changes: dict[Node, tuple[bool, list[int]]] = {}
+        local_expands: set[Node] = set()
+        aliased_views: set[Node] = set()
+        # Arbitrary views and expands may be aliases in the emitter. Do not
+        # normalize a later singleton view as if those shape changes were rendered.
+        # A view back to the preserved shape restores compatibility.
+        aliased_shapes: dict[Node, torch.Size | None] = {}
+        for node in graph.nodes:
+            if any(source in aliased_shapes for source in node.all_input_nodes):
+                sources = same_shape_inputs(node)
+                if sources:
+                    shape = aliased_shapes.get(sources[0], sources[0].meta["val"].shape)
+                    aliased_shapes[node] = (
+                        shape
+                        if all(
+                            aliased_shapes.get(source, source.meta["val"].shape)
+                            == shape
+                            for source in sources
+                        )
+                        else None
+                    )
+                else:
+                    aliased_shapes[node] = None
+            if (
+                node.op != "call_function"
+                or node.target
+                not in (torch.ops.aten.view.default, torch.ops.aten.expand.default)
+                or not node.args
+                or not isinstance(source := node.args[0], Node)
+                or not isinstance(source_value := source.meta.get("val"), torch.Tensor)
+                or not isinstance(value := node.meta.get("val"), torch.Tensor)
+            ):
+                continue
+            shape = aliased_shapes.get(source, source_value.shape)
+            if shape == value.shape:
+                aliased_shapes.pop(node, None)
+            else:
+                aliased_shapes[node] = shape
+            if node.target is torch.ops.aten.expand.default:
+                # Local singleton replication must retain its extent for reductions.
+                # A size matching a root iteration extent may need tiled
+                # coordinates, so this unit retains its legacy alias behavior.
+                # The emitter rejects an aliased expansion when a sum still
+                # needs its replicated count.
+                # Unchanged axes use the source tile shape.
+                if (
+                    node not in blocked
+                    and shape == source_value.shape
+                    and source_value.ndim == value.ndim
+                    and source_value.shape != value.shape
+                    and all(
+                        type(old) is int
+                        and type(new) is int
+                        and (
+                            old == new
+                            or (old == 1 and new > 1 and new not in iteration_shape)
+                        )
+                        for old, new in zip(
+                            source_value.shape, value.shape, strict=True
+                        )
+                    )
+                ):
+                    local_expands.add(node)
+                    aliased_shapes.pop(node, None)
+                # Other expands still alias their input in the emitter.
+                continue
+            if value.shape == source_value.shape:
+                continue
+            if value.ndim == source_value.ndim or not all(
+                type(size) is int for size in (*source_value.shape, *value.shape)
+            ):
+                return graph
+            inserting = value.ndim > source_value.ndim
+            smaller, larger = (
+                (source_value.shape, value.shape)
+                if inserting
+                else (value.shape, source_value.shape)
+            )
+            source_dim = 0
+            axes: list[int] = []
+            for dim, size in enumerate(larger):
+                if source_dim < len(smaller) and size == smaller[source_dim]:
+                    source_dim += 1
+                elif size == 1:
+                    axes.append(dim)
+                else:
+                    return graph
+            if source_dim != len(smaller):
+                return graph
+            if shape != source_value.shape:
+                aliased_views.add(node)
+                continue
+            if node not in blocked:
+                changes[node] = inserting, axes
+                aliased_shapes.pop(node, None)
+
+        if aliased_views or blocked:
+            # A component ends at a proven logical and physical iteration shape.
+            # Other values join their users so a shared shape effect is never
+            # changed for only one consumer. Restored branches stay independent.
+            neighbors: dict[Node, list[Node]] = {node: [] for node in graph.nodes}
+            for node in graph.nodes:
+                if node.op == "output":
+                    continue
+                for source in node.all_input_nodes:
+                    value = source.meta.get("val")
+                    if (
+                        source.op != "placeholder"
+                        and isinstance(value, torch.Tensor)
+                        # Rank-zero scalar values carry no tensor shape axes.
+                        and value.ndim != 0
+                        and (
+                            tuple(value.shape) != iteration_shape
+                            or aliased_shapes.get(source, value.shape) != value.shape
+                        )
+                    ):
+                        neighbors[node].append(source)
+                        neighbors[source].append(node)
+            next_blocked = blocked | aliased_views
+            pending = list(next_blocked)
+            while pending:
+                for neighbor in neighbors[pending.pop()]:
+                    if neighbor not in next_blocked:
+                        next_blocked.add(neighbor)
+                        pending.append(neighbor)
+            if next_blocked != blocked:
+                blocked = next_blocked
+                continue
+        if not changes and not local_expands:
+            return graph
+        break
+
+    expanded = torch.fx.Graph()
+    copies: dict[Node, Node] = {}
+    for node in graph.nodes:
+        change = changes.get(node)
+        if change is None:
+            copies[node] = expanded.node_copy(node, lambda arg: copies[arg])
+            if node in local_expands:
+                copies[node].meta["helion_local_expand"] = True
+            continue
+        source = node.args[0]
+        assert isinstance(source, Node)
+        current = copies[source]
+        value = current.meta["val"]
+        inserting, axes = change
+        if not inserting:
+            axes = list(reversed(axes))
+        for dim in axes:
+            current = expanded.call_function(
+                torch.ops.aten.unsqueeze.default
+                if inserting
+                else torch.ops.aten.squeeze.dim,
+                (current, dim),
+            )
+            # This converter consumes val; debug metadata identifies the
+            # originating view even for an intermediate synthesized node.
+            current.meta = dict(node.meta)
+            value = value.unsqueeze(dim) if inserting else value.squeeze(dim)
+            current.meta["val"] = value
+        copies[node] = current
+    return expanded
+
+
 class FXToHelionConverter:
     """Converts backward FX graph to Helion kernel source code."""
 
@@ -3050,6 +3254,32 @@ class FXToHelionConverter:
         self.forward_full_slice_dims = forward_full_slice_dims
         self.forward_untiled_inputs = forward_untiled_inputs
         self._has_root_matmul = has_root_matmul
+
+        if not _has_scan_nodes(backward_graph):
+            iter_ndim = len(self.tensor_shapes[self._iter_tensor_name()])
+            # Singleton normalization uses a one-padding-axis proof. Preserve
+            # the existing view lowering when a loader can add several axes;
+            # restoring such a view with unsqueezes would duplicate its padding.
+            # Unpadded chains may still insert/remove multiple singleton axes.
+            ranks = [
+                len(shape) for shape in (*self.tensor_shapes.values(), *grad_out_shapes)
+            ]
+            # The final gradient rank can hide a larger intermediate drop.
+            # Check both endpoints of every view before normalizing any chain.
+            ranks.extend(
+                value.ndim
+                for node in backward_graph.nodes
+                if node.op == "call_function"
+                and node.target is torch.ops.aten.view.default
+                for endpoint in (node, *node.all_input_nodes)
+                if isinstance(value := endpoint.meta.get("val"), torch.Tensor)
+            )
+            if all(iter_ndim - rank <= 1 for rank in ranks):
+                self.backward_graph = _expand_singleton_views(
+                    backward_graph,
+                    self._same_shape_tensor_inputs,
+                    self.tensor_shapes[self._iter_tensor_name()],
+                )
 
     def _grad_out_index(self, param_name: str) -> int:
         """Return the grad_out index encoded in `param_name` (e.g.
@@ -3111,6 +3341,28 @@ class FXToHelionConverter:
                 return list(non_reduced_dims)
 
         return _match_dims(param_shape, iter_shape)
+
+    def _param_padding_dims(
+        self, param_name: str, iter_shape: tuple[int, ...]
+    ) -> list[int]:
+        """Axes inserted by the non-reduction broadcast loader."""
+        mapped = self._map_param_to_iter_dims(
+            param_name, iter_shape, self._non_reduced_dims
+        )
+        return [dim for dim in range(len(iter_shape)) if dim not in mapped]
+
+    def _nonreduction_load_indices(
+        self, param_name: str, iter_shape: tuple[int, ...], tiles: list[str]
+    ) -> list[str]:
+        """Give singleton iteration axes and inserted padding physical extent one."""
+        padding = self._param_padding_dims(param_name, iter_shape)
+        sizes = iter(self._param_shape(param_name))
+        return [
+            "None"
+            if dim in padding
+            else (":" if next(sizes) == 1 and iter_shape[dim] == 1 else tile)
+            for dim, tile in enumerate(tiles)
+        ]
 
     def _iter_tensor_name(self) -> str:
         """Name of the input that spans the iteration shape (highest rank).
@@ -3230,10 +3482,7 @@ class FXToHelionConverter:
                 output_node = node
 
         # Multi-tile-loop bw FX (has scan_op nodes) uses a separate lowering.
-        if any(
-            n.op == "call_function" and getattr(n.target, "__name__", "") == "scan"
-            for n in self.backward_graph.nodes
-        ):
+        if _has_scan_nodes(self.backward_graph):
             return _convert_scan_op_bw_to_helion(
                 backward_graph=self.backward_graph,
                 bw_module=getattr(self, "bw_module", None),
@@ -3413,11 +3662,288 @@ class FXToHelionConverter:
                 )
             return f"{self.primal_to_name[idx]}_tile"
         if node_name.startswith("tangents_"):
-            if self.num_grad_outs == 1:
-                return "grad_out_tile"
-            idx = int(node_name.split("_")[1]) - 1
-            return f"grad_out_{idx}_tile"
+            return f"{self._tangent_param_name(node_name)}_tile"
         return f"{node_name}_val"
+
+    def _tangent_param_name(self, node_name: str) -> str:
+        if self.num_grad_outs == 1:
+            return "grad_out"
+        index = int(node_name.split("_")[1]) - 1
+        return f"grad_out_{index}"
+
+    @staticmethod
+    def _same_shape_tensor_inputs(node: Node) -> tuple[Node, ...] | None:
+        target = node.target
+        val = node.meta.get("val")
+        if (
+            node.op != "call_function"
+            or not isinstance(target, torch._ops.OpOverload)
+            or target._schema.is_mutable
+            or (
+                torch.Tag.pointwise not in target.tags
+                and target._opname
+                not in (
+                    "_to_copy",
+                    "convert_element_type",
+                    "view",
+                    "squeeze",
+                    "alias",
+                    "detach",
+                    "expand",
+                )
+            )
+            or not isinstance(val, torch.Tensor)
+        ):
+            return None
+        tensor_inputs = [
+            arg
+            for arg in node.all_input_nodes
+            if isinstance(arg.meta.get("val"), torch.Tensor)
+            and arg.meta["val"].ndim > 0
+        ]
+        if not tensor_inputs or any(
+            tuple(source.meta["val"].shape) != tuple(val.shape)
+            for source in tensor_inputs
+        ):
+            return None
+        return tuple(tensor_inputs)
+
+    def _shape_chain_roots(
+        self,
+        node: Node,
+        restored_inputs: dict[str, tuple[Node, ...]],
+        stop_at: Mapping[str, object] | None = None,
+    ) -> tuple[Node, ...]:
+        # The map records shape provenance only. Values keep every operation
+        # performed inside a proven singleton round trip.
+        pending = [node]
+        seen: set[Node] = set()
+        roots: list[Node] = []
+        while pending:
+            current = pending.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            if stop_at is not None and current.name in stop_at:
+                roots.append(current)
+                continue
+            sources = restored_inputs.get(current.name)
+            if sources is None:
+                sources = self._same_shape_tensor_inputs(current)
+            if sources is None:
+                roots.append(current)
+            else:
+                pending.extend(sources)
+        return tuple(roots)
+
+    def _placeholder_param(self, node: Node) -> str | None:
+        if node.op != "placeholder":
+            return None
+        if node.name.startswith("tangents_"):
+            return self._tangent_param_name(node.name)
+        if node.name.startswith("primals_"):
+            return self.primal_to_name[int(node.name.split("_")[1])]
+        return None
+
+    def _prebroadcasted_axes(
+        self,
+        node: Node,
+        restored_inputs: dict[str, tuple[Node, ...]],
+        elided_padding: dict[str, tuple[int, ...]],
+    ) -> tuple[int, ...]:
+        """Track loader padding through scalar/cast/identity and inverse-view chains."""
+        if self._use_reduction_kernel_path or not self._needs_broadcast:
+            return ()
+        axes: set[tuple[int, ...]] = set()
+        iter_shape = self.tensor_shapes[self._iter_tensor_name()]
+        for source in self._shape_chain_roots(node, restored_inputs, elided_padding):
+            if source.name in elided_padding:
+                axes.add(elided_padding[source.name])
+                continue
+            if source.op != "placeholder":
+                return ()
+            param = self._placeholder_param(source)
+            if param is None:
+                return ()
+            missing = self._param_padding_dims(param, iter_shape)
+            axes.add(tuple(missing))
+        return next(iter(axes)) if len(axes) == 1 else ()
+
+    def _has_logical_shape(self, node: Node, shaped: dict[str, bool]) -> bool:
+        """Whether prior emission preserved this value's logical FX dimensions.
+
+        Loader padding and unrendered shape changes are deliberately excluded.
+        This permits ordinary inverses on unpadded nonlinear view chains.
+        """
+        if node.name in shaped:
+            return shaped[node.name]
+        if node.op == "placeholder":
+            if self._use_reduction_kernel_path:
+                return False
+            param = self._placeholder_param(node)
+            if param is None:
+                return False
+            iter_shape = self.tensor_shapes[self._iter_tensor_name()]
+            # Only singleton axes shared with the iteration use literal-extent
+            # loads. Implicit trailing dimensions already use full slices.
+            return not self._param_padding_dims(param, iter_shape) and all(
+                size != 1 or iter_size == 1
+                for size, iter_size in zip(
+                    self._param_shape(param), iter_shape, strict=False
+                )
+            )
+        if (
+            node.op == "call_function"
+            and isinstance(node.target, torch._ops.OpOverload)
+            and node.target._opname in self._REDUCTION_OPS
+            and node.args
+            and isinstance(node.args[0], Node)
+        ):
+            # Rendered reductions preserve their declared rank when the input
+            # has its logical axes, including explicitly expanded local axes.
+            inputs = (node.args[0],)
+        else:
+            inputs = self._same_shape_tensor_inputs(node)
+        result = inputs is not None and all(
+            self._has_logical_shape(source, shaped) for source in inputs
+        )
+        shaped[node.name] = result
+        return result
+
+    def _has_unpadded_reduction_load_shape(
+        self, node: Node, emitted_axes: dict[str, int]
+    ) -> bool:
+        """Prove local-expand inputs without widening squeeze/view admission.
+
+        Full-rank and wholly sliced reduction loads preserve axes; singleton
+        iteration axes use literal slices. Rendered reductions and recorded
+        singleton insertions preserve that input's declared dimensions. Aliased
+        views and padded loaders cannot supply this proof. The cache is local
+        to this proof query.
+        """
+        if not self._use_reduction_kernel_path:
+            return False
+
+        iter_shape = self.tensor_shapes[self._iter_tensor_name()]
+
+        @functools.cache
+        def prove(node: Node) -> bool:
+            if (
+                node.op == "call_function"
+                and isinstance(node.target, torch._ops.OpOverload)
+                and (
+                    node.target._opname in self._REDUCTION_OPS
+                    or (
+                        node.target is torch.ops.aten.unsqueeze.default
+                        and node.name in emitted_axes
+                    )
+                )
+                and node.args
+                and isinstance(node.args[0], Node)
+            ):
+                return prove(node.args[0])
+            for source in self._shape_chain_roots(node, {}):
+                if source.op != "placeholder":
+                    if source is node or not prove(source):
+                        return False
+                    continue
+                param = self._placeholder_param(source)
+                if param is None:
+                    return False
+                shape = self._param_shape(param)
+                if len(shape) < len(iter_shape):
+                    try:
+                        mapped = self._map_param_to_iter_dims(
+                            param, iter_shape, self._non_reduced_dims
+                        )
+                    except exc.AutodiffNotSupported:
+                        # An unmappable load cannot establish this proof.
+                        return False
+                    # This loader branch emits one ':' per parameter axis,
+                    # without the None axes of a tiled broadcast load.
+                    if not all(dim in self._full_slice_dims for dim in mapped):
+                        return False
+                elif any(
+                    shape[dim] == 1 and iter_shape[dim] != 1 for dim in self._tiled_dims
+                ):
+                    return False
+            return True
+
+        return prove(node)
+
+    def _validate_aliased_expand_counts(self, computations: list[Node]) -> None:
+        """Reject reductions that count an unmaterialized broadcast extent.
+
+        Track axes whose logical replication an aliased value does not prove.
+        Pointwise joins retain an axis only when every operand lacks that proof;
+        another full-sized operand materializes the broadcast. Arbitrary views
+        lose the axis map, so defer rejection until a reduction needs it.
+        """
+        aliased: dict[Node, set[int]] = {}
+        for node in computations:
+            value = node.meta.get("val")
+            if not isinstance(value, torch.Tensor):
+                continue
+            inputs = [
+                source
+                for source in node.all_input_nodes
+                if isinstance(source.meta.get("val"), torch.Tensor)
+            ]
+            if not inputs or not isinstance(node.target, torch._ops.OpOverload):
+                continue
+            op_name = node.target._opname
+            source = inputs[0]
+            source_shape = source.meta["val"].shape
+            source_axes = aliased.get(source, set())
+            shape = value.shape
+            if op_name in self._REDUCTION_OPS:
+                if not source_axes:
+                    continue
+                axes, keepdim = _reduction_dims_and_keepdim(
+                    node, ndim=len(source_shape), implicit_all=True
+                )
+                if op_name == "sum" and axes & source_axes:
+                    raise exc.AutodiffNotSupported(
+                        "sum over an aliased expand requires explicit replication"
+                    )
+                aliased[node] = {
+                    dim if keepdim else dim - sum(axis < dim for axis in axes)
+                    for dim in source_axes - axes
+                }
+            elif op_name in {"view", "squeeze", "unsqueeze"}:
+                if not source_axes:
+                    continue
+                old_axes = [i for i, size in enumerate(source_shape) if size != 1]
+                new_axes = [i for i, size in enumerate(shape) if size != 1]
+                if [source_shape[i] for i in old_axes] != [shape[i] for i in new_axes]:
+                    aliased[node] = set(new_axes)
+                    continue
+                aliased[node] = {
+                    new
+                    for old, new in zip(old_axes, new_axes, strict=True)
+                    if old in source_axes
+                }
+            elif op_name == "expand" and node.meta.get("helion_local_expand"):
+                # Its separate logical-shape proof runs before explicit emission.
+                continue
+            elif (
+                op_name
+                in {"expand", "alias", "detach", "_to_copy", "convert_element_type"}
+                or torch.Tag.pointwise in node.target.tags
+            ):
+                missing = {dim for dim, size in enumerate(shape) if size != 1}
+                for operand in inputs:
+                    operand_shape = operand.meta["val"].shape
+                    leading = len(shape) - len(operand_shape)
+                    operand_axes = aliased.get(operand, set())
+                    missing = {
+                        dim
+                        for dim in missing
+                        if dim < leading
+                        or operand_shape[dim - leading] == 1
+                        or dim - leading in operand_axes
+                    }
+                aliased[node] = missing
 
     def _generate_computation(
         self, computations: list[Node], placeholders: list[Node]
@@ -3432,6 +3958,7 @@ class FXToHelionConverter:
             (computation_lines, node_to_var) where node_to_var maps node names
             to generated variable names (including aliases from skipped ops).
         """
+        self._validate_aliased_expand_counts(computations)
         lines = []
         node_to_var: dict[str, str] = {}
 
@@ -3455,6 +3982,12 @@ class FXToHelionConverter:
                 f"{sorted(tangent_indices)}"
             )
 
+        emitted_axes: dict[str, int] = {}
+        reshaped_padding: dict[str, tuple[int, ...]] = {}
+        elided_unsqueezes: set[str] = set()
+        restored_inputs: dict[str, tuple[Node, ...]] = {}
+        logical_shapes: dict[str, bool] = {}
+        elided_padding: dict[str, tuple[int, ...]] = {}
         for node in computations:
             target = node.target
             op_name = getattr(target, "_opname", None)
@@ -3492,28 +4025,109 @@ class FXToHelionConverter:
                         node_to_var[node.name] = input_var
                     continue
 
+            if op_name in ("view", "squeeze"):
+                if node.args and isinstance(node.args[0], Node):
+                    input_node = node.args[0]
+                    assert "val" in node.meta, (
+                        f"{op_name} node {node.name} missing fake-tensor meta"
+                    )
+                    # Scalar arithmetic/casts preserve a singleton round trip.
+                    # Undo an emitted shape change on the computed value. When
+                    # the unsqueeze used loader padding, retain that padding.
+                    sources = self._shape_chain_roots(input_node, restored_inputs)
+                    originals: list[Node] = []
+                    effects: set[tuple[str, tuple[int, ...]]] = set()
+                    for source in sources:
+                        if getattr(source.target, "_opname", None) != "unsqueeze":
+                            break
+                        original = source.args[0]
+                        assert isinstance(original, Node)
+                        assert "val" in original.meta, (
+                            f"unsqueeze input {original.name} missing fake-tensor meta"
+                        )
+                        if node.meta["val"].shape != original.meta["val"].shape:
+                            break
+                        if source.name in reshaped_padding:
+                            effect = ("reshape", reshaped_padding[source.name])
+                        elif source.name in emitted_axes:
+                            effect = ("squeeze", (emitted_axes[source.name],))
+                        elif source.name in elided_unsqueezes:
+                            effect = ("alias", ())
+                        else:
+                            break
+                        originals.append(original)
+                        effects.add(effect)
+                    else:
+                        # A pointwise join may merge several tangent branches.
+                        # Undo only a shape effect proved identical on all of
+                        # them; never infer one branch's layout for another.
+                        if len(effects) == 1:
+                            action, axes = next(iter(effects))
+                            input_var = node_to_var[input_node.name]
+                            if action != "alias":
+                                result_var = f"{node.name}_val"
+                                node_to_var[node.name] = result_var
+                                if action == "reshape":
+                                    # A rank-zero/one input was reshaped rather
+                                    # than given an extra physical axis. Restore
+                                    # every original padding axis on this value.
+                                    rank = originals[0].meta["val"].ndim + len(axes)
+                                    shape = ", ".join(
+                                        "1" if axis in axes else "-1"
+                                        for axis in range(rank)
+                                    )
+                                    expression = f"{input_var}.reshape({shape})"
+                                else:
+                                    expression = f"{input_var}.squeeze({axes[0]})"
+                                lines.append(f"{result_var} = {expression}")
+                            else:
+                                node_to_var[node.name] = input_var
+                            restored_inputs[node.name] = tuple(originals)
+                            if all(
+                                self._has_logical_shape(original, logical_shapes)
+                                for original in originals
+                            ):
+                                logical_shapes[node.name] = True
+                            continue
+
             if op_name == "unsqueeze":
                 if node.args and isinstance(node.args[0], Node):
                     input_node = node.args[0]
-                    # In the non-reduction path, `tangents_N` tiles are already
-                    # loaded with the correct shape (tile loading inserts `None`
-                    # indices for missing dims), so aliasing is correct; so is
-                    # a same-shape op of the tangent alone (newer PyTorch
-                    # divides the mean backward's tangent before unsqueezing).
-                    # For other inputs (primals or intermediates) the tile
-                    # variable has the same ndim as the original tensor and the
-                    # unsqueeze must be emitted explicitly.
-                    is_tangent_input = _is_tangent_shaped(input_node)
-                    if self._use_reduction_kernel_path or not is_tangent_input:
+                    assert "val" in input_node.meta, (
+                        f"unsqueeze input {input_node.name} missing fake-tensor meta"
+                    )
+                    val = input_node.meta["val"]
+                    assert isinstance(val, torch.Tensor)
+                    in_ndim = val.ndim
+                    dim = node.args[1]
+                    padded_axes = self._prebroadcasted_axes(
+                        input_node, restored_inputs, elided_padding
+                    )
+                    # Padding axes are physical positions; prior padding is
+                    # absent from the logical FX rank. Consume one singleton
+                    # only at the requested logical insertion position.
+                    consumed_axis = next(
+                        (
+                            axis
+                            for index, axis in enumerate(padded_axes)
+                            if isinstance(dim, int)
+                            and dim % (in_ndim + 1) == axis - index
+                        ),
+                        None,
+                    )
+                    if consumed_axis is None:
+                        if isinstance(dim, int):
+                            # Record the inserted physical position for the
+                            # inverse handler, not a general logical axis map.
+                            emitted_axes[node.name] = dim % (in_ndim + 1)
                         result_var = f"{node.name}_val"
                         node_to_var[node.name] = result_var
                         input_var = node_to_var[input_node.name]
-                        assert "val" in input_node.meta, (
-                            f"unsqueeze input {input_node.name} missing fake-tensor meta"
-                        )
-                        in_ndim = input_node.meta["val"].ndim
-                        dim = node.args[1] if len(node.args) > 1 else -1
+                        if self._has_logical_shape(input_node, logical_shapes):
+                            logical_shapes[node.name] = True
                         if in_ndim <= 1:
+                            if padded_axes:
+                                reshaped_padding[node.name] = padded_axes
                             out_ndim = in_ndim + 1
                             # in_ndim ≤ 1 ⇒ out_ndim ≤ 2, so `shape` has at
                             # most one -1 (set explicitly to 1 below).
@@ -3546,8 +4160,11 @@ class FXToHelionConverter:
                                 f"{result_var} = {input_var}[{', '.join(idx)}]"
                             )
                     else:
-                        # Tangent input in non-reduction path: tile loading already
-                        # applied the correct shape, so alias is sufficient.
+                        # The input chain already owns this broadcast axis.
+                        elided_unsqueezes.add(node.name)
+                        elided_padding[node.name] = tuple(
+                            axis for axis in padded_axes if axis != consumed_axis
+                        )
                         node_to_var[node.name] = node_to_var[input_node.name]
                     continue
 
@@ -3556,7 +4173,33 @@ class FXToHelionConverter:
             if op_name == "expand":
                 if node.args and isinstance(node.args[0], Node):
                     input_node = node.args[0]
-                    node_to_var[node.name] = node_to_var[input_node.name]
+                    input_var = node_to_var[input_node.name]
+                    if node.meta.get("helion_local_expand"):
+                        if not (
+                            self._has_logical_shape(input_node, logical_shapes)
+                            or self._has_unpadded_reduction_load_shape(
+                                input_node, emitted_axes
+                            )
+                        ):
+                            raise exc.AutodiffNotSupported(
+                                "local expand requires a logically shaped input"
+                            )
+                        source_shape = input_node.meta["val"].shape
+                        output_shape = node.meta["val"].shape
+                        dimensions = [
+                            f"{input_var}.shape[{i}]" if old == new else str(new)
+                            for i, (old, new) in enumerate(
+                                zip(source_shape, output_shape, strict=True)
+                            )
+                        ]
+                        result_var = f"{node.name}_val"
+                        lines.append(
+                            f"{result_var} = {input_var}.expand({', '.join(dimensions)})"
+                        )
+                        node_to_var[node.name] = result_var
+                        logical_shapes[node.name] = True
+                    else:
+                        node_to_var[node.name] = input_var
                     continue
 
             if op_name == "view":
@@ -3622,13 +4265,22 @@ class FXToHelionConverter:
             if op_name == "squeeze":
                 if node.args and isinstance(node.args[0], Node):
                     input_node = node.args[0]
-                    if self._use_reduction_kernel_path:
+                    if node.meta["val"].shape == input_node.meta["val"].shape:
+                        node_to_var[node.name] = node_to_var[input_node.name]
+                        continue
+                    # An individually logical primal can still meet a padded
+                    # tangent later. Ordinary squeezes require an unpadded
+                    # loader; the proven inserted-axis inverse above handles
+                    # padded round trips separately.
+                    exact_shape = not self._needs_broadcast and self._has_logical_shape(
+                        input_node, logical_shapes
+                    )
+                    if self._use_reduction_kernel_path or exact_shape:
+                        if exact_shape:
+                            logical_shapes[node.name] = True
                         result_var = f"{node.name}_val"
                         node_to_var[node.name] = result_var
                         input_var = node_to_var[input_node.name]
-                        assert "val" in node.meta, (
-                            f"squeeze node {node.name} missing fake-tensor meta"
-                        )
                         out_ndim = node.meta["val"].ndim
                         if out_ndim <= 1:
                             lines.append(f"{result_var} = {input_var}.reshape(-1)")
@@ -3650,6 +4302,34 @@ class FXToHelionConverter:
                                 f"{result_var} = {input_var}.squeeze({squeezed[0]})"
                             )
                     else:
+                        # Removing an existing singleton logically, while
+                        # retaining it physically, creates the same one-axis
+                        # padding effect as the broadcast loader.
+                        if self._has_logical_shape(input_node, logical_shapes):
+                            shape = tuple(input_node.meta["val"].shape)
+                            dimensions = (
+                                node.args[1]
+                                if len(node.args) > 1
+                                else tuple(range(len(shape)))
+                            )
+                            if isinstance(dimensions, int):
+                                dimensions = (dimensions,)
+                            if isinstance(dimensions, (tuple, list)) and all(
+                                isinstance(dim, int) for dim in dimensions
+                            ):
+                                removed = {
+                                    dim % len(shape)
+                                    for dim in cast(
+                                        "tuple[int, ...] | list[int]", dimensions
+                                    )
+                                    if shape[dim % len(shape)] == 1
+                                }
+                                if len(removed) == 1:
+                                    axis = next(iter(removed))
+                                    if shape[:axis] + shape[axis + 1 :] == tuple(
+                                        node.meta["val"].shape
+                                    ):
+                                        elided_padding[node.name] = (axis,)
                         node_to_var[node.name] = node_to_var[input_node.name]
                     continue
 
@@ -3894,7 +4574,14 @@ class FXToHelionConverter:
                         )
                         load_expr = f"{p}[{', '.join(indices)}]"
                 else:
-                    load_expr = f"{p}[{', '.join(full_indices)}]"
+                    # A singleton iteration axis still has a symbolic tile
+                    # extent. Preserve its literal size for local expansion.
+                    shape = self._param_shape(p)
+                    indices = [
+                        "0:1" if shape[dim] == iter_shape[dim] == 1 else index
+                        for dim, index in enumerate(full_indices)
+                    ]
+                    load_expr = f"{p}[{', '.join(indices)}]"
                 loop_body.append(parse_stmt(f"{p}_tile = {load_expr}"))
 
             for line in computation_lines:
@@ -4034,21 +4721,8 @@ class FXToHelionConverter:
                 body.append(parse_stmt(f"({dim_vars[0]},) = {iter_var}.shape"))
 
             for p in input_params:
-                tensor_ndim = self._param_ndim(p)
-                if tensor_ndim < iter_ndim:
-                    dim_map = self._map_param_to_iter_dims(
-                        p, iter_shape, self._non_reduced_dims
-                    )
-                    mapped_iter_dims = set(dim_map)
-                    indices = []
-                    for i in range(iter_ndim):
-                        if i in mapped_iter_dims:
-                            indices.append(tile_vars[i])
-                        else:
-                            indices.append("None")
-                    load_expr = f"{p}[{', '.join(indices)}]"
-                else:
-                    load_expr = f"{p}[{', '.join(tile_vars)}]"
+                indices = self._nonreduction_load_indices(p, iter_shape, tile_vars)
+                load_expr = f"{p}[{', '.join(indices)}]"
                 loop_body.append(parse_stmt(f"{p}_tile = {load_expr}"))
 
             for line in computation_lines:
@@ -4099,7 +4773,20 @@ class FXToHelionConverter:
         else:
             # All inputs have iter_ndim — single shared `tile` indexer.
             for p in input_params:
-                loop_body.append(parse_stmt(f"{p}_tile = {p}[tile]"))
+                if any(
+                    size == 1 and iter_shape[dim] == 1
+                    for dim, size in enumerate(self._param_shape(p)[:iter_ndim])
+                ):
+                    tiles = (
+                        ["tile"]
+                        if iter_ndim == 1
+                        else [f"tile[{dim}]" for dim in range(iter_ndim)]
+                    )
+                    indices = self._nonreduction_load_indices(p, iter_shape, tiles)
+                    index = ", ".join(indices)
+                else:
+                    index = "tile"
+                loop_body.append(parse_stmt(f"{p}_tile = {p}[{index}]"))
 
             for line in computation_lines:
                 loop_body.append(parse_stmt(line))
@@ -4224,6 +4911,33 @@ def _resolve_scalar_values(
     return scalar_values
 
 
+def _reduction_dims_and_keepdim(
+    node: Node,
+    *,
+    ndim: int | None = None,
+    implicit_all: bool = False,
+) -> tuple[set[int], bool]:
+    """Read positional/keyword reduction axes and optionally normalize them.
+
+    Collectors retain their historical empty result for None or empty dims.
+    The alias-count validator instead sets implicit_all with the source rank.
+    """
+    dim_arg = node.args[1] if len(node.args) >= 2 else node.kwargs.get("dim")
+    if dim_arg is None or dim_arg == [] or dim_arg == ():
+        candidates = range(ndim) if implicit_all and ndim is not None else ()
+    else:
+        candidates = dim_arg if isinstance(dim_arg, (list, tuple)) else (dim_arg,)
+    dims = {
+        dim % ndim if ndim is not None else dim
+        for dim in candidates
+        if isinstance(dim, int)
+    }
+    keepdim = node.kwargs.get("keepdim", False)
+    if not keepdim and len(node.args) >= 3:
+        keepdim = node.args[2]
+    return dims, bool(keepdim)
+
+
 def _collect_reduce_dims(
     graph: torch.fx.Graph,
     *,
@@ -4247,25 +4961,11 @@ def _collect_reduce_dims(
         op_name = getattr(node.target, "_opname", None)
         if op_name not in FXToHelionConverter._REDUCTION_OPS:
             continue
-        # Skip keepdim=True reductions when requested (they are intermediate
-        # computations that don't reduce the output rank).
-        if skip_keepdim:
-            keepdim = node.kwargs.get("keepdim", False)
-            if not keepdim and len(node.args) >= 3:
-                keepdim = node.args[2]
-            if keepdim:
-                continue
-        dim_arg: object = None
-        if len(node.args) >= 2:
-            dim_arg = node.args[1]
-        elif "dim" in node.kwargs:
-            dim_arg = node.kwargs["dim"]
-        if dim_arg is None:
-            continue
-        candidates = dim_arg if isinstance(dim_arg, (list, tuple)) else (dim_arg,)
-        for d in candidates:
-            if isinstance(d, int):
-                reduce_dims.add(d % iter_ndim if iter_ndim is not None else d)
+        dims, keepdim = _reduction_dims_and_keepdim(node)
+        if not (skip_keepdim and keepdim):
+            reduce_dims.update(
+                dim % iter_ndim if iter_ndim is not None else dim for dim in dims
+            )
     return reduce_dims
 
 
@@ -4351,23 +5051,9 @@ def _collect_store_reduce_dims(
             else None
         )
         if op_name in _REDUCTION_OPS:
-            # Skip keepdim=True: those don't change the output rank.
-            keepdim = node.kwargs.get("keepdim", False)
-            if not keepdim and len(node.args) >= 3:
-                keepdim = node.args[2]
+            reduction_dims, keepdim = _reduction_dims_and_keepdim(node)
             if not keepdim:
-                dim_arg: object = None
-                if len(node.args) >= 2:
-                    dim_arg = node.args[1]
-                elif "dim" in node.kwargs:
-                    dim_arg = node.kwargs["dim"]
-                if dim_arg is not None:
-                    candidates = (
-                        dim_arg if isinstance(dim_arg, (list, tuple)) else (dim_arg,)
-                    )
-                    for d in candidates:
-                        if isinstance(d, int):
-                            dims.add(d)
+                dims.update(reduction_dims)
         for arg in node.args:
             if isinstance(arg, torch.fx.Node):
                 dims |= _upstream_output_reduce_dims(arg, visited)
@@ -4868,28 +5554,6 @@ def _numel(shape: tuple[int, ...]) -> int:
     for s in shape:
         n *= s
     return n
-
-
-def _is_tangent_shaped(node: Node) -> bool:
-    """Whether ``node`` is a ``tangents_N`` placeholder or a chain of
-    same-shape ops on one, whose other operands are scalars."""
-    while not node.name.startswith("tangents_"):
-        val = node.meta.get("val")
-        tensor_args = [
-            arg
-            for arg in node.args
-            if isinstance(arg, Node)
-            and isinstance(arg.meta.get("val"), torch.Tensor)
-            and arg.meta["val"].ndim > 0
-        ]
-        if (
-            len(tensor_args) != 1
-            or not isinstance(val, torch.Tensor)
-            or val.shape != tensor_args[0].meta["val"].shape
-        ):
-            return False
-        node = tensor_args[0]
-    return True
 
 
 def _diff_squeezed_dims(

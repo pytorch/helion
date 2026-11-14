@@ -11,11 +11,16 @@ import tempfile
 import textwrap
 import types
 from typing import TYPE_CHECKING
+from typing import cast
 
 import torch
+from torch._dynamo.source import AttrSource
 from torch._dynamo.source import GetItemSource
 from torch._dynamo.source import LocalSource
+from torch._dynamo.source import TensorProperty
+from torch._dynamo.source import TensorPropertySource
 
+from .._compiler.runtime_tensor_guards import _CanonicalLayoutClassifier
 from ..runtime.structural_policy import StructuralPolicyError
 from .aot_structural_policy import MODEL_MANIFEST
 from .aot_structural_policy import model_configs
@@ -28,21 +33,34 @@ if TYPE_CHECKING:
     from ..runtime.kernel import BoundKernel
     from ..runtime.structural_policy import StructuralPolicy
 
-RuntimeGuard = tuple[
+_GuardProjection = tuple[int, tuple[int | str | tuple[str, int], ...]]
+_RuntimeGuardBase = tuple[
     str,
     str,
     str,
     str,
     str,
     tuple[str, ...],
-    tuple[tuple[int, tuple[int | str, ...]], ...],
+    tuple[_GuardProjection, ...],
 ]
+_CanonicalRuntimeGuard = tuple[
+    str,
+    str,
+    str,
+    str,
+    str,
+    tuple[str, ...],
+    tuple[_GuardProjection, ...],
+    tuple[bool, tuple[str, ...], int],
+]
+RuntimeGuard = _RuntimeGuardBase | _CanonicalRuntimeGuard
+GuardedCallKey = tuple[tuple[RuntimeGuard, ...], tuple[object, ...], tuple[object, ...]]
 
 
 def export_runtime_guards(
     bound: BoundKernel, args: tuple[object, ...]
 ) -> tuple[tuple[RuntimeGuard, ...], tuple[object, ...]]:
-    """Snapshot declared storage-only classifiers and their input projections.
+    """Snapshot relocatable storage and canonical metadata classifiers.
 
     The same named classifier executes during exported dispatch. Its source
     module identity is checked when the artifact loads; no tensor contents or
@@ -55,9 +73,20 @@ def export_runtime_guards(
         name: index for index, name in enumerate(bound.kernel.signature.parameters)
     }
 
-    def projection(source: object) -> tuple[int, tuple[int | str, ...]]:
+    def projection(source: object) -> _GuardProjection:
+        if (
+            isinstance(source, TensorPropertySource)
+            and source.prop in (TensorProperty.SIZE, TensorProperty.STRIDE)
+            and source.idx is not None
+        ):
+            index, path = projection(source.base)
+            property_name = "size" if source.prop == TensorProperty.SIZE else "stride"
+            return index, (*path, (property_name, source.idx))
         if isinstance(source, LocalSource) and source.local_name in indices:
             return indices[source.local_name], ()
+        if isinstance(source, AttrSource):
+            index, path = projection(source.base)
+            return index, (*path, source.member)
         if (
             isinstance(source, GetItemSource)
             and isinstance(source.index, (int, str))
@@ -72,39 +101,64 @@ def export_runtime_guards(
     guards: list[RuntimeGuard] = []
     for key, specialization in sorted(bound.env.runtime_input_specializations.items()):
         classifier = specialization.classifier
-        if not specialization.reusable_tensor_properties:
+        canonical = type(classifier) is _CanonicalLayoutClassifier
+        if not canonical and not specialization.reusable_tensor_properties:
             raise StructuralPolicyError(
                 "Standalone AOT cannot relocate tensor-content specialization "
                 "classifiers; retain runtime AOT for this kernel"
             )
-        if (
+        if not canonical and (
             not isinstance(classifier, types.FunctionType)
             or "<locals>" in classifier.__qualname__
         ):
             raise StructuralPolicyError(
                 "Standalone AOT needs an importable storage classifier"
             )
-        source_file = inspect.getsourcefile(classifier)
+        implementation = (
+            _CanonicalLayoutClassifier
+            if canonical
+            else cast("types.FunctionType", classifier)
+        )
+        source_file = inspect.getsourcefile(implementation)
         if source_file is None:
             raise StructuralPolicyError(
                 "Standalone AOT cannot identify storage classifier source"
             )
-        guards.append(
-            (
-                key,
-                classifier.__module__,
-                classifier.__qualname__,
-                hashlib.sha256(Path(source_file).read_bytes()).hexdigest(),
-                repr(specialization.classifier_identity),
-                tuple(sorted(specialization.reusable_tensor_properties)),
-                tuple(projection(source) for source in specialization.sources),
-            )
+        base_guard: _RuntimeGuardBase = (
+            key,
+            implementation.__module__,
+            implementation.__qualname__,
+            hashlib.sha256(Path(source_file).read_bytes()).hexdigest(),
+            repr(specialization.classifier_identity),
+            tuple(sorted(specialization.reusable_tensor_properties)),
+            tuple(projection(source) for source in specialization.sources),
         )
+        if canonical:
+            classifier = cast("_CanonicalLayoutClassifier", classifier)
+            guards.append(
+                (
+                    *base_guard,
+                    (
+                        classifier.require_canonical_input,
+                        classifier.expressions,
+                        classifier.parameter_count,
+                    ),
+                )
+            )
+        else:
+            guards.append(base_guard)
     plans = tuple(guards)
     classifiers = _export_classifiers(plans)
     for guard, imported in zip(plans, classifiers, strict=True):
         declared = bound.env.runtime_input_specializations[guard[0]].classifier
+        if type(declared) is _CanonicalLayoutClassifier:
+            if type(imported) is not _CanonicalLayoutClassifier or declared != imported:
+                raise StructuralPolicyError(
+                    "Standalone canonical metadata classifier changed"
+                )
+            continue
         assert isinstance(declared, types.FunctionType)
+        assert isinstance(imported, types.FunctionType)
         # Tracing can clone a function while retaining its exact code and
         # globals dictionary. Identity of the function object is not required;
         # changed code, globals, defaults or closure state is not relocatable.
@@ -120,7 +174,15 @@ def export_runtime_guards(
                 "Standalone storage classifier is not its declared global"
             )
     observed = _export_guard_key(args, plans, classifiers)
-    snapshots = bound.env.bound_runtime_input_specialization_results
+    snapshots = dict(bound.env.bound_runtime_input_specialization_results)
+    for guard in plans:
+        if (
+            len(guard) == 8
+            and guard[0] in bound.env.bound_metadata_specialization_results
+        ):
+            snapshots[guard[0]] = bound.env.bound_metadata_specialization_results[
+                guard[0]
+            ]
     if any(guard[0] not in snapshots for guard in plans):
         raise StructuralPolicyError(
             "Standalone storage guard requires a new binding snapshot"
@@ -137,31 +199,33 @@ def export_runtime_guards(
 
 def _export_classifiers(
     guards: tuple[RuntimeGuard, ...],
-) -> tuple[types.FunctionType, ...]:
+) -> tuple[Callable[..., object], ...]:
     """Resolve exact imported classifier implementations before dispatch."""
-    result = []
-    for (
-        _key,
-        module_name,
-        qualified_name,
-        digest,
-        _identity,
-        _properties,
-        _paths,
-    ) in guards:
-        module = importlib.import_module(module_name)
+    result: list[Callable[..., object]] = []
+    for guard in guards:
+        module = importlib.import_module(guard[1])
         classifier = module
-        for attribute in qualified_name.split("."):
+        for attribute in guard[2].split("."):
             classifier = getattr(classifier, attribute)
-        if not isinstance(classifier, types.FunctionType):
+        if not (
+            len(guard) == 8
+            and classifier is _CanonicalLayoutClassifier
+            or len(guard) == 7
+            and isinstance(classifier, types.FunctionType)
+        ):
             raise ValueError("Standalone storage classifier implementation changed")
         source_file = inspect.getsourcefile(classifier)
         if (
             source_file is None
-            or hashlib.sha256(Path(source_file).read_bytes()).hexdigest() != digest
+            or hashlib.sha256(Path(source_file).read_bytes()).hexdigest() != guard[3]
         ):
             raise ValueError("Standalone storage classifier source identity changed")
-        result.append(classifier)
+        if len(guard) == 8:
+            definition = cast("_CanonicalRuntimeGuard", guard)[7]
+            result.append(_CanonicalLayoutClassifier(*definition))
+        else:
+            assert isinstance(classifier, types.FunctionType)
+            result.append(classifier)
     return tuple(result)
 
 
@@ -172,11 +236,23 @@ def _export_guard_key(
 ) -> tuple[object, ...]:
     from .aot_compile import _standalone_value_key
 
-    def project(path: tuple[int, tuple[int | str, ...]]) -> object:
+    def project(path: _GuardProjection) -> object:
         index, steps = path
         value = args[index]
         for step in steps:
-            if (
+            if isinstance(step, tuple):
+                if not isinstance(value, torch.Tensor):
+                    return None
+                property_name, dimension = step
+                if not -value.ndim <= dimension < value.ndim:
+                    return None
+                if property_name == "size":
+                    value = value.size(dimension)
+                elif property_name == "stride":
+                    value = value.stride(dimension)
+                else:
+                    return None
+            elif (
                 isinstance(step, int)
                 and isinstance(value, (list, tuple))
                 and 0 <= step < len(value)
@@ -194,7 +270,7 @@ def _export_guard_key(
         (
             guard[0],
             _standalone_value_key(
-                classifier(tuple(project(path) for path in guard[-1]))
+                classifier(tuple(project(path) for path in guard[6]))
             ),
         )
         for guard, classifier in zip(guards, classifiers, strict=True)
@@ -247,6 +323,35 @@ def _export_call_key(
         return _standalone_value_key(value)
 
     return key(args)
+
+
+def _select_guarded_variant(
+    args: tuple[object, ...],
+    plans: tuple[tuple[RuntimeGuard, ...], ...],
+    classifiers: tuple[tuple[Callable[..., object], ...], ...],
+    variants: dict[tuple[object, ...], int | list[int]],
+    dynamic: bool,
+) -> int | list[int]:
+    """Prefer exact calls, then dynamic calls with more checked conditions."""
+    observed = [
+        (plan, _export_guard_key(args, plan, functions))
+        for plan, functions in zip(plans, classifiers, strict=True)
+    ]
+    exact_call_key = _export_call_key(args)
+    for dynamic_key in (False, True) if dynamic else (False,):
+        call_key = (
+            _export_call_key(args, dynamic=True) if dynamic_key else exact_call_key
+        )
+        for plan, guard_key in observed:
+            key: tuple[object, ...] = (plan, call_key, guard_key)
+            if dynamic:
+                key = ("dynamic" if dynamic_key else "exact", key)
+            if key in variants:
+                return variants[key]
+    raise ValueError(
+        f"No standalone variant for call signature {exact_call_key!r}; "
+        f"observed per-plan guards {observed!r}"
+    )
 
 
 def _model_manifest(code: str, name: str, policy: StructuralPolicy) -> dict[str, Any]:
@@ -342,6 +447,7 @@ def generate_policy_standalone(
     user_key: Callable[..., object] | None,
     dynamic_groups: list[tuple[tuple[object, ...], list[int]]] | None,
     runtime_guards: tuple[RuntimeGuard, ...],
+    runtime_guard_plans: tuple[tuple[RuntimeGuard, ...], ...] | None = None,
 ) -> Path:
     """Link exact generated modules, including embedded multi-launch children.
 
@@ -354,6 +460,40 @@ def generate_policy_standalone(
     from .aot_compile import _standalone_value_key
     from .aot_kernel import _flatten_key_value
 
+    if runtime_guard_plans is None:
+        # Keep the legacy tuple formats at the API boundary, then link every
+        # variant through the same plan-aware dispatcher.
+        runtime_guard_plans = (runtime_guards,)
+        if dispatch_keys is not None:
+            dispatch_keys = [(runtime_guards, *key) for key in dispatch_keys]
+        if dynamic_groups is not None:
+            dynamic_groups = [
+                (
+                    (key[0], (runtime_guards, *cast("tuple[object, ...]", key[1]))),
+                    indices,
+                )
+                for key, indices in dynamic_groups
+            ]
+    elif runtime_guards:
+        raise StructuralPolicyError(
+            "runtime_guards and runtime_guard_plans cannot both be specified"
+        )
+    runtime_guard_plans = tuple(
+        sorted(set(runtime_guard_plans), key=lambda plan: (-len(plan), repr(plan)))
+    )
+    if dispatch_keys is not None and any(
+        key[0] not in runtime_guard_plans for key in dispatch_keys
+    ):
+        raise StructuralPolicyError(
+            "Static variant plan is absent from runtime_guard_plans"
+        )
+    if dynamic_groups is not None and any(
+        cast("GuardedCallKey", key[1])[0] not in runtime_guard_plans
+        for key, _indices in dynamic_groups
+    ):
+        raise StructuralPolicyError(
+            "Dynamic variant plan is absent from runtime_guard_plans"
+        )
     payload = _model_manifest(heuristic_code, kernel_name, policy)
     if not codes:
         raise StructuralPolicyError("Standalone AOT requires at least one variant")
@@ -401,7 +541,12 @@ def generate_policy_standalone(
     while kernel_name.startswith(prefix):
         prefix += "_"
     linked_helpers = []
-    for helper in (_export_call_key, _export_classifiers, _export_guard_key):
+    for helper in (
+        _export_call_key,
+        _export_classifiers,
+        _export_guard_key,
+        _select_guarded_variant,
+    ):
         function = ast.parse(textwrap.dedent(inspect.getsource(helper))).body[0]
         assert isinstance(function, ast.FunctionDef)
         # These helpers are linked alongside the exact key helper.
@@ -418,6 +563,8 @@ def generate_policy_standalone(
             "import inspect",
             "import types",
             "from pathlib import Path",
+            "from typing import cast",
+            "from helion._compiler.runtime_tensor_guards import _CanonicalLayoutClassifier",
             textwrap.dedent(inspect.getsource(_standalone_value_key)),
             textwrap.dedent(inspect.getsource(_standalone_call_key)),
             textwrap.dedent(inspect.getsource(_flatten_key_value)),
@@ -436,10 +583,12 @@ def generate_policy_standalone(
         f"{prefix}_modules = tuple({prefix}_cache.load(code, extra={policy.identity()!r}) for code in {prefix}_sources)",
         f"{prefix}_functions = tuple(module.{kernel_name} for module in {prefix}_modules)",
         f"{prefix}_utilities = {prefix}_cache.load({utility_code!r}, extra={policy.identity()!r})",
-        f"{prefix}_runtime_guards = {runtime_guards!r}",
-        f"{prefix}_classifiers = {prefix}_utilities._export_classifiers({prefix}_runtime_guards)",
         f"{prefix}_signature = {prefix}_inspect.signature({prefix}_functions[0])",
         f"{prefix}_parameters = tuple(name for name, parameter in {prefix}_signature.parameters.items() if parameter.kind in ({prefix}_inspect.Parameter.POSITIONAL_ONLY, {prefix}_inspect.Parameter.POSITIONAL_OR_KEYWORD))",
+    ]
+    lines += [
+        f"{prefix}_guard_plans = {runtime_guard_plans!r}",
+        f"{prefix}_classifiers = tuple({prefix}_utilities._export_classifiers(plan) for plan in {prefix}_guard_plans)",
     ]
     if dispatch_keys is None:
         if dynamic_groups is not None:
@@ -461,25 +610,16 @@ def generate_policy_standalone(
         f"    bound = {prefix}_signature.bind(*args, **kwargs)",
         "    bound.apply_defaults()",
         f"    normalized = tuple(bound.arguments[name] for name in {prefix}_parameters)",
-        f"    guards = {prefix}_utilities._export_guard_key(normalized, {prefix}_runtime_guards, {prefix}_classifiers)",
     ]
     if dispatch_keys is not None:
-        lines += [
-            f"    key = ({prefix}_utilities._export_call_key(normalized), guards)",
-            "    try:",
-            f"        index = {prefix}_variants[key]",
-            "    except KeyError:",
-            "        raise ValueError(f'No standalone variant for call signature {key!r}') from None",
-        ]
+        lines.append(
+            f"    index = {prefix}_utilities._select_guarded_variant(normalized, {prefix}_guard_plans, {prefix}_classifiers, {prefix}_variants, False)"
+        )
     else:
         if dynamic_groups is not None:
-            lines += [
-                f"    exact_key = ('exact', ({prefix}_utilities._export_call_key(normalized), guards))",
-                f"    dynamic_key = ('dynamic', ({prefix}_utilities._export_call_key(normalized, dynamic=True), guards))",
-                f"    indices = {prefix}_groups.get(exact_key, {prefix}_groups.get(dynamic_key))",
-                "    if indices is None:",
-                "        raise ValueError('No standalone variant for call signature')",
-            ]
+            lines.append(
+                f"    indices = {prefix}_utilities._select_guarded_variant(normalized, {prefix}_guard_plans, {prefix}_classifiers, {prefix}_groups, True)"
+            )
         if user_key is not None:
             lines.append(
                 f"    normalized = {prefix}_utilities._flatten_key_value({prefix}_user_key(*normalized))"

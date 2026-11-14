@@ -34,6 +34,7 @@ from helion._compiler.cute.split_k_cluster_config import SCHEDULE_KEY
 from helion._compiler.cute.state import cute_env_state
 from helion._testing import default_cute_mma_support
 from helion._testing import import_example
+from helion._testing.cute_codegen import check_config_compile_options
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.pattern_search import PatternSearch
@@ -113,6 +114,8 @@ def test_original_family_normal_set_config_preserves_allocating_host(shape, bias
         assert len(values) == (4 if bias else 3)
     source = _embedded_sources(bound.to_code(config))[0]
     assert "atomic" not in source and "torch.zeros" not in source
+    if shape == (32, 4096, 64) and not bias:
+        check_config_compile_options(bound, config)
     assert "cluster_arrive_relaxed()" in source
     assert source.count("cluster_wait()") == 2
     if bias:

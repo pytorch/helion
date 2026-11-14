@@ -17,6 +17,7 @@ from helion._compiler.cute.tcgen05_config import seeds
 from helion._compiler.cute.tcgen05_config import surface
 from helion._testing import cpu_render_target
 from helion._testing.cute_codegen import cuda_fake
+from helion._testing.cute_mma_dag import _ordinary_gemm
 from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
@@ -32,18 +33,6 @@ if TYPE_CHECKING:
     from collections.abc import Generator
 
     from helion.runtime.kernel import BoundKernel
-
-
-def _ordinary_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    m, k = a.shape
-    _, n = b.shape
-    out = torch.empty((m, n), dtype=a.dtype, device=a.device)
-    for tile_m, tile_n in hl.tile((m, n)):
-        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-        for tile_k in hl.tile(k):
-            acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
-        out[tile_m, tile_n] = acc.to(out.dtype)
-    return out
 
 
 def _reshape_view_lhs_gemm(x3: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -262,6 +251,7 @@ def test_non_ffi_sibling_survives_flat_transfer(grouping: int) -> None:
             tcgen05_acc_stages=2,
             tcgen05_c_stages=2,
             tcgen05_tvm_ffi_launch=False,
+            cute_compiler_pipeline="default",
         )
         normalized = bound.config_spec.normalized_config(config)
         generator = ConfigGeneration(bound.config_spec)
@@ -300,7 +290,8 @@ def test_one_cta_n_multicast_repairs_only_search(
 @pytest.mark.parametrize(
     "invalid",
     [
-        {"tcgen05_ab_stages": 6, "tcgen05_c_stages": 4},
+        # The seed's 64-deep tiles cannot hold eight AB stages.
+        {"tcgen05_ab_stages": 8, "tcgen05_c_stages": 4},
         {"tcgen05_cta_group": "two"},
         {"tcgen05_num_epi_warps": 2},
         {"tcgen05_tvm_ffi_launch": 1},

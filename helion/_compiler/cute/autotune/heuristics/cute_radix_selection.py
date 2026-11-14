@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 class CuteRadixSelectionHeuristic(AutotunerHeuristic):
     name = "cute_radix_selection"
     backend = "cute"
-    priority = 89
+    priority = 90
 
     @classmethod
     def register_facts(

@@ -284,6 +284,8 @@ def default_autotuner_fn(
     from ..autotuner import LFBOTreeSearch
     from ..autotuner import cache_classes
     from ..autotuner import search_algorithms
+    from ..autotuner.base_cache import _requires_uncached_tuning
+    from ..autotuner.base_cache import _UncachedAutotuneCache
 
     autotuner_name = _env_get_str("HELION_AUTOTUNER", "")
 
@@ -326,6 +328,13 @@ def default_autotuner_fn(
     # trial. The first construction here is the autotuner the cache wraps
     # for the K=1 path; the factory is also passed through so K>1 trials can
     # build additional fresh autotuners.
+    if (
+        _requires_uncached_tuning(bound_kernel, args)
+        and not cache_cls._supports_fresh_bindings
+    ):
+        return _UncachedAutotuneCache(
+            autotuner_factory(), autotuner_factory=autotuner_factory
+        )
     return cache_cls(autotuner_factory(), autotuner_factory=autotuner_factory)
 
 
@@ -610,6 +619,11 @@ class _Settings:
     )
     autotune_baseline_accuracy_check_fn: Callable[[object, object], None] | None = None
     autotune_benchmark_fn: Callable[..., list[float]] | None = None
+    autotune_benchmark_input_banks: int = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_int, "HELION_AUTOTUNE_BENCHMARK_INPUT_BANKS", 1
+        )
+    )
     autotune_best_available_max_configs: int = dataclasses.field(
         default_factory=functools.partial(
             _env_get_int, "HELION_BEST_AVAILABLE_MAX_CONFIGS", 20
@@ -1110,6 +1124,14 @@ class Settings(_Settings):
             "remote caching via a user-provided RemoteCacheBackend subclass. "
             "Defaults to 'LocalAutotuneCache'."
         ),
+        "autotune_benchmark_input_banks": (
+            "Independent alias-preserving argument banks per captured benchmark cycle. "
+            "Default 1; larger values require isolated CUDA graph timing with replay "
+            "or off L2 mode and an explicit matching final target. Replay starts each "
+            "cycle cold; off primes a complete untimed bank cycle before the timed one. "
+            "In off mode both cycles retain outputs and count toward the memory budget. "
+            "Cloning occurs before timing and scores remain milliseconds per call."
+        ),
         "autotune_benchmark_fn": (
             "Custom benchmark function for rebenchmarking during autotuning. "
             "Should have the following signature: "
@@ -1200,6 +1222,14 @@ class Settings(_Settings):
 
         if self.backend == "tileir" and os.environ.get("ENABLE_TILE", "0") != "1":
             raise exc.MissingEnableTile
+
+        if (
+            type(self.autotune_benchmark_input_banks) is not int
+            or self.autotune_benchmark_input_banks < 1
+        ):
+            raise ValueError(
+                "autotune_benchmark_input_banks must be a positive integer"
+            )
 
         if self.autotune_best_of_k < 1:
             raise ValueError(

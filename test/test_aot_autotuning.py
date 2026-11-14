@@ -8,10 +8,13 @@ Tests for the collect/measure/evaluate workflow.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import csv
+from functools import partial
 import importlib.util
 import inspect
 import json
 import os
+import struct
 import sys
 import threading
 import time
@@ -26,9 +29,14 @@ import numpy as np
 import pytest
 import torch
 
+import helion
 from helion import exc
 from helion._hardware import HardwareInfo
+from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion.autotuner import BooleanFragment
+from helion.autotuner import EnumFragment
 import helion.autotuner.aot_cache as aot_cache_module
 from helion.autotuner.aot_cache import AOTAutotuneCache
 from helion.autotuner.aot_cache import ShapeKey
@@ -41,11 +49,19 @@ from helion.autotuner.aot_compile import _standalone_call_key
 from helion.autotuner.aot_compile import generate_standalone_file
 from helion.autotuner.aot_kernel import aot_key
 from helion.autotuner.aot_kernel import extract_shape_features
+from helion.autotuner.base_cache import AutotuneCacheBase
+from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
+from helion.autotuner.finite_search import FiniteSearch
 from helion.autotuner.heuristic_generator import PerformanceTarget
 from helion.autotuner.heuristic_generator import ShapeConfigData
 from helion.autotuner.heuristic_generator import compute_validity_partitions
 from helion.autotuner.heuristic_generator import select_config_subset
+from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
+import helion.language as hl
 from helion.runtime.config import Config
+from helion.runtime.kernel import _constexpr_key
+from helion.runtime.settings import Settings
+from helion.runtime.settings import default_autotuner_fn
 
 pytestmark = pytest.mark.cpu_only
 
@@ -107,6 +123,72 @@ class TestShapeKey:
         key3 = ShapeKey("k", (1, 2, 4), "hw")
         assert key1.stable_hash() != key3.stable_hash()
 
+    @pytest.mark.parametrize("kind", ["float", "fragment", "fragment_set"])
+    def test_typed_constexpr_shape_key_round_trip(self, kind) -> None:
+        @helion.kernel()
+        def kernel(x, value: hl.constexpr):
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.numel()):
+                out[tile] = x[tile] + 1
+            return out
+
+        tensor = torch.empty(3)
+        payloads = (
+            "0000000000000000",
+            "8000000000000000",
+            "7ff8000000000001",
+            "fff8000000000002",
+        )
+        hashes = []
+        for index, payload in enumerate(payloads):
+            scalar = struct.unpack("!d", bytes.fromhex(payload))[0]
+            value = scalar if kind == "float" else EnumFragment((scalar,))
+            if kind == "fragment_set":
+                # Equal declarations are distinct set members under their
+                # public identity equality; serialization must keep the count.
+                value = frozenset(BooleanFragment() for _ in range(index + 1))
+            args = (tensor, value)
+            with cpu_render_target():
+                if kind != "fragment_set":
+                    kernel.bind(args)
+                # Frozensets have specialization keys even though they are
+                # not accepted frontend arguments; cover that key codec too.
+                key = ShapeKey("typed", kernel.specialization_key(args), "cpu")
+            original_hash = key.stable_hash()
+            restored = ShapeKey.from_dict(json.loads(json.dumps(key.to_dict())))
+            assert restored.specialization_key == key.specialization_key
+            assert restored.stable_hash() == original_hash
+            assert ShapeKey.from_dict(restored.to_dict()).stable_hash() == original_hash
+            hashes.append(original_hash)
+        assert len(set(hashes)) == len(payloads)
+
+    def test_boolean_constexpr_shape_keys_remain_distinct_after_json(self) -> None:
+        hashes = []
+        for value in (True, 1, False, 0):
+            # Exercise the same recursive key used by real constexpr bindings,
+            # including frozensets (keyable but not frontend arguments).
+            signature = (_constexpr_key(((value,), frozenset((value,)))),)
+            key = ShapeKey("boolean", signature, "cpu")
+            restored = ShapeKey.from_dict(json.loads(json.dumps(key.to_dict())))
+            assert restored.specialization_key == signature
+            assert restored.stable_hash() == key.stable_hash()
+            hashes.append(restored.stable_hash())
+        assert len(set(hashes)) == 4
+
+    def test_nested_finite_float_shape_keys_remain_distinct_after_json(self) -> None:
+        hashes = []
+        keys = []
+        for value in (1, 1.0, -2, -2.0):
+            signature = (_constexpr_key(((value,), frozenset((value,)))),)
+            key = ShapeKey("nested-finite", signature, "cpu")
+            restored = ShapeKey.from_dict(json.loads(json.dumps(key.to_dict())))
+            assert restored.specialization_key == signature
+            assert restored.stable_hash() == key.stable_hash()
+            hashes.append(restored.stable_hash())
+            keys.append(restored.specialization_key)
+        assert len(set(hashes)) == 4
+        assert len(set(keys)) == 4
+
     def test_search_policy_is_structural_and_legacy_serialization_is_unchanged(
         self,
     ) -> None:
@@ -144,43 +226,8 @@ class TestShapeKey:
         policy_hash.assert_called_once_with(
             cache.autotuner,
             cute_flash_search_enabled=True,
+            explicit_aot=True,
         )
-
-    def test_aot_shape_key_preserves_uncacheable_instance_identity(self) -> None:
-        cache = object.__new__(AOTAutotuneCache)
-        first_autotuner = SimpleNamespace(_search_policy_cacheable=True)
-        cache.autotuner = first_autotuner
-        cache.args = ()
-        cache.hardware_id = "hw"
-        cache.kernel = SimpleNamespace(
-            config_spec=SimpleNamespace(cute_flash_search_enabled=True),
-            kernel=SimpleNamespace(
-                name="kernel",
-                specialization_key=Mock(return_value=("shape",)),
-            ),
-        )
-        nonces = iter(("random-nonce-1", "random-nonce-2", "random-nonce-3"))
-
-        def uncacheable_policy(autotuner, *, cute_flash_search_enabled):
-            assert cute_flash_search_enabled
-            autotuner._search_policy_cacheable = False
-            return next(nonces)
-
-        with patch(
-            "helion.autotuner.local_cache._search_policy_hash",
-            side_effect=uncacheable_policy,
-        ):
-            first = cache._create_shape_key()
-        cache.autotuner = SimpleNamespace(_search_policy_cacheable=True)
-        with patch(
-            "helion.autotuner.local_cache._search_policy_hash",
-            side_effect=uncacheable_policy,
-        ):
-            second = cache._create_shape_key()
-
-        assert first.search_policy_hash == "random-nonce-1"
-        assert second.search_policy_hash == "random-nonce-2"
-        assert first != second
 
     def test_uncacheable_policy_still_uses_aot_evaluate_selection(self) -> None:
         selected = Config(block_sizes=[8])
@@ -211,7 +258,8 @@ class TestShapeKey:
             log=Mock(),
         )
         cache.args = ()
-        cache.get = Mock()  # type: ignore[method-assign]
+        cache.kernel = SimpleNamespace()
+        cache.get = Mock(return_value=None)  # type: ignore[method-assign]
         cache.put = Mock()  # type: ignore[method-assign]
         cache._maybe_run_input_fn_workflows = Mock()  # type: ignore[method-assign]
         cache._run_autotune_trials = Mock(  # type: ignore[method-assign]
@@ -221,7 +269,7 @@ class TestShapeKey:
         result = cache.autotune()
 
         assert result == selected
-        cache.get.assert_not_called()
+        cache.get.assert_called_once_with()
         cache.put.assert_called_once_with(selected)
 
 
@@ -843,13 +891,15 @@ def test_aot_cache_canonicalizes_defaults_for_compile_get(
     )
     bound_kernel = SimpleNamespace(
         kernel=kernel_api,
+        settings=Settings(),
         config_spec=SimpleNamespace(cute_flash_search_enabled=False),
         is_cacheable=lambda: True,
     )
     autotuner = SimpleNamespace(
         kernel=bound_kernel,
+        settings=bound_kernel.settings,
         args=(tensor,),
-        settings=SimpleNamespace(autotune_baseline_accuracy_check_fn=None),
+        _benchmark_provider_cls=LocalBenchmarkProvider,
     )
     monkeypatch.setenv("HELION_AOT_MODE", "compile")
     monkeypatch.setattr(aot_cache_module, "get_aot_data_dir", lambda: tmp_path)
@@ -1252,6 +1302,142 @@ def test_static_aot_compile_serializes_concurrent_variants(
     assert module.demo(torch.empty(2)) == 2
     assert module.demo(torch.empty(3)) == 3
     AOTAutotuneCache.clear_caches()
+
+
+@helion.aot_kernel()
+def _explicit_aot_pointwise(x):
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        out[tile] = x[tile] + 1
+    return out
+
+
+class _ExplicitAOTProvider(LocalBenchmarkProvider):
+    pass
+
+
+@onlyBackends(["triton", "cute"])
+def test_custom_provider_aot_artifacts_are_deterministic(monkeypatch, tmp_path, caplog):
+    monkeypatch.setenv("HELION_AOT_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("HELION_AOT_MODE", "collect")
+    monkeypatch.delenv("HELION_SKIP_CACHE", raising=False)
+    monkeypatch.delenv("HELION_ASSERT_CACHE_HIT", raising=False)
+    args = (torch.arange(8, dtype=torch.float32),)
+    with (
+        cpu_render_target(),
+        patch.object(
+            aot_cache_module,
+            "get_hardware_info",
+            return_value=HardwareInfo(
+                device_kind="cuda",
+                hardware_name="CPU bookkeeping proof",
+                runtime_version="0",
+                compute_capability="sm100",
+            ),
+        ),
+    ):
+        bound = cpu_bind(_explicit_aot_pointwise, args)
+        config = bound.config_spec.default_config()
+
+        def make_cache():
+            search = FiniteSearch(
+                bound,
+                args,
+                [config, Config(block_sizes=[16])],
+                benchmark_provider_cls=partial(_ExplicitAOTProvider),
+            )
+            return AOTAutotuneCache(search)
+
+        first = make_cache()
+        # Real collection bookkeeping, with the device launch replaced by the
+        # equivalent CPU result. No benchmark provider or timer executes.
+        with (
+            patch.object(first, "_run_autotune_trials", return_value=config) as tune,
+            patch.object(bound, "compile_config", return_value=lambda x: x + 1),
+        ):
+            assert first.autotune() == config
+        tune.assert_called_once()
+        second = make_cache()
+        assert first.shape_key == second.shape_key
+        # Explicit collection owns this artifact even though automatic winner
+        # caching is disabled for its custom benchmark provider.
+        monkeypatch.setenv("HELION_ASSERT_CACHE_HIT", "1")
+        with patch.object(second, "_run_autotune_trials") as tune:
+            assert second.autotune() == config
+        tune.assert_not_called()
+        assert len(second._tuned_configs[bound.kernel.name]) == 1
+        for cache in (first, second):
+            cache._save_measurement(bound.kernel.name, cache.shape_key, config, 1.0, {})
+        rows = list(csv.DictReader(first._measurements_file.open()))
+        assert rows[0]["shape_hash"] == rows[1]["shape_hash"]
+        monkeypatch.setenv("HELION_AOT_MODE", "evaluate")
+        assert make_cache().shape_key == first.shape_key
+        assert "cache reuse is disabled" not in caplog.text
+
+
+_AOT_ANCHOR = (2, 3)
+
+
+def _aot_anchor():
+    return _AOT_ANCHOR
+
+
+@helion.aot_kernel()
+def _fresh_aot_binding(x, value: hl.constexpr):
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        offset = 2 if value is _aot_anchor() else 5
+        out[tile] = x[tile] + offset
+    return out
+
+
+@onlyBackends(["triton", "cute"])
+@pytest.mark.parametrize("mode", ["evaluate", "compile"])
+@pytest.mark.parametrize("construction", ["default", "indexed", "direct"])
+def test_fresh_aot_binding_preserves_explicit_selection_mode(
+    monkeypatch, tmp_path, mode, construction
+):
+    monkeypatch.setenv("HELION_AOT_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("HELION_AOT_MODE", mode)
+    args = (torch.arange(8, dtype=torch.float32), _AOT_ANCHOR)
+    with (
+        cpu_render_target(),
+        patch.object(
+            aot_cache_module,
+            "get_hardware_info",
+            return_value=HardwareInfo(
+                device_kind="cuda",
+                hardware_name="CPU bookkeeping proof",
+                runtime_version="0",
+                compute_capability="sm100",
+            ),
+        ),
+    ):
+        bound = _fresh_aot_binding.bind(args)
+        assert bound.env.requires_fresh_binding
+        if construction == "direct":
+            cache = AOTAutotuneCache(LFBOTreeSearch(bound, args))
+        else:
+            factory = (
+                AOTAutotuneCache[LFBOTreeSearch]
+                if construction == "indexed"
+                else default_autotuner_fn
+            )
+            cache = factory(bound, args)
+        assert isinstance(cache, AOTAutotuneCache)
+        assert cache.mode == mode
+        selected = bound.config_spec.default_config()
+        with (
+            patch.object(cache, "_get_heuristic_config", return_value=selected),
+            patch.object(cache, "_maybe_run_compile") as compile_entry,
+            patch.object(
+                AutotuneCacheBase,
+                "_run_autotune_trials",
+                side_effect=AssertionError("AOT started tuning"),
+            ),
+        ):
+            assert cache.autotune() == selected
+        assert compile_entry.call_count == int(mode == "compile")
 
 
 if __name__ == "__main__":

@@ -152,7 +152,7 @@ def _lowering_features(node: torch.fx.Node) -> LoweringFeatures:
     if buffer is not None:
         # A buffer-allocating lowering exposes input_fake_tensors and a missing
         # method or non-iterable result fails loudly.
-        fakes = type(lowering).input_fake_tensors(node)
+        fakes = lowering.input_fake_tensors(node)
         out.input_dtypes = [str(t.dtype) for t in fakes]
         out.input_shapes = [[str(d) for d in t.shape] for t in fakes]
 

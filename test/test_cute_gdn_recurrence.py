@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import contextlib
 import dataclasses
 import inspect
@@ -59,6 +58,9 @@ from helion._testing import DEVICE
 from helion._testing import EXAMPLES_DIR
 from helion._testing import code_and_output
 from helion._testing import import_path
+from helion._testing.cute_recurrence_host import gdn_test_wrapper as _gdn_test_wrapper
+from helion._testing.cute_recurrence_host import gdn_wrapper_plan as _wrapper_plan
+from helion._testing.tunable_fragments import load_host_function
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -192,6 +194,105 @@ def _gdn_fwd_h_with_floordiv_gate_index(
     return h
 
 
+@helion.kernel(autotune_effort="none")
+def _gdn_with_runtime_float(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor,
+    chunk_size: int,
+    scale: float,
+    live: hl.constexpr,
+    root_live: hl.constexpr,
+) -> torch.Tensor:
+    """The example recurrence with a dead or live scalar capture before its state."""
+    batch, seqlen, nheads, dhead = k.shape
+    dhead = hl.specialize(dhead)
+    chunk_size = hl.specialize(chunk_size)
+    dstate = u.shape[-1]
+    acc_dtype = torch.float32
+    dtype = k.dtype
+    nchunks = (seqlen + chunk_size - 1) // chunk_size
+    h = torch.empty(batch, nchunks, nheads, dhead, dstate, dtype=dtype, device=k.device)
+    block_v = hl.register_block_size(dstate)
+    for tile_b, tile_h, tile_v in hl.tile(
+        [batch, nheads, dstate], block_size=[1, 1, block_v]
+    ):
+        i_b = tile_b.id
+        i_h = tile_h.id
+        scalar = scale
+        first_copy = scalar
+        scalar_copy = first_copy
+        b_h = hl.zeros([dhead, tile_v], dtype=acc_dtype)
+        for t_i in hl.tile(seqlen, block_size=chunk_size):
+            _unused = scalar_copy
+            h[i_b, t_i.id, i_h, :, tile_v] = b_h.to(dtype)
+            b_w = w[i_b, t_i, i_h, :]
+            c_h = b_h.to(dtype)
+            b_v = hl.dot(b_w, c_h, out_dtype=acc_dtype)
+            p_v = u[i_b, t_i, i_h, tile_v].to(acc_dtype)
+            b_v = p_v - b_v
+            m_t = t_i.index < seqlen
+            t_i_last = min(t_i.begin + chunk_size, seqlen) - 1
+            b_g_last = g[i_b, t_i_last, i_h].to(acc_dtype)
+            b_g = g[i_b, t_i, i_h].to(acc_dtype)
+            b_v *= torch.where(m_t, torch.exp(b_g_last - b_g), 0)[:, None]
+            if live:
+                b_v *= scalar_copy
+            b_g_last = torch.exp(b_g_last)
+            b_h *= b_g_last
+            b_v = b_v.to(dtype)
+            p_k = k[i_b, t_i, i_h, :]
+            b_h = hl.dot(p_k.T, b_v, acc=b_h)
+        if root_live:
+            h[i_b, 0, i_h, :, tile_v] = scalar
+    return h
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "live,root_live", [(False, False), (True, False), (False, True)]
+)
+def test_gdn_runtime_float_capture(live: bool, root_live: bool) -> None:
+    from helion._compiler.device_ir import ForLoopGraphInfo
+
+    kernel = _gdn_with_runtime_float
+    kernel.reset()
+    inputs = _fake_inputs()
+    with _sm100_environment():
+        args = (*inputs, 128, 0.25, live, root_live)
+        bound = kernel.bind(args)
+        config = _config(bound, 128)
+        source = bound.to_code(config)
+        assert (_PLAN_KIND in source) is not (live or root_live)
+        loop = next(
+            g
+            for g in bound.host_function.device_ir.graphs
+            if isinstance(g, ForLoopGraphInfo)
+        )
+        placeholders = [n for n in loop.graph.nodes if n.op == "placeholder"]
+        assert len(placeholders) == 2
+        scalar = next(
+            n for n in placeholders if isinstance(n.meta["val"], torch.SymFloat)
+        )
+        assert bool(scalar.users) is live
+        assert placeholders.index(scalar) == 0  # The tensor is input slot 1.
+        observed = []
+
+        def observe(_kernel, _grid, *args, **kwargs):
+            observed.append([arg for arg in args if type(arg) is float])
+
+        host = load_host_function(bound, config, observe)
+        for value in (0.25, 1.5, 0.25):
+            changed = (*inputs, 128, value, live, root_live)
+            assert kernel.bind(changed) is bound
+            with cast("FakeTensor", inputs[0]).fake_mode:
+                host(*changed)
+            assert observed[-1] == ([value] if live or root_live else [])
+        assert len(observed) == 3
+        assert bound.to_code(config) == source
+
+
 @contextlib.contextmanager
 def _sm100_environment(
     capability: tuple[int, int] = _CAPABILITY, num_sm: int = 148
@@ -319,6 +420,7 @@ def _captured_plan(
     return captured[0]
 
 
+@pytest.mark.cpu_only
 def test_gdn_recurrence_codegen_emits_sm100_plan() -> None:
     code = _code()
     assert "from helion._compiler.cute.gdn_recurrence_sm100 import" in code
@@ -717,12 +819,14 @@ def _shorten_root_task_extent(device_ir: object) -> None:
         _shorten_root_task_extent,
     ),
 )
+@pytest.mark.cpu_only
 def test_gdn_recurrence_rejects_semantic_mutations(
     mutate: Callable[[object], None],
 ) -> None:
     assert _captured_plan(mutate=mutate) is None
 
 
+@pytest.mark.cpu_only
 def test_gdn_recurrence_search_knobs_and_seeds() -> None:
     with _sm100_environment():
         bound = _bind()
@@ -1336,112 +1440,23 @@ def test_gdn_recurrence_geometry_helpers() -> None:
     assert not gdn_shape_admitted(dhead=64, chunk=128, dstate=128, block_v=256)
 
 
-def _wrapper_plan(**overrides: object) -> dict[str, object]:
-    layout = gdn_tmem_layout(64, 128)
-    assert layout is not None
-    plan: dict[str, object] = {
-        "kind": "gdn_recurrence_sm100",
-        "k_idx": 0,
-        "w_idx": 1,
-        "u_idx": 2,
-        "g_idx": 3,
-        "h_idx": 4,
-        "batch": 2,
-        "heads": 8,
-        "seqlen": 1024,
-        "chunk": 128,
-        "dhead": 64,
-        "dstate": 128,
-        "num_chunks": 8,
-        "block_v": 128,
-        "epilogue_warps": 8,
-        "stages": 3,
-        "token_groups": 2,
-        "mma_m": 128,
-        "threads": 288,
-        "tmem_cols": layout.alloc_cols,
-        "smem_bytes": gdn_smem_bytes(128, 64, 128, 3, 128),
-        "state_col": layout.state_col,
-        "state_image_col": layout.state_image_col,
-        "acc_col": layout.acc_col,
-        "update_image_col": layout.update_image_col,
-        "device_abi": 5,
-    }
-    plan.update(overrides)
-    return plan
-
-
-def _tensor_schema(dtype: torch.dtype, shape: tuple[int, ...]) -> tuple[object, ...]:
-    strides = []
-    stride = 1
-    for dim in reversed(shape):
-        strides.append(stride)
-        stride *= dim
-    return ("tensor", str(dtype), len(shape), shape, tuple(reversed(strides)))
-
-
-def _helion_imports(relative: str) -> set[str]:
-    """Package-relative paths of the Helion modules ``relative`` imports.
-
-    Follows the relative ``from . import`` statements transitively (type-only
-    imports excluded), so a new Helion import in the schedule shows up here.
-    """
-
-    root = Path(cast("str", helion.__file__)).resolve().parent
-    pending = [relative]
-    seen: set[str] = set()
-    while pending:
-        current = pending.pop()
-        if current in seen:
-            continue
-        seen.add(current)
-        package = Path(current).parent
-        statements = list(ast.parse((root / current).read_text()).body)
-        while statements:
-            statement = statements.pop()
-            if isinstance(statement, ast.If):
-                test = statement.test
-                if not (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING"):
-                    statements.extend(statement.body)
-                statements.extend(statement.orelse)
-                continue
-            if not isinstance(statement, ast.ImportFrom) or not statement.level:
-                continue
-            base = package
-            for _ in range(statement.level - 1):
-                base = base.parent
-            module = base.joinpath(*(statement.module or "").split("."))
-            candidates = (
-                [module.with_suffix(".py")]
-                if statement.module
-                else [module / f"{alias.name}.py" for alias in statement.names]
-            )
-            for candidate in candidates:
-                if (root / candidate).is_file():
-                    pending.append(candidate.as_posix())
-    return seen
-
-
 def test_gdn_recurrence_schedule_sources_fingerprint_the_disk_cache() -> None:
     """Editing the schedule must change the on-disk compile cache key.
 
     The generated wrapper only imports the schedule, so the launcher's key has
     to hash the schedule sources themselves or a schedule fix would reload
-    obsolete machine code from an earlier build.  The expected set follows
-    the schedule's imports, so a new Helion import needs a table entry too.
+    obsolete machine code from an earlier build. Import closure for every
+    wrapper family is checked in test_cute_helper_cache_dependencies.
     """
 
     from helion.runtime.cute import source_dependencies
 
     dependencies = source_dependencies.wrapper_dependencies()["gdn_recurrence_sm100"]
-    imported = _helion_imports("_compiler/cute/gdn_recurrence_sm100.py")
-    assert imported >= {
+    assert set(dependencies) >= {
         "_compiler/cute/gdn_recurrence_sm100.py",
         "_compiler/cute/gdn_recurrence_geometry.py",
         "_compiler/cute/affine_recurrence_primitives.py",
     }
-    assert set(dependencies) | set(source_dependencies._COMMON_DEPENDENCIES) >= imported
-    assert set(dependencies) >= imported - set(source_dependencies._COMMON_DEPENDENCIES)
     fingerprints = source_dependencies.wrapper_source_dependencies(
         ("gdn_recurrence_sm100",)
     )
@@ -1450,21 +1465,7 @@ def test_gdn_recurrence_schedule_sources_fingerprint_the_disk_cache() -> None:
 
 
 def test_gdn_recurrence_wrapper_calls_external_host_schedule() -> None:
-    from helion.runtime.cute.launcher import _create_cute_wrapper
-
-    def dummy_kernel(*_args: object) -> None:
-        pass
-
-    dummy_kernel._helion_cute_wrapper_plans = [_wrapper_plan()]  # type: ignore[attr-defined]
-    schema = (
-        _tensor_schema(torch.bfloat16, (2, 1024, 8, 64)),
-        _tensor_schema(torch.bfloat16, (2, 1024, 8, 64)),
-        _tensor_schema(torch.bfloat16, (2, 1024, 8, 128)),
-        _tensor_schema(torch.float32, (2, 1024, 8)),
-        _tensor_schema(torch.bfloat16, (2, 8, 8, 64, 128)),
-        ("scalar_constexpr", "int", 128, 128),
-    )
-    wrapper = _create_cute_wrapper(dummy_kernel, schema, (288, 1, 1))
+    wrapper = _gdn_test_wrapper()
     source = inspect.getsource(cast("Callable[..., object]", wrapper))
     assert "_helion_cute_kernel_tag = 'gdn_recurrence_sm100'" in source
     assert (
@@ -1693,6 +1694,29 @@ def _tensor_core_config(
     if mma_m is not None:
         config[CUTE_GDN_RECURRENCE_MMA_M_KEY] = mma_m
     return config
+
+
+def test_gdn_dead_float_capture_matches_reference_cuda() -> None:
+    device = _require_sm100_runtime()
+    args = _runtime_inputs(
+        device,
+        batch=1,
+        heads=2,
+        seqlen=256,
+        chunk=64,
+        dhead=32,
+        dstate=32,
+        seed=20261110,
+    )
+    _gdn_with_runtime_float.reset()
+    code, result = code_and_output(
+        _gdn_with_runtime_float,
+        (*args, 0.25, False, False),
+        **_tensor_core_config(32, 4, 3),
+    )
+    assert _PLAN_KIND in code
+    expected = _torch_reference(*args)
+    torch.testing.assert_close(result.float(), expected.float(), atol=1e-1, rtol=1e-2)
 
 
 @pytest.mark.parametrize(

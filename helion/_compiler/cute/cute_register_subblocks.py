@@ -27,7 +27,7 @@ axis; static windows of literal extents (``start + hl.arange(E)`` or a literal
 slice); pointwise chains in fp32, or in bf16 with every result rounded as
 torch rounds it (casts, ``*``, ``+``, ``-``, ``neg``, ``exp2``, ``rsqrt``,
 ``where`` with static masks of ``hl.arange`` origin; a repeated operand such
-as ``x * x``, which the lowering spells ``mul(x, None)``); the per-row
+as ``x * x`` retains both operands); the per-row
 ``sum(dim=-1, keepdim=True)`` of an fp32 tile over a static extent (the
 fused row L2 norm ``x * rsqrt((x * x).sum(-1, keepdim=True) + eps)``);
 ``hl.dot`` with fp32 operands under tf32 ``dot_precision`` on sm_80+; plain
@@ -1735,21 +1735,10 @@ class _Matcher:
 
     @staticmethod
     def lowered_args(node: Node) -> tuple[object, ...]:
-        """The operands of a lowered pointwise node.  The inductor lowering
-        (``strip_unused_inputs``) replaces a repeated input by None after
-        its first occurrence (``x * x`` is ``mul(x, None)``): that None is the
-        one Node the other args name; with several candidates (a ``where``
-        of two tensors) the operand is ambiguous and the program declines."""
-        args = node.args
-        if not any(a is None for a in args):
-            return args
-        if "lowering" not in node.meta:
+        """Read exact semantic operands; pruned inputs are not reconstructible."""
+        if any(a is None for a in node.args):
             raise _NotMine(f"a None operand of {node.target}")
-        nodes = {a for a in args if isinstance(a, torch.fx.Node)}
-        if len(nodes) != 1:
-            raise _NotMine(f"ambiguous repeated operand of {node.target}")
-        (only,) = nodes
-        return tuple(only if a is None else a for a in args)
+        return node.args
 
     def build_row_reduce(self, node: Node, values: dict[Node, object]) -> Value:
         """``x.sum(dim=-1, keepdim=True)`` of an fp32 tile value over a static

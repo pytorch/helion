@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from helion.runtime.kernel import Kernel
 
 CUDA_DEVICE = "cuda"
+pytestmark = pytest.mark.cpu_only
 
 
 def _rewrite(source: str) -> str:
@@ -242,7 +243,7 @@ def _rounded_self_product(
     out = torch.empty_like(a)
     for tile in hl.tile(a.size(0)):
         first = a[tile].float()
-        # ``strip_unused_inputs`` hands the lowering ``mul(first, None)``.
+        # One lowering input is read twice by the multiplication recipe.
         out[tile] = (first * first).to(a.dtype) - c[tile]
     return out
 
@@ -699,6 +700,7 @@ def _exactness_operands(
     return a, b, c, d
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @skipUnlessBackends(["cute"])
@@ -747,6 +749,7 @@ def test_narrowed_products_are_rounded_once_on_cuda(dtype: torch.dtype) -> None:
     )
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("copy", ["scalar", "async_cached"])

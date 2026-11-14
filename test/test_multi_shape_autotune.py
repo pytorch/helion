@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import Mock
 from unittest.mock import patch
 
+import pytest
 import torch
 
 import helion
@@ -51,6 +52,9 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterable
     from collections.abc import Sequence
+
+
+pytestmark = pytest.mark.cpu_only
 
 
 class TestMultiShapeTimingAggregation(unittest.TestCase):
@@ -265,6 +269,7 @@ class _RuntimeBoundKernel:
             backend=backend,
             device=torch.device("cuda", 0),
             process_group_name=None,
+            requires_fresh_binding=False,
         )
         self.compile_config = Mock()
         self.set_config = Mock()
@@ -279,6 +284,7 @@ def _runtime_settings(**overrides: object) -> SimpleNamespace:
         "autotune_baseline_fn": None,
         "autotune_baseline_accuracy_check_fn": None,
         "autotune_benchmark_fn": None,
+        "autotune_benchmark_input_banks": 1,
         "autotune_config_filter": None,
         "autotune_config_overrides": {},
         "autotune_search_acf": [],
@@ -321,7 +327,7 @@ class TestMultiShapeRuntime(unittest.TestCase):
             workload_key=workload_key,
         )
         cache.autotuner = SimpleNamespace(  # pyrefly: ignore [bad-assignment]
-            settings=settings
+            settings=settings, _benchmark_provider_cls=LocalBenchmarkProvider
         )
 
         key = cache._generate_key()
@@ -373,6 +379,12 @@ class TestMultiShapeRuntime(unittest.TestCase):
                 _runtime_settings(autotune_benchmark_fn=Mock()),
                 {"cache_tag": "callback-v1"},
                 "does not support",
+            ),
+            (
+                "rotating benchmark input banks",
+                _runtime_settings(autotune_benchmark_input_banks=3),
+                {},
+                "does not support rotating benchmark input banks",
             ),
             (
                 "dynamic shapes without cache tag",
@@ -1615,6 +1627,8 @@ class TestMultiShapeLLMSeeded(unittest.TestCase):
         self.assertEqual(search._autotune_metrics.num_configs_tested, 5)
 
 
+@pytest.mark.slow
+@pytest.mark.cuda
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
 @skipIfRefEager("Autotuning requires compilation, not supported in ref eager mode")
 class TestMultiShapeAutotuneIntegration(unittest.TestCase):

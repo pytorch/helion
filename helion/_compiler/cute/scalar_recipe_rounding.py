@@ -169,23 +169,12 @@ def _upcast_source(value: object) -> Node | None:
 
 
 def _product_factors(product: Node) -> tuple[object, object] | None:
-    """The two factors of a flagged product, a repeated factor restored.
-
-    ``x ** 2`` is ``pow(x, 2)``; ``inductor_lowering.strip_unused_inputs``
-    masks a repeated operand with None after the lowering (``x * x`` arrives
-    as ``mul(x, None)``), and the masked operand is the node's unique tensor
-    input (``flash_row_epilogue._operands``).
-    """
+    """Read the exact product factors, expanding the explicit square spelling."""
     if product.target is _SQUARE:
         return product.args[0], product.args[0]
     if product.target is not torch.ops.aten.mul.Tensor or len(product.args) != 2:
         return None
-    left, right = product.args
-    if right is None and isinstance(left, torch.fx.Node):
-        return left, left
-    if left is None and isinstance(right, torch.fx.Node):
-        return right, right
-    return left, right
+    return product.args
 
 
 def narrow_exact_products(graph: torch.fx.Graph, products: Sequence[Node]) -> None:

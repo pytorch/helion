@@ -45,6 +45,7 @@ import torch
 
 from ..ast_extension import ExtendedAST
 from ..ast_extension import statement_from_string
+from .compile_options import compile_options_keyword
 from .host_zero_fills import _EMPTY_FACTORY
 from .host_zero_fills import _factory_call_source
 from .host_zero_fills import _zero_factory
@@ -196,6 +197,7 @@ def zero_fill_kernel_launch(
     num_sm: int | None,
     numel: int | None,
     launcher: str = "_launcher",
+    compile_options: str = "",
 ) -> tuple[list[ast.stmt], ast.stmt]:
     """The module statements defining the fill kernel ``name`` for a
     contiguous ``dtype`` tensor (a programmatic dependent: it waits, releases
@@ -213,10 +215,11 @@ def zero_fill_kernel_launch(
     module.append(statement_from_string(f"{name}._helion_cute_use_pdl = True"))
     max_ctas = _CTAS_PER_SM * max(1, num_sm or 1)
     per_cta = _THREADS * (_PACKET_BYTES // dtype.itemsize)
+    option = compile_options_keyword(compile_options)
     call = (
         f"{launcher}({name}, (max(1, min(({target}.numel() + "
         f"{per_cta - 1}) // {per_cta}, {max_ctas})),), {target}.view(-1), "
-        f"block=({_THREADS}, 1, 1))"
+        f"block=({_THREADS}, 1, 1){option})"
     )
     if numel is not None and numel < MAX_FILL_NUMEL:
         return module, statement_from_string(call)
@@ -236,6 +239,7 @@ def lower_host_zero_fill_launches(
     env: CompileEnvironment,
     kernel_name: str,
     launcher: str = "_launcher",
+    compile_options: str = "",
 ) -> tuple[list[ast.AST], list[ast.AST]]:
     """Rewrite the admitted zero fills of ``body`` (the host statements after
     the dead-fill elision) into ``empty`` plus a fill-kernel launch.
@@ -285,7 +289,13 @@ def lower_host_zero_fill_launches(
         fill_name = f"{ZERO_FILL_KERNEL_PREFIX}{index}_{kernel_name.lstrip('_')}"
         index += 1
         definitions, launch = zero_fill_kernel_launch(
-            fill_name, dtype, target, num_sm=num_sm, numel=numel, launcher=launcher
+            fill_name,
+            dtype,
+            target,
+            num_sm=num_sm,
+            numel=numel,
+            launcher=launcher,
+            compile_options=compile_options,
         )
         module.extend(definitions)
         result.extend(

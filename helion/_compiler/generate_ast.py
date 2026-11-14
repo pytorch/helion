@@ -1179,6 +1179,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         return self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> ast.AST:
+        from .type_info import ConfigFragmentType
+
         assert isinstance(node, ExtendedAST)
         if isinstance(node.ctx, ast.Load) and node._type_info is not None:
             origin = node._type_info.origin
@@ -1186,8 +1188,24 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 isinstance(origin, ArgumentOrigin)
                 and origin.name in self.host_function.constexpr_args
             ):
+                if not self.on_device and node._type_info.contains_type(
+                    ConfigFragmentType
+                ):
+                    # Fragments, including container leaves, are not Python
+                    # literals. Preserve the actual argument and custom equality.
+                    name = origin.name
+                    return expr_from_string(
+                        f"{name}.value if isinstance({name}, hl.constexpr) else {name}"
+                    )
+                value = self.host_function.constexpr_args[origin.name]
+                if not self.on_device:
+                    return expr_from_string(
+                        self.host_function.constexpr_literal_expr(value)
+                    )
                 return expr_from_string(
-                    repr(self.host_function.constexpr_args[origin.name])
+                    self.host_function.literal_expr(value)
+                    if type(value) in (torch.dtype, torch.device)
+                    else repr(value)
                 )
             if origin.needs_rename():
                 # `x` => `_source_module.x`
@@ -1509,11 +1527,12 @@ def _generate_ast(
                 oo_set = set(output_only_names)
                 # ``static_shapes=True``: cache the output-only meta placeholder
                 # ``torch.empty(..., device='meta')`` on the inner device
-                # function so repeat calls reuse it (shape/dtype/device are
-                # constant).  ``static_shapes=False`` keeps the per-call alloc.
+                # function when the backend proves its metadata fixed.
+                # Dynamic or unproved metadata keeps the per-call allocation.
                 cache_static_shapes = (
                     CompileEnvironment.current().settings.static_shapes
                 )
+                cacheable_names = set(env.backend.cacheable_output_only_names())
                 inner_fn_name = codegen.device_function.name
                 cached_meta_index = 0
                 new_host_statements: list[ast.AST] = []
@@ -1532,7 +1551,10 @@ def _generate_ast(
                     call.keywords = [
                         kw for kw in call.keywords if kw.arg != "device"
                     ] + [ast.keyword(arg="device", value=ast.Constant(value="meta"))]
-                    if not cache_static_shapes:
+                    if (
+                        not cache_static_shapes
+                        or stmt.targets[0].id not in cacheable_names
+                    ):
                         new_host_statements.append(stmt)
                         continue
                     # Read the cache slot (``getattr`` -> ``None`` on the first

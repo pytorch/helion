@@ -2,18 +2,193 @@
 
 from __future__ import annotations
 
+import dataclasses
 import itertools
+import json
 from pathlib import Path
+import runpy
+import shutil
+import sys
+import textwrap
+from unittest.mock import patch
 
 import pytest
+import torch
 
+import helion
+from helion import _compat
+from helion import _hardware
+from helion._compiler.cute.target_facts import B200
+from helion._testing import cpu_render_target
+from helion._testing import import_path
+from helion._testing import onlyBackends
 from helion._testing import pairwise
+from helion._testing import patch_target_facts
+from helion._testing import sharding
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import tcgen05_target
 from helion._testing.sharding import MIN_WEIGHT
 from helion._testing.sharding import assign_shards
 from helion._testing.sharding import load_durations
 from helion._testing.sharding import shard_loads
+from helion.autotuner.base_search import BaseSearch
+from helion.autotuner.local_cache import LocalAutotuneCache
+import helion.language as hl
 
 pytestmark = pytest.mark.cpu_only
+
+
+@onlyBackends(["triton", "cute"])
+def test_cpu_render_target_constructs_cache_without_host_cuda_runtime(monkeypatch):
+    @helion.kernel()
+    def pointwise(x: torch.Tensor) -> torch.Tensor:
+        out = torch.empty_like(x)
+        for tile in hl.tile(x.size(0)):
+            out[tile] = x[tile] + 1
+        return out
+
+    monkeypatch.setattr(torch.version, "cuda", None)
+    monkeypatch.setattr(torch.version, "hip", None)
+    args = (torch.empty(8),)
+    with cpu_render_target():
+        assert not torch.cuda.is_available()
+        bound = cpu_bind(pointwise, args)
+        with (
+            patch(
+                "helion.autotuner.local_cache.extract_device",
+                return_value=torch.device("cuda:0"),
+            ),
+            patch(
+                "helion.autotuner.local_cache.get_device_name",
+                return_value=B200.hardware_name,
+            ),
+            patch("torch.cuda.is_available", return_value=True),
+        ):
+            cache = LocalAutotuneCache(BaseSearch(bound, args))
+        assert cache.key.runtime_name == B200.runtime_version
+        assert cache.key.hardware == B200.hardware_name
+    assert torch.version.cuda is None and torch.version.hip is None
+
+
+def test_patch_target_runtime_versions_restore_nested_models(monkeypatch):
+    monkeypatch.setattr(torch.version, "cuda", "host-cuda")
+    monkeypatch.setattr(torch.version, "hip", "host-hip")
+    cuda = dataclasses.replace(B200.hardware_info(), runtime_version="modeled-cuda")
+    hip = dataclasses.replace(
+        cuda,
+        device_kind="rocm",
+        hardware_name="AMD Instinct MI350X",
+        compute_capability="gfx950",
+        runtime_version="modeled-hip",
+    )
+    with patch_target_facts(hardware=cuda, is_hip=False):
+        assert (torch.version.cuda, torch.version.hip) == ("modeled-cuda", None)
+        with (
+            pytest.raises(RuntimeError, match="leave nested model"),
+            patch_target_facts(hardware=hip, is_hip=True),
+        ):
+            assert (torch.version.cuda, torch.version.hip) == (None, "modeled-hip")
+            assert _hardware.get_hardware_info() is hip
+            assert _compat.is_hip()
+            raise RuntimeError("leave nested model")
+        assert (torch.version.cuda, torch.version.hip) == ("modeled-cuda", None)
+        assert _hardware.get_hardware_info() is cuda
+        assert not _compat.is_hip()
+    assert (torch.version.cuda, torch.version.hip) == ("host-cuda", "host-hip")
+
+
+def test_tcgen05_target_models_runtime_and_restores_nested_contexts(monkeypatch):
+    monkeypatch.setattr(torch.version, "cuda", None)
+    monkeypatch.setattr(torch.version, "hip", "host-hip")
+    expected = (B200.runtime_version, None)
+    with tcgen05_target():
+        assert (torch.version.cuda, torch.version.hip) == expected
+        with pytest.raises(RuntimeError, match="leave tcgen05 model"), tcgen05_target():
+            assert (torch.version.cuda, torch.version.hip) == expected
+            raise RuntimeError("leave tcgen05 model")
+        assert (torch.version.cuda, torch.version.hip) == expected
+    assert (torch.version.cuda, torch.version.hip) == (None, "host-hip")
+
+
+@pytest.mark.parametrize("device_kind,is_hip", [("cuda", True), ("rocm", False)])
+def test_patch_target_runtime_versions_reject_inconsistent_models(device_kind, is_hip):
+    outer = dataclasses.replace(B200.hardware_info(), runtime_version="outer-cuda")
+    inconsistent = dataclasses.replace(outer, device_kind=device_kind)
+    with patch_target_facts(hardware=outer, is_hip=False):
+        with (
+            pytest.raises(
+                AssertionError, match="is_hip must match hardware.device_kind"
+            ),
+            patch_target_facts(hardware=inconsistent, is_hip=is_hip),
+        ):
+            pass
+        assert _hardware.get_hardware_info() is outer
+        assert not _compat.is_hip()
+        assert (torch.version.cuda, torch.version.hip) == ("outer-cuda", None)
+
+
+def test_patch_target_runtime_versions_leave_unspecified_models_untouched(monkeypatch):
+    monkeypatch.setattr(torch.version, "cuda", None)
+    monkeypatch.setattr(torch.version, "hip", "host-hip")
+    hardware = B200.hardware_info()
+
+    def uncalled_probe(*args):
+        raise AssertionError("an opaque hardware probe must not be evaluated")
+
+    with patch_target_facts(hardware=uncalled_probe, is_hip=False):
+        assert (torch.version.cuda, torch.version.hip) == (None, "host-hip")
+    with patch_target_facts(hardware=hardware):
+        assert (torch.version.cuda, torch.version.hip) == (None, "host-hip")
+
+
+def test_import_path_supports_dataclass_annotations_and_cached_defaults(tmp_path):
+    path = tmp_path / "helper_dataclass.py"
+    name = "helion._testing.helper_dataclass"
+    path.write_text(
+        textwrap.dedent(
+            """
+            from __future__ import annotations
+            from dataclasses import dataclass, fields
+            from typing import ClassVar
+
+            @dataclass(slots=True)
+            class Defaults:
+                marker: ClassVar[int] = 7
+                scale: float = -0.0
+
+            default = Defaults()
+            def call(value=default):
+                return value
+            """
+        )
+    )
+    try:
+        module = import_path(path)
+        assert [field.name for field in module.fields(module.Defaults)] == ["scale"]
+        assert module.call() is module.default
+        assert module.call().scale.hex() == (-0.0).hex()
+        assert import_path(path) is module
+        assert sys.modules[name] is module
+    finally:
+        sys.modules.pop(name, None)
+
+
+def test_import_path_failed_execution_does_not_publish_partial_module(tmp_path):
+    path = tmp_path / "helper_failed_import.py"
+    name = "helion._testing.helper_failed_import"
+    path.write_text(
+        "import sys\n"
+        "published_during_execution = sys.modules[__name__]\n"
+        "raise RuntimeError('failed during execution')\n"
+    )
+    try:
+        with pytest.raises(RuntimeError, match="failed during execution"):
+            import_path(path)
+        assert name not in sys.modules
+        path.write_text("value = 2\n")
+        assert import_path(path).value == 2
+    finally:
+        sys.modules.pop(name, None)
 
 
 def _assert_all_pairs_covered(rows: list[tuple[object, ...]], **axes: tuple) -> None:
@@ -116,3 +291,69 @@ def test_recorded_shard_durations_name_existing_test_modules() -> None:
     )
     assert all(m.startswith("test/") and m.endswith(".py") for m in durations)
     assert all(seconds >= 0 for seconds in durations.values())
+
+
+@pytest.mark.parametrize("explicit_output", [False, True])
+def test_shard_duration_script_uses_its_checkout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    explicit_output: bool,
+) -> None:
+    checkout = tmp_path / "checkout"
+    (checkout / "scripts").mkdir(parents=True)
+    (checkout / "test").mkdir()
+    script = checkout / "scripts" / "shard_durations.py"
+    shutil.copyfile(
+        Path(__file__).resolve().parents[1] / "scripts" / script.name, script
+    )
+    for name in ("test_kept.py", "test_small.py", "test_measured_zero.py"):
+        (checkout / "test" / name).touch()
+    (checkout / "test" / "test_unreported.py").touch()
+    (checkout / "test" / "test_legacy_zero.py").touch()
+
+    # The helper is imported from another checkout. Redirect its duration path
+    # to a sentinel so the regression cannot overwrite that checkout's real file.
+    foreign_output = tmp_path / "installed-durations.json"
+    foreign_contents = '{"test/test_unreported.py": 99.0}\n'
+    foreign_output.write_text(foreign_contents)
+    monkeypatch.setattr(sharding, "DURATIONS_FILE", foreign_output)
+    # Keep even a mistaken cwd-relative output path inside the temporary tree.
+    monkeypatch.chdir(tmp_path)
+
+    local_output = checkout / "test" / "shard_durations.json"
+    local_contents = (
+        '{"test/test_kept.py": 1.0, "test/test_deleted.py": 2.0, '
+        '"test/test_unreported.py": 3.0, "test/test_legacy_zero.py": 0.0}\n'
+    )
+    local_output.write_text(local_contents)
+    output = tmp_path / "explicit.json" if explicit_output else local_output
+    if explicit_output:
+        output.write_text('{"test/test_unreported.py": 4.0}\n')
+    report = tmp_path / "report.xml"
+    report.write_text(
+        '<testsuite><testcase classname="test.test_kept.TestKept" time="3.5"/>'
+        '<testcase classname="test.test_small.TestSmall" time="0.004"/>'
+        '<testcase classname="test.test_measured_zero.TestZero" time="0.0"/>'
+        "</testsuite>"
+    )
+    args = [str(report)]
+    if explicit_output:
+        args.extend(["--output", str(output)])
+
+    namespace = runpy.run_path(str(script))
+    assert namespace["read_junit"](report, checkout) == {
+        "test/test_kept.py": 3.5,
+        "test/test_small.py": 0.004,
+        "test/test_measured_zero.py": 0.0,
+    }
+    assert namespace["main"](args) == 0
+    assert json.loads(output.read_text()) == {
+        "test/test_kept.py": 3.5,
+        "test/test_small.py": 0.1,
+        "test/test_measured_zero.py": 0.0,
+        "test/test_unreported.py": 4.0 if explicit_output else 3.0,
+        **({} if explicit_output else {"test/test_legacy_zero.py": 0.0}),
+    }
+    assert foreign_output.read_text() == foreign_contents
+    if explicit_output:
+        assert local_output.read_text() == local_contents

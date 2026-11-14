@@ -66,6 +66,9 @@ class BackendSearchSurface:
     config_keys: frozenset[str] = frozenset()
     debug_keys: frozenset[str] = frozenset()
     implicit_default_keys: frozenset[str] = frozenset()
+    # Scalar compiler and schedule choices worth crossing with discovered layouts
+    # before full-effort final selection. Empty for backends without this phase.
+    compiler_refinement_keys: tuple[str, ...] = ()
 
     def supports_key(self, key: str) -> bool:
         """Whether this surface accepts a backend-specific config key."""
@@ -269,7 +272,8 @@ class ConfigGenerationExtension:
     ``ConfigGeneration`` calls the hooks at fixed positions of its own
     pipeline: ``narrow_search_choices`` before the flat field table is
     collected, ``repair_flat_config`` on every flat config it produces
-    (defaults, random draws, mutations, ``flatten``), and
+    (defaults, random draws, mutations, ``flatten``),
+    ``conditional_neighbor_updates`` when constructing search neighbors, and
     ``initial_population_flats`` first thing in ``random_population_flat``.
     The structural-coverage hooks size and seed the population-based searches
     (``PatternSearch``, ``PopulationBasedSearch``); the defaults describe a
@@ -288,6 +292,17 @@ class ConfigGenerationExtension:
     def repair_flat_config(self, flat_config: FlatConfig) -> None:
         """Repair backend-coupled coordinates of a flat config in place."""
         return
+
+    def conditional_neighbor_updates(
+        self, base: FlatConfig, requested: FlatConfig
+    ) -> Mapping[int, object]:
+        """Deterministic prerequisite flat values for a requested search transition.
+
+        This hook only affects neighbors, not explicit config normalization or
+        identity. ConfigGeneration applies the updates atomically when all
+        prerequisites are searchable and no frozen coordinate would change.
+        """
+        return {}
 
     def initial_population_flats(
         self,

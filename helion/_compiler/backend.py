@@ -14,10 +14,12 @@ from typing import Callable
 from typing import Sequence
 
 import torch
+from torch._inductor.codegen.simd import constant_repr
 
 from .. import exc
 from .ast_extension import expr_from_string
 from .emitter_protocols import NO_RETRY
+from .utils import is_full_slice
 
 if TYPE_CHECKING:
     import ast
@@ -132,10 +134,7 @@ def _validate_subscript_indices(index: list[object]) -> int:
     """Validate supported kernel-tensor indices and count narrowing entries."""
     narrowed = 0
     for value in index:
-        if value is None or (
-            isinstance(value, slice)
-            and (value.start, value.stop, value.step) == (None, None, None)
-        ):
+        if value is None or is_full_slice(value):
             continue
         if isinstance(value, int):
             valid = value >= 0
@@ -335,6 +334,10 @@ class Backend(abc.ABC):
         """
         return []
 
+    def cacheable_output_only_names(self) -> list[str]:
+        """Output placeholders whose metadata is fixed by input specialization."""
+        return self.output_only_names()
+
     @property
     def lowers_integer_powers(self) -> bool:
         """Whether scalar device expressions prove bounded integer powers
@@ -429,7 +432,19 @@ class Backend(abc.ABC):
     def requires_merged_reduction_dims(self) -> bool:
         """Whether a multi-dim reduction chain ``merge_reduction_dims`` cannot
         flatten is a refusal (``BackendUnsupported``) rather than lowered as
-        its chain of single-dim reductions."""
+        its chain of single-dim reductions, unless
+        ``defer_unmerged_reduction_chain`` requires a complete backend owner."""
+        return False
+
+    def defer_unmerged_reduction_chain(
+        self, result: torch.fx.Node, source: torch.fx.Node, dims: tuple[int, ...]
+    ) -> bool:
+        """Require a complete backend owner for an otherwise unsupported chain.
+
+        Returning True retains the original producer coordinates. The backend
+        must reject code generation if that complete owner cannot lower it;
+        this is not permission to use an unsupported scalar reduction chain.
+        """
         return False
 
     @property
@@ -537,6 +552,13 @@ class Backend(abc.ABC):
         return False
 
     @property
+    def places_pdl_markers(self) -> bool:
+        """Whether ``finalize_device_body`` takes the kernel's entry markers
+        (``hl.code_warm`` and the PDL entry ops) and exit ops in the body and
+        places them itself; otherwise they surround the final body."""
+        return False
+
+    @property
     def uses_triton_compiler(self) -> bool:
         """Whether kernels compile through Triton's compiler and GPU targets,
         whose libdevice, inline PTX, descriptor legality checks and outlined
@@ -561,26 +583,21 @@ class Backend(abc.ABC):
         distinct Python modules (i.e. the generated module holds shape-specific
         mutable state cached across calls).
 
-        The Pallas runtime treats each generated module as the state container for
-        one static specialization -- the output-meta descriptor
-        (``_helion_output_meta_cache_N``), the launcher cache (``_pallas_cache``),
-        the ``_LauncherFastPath`` ds-pad decision, and ``_DirectCallKernel``'s
-        signature lock are all monomorphic (populated on first call, reused as-is).
-        Since ``PyCodeCache`` keys modules by source text, a shape-polymorphic body
-        (e.g. ``compact_worklist``) would otherwise share one module across shapes
-        and inherit the first shape's state; the compiler folds the input signature
-        into the module cache key to prevent that.
+        Pallas caches output-meta descriptors proven fixed by a static input
+        specialization on the generated module. Since ``PyCodeCache`` keys
+        modules by source text, distinct static bindings could otherwise share
+        a module and inherit its first descriptors. The compiler folds the input
+        signature into the module cache key to prevent that.
 
         Backends that allocate outputs fresh each call and hold no shape-dependent
         module state (e.g. Triton) return False and may freely share a module
         across shapes.
 
-        The per-module signature only discriminates shapes that ``bind()`` already
-        keys to distinct BoundKernels -- i.e. shapes derived from tensor metadata
-        (shape/dtype/stride/device). An output extent driven by an *unbacked* scalar
-        arg is collapsed by ``bind()`` to a single BoundKernel, so it is not
-        distinguished here; such kernels must ``hl.specialize()`` the scalar to get a
-        distinct module per extent.
+        This signature only distinguishes inputs that ``bind()`` already keys to
+        separate BoundKernels. Pallas creates other output descriptors per call
+        and keys launcher state, padding decisions and direct-call signatures
+        by the actual argument metadata. Runtime scalar extents and post-mutation
+        shapes therefore do not require a separate module per value.
         """
         return False
 
@@ -937,7 +954,7 @@ class Backend(abc.ABC):
         for value in index:
             if value is None:
                 output_size.append(1)
-            elif isinstance(value, slice) and repr(value) == "slice(None, None, None)":
+            elif is_full_slice(value):
                 output_size.append(input_size.popleft())
             else:
                 raise exc.InvalidIndexingType(repr(value))
@@ -1482,6 +1499,10 @@ class Backend(abc.ABC):
         """
         return None
 
+    def scalar_literal_expr(self, value: float | bool) -> str:
+        """Emit a scalar literal for device code, preserving its value and sign."""
+        return constant_repr(value)
+
     def scalar_float_operand_ast(
         self, x: ast.AST, value: torch.SymFloat, *, computes_in_float64: bool
     ) -> ast.AST:
@@ -1663,6 +1684,8 @@ class Backend(abc.ABC):
         """
         return False
 
+    _pre_inductor_squeeze = False
+
     def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
         """Return a backend-owned lowering that must bypass Inductor IR.
 
@@ -1670,6 +1693,15 @@ class Backend(abc.ABC):
         override this for operations whose Inductor representation cannot be
         consumed by that shared path.
         """
+        if self._pre_inductor_squeeze and node.target in (
+            torch.ops.aten.squeeze.default,
+            torch.ops.aten.squeeze.dims,
+        ):
+            from .aten_lowering import squeeze_lowering
+
+            # These logical views use the traced output shape, like squeeze.dim.
+            # Route them before Inductor creates an unsupported ReinterpretView.
+            return squeeze_lowering
         return None
 
     def argreduce_uses_aten_lowering(self, node: torch.fx.Node) -> bool:
@@ -2076,6 +2108,10 @@ class Backend(abc.ABC):
         qualifies; runs once per strategy, before its first device loop."""
         return None
 
+    def lane_loop_semantic_reads(self, body: list[ast.AST]) -> set[str]:
+        """Lane dependencies carried by backend markers rather than AST names."""
+        return set()
+
     def check_lane_loop_nest(self, state: DeviceLoopState) -> None:
         """Make the lane loop nest a device loop built around its body the
         tile program (redistribute or reject an inexact nest, order the
@@ -2128,14 +2164,22 @@ class Backend(abc.ABC):
         """
         return None
 
+    def pdl_capability(self, env: CompileEnvironment) -> tuple[int, int] | None:
+        """NVIDIA target capability for explicit programmatic launch, if any."""
+        return None
+
+    def pdl_instruction(self, operation: str) -> str:
+        """Render an explicit PDL marker at its validated entry/exit position."""
+        raise exc.BackendUnsupported(self.name, "programmatic dependent launch")
+
     def finalize_device_body(
         self, body: list[ast.stmt], ctx: DeviceBodyContext
     ) -> tuple[list[ast.stmt], list[ast.arg]]:
         """Rewrite the rendered kernel body before variable renaming.
 
         Called by ``DeviceFunction.codegen_function_def`` once every statement
-        of the kernel body (dependent-launch prologue, preambles, body) is
-        rendered and before ``ast_rename`` applies the loop-carried aliases.
+        of the kernel body (preambles and computation, without explicit PDL
+        markers) is rendered and before ``ast_rename`` applies the loop-carried aliases.
         Returns the body and the kernel parameters to append to the signature
         (``ctx.args`` is the signature so far).  Facts for
         ``finalize_kernel_def`` go on ``ctx``.  The default changes nothing.
@@ -2260,6 +2304,16 @@ class Backend(abc.ABC):
         of a multi-root kernel do not apply.  ``False`` by default."""
         return False
 
+    def lower_dependency_phases_as_ordered_launches(
+        self, host: HostFunction, ir: DeviceIR
+    ) -> bool:
+        """Discharge analyzed local dependencies through proved ordered launches.
+
+        Called only after the normal dependency graph and phases are installed;
+        it cannot substitute for that analysis or mark roots as already split.
+        """
+        return False
+
     # Backend state.  Each core compile object carries one opaque
     # ``backend_state`` slot the backend fills through these hooks and reads
     # back through its own typed accessors; core never names the fields.  The
@@ -2368,12 +2422,19 @@ class Backend(abc.ABC):
         return host_str
 
     def tensors_proven_disjoint(
-        self, env: CompileEnvironment, left: torch.Tensor, right: torch.Tensor
+        self,
+        env: CompileEnvironment,
+        left: torch.Tensor,
+        right: torch.Tensor,
+        *,
+        allow_unbound: bool = False,
     ) -> bool:
         """Whether two input tensors behind kernel arguments are proven not to
         alias by a runtime fact that is part of the bound kernel's cache key
         (``DeviceFunction.proven_disjoint_tensor_pairs``).  ``False`` by
-        default: no backend-owned runtime storage fact."""
+        default: no backend-owned runtime storage fact. Discovery may explicitly
+        request registered live facts before bound results exist; the backend
+        must opt into that proof as well."""
         return False
 
     def scalar_arg_preamble(self, arg: Argument) -> list[ast.AST]:

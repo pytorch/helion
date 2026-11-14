@@ -94,6 +94,7 @@ def test_fixed_stateful_width_survives_canonical_round_trip(heads: int) -> None:
             cute_flash_pipeline_family="fa4",
             cute_flash_softmax_lowering="resident_stateful",
             cute_flash_causal_lpt_swizzle=width,
+            cute_compiler_pipeline="default",
         )
         spec.normalize(config)
         assert config.config[flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY] == max(

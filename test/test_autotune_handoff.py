@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections import deque
+from contextlib import contextmanager
 import csv
 from dataclasses import FrozenInstanceError
 import json
@@ -30,6 +31,7 @@ from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.base_search import _AutotunableKernel
 from helion.autotuner.benchmark_provider import BenchmarkProvider
 from helion.autotuner.benchmark_provider import BenchmarkResult
+from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.benchmark_provider import MultiShapeBenchmarkProvider
 from helion.autotuner.benchmark_provider import _MultiShapeAutotuneArgs
 from helion.autotuner.config_fragment import EnumFragment
@@ -44,6 +46,7 @@ pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterator
     from collections.abc import Sequence
 
     from helion.autotuner.logger import AutotuningLogger
@@ -216,6 +219,19 @@ class _Provider(BenchmarkProvider):
         return results
 
 
+@contextmanager
+def _scripted_local_provider() -> Iterator[None]:
+    # Keep the exact built-in provider class and its real cache-policy gate.
+    # Script only benchmark behavior for these cache-orchestration controls.
+    with (
+        patch.object(LocalBenchmarkProvider, "__init__", _Provider.__init__),
+        patch.object(LocalBenchmarkProvider, "setup", _Provider.setup),
+        patch.object(LocalBenchmarkProvider, "benchmark", _Provider.benchmark),
+        patch.object(LocalBenchmarkProvider, "cleanup", _Provider.cleanup),
+    ):
+        yield
+
+
 class _Search(BaseSearch):
     def __init__(
         self,
@@ -224,8 +240,9 @@ class _Search(BaseSearch):
         *,
         returned: int | None = None,
         args: Sequence[object] = (),
+        provider_cls: type[BenchmarkProvider] = _Provider,
     ) -> None:
-        super().__init__(cast("_AutotunableKernel", kernel), args, _Provider)
+        super().__init__(cast("_AutotunableKernel", kernel), args, provider_cls)
         self.batches = batches
         self.returned = returned
         self.started = False
@@ -239,7 +256,7 @@ class _Search(BaseSearch):
         provider_cls = (
             MultiShapeBenchmarkProvider
             if isinstance(self.args, _MultiShapeAutotuneArgs)
-            else _Provider
+            else self._benchmark_provider_cls
         )
         self.benchmark_provider = provider_cls(
             self.kernel,
@@ -579,10 +596,12 @@ class TestAutotuneHandoff(unittest.TestCase):
         self.assertEqual(point.progress.trials, 1)
         self.assert_cleaned_up(script)
 
+    @_scripted_local_provider()
     def test_cache_hit_is_confirmed_without_search_or_write(self) -> None:
         script = _Script({1: [1.0]})
-        search = _Search(_Kernel(script), [[1]])
+        search = _Search(_Kernel(script), [[1]], provider_cls=LocalBenchmarkProvider)
         cache = _Cache(search, _config(1))
+        self.assertTrue(cache._search_policy_allows_cache_io())
 
         point = find_handoff(cache)
 
@@ -595,9 +614,18 @@ class TestAutotuneHandoff(unittest.TestCase):
         self.assertEqual(script.calls[1], 3)
         self.assert_cleaned_up(script)
 
+    @_scripted_local_provider()
     def test_completed_cache_miss_preserves_search_result_in_cache(self) -> None:
         script = _Script({1: [0.5, 2.0], 2: [1.0]})
-        cache = _Cache(_Search(_Kernel(script), [[1, 2]], returned=1))
+        cache = _Cache(
+            _Search(
+                _Kernel(script),
+                [[1, 2]],
+                returned=1,
+                provider_cls=LocalBenchmarkProvider,
+            )
+        )
+        self.assertTrue(cache._search_policy_allows_cache_io())
 
         point = find_handoff(cache)
 
@@ -606,9 +634,13 @@ class TestAutotuneHandoff(unittest.TestCase):
         self.assertEqual(cache.writes, [_config(1)])
         self.assert_cleaned_up(script)
 
+    @_scripted_local_provider()
     def test_early_handoff_unwinds_before_cache_write(self) -> None:
         script = _Script({1: [1.0], 2: [0.5]})
-        cache = _Cache(_Search(_Kernel(script), [[1], [2]]))
+        cache = _Cache(
+            _Search(_Kernel(script), [[1], [2]], provider_cls=LocalBenchmarkProvider)
+        )
+        self.assertTrue(cache._search_policy_allows_cache_io())
 
         point = find_handoff(cache, HandoffPolicy(after_trials=1))
 
@@ -634,9 +666,14 @@ class TestAutotuneHandoff(unittest.TestCase):
         self.assertEqual(point.progress.trials, 1)
         self.assert_cleaned_up(script)
 
+    @_scripted_local_provider()
     def test_skip_cache_bypasses_read_but_preserves_write(self) -> None:
         script = _Script({1: [1.0]})
-        cache = _Cache(_Search(_Kernel(script), [[1]]), _config(2))
+        cache = _Cache(
+            _Search(_Kernel(script), [[1]], provider_cls=LocalBenchmarkProvider),
+            _config(2),
+        )
+        self.assertTrue(cache._search_policy_allows_cache_io())
 
         point = find_handoff(cache, skip_cache=True)
 
@@ -672,6 +709,7 @@ class TestAutotuneHandoff(unittest.TestCase):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 HandoffPolicy(**kwargs)
 
+    @_scripted_local_provider()
     def test_best_of_k_stop_restores_settings_and_skips_later_trials(self) -> None:
         script = _Script({1: [1.0]})
         settings = Settings(
@@ -682,8 +720,9 @@ class TestAutotuneHandoff(unittest.TestCase):
             autotune_log_level=0,
         )
         kernel = _Kernel(script, settings)
-        original = _Search(kernel, [[1]])
+        original = _Search(kernel, [[1]], provider_cls=LocalBenchmarkProvider)
         cache = _Cache(original)
+        self.assertTrue(cache._search_policy_allows_cache_io())
         trials: list[_Search] = []
 
         class AdaptiveSearch(_Search):
@@ -692,7 +731,9 @@ class TestAutotuneHandoff(unittest.TestCase):
                 return super()._autotune()
 
         def factory() -> _Search:
-            search = AdaptiveSearch(kernel, [[1]], args=original.args)
+            search = AdaptiveSearch(
+                kernel, [[1]], args=original.args, provider_cls=LocalBenchmarkProvider
+            )
             trials.append(search)
             return search
 
@@ -955,10 +996,12 @@ class TestAutotuneHandoff(unittest.TestCase):
 
     def test_peer_finalist_failure_disqualifies_local_success(self) -> None:
         script = _Script({1: [0.5], 2: [1.0]})
-        rejected = _config(1)
+        rejected_index = 0
 
         def gather(value: object, group: str | None) -> list[object]:
-            return [value, {rejected}] if isinstance(value, set) else [value, None]
+            return (
+                [value, {rejected_index}] if isinstance(value, set) else [value, None]
+            )
 
         with patch("helion.autotuner.handoff.all_gather_object", side_effect=gather):
             point = find_handoff(_Search(_Kernel(script), [[1, 2]]))

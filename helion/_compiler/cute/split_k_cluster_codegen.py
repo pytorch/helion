@@ -16,6 +16,8 @@ from ..ast_extension import LoopType
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
 from ..type_info import CallableType
+from .compile_options import compile_options_keyword
+from .compile_options import config_compile_options
 from .materialized_fission_codegen import _empty_graph
 from .materialized_fission_codegen import prepend_missing_imports
 from .memory_ops import tensor_has_specialized_tma_alignment
@@ -269,9 +271,10 @@ def generate_split_k_cluster(
     s = CLUSTER_K_SCHEDULE
     grid = (facts.m // s.bm) * (facts.n // s.bn) * s.cluster_ctas
     bias_arg = f", {proof.bias.host_expression}" if proof.bias is not None else ""
+    options = compile_options_keyword(config_compile_options(config))
     launch = statement_from_string(
         f"_launcher({kernel}, ({grid},), {proof.lhs_expression}, {proof.rhs_expression}, "
-        f"{proof.output_name}{bias_arg}, block=(32, 4, 1))"
+        f"{proof.output_name}{bias_arg}, block=(32, 4, 1){options})"
     )
     host.body[host.body.index(marker)] = launch
     metadata = {

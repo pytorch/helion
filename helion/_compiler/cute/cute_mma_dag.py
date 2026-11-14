@@ -61,9 +61,11 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
+import math
 import operator
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import Literal
 from typing import cast
 
 import sympy
@@ -78,6 +80,7 @@ from .cute_warp_mma_gemm import warp_mma_warp_layout
 from .fx_matcher import _is_call
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Collection
     from collections.abc import Iterable
     from collections.abc import Mapping
@@ -86,10 +89,16 @@ if TYPE_CHECKING:
 
     from torch.fx.node import Node
 
+    from ...autotuner.config_fragment import ConfigSpecFragment
+    from ...runtime.config import Config
+    from ..compile_environment import ConfigValueExpression
     from ..device_ir import GraphInfo
+    from .analysis.separable_index_map import SeparableIndexMap
     from .cute_mma_dag_tcgen05 import StreamedLoopFacts
     from .cute_mma_dag_tcgen05 import Tcgen05Facts
     from .cute_mma_dag_tcgen05 import Tcgen05Plan
+    from .paged_attention_transport import PagedAttentionSchedule
+    from .paged_attention_transport import PagedAttentionScheduleFacts
 
     Layouts = dict[tuple[int, int], tuple[int, int]]
 
@@ -157,10 +166,44 @@ MMA_DAG_EXCHANGE_CHOICES: tuple[str, ...] = (
     MMA_DAG_EXCHANGE_AUTO,
     MMA_DAG_EXCHANGE_SMEM,
 )
+MMA_DAG_V_LAG_KEY = "cute_mma_dag_v_lag"
+# The paired loader keeps the original K0,K1,V0,V1 order at zero. Positive
+# values issue K(i) before V(i-lag), with a guarded bounded-head drain.
+MMA_DAG_V_LAG_CHOICES: tuple[int, ...] = (0, 1, 2, 3)
+# Paired non-MMA warps may suspend at barriers, leaving the issuer warps'
+# latency-sensitive waits unchanged. Short and long pipelines can differ.
+MMA_DAG_SLEEP_WAITS_KEY = "cute_mma_dag_sleep_waits"
+# Retire the paired allocation after its last TMEM reads, before output stores.
+MMA_DAG_EARLY_TMEM_RETIREMENT_KEY = "cute_mma_dag_early_tmem_retirement"
+# Paired queries can use a proved rectangular TMA map or scalar shared stores.
+MMA_DAG_QUERY_TMA_KEY = "cute_mma_dag_query_tma"
+# Paired V transport can inspect proved scale metadata before fetching raw bytes.
+MMA_DAG_VALUE_METADATA_SKIP_KEY = "cute_mma_dag_value_metadata_skip"
+# Read immutable scale words while the prior shared-slot consumer is active.
+MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY = "cute_mma_dag_value_metadata_read_overlap"
+# ``serial`` prepares P after the prior PV; ``early`` prepares it in registers
+# before that wait. ``early_tmem`` also keeps denominator partials in TMEM.
+MMA_DAG_PROBABILITY_SCHEDULE_KEY = "cute_mma_dag_probability_schedule"
+MMA_DAG_PROBABILITY_SCHEDULE_SERIAL = "serial"
+MMA_DAG_PROBABILITY_SCHEDULE_EARLY = "early"
+MMA_DAG_PROBABILITY_SCHEDULE_EARLY_TMEM = "early_tmem"
+MMA_DAG_PROBABILITY_SCHEDULE_CHOICES: tuple[str, ...] = (
+    MMA_DAG_PROBABILITY_SCHEDULE_SERIAL,
+    MMA_DAG_PROBABILITY_SCHEDULE_EARLY,
+    MMA_DAG_PROBABILITY_SCHEDULE_EARLY_TMEM,
+)
 MMA_DAG_PASS_WARPS_KEY = "cute_mma_dag_pass_warps"
 MMA_DAG_PASS_WARPS_OFF = "off"
 MMA_DAG_PASS_WARPS_ON = "on"
 MMA_DAG_PASS_WARPS_MMA = "mma"
+MMA_DAG_PASS_WARPS_ATTENTION = "attention"
+MMA_DAG_PASS_WARPS_ATTENTION_SCOPED = "attention_scoped"
+MMA_DAG_PASS_WARPS_ATTENTION_PAIRED = "attention_paired"
+MMA_DAG_ATTENTION_PASS_WARPS: tuple[str, ...] = (
+    MMA_DAG_PASS_WARPS_ATTENTION,
+    MMA_DAG_PASS_WARPS_ATTENTION_SCOPED,
+    MMA_DAG_PASS_WARPS_ATTENTION_PAIRED,
+)
 # tcgen05 at eight warps with loop operand passes: ``on`` has warps 4-7
 # rewrite the operand tiles one tile ahead of the epilogue warps' chain
 # (handing each over through a per-stage mbarrier); ``off`` runs the passes
@@ -175,11 +218,80 @@ MMA_DAG_PASS_WARPS_MMA = "mma"
 # graph; bit-equal to the chain schedule's render of the same tile).  The
 # warp owns no packet of the passes and drains it reaches outside its loop
 # (``pass_guard``).
+# ``attention`` uses the proved paged recurrence's ten- or thirteen-warp
+# topology. ``attention_scoped`` retains the per-key recurrence's pipeline
+# with twelve warps and 128/64/32 compute/conversion/control register quotas.
+# ``attention_paired`` groups two proved independent heads in a twenty-warp
+# CTA with 144/72/48 compute/conversion/control quotas. These are explicit
+# search choices; reduced denominators retain only ``attention``.
 MMA_DAG_PASS_WARPS_CHOICES: tuple[str, ...] = (
     MMA_DAG_PASS_WARPS_OFF,
     MMA_DAG_PASS_WARPS_ON,
     MMA_DAG_PASS_WARPS_MMA,
+    *MMA_DAG_ATTENTION_PASS_WARPS,
 )
+
+
+def paged_attention_pass_warp_choices(facts: CuteMmaDagFacts) -> tuple[str, ...]:
+    """Schedules whose role topology implements the proved recurrence."""
+    if facts.attention is None:
+        return ()
+    if facts.attention.partial_statistics:
+        return (MMA_DAG_PASS_WARPS_ATTENTION_PAIRED,)
+    if facts.attention.denominator_per_key:
+        return (
+            MMA_DAG_ATTENTION_PASS_WARPS
+            if facts.attention.paired_items
+            else (MMA_DAG_PASS_WARPS_ATTENTION, MMA_DAG_PASS_WARPS_ATTENTION_SCOPED)
+        )
+    return (MMA_DAG_PASS_WARPS_ATTENTION,)
+
+
+def paged_attention_v_lag_choices(
+    facts: CuteMmaDagFacts, pass_warps: object
+) -> tuple[int, ...]:
+    """Only a proved paired loader consumes the V issue-distance knob."""
+    if (
+        facts.attention is not None
+        and facts.attention.paired_items
+        and pass_warps == MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
+    ):
+        return MMA_DAG_V_LAG_CHOICES
+    return (0,)
+
+
+def paged_attention_probability_choices(
+    facts: CuteMmaDagFacts, pass_warps: object
+) -> tuple[str, ...]:
+    """Early P preparation has a lifetime proof for paired reference scores."""
+    if (
+        facts.attention is not None
+        and facts.attention.paired_items
+        and facts.attention.reference_scores
+        and pass_warps == MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
+    ):
+        return MMA_DAG_PROBABILITY_SCHEDULE_CHOICES
+    return (MMA_DAG_PROBABILITY_SCHEDULE_SERIAL,)
+
+
+def paged_attention_pass_warps_reason(
+    facts: CuteMmaDagFacts, pass_warps: object
+) -> str | None:
+    """Shared semantic gate for the explicit attention schedule family."""
+    if facts.attention is None:
+        return "the paged-attention semantic and transport proof did not match"
+    if pass_warps not in paged_attention_pass_warp_choices(facts):
+        if facts.attention.partial_statistics:
+            return "raw attention statistics require the paired schedule"
+        if pass_warps == MMA_DAG_PASS_WARPS_ATTENTION_PAIRED:
+            return (
+                "attention_paired requires a per-key denominator and compatible "
+                "paired-head bounds, layout, and shared-memory capacity"
+            )
+        return f"{pass_warps} requires the per-key denominator"
+    return None
+
+
 # Ring depth the pass-warp seed asks for: the next tile must land before
 # its pass is due (at two slots the TMA of tile i + 1 goes out with
 # iteration i and the pass warps wait on it: gated fwd_h_delta at s2 305 us
@@ -339,6 +451,13 @@ MMA_DAG_KEYS: tuple[str, ...] = (
     MMA_DAG_STORE_KEY,
     MMA_DAG_EXCHANGE_KEY,
     MMA_DAG_PASS_WARPS_KEY,
+    MMA_DAG_V_LAG_KEY,
+    MMA_DAG_SLEEP_WAITS_KEY,
+    MMA_DAG_EARLY_TMEM_RETIREMENT_KEY,
+    MMA_DAG_QUERY_TMA_KEY,
+    MMA_DAG_VALUE_METADATA_SKIP_KEY,
+    MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY,
+    MMA_DAG_PROBABILITY_SCHEDULE_KEY,
     MMA_DAG_LOADS_KEY,
     MMA_DAG_AUX_KEY,
     MMA_DAG_PERSISTENT_KEY,
@@ -588,8 +707,8 @@ class Axis:
     kind: str
     extent: int
     loop: int = -1
-    # A tile loop over a fixed block size (``hl.tile(n, block_size=C)`` with
-    # a specialized ``C``): the size is the kernel's, not the config's.
+    # A fixed tile loop or complete root tile (``hl.tile(n, block_size=C)``):
+    # the size is the kernel's, not the config's.
     size: int | None = None
 
 
@@ -620,7 +739,8 @@ class Subscript:
     """One subscript position of a tensor access: a whole tile of ``axis``
     (``root`` / ``loop`` / ``lead`` tiles and ``:`` rdims) or a uniform
     integer expression ``expr`` over grid loop indices and the leading tile
-    ids (``loops`` lists the loops whose index occurs in it;
+    ids, optionally through scalar integer table loads (``loops`` lists
+    address dependencies and the declaring loops of those loads;
     ``loop_dependent`` says there is at least one).  An ``axis`` subscript
     may carry a loop-invariant uniform ``offset`` over the leading tile ids
     (``x[tile_k.index + tile_c.begin * C]``): the tile's elements sit at
@@ -634,6 +754,9 @@ class Subscript:
     loops: tuple[int, ...] = ()
     offset: sympy.Expr | None = None
     window: Window | None = None
+    # A grouped read uses floor(global_axis_index / divisor). Its value
+    # retains the logical axis, while its physical tensor dim is smaller.
+    divisor: int | None = None
 
     @property
     def loop_set(self) -> frozenset[int]:
@@ -669,10 +792,19 @@ class Access:
     # without an explicit policy in program order, as the ordinary lowering
     # numbers its sites); None for a store.
     eviction_slot: int | None = None
+    # Explicit logical coordinates for a rank-one physical storage view.
+    # This is not an affine tensor layout: dim_strides/subscripts are empty,
+    # and only a consumer implementing the map may lower the access.
+    index_map: SeparableIndexMap | None = None
 
     @property
     def dtype(self) -> torch.dtype:
         return self.fake.dtype
+
+    @property
+    def grouped(self) -> bool:
+        """Whether a logical axis gathers groups of a smaller physical dim."""
+        return any(subscript.divisor is not None for subscript in self.subscripts)
 
     @property
     def tile_dims(self) -> tuple[Axis, ...]:
@@ -681,6 +813,8 @@ class Access:
     @property
     def tile_dim_strides(self) -> tuple[int, ...]:
         """Element strides of ``tile_dims`` (lead dims dropped)."""
+        if self.index_map is not None:
+            raise _NotMine
         return tuple(
             stride
             for axis, stride in zip(self.dims, self.dim_strides, strict=True)
@@ -695,6 +829,8 @@ class Access:
     def stride_of(self, axis: Axis) -> int:
         """Element stride of the tensor dim ``axis`` indexes (the axis must
         index exactly one dim; positional lookups use ``stride_at``)."""
+        if self.index_map is not None:
+            raise _NotMine
         strides = [
             stride
             for subscript, stride in zip(self.subscripts, self.strides, strict=True)
@@ -706,6 +842,8 @@ class Access:
 
     def subscript_index(self, position: int) -> int:
         """The subscript (tensor dim) behind value dim ``position``."""
+        if self.index_map is not None:
+            raise _NotMine
         axis_positions = [
             index
             for index, subscript in enumerate(self.subscripts)
@@ -715,6 +853,8 @@ class Access:
 
     def stride_at(self, position: int) -> int:
         """Element stride of the tensor dim behind value dim ``position``."""
+        if self.index_map is not None:
+            raise _NotMine
         return self.dim_strides[position]
 
     @property
@@ -839,6 +979,8 @@ class Dot:
     transposed: bool = False
     # The device loop whose body holds the dot (-1: the root region).
     loop: int = -1
+    # Register vectors read while materializing the accumulator expression.
+    acc_vecs: tuple[Node, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -858,6 +1000,7 @@ class Derived:
     rows: Axis
     cols: Axis
     loop: int = -1
+    vecs: tuple[Node, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -904,7 +1047,7 @@ class Carry:
 @dataclasses.dataclass(frozen=True)
 class VecCarry:
     """A loop-carried fp32 vector (``[1, C]``, varying along one axis) in
-    vector slot ``slot``: zeros at entry, or an earlier loop's vector
+    vector slot ``slot``: a scalar fill at entry, or an earlier loop's vector
     (``init_vec``) carried on.  An ``identity`` carry passes through the
     loop unchanged (a gradient accumulator of a decay mode the kernel does
     not run) and needs no registers (``slot`` is -1)."""
@@ -916,6 +1059,7 @@ class VecCarry:
     phi: Node
     identity: bool
     init_vec: Node | None = None
+    init_fill: float = 0.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -926,14 +1070,16 @@ class VecSlot:
     axis) is one value every lane holds."""
 
     axis: Axis | None
-    orient: str  # "rows" | "cols" | "scalar"
+    # A scalar-filled carry starts "pending" in the matcher until a vector
+    # operation links it to a reduction's layout. Programs have no pending slots.
+    orient: str  # "rows" | "cols" | "scalar" | "pending"
 
 
 @dataclasses.dataclass(frozen=True)
 class Reduce:
-    """``sum(value, -1)`` / ``sum(value, -2)`` of a pointwise value over one
+    """A sum or maximum along one of the last two dims of a pointwise value over one
     fragment leaf (``frag``, in the registers; aux loads beside it) into
-    vector slot ``slot``: each lane sums its registers along the reduced
+    vector slot ``slot``: each lane reduces its registers along the reduced
     dim, the quad / octet shuffles complete the warp's part and the warp
     grid's other split goes through shared memory.  With ``vec`` set the
     value is a vector reduced to a scalar."""
@@ -946,6 +1092,8 @@ class Reduce:
     aux_loads: tuple[Access, ...]
     loop: int = -1
     vec: Node | None = None
+    kind: Literal["sum", "max"] = "sum"
+    vecs: tuple[Node, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1087,8 +1235,8 @@ class MmaDagProgram:
     # Loop placeholders that alias a value of the enclosing region (read-only
     # loop inputs) -> that value.
     aliases: dict[Node, Node] = dataclasses.field(default_factory=dict)
-    # Fragment leaf (dot, derived value, carry placeholder, phi) -> the
-    # region defining it (loop index; -1: the root region).
+    # Fragment or vector leaf (dot, derived value, reduction, vector op,
+    # carry placeholder, phi) -> its defining region (-1: the root region).
     frag_regions: dict[Node, int] = dataclasses.field(default_factory=dict)
     # Vector slots and the vector leaves (carry placeholders, phis,
     # reductions, vector ops) in them.
@@ -1110,6 +1258,14 @@ class MmaDagProgram:
     # of ``cute_mma_dag_derived`` writes such an operand's tile straight
     # from the staged source tiles (``mma_dag_pass_chains``).
     pass_chains: dict[Node, tuple[Derived, ...]] = dataclasses.field(
+        default_factory=dict
+    )
+    # Declared integer tunables retain their config identity, not a default or
+    # size hint. Semantic matchers can consume these without an active compiler.
+    config_scalars: dict[sympy.Symbol, ConfigValueExpression] = dataclasses.field(
+        default_factory=dict
+    )
+    config_fragments: dict[str, ConfigSpecFragment] = dataclasses.field(
         default_factory=dict
     )
 
@@ -1365,6 +1521,7 @@ class MmaDagProgram:
             result.extend(scan.aux_loads)
         result.extend(store.access for store in self.vec_stores)
         result.extend(self.scalar_loads)
+        result.extend(self.index_loads.values())
         seen: dict[Node, Access] = {}
         for access in result:
             seen.setdefault(access.node, access)
@@ -1378,6 +1535,20 @@ class MmaDagProgram:
     # bounds, a window's row offset and limit: loads at subscripts uniform
     # over the leading tiles, read once per CTA ahead of the loops.
     scalar_loads: tuple[Access, ...] = ()
+    # Invariant integer expression DAGs used as loop bounds, in dependency
+    # order. Their loads and induction retain the FX integer width.
+    uniform_values: tuple[Node, ...] = ()
+    # Uniform integer expressions used inside pointwise recipes, possibly
+    # depending on the current device-loop indices.
+    aux_indices: dict[Node, sympy.Expr] = dataclasses.field(default_factory=dict)
+    # Uniform integer table reads used as tensor subscripts. A read retains
+    # the loops its own address depends on, so operand staging reads the
+    # index for the same iteration (including a prefetched future one).
+    index_loads: dict[sympy.Symbol, Access] = dataclasses.field(default_factory=dict)
+    # Typed scalar index expressions are separate from invariant bounds: their
+    # tensor nodes retain INT32/INT64 wrapping and may read a future iteration.
+    index_values: dict[sympy.Symbol, Node] = dataclasses.field(default_factory=dict)
+    index_exprs: dict[Node, sympy.Expr] = dataclasses.field(default_factory=dict)
     # Vector leaf -> the 2-D dim it is read along (``v[:, None]``: 0), where
     # the dim is positional (a slot over one axis, ``rows is cols``).
     vec_positions: dict[Node, int] = dataclasses.field(default_factory=dict)
@@ -1402,8 +1573,8 @@ class AxisFacts:
     # the last CTA's rows past the extent are zero-filled operand rows and
     # zero side loads, their stores dropped).  See ``ragged_root_axes``.
     ragged: bool = False
-    # The block size of a fixed-size tile loop axis (``Axis.size``); None
-    # for an axis the config sizes.
+    # The block size of a fixed tile loop or complete root (``Axis.size``);
+    # None for an axis the config sizes.
     fixed: int | None = None
 
     @property
@@ -1625,6 +1796,12 @@ class CuteMmaDagFacts:
     # innermost ring loop of the bound inputs): the smem estimate's and the
     # per-thread cap's inputs under ``MMA_DAG_AUX_RING``.
     aux_loads: tuple[AuxLoadFacts, ...] = ()
+    # The explicit paged-attention topology: graph-free facts only after
+    # both the online recurrence and physical byte transport are proved.
+    attention: PagedAttentionScheduleFacts | None = None
+    mapped_io: bool = False
+    # Native bit decoders currently have only the dedicated attention emitter.
+    native_s2f6_operands: bool = False
 
     def block_size(self, axis: int, sizes: Mapping[int, object]) -> int | None:
         facts = self.axes[axis]
@@ -1796,6 +1973,9 @@ class MmaDagPlan:
     # ``threads`` stays the config's warps (the passes, the epilogue), the
     # launch adds the warp (``launch_threads``).
     mma_warp: bool = False
+    # Explicitly selected paged attention has its own producer topology;
+    # ordinary choices retain the existing tcgen05 or warp plan.
+    attention: PagedAttentionSchedule | None = None
 
     @property
     def threads(self) -> int:
@@ -1804,6 +1984,8 @@ class MmaDagPlan:
     @property
     def launch_threads(self) -> int:
         """The CTA's thread count: the config's warps plus the MMA warp."""
+        if self.attention is not None:
+            return 32 * self.attention.launch_warps
         return self.threads + (32 if self.mma_warp else 0)
 
     def block(self, axis: Axis) -> int:
@@ -2515,7 +2697,11 @@ def mma_dag_ring_loops(
     a stride off the 16-byte grid -- takes the synchronous lane pass and
     stages nothing, and a loop of such operands alone has no ring for a
     side tile to ride.  The routes read the bound tensors alone (no config),
-    so the facts and every plan agree."""
+    so the facts and every plan agree at the shared frontend's minimum
+    dot widths. Plans also check the chosen source width: smaller native
+    MMA atoms without a whole raw packet take the synchronous pass. If
+    this removes an advertised auxiliary ring, planning rejects that option
+    rather than emitting an incomplete ring."""
     loops: set[int] = set()
     for dot in program.dots:
         for operand in (dot.a, dot.b):
@@ -2610,7 +2796,7 @@ def mma_dag_aux_records(
             along = load.tile_dims[contiguous]
             one_axis = operand.rows is operand.cols
             for access in operand.aux_loads:
-                if program.level(access) != index:
+                if program.level(access) != index or access.grouped:
                     continue
                 geometry = {
                     "rows": operand.rows.index,
@@ -3047,6 +3233,16 @@ def mma_dag_config_reason(
     ``cute_mma_dag_pass_warps`` schedule (``mma`` adds the streamed loops'
     ``ready`` barriers and needs their accumulators in tensor memory).
     """
+    if facts.native_s2f6_operands and pass_warps not in MMA_DAG_ATTENTION_PASS_WARPS:
+        return Reason(
+            "native S2F6 operands require the proved attention transport",
+            MMA_DAG_PASS_WARPS_KEY,
+        )
+    if facts.mapped_io and pass_warps not in MMA_DAG_ATTENTION_PASS_WARPS:
+        return Reason(
+            "folded storage index maps require the proved attention transport",
+            MMA_DAG_PASS_WARPS_KEY,
+        )
     if mode == MMA_DAG_TCGEN05:
         from .cute_mma_dag_tcgen05 import tcgen05_warps_reason
 
@@ -3089,7 +3285,15 @@ def mma_dag_config_reason(
             # A root tile past its extent (a 16-row MMA atom over M = 8)
             # runs on the warp path where the emitter predicates the ragged
             # rows; the tensor-memory renderers keep whole tiles.
-            if not (axis.ragged and mode == MMA_DAG_WARP):
+            attention = facts.attention
+            attention_padding = (
+                pass_warps in MMA_DAG_ATTENTION_PASS_WARPS
+                and attention is not None
+                and index == attention.query_axis
+                and axis.extent == attention.query_rows
+                and size == attention.query_block
+            )
+            if not attention_padding and not (axis.ragged and mode == MMA_DAG_WARP):
                 return Reason(
                     f"block size {size} must divide the extent {axis.extent} of tile axis {axis.block_id}"
                 )
@@ -3118,6 +3322,26 @@ def mma_dag_config_reason(
                 f" is not a multiple of its block size {resolved[loop.axis]} in every"
                 " CTA and no operand pass can mask the partial trip"
             )
+    if pass_warps in MMA_DAG_ATTENTION_PASS_WARPS:
+        from .paged_attention_config import paged_attention_config_reason
+
+        reason = paged_attention_config_reason(
+            facts,
+            sizes,
+            {
+                MMA_DAG_KEY: mode,
+                MMA_DAG_PASS_WARPS_KEY: pass_warps,
+                MMA_DAG_WARPS_KEY: warps,
+                MMA_DAG_STAGES_KEY: stages,
+                MMA_DAG_DERIVED_KEY: derived,
+                MMA_DAG_EPILOGUE_KEY: epilogue,
+                MMA_DAG_LOOKAHEAD_KEY: lookahead,
+                MMA_DAG_AUX_KEY: aux,
+                MMA_DAG_PERSISTENT_KEY: int(persistent),
+                MMA_DAG_CLUSTER_KEY: facts.cluster_of(sizes),
+            },
+        )
+        return None if reason is None else Reason(reason, MMA_DAG_PASS_WARPS_KEY)
     assert type(warps) is int
     if mode == MMA_DAG_TCGEN05:
         from .cute_mma_dag_tcgen05 import tcgen05_config_reason
@@ -3375,6 +3599,19 @@ def mma_dag_pass_warps_reason(
     tile otherwise, ``streamed_loop_subject``)."""
     if mode != MMA_DAG_TCGEN05:
         return "the warp mode runs its passes on every warp"
+    if pass_warps in MMA_DAG_ATTENTION_PASS_WARPS:
+        reason = paged_attention_pass_warps_reason(facts, pass_warps)
+        if reason is not None:
+            return reason
+        attention = facts.attention
+        assert attention is not None
+        if warps != attention.compute_warps or stages != attention.raw_stages:
+            return (
+                "the attention schedule needs "
+                f"{attention.compute_warps} compute warps and "
+                f"{attention.raw_stages} raw stages"
+            )
+        return None
     if pass_warps == MMA_DAG_PASS_WARPS_MMA:
         if facts.tcgen05 is None or not facts.tcgen05.regions:
             return "the MMA warp serves the region renderer's streamed loops"
@@ -4107,7 +4344,11 @@ def _tile_signature(access: Access) -> tuple[object, ...] | None:
     """What makes two loads of a region the same tile: the tensor, its
     dtype and strides, and whole-tile subscripts of the same axes (loads
     with scalar subscripts are not deduplicated)."""
-    if any(subscript.kind != "axis" for subscript in access.subscripts):
+    if (
+        access.index_map is not None
+        or access.grouped
+        or any(subscript.kind != "axis" for subscript in access.subscripts)
+    ):
         return None
     return (
         access.name,
@@ -4182,6 +4423,91 @@ def _uniform_input(node: Node) -> bool:
     val = node.meta.get("val")
     return not isinstance(val, torch.Tensor) or all(
         isinstance(size, int) and size == 1 for size in val.shape
+    )
+
+
+_SCALAR_INDEX_PREDICATES = frozenset(
+    (
+        torch.ops.aten.eq.Tensor,
+        torch.ops.aten.eq.Scalar,
+        torch.ops.aten.ne.Tensor,
+        torch.ops.aten.ne.Scalar,
+        torch.ops.aten.lt.Tensor,
+        torch.ops.aten.lt.Scalar,
+        torch.ops.aten.le.Tensor,
+        torch.ops.aten.le.Scalar,
+        torch.ops.aten.gt.Tensor,
+        torch.ops.aten.gt.Scalar,
+        torch.ops.aten.ge.Tensor,
+        torch.ops.aten.ge.Scalar,
+    )
+)
+
+
+_SCALAR_INDEX_OPS = _SCALAR_INDEX_PREDICATES | frozenset(
+    (
+        torch.ops.aten.add.Tensor,
+        torch.ops.aten.sub.Tensor,
+        torch.ops.aten.mul.Tensor,
+        torch.ops.aten.div.Tensor_mode,
+        torch.ops.aten.remainder.Scalar,
+        torch.ops.aten.clamp.default,
+        torch.ops.aten.clamp_min.default,
+        torch.ops.aten.clamp_max.default,
+        torch.ops.aten.minimum.default,
+        torch.ops.aten.maximum.default,
+        torch.ops.prims.convert_element_type.default,
+    )
+)
+
+
+def _is_scalar_index_pointwise(node: Node) -> bool:
+    """Uniform integer arithmetic and comparison intermediates in addresses.
+
+    Comparison operands retain the lowering's integer-width semantics. Divisors
+    are positive literals representable in the result dtype, excluding zero and
+    MIN/-1 overflow even after converting a Python scalar to the tensor width.
+    """
+    if not _is_pointwise(node) or node.target not in _SCALAR_INDEX_OPS:
+        return False
+    if node.meta["val"].dtype == torch.bool:
+        # Boolean intermediates are typed predicates, not integer arithmetic.
+        # Their operands are checked recursively by index_value, so floating
+        # point dependencies and nonuniform tensors remain unsupported.
+        return node.target in _SCALAR_INDEX_PREDICATES and all(
+            isinstance(arg, torch.fx.Node) or type(arg) is int for arg in node.args
+        )
+    if node.target in (
+        torch.ops.aten.div.Tensor_mode,
+        torch.ops.aten.remainder.Scalar,
+    ):
+        if (
+            len(node.args) != 2
+            or type(node.args[1]) is not int
+            or not 0 < node.args[1] <= torch.iinfo(node.meta["val"].dtype).max
+        ):
+            return False
+        if (
+            node.target is torch.ops.aten.div.Tensor_mode
+            and node.kwargs.get("rounding_mode") != "floor"
+        ):
+            return False
+    return True
+
+
+def _plain_integer_scalar_load(node: Node) -> bool:
+    """An Int32/Int64 scalar load with no mask or explicit eviction policy."""
+    from ...language import memory_ops
+
+    val = node.meta.get("val")
+    return (
+        _is_call(node, memory_ops.load)
+        and isinstance(val, torch.Tensor)
+        and val.ndim == 0
+        and val.dtype in (torch.int32, torch.int64)
+        and len(node.args) >= 4
+        and node.args[2] is None
+        and node.args[3] is None
     )
 
 
@@ -4415,10 +4741,30 @@ class _LoopBuild:
 
 
 class _Matcher:
-    def __init__(self, graphs: Sequence[GraphInfo]) -> None:
+    def static_int(self, value: object) -> int | None:
+        """Resolve configured extents; singleton checks must ignore the config."""
+        if isinstance(value, torch.SymInt) and self.resolve_block_size is not None:
+            from .fragment_storage import configured_fragment_expr
+
+            env = CompileEnvironment.current()
+            expr = configured_fragment_expr(
+                env, value._sympy_(), self.resolve_block_size
+            )
+            if expr != value._sympy_():
+                resolved = env.specialize_expr(cast("sympy.Expr", expr))
+                return int(resolved) if resolved.is_Integer else None
+        return _static_int(value)
+
+    def __init__(
+        self,
+        graphs: Sequence[GraphInfo],
+        resolve_block_size: Callable[[int], int | torch.SymInt | None] | None = None,
+    ) -> None:
+        self.resolve_block_size = resolve_block_size
         self.graphs = graphs
         self.axes: dict[int, Axis] = {}
         self.axis_list: list[Axis] = []
+        self.mapped_accesses: dict[Node, Access] = {}
         self.root_block_ids: tuple[int, ...] = ()
         # Canonical block id -> loop index of the tile loops and of the
         # grid-like (fixed step one) loops; the latter's index symbols.
@@ -4471,6 +4817,15 @@ class _Matcher:
         self.loop_ends: dict[int, tuple[sympy.Expr, sympy.Expr]] = {}
         # Uniform scalars read from tensors (``scalar_load``), by node.
         self.scalar_loads: dict[Node, Access] = {}
+        self.uniform_values: dict[Node, None] = {}
+        self.aux_indices: dict[Node, sympy.Expr] = {}
+        self.index_loads: dict[Node, tuple[sympy.Symbol, Access]] = {}
+        self.index_values: dict[Node, tuple[sympy.Symbol, tuple[int, ...]]] = {}
+        self.index_exprs: dict[Node, sympy.Expr] = {}
+        # Loop-local loads and scalar recipes need a speculation proof before
+        # moving to CTA entry: an empty loop must not dereference a body
+        # lookup or evaluate potentially undefined integer arithmetic.
+        self.node_regions: dict[Node, int] = {}
         # Vector leaf -> the 2-D dims it is read along (``note_vec_position``).
         self.vec_positions: dict[Node, set[int]] = {}
         # One-dim load -> the 2-D dims a subscript reads it along.
@@ -4503,13 +4858,17 @@ class _Matcher:
             if kind == AXIS_LOOP:
                 extent = self.loop_axis_extent(block_id, info.size)
             else:
-                extent = _static_int(info.size)
+                extent = self.static_int(info.size)
             if extent is None or extent <= 0:
                 raise _NotMine
             if kind == AXIS_RDIM and (extent & (extent - 1) or extent % MMA_DAG_K_STEP):
                 raise _NotMine
-            size = self.fixed_sizes.get(block_id) if kind == AXIS_LOOP else None
-            if size is not None and extent % size:
+            size = (
+                self.fixed_sizes.get(block_id)
+                if kind in (AXIS_ROOT, AXIS_LOOP)
+                else None
+            )
+            if kind == AXIS_LOOP and size is not None and extent % size:
                 raise _NotMine
             axis = Axis(len(self.axis_list), block_id, kind, extent, loop, size)
             self.axes[block_id] = axis
@@ -4559,7 +4918,7 @@ class _Matcher:
                 continue
             if not isinstance(origin, (TileIdOrigin, TileBeginOrigin)):
                 raise _NotMine
-            axis = self.axis_of_block(origin.block_id)
+            axis = self.bound_coordinate_axis(origin.block_id)
             if axis.kind == AXIS_LEAD:
                 largest[symbol] = sympy.Integer(axis.extent - 1)
                 placeholders[symbol] = bound_symbol(BOUND_ID, axis.index)
@@ -4608,7 +4967,9 @@ class _Matcher:
         return int(extent)
 
     def axis_of_size(self, size: object) -> Axis | None:
-        """The axis behind a value dim size (None for a size-1 dim)."""
+        """The axis behind a value dim, before resolving configured tile sizes."""
+        # A tile configured to have one lane still owns an axis. Classify
+        # singleton dimensions without resolving configured tile sizes.
         static = _static_int(size)
         if static == 1:
             return None
@@ -4675,9 +5036,19 @@ class _Matcher:
             raise _NotMine
         return True
 
-    def uniform_expr(self, subscript: object) -> tuple[sympy.Expr, tuple[int, ...]]:
-        """A uniform integer subscript and the grid loops whose index occurs
-        in it."""
+    def bound_coordinate_axis(self, block_id: int) -> Axis:
+        """Axis whose extent bounds its zero-based, unit-stride coordinates."""
+        if self.canonical(block_id) in self.noncanonical_coordinate_blocks:
+            # A trip count cannot bound shifted or strided coordinates. Such
+            # origins need a separate proof before unmasked transfer planning.
+            raise _NotMine
+        return self.axis_of_block(block_id)
+
+    def uniform_expr(
+        self, subscript: object, *, root_coordinates: bool = False
+    ) -> tuple[sympy.Expr, tuple[int, ...]]:
+        """A uniform integer subscript and its loop dependencies, including
+        the declaring loops of table lookups even at invariant addresses."""
 
         if isinstance(subscript, bool):
             raise _NotMine
@@ -4686,15 +5057,87 @@ class _Matcher:
         if not isinstance(subscript, torch.fx.Node):
             raise _NotMine
         val = subscript.meta.get("val")
+        if isinstance(val, torch.Tensor):
+            # A Boolean subscript is a mask, not an integer 0/1 address.
+            if val.dtype == torch.bool:
+                raise _NotMine
+            return self.index_value(subscript)
         if isinstance(val, int) and not isinstance(val, bool):
             return sympy.Integer(val), ()
         if not isinstance(val, torch.SymInt):
             raise _NotMine
-        return self.uniform_sym(val._sympy_())
+        return self.uniform_sym(val._sympy_(), root_coordinates=root_coordinates)
 
-    def uniform_sym(self, expr: object) -> tuple[sympy.Expr, tuple[int, ...]]:
-        """``uniform_expr`` of a sympy integer expression."""
+    def index_value(self, node: Node) -> tuple[sympy.Expr, tuple[int, ...]]:
+        """A typed scalar integer recipe with Boolean comparison intermediates.
+
+        Never turn tensor arithmetic into unbounded SymPy algebra or move a
+        declaring-loop load outside its guard.
+        """
+        node = self.resolve(node)
+        val = node.meta.get("val")
+        if isinstance(val, (int, torch.SymInt)) and not isinstance(val, bool):
+            expr, loops = self.uniform_expr(node)
+        elif _plain_integer_scalar_load(node):
+            expr, loops = self.index_load(node)
+        else:
+            known = self.index_values.get(node)
+            if known is not None:
+                return known
+            if (
+                not isinstance(val, torch.Tensor)
+                or val.ndim != 0
+                or val.dtype not in (torch.int32, torch.int64, torch.bool)
+                or not _is_scalar_index_pointwise(node)
+            ):
+                raise _NotMine
+            dependencies: set[int] = set()
+            for value in _node_inputs(node):
+                _expr, value_loops = self.index_value(value)
+                dependencies.update(value_loops)
+            expr = sympy.Symbol(
+                f"_mma_dag_index_value_{len(self.index_values)}", integer=True
+            )
+            loops = tuple(sorted(dependencies))
+            self.index_values[node] = expr, loops
+        self.index_exprs[node] = expr
+        return expr, loops
+
+    def index_load(self, node: Node) -> tuple[sympy.Symbol, tuple[int, ...]]:
+        """A scalar integer table lookup used as a uniform tensor index."""
+        node = self.resolve(node)
+        known = self.index_loads.get(node)
+        if known is not None:
+            symbol, access = known
+            return symbol, self.index_load_loops(node, access)
+        if not _plain_integer_scalar_load(node):
+            raise _NotMine
+        access = self.access(node)
+        if access.dims:
+            raise _NotMine
+        symbol = sympy.Symbol(f"_mma_dag_index_{len(self.index_loads)}", integer=True)
+        self.index_loads[node] = symbol, access
+        return symbol, self.index_load_loops(node, access)
+
+    def index_load_loops(self, node: Node, access: Access) -> tuple[int, ...]:
+        # A lookup declared inside a loop must not be dereferenced before
+        # that loop executes, even when its address is iteration-invariant.
+        loops = set(access.loops)
+        region = self.node_regions[node]
+        if region >= 0:
+            loops.add(region)
+        return tuple(sorted(loops))
+
+    def uniform_sym(
+        self, expr: object, *, root_coordinates: bool = False
+    ) -> tuple[sympy.Expr, tuple[int, ...]]:
+        """``uniform_expr`` of a sympy integer expression.
+
+        Pointwise recipes may read a root tile's begin or id as a scalar.
+        Address callers retain the stricter leading-coordinate contract.
+        """
         from ..host_function import HostFunction
+        from ..variable_origin import BlockSizeOrigin
         from ..variable_origin import GridOrigin
         from ..variable_origin import TensorSizeOrigin
         from ..variable_origin import TileBeginOrigin
@@ -4757,7 +5200,15 @@ class _Matcher:
                     loops.append(loop)
             elif type(origin) is GridOrigin:
                 raise _NotMine
-            elif self.lead_coordinate(origin):
+            elif isinstance(origin, BlockSizeOrigin):
+                # Every selected block size is uniform across the launch.
+                # The emitter resolves its symbol from the current config.
+                pass
+            elif (
+                root_coordinates
+                and isinstance(origin, (TileBeginOrigin, TileIdOrigin))
+                and self.canonical(origin.block_id) in self.root_block_ids
+            ) or self.lead_coordinate(origin):
                 pass
             elif not (isinstance(origin, TensorSizeOrigin) or origin.is_host()):
                 # (A host value -- a tensor size, an int argument -- is one
@@ -4798,7 +5249,7 @@ class _Matcher:
                 raise _NotMine
             assert isinstance(origin, GridOrigin)
             highest[cast("sympy.Symbol", symbol)] = (
-                self.axis_of_block(origin.block_id).extent - 1
+                self.bound_coordinate_axis(origin.block_id).extent - 1
             )
         try:
             poly = sympy.Poly(expr, *symbols) if symbols else None
@@ -4821,13 +5272,14 @@ class _Matcher:
 
     def bound_varies(self, val: torch.SymInt) -> bool:
         """Whether a grid loop bound varies within the kernel: any symbol
-        that is not a host value (a tensor size, an int argument) or a lead
+        that is not a host/config value (size, int argument, block size) or a lead
         tile's id -- an enclosing grid loop's index, a device tile's
         position, a value minted in device code (``int or int`` on a loop
         index), or a symbol of unknown origin.  The emitter renders bounds
         with the host's symbols, and an enclosing loop evaluates a nested
         loop's bounds ahead of its iteration (the early ring prologue)."""
         from ..host_function import HostFunction
+        from ..variable_origin import BlockSizeOrigin
         from ..variable_origin import TileBeginOrigin
         from ..variable_origin import TileIdOrigin
 
@@ -4840,6 +5292,8 @@ class _Matcher:
             if isinstance(origin, (TileIdOrigin, TileBeginOrigin)):
                 if self.axis_of_block(origin.block_id).kind != AXIS_LEAD:
                     return True
+            elif isinstance(origin, BlockSizeOrigin):
+                continue
             elif not origin.is_host():
                 return True
         return False
@@ -4847,8 +5301,8 @@ class _Matcher:
     def scalar_load(self, node: Node) -> Access:
         """A uniform scalar read from a tensor -- a grid loop bound, a
         window's row offset or limit: a plain load of one integer at
-        subscripts uniform over the leading tile coordinates
-        (``chunk_offsets[hn % N]``, ``token_base[r % NT]``), the same for
+        subscripts uniform over leading tile coordinates or invariant lookups
+        (``chunk_offsets[hn % N]``, ``lengths[request_ids[0]]``), the same for
         every thread of the CTA and loop-invariant, so the emitter reads it
         once ahead of the loops.  ``_NotMine`` for anything else (a masked
         load, a value computed from several loads, a subscript varying with
@@ -4860,35 +5314,93 @@ class _Matcher:
 
     def scalar_load_access(self, node: object) -> Access | None:
         """``scalar_load`` of a value that may be something else (None)."""
-        from ...language import memory_ops
-
         if not isinstance(node, torch.fx.Node):
             return None
         node = self.resolve(node)
         known = self.scalar_loads.get(node)
         if known is not None:
             return known
-        val = node.meta.get("val")
-        if (
-            not _is_call(node, memory_ops.load)
-            or not isinstance(val, torch.Tensor)
-            or val.ndim != 0
-            or val.dtype not in (torch.int32, torch.int64)
-            or len(node.args) < 4
-            or node.args[2] is not None
-            or node.args[3] is not None
-        ):
+        if not _plain_integer_scalar_load(node):
             return None
         access = self.access(node)
-        if access.dims or any(
-            subscript.kind != "scalar" or subscript.loop_dependent
-            for subscript in access.subscripts
+        if (
+            access.dims
+            or access.index_map is not None
+            or any(
+                subscript.kind != "scalar" or subscript.loop_dependent
+                for subscript in access.subscripts
+            )
         ):
             # (A per-iteration scalar -- ``decay[idx, i_t]`` -- is a side
             # load of the iteration, not a uniform of the CTA.)
             return None
+        if self.node_regions[node] >= 0:
+            # An enclosing loop may have no iterations, but these scalars
+            # are read at CTA entry. Only constant, proved in-bounds addresses
+            # are safe to speculate. Symbolic addresses (including table
+            # lookups) retain their declaring region. The finished program
+            # also rejects any loaded storage that it writes.
+            for subscript, size in zip(
+                access.subscripts, access.fake.shape, strict=True
+            ):
+                extent = self.static_int(size)
+                if (
+                    not isinstance(subscript.expr, sympy.Integer)
+                    or extent is None
+                    or not 0 <= subscript.expr < extent
+                ):
+                    return None
         self.scalar_loads[node] = access
         return access
+
+    def uniform_value(self, node: Node) -> None:
+        """An invariant scalar integer expression over uniform loads.
+
+        Boolean intermediates may select integer bounds. A device-loop index
+        or a load indexed by one is not invariant and remains unsupported here.
+        """
+        from ...language import creation_ops
+        from ...language import memory_ops
+
+        node = self.resolve(node)
+        if node in self.uniform_values:
+            return
+        val = node.meta.get("val")
+        if isinstance(val, (int, torch.SymInt)) and not isinstance(val, bool):
+            _expr, loops = self.uniform_expr(node)
+            if loops:
+                raise _NotMine
+        else:
+            if (
+                not isinstance(val, torch.Tensor)
+                or val.ndim != 0
+                or val.dtype not in (torch.int32, torch.int64, torch.bool)
+            ):
+                raise _NotMine
+            if _is_call(node, memory_ops.load):
+                self.scalar_load(node)
+            elif _is_pointwise(node) or any(
+                _is_call(node, target)
+                for target in (
+                    torch.ops.aten.full.default,
+                    creation_ops.full,
+                )
+            ):
+                if (
+                    self.node_regions[node] >= 0
+                    and _is_pointwise(node)
+                    and not _is_scalar_index_pointwise(node)
+                ):
+                    # Speculating safe loads does not make every composed
+                    # bound safe: a skipped loop may divide by zero, for
+                    # example. The typed index whitelist admits only total
+                    # integer recipes, including positive literal divisors.
+                    raise _NotMine
+                for value in _node_inputs(node):
+                    self.uniform_value(value)
+            else:
+                raise _NotMine
+        self.uniform_values[node] = None
 
     def iota_extent(self, node: object) -> int | None:
         """The extent of ``hl.arange(E)`` (``iota(E)`` from 0 in steps of
@@ -4972,7 +5484,120 @@ class _Matcher:
             raise _NotMine
         return {position: (extent, limit)}
 
+    def grouped_index(
+        self, index: object, size: object, extent: int | None
+    ) -> tuple[Axis, int] | None:
+        """Prove a positive constant floor division of a whole logical axis.
+
+        Grouped loads keep their logical shape and are evaluated at each
+        operand element. Offsets, arbitrary gathers, and grouped stores
+        have separate address/alias contracts and are not admitted here.
+        """
+        from ..indexing_strategy import subscript_tile_info
+
+        if not isinstance(index, torch.fx.Node):
+            return None
+        index = self.resolve(index)
+        if not (
+            _is_call(index, torch.ops.aten.floor_divide.default)
+            or (
+                _is_call(index, torch.ops.aten.div.Tensor_mode)
+                and index.kwargs.get("rounding_mode") == "floor"
+            )
+        ):
+            return None
+        if len(index.args) != 2:
+            return None
+        source, divisor = index.args
+        if not isinstance(divisor, int) or divisor <= 0:
+            return None
+        val = index.meta.get("val")
+        block_id = self.env.resolve_block_id(size)
+        if (
+            not isinstance(val, torch.Tensor)
+            or val.ndim != 1
+            or val.dtype not in (torch.int32, torch.int64)
+            or block_id is None
+            or extent is None
+        ):
+            return None
+        axis = self.bound_coordinate_axis(block_id)
+        iota = self.iota_extent(source)
+        if iota is not None:
+            if axis.kind != AXIS_RDIM or axis.extent != iota:
+                return None
+        elif isinstance(source, torch.fx.Node) and _tile_index_position(source) == 0:
+            if axis.kind not in (AXIS_ROOT, AXIS_LOOP) or self.shape_axes(source) != (
+                axis,
+            ):
+                return None
+        else:
+            tile = subscript_tile_info(self.env, source)
+            if (
+                tile is None
+                or self.canonical(tile.block_id) != axis.block_id
+                or axis.kind not in (AXIS_ROOT, AXIS_LOOP)
+                or not self.env.known_equal(tile.offset, 0)
+            ):
+                return None
+        if (axis.extent + divisor - 1) // divisor > extent:
+            return None
+        return axis, divisor
+
     def access(self, node: Node) -> Access:
+        """Keep ordinary indexing first, then prove explicitly mapped storage."""
+        if node in self.mapped_accesses:
+            return self.mapped_accesses[node]
+        try:
+            return self._ordinary_access(node)
+        except _NotMine:
+            return self._mapped_access(node)
+
+    def _mapped_access(self, node: Node) -> Access:
+        from ...language import memory_ops
+        from .analysis.separable_index_map import prove_separable_index_map
+        from .fx_matcher import _host_tensor_ref
+
+        is_load = _is_call(node, memory_ops.load)
+        if not is_load and not _is_call(node, memory_ops.store):
+            raise _NotMine
+        if len(node.args) < 4 or (is_load and node.args[3] is not None):
+            raise _NotMine
+        mask = node.args[2] if is_load else node.args[3]
+        ref = _host_tensor_ref(node.args[0])
+        indices = node.args[1]
+        if (
+            ref is None
+            or ref.fake.ndim != 1
+            or tuple(ref.fake.stride()) != (1,)
+            or mask is not None
+            or not isinstance(indices, (tuple, list))
+            or len(indices) != 1
+            or not isinstance(indices[0], torch.fx.Node)
+        ):
+            raise _NotMine
+        extent = _static_int(ref.fake.shape[0])
+        mapped = (
+            prove_separable_index_map(self, indices[0], extent)
+            if extent is not None
+            else None
+        )
+        if mapped is None:
+            raise _NotMine
+        access = Access(
+            node=node,
+            fake=ref.fake,
+            name=ref.name,
+            strides=(1,),
+            subscripts=(),
+            dims=tuple(part.axis for part in mapped.axes),
+            eviction_slot=self.eviction_slots.get(node) if is_load else None,
+            index_map=mapped,
+        )
+        self.mapped_accesses[node] = access
+        return access
+
+    def _ordinary_access(self, node: Node) -> Access:
         """Decode a load / store site; ``_NotMine`` for unsupported indexing."""
         from ...language import memory_ops
         from ..indexing_strategy import subscript_tile_info
@@ -4995,7 +5620,7 @@ class _Matcher:
             raise _NotMine
         strides: list[int] = []
         for stride in fake.stride():
-            static = _static_int(stride)
+            static = self.static_int(stride)
             if static is None:
                 raise _NotMine
             strides.append(static)
@@ -5011,7 +5636,19 @@ class _Matcher:
         dims: list[Axis] = []
         dim_strides: list[int] = []
         for dim, index in enumerate(indices):
-            extent = _static_int(fake.shape[dim])
+            extent = self.static_int(fake.shape[dim])
+            grouped = (
+                self.grouped_index(index, value_sizes[0], extent)
+                if is_load and value_sizes
+                else None
+            )
+            if grouped is not None:
+                axis, divisor = grouped
+                value_sizes.pop(0)
+                subscripts.append(Subscript("axis", axis, divisor=divisor))
+                dims.append(axis)
+                dim_strides.append(strides[dim])
+                continue
             window = None if index == slice(None) else self.window_index(index)
             if index == slice(None) or window is not None:
                 if not value_sizes:
@@ -5059,7 +5696,9 @@ class _Matcher:
             if tile is not None and self.canonical(tile.block_id) in tile_blocks:
                 if not value_sizes:
                     raise _NotMine
-                axis = self.axis_of_block(tile.block_id)
+                # Both a bare tile and tile.index + offset require the tile's
+                # own coordinates to be bounded by its declared extent.
+                axis = self.bound_coordinate_axis(tile.block_id)
                 size = value_sizes.pop(0)
                 size_block = self.env.resolve_block_id(size)
                 if size_block is None or self.canonical(size_block) != axis.block_id:
@@ -5090,6 +5729,11 @@ class _Matcher:
             dim_strides=tuple(dim_strides),
             eviction_slot=self.eviction_slots.get(node) if is_load else None,
         )
+        if access.grouped and len(access.tile_dims) != 2:
+            # Vector auxiliaries have separate ring, alias, and iteration-ahead
+            # table protocols. Grouped addressing is currently proved only
+            # for the per-element 2D operand recipe.
+            raise _NotMine
         if len(access.tile_dims) == 2:
             # A tile's window is its first tile dim (the rows) at a 16-byte
             # multiple of a row stride: the emitter moves the tile's
@@ -5111,7 +5755,7 @@ class _Matcher:
         loop placeholders aliasing a value of the enclosing region."""
         return _resolve(node, self.aliases)
 
-    def vec_sources(self, node: Node) -> list[Node]:
+    def vec_sources(self, node: Node, *, stop_at_fragments: bool = False) -> list[Node]:
         """The vector leaves under ``node`` (through pointwise ops, views,
         ``_new_var`` and aliases), in input order, each once."""
         from ...language import memory_ops
@@ -5125,6 +5769,8 @@ class _Matcher:
             if current in seen:
                 return
             seen.add(current)
+            if stop_at_fragments and self.is_frag_leaf(current):
+                return
             if current in self.vec_leaves:
                 result.append(current)
                 return
@@ -5161,6 +5807,38 @@ class _Matcher:
                 result.append(user)
         return result
 
+    def feeds_dot_operand(self, node: Node) -> bool:
+        """Whether a pointwise/view chain feeds a dot in a matched region.
+
+        ``users_of`` crosses only loops already matched in program order.
+        Other register consumers evaluate vector side inputs in place.
+        """
+        from ...language import _tracing_ops
+        from ...language import view_ops
+
+        pending = [node]
+        seen: set[Node] = set()
+        while pending:
+            current = pending.pop()
+            for user in self.users_of(current):
+                if _is_dot(user):
+                    if current in _dot_operands(user):
+                        return True
+                    continue
+                if user in seen:
+                    continue
+                seen.add(user)
+                if (
+                    _is_pointwise(user)
+                    or _is_swap_permute(user)
+                    or _is_call(user, view_ops.subscript)
+                    or _is_call(user, torch.ops.aten.expand.default)
+                    or _is_call(user, _tracing_ops._new_var)
+                    or _is_call(user, _tracing_ops._mask_to)
+                ):
+                    pending.append(user)
+        return False
+
     def has_source(self, node: Node, memo: dict[Node, bool]) -> bool:
         """Whether a 2-D tile load or a fragment lies under ``node``."""
         from ...language import memory_ops
@@ -5175,7 +5853,10 @@ class _Matcher:
             # register per row / column), never its 2-D source.
             result = False
         elif _is_call(resolved, memory_ops.load):
-            result = len(self.tile_dims(resolved)) == 2
+            result = False
+            if _tile_index_position(resolved) is None:
+                access = self.access(resolved)
+                result = len(access.tile_dims) == 2 and not access.grouped
         elif resolved.op != "call_function":
             result = False
         else:
@@ -5215,14 +5896,24 @@ class _Matcher:
                 vecs.append(node)
             val = node.meta.get("val")
             if isinstance(val, torch.Tensor) and val.ndim == 2:
-                # A ``keepdim`` reduction read as it is varies along its
-                # dim that is not one.
+                # A keepdim vector varies along its original tile dimension,
+                # even with one configured lane. Find the inserted singleton
+                # without resolving configured tile sizes.
                 sizes = [_static_int(size) for size in val.shape]
                 if sizes.count(1) == 1:
                     self.note_vec_position(node, 1 - sizes.index(1))
             return
         if node.op != "call_function":
             raise _NotMine
+        if isinstance(node.meta.get("val"), torch.SymInt):
+            expr, loops = self.uniform_expr(node, root_coordinates=True)
+            if loops and vecs is None:
+                # Operand passes can run ahead of the iteration they feed.
+                # Admit composed loop indices through the fragment recipe
+                # callers that provide a vector dependency list.
+                raise _NotMine
+            self.aux_indices[node] = expr
+            return
         if _is_call(node, torch.ops.aten.expand.default):
             # ``broadcast_to``: the output dims are the input's or size one.
             self.shape_axes(node)
@@ -5244,7 +5935,7 @@ class _Matcher:
                     and self.shape_axes(source) != (axis,)
                 )
                 or not isinstance(val, torch.Tensor)
-                or val.dtype != torch.int32
+                or val.dtype not in (torch.int32, torch.int64)
             ):
                 raise _NotMine
             self.tile_index_loads[node] = axis
@@ -5254,7 +5945,13 @@ class _Matcher:
             # ``hl.arange`` -- is read once per CTA, whatever its width.)
             access = self.scalar_load_access(node) or self.access(node)
             if access.node not in self.scalar_loads and (
-                len(access.tile_dims) > 1 or access.dtype not in _SIDE_DTYPES
+                (len(access.tile_dims) > 1 and not access.grouped)
+                or (
+                    access.dtype not in _SIDE_DTYPES
+                    and not (
+                        access.grouped and access.dtype in (torch.int8, torch.uint8)
+                    )
+                )
             ):
                 raise _NotMine
             aux.append(access)
@@ -5346,6 +6043,7 @@ class _Matcher:
         """
         from ...language import _tracing_ops
         from ...language import memory_ops
+        from .analysis.native_s2f6_operand import match_native_s2f6_operand
 
         memo: dict[Node, bool] = {}
         aux: list[Access] = []
@@ -5366,13 +6064,28 @@ class _Matcher:
             if self.is_frag_leaf(current):
                 return current, swap, aux, _chain_key(chain), pointwise
             if _is_call(current, memory_ops.load):
-                if len(self.tile_dims(current)) != 2:
+                access = self.access(current)
+                if len(access.tile_dims) != 2 or access.grouped:
                     raise _NotMine
                 return current, swap, aux, _chain_key(chain), pointwise
             if _is_swap_permute(current):
                 swap = not swap
                 chain.append(("permute",))
                 current = cast("Node", current.args[0])
+                continue
+            native = match_native_s2f6_operand(current, resolve=self.resolve)
+            if native is not None:
+                # Only this complete integer/assembly proof may cross the
+                # BF16 bitcast. Arbitrary views and inline assembly retain
+                # their existing refusal. Addressing, aux lifetime and the
+                # complete region closure are still checked below.
+                dimensions = self.tile_dims(current)
+                if len(dimensions) != 2 or dimensions != self.tile_dims(native.raw):
+                    raise _NotMine
+                self.aux_dag(native.scale, aux, seen, vecs)
+                chain.append(("native_s2f6_bf16", (), (), (native.scale,)))
+                pointwise = True
+                current = native.raw
                 continue
             if not _is_pointwise(current):
                 raise _NotMine
@@ -5499,26 +6212,44 @@ class _Matcher:
             # loaded: the tile is staged as loaded, no per-element pass.
             pointwise = False
             chain = ()
-        contiguous = [
-            position
-            for position, stride in enumerate(access.tile_dim_strides)
-            if stride == 1
-        ]
+        if access.index_map is not None:
+            column = access.index_map.axes[1]
+            if column.divisor != 1 or column.major_stride != 1:
+                raise _NotMine
+            contiguous = [1]
+        else:
+            contiguous = [
+                position
+                for position, stride in enumerate(access.tile_dim_strides)
+                if stride == 1
+            ]
         if len(contiguous) != 1:
             raise _NotMine
         cols_pos = contiguous[0]
         rows_pos = 1 - cols_pos
         rows, cols = source_dims[rows_pos], source_dims[cols_pos]
-        if (access.tile_dim_strides[rows_pos] * access.dtype.itemsize) % 4:
+        if (
+            access.index_map is None
+            and (access.tile_dim_strides[rows_pos] * access.dtype.itemsize) % 4
+        ):
             raise _NotMine
         # The tile is staged as loaded, or rewritten per element (a 16-bit
         # tile in place or from an fp32 source, an fp32 operand from a 16-bit
         # source; the in-place pass rewrites 16-bit packets only).
         if not pointwise and access.dtype != val.dtype:
             raise _NotMine
-        if pointwise and access.dtype not in (*_OPERAND_DTYPES, torch.float32):
+        if pointwise and access.dtype not in (
+            *_OPERAND_DTYPES,
+            torch.float32,
+            torch.int8,
+            torch.uint8,
+        ):
             raise _NotMine
         if pointwise and access.dtype == val.dtype == torch.float32:
+            raise _NotMine
+        # Byte packets widen into 16-bit operands only. Both natural and
+        # transposed fp32 destinations require a different packet protocol.
+        if access.dtype in (torch.int8, torch.uint8) and val.dtype == torch.float32:
             raise _NotMine
         trans = k_source_pos == rows_pos
         # (Only the widen pass scatters into the transposed tile: an
@@ -5751,8 +6482,10 @@ class _Matcher:
                 # A vector is a side input (``aux_dag``), not a source.
                 return
             if _is_call(current, memory_ops.load):
-                if len(self.tile_dims(current)) == 2:
-                    result.append(current)
+                if _tile_index_position(current) is None:
+                    access = self.access(current)
+                    if len(access.tile_dims) == 2 and not access.grouped:
+                        result.append(current)
                 return
             if (
                 _is_call(current, view_ops.subscript)
@@ -5918,6 +6651,12 @@ class _Matcher:
         # environment and host function.
         self.env = CompileEnvironment.current()
         device_ir = HostFunction.current().device_ir
+        # Registered sizes may alias the raw IDs recorded for loop origins.
+        # Resolve once so every coordinate proof uses the same canonical set.
+        self.noncanonical_coordinate_blocks = frozenset(
+            self.canonical(block_id)
+            for block_id in device_ir.noncanonical_task_origin_block_ids
+        )
         # Contractions the tensor-core families already claim (tcgen05
         # collective / warp-MMA search, or a dot their operand analyzer
         # accepts) keep their search surface: this owner exists for the
@@ -5961,7 +6700,7 @@ class _Matcher:
                     raise _NotMine
                 source = self.env.block_sizes[block_id].block_size_source
                 if isinstance(source, FixedBlockSizeSource):
-                    fixed = _static_int(source.value)
+                    fixed = self.static_int(source.value)
                     if fixed is None or fixed < 1:
                         raise _NotMine
                     if fixed == 1:
@@ -6003,7 +6742,13 @@ class _Matcher:
             source = self.env.block_sizes[block_id].block_size_source
             if block_id in tiled_blocks:
                 if isinstance(source, FixedBlockSizeSource):
-                    raise _NotMine
+                    fixed = self.static_int(source.value)
+                    extent = self.static_int(self.env.block_sizes[block_id].size)
+                    # One fixed root tile owns the complete logical axis.
+                    # Partial fixed root tiling still needs its own coordinate proof.
+                    if fixed is None or extent is None or fixed < extent or fixed < 1:
+                        raise _NotMine
+                    self.fixed_sizes[block_id] = fixed
                 self.axis_of_block(block_id, AXIS_ROOT)
             else:
                 if isinstance(source, FixedBlockSizeSource) and source.value != 1:
@@ -6040,6 +6785,7 @@ class _Matcher:
             )
             if not frags and self.vec_slot_list[slot].axis is not None:
                 raise _NotMine
+            assert self.vec_slot_list[slot].orient != "pending"
             vec_frag_slots[slot] = tuple(frags)
         completed = [cast("Loop", loop) for loop in self.loops]
         # The single-loop fields describe the first loop; a loop-less
@@ -6083,9 +6829,22 @@ class _Matcher:
             scans=tuple(self.scans),
             vec_frag_slots=vec_frag_slots,
             tile_index_loads=dict(self.tile_index_loads),
+            config_scalars={
+                symbol: self.env.config_value_expressions[symbol]
+                for symbol in self.env.tunable_symbols
+                if symbol in self.env.config_value_expressions
+            },
+            config_fragments=dict(self.env.config_spec.user_defined_tunables),
             acc_loads=self.acc_loads,
             store_aux_loads=tuple(store_aux),
             scalar_loads=tuple(self.scalar_loads.values()),
+            uniform_values=tuple(self.uniform_values),
+            aux_indices=dict(self.aux_indices),
+            index_loads=dict(self.index_loads.values()),
+            index_values={
+                symbol: node for node, (symbol, _loops) in self.index_values.items()
+            },
+            index_exprs=dict(self.index_exprs),
             aux_positions={
                 node: tuple(sorted(positions))
                 for node, positions in self.aux_positions.items()
@@ -6128,6 +6887,7 @@ class _Matcher:
         from ...language import scan_ops
 
         steps: list[Step] = []
+        self.node_regions.update((node, loop) for node in graph.graph.nodes)
         loaded: dict[tuple[object, ...], Node] = {}
         for node in graph.graph.nodes:
             if _is_call(node, memory_ops.load) and _tile_index_position(node) is None:
@@ -6154,7 +6914,9 @@ class _Matcher:
                     self.vec_stores.append(step)
                 else:
                     self.stores.append(step)
-            elif _is_call(node, torch.ops.aten.sum.dim_IntList):
+            elif _is_call(node, torch.ops.aten.sum.dim_IntList) or _is_call(
+                node, torch.ops.aten.amax.default
+            ):
                 step = self._reduce(node, loop)
                 self.reduces.append(step)
             elif _is_call(node, scan_ops._associative_scan):
@@ -6166,6 +6928,13 @@ class _Matcher:
                 and (
                     len(self.sources(node)) > 1
                     or (
+                        any(self.is_frag_leaf(source) for source in self.sources(node))
+                        and self.vec_sources(node, stop_at_fragments=True)
+                        # Dot operand passes cannot read vector registers.
+                        # Other consumers already evaluate these values in place.
+                        and self.feeds_dot_operand(node)
+                    )
+                    or (
                         # A pointwise value over one loaded tile that a
                         # reduction sums (the row norms of a windowed q):
                         # a fragment of its own, so the reduction has
@@ -6174,9 +6943,11 @@ class _Matcher:
                         and not self.is_frag_leaf(self.sources(node)[0])
                         and any(
                             _is_call(user, torch.ops.aten.sum.dim_IntList)
+                            or _is_call(user, torch.ops.aten.amax.default)
                             or _is_call(user, _tracing_ops._mask_to)
                             and any(
                                 _is_call(u, torch.ops.aten.sum.dim_IntList)
+                                or _is_call(u, torch.ops.aten.amax.default)
                                 for u in user.users
                             )
                             for user in node.users
@@ -6190,6 +6961,8 @@ class _Matcher:
                 _is_pointwise(node)
                 and len(self.tile_dims(node)) <= 1
                 and self.vec_sources(node)
+                and isinstance(node.meta.get("val"), torch.Tensor)
+                and node.meta["val"].dtype == torch.float32
             ):
                 step = self._vec_op(node, loop)
                 self.vec_ops.append(step)
@@ -6272,10 +7045,12 @@ class _Matcher:
                     if isinstance(bound, torch.fx.Node):
                         val = bound.meta.get("val")
                         if isinstance(val, torch.Tensor):
-                            # A bound read from a table of offsets (a varlen
-                            # walk's ``chunk_offsets[n]``): one uniform
-                            # scalar per CTA, loaded ahead of the loop.
-                            self.scalar_load(bound)
+                            # A bound loaded or computed from invariant
+                            # integer values: one scalar per CTA, evaluated
+                            # ahead of the loop at its original integer width.
+                            if val.dtype not in (torch.int32, torch.int64):
+                                raise _NotMine
+                            self.uniform_value(bound)
                             continue
                         if not isinstance(val, (int, torch.SymInt)):
                             raise _NotMine
@@ -6308,7 +7083,7 @@ class _Matcher:
                     if len(block_ids) != 1:
                         raise _NotMine
                     tile_end = self.loop_ends[block_id][1]
-                elif _static_int(hi_val) != axis.extent:
+                elif self.static_int(hi_val) != axis.extent:
                     raise _NotMine
         if len(axes) > 1:
             # A multi-dim tile loop has no single bound; its iteration
@@ -6414,7 +7189,7 @@ class _Matcher:
                         raise _NotMine
                     small.append(VecCarry(-1, placeholder, init, out, phi, True))
                     continue
-                init_vec, vslot = self._vec_carry_init(
+                init_vec, vslot, init_fill = self._vec_carry_init(
                     init, node, placeholder, phi, dims[0] if dims else None
                 )
                 self.vec_leaves[placeholder] = vslot
@@ -6422,7 +7197,9 @@ class _Matcher:
                 self.region_of[placeholder] = index
                 self.region_of[phi] = parent
                 small.append(
-                    VecCarry(vslot, placeholder, init, out, phi, False, init_vec)
+                    VecCarry(
+                        vslot, placeholder, init, out, phi, False, init_vec, init_fill
+                    )
                 )
                 build.vec_carries.append(small[-1])
             else:
@@ -6436,9 +7213,11 @@ class _Matcher:
                     self.resolve(cast("Node", body_node.args[0]))
                 ]
         steps = self._region(graph, index)
+        children = [step for step in steps if isinstance(step, Loop)]
         produced = {step.node for step in steps if isinstance(step, (Dot, Derived))}
+        produced.update(carry.phi for child in children for carry in child.carries)
         for carry in carries:
-            # The loop output is a dot or derived value of this loop (copied
+            # The loop output is a dot, derived value or child-loop result (copied
             # into the carry's slot at the iteration end when computed in
             # another one), or the carry itself, unchanged.
             out = self.resolve(carry.output)
@@ -6450,11 +7229,18 @@ class _Matcher:
         vec_produced = {
             step.node for step in steps if isinstance(step, (Reduce, VecOp))
         }
+        vec_produced.update(
+            carry.phi for child in children for carry in child.vec_carries
+        )
         for vec_carry in small:
             if vec_carry.identity:
                 continue
             out = self.resolve(vec_carry.output)
-            if out not in vec_produced or self.vec_leaves.get(out) != vec_carry.slot:
+            output_slot = self.vec_leaves.get(out)
+            if out not in vec_produced or output_slot is None:
+                raise _NotMine
+            self.link_vecs(vec_carry.slot, output_slot)
+            if self.vec_root(vec_carry.slot) != self.vec_root(output_slot):
                 raise _NotMine
         loop = Loop(
             index=index,
@@ -6469,7 +7255,7 @@ class _Matcher:
             carries=tuple(carries),
             vec_carries=tuple(small),
             steps=steps,
-            innermost=not any(isinstance(step, Loop) for step in steps),
+            innermost=not children,
             tile_end=tile_end,
         )
         self.loops[index] = loop
@@ -6492,7 +7278,16 @@ class _Matcher:
         """Slots ``a`` and ``b`` of one orientation share one warp split (a
         value flows from one into the other without a relayout)."""
         ra, rb = self.vec_root(a), self.vec_root(b)
-        if ra != rb and self.vec_slot_list[ra].orient == self.vec_slot_list[rb].orient:
+        if ra == rb or self.vec_slot_list[ra].axis is not self.vec_slot_list[rb].axis:
+            # A broadcast scalar has no vector layout to contribute.
+            return
+        oa, ob = self.vec_slot_list[ra].orient, self.vec_slot_list[rb].orient
+        if oa != ob and (oa == "pending" or ob == "pending"):
+            orient = ob if oa == "pending" else oa
+            for slot, value in enumerate(self.vec_slot_list):
+                if self.vec_root(slot) in (ra, rb):
+                    self.vec_slot_list[slot] = dataclasses.replace(value, orient=orient)
+        if self.vec_slot_list[ra].orient == self.vec_slot_list[rb].orient:
             self.vec_parent[rb] = ra
 
     def _vec_carry_init(
@@ -6502,8 +7297,8 @@ class _Matcher:
         placeholder: Node,
         phi: Node,
         axis: Axis | None,
-    ) -> tuple[Node | None, int]:
-        """A vector carry's init: zeros (a fresh slot) or a vector of the
+    ) -> tuple[Node | None, int, float]:
+        """A vector carry's init: a scalar fill (a fresh slot) or a vector of the
         enclosing region (its slot when nothing else reads it after the
         loop starts, else a fresh slot it is copied into)."""
         from ...language import creation_ops
@@ -6514,12 +7309,17 @@ class _Matcher:
             ):
                 raise _NotMine
             fill = init.args[1]
-            if type(fill) not in (int, float) or fill != 0:
+            if type(fill) not in (int, float):
+                raise _NotMine
+            fill = cast("float | int", fill)
+            if math.isnan(fill):
                 raise _NotMine
             if init.args[2] is not torch.float32:
                 raise _NotMine
-            return None, self.new_vec_slot(
-                axis, "rows" if axis is not None else "scalar"
+            return (
+                None,
+                self.new_vec_slot(axis, "pending" if axis is not None else "scalar"),
+                float(fill),
             )
         source = self.resolve(init)
         if source not in self.vec_leaves:
@@ -6530,17 +7330,20 @@ class _Matcher:
         # The carry takes over the vector's registers when nothing else reads
         # them once the loop starts (its own placeholder and phi read nothing).
         if self.dies_at(source, loop_node, skip=(placeholder, phi)):
-            return source, source_slot
+            return source, source_slot, 0.0
         slot = self.new_vec_slot(axis, self.vec_slot_list[source_slot].orient)
         self.link_vecs(source_slot, slot)
-        return source, slot
+        return source, slot, 0.0
 
     def _reduce(self, node: Node, loop: int) -> Reduce:
-        """``sum(value, [-1])`` of a pointwise value over one fragment leaf
+        """A sum or maximum of a pointwise value over one fragment leaf
         (aux loads beside it; a value over several sources is a derived
         fragment first) into a vector along the fragment's rows."""
         if len(node.args) < 2 or node.kwargs or len(node.args) > 3:
             raise _NotMine
+        kind: Literal["sum", "max"] = (
+            "max" if _is_call(node, torch.ops.aten.amax.default) else "sum"
+        )
         dims = node.args[1]
         if not isinstance(dims, (list, tuple)) or len(dims) != 1:
             raise _NotMine
@@ -6584,6 +7387,8 @@ class _Matcher:
                 aux_loads=(),
                 loop=loop,
                 vec=source,
+                kind=kind,
+                vecs=(source,),
             )
         vecs: list[Node] = []
         leaf, swap, aux = self.frag_value(value, vecs)
@@ -6608,6 +7413,8 @@ class _Matcher:
             slot=slot,
             aux_loads=tuple(aux),
             loop=loop,
+            kind=kind,
+            vecs=tuple(vecs),
         )
 
     def _scan(self, node: Node, loop: int) -> Scan:
@@ -6844,7 +7651,13 @@ class _Matcher:
         if _is_call(loaded, memory_ops.load):
             # The tile as loaded (widened on the way): no per-register pass.
             access = self.access(loaded)
-            if len(access.tile_dims) != 2 or access.dtype not in _STORE_DTYPES:
+            if (
+                len(access.tile_dims) != 2
+                or access.dtype not in _STORE_DTYPES
+                or access.grouped
+            ):
+                # Raw carry seeds use consecutive pair loads.  Grouped
+                # addressing is supported only by operand evaluation.
                 raise _NotMine
             return access, None, -1, None, (), []
         # A pointwise chain over one 2-D load, read straight at the carry's
@@ -6922,6 +7735,7 @@ class _Matcher:
             b = self.operand("b", b_node, (cols, k))
         acc_frag: Node | None = None
         acc_slot: int | None = None
+        vecs: list[Node] = []
         slot: int
         if acc is None:
             slot = len(self.slots)
@@ -6931,7 +7745,6 @@ class _Matcher:
                 raise _NotMine
             if self.tile_dims(acc) != result_dims:
                 raise _NotMine
-            vecs: list[Node] = []
             acc_frag, swap, aux = self.frag_value(acc, vecs)
             if swap:
                 raise _NotMine
@@ -6974,6 +7787,7 @@ class _Matcher:
             slot=slot,
             transposed=transposed,
             loop=loop,
+            acc_vecs=tuple(vecs),
         )
 
     def _derived(self, node: Node, loop: int) -> Derived:
@@ -7041,6 +7855,7 @@ class _Matcher:
             rows=dims[0],
             cols=dims[1],
             loop=loop,
+            vecs=tuple(vecs),
         )
 
     def trace_source_to(
@@ -7189,13 +8004,35 @@ class _Matcher:
         )
 
 
-def match_mma_dag(graphs: Sequence[GraphInfo]) -> MmaDagProgram | None:
-    """Match the MMA dataflow program in ``graphs`` (config-free).
+def match_mma_dag(
+    graphs: Sequence[GraphInfo],
+    *,
+    resolve_block_size: Callable[[int], int | torch.SymInt | None] | None = None,
+) -> MmaDagProgram | None:
+    """Match the MMA dataflow program in ``graphs``.
 
     Needs the compile environment and host function to be current (the
     autotuner heuristic enters them; pre-codegen already runs inside them).
+    Heuristics omit the resolver; plan-time matching uses configured extents.
     """
-    return _Matcher(graphs).match()
+    program = _Matcher(graphs, resolve_block_size).match()
+    if program is not None and any(
+        access.index_map is not None for access in program.accesses
+    ):
+        from .analysis.paged_attention_match import match_paged_attention
+        from .paged_attention_transport import _direct_io
+
+        semantic = match_paged_attention(program)
+        # Recognition precedes pointer-residue specialization. Prove the
+        # logical/physical index relation now; selected transport repeats
+        # alignment and target checks after those cache-key facts exist.
+        if (
+            semantic is None
+            or semantic.key.raw.fake.ndim != 5
+            or _direct_io(semantic, int(semantic.key.raw.fake.shape[3])) is None
+        ):
+            return None
+    return program
 
 
 def _frag_readers(program: MmaDagProgram) -> dict[Node, list[tuple[object, ...]]]:
@@ -7258,7 +8095,7 @@ def mma_dag_pass_chains(program: MmaDagProgram) -> dict[Node, tuple[Derived, ...
         ok = True
         while pending and ok:
             step = pending.pop()
-            if step.loop != loop or any(other is step for other in chain):
+            if step.loop != loop or step.vecs or any(other is step for other in chain):
                 ok = False
                 break
             chain.append(step)
@@ -7313,6 +8150,11 @@ def ragged_root_axes(program: MmaDagProgram) -> frozenset[int]:
     candidates = {axis.index for axis in program.axes if axis.kind == AXIS_ROOT}
     candidates.difference_update(dot.k.index for dot in program.dots)
     for access in program.accesses:
+        if access.index_map is not None:
+            # Ordinary warp predication has no folded-address contract.
+            # The selected attention schedule proves its row padding itself.
+            candidates.difference_update(axis.index for axis in access.dims)
+            continue
         if access.repeated_axes:
             candidates.difference_update(axis.index for axis in access.dims)
         if len(access.tile_dims) == 2:
@@ -7346,7 +8188,7 @@ def mma_dag_staged_loads(program: MmaDagProgram) -> tuple[Access, ...]:
     for dot in program.dots:
         for operand in (dot.a, dot.b):
             load = operand.load
-            if load is not None and load.node not in seen:
+            if load is not None and load.index_map is None and load.node not in seen:
                 seen[load.node] = load
     for derived in program.derived:
         for access in derived.loads:
@@ -7377,7 +8219,9 @@ def mma_dag_load_hints(program: MmaDagProgram, policies: object) -> dict[Node, s
 
 
 def mma_dag_facts(program: MmaDagProgram) -> CuteMmaDagFacts:
+    from .analysis.paged_attention_match import match_paged_attention
     from .cute_warp_mma_gemm import _device_sm_count
+    from .paged_attention_transport import paged_attention_schedule_facts
 
     env = CompileEnvironment.current()
     ragged = ragged_root_axes(program)
@@ -7467,6 +8311,7 @@ def mma_dag_facts(program: MmaDagProgram) -> CuteMmaDagFacts:
 
     split = cluster_split_axis(program)
     aux_loads = mma_dag_aux_loads(env, program)
+    attention = match_paged_attention(program)
     return CuteMmaDagFacts(
         axes=tuple(
             AxisFacts(a.block_id, a.kind, a.extent, a.loop, a.index in ragged, a.size)
@@ -7567,6 +8412,18 @@ def mma_dag_facts(program: MmaDagProgram) -> CuteMmaDagFacts:
         aux_loads=tuple(
             record for records in aux_loads.values() for _node, record in records
         ),
+        attention=(
+            paged_attention_schedule_facts(env, attention)
+            if attention is not None
+            else None
+        ),
+        mapped_io=any(access.index_map is not None for access in program.accesses),
+        native_s2f6_operands=any(
+            isinstance(entry, tuple) and entry[0] == "native_s2f6_bf16"
+            for dot in program.dots
+            for operand in (dot.a, dot.b)
+            for entry in cast("tuple[object, ...]", operand.chain_key[1])
+        ),
     )
 
 
@@ -7641,16 +8498,29 @@ def _decline(reason: str) -> exc.BackendUnsupported:
     return exc.BackendUnsupported("cute", f"cute_mma_dag: {reason}")
 
 
-def async_route_reason(env: CompileEnvironment, operand: Operand) -> str | None:
+def async_route_reason(
+    env: CompileEnvironment, operand: Operand, source_cols: int | None = None
+) -> str | None:
     """Why the operand's source tile cannot be staged with 16-byte
     ``cp.async`` packets straight from global memory (None: it can).  A
-    pointwise operand's source is rewritten packet by packet: in place when
-    it has the operand's dtype, from a raw fp32 tile into the 16-bit tile
-    otherwise."""
+    pointwise operand's source is rewritten packet by packet: in place at
+    the same dtype, or through a supported byte/16-bit/fp32 conversion.
+    ``source_cols`` is the planner's resolved contiguous source width;
+    configuration-free callers leave it unknown."""
     load = operand.load
     assert load is not None
-    if load.dtype != operand.dtype and torch.float32 not in (load.dtype, operand.dtype):
+    byte_conversion = load.dtype in (torch.int8, torch.uint8) and operand.dtype in (
+        torch.float16,
+        torch.bfloat16,
+    )
+    if (
+        load.dtype != operand.dtype
+        and torch.float32 not in (load.dtype, operand.dtype)
+        and not byte_conversion
+    ):
         return "the source tile dtype differs from the operand dtype"
+    if source_cols is not None and source_cols * load.dtype.itemsize % 16:
+        return "the source rows do not contain whole 16-byte packets"
     return async_tile_reason(env, load, operand.cols_pos)
 
 
@@ -7914,7 +8784,19 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
         return None
     if mode not in (MMA_DAG_WARP, MMA_DAG_TCGEN05):
         raise _decline(f"unknown mode {mode!r}")
-    program = match_mma_dag(graphs)
+    if CompileEnvironment.current().config_spec.cute_mma_dag_phase_index is not None:
+        from ..host_function import HostFunction
+        from .materialized_fission_codegen import _region_graph_ids
+
+        ir = HostFunction.current().device_ir
+        if len(ir.root_ids) != 1:
+            raise _decline("ordered MMA-DAG requires a projected single-root phase")
+        region = _region_graph_ids(list(graphs), ir.root_ids[0])
+        graphs = [graph for graph in graphs if graph.graph_id in region]
+    program = match_mma_dag(
+        graphs,
+        resolve_block_size=DeviceFunction.current().resolved_block_size,
+    )
     if program is None:
         raise _decline("the kernel is not an MMA dataflow program the owner lowers")
     df = DeviceFunction.current()
@@ -7960,6 +8842,14 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
     if reason is not None:
         raise _decline(reason)
     assert type(cluster) is int and isinstance(split_mode, str)
+    if pass_warps in MMA_DAG_ATTENTION_PASS_WARPS:
+        from .paged_attention_config import paged_attention_config_reason
+
+        reason = paged_attention_config_reason(
+            facts, sizes_by_block, cast("Mapping[str, object]", config)
+        )
+        if reason is not None:
+            raise _decline(reason)
     if pass_warps not in MMA_DAG_PASS_WARPS_CHOICES:
         raise _decline(
             f"{MMA_DAG_PASS_WARPS_KEY} {pass_warps!r} must be one of {MMA_DAG_PASS_WARPS_CHOICES}"
@@ -8033,6 +8923,31 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
     sizes = (
         tuple(mma_dag_padded_sizes(facts, blocks)) if mode == MMA_DAG_WARP else blocks
     )
+    if pass_warps in MMA_DAG_ATTENTION_PASS_WARPS:
+        from .analysis.paged_attention_match import match_paged_attention
+        from .paged_attention_transport import plan_paged_attention_schedule
+
+        # The proved attention topology keeps its state in registers/TMEM;
+        # it does not allocate the generic renderer's derived-value layout.
+        selected = MmaDagPlan(
+            program=program,
+            sizes=sizes,
+            warps=warps,
+            stages=stages,
+            routes={},
+            staged_stores=(),
+            exchange_mode=cast("str", exchange_mode),
+            compute=MMA_DAG_TCGEN05,
+            blocks=blocks,
+        )
+        semantic = match_paged_attention(program)
+        assert semantic is not None
+        schedule = plan_paged_attention_schedule(
+            env, semantic, selected, cast("Config", config)
+        )
+        if schedule is None:
+            raise _decline("the selected plan cannot run the attention schedule")
+        return dataclasses.replace(selected, attention=schedule)
     layouts, routes = solve_mma_dag_layouts(program, facts, sizes, warps)
     bound_masks = mma_dag_bound_masks(program, sizes)
     if mma_dag_vec_violations(facts, sizes, layouts, warps):
@@ -8080,9 +8995,11 @@ def plan_mma_dag(graphs: Sequence[GraphInfo], config: object) -> MmaDagPlan | No
                 elif exchange_mode != MMA_DAG_EXCHANGE_AUTO:
                     routes[(dot.node, operand.role)] = ROUTE_EXCHANGE
                 continue
-            if async_route_reason(env, operand) is not None:
+            assert operand.load is not None
+            source_cols = sizes[operand.load.tile_dims[operand.cols_pos].index]
+            if async_route_reason(env, operand, source_cols) is not None:
                 route = ROUTE_SYNC
-            elif operand.load is not None and operand.load.dtype != operand.dtype:
+            elif operand.load.dtype != operand.dtype:
                 route = ROUTE_CONVERT
             elif operand.pointwise:
                 route = ROUTE_INPLACE
@@ -8211,6 +9128,7 @@ def tma_tile_source(load: Access, cols_pos: int) -> bool:
     es = load.dtype.itemsize
     return (
         len(load.tile_dims) == 2
+        and load.index_map is None
         and not load.windows
         and load.tile_dim_strides[cols_pos] == 1
         and all(stride == 1 or (stride * es) % 16 == 0 for stride in load.strides)
@@ -8221,7 +9139,9 @@ def mma_dag_fixed_derived(program: MmaDagProgram) -> bool:
     """Whether an epilogue value reads a loop-invariant 2-D tile with
     contiguous columns (the alignment check is per config, the planner's)."""
     return any(
-        program.fixed_derived_load(derived, access) and access.tile_dim_strides[1] == 1
+        access.index_map is None
+        and program.fixed_derived_load(derived, access)
+        and access.tile_dim_strides[1] == 1
         for derived in program.derived
         for access in derived.loads
     )

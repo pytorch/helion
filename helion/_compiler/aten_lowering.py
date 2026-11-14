@@ -463,9 +463,56 @@ def _pallas_argreduce(ctx: LoweringContext, node: Node, reduction_type: str) -> 
     return expr_from_string(reduced, tensor=tensor)
 
 
+# The dtypes that read all-clear bits as zero (not float8_e8m0fnu, which reads
+# them as 2^-127, nor the packed sub-byte dtypes).
+_ZERO_BITS_READ_AS_ZERO = frozenset(
+    {
+        torch.bool,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.uint8,
+        torch.uint16,
+        torch.uint32,
+        torch.uint64,
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.float64,
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+        torch.float8_e5m2,
+        torch.float8_e5m2fnuz,
+    }
+)
+
+
+def view_dtype_masked_value(node: Node) -> float | bool | None:
+    """A view reinterprets bits, so its masked lanes keep a known value only
+    where the source's is a known bit pattern: an integer or bool zero, all
+    bits clear.  A floating masked value of zero may be -0.0, since masked
+    values don't track the sign of zero (``-x`` of a masked 0 is tracked as
+    0).  All-clear bits read as zero in the target dtype if it is one of
+    ``_ZERO_BITS_READ_AS_ZERO``."""
+    source, dtype = node.args[:2]
+    assert isinstance(source, Node) and isinstance(dtype, torch.dtype)
+    source_dtype = source.meta["val"].dtype
+    if (
+        source_dtype.is_floating_point
+        or source_dtype.is_complex
+        or dtype not in _ZERO_BITS_READ_AS_ZERO
+        or cached_masked_value(source) != 0
+    ):
+        return None
+    if dtype == torch.bool:
+        return False
+    return 0.0 if dtype.is_floating_point else 0
+
+
 view_dtype_lowering = register_lowering(
     torch.ops.aten.view.dtype,
-    masked_value_fn=passthrough_masked_value,
+    masked_value_fn=view_dtype_masked_value,
 )
 
 

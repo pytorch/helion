@@ -1,60 +1,18 @@
 from __future__ import annotations
 
-from contextlib import ExitStack
-from unittest.mock import patch
-
 import pytest
 import torch
 
-from test.test_cute_fixed_token_rank1_recurrence import _fixed_rank1
-from test.test_cute_fixed_token_rank1_recurrence import _inputs
-from test.test_cute_fixed_token_rank1_recurrence import _precise_fixed_rank1
-from test.test_cute_fixed_token_rank1_recurrence import _to_cuda_fake_tensor
-
 import helion
+from helion._testing.cute_fixed_token_rank1 import fixed_rank1
+from helion._testing.cute_fixed_token_rank1 import fixed_rank1_cpu_target
+from helion._testing.cute_fixed_token_rank1 import fixed_rank1_inputs
+from helion._testing.cute_fixed_token_rank1 import precise_fixed_rank1
 import helion.language as hl
 
+pytestmark = pytest.mark.cpu_only
+
 pytest.importorskip("cutlass")
-
-
-def _fake_cute_context() -> ExitStack:
-    stack = ExitStack()
-    # Binding fake tensors only tests heuristic selection, not the CuTe runtime.
-    stack.enter_context(
-        patch("helion._compiler.cute.cutedsl_compat.check_cute_backend_requirements")
-    )
-    stack.enter_context(
-        patch("helion.runtime.kernel._find_device", return_value=torch.device("cuda"))
-    )
-    stack.enter_context(
-        patch(
-            "helion._compiler.cute.backend.CuteBackend.normalize_input_fake_tensor",
-            new=_to_cuda_fake_tensor,
-        )
-    )
-    stack.enter_context(
-        patch("helion.runtime.kernel.target_device_capability", return_value=(10, 3))
-    )
-    stack.enter_context(
-        patch(
-            "helion._compiler.compile_environment.target_device_capability",
-            return_value=(10, 3),
-        )
-    )
-    stack.enter_context(
-        patch("helion.language.loops.use_tileir_tunables", return_value=False)
-    )
-    stack.enter_context(
-        patch("helion.language.loops._supports_warp_specialize", return_value=True)
-    )
-    stack.enter_context(
-        patch("helion._compat._supports_tensor_descriptor", return_value=True)
-    )
-    stack.enter_context(
-        patch("helion._compat._min_dot_size", return_value=(16, 16, 16))
-    )
-    stack.enter_context(patch("helion._compat._is_hip", return_value=False))
-    return stack
 
 
 @pytest.mark.parametrize(
@@ -72,9 +30,9 @@ def test_affine_scan_seed_is_algebraic(
     rows: int,
     threads: list[int],
 ) -> None:
-    with _fake_cute_context():
-        bound = _fixed_rank1._bind_isolated(
-            (*_inputs(steps), steps, 1.0e-6, True, False, False, False)
+    with fixed_rank1_cpu_target():
+        bound = fixed_rank1._bind_isolated(
+            (*fixed_rank1_inputs(steps), steps, 1.0e-6, True, False, False, False)
         )
 
     assert "cute_affine_scan" in bound.config_spec.autotuner_heuristics
@@ -103,7 +61,7 @@ def _pointwise(x: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
 
 
 def test_affine_scan_schedule_stays_hidden_for_unrelated_kernel() -> None:
-    with _fake_cute_context():
+    with fixed_rank1_cpu_target():
         bound = _pointwise._bind_isolated((torch.empty(256), torch.empty(256)))
 
     assert bound.config_spec.cute_affine_scan_schedule is None
@@ -111,9 +69,9 @@ def test_affine_scan_schedule_stays_hidden_for_unrelated_kernel() -> None:
 
 
 def test_affine_scan_schedule_stays_hidden_without_fast_math() -> None:
-    with _fake_cute_context():
-        bound = _precise_fixed_rank1._bind_isolated(
-            (*_inputs(3), 3, 1.0e-6, True, False, False, False)
+    with fixed_rank1_cpu_target():
+        bound = precise_fixed_rank1._bind_isolated(
+            (*fixed_rank1_inputs(3), 3, 1.0e-6, True, False, False, False)
         )
 
     assert bound.config_spec.cute_affine_scan_schedule is None

@@ -43,11 +43,13 @@ from .host_function import HostFunction
 from .host_function import NoCurrentFunction
 from .lane_loop_context import LaneLoopContext
 from .output_header import reserved_names
+from .runtime_tensor_guards import tensor_pairs_with_proven_disjoint_storage
 from .source_location import SyntheticLocation
 from .variable_origin import BlockSizeOrigin
 from .variable_origin import GridOrigin
 from .variable_origin import Origin
 from .variable_origin import TensorSizeOrigin
+from .variable_origin import TensorStrideOrigin
 from .variable_origin import TileBeginOrigin
 from .variable_origin import TileExtentOrigin
 
@@ -180,6 +182,22 @@ def find_block_size_symbols(
 
     # pyrefly: ignore[bad-return]
     return block_sizes, non_block_size_symbols
+
+
+def substitute_configured_block_sizes(expr: sympy.Expr, config: Config) -> sympy.Expr:
+    """Substitute only block-size symbols fixed by this config, without hints.
+
+    Runtime size symbols remain symbolic. This also works before the device
+    function's strategies exist, when Metal budgets their thread counts.
+    """
+    env = CompileEnvironment.current()
+    block_symbols, _ = find_block_size_symbols(expr)
+    values = {
+        symbol: sympy.Integer(size)
+        for symbol, block_id in block_symbols.items()
+        if isinstance(size := env.block_sizes[block_id].from_config(config), int)
+    }
+    return expr.xreplace(values)
 
 
 def contains_only_block_size_symbols(expr: sympy.Expr) -> bool:
@@ -851,6 +869,11 @@ class DeviceFunction:
         with contextlib.suppress(Exception):
             expr = env.shape_env.simplify(expr)
         expr = env.specialize_expr(expr)
+        host = HostFunction.current()
+        resolved = host.resolve_tunable_expr(expr, self.config)
+        if isinstance(resolved, (int, float, bool)):
+            return env.backend.scalar_literal_expr(resolved)
+        expr = resolved
         if not expr.free_symbols:
             return env.backend.sympy_printer_expr(expr)
         if expr in self.expr_to_var_info:
@@ -868,15 +891,27 @@ class DeviceFunction:
         replacements = {}
         for sym in sorted(expr.free_symbols, key=lambda x: x.name):
             assert isinstance(sym, sympy.Symbol)
-            if sym in self.expr_to_var_info:
+            selected = (
+                host.resolve_tunable_expr(sym, self.config)
+                if sym not in expr_to_origin
+                else sym
+            )
+            if isinstance(selected, (int, float, bool)):
+                # A selected constant cannot depend on an inner-loop alias:
+                # lift_symnode may hoist this expression outside that loop.
+                replacements[sym] = sympy.Symbol(
+                    f"({env.backend.scalar_literal_expr(selected)})"
+                )
+            elif sym in self.expr_to_var_info:
                 replacements[sym] = sympy.Symbol(
                     self.expr_to_var_info[sym].name, integer=True
                 )
-            else:
-                assert sym in expr_to_origin, f"no origin found for {sym.name}"
+            elif sym in expr_to_origin:
                 replacements[sym] = sympy.Symbol(
                     self._lift_sympy_arg(sym), integer=True
                 )
+            else:
+                raise AssertionError(f"no origin found for {sym.name}")
         # pyrefly: ignore [bad-argument-type]
         return env.backend.sympy_printer_expr(expr.xreplace(replacements))
 
@@ -890,6 +925,11 @@ class DeviceFunction:
                 origin.origin.key,
             )
             return arg.name
+        if (
+            isinstance(origin.origin, TensorStrideOrigin)
+            and origin.fake_value is not None
+        ):
+            return self.tensor_stride(origin.fake_value, origin.origin.key).name
         if isinstance(origin.origin, BlockSizeOrigin):
             result = self.block_size_var(env.canonical_block_id(origin.origin.block_id))
             assert result is not None
@@ -1191,12 +1231,11 @@ class DeviceFunction:
 
     def expr_arg(self, sym: sympy.Expr, origin: Origin) -> NumericArgument:
         if sym not in self._expr_args:
-            tunable_symbols = CompileEnvironment.current().tunable_symbols
             # A tunable-only expression is constant for each compiled config.
             arg_type = (
                 ConstExprArg
                 if sym in self._constexpr_exprs
-                or (sym.free_symbols and sym.free_symbols.issubset(tunable_symbols))
+                or CompileEnvironment.current().is_tunable_expr(sym)
                 else SymbolArgument
             )
             arg = arg_type(
@@ -1284,9 +1323,9 @@ class DeviceFunction:
 
         # Handle sympy expressions
         if isinstance(value, sympy.Expr):
-            return HostFunction.current().sympy_expr(value)
+            return HostFunction.current().sympy_expr(value, self.config)
 
-        return HostFunction.current().literal_expr(value)
+        return HostFunction.current().literal_expr(value, self.config)
 
     def _tensor_property(
         self,
@@ -1318,27 +1357,9 @@ class DeviceFunction:
         return self._tensor_property(TensorSizeArg, fake_value, dim, "size")
 
     def tensor_stride(self, fake_value: torch.Tensor, dim: int) -> Argument:
-        v = fake_value.stride(dim)
-        env = CompileEnvironment.current()
-        # Only literalize a dynamic-kernel stride with positive provenance that
-        # the generated wrapper fixes this layout.  A missing input source is
-        # not such a proof: views and aliases of inputs commonly have none.
-        if isinstance(v, int) and env.tensor_layout_is_symbolically_exact(fake_value):
-            return StaticShape(v)
-        source = env.tensor_input_source(fake_value)
-        # Check if this input stride was explicitly specialized.
-        if (
-            source is not None
-            and TensorPropertySource(source, TensorProperty.STRIDE, dim)
-            in env.specialized_strides
-        ):
-            return StaticShape(int(v))
-        if isinstance(v, int) and (
-            env.settings.static_shapes
-            or fake_value.untyped_storage()
-            in HostFunction.current().compiler_state.static_peer_layouts
-        ):
-            return StaticShape(v)
+        known = CompileEnvironment.current().known_stride(fake_value, dim)
+        if known is not None:
+            return StaticShape(known)
         return self._tensor_property(TensorStrideArg, fake_value, dim, "stride")
 
     def sorted_args(self) -> list[Argument]:
@@ -1446,24 +1467,31 @@ class DeviceFunction:
             and "wait" not in env.pdl_entry
         ):
             raise exc.PdlStateWithoutWait
-        pdl = {
-            "wait": "tl.extra.cuda.gdc_wait()",
-            "launch_dependents": "tl.extra.cuda.gdc_launch_dependents()",
-        }
         code_warm = (
             [statement_from_string("helion_code_warm.code_warm()")]
             if env.code_warm and backend.uses_triton_compiler
             else []
         )
+        entry = [
+            *code_warm,
+            *[
+                statement_from_string(backend.pdl_instruction(op))
+                for op in env.pdl_entry
+            ],
+        ]
+        exit_ = [
+            statement_from_string(backend.pdl_instruction(op)) for op in env.pdl_exit
+        ]
+        # A backend that places the markers itself takes them in the body.
+        in_body = backend.places_pdl_markers
         kernel_body: list[ast.stmt] = cast(
             "list[ast.stmt]",
             [
-                *code_warm,
-                *[statement_from_string(pdl[op]) for op in env.pdl_entry],
+                *(entry if in_body else []),
                 *scalar_preamble,
                 *self.preamble,
                 *self.body,
-                *[statement_from_string(pdl[op]) for op in env.pdl_exit],
+                *(exit_ if in_body else []),
             ],
         )
         body_context = DeviceBodyContext(
@@ -1474,7 +1502,9 @@ class DeviceFunction:
             constexpr_to_inline=constexpr_to_inline,
             wrapper_only_params=wrapper_only_params,
             bounded_cache_request=bounded_cache_request,
-            body_start=len(env.pdl_entry) + len(scalar_preamble) + len(self.preamble),
+            body_start=(len(entry) if in_body else 0)
+            + len(scalar_preamble)
+            + len(self.preamble),
         )
         kernel_body, extra_args = backend.finalize_device_body(
             kernel_body, body_context
@@ -1492,6 +1522,11 @@ class DeviceFunction:
             {k: v[0] for k, v in self._variable_renames.items()},
         )
         trailing = backend.finalize_kernel_def(definition, prefix, body_context)
+        if not in_body:
+            # Explicit entry/exit markers surround the final body: backend
+            # schedule rewrites must neither move the wait past memory nor
+            # release earlier than an explicit exit trigger.
+            definition.body = [*entry, *definition.body, *exit_]
         return [*prefix, definition, *trailing]
 
     def proven_disjoint_tensor_pairs(self) -> set[frozenset[str]]:
@@ -1499,48 +1534,24 @@ class DeviceFunction:
 
         Different user/global tensor arguments are not a non-aliasing proof:
         callers may pass the same tensor, or overlapping views, under multiple
-        names.  A tensor backed by storage absent from the original function
-        inputs cannot overlap an external input or a separately allocated
-        output.  Two external inputs are disjoint only when the current runtime
-        storage spans do not overlap and that predicate is part of the bound
-        kernel cache key.  The predicate compares whole storages, so it also
-        covers host-side views (``x.view(...)``) through the input whose
+        names. Positively identified wrapper allocations cannot overlap an
+        external input or another allocation. Synthetic host-join storage
+        instead represents every branch's possible storage, all of which must
+        prove disjointness. Two external inputs are disjoint only when their
+        current runtime storage spans do not overlap and that predicate is part
+        of the bound kernel cache key. The predicate compares whole storages,
+        so it also covers host-side views (``x.view(...)``) through the input whose
         storage they share.  Origin type alone is insufficient: host-local
         ``torch.empty``-family outputs commonly carry ``NameOrigin`` too.
         """
-        env = CompileEnvironment.current()
-        host_function = HostFunction.current()
-        input_storages = {
-            id(tensor.untyped_storage()): tensor for tensor in env.input_sources
-        }
-        origins: dict[str, tuple[str, int, torch.Tensor | None]] = {}
-        for arg in self.arguments:
-            if not isinstance(arg, TensorArg):
-                continue
-            origin = host_function.tensor_to_origin.get(arg.fake_value)
-            root = origin.root_rw_name() if origin is not None else None
-            if root is not None:
-                storage = id(arg.fake_value.untyped_storage())
-                origins[arg.name] = (
-                    root,
-                    storage,
-                    arg.fake_value
-                    if arg.fake_value in env.input_sources
-                    else input_storages.get(storage),
-                )
-        return {
-            frozenset((left_name, right_name))
-            for left_name, (left_root, left_storage, left_input) in origins.items()
-            for right_name, (right_root, right_storage, right_input) in origins.items()
-            if left_name < right_name
-            and left_root != right_root
-            and left_storage != right_storage
-            and (
-                left_input is None
-                or right_input is None
-                or env.backend.tensors_proven_disjoint(env, left_input, right_input)
-            )
-        }
+        return tensor_pairs_with_proven_disjoint_storage(
+            CompileEnvironment.current(),
+            {
+                arg.name: arg.fake_value
+                for arg in self.arguments
+                if isinstance(arg, TensorArg)
+            },
+        )
 
     def proven_tensor_stride_values(self) -> dict[tuple[str, int], int]:
         """Return tensor strides whose exact value is cache-safe.

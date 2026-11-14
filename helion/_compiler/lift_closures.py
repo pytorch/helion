@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+from types import CellType
 from types import FunctionType
 import weakref
 
@@ -8,6 +9,7 @@ from torch._dynamo.utils import make_cell
 from torch.fx.experimental.proxy_tensor import disable_proxy_modes_tracing
 
 from .. import exc
+from .._utils import _read_cell
 from .host_function import HostFunction
 from .variable_origin import ClosureOrigin
 from .variable_origin import Origin
@@ -63,13 +65,16 @@ def lift_closures(func: FunctionType, origin: Origin) -> FunctionType:
             host_function = HostFunction.current()
             closure = None
             if func.__closure__ is not None:
-                closure_contents = [
-                    host_function.register_fake(
-                        obj.cell_contents, ClosureOrigin(origin, i)
-                    )
-                    for i, obj in enumerate(func.__closure__)
-                ]
-                closure = (*map(make_cell, closure_contents),)
+                closure_cells = []
+                for i, cell in enumerate(func.__closure__):
+                    filled, value = _read_cell(cell)
+                    if filled:
+                        value = host_function.register_fake(
+                            value, ClosureOrigin(origin, i)
+                        )
+                    closure_contents.append((filled, value))
+                    closure_cells.append(make_cell(value) if filled else CellType())
+                closure = tuple(closure_cells)
             new_func = FunctionType(
                 code=func.__code__,
                 globals=(CaptureGlobals(func.__globals__)),
@@ -77,6 +82,9 @@ def lift_closures(func: FunctionType, origin: Origin) -> FunctionType:
                 argdefs=func.__defaults__,
                 closure=closure,
             )
+            # FunctionType only accepts positional defaults. Keep keyword-only
+            # defaults by reference too, including shared mutable default objects.
+            new_func.__kwdefaults__ = func.__kwdefaults__
         result = new_func(*args, **kwargs)
         if closure_contents:
             for cell, expected, varname in zip(
@@ -85,10 +93,11 @@ def lift_closures(func: FunctionType, origin: Origin) -> FunctionType:
                 new_func.__code__.co_freevars,
                 strict=True,
             ):
-                if cell.cell_contents is not expected:
+                filled, value = _read_cell(cell)
+                if filled != expected[0] or value is not expected[1]:
                     raise exc.ClosureMutation(varname)
         return result
 
     new_func: FunctionType | None = None
-    closure_contents: list[object] = []
+    closure_contents: list[tuple[bool, object]] = []
     return wrapper

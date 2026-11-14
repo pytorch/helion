@@ -16,6 +16,7 @@ import helion
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_target
+from helion._testing.cute_codegen import stage_sources
 import helion.language as hl
 from helion.language import _decorators
 from helion.language import tile_ops
@@ -73,19 +74,6 @@ def _loop_origins(x: torch.Tensor) -> torch.Tensor:
         for column in hl.tile(3, x.size(1)):
             out[row, column] = column.begin
     return out
-
-
-def _region(source: str, index: int) -> str:
-    tree = ast.parse(source)
-    regions = [
-        node.args[0].value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and ast.unparse(node.func) == "PyCodeCache.load"
-        and isinstance(node.args[0], ast.Constant)
-        and isinstance(node.args[0].value, str)
-    ]
-    return regions[index]
 
 
 def _block(tree: ast.Module) -> tuple[int, int, int]:
@@ -326,7 +314,7 @@ def test_materialized_interleave_keeps_every_source_row(
             ),
         }
     )
-    source = _region(bound.to_code(config), 0)
+    source = stage_sources(bound.to_code(config))[0]
     for offset in range(0, 512, blocks[0]):
         records = _axis_coordinates(source, 0, offset, emitted_origins)
         assert Counter(index for index, _ in records) == Counter(

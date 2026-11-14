@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 class CuteHostPairedSumHeuristic(AutotunerHeuristic):
     name = "cute_host_paired_sum"
     backend = "cute"
-    priority = 55
+    priority = 56
 
     @classmethod
     def register_facts(

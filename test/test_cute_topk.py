@@ -25,7 +25,6 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from test.cute_population_contracts import _target
 from test.cute_register_model import execute_register_plan_events
 from test.cute_register_model import gather_registers
 
@@ -56,6 +55,7 @@ from helion._testing import skipUnlessCuteAvailable
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_native_compile
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_codegen import tcgen05_target as _target
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import ConfigSpec
 import helion.language as hl
@@ -191,6 +191,8 @@ def _pairwise_cases(
     return [(*row[:-1], *row[-1]) for row in pairwise(**axes, cases=cases)]
 
 
+@pytest.mark.cpu_only
+@pytest.mark.slow
 def test_topk_collection_without_cute(tmp_path: Path) -> None:
     """A Triton-only installation keeps portable tests and leaves out CuTe tests."""
     script = textwrap.dedent(
@@ -246,7 +248,10 @@ def test_topk_collection_without_cute(tmp_path: Path) -> None:
     probe.write_text(script)
     root = Path(__file__).resolve().parents[1]
     env = {**os.environ, "CUDA_VISIBLE_DEVICES": "", "HELION_BACKEND": "triton"}
-    env["PYTHONPATH"] = str(root)
+    # Keep test dependencies while the child explicitly blocks CuTe imports.
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(root), *filter(None, os.environ.get("PYTHONPATH", "").split(os.pathsep))]
+    )
     result = subprocess.run(
         [sys.executable, str(probe)],
         cwd=root,
@@ -1243,7 +1248,10 @@ def test_topk_geometry_survives_flat_config_roundtrip(
     )
     topk_spec.normalize(config)
     generation = ConfigGeneration(topk_spec)
-    assert generation.unflatten(generation.flatten(config)) == config
+    assert generation.unflatten(generation.flatten(config)).config == {
+        **config.config,
+        "cute_compiler_pipeline": "default",
+    }
 
 
 @pytest.mark.parametrize("vector", [1, 2, 4, 8])
@@ -1253,7 +1261,10 @@ def test_topk_output_vector_survives_flat_config_roundtrip(
     config = helion.Config(cute_topk_output_vector_width=vector)
     topk_spec.normalize(config)
     generation = ConfigGeneration(topk_spec)
-    assert generation.unflatten(generation.flatten(config)) == config
+    assert generation.unflatten(generation.flatten(config)).config == {
+        **config.config,
+        "cute_compiler_pipeline": "default",
+    }
 
 
 @pytest.mark.parametrize("mode", ["gather", "decode"])
@@ -1264,7 +1275,10 @@ def test_topk_value_mode_survives_flat_config_roundtrip(
     config = helion.Config(cute_topk_value_mode=mode)
     topk_spec.normalize(config)
     generation = ConfigGeneration(topk_spec)
-    assert generation.unflatten(generation.flatten(config)) == config
+    assert generation.unflatten(generation.flatten(config)).config == {
+        **config.config,
+        "cute_compiler_pipeline": "default",
+    }
 
 
 def test_topk_invalid_value_mode_normalizes_to_gather(topk_spec: ConfigSpec) -> None:
@@ -1281,7 +1295,10 @@ def test_topk_key_dtype_survives_flat_config_roundtrip(
     config = helion.Config(cute_topk_key_dtype=key_dtype)
     topk_spec.normalize(config)
     generation = ConfigGeneration(topk_spec)
-    assert generation.unflatten(generation.flatten(config)) == config
+    assert generation.unflatten(generation.flatten(config)).config == {
+        **config.config,
+        "cute_compiler_pipeline": "default",
+    }
 
 
 def test_topk_invalid_key_dtype_normalizes_to_int32(topk_spec: ConfigSpec) -> None:
@@ -1298,7 +1315,10 @@ def test_topk_rank_mode_survives_flat_config_roundtrip(
     config = helion.Config(cute_topk_rank_mode=rank_mode)
     topk_spec.normalize(config)
     generation = ConfigGeneration(topk_spec)
-    assert generation.unflatten(generation.flatten(config)) == config
+    assert generation.unflatten(generation.flatten(config)).config == {
+        **config.config,
+        "cute_compiler_pipeline": "default",
+    }
 
 
 def test_topk_invalid_rank_mode_normalizes_to_signed(topk_spec: ConfigSpec) -> None:
@@ -1315,7 +1335,10 @@ def test_topk_selection_layout_survives_flat_config_roundtrip(
     config = helion.Config(cute_topk_selection_layout=layout)
     topk_spec.normalize(config)
     generation = ConfigGeneration(topk_spec)
-    assert generation.unflatten(generation.flatten(config)) == config
+    assert generation.unflatten(generation.flatten(config)).config == {
+        **config.config,
+        "cute_compiler_pipeline": "default",
+    }
 
 
 def test_topk_invalid_selection_layout_normalizes_to_replicated(
@@ -1334,7 +1357,10 @@ def test_topk_sort_network_config_roundtrip(
     config = helion.Config(cute_topk_sort_network=network)
     topk_spec.normalize(config)
     generation = ConfigGeneration(topk_spec)
-    assert generation.unflatten(generation.flatten(config)) == config
+    assert generation.unflatten(generation.flatten(config)).config == {
+        **config.config,
+        "cute_compiler_pipeline": "default",
+    }
     assert helion.Config.from_json(config.to_json()) == config
 
 
@@ -2812,7 +2838,10 @@ def test_packed_rare_config(
     config.config[key] = valid
     spec.normalize(config)
     generation = ConfigGeneration(spec)
-    assert generation.unflatten(generation.flatten(config)) == config
+    assert generation.unflatten(generation.flatten(config)).config == {
+        **config.config,
+        "cute_compiler_pipeline": "default",
+    }
     invalid_config = helion.Config()
     invalid_config.config[key] = invalid
     with pytest.raises(exc.InvalidConfig, match="must be one of"):
@@ -3581,7 +3610,10 @@ def test_balanced_config_roundtrip_and_default(monkeypatch: pytest.MonkeyPatch) 
     config = helion.Config(cute_topk_merge_schedule="balanced")
     spec.normalize(config)
     generation = ConfigGeneration(spec)
-    assert generation.unflatten(generation.flatten(config)) == config
+    assert generation.unflatten(generation.flatten(config)).config == {
+        **config.config,
+        "cute_compiler_pipeline": "default",
+    }
     for invalid in (True, 1, "tree"):
         with pytest.raises(exc.InvalidConfig):
             spec.normalize(helion.Config(cute_topk_merge_schedule=invalid))

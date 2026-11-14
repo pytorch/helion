@@ -35,12 +35,14 @@ from .._compiler.cute.flash_facts import FlashSurfaceFacts
 from .._utils import indexing_uses_tensor_descriptor
 from .._utils import prev_power_of_2
 from ..exc import InvalidConfig
+from ..runtime.config import _copy_config_structure
 from ..runtime.triton.launcher import get_num_xcd
 from .block_id_sequence import BlockIdSequence
 from .block_id_sequence import _BlockIdItem
 from .block_id_sequence import _PowerOfTwoBlockIdItem
 from .compiler_coverage import CompilerCoverageGroup
 from .compiler_coverage import coverage_policy
+from .config_fragment import BaseIntegerFragment
 from .config_fragment import BlockSizeFragment
 from .config_fragment import BooleanFragment
 from .config_fragment import ConfigSpecFragment
@@ -51,6 +53,7 @@ from .config_fragment import NumThreadsFragment
 from .config_fragment import NumWarpsFragment
 from .config_fragment import PermutationFragment
 from .config_fragment import PowerOfTwoFragment
+from .config_fragment import _fragment_domain_fields
 from .config_fragment import assert_integer_power_of_two
 import helion
 
@@ -133,17 +136,6 @@ def _record_restriction(
 
 
 _TARGET_DEVICE_CAPABILITY_UNSET = object()
-
-
-def _copy_config_structure(value: object) -> object:
-    """Copy built-in config containers while preserving opaque leaf objects."""
-    if type(value) is dict:
-        return {key: _copy_config_structure(item) for key, item in value.items()}
-    if type(value) is list:
-        return [_copy_config_structure(item) for item in value]
-    if type(value) is tuple:
-        return tuple(_copy_config_structure(item) for item in value)
-    return value
 
 
 class TensorNumelConstraint(NamedTuple):
@@ -928,6 +920,9 @@ class ConfigSpec:
     ) -> None:
         self.backend = backend
         self.backend_name = backend.name
+        # Explicit dependency markers fix launch placement independently of
+        # backend scheduling knobs; populated during type propagation.
+        self.has_explicit_pdl = False
         # The backend's contribution to this spec's search surface (keys,
         # fields, normalization phases, seeds); stateless, so one object per
         # backend serves every spec.
@@ -1041,6 +1036,10 @@ class ConfigSpec:
         self.static_ranges: BlockIdSequence[StaticRangeSpec] = BlockIdSequence()
 
         self.allowed_pid_types: tuple[PidTypeLiteral, ...] = tuple(VALID_PID_TYPES)
+        # Keep alternative pid types searchable when an ordered reference uses flat.
+        self.cute_ordered_phase_pid_search: bool = False
+        # Confirmed dependent owners require ordinary ordered launches, not PDL.
+        self.cute_dependent_phase_launches: bool = False
         # Why each disabled pid_type was removed, for search-space logging.
         self.disallowed_pid_type_reasons: dict[str, str] = {}
         # All independent vetoes, including callers without a diagnostic reason.
@@ -1105,6 +1104,9 @@ class ConfigSpec:
         # Whether the kernel runs several phases in one persistent launch
         # (``hl.barrier()`` or an implicit cross-root dependency).
         self.multi_phase: bool = False
+        # Set only for a single native paired-attention root. The selected
+        # emitter also proves complete load/store effects before adding its ABI.
+        self.cute_pdl_capture_overlap_available: bool = False
         # Enabled only when the exact five-factor BT16 recurrence carrier is
         # detected. Choice ordering makes the geometry seed the no-autotune
         # default while leaving both legal schedules in cold/full search.
@@ -1146,6 +1148,13 @@ class ConfigSpec:
         self.cute_mma_dag_store: EnumFragment | None = None
         self.cute_mma_dag_exchange: EnumFragment | None = None
         self.cute_mma_dag_pass_warps: EnumFragment | None = None
+        self.cute_mma_dag_v_lag: EnumFragment | None = None
+        self.cute_mma_dag_sleep_waits: EnumFragment | None = None
+        self.cute_mma_dag_early_tmem_retirement: EnumFragment | None = None
+        self.cute_mma_dag_query_tma: EnumFragment | None = None
+        self.cute_mma_dag_value_metadata_skip: EnumFragment | None = None
+        self.cute_mma_dag_value_metadata_read_overlap: EnumFragment | None = None
+        self.cute_mma_dag_probability_schedule: EnumFragment | None = None
         self.cute_mma_dag_loads: EnumFragment | None = None
         self.cute_mma_dag_aux: EnumFragment | None = None
         # How a dot operand that is a pointwise chain over loaded tiles
@@ -1169,6 +1178,11 @@ class ConfigSpec:
         # distributed shared memory, or the fixup grid's global workspace.
         self.cute_mma_dag_split: EnumFragment | None = None
         self.cute_mma_dag_facts: CuteMmaDagFacts | None = None
+        # A single MMA-DAG phase in an explicitly ordered launch bundle.
+        self.cute_mma_dag_phase_index: int | None = None
+        self.cute_mma_dag_phase_eviction_map: dict[int, int] = {}
+        self.cute_mma_dag_phase_load_slots: frozenset[int] = frozenset()
+        self.cute_mma_dag_phase_owned_blocks: frozenset[int] = frozenset()
         # Enabled only when the register sub-block family
         # (``cute_register_subblocks``, cute_register_subblocks.py) admits
         # the root: the family switch and its knobs; the facts carry the
@@ -1231,6 +1245,8 @@ class ConfigSpec:
         self.cute_fragment_reduction_search_enabled = False
         self.cute_fp32_dot_root_ids: frozenset[int] = frozenset()
         self.cute_fp32_dot_search_enabled = False
+        self.cute_fragment_half_mma_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_half_mma_search_enabled = False
         self.cute_fp32_dot_seed_worthy = False
         self.cute_fragment_thread_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_threads_search_enabled = False
@@ -1476,6 +1492,14 @@ class ConfigSpec:
             raise RuntimeError(
                 f"Backend {self.backend_name!r} returned unknown tunables: {sorted(unknown_tunables)!r}"
             )
+
+    def rollable_reduction_block_ids(self) -> set[int]:
+        """Axes that may roll, without changing legacy reduction-loop slots."""
+        return {
+            spec.block_id
+            for spec in self.reduction_loops
+            if spec.persistent_reason is None
+        }
 
     @property
     def compiler_coverage_groups(self) -> tuple[CompilerCoverageGroup, ...]:
@@ -2105,9 +2129,12 @@ class ConfigSpec:
             if isinstance(reduction_loops, list):
                 new_loops = list(reduction_loops)
                 changed = False
+                rollable_ids = self.rollable_reduction_block_ids()
                 for i, spec in enumerate(self.reduction_loops):
                     if i >= len(new_loops):
                         break
+                    if spec.block_id not in rollable_ids:
+                        continue
                     block_threshold, max_chunk = spec._limits(self)
                     if block_threshold is None:
                         continue
@@ -2252,6 +2279,9 @@ class ConfigSpec:
                 config["host_tensor_descriptors"] = False
         for key, fragment in self.backend_tunable_fragments.items():
             config.setdefault(key, fragment.default())
+        for key, fragment in self.user_defined_tunables.items():
+            if key not in config:
+                config[key] = fragment.default()
         self._normalize_amd_mfma(config, fix_invalid=_fix_invalid)
         surface.normalize_after_defaults(self, config, fix_invalid=_fix_invalid)
         cross_loop_pipeline_fragment = self.cross_loop_pipeline
@@ -3087,8 +3117,9 @@ class ConfigSpec:
 
         Target lowering policy also affects generated code even when its
         promoted seed is unchanged, so include its stable identity.  Generic
-        targets with no compiler default or seed retain the historical
-        structural hash verbatim.
+        targets with no compiler default, seed, or user-declared built-in domain
+        retain the historical structural hash verbatim. Declared domains affect
+        persistent reuse but not the flat layout shared across shapes.
         """
         structural_hash = self.structural_fingerprint_hash(
             advanced_controls_files=advanced_controls_files
@@ -3110,7 +3141,7 @@ class ConfigSpec:
         self, *, advanced_controls_files: list[str] | None = None
     ) -> str:
         """Identity of the old layout, used only by initial warm-base decoding."""
-        owned = {group.key for group in self.compiler_coverage_groups}
+        owned = frozenset(group.key for group in self.compiler_coverage_groups)
         fingerprint = tuple(
             row
             for row in self.structural_fingerprint(
@@ -3119,9 +3150,37 @@ class ConfigSpec:
             if row[0] not in owned
         )
         structural_hash = hashlib.sha256(repr(fingerprint).encode("utf-8")).hexdigest()
-        return self._cache_fingerprint_from_structural_hash(structural_hash)
+        return self._cache_fingerprint_from_structural_hash(
+            structural_hash, excluded_tunables=owned
+        )
 
-    def _cache_fingerprint_from_structural_hash(self, structural_hash: str) -> str:
+    def _cache_fingerprint_from_structural_hash(
+        self,
+        structural_hash: str,
+        *,
+        excluded_tunables: frozenset[str] = frozenset(),
+    ) -> str:
+        declared_domains = tuple(
+            (
+                name,
+                type(fragment).__module__,
+                type(fragment).__qualname__,
+                _fragment_domain_fields(fragment),
+            )
+            for name, fragment in sorted(self.user_defined_tunables.items())
+            if name not in excluded_tunables
+            # Enum domains already participate in structural_fingerprint();
+            # BooleanFragment has no variable domain. Preserve their old keys.
+            and isinstance(fragment, (BaseIntegerFragment, NumThreadsFragment))
+        )
+        if declared_domains:
+            # The projected warm-base layout still decodes these user slots.
+            # Both persistent keys must distinguish their declared domains.
+            structural_hash = hashlib.sha256(
+                repr(
+                    (structural_hash, "user_tunable_domains:v1", declared_domains)
+                ).encode("utf-8")
+            ).hexdigest()
         target_policy_identity = self.search_surface.fingerprint_extra(self)
         if (
             self.compiler_default_config is None
@@ -3547,17 +3606,23 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         size_hint: int,
         allow_non_power_of_two: bool = False,
         allow_full_extent: bool = False,
+        persistent_reason: str | None = None,
     ) -> None:
         super().__init__([block_id])
         self.size_hint = size_hint
         self.allow_non_power_of_two = allow_non_power_of_two
         self.allow_full_extent = allow_full_extent
+        self.persistent_reason = persistent_reason
 
     def _full_extent_chunk(self) -> int | None:
         # A padded single iteration can preserve vector packets where an exact
         # non-power-of-two chunk leaves too few elements per thread. Keep it
         # distinct from persistent None, just like an exact full-width chunk.
-        if self.allow_full_extent and self.size_hint >= 8:
+        if (
+            self.persistent_reason is None
+            and self.allow_full_extent
+            and self.size_hint >= 8
+        ):
             return next_power_of_2(self.size_hint)
         return None
 
@@ -3576,6 +3641,9 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         # - flatten: Config value -> flat integer via _encode_flat_value()
         low = 8  # TODO(jansel): is smaller needed?
         high = next_power_of_2(max(low, self.size_hint))
+        if self.persistent_reason is not None:
+            # Keep the saved-config slot but remove unsafe chunks from search.
+            return BlockSizeFragment(high, high, high)
         default = min(high, 4096)
         # Cap default at the backend's max reduction loop so that
         # large reductions default to looped rather than persistent.
@@ -3625,6 +3693,8 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         # round-trip None into a slow looped config (e.g. size_hint=32000 ->
         # default 4096 -> reduction_loops=[4096]).
         # The backend may repair search/cache/seed budgets before decoding.
+        if self.persistent_reason is not None:
+            return self._flat_fragment(base).high
         value = base.search_surface.explicit_reduction_chunk(base, self, value)
         if value is None:
             return self._flat_fragment(base).high
@@ -3647,6 +3717,14 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
             normalized = value
         else:
             normalized = super()._normalize(name, value)
+        if self.persistent_reason is not None:
+            log.warning(
+                "%s=%s uses a persistent reduction instead: %s",
+                name,
+                normalized,
+                self.persistent_reason,
+            )
+            return None
         # A looped chunk of 1 is degenerate: "hold the whole axis" is encoded as
         # ``None`` (persistent), not 1, and ``LoopedReductionStrategy`` rejects a
         # block size <= 1.  The autotuner search never proposes < 8 (its fragment

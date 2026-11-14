@@ -51,7 +51,7 @@ class CuteBoundedLoopCacheHeuristic(CuteResidentSequenceHeuristic):
     """Offer complete opt-in cache schedules without changing earlier seeds."""
 
     name = "cute_bounded_loop_cache"
-    priority = 54
+    priority = 55
 
     @classmethod
     def get_seed_configs(

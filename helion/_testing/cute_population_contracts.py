@@ -1,0 +1,131 @@
+"""Audit the legacy population budget and the separate coverage additions."""
+
+from __future__ import annotations
+
+from copy import deepcopy
+import random
+from typing import TYPE_CHECKING
+from unittest.mock import patch
+
+from helion._testing.cute_codegen import b200_target as _cpu_target
+from helion._testing.cute_codegen import tcgen05_mma_support
+from helion._testing.cute_codegen import tcgen05_target as _target
+from helion.autotuner.compiler_coverage import same_value
+from helion.exc import InvalidConfig
+
+if TYPE_CHECKING:
+    from helion.autotuner.config_generation import ConfigGeneration
+    from helion.autotuner.config_generation import FlatConfig
+    from helion.autotuner.config_spec import ConfigSpec
+    from helion.autotuner.pattern_search import PatternSearch
+    from helion.runtime.config import Config
+
+
+# Retain historical helper names while callers migrate to the shared module.
+__all__ = [
+    "_cpu_target",
+    "_target",
+    "checked_initial_population",
+    "tcgen05_mma_support",
+    "with_flat_min_blocks_default",
+]
+
+
+def with_flat_min_blocks_default(spec: ConfigSpec, config: Config) -> Config:
+    """Express the optional public zero explicitly in the admitted flat schema."""
+    result = deepcopy(config)
+    if "cute_min_blocks_per_mp" in spec._flat_fields():
+        result.config.setdefault("cute_min_blocks_per_mp", 0)
+    return result
+
+
+def checked_initial_population(search: PatternSearch) -> list[FlatConfig]:
+    """Keep N exact base rows; account for declared and requested seed additions.
+
+    The old builder is observed directly before the append. This checks its
+    nominal budget, exact prefix, and final RNG state without changing its
+    inputs, seeds, cache policy or random draws. Appended rows are additionally
+    matched to independently normalized immutable declarations and final pins.
+    """
+    base_calls = []
+    build_base = search._generate_initial_population_base
+
+    def observe_base(**kwargs: ConfigGeneration | None) -> list[FlatConfig]:
+        result = build_base(**kwargs)
+        base_calls.append((deepcopy(result), random.getstate()))
+        return result
+
+    with patch.object(search, "_generate_initial_population_base", observe_base):
+        result = search._generate_initial_population_flat()
+    assert len(base_calls) == 1
+    base, state = base_calls[0]
+    assert len(base) == search.initial_population
+    assert result[: len(base)] == base
+    assert random.getstate() == state
+    generation = search.config_gen
+    groups = generation.config_spec.compiler_coverage_groups
+    declarations = []
+    for group in groups if generation.compiler_coverage_enabled else ():
+        for witness in group.witnesses:
+            requested = witness.carrier
+            requested.config[group.key] = witness.value
+            declarations.append((group, witness, requested))
+    outcomes = search.compiler_coverage_outcomes if declarations else []
+    assert len(outcomes) == len(declarations)
+    base_configs = {generation.canonicalize_flat(deepcopy(row))[1] for row in base}
+    expected_additions = []
+    seen = set(base_configs)
+    owned_keys = {group.key for group in groups}
+    for (group, witness, requested), outcome in zip(
+        declarations, outcomes, strict=True
+    ):
+        assert outcome.origin == "declared"
+        assert outcome.mechanism == group.mechanism
+        assert outcome.requested == requested
+        try:
+            flat, effective = generation.strict_config_pair(requested)
+            _, control = generation.strict_config_pair(witness.carrier)
+        except InvalidConfig:
+            assert outcome.outcome.startswith("invalid:")
+            continue
+        assert outcome.effective == effective
+        if not same_value(effective.config.get(group.key, group.legacy), witness.value):
+            assert outcome.outcome == "mode_not_effective"
+            continue
+        assert {
+            key: value for key, value in control.config.items() if key not in owned_keys
+        } == {
+            key: value
+            for key, value in effective.config.items()
+            if key not in owned_keys
+        }
+        for dependency in group.dependencies:
+            assert same_value(control.config[dependency.key], dependency.value)
+            assert same_value(effective.config[dependency.key], dependency.value)
+        if effective in seen:
+            assert outcome.outcome == "already_present"
+        else:
+            assert outcome.outcome == "added"
+            expected_additions.append(flat)
+            seen.add(effective)
+        assert effective in search._pinned_finalist_configs
+    # The overflow design is independently enumerated from the registry, after
+    # all declared coverage. No nominal/coverage row may be displaced by a seed.
+    if (
+        generation.config_spec.compiler_seed_overflow_requested
+        and search.initial_population > 0
+    ):
+        for seed in generation.config_spec.compiler_seed_configs:
+            try:
+                flat, effective = generation.canonicalize_flat(
+                    generation.flatten(deepcopy(seed))
+                )
+            except (InvalidConfig, ValueError, TypeError, KeyError, AssertionError):
+                continue
+            if effective not in seen:
+                expected_additions.append(flat)
+                seen.add(effective)
+            assert effective in search._pinned_finalist_configs
+    assert result[len(base) :] == expected_additions
+    assert len(result) == search.initial_population + len(expected_additions)
+    return result

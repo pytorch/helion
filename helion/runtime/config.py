@@ -1,13 +1,109 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Iterator
 from collections.abc import Mapping
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import struct
+from typing import Hashable
 from typing import Literal
+from typing import TypeVar
 from typing import cast
 import uuid
+
+
+@dataclass(frozen=True, eq=False)
+class _ConfigObjectIdentity:
+    value: object
+
+    def __hash__(self) -> int:
+        return id(self.value)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _ConfigObjectIdentity) and self.value is other.value
+
+
+def _config_value_key(value: object) -> Hashable:
+    """In-memory identity for values that may affect generated code.
+
+    Preserve order in mappings and bits in floating-point values. Hashable
+    opaque objects retain their equality contract: this includes complex
+    numbers, frozensets, and numeric types that are not Python float subclasses.
+    Unhashable list and dict subclasses use identity plus their contents:
+    sharing less is safer than
+    dropping their custom equality or invoking arbitrary copy hooks. As with
+    other opaque tunables, mutation of custom attributes or external state is
+    outside the cache contract.
+    """
+    kind = type(value)
+    if kind is float:
+        return kind, struct.pack("!d", cast("float", value))
+    if isinstance(value, float):
+        return kind, struct.pack("!d", value), value
+    if kind in (list, tuple):
+        return kind, tuple(
+            _config_value_key(item)
+            for item in cast("list[object] | tuple[object, ...]", value)
+        )
+    if kind in (dict, OrderedDict):
+        return kind, tuple(
+            (_config_value_key(key), _config_value_key(item))
+            for key, item in cast("dict[object, object]", value).items()
+        )
+    if kind.__hash__ is None:
+        if isinstance(value, list):
+            return (
+                kind,
+                _ConfigObjectIdentity(value),
+                tuple(_config_value_key(item) for item in value),
+            )
+        if isinstance(value, dict):
+            return (
+                kind,
+                _ConfigObjectIdentity(value),
+                tuple(
+                    (_config_value_key(key), _config_value_key(item))
+                    for key, item in value.items()
+                ),
+            )
+    return kind, cast("Hashable", value)
+
+
+def _config_key(config: Config) -> Hashable:
+    """Ignore option order; preserve code-relevant identity within each value."""
+    return frozenset(
+        (name, _config_value_key(value)) for name, value in config.config.items()
+    )
+
+
+_ConfigValue = TypeVar("_ConfigValue")
+
+
+def _copy_config_structure(value: _ConfigValue) -> _ConfigValue:
+    """Copy known config containers while preserving opaque leaf objects."""
+    if type(value) is OrderedDict:
+        return cast(
+            "_ConfigValue",
+            OrderedDict(
+                (key, _copy_config_structure(item)) for key, item in value.items()
+            ),
+        )
+    if type(value) is dict:
+        return cast(
+            "_ConfigValue",
+            {key: _copy_config_structure(item) for key, item in value.items()},
+        )
+    if type(value) is list:
+        return cast("_ConfigValue", [_copy_config_structure(item) for item in value])
+    if type(value) is tuple:
+        return cast(
+            "_ConfigValue", tuple(_copy_config_structure(item) for item in value)
+        )
+    return value
+
 
 IndexingLiteral = Literal["pointer", "tensor_descriptor", "block_ptr"]
 PidTypeLiteral = Literal[
@@ -23,6 +119,7 @@ StoreCacheModifierLiteral = Literal["", ".cs", ".wt"]
 CuteAsyncLoadCacheLiteral = Literal["cg", "ca"]
 CuteAsyncStorePolicyLiteral = Literal["default", "l2_evict_last"]
 CuteStorePolicyLiteral = Literal["default", "streaming", "l2_evict_last"]
+CuteCompilerPipelineLiteral = Literal["default", "opt2"]
 CuteExactDivFormLiteral = Literal["redo", "plain"]
 CuteAffineScanScheduleLiteral = Literal[
     "ordinary",
@@ -30,7 +127,9 @@ CuteAffineScanScheduleLiteral = Literal[
     "direct_m16n16_v1",
 ]
 CuteHostPairedSumLiteral = Literal["off", "mapped", "narrow"]
-CutePdlReleaseLiteral = Literal["auto", "entry", "none", "exit", "last_wave"]
+CutePdlReleaseLiteral = Literal[
+    "auto", "entry", "none", "exit", "last_wave", "loader_tail"
+]
 NumSmMultiplierLiteral = int
 MaxnregLiteral = int | None
 
@@ -61,6 +160,7 @@ class Config(Mapping[str, object]):
         load_cache_modifiers: list[LoadCacheModifierLiteral] | None = None,
         store_cache_modifiers: list[StoreCacheModifierLiteral] | None = None,
         cute_store_policy: CuteStorePolicyLiteral | None = None,
+        cute_compiler_pipeline: CuteCompilerPipelineLiteral | None = None,
         cute_exact_div_form: CuteExactDivFormLiteral | None = None,
         cute_async_load_stages: int | None = None,
         cute_async_load_lookahead: int | None = None,
@@ -79,6 +179,7 @@ class Config(Mapping[str, object]):
         cute_lane_unroll: int | None = None,
         cute_wide_packet_hints: bool | None = None,
         cute_pdl: bool | None = None,
+        cute_pdl_capture_overlap: bool | None = None,
         cute_pdl_release: CutePdlReleaseLiteral | None = None,
         cute_pdl_spread: bool | None = None,
         cute_warp_aggregated_atomics: bool | None = None,
@@ -128,6 +229,9 @@ class Config(Mapping[str, object]):
             cute_store_policy: Cache policy for proven full aligned 16-byte CuTe
                 global store packets ("default", "streaming" = evict-first
                 ``st.global.cs`` for outputs written once, or "l2_evict_last").
+            cute_compiler_pipeline: CuTe compiler optimization pipeline. "default"
+                leaves SDK options unchanged; "opt2" requests optimization level 2.
+                Explicit SDK compiler environment overrides still take precedence.
             cute_async_load_stages: Shared-memory ring stages for eligible CuTe
                 in-place 16-byte state loads. Zero disables the transformation.
             cute_async_load_lookahead: Async-copy groups kept ahead of compute.
@@ -186,6 +290,26 @@ class Config(Mapping[str, object]):
                 with it, bodies with their own wait or release, the
                 materialized-fission producer) and pre-sm_90 targets generate
                 exactly the knob-off code.
+            cute_pdl_capture_overlap: During CUDA graph capture, permit a proved
+                paired attention kernel to read inputs before its PDL dependency
+                completes when none of its known pending ancestors can write
+                those storages. It still waits before every global write.
+                Requires ``cute_pdl=True`` and automatic, entry or loader-tail
+                release.
+                Unknown predecessors, aliases, unsupported wrappers and eager
+                calls retain the ordinary early wait. Default autotuning and
+                compiler seeds leave it off. An explicit Config, user seed, or
+                autotune_config_overrides may opt an eligible kernel in, with
+                ``cute_pdl=True`` and ``cute_pdl_spread=False``.
+                Eager benchmark timings cannot demonstrate this capture-only
+                overlap benefit; a selected configuration is not evidence of a
+                speedup for the application's captured graph.
+                With this policy enabled, captured topology and parameter
+                addresses must remain immutable; tensor contents may change
+                between replays. Recapture after rewiring a graph or replacing
+                its pointer arguments. Applications that edit captured graphs
+                must leave this policy off, including when supplying stored
+                configurations or user seeds that previously enabled it.
             cute_pdl_release: Where a ``cute_pdl`` kernel releases its own
                 dependents (``griddepcontrol.launch_dependents``), which is what
                 lets the next kernel of a sequence launch early too. ``entry``
@@ -204,8 +328,12 @@ class Config(Mapping[str, object]):
                 while the launch grid is known to fit in one wave of resident
                 CTAs (the SM count times the CTAs an SM holds, from the launch
                 block or ``cute_min_blocks_per_mp``) and ``last_wave`` past it
-                or when the grid is sized at runtime; the search leaves the
-                placement at ``auto``. Every placement reads the same data: a
+                or when the grid is sized at runtime. ``loader_tail`` requires
+                proved paired capture overlap: the loader releases with four
+                logical pages left to issue, or after a shorter/empty loop.
+                Its waits and ancestor-storage proof are unchanged. This choice
+                also requires explicit opt-in; default search leaves placement
+                at ``auto``. Every placement reads the same data: a
                 dependent's own wait blocks until this grid has completed and
                 flushed. On the tcgen05 GEMM kernels, whose lowering waits in
                 its warp roles and releases after the last MMA, ``entry`` and
@@ -310,6 +438,7 @@ class Config(Mapping[str, object]):
             "load_cache_modifiers": load_cache_modifiers,
             "store_cache_modifiers": store_cache_modifiers,
             "cute_store_policy": cute_store_policy,
+            "cute_compiler_pipeline": cute_compiler_pipeline,
             "cute_exact_div_form": cute_exact_div_form,
             "cute_async_load_stages": cute_async_load_stages,
             "cute_async_load_lookahead": cute_async_load_lookahead,
@@ -328,6 +457,7 @@ class Config(Mapping[str, object]):
             "cute_lane_unroll": cute_lane_unroll,
             "cute_wide_packet_hints": cute_wide_packet_hints,
             "cute_pdl": cute_pdl,
+            "cute_pdl_capture_overlap": cute_pdl_capture_overlap,
             "cute_pdl_release": cute_pdl_release,
             "cute_pdl_spread": cute_pdl_spread,
             "cute_warp_aggregated_atomics": cute_warp_aggregated_atomics,
@@ -404,8 +534,8 @@ class Config(Mapping[str, object]):
         """
         Return a new Config with values matching effective defaults removed.
 
-        This produces a minimal config representation by removing any values
-        that match what the config_spec would use as defaults.
+        Matching defaults are removed only when normalization preserves the
+        selected config. Dependent or unprovable forms retain their fields.
 
         Args:
             config_spec: The ConfigSpec that defines the defaults for this kernel.
@@ -413,23 +543,62 @@ class Config(Mapping[str, object]):
         Returns:
             A new Config with default values removed.
         """
+        from ..autotuner.config_fragment import _plain_builtin_fragment_key
         from ..autotuner.config_spec import ConfigSpec
+        from ..exc import InvalidConfig
 
         assert isinstance(config_spec, ConfigSpec)
         default_config = config_spec.default_config()
 
-        # block_sizes is always required and must never be removed
-        required_keys = {"block_sizes"}
+        # Arbitrary default protocols may have side effects. Keep explicit
+        # custom values while minimizing the independent schedule fields.
+        custom_keys = {
+            key
+            for key, fragment in config_spec.user_defined_tunables.items()
+            if _plain_builtin_fragment_key(fragment) is None
+        }
+        if not custom_keys.issubset(self.config):
+            # Proving an omitted custom value would call its default again.
+            return Config.from_dict(self.config)
+        required_keys = {"block_sizes"} | custom_keys
 
         minimal: dict[str, object] = {}
         for key, value in self.config.items():
             # Keep value if it differs from the default or is required
             default_value = default_config.config.get(key)
-            if value != default_value or key in required_keys:
+            if (
+                _config_value_key(value) != _config_value_key(default_value)
+                or key in required_keys
+            ):
                 minimal[key] = value
 
-        # pyrefly: ignore [bad-argument-type]
-        return Config(**minimal)
+        candidate = Config.from_dict(minimal)
+        try:
+            expected = config_spec.normalized_config(self)
+            normalized = config_spec.normalized_config(candidate)
+            if _config_key(normalized) == _config_key(expected):
+                return candidate
+
+            # Effective search defaults may differ from normalization's omitted
+            # defaults (for example after shrinking a small kernel's warp count).
+            # Restore those fields rather than change the selected configuration.
+            for key, value in self.config.items():
+                if key not in minimal and (
+                    (key in expected) != (key in normalized)
+                    or _config_value_key(expected.config.get(key))
+                    != _config_value_key(normalized.config.get(key))
+                ):
+                    minimal[key] = value
+            candidate = Config.from_dict(minimal)
+            if _config_key(config_spec.normalized_config(candidate)) == _config_key(
+                expected
+            ):
+                return candidate
+        except InvalidConfig:
+            # Minimization is optional; leave rejected or dependent forms for
+            # the usual compilation validation instead of guessing defaults.
+            pass
+        return Config.from_dict(self.config)
 
     def save(self, path: str | Path) -> None:
         """Save the config to a JSON file."""
@@ -608,6 +777,13 @@ class Config(Mapping[str, object]):
         return cast(
             "CuteStorePolicyLiteral",
             self.config.get("cute_store_policy", "default"),
+        )
+
+    @property
+    def cute_compiler_pipeline(self) -> CuteCompilerPipelineLiteral:
+        return cast(
+            "CuteCompilerPipelineLiteral",
+            self.config.get("cute_compiler_pipeline", "default"),
         )
 
     @property

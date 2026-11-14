@@ -169,6 +169,28 @@ _OPMATH_SCALAR_TARGETS = {
 }
 
 
+def _value_input_occurrences(node: Node) -> list[Node]:
+    """Current operand occurrences, without post-lowering scheduler edges."""
+    inputs: list[Node] = []
+    map_arg(
+        (node.args, {**node.kwargs, "_extra_deps": None}),
+        lambda source: inputs.append(source),
+    )
+    return inputs
+
+
+def lowering_input_nodes(node: Node) -> list[Node]:
+    """Inductor input slots, or unique value operands for other lowerings.
+
+    Prepared slots remain distinct after CSE merges their source nodes.
+    Nodes without an InductorLowering have no named slots, including unprepared
+    nodes and AtenLowering/APIFuncLowering nodes; each source is listed once.
+    """
+    if isinstance(lowering := node.meta.get("lowering"), InductorLowering):
+        return lowering.input_nodes(node)
+    return list(dict.fromkeys(_value_input_occurrences(node)))
+
+
 def opmath_scalar_dtype(node: Node) -> torch.dtype | None:
     """The fp16/bf16 dtype of ``node`` when it combines a SymFloat or SymInt
     (a Python host scalar) with 16-bit tensors and torch computes it at
@@ -183,7 +205,13 @@ def opmath_scalar_dtype(node: Node) -> torch.dtype | None:
         for arg in node.args
     ):
         return None
-    tensors = InductorLowering.input_fake_tensors(node)
+    # Preparation may replace a stale lowering after an operand rewrite.
+    # Dtype promotion uses the current operands, never the previous slots.
+    tensors = [
+        value
+        for source in _value_input_occurrences(node)
+        if isinstance(value := source.meta["val"], torch.Tensor)
+    ]
     if not tensors:
         return None
     dtype = functools.reduce(torch.promote_types, [t.dtype for t in tensors])
@@ -198,8 +226,14 @@ def _rounded_result_dtype(node: Node) -> torch.dtype | None:
     if (dtype := opmath_scalar_dtype(node)) is not None:
         # The float32 scalar promoted the math to float32.
         return dtype
-    if node.target is torch.ops.aten.reciprocal.default:
-        # Lowered as 1.0 / x with a float32 1.0.
+    if node.target is torch.ops.aten.reciprocal.default or (
+        node.target in _OPMATH_SCALAR_TARGETS
+        and any(
+            isinstance(arg, (int, float)) for arg in (*node.args, *node.kwargs.values())
+        )
+    ):
+        # A literal can promote the backend's arithmetic to fp32, including
+        # reciprocal's 1.0 / x. Round the completed FX op, not its inner math.
         dtype = node.meta["val"].dtype
         if dtype in (torch.float16, torch.bfloat16):
             return dtype
@@ -381,12 +415,14 @@ def prepare_node_lowering(
         for inp_node in current_input_nodes:
             current_input_names.append(node_to_buf_name_mapping[inp_node])
 
-        used_input_names = strip_unused_inputs(
+        used_input_names, input_slots = strip_unused_inputs(
             new_node,
             buffer.get_read_names(),
             dict(zip(current_input_nodes, current_input_names, strict=True)),
         )
-        new_node.meta["lowering"] = lowering = lowering_cls(buffer, used_input_names)
+        new_node.meta["lowering"] = lowering = lowering_cls(
+            buffer, used_input_names, input_slots
+        )
         lowering.input_layouts = input_layouts
         new_node.meta["orig_node"] = node
         if isinstance(lowering, ReductionLowering):
@@ -417,10 +453,12 @@ def strip_unused_inputs(
     node: torch.fx.Node,
     used_input_names: OrderedSet[str],
     input_names: dict[torch.fx.Node, str],
-) -> list[str]:
+) -> tuple[list[str], tuple[int, ...]]:
     """
-    Remove unused inputs from the node.  Inplace updates node.args and
-    node.kwargs to replace unused inputs with None.
+    Replace unused inputs with None, retaining repeated used operands.
+
+    The FX arguments also describe the operation to semantic matchers. Their
+    multiplicity must survive even though Inductor names each input only once.
 
     Args:
         node: Node to mutate args of
@@ -428,21 +466,24 @@ def strip_unused_inputs(
         input_names: Mapping of node inputs to their names.
 
     Returns:
-        list[str]: List of names that were used in the lowering.
+        Used names and a lowering slot for each occurrence. Slots preserve the
+        input-name association if CSE later merges distinct nodes.
     """
 
     def mask_unused_inputs(n: torch.fx.Node) -> torch.fx.Node | None:
-        if (name := input_names[n]) in used_input_names and name not in seen_names:
-            seen_names.setdefault(name)
+        if (name := input_names[n]) in used_input_names:
+            slot = seen_names.setdefault(name, len(seen_names))
+            input_slots.append(slot)
             return n
         return None
 
     assert len(input_names) == len(node._input_nodes)
-    seen_names: dict[str, None] = {}
+    seen_names: dict[str, int] = {}
+    input_slots: list[int] = []
     node.args = map_arg(node.args, mask_unused_inputs)
     node.kwargs = map_arg(node.kwargs, mask_unused_inputs)
     assert len(seen_names) == len(used_input_names)
-    return [*seen_names]
+    return [*seen_names], tuple(input_slots)
 
 
 def create_extra_node(
@@ -497,10 +538,37 @@ def _unpack_symint(x: torch.SymInt | int) -> sympy.Expr:
 class InductorLowering(Lowering):
     buffer: ComputedBuffer
     input_names: list[str]
+    # Each occurrence retains its original lowering slot. Slots are numbered
+    # in first-seen order; CSE may merge them, but a repeated group cannot split.
+    input_slots: tuple[int, ...]
     # Size and stride of each node input the inner function loads, by name.
     input_layouts: dict[str, tuple[list[sympy.Expr], list[sympy.Expr]]] = (
         dataclasses.field(default_factory=dict)
     )
+
+    def input_nodes(self, node: torch.fx.Node) -> list[torch.fx.Node]:
+        """Value inputs aligned with lowering names, excluding scheduler edges."""
+        if node.op != "call_function":
+            # Rolled graph-boundary values can inherit a producer's metadata;
+            # they do not call that producer or consume its operand slots.
+            return []
+        inputs = _value_input_occurrences(node)
+        if len(inputs) != len(self.input_slots):
+            raise exc.InternalError(
+                AssertionError(
+                    f"{node.name}: lowered value inputs changed "
+                    f"({len(self.input_slots)} occurrences expected, {len(inputs)} found)"
+                )
+            )
+        values: list[torch.fx.Node] = []
+        for source, slot in zip(inputs, self.input_slots, strict=True):
+            if slot == len(values):
+                values.append(source)
+            elif source is not values[slot]:
+                raise exc.InternalError(
+                    AssertionError(f"{node.name}: repeated lowered value input changed")
+                )
+        return values
 
     def input_asts(self, ctx: LoweringContext, node: torch.fx.Node) -> list[ast.AST]:
         def visit(n: torch.fx.Node) -> None:
@@ -560,21 +628,17 @@ class InductorLowering(Lowering):
         )
         opmath_dtype = opmath_scalar_dtype(node)
         input_asts: list[ast.AST] = []
-        # _extra_deps should not be included in the inductor node inputs
-        map_arg((node.args, {**node.kwargs, "_extra_deps": None}), visit)
+        for source in self.input_nodes(node):
+            visit(source)
         assert len(input_asts) == len(self.input_names)
         return input_asts
 
-    @staticmethod
-    def input_fake_tensors(node: torch.fx.Node) -> list[torch.Tensor]:
-        def visit(n: torch.fx.Node) -> torch.fx.Node:
-            if isinstance(val := n.meta["val"], torch.Tensor):
-                result.append(val)
-            return n
-
-        result: list[torch.Tensor] = []
-        map_arg((node.args, node.kwargs), visit)
-        return result
+    def input_fake_tensors(self, node: torch.fx.Node) -> list[torch.Tensor]:
+        return [
+            val
+            for source in self.input_nodes(node)
+            if isinstance(val := source.meta["val"], torch.Tensor)
+        ]
 
     def codegen(self, ctx: LoweringContext, node: torch.fx.Node) -> object:
         raise NotImplementedError(
@@ -993,8 +1057,9 @@ class ReductionLowering(InductorLowering):
         self,
         buffer: ComputedBuffer,
         input_names: list[str],
+        input_slots: tuple[int, ...],
     ) -> None:
-        super().__init__(buffer, input_names)
+        super().__init__(buffer, input_names, input_slots)
         reduction = self.buffer.data
         assert isinstance(reduction, Reduction)
         reduction_ranges = reduction.reduction_ranges
@@ -1007,7 +1072,17 @@ class ReductionLowering(InductorLowering):
 
         env = CompileEnvironment.current()
         if isinstance(reduction_size, sympy.Symbol):
-            block_index: int | None = env.get_block_id(reduction_size)
+            block_index = env.get_block_id(reduction_size)
+            if block_index is None:
+                # A bare symbol that is not a block size (e.g. a runtime int).
+                raise exc.ReductionOnNonTile(reduction_size)
+            # A registered extent is a config value, not a tile coordinate.
+            # Its reduction alias carries the full symbolic domain and can
+            # own lanes independently in a materialized consumer stage.
+            if env.registered_extent_owner(block_index) is not None:
+                block_index = env.allocate_reduction_dimension(
+                    to_symint(reduction_size)
+                ).block_id
         elif isinstance(reduction_size, (int, sympy.Integer)):
             # Allocate or find a reduction dimension matching this size.
             # Convert to a SymInt when needed.
@@ -1022,7 +1097,6 @@ class ReductionLowering(InductorLowering):
                 raise exc.ReductionOnNonTile(reduction_size)
         else:
             raise exc.ReductionOnNonTile(reduction_size)
-        assert block_index is not None
         self.block_index: int = block_index
 
     @property
@@ -1153,7 +1227,12 @@ class ReductionLowering(InductorLowering):
 
         dims = node.kwargs.get("dim", node.kwargs.get("dims"))
         if dims is None:
-            schema = node.meta["original_aten"]._schema
+            # Decomposition may change the overload (e.g. any.default into
+            # amax.default). Positional arguments belong to the actual FX target,
+            # while original_aten describes the user operation for diagnostics.
+            target = node.target
+            assert isinstance(target, torch._ops.OpOverload)
+            schema = target._schema
             assert isinstance(schema, torch._C.FunctionSchema)
             for index, arg in enumerate(schema.arguments):
                 if arg.name in {"dim", "dims"}:
@@ -1501,27 +1580,24 @@ class GenerateASTFromInductor(DefaultHandler):
         return self._default("minimum", (a, b), {})
 
     def mul(self, a: object, b: object) -> str:  # type: ignore[override]
-        # Triton promotes scalar*tensor results to float32, deviating from
-        # PyTorch semantics (e.g. x_bf16 * 0.1).  Emit an explicit cast back.
+        # Retain the legacy dtype correction for non-opmath Triton products.
+        # Opmath products round once at the FX node boundary instead, including
+        # fused inner math such as the scalar multiplication in add(alpha=...).
         if not CompileEnvironment.current().backend.uses_triton_compiler:
             return self._default("mul", (a, b), {})
 
-        def has_scalar_operand() -> bool:
-            current_node = V.current_node
-            if current_node is None:
-                return False
-            return any(isinstance(arg, (int, float, bool)) for arg in current_node.args)
-
         result_expr = self._parse_op(self.parent_handler.mul(a, b))
 
-        # Only cast if we have a scalar operand and expected dtype is not float32.
-        # This is to handle cases like `x_bf16 * 0.1` where Triton would promote the result to float32,
-        # deviating from PyTorch semantics.
         expected_dtype = self._expected_tensor_dtype()
+        current_node = V.current_node
+        # Keep the legacy args-only scope; kwargs must not newly enable this
+        # inner-operation cast for unrelated FX operators.
         if (
-            has_scalar_operand()
+            current_node is not None
+            and any(isinstance(arg, (int, float, bool)) for arg in current_node.args)
             and expected_dtype is not None
             and expected_dtype != torch.float32
+            and _rounded_result_dtype(current_node) != expected_dtype
         ):
             result_expr = self._maybe_cast_to_expected_dtype(result_expr)
 

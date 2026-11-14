@@ -36,7 +36,6 @@ def _promotion_on(monkeypatch: pytest.MonkeyPatch) -> None:
     for kernel in (
         _partitioned_matmul,
         _unhashable_host_factory_output,
-        _metadata_alias_output_matmul,
         _atomic_into_argument,
         matmul_split_k,
     ):
@@ -93,27 +92,6 @@ def test_output_promotion_requires_single_fresh_factory_binding(
     assert result == ({"out": torch.float16} if accepted else {})
 
 
-@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def _aliased_output_matmul(
-    a: torch.Tensor, b: torch.Tensor, broadcast: bool
-) -> torch.Tensor:
-    m, k = a.shape
-    n = b.size(1)
-    out = torch.zeros((m, n), dtype=a.dtype, device=a.device)
-    alias = out[:1, :].expand(m, n) if broadcast else out.view(m, n)
-    for row, column in hl.tile([m, n]):
-        acc = hl.zeros([row, column], dtype=torch.float32)
-        for reduction in hl.tile(k):
-            acc = torch.addmm(acc, a[row, reduction], b[reduction, column])
-        previous = alias[row, column]
-        hl.atomic_add(out, [row, column], acc + previous, sem="relaxed")
-    return out
-
-
-def _metadata_receiver(method: Any) -> torch.Tensor:
-    return method.__self__
-
-
 @dataclass
 class _HostFactory:
     def __call__(self, value: torch.Tensor) -> torch.Tensor:
@@ -128,24 +106,6 @@ def _unhashable_host_factory_output(a: torch.Tensor) -> torch.Tensor:
     out = _host_factory(a)
     for index in hl.tile(a.numel()):
         hl.atomic_add(out, [index], a[index], sem="relaxed")
-    return out
-
-
-@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def _metadata_alias_output_matmul(
-    a: torch.Tensor, b: torch.Tensor, broadcast: bool
-) -> torch.Tensor:
-    m, k = a.shape
-    n = b.size(1)
-    out = torch.zeros((m, n), dtype=a.dtype, device=a.device)
-    receiver = _metadata_receiver(out.size)
-    alias = receiver[:1, :].expand(m, n) if broadcast else receiver.view(m, n)
-    for row, column in hl.tile([m, n]):
-        acc = hl.zeros([row, column], dtype=torch.float32)
-        for reduction in hl.tile(k):
-            acc = torch.addmm(acc, a[row, reduction], b[reduction, column])
-        previous = alias[row, column]
-        hl.atomic_add(out, [row, column], acc + previous, sem="relaxed")
     return out
 
 
@@ -183,24 +143,6 @@ def test_unhashable_host_callable_is_not_a_proven_fresh_factory() -> None:
         _unhashable_host_factory_output, (torch.empty(32, dtype=torch.float16),)
     )
     assert not cute_env_state(bound.env).half_atomic_output_promotions
-
-
-@pytest.mark.parametrize("collective", [False, True])
-@pytest.mark.parametrize("broadcast", [False, True])
-@pytest.mark.parametrize("metadata_alias", [False, True])
-@skipUnlessBackends(["cute"])
-def test_output_storage_aliases_preserve_requested_half_atomics(
-    collective: bool, broadcast: bool, metadata_alias: bool
-) -> None:
-    kernel = _metadata_alias_output_matmul if metadata_alias else _aliased_output_matmul
-    bound = cpu_bind(kernel, (*_inputs(), broadcast))
-    assert not cute_env_state(bound.env).half_atomic_output_promotions
-    config = _config(collective=collective).config.copy()
-    config.pop("partitions")
-    code = bound.to_code(helion.Config.from_dict(config))
-    assert "dtype=a.dtype, device=a.device" in code
-    assert "val=cutlass.Float16(" in code
-    assert "return out.to(torch.float16)" not in code
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")

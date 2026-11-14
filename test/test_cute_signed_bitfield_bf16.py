@@ -10,7 +10,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from torch.fx import Graph
 
 from helion._compiler.cute import signed_bitfield as sb
 from helion._compiler.cute.autotune.heuristics.cute_signed_bitfield import (
@@ -25,74 +24,13 @@ from helion._compiler.cute.state import CuteCodegenState
 from helion._compiler.cute.state import cute_codegen_state
 from helion._compiler.lane_loop_context import LaneLoopContext
 from helion._compiler.tile_strategy import DeviceGridState
+from helion._testing.cute_signed_bitfield import field_node as _node
+from helion._testing.cute_signed_bitfield import signed_field_graph as _graph
 from helion.autotuner.config_spec import ConfigSpec
 from helion.exc import InvalidConfig
-from helion.language import memory_ops
 from helion.runtime.config import Config
 
 pytestmark = pytest.mark.cpu_only
-
-
-def _node(graph, target, args, dtype, kwargs=None):
-    node = graph.call_function(target, args, kwargs or {})
-    node.meta["val"] = torch.empty((2, 8), dtype=dtype)
-    return node
-
-
-def _graph(offset=0, width=4, *, identity=False, shift_only=False, wide=torch.int32):
-    graph = Graph()
-    source = graph.placeholder("source")
-    source.meta["val"] = torch.empty((2, 8), dtype=torch.int8)
-    output = graph.placeholder("destination")
-    output.meta["val"] = torch.empty((2, 8), dtype=torch.bfloat16)
-    load = _node(graph, memory_ops.load, (source, [0, 0]), torch.int8)
-    current = load
-    if offset:
-        current = _node(
-            graph,
-            torch.ops.aten.bitwise_right_shift.Tensor_Scalar,
-            (current, offset),
-            torch.int8,
-        )
-    if not identity and not shift_only:
-        # The original INT4 source masks in INT8 and then widens.
-        if width == 8:
-            current = _node(
-                graph,
-                torch.ops.aten._to_copy.default,
-                (current,),
-                wide,
-                {"dtype": wide},
-            )
-        current = _node(
-            graph,
-            torch.ops.aten.bitwise_and.Scalar,
-            (current, (1 << width) - 1),
-            current.meta["val"].dtype,
-        )
-    current = _node(
-        graph, torch.ops.aten._to_copy.default, (current,), wide, {"dtype": wide}
-    )
-    if not identity and not shift_only:
-        compare = _node(
-            graph, torch.ops.aten.ge.Scalar, (current, 1 << (width - 1)), torch.bool
-        )
-        subtract = _node(graph, torch.ops.aten.sub.Tensor, (current, 1 << width), wide)
-        current = _node(
-            graph, torch.ops.aten.where.self, (compare, subtract, current), wide
-        )
-    value = _node(
-        graph,
-        torch.ops.aten._to_copy.default,
-        (current,),
-        torch.bfloat16,
-        {"dtype": torch.bfloat16},
-    )
-    store = _node(graph, memory_ops.store, (output, [0, 0], value), torch.bfloat16)
-    graph.output(())
-    return SimpleNamespace(
-        graph=graph, source=source, output=output, load=load, value=value, store=store
-    )
 
 
 @pytest.mark.parametrize(
@@ -337,13 +275,16 @@ def _physical(monkeypatch):
     )
     from helion._compiler.compile_environment import CompileEnvironment
 
-    monkeypatch.setattr(
-        CompileEnvironment,
-        "current",
-        lambda: SimpleNamespace(index_type=lambda: "cutlass.Int32"),
+    source = case.source.meta["val"]
+    fresh_storage = case.output.meta["val"].untyped_storage()
+    compile_env = SimpleNamespace(
+        index_type=lambda: "cutlass.Int32",
+        input_sources={source: None},
+        tensor_storage_provenance=lambda tensor: (
+            (tensor.untyped_storage(), tensor.untyped_storage() is fresh_storage),
+        ),
     )
-    monkeypatch.setattr(sb.HostFunction, "current", lambda: None)
-    monkeypatch.setattr(sb, "_fresh_tensors", lambda host: {case.output.meta["val"]})
+    monkeypatch.setattr(CompileEnvironment, "current", lambda: compile_env)
     monkeypatch.setattr(
         "helion._compiler.runtime_tensor_guards.runtime_tensors_are_proven_disjoint",
         lambda *args: False,
@@ -468,7 +409,6 @@ def test_physical_proof_declines_before_store_change(monkeypatch, fault):
         cute_codegen_state(state.codegen).branch_path = [(7, 0)]
     elif fault == "alias":
         case.output.meta["val"] = case.source.meta["val"]
-        monkeypatch.setattr(sb, "_fresh_tensors", lambda host: set())
     elif fault == "effect":
         with case.graph.inserting_before(case.store):
             _node(case.graph, torch.ops.aten.zero_.default, (case.source,), torch.int8)

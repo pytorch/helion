@@ -50,6 +50,9 @@ TCGEN05_TWO_CTA_MAX_K_TILES = 256
 # quarter of the SMs even with those pairs; the floor only needs to exclude
 # the launch-bound regime.
 TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM = 256
+# Smallest K tile the planner caps a K-tail shape to so that whole K tiles
+# keep the persistent and CtaGroup.TWO schedules (``enable_cute_tcgen05_search``).
+TCGEN05_WHOLE_K_TILE_MIN = 64
 # The tile of the edge family's 128-row CTA pair (each CTA owns 64 rows of a
 # 128 x 128 pair tile); the planner counts a 16-bit edge grid in these.
 TCGEN05_TWO_CTA_EDGE_PAIR128_BLOCK = 128
@@ -61,8 +64,9 @@ RAGGED_BATCHED_MIN_BLOCK_N = 32
 # That same family is validated only at this K/stage point. The output-edge
 # full-tile TMA-store epilogue needs an extra SMEM tile, so the edge seed must
 # stay within ``TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES``. Larger explicit
-# AB-stage configs remain legal only through the SIMT-store fallback when they
-# otherwise fit.
+# AB-stage configs keep the TMA store where the arena model fits its C ring
+# (``smem.output_edge_tma_store_smem_fits``) and take the SIMT store
+# otherwise.
 TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K = 128
 TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES = 2
 TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES = 1
@@ -112,11 +116,18 @@ TCGEN05_TWO_CTA_EDGE_K_TAIL_L2_SWIZZLE_SIZE = 4
 TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE = 1
 TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES = 2
 # Plain 16-bit two-CTA epilogues take the (128, 32) subtile (and the
-# explicit-store family's no-unroll K loop) on this N tile, where CuTe's
+# explicit-store family's no-unroll K loop) on these N tiles, where CuTe's
 # with-source rule would give (128, 64); narrower tiles already get (128, 32)
 # from the default rule. Measured in ``cute_mma`` next to the decision
-# (``tcgen05_plain_narrow_subtile``).
+# (``tcgen05_plain_narrow_subtile``); 192 is the aligned-N physical tile.
 TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N = 256
+TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_NS = (192, TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N)
+# The C-ring subtile width of that rule: ``(128, 32)`` stages.
+TCGEN05_PLAIN_NARROW_SUBTILE_N = 32
+# Tall 16-bit aligned-N problems (at least this many 256-row pair rows) also
+# seed the grouped persistent raster at these L2 groupings.
+TCGEN05_ALIGNED_N_TALL_PAIR_ROWS = 64
+TCGEN05_ALIGNED_N_TALL_L2_GROUPINGS = (8, 16)
 assert (
     TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES
     <= TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
@@ -129,6 +140,9 @@ TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M = 128
 TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N = 128
 # Best measured seed L2 grouping for the full-tile CtaGroup.TWO row.
 TCGEN05_TWO_CTA_SEED_L2_GROUPING = 4
+# Grouped raster for the resident-cluster 2x2 twin seeds: the co-resident
+# wave walks this many pair rows per group across the cluster-N columns.
+TCGEN05_CLUSTER_N2_SEED_L2_GROUPING = 8
 # This pid order stays slightly ahead of persistent_blocked in the validated
 # CtaGroup.TWO envelope.
 TCGEN05_TWO_CTA_SEED_PID_TYPE = "persistent_interleaved"
@@ -840,11 +854,12 @@ TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY = "tcgen05_warp_register_reallocat
 # general FFI seed eligibility (``tcgen05_config/seeds.py``) and the FFI
 # AB-stage repair (``tcgen05_config/repair.py``) consume this table via
 # ``tcgen05_direct_entry_stage_tuple_allowed``. ``bk=64`` admits the shallow
-# ``(3, 2)`` and deep ``(6, 4)`` A/B pipelines; ``bk=128`` admits the
-# ``(3, 2)`` pipeline. The admission is otherwise structural (any CtaGroup.TWO
-# ``bm=bn=256`` shape) — these stage tuples are the only per-``bk`` constraint.
+# ``(3, 2)`` and the deep ``(6, 2)`` / ``(6, 4)`` A/B pipelines; ``bk=128``
+# admits the ``(3, 2)`` pipeline. The admission is otherwise structural (any
+# CtaGroup.TWO ``bm=bn=256`` shape) — these stage tuples are the only
+# per-``bk`` constraint.
 TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK: dict[int, tuple[tuple[int, int], ...]] = {
-    64: ((3, 2), (6, 4)),
+    64: ((3, 2), (6, 2), (6, 4)),
     128: ((3, 2),),
 }
 

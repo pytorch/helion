@@ -24,9 +24,9 @@ import torch
 from .....autotuner.compiler_coverage import CompilerCoverageGroup
 from .....autotuner.compiler_coverage import CoverageWitness
 from .....exc import InvalidConfig
-from .....language import matmul_ops
 from .....runtime.config import Config
 from ....autotuner_heuristics.registry import AutotunerHeuristic
+from ...fragment_dot_support import fragment_tf32_dot_supported
 from .cute_fragment_common import computed_fragment_discovery_supported
 from .cute_fragment_common import fragment_coverage_carrier
 from .cute_fragment_common import fragment_root_regions
@@ -42,39 +42,6 @@ KEY = "cute_fp32_dot"
 MODES = ("simt", "tf32_mma")
 # A dot this large on every axis makes tf32_mma a seeded witness.
 SEED_DOT_EXTENT = 64
-# ``mma.sync`` with tf32 operands exists from sm_80.
-MIN_CAPABILITY = 8
-
-
-def fragment_tf32_dot_supported(node: Node, env: CompileEnvironment) -> bool:
-    """Whether *node* is an fp32 ``hl.dot`` the tf32 fragment MMA may lower.
-
-    Operands and the accumulator must be fp32 (the tensor core truncates the
-    staged fp32 words to tf32; nothing is rounded to half), the kernel's
-    ``dot_precision`` must map to tf32 and the target must have ``mma.sync``
-    tf32.  Tile divisibility (16 x 8 x 8) is a codegen matter: partial tiles
-    are predicated, so a qualifying dot never falls back silently.
-    """
-    from ...mma_support import cute_fp32_dot_uses_tf32
-
-    if node.op != "call_function" or node.target is not matmul_ops.dot:
-        return False
-    if len(node.args) < 2:
-        return False
-    operands = [node.args[0], node.args[1]]
-    if len(node.args) > 2 and node.args[2] is not None:
-        operands.append(node.args[2])
-    for operand in operands:
-        value = operand.meta.get("val") if isinstance(operand, torch.fx.Node) else None
-        if not isinstance(value, torch.Tensor) or value.dtype != torch.float32:
-            return False
-    out = node.meta.get("val")
-    if not isinstance(out, torch.Tensor) or out.dtype != torch.float32:
-        return False
-    if not cute_fp32_dot_uses_tf32():
-        return False
-    capability = env.config_spec.target_device_capability
-    return capability is not None and capability[0] >= MIN_CAPABILITY
 
 
 def _extent_hint(env: CompileEnvironment, size: int | torch.SymInt) -> int:
@@ -130,7 +97,7 @@ class CuteFp32DotHeuristic(AutotunerHeuristic):
 
     name = KEY
     backend = "cute"
-    priority = 60
+    priority = 61
 
     @classmethod
     def register_facts(

@@ -71,16 +71,6 @@ def node_tensor(node: object) -> torch.Tensor | None:
     return None
 
 
-def is_full_slice(value: object) -> bool:
-    """``value`` is the bare ``:`` subscript (``slice(None, None, None)``)."""
-    return (
-        isinstance(value, slice)
-        and value.start is None
-        and value.stop is None
-        and value.step is None
-    )
-
-
 def new_var_source(node: torch.fx.Node) -> torch.fx.Node | None:
     """The node one ``_new_var`` wrapper renames; None for any other node."""
     from ....language._tracing_ops import _new_var

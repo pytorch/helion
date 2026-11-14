@@ -79,6 +79,7 @@ from ..tile_strategy import TileStrategy
 from ..tile_strategy import VecLaneWrapper
 from ..tile_strategy import _to_sympy
 from . import thread_budget
+from .analysis.broadcast_axis import explicitly_replicated_axis
 from .argreduce import codegen_packed_reduction
 from .device_state import CuteVloopWrapperFact
 from .fold_lane_reductions import fold_site_key
@@ -1401,8 +1402,7 @@ class CutePersistentReductionEmitter(
     def _sibling_axis_group_params(
         self, state: CodegenState
     ) -> tuple[int, int, str, int, str] | None:
-        """Group params for a lane-reduce marker whose live thread axis has
-        unrelated sibling thread axes BELOW it in the launch block.
+        """Prove a lane-reduce marker's physical thread group.
 
         A plain ``warp_reduction_*(threads_in_group=N)`` folds N consecutive
         linear lanes, which is the reduction group only when the reduce axis
@@ -1417,9 +1417,10 @@ class CutePersistentReductionEmitter(
         group_count, shared_lane_expr)`` -- ``lane_expr`` is the static linear
         lane the marker analysis parses, ``shared_lane_expr`` the (possibly
         different) lane keying the two-stage helper's shared memory, or ``""``
-        for the same -- or ``None`` when the plain consecutive fold is already
-        correct (``pre == 1`` within one warp) or the layout cannot be
-        de-interleaved safely.
+        for the same -- or ``None`` when the layout cannot be proved. Even a
+        consecutive fold retains its physical coordinates: a broadcast input
+        may not read the reduction index, but its owner guard must still keep
+        that thread axis in the launch.
         """
         strategy = self.strategy
         env = CompileEnvironment.current()
@@ -1437,11 +1438,6 @@ class CutePersistentReductionEmitter(
         pre = 1
         for axis in range(reduce_axis):
             pre *= axis_sizes.get(axis, 1)
-        if pre <= 1 and reduce_extent <= _CUTE_WARP_REDUCTION_THREADS:
-            # The reduce axis is already at the bottom of the linear lane
-            # index and fits one warp: consecutive warp lanes belong to the
-            # reduction, so the plain warp reduce is correct.
-            return None
         group_span = pre * reduce_extent
         if group_span > 32 and group_span % 32 != 0:
             return None
@@ -1459,7 +1455,11 @@ class CutePersistentReductionEmitter(
         lane_expr = backend.thread_linear_index_expr(axis_sizes)
         if lane_expr is None:
             return None
-        if pre <= 1 and not strategy._cute_resident_reduction:
+        if (
+            pre <= 1
+            and group_span > _CUTE_WARP_REDUCTION_THREADS
+            and not strategy._cute_resident_reduction
+        ):
             # A one-vector-per-thread multi-warp row or a register tile
             # (``_cute_register_tile_predicted``): the only other ways a
             # synthetic-lane reduction keeps more than one warp.  Their
@@ -1652,6 +1652,11 @@ class CutePersistentReductionEmitter(
                         "cute", "reshape reduction has conflicting physical groups"
                     )
             owner_lane = self._lane_reduce_owner(state, reshape_group=group_params)
+            broadcast_owner = (
+                state.fx_node is not None
+                and isinstance(state.fx_node.args[0], torch.fx.Node)
+                and explicitly_replicated_axis(state.fx_node.args[0], dim)
+            )
             sibling_params = (
                 self._sibling_axis_group_params(state) if group_params is None else None
             )
@@ -1668,6 +1673,7 @@ class CutePersistentReductionEmitter(
                         group_span=group_span,
                         group_lane_expr=group_lane_expr,
                         owner_lane=owner_lane,
+                        broadcast_owner=broadcast_owner,
                     )
                 if sibling_params is not None:
                     (
@@ -1687,10 +1693,16 @@ class CutePersistentReductionEmitter(
                         group_lane_expr=group_lane_expr,
                         group_count=group_count,
                         owner_lane=owner_lane,
+                        broadcast_owner=broadcast_owner,
                         shared_lane_expr=shared_lane_expr,
                     )
                 return _lane_reduce_marker_expr(
-                    value, combine, identity, threads, owner_lane=owner_lane
+                    value,
+                    combine,
+                    identity,
+                    threads,
+                    owner_lane=owner_lane,
+                    broadcast_owner=broadcast_owner,
                 )
 
             if not backend.is_indexed_reduction(reduction_type):

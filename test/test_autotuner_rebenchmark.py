@@ -264,7 +264,7 @@ class TestAutotunerRebenchmark(AutotunerTestCase):
             lambda: None, [11.0], (), helion.Config(num_warps=8), status="ok"
         )
         search.population = [other, best]
-        search._unkillable_configs = set()
+        search._fallback_excluded_configs = set()
 
         with patch.object(
             search,
@@ -290,19 +290,19 @@ class TestAutotunerRebenchmark(AutotunerTestCase):
             lambda: None, [11.0], (), helion.Config(num_warps=8), status="ok"
         )
         search.population = [other, best]
-        search._unkillable_configs = set()
+        search._fallback_excluded_configs = set()
         error = BenchmarkWorkerUnkillable("worker remained alive")
         error.fn_index = 1
         search._record_unkillable([other, best], error)
-        self.assertEqual(search._unkillable_configs, {best.config})
+        self.assertEqual(search._fallback_excluded_configs, {best.config})
 
         with patch.object(search, "final_rebenchmark_best", side_effect=error):
             self.assertEqual(search._finalize(), other.config)
         self.assertIs(search.best, other)
 
         search._record_unkillable([other, best], BenchmarkWorkerUnkillable("x"))
-        self.assertEqual(search._unkillable_configs, {best.config})
-        search._unkillable_configs.add(other.config)
+        self.assertEqual(search._fallback_excluded_configs, {best.config})
+        search._fallback_excluded_configs.add(other.config)
         with (
             patch.object(search, "final_rebenchmark_best", side_effect=error),
             self.assertRaises(BenchmarkWorkerUnkillable),
@@ -326,7 +326,7 @@ class TestAutotunerRebenchmark(AutotunerTestCase):
         search.benchmark_provider.cleanup.side_effect = BenchmarkWorkerUnkillable(
             "worker remained alive"
         )
-        search._unkillable_configs = set()
+        search._fallback_excluded_configs = set()
         selected = helion.Config(num_warps=4)
 
         with (
@@ -338,7 +338,7 @@ class TestAutotunerRebenchmark(AutotunerTestCase):
         search.benchmark_provider.cleanup.assert_called_once()
 
         # ... unless the selected config is the one whose worker hung
-        search._unkillable_configs = {selected}
+        search._fallback_excluded_configs = {selected}
         with (
             patch.object(search, "_prepare"),
             patch.object(search, "_autotune", return_value=selected),
@@ -1967,6 +1967,7 @@ class TestAutotuneBestOfK(RefEagerTestDisabled, TestCase):
                 self.args = args
                 self.best_perf_so_far = math.inf
                 self._skip_cache = False
+                self._benchmark_provider_cls = LocalBenchmarkProvider
 
                 class _Log:
                     def __call__(self, *a, **kw):
@@ -2030,6 +2031,7 @@ class TestAutotuneBestOfK(RefEagerTestDisabled, TestCase):
                 self.args = args
                 self.best_perf_so_far = math.inf
                 self._skip_cache = False
+                self._benchmark_provider_cls = LocalBenchmarkProvider
 
                 class _Log:
                     def __call__(self, *a, **kw):
@@ -2266,6 +2268,7 @@ class TestAutotuneBestOfK(RefEagerTestDisabled, TestCase):
                 self.args = args
                 self.best_perf_so_far = math.inf
                 self._skip_cache = False
+                self._benchmark_provider_cls = LocalBenchmarkProvider
 
                 class _Log:
                     def __call__(self, *a, **kw):
@@ -2362,6 +2365,7 @@ class TestAutotuneBestOfK(RefEagerTestDisabled, TestCase):
                 self.args = args
                 self.best_perf_so_far = 1.0
                 self._skip_cache = False
+                self._benchmark_provider_cls = LocalBenchmarkProvider
                 self.log = _Log()
 
             def autotune(self, *, skip_cache: bool = False):

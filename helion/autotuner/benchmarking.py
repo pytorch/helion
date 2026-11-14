@@ -14,6 +14,7 @@ import time
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+from typing import Literal
 from typing import TypeVar
 from typing import cast
 
@@ -190,6 +191,7 @@ class MirroredBenchmarkTrace:
     sweep_count: int | None = None
     calls_per_sample: int | None = None
     total_calls: int | None = None
+    statuses: list[Literal["ok", "incomplete", "error", "timeout"]] | None = None
 
 
 def _mirrored_bench_call_layout(desired_calls: int) -> tuple[int, int, int]:
@@ -869,6 +871,9 @@ def interleaved_bench(
             ``replay``, see ``_l2_flush_mode``); ``None`` reads
             ``HELION_AUTOTUNE_L2_FLUSH``
     """
+    if not fns:
+        return []
+
     from triton import runtime
 
     # warmup
@@ -1584,12 +1589,22 @@ def do_bench_cuda_graph(
     pre_warmed: bool = False,
     reset: Callable[[], None] | None = None,
     phase: Callable[[str], None] | None = None,
+    l2_flush_mode: str = "replay",
+    pre_timing: Callable[[], object] | None = None,
 ) -> float | tuple[float, ...]:
     """Time GPU execution with external event nodes inside one CUDA graph.
 
     Input reset and L2 clearing precede the start event. Python dispatch and
     graph submission are excluded. ``reset`` must contain capturable device
     operations; it runs before every invocation, including capture and warmup.
+    ``l2_flush_mode`` is explicitly ``replay`` (the historical default, which
+    does not consult the environment) or ``off``. ``pre_timing`` optionally
+    runs after clearing and before the start event on every replay; its outputs
+    stay alive alongside the timed outputs. A reset also separates these calls.
+    Setup warms both callbacks unless ``pre_warmed`` says the caller already did.
+    An explicit primer also works with ``replay``: that mode clears before the
+    primer, not between the primer and timed call. Callers choose this order
+    explicitly; rotating input banks use a primer only with ``off``.
 
     Warmup/repetition windows bound sampling wall time; reported samples are
     device milliseconds. Capture errors propagate without a timing fallback.
@@ -1613,8 +1628,12 @@ def do_bench_cuda_graph(
         raise ValueError("warmup must be nonnegative and rep must be positive")
     if return_mode not in ("min", "max", "mean", "median", "all"):
         raise ValueError(f"Invalid return_mode: {return_mode}")
+    if l2_flush_mode not in ("replay", "off"):
+        raise ValueError("CUDA graph l2_flush_mode must be replay or off")
 
-    clear_l2 = _make_l2_cache_clearer()
+    clear_l2 = (
+        _make_l2_cache_clearer() if l2_flush_mode == "replay" else _no_cache_clear
+    )
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     start = torch.cuda.Event(enable_timing=True, external=True)
@@ -1623,6 +1642,10 @@ def do_bench_cuda_graph(
         if reset is not None:
             reset()
         if not pre_warmed:
+            if pre_timing is not None:
+                pre_timing()
+                if reset is not None:
+                    reset()
             fn()
         # Materialize event handles before capture.
         start.record()
@@ -1630,48 +1653,63 @@ def do_bench_cuda_graph(
     stream.synchronize()
     if phase is not None:
         phase("capture")
-    with cute_cuda_graph(stream=stream) as graph:
-        if reset is not None:
-            reset()
-        clear_l2()
-        start.record()
-        # Keep the captured output alive until all replays finish.
-        _output = fn()
-        end.record()
+    graph = None
+    _priming_output = None
+    _output = None
+    try:
+        with cute_cuda_graph(stream=stream) as graph:
+            if reset is not None:
+                reset()
+            clear_l2()
+            _priming_output = pre_timing() if pre_timing is not None else None
+            if pre_timing is not None and reset is not None:
+                reset()
+            start.record()
+            # Keep the captured output alive until all replays finish.
+            _output = fn()
+            end.record()
 
-    def sample() -> float:
-        with torch.cuda.stream(stream):
-            graph.replay()
-        stream.synchronize()
-        elapsed = float(start.elapsed_time(end))
-        if not math.isfinite(elapsed) or elapsed <= 0:
-            raise ValueError(f"Invalid GPU-only timing: {elapsed}")
-        return elapsed
+        def sample() -> float:
+            with torch.cuda.stream(stream):
+                graph.replay()
+            stream.synchronize()
+            elapsed = float(start.elapsed_time(end))
+            if not math.isfinite(elapsed) or elapsed <= 0:
+                raise ValueError(f"Invalid GPU-only timing: {elapsed}")
+            return elapsed
 
-    if phase is not None:
-        phase("warmup")
-    if fixed_repetitions is None:
-        began = time.perf_counter()
-        sample()
-        # Count complete replays, including cache clearing and synchronization,
-        # to avoid excessive sampling work for microsecond kernels.
-        iteration_ms = sync_object(
-            max((time.perf_counter() - began) * 1000, 1e-6), process_group_name
+        if phase is not None:
+            phase("warmup")
+        if fixed_repetitions is None:
+            began = time.perf_counter()
+            sample()
+            # Count complete replays, including cache clearing and synchronization,
+            # to avoid excessive sampling work for microsecond kernels.
+            iteration_ms = sync_object(
+                max((time.perf_counter() - began) * 1000, 1e-6), process_group_name
+            )
+            n_warmup = max(0, int(warmup / iteration_ms))
+            n_repeat = max(1, int(rep / iteration_ms))
+        else:
+            n_warmup = 0
+            n_repeat = fixed_repetitions
+        for _ in range(n_warmup):
+            sample()
+        if phase is not None:
+            phase("measure")
+        samples = [sample() for _ in range(n_repeat)]
+        return cast(
+            "float | tuple[float, ...]",
+            _summarize_statistics(samples, quantiles, return_mode),
         )
-        n_warmup = max(0, int(warmup / iteration_ms))
-        n_repeat = max(1, int(rep / iteration_ms))
-    else:
-        n_warmup = 0
-        n_repeat = fixed_repetitions
-    for _ in range(n_warmup):
-        sample()
-    if phase is not None:
-        phase("measure")
-    samples = [sample() for _ in range(n_repeat)]
-    return cast(
-        "float | tuple[float, ...]",
-        _summarize_statistics(samples, quantiles, return_mode),
-    )
+    finally:
+        if graph is not None:
+            # Native graph resources must be released before retained outputs
+            # die, including when capture, a callback, or sampling raises.
+            try:
+                stream.synchronize()
+            finally:
+                graph.reset()
 
 
 def do_bench_generic(

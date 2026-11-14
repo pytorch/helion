@@ -15,13 +15,10 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from test.test_cute_tcgen05_fixed_chain import CPU_DEVICE
 from test.test_cute_tcgen05_fixed_chain import _batched_gemm
 from test.test_cute_tcgen05_fixed_chain import _bind_bmm
-from test.test_cute_tcgen05_fixed_chain import _bind_gemm
 from test.test_cute_tcgen05_fixed_chain import _bind_two_output_gemm
 from test.test_cute_tcgen05_fixed_chain import _kernel_body
-from test.test_cute_tcgen05_fixed_chain import _ordinary_gemm
 from test.test_cute_tcgen05_fixed_chain import _source
 from test.test_cute_tcgen05_fixed_chain import _two_output_gemm
 from test.test_cute_tcgen05_fixed_cost import _bind_row_bias_gemm
@@ -37,6 +34,11 @@ from helion._compiler.cute.tcgen05_config import surface
 from helion._testing import DEVICE
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
+from helion._testing.cute_mma_dag import CPU_DEVICE
+from helion._testing.cute_mma_dag import _ordinary_gemm
+from helion._testing.cute_mma_dag import bind_cpu_gemm as _bind_gemm
+from helion._testing.cute_mma_dag import normalize_config as _normalize
+from helion._testing.cute_mma_dag import repaired_config as _repaired
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -250,27 +252,10 @@ def _warp_config(
     return helion.Config(**values)
 
 
-def _normalize(
-    bound: helion.runtime.kernel.BoundKernel, config: helion.Config, *, fix: bool
-) -> dict[str, object]:
-    copied = helion.Config(
-        **{k: list(v) if isinstance(v, list) else v for k, v in config.config.items()}
-    )
-    with bound.env:
-        bound.config_spec.normalize(copied, _fix_invalid=fix)
-    return copied.config
-
-
 def _strict(
     bound: helion.runtime.kernel.BoundKernel, config: helion.Config
 ) -> dict[str, object]:
     return _normalize(bound, config, fix=False)
-
-
-def _repaired(
-    bound: helion.runtime.kernel.BoundKernel, config: helion.Config
-) -> dict[str, object]:
-    return _normalize(bound, config, fix=True)
 
 
 def _plan(source: str) -> dict[str, object]:

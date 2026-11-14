@@ -392,7 +392,7 @@ def disk_cache_key(
     (``referenced_helper_sources``), full input
     specialization (dtypes, ranks,
     pointer alignments, baked shapes/strides, constexpr values), launch shape
-    (block/cluster), preferred shared-memory carveout, CuTe compile options,
+    (block/cluster), CuTe compile options,
     the IR-affecting
     ``CUTE_DSL_*`` env vars (target SM arch among them), and the cutlass version.
 
@@ -459,11 +459,6 @@ def disk_cache_key(
             block,
             wrapper_plans,
             repr(cluster_shape),
-            getattr(
-                cast("Any", cute_kernel),
-                "_helion_cute_preferred_smem_carveout",
-                None,
-            ),
             compile_options or "",
             cache_relevant_env(),
             cutlass_version,

@@ -4,7 +4,31 @@ import torch
 import triton
 import triton.language as tl
 
-__all__ = ["max_propagate_nan", "min_propagate_nan", "triton_wait_signal"]
+__all__ = [
+    "integer_full",
+    "max_propagate_nan",
+    "min_propagate_nan",
+    "triton_wait_signal",
+]
+
+
+@triton.jit
+def integer_full(
+    shape: tl.constexpr, value: tl.tensor, dtype: tl.constexpr
+) -> tl.tensor:
+    # tl.full forwards a constexpr directly to the integer constant builder,
+    # which rejects Python floats. Convert before materializing a tensor so a
+    # float64 Python value is not rounded to float32, or a large int to float64.
+    # Runtime scalar tensors retain tl.full's ordinary device cast.
+    # Triton's isinstance unwraps constexprs before checking the Python type.
+    if not isinstance(value, tl.tensor):
+        if dtype == tl.int1:
+            converted = value != 0
+        else:
+            converted = int(value)
+    else:
+        converted = value
+    return tl.full(shape, converted, dtype)
 
 
 @triton.jit

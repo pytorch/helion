@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-from contextlib import ExitStack
 from copy import deepcopy
 from dataclasses import replace
 from itertools import count
@@ -9,18 +8,12 @@ from types import ModuleType
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import cast
-from unittest.mock import patch
 
 import pytest
 import torch
-from torch._inductor.runtime.hints import DeviceProperties
-from torch._subclasses.fake_tensor import FakeTensor
-
-from test.cute_population_contracts import _target
 
 import helion
 from helion._compiler.ast_extension import ExtendedAST
-from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.autotune.heuristics.cute_epilogue_fanout import (
     _fits_one_wave,
 )
@@ -42,7 +35,7 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
 from helion._compiler.type_info import LiteralType
 from helion._testing import import_example
-from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_codegen import cuda_metadata_trace
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 import helion.language as hl
@@ -342,62 +335,8 @@ def known_metadata(
 
 @pytest.fixture(autouse=True)
 def cuda_trace() -> Generator[None, None, None]:
-    """Real static converter, with only the traced device replaced by CUDA."""
-    old_init = CompileEnvironment.__init__
-    old_convert = CompileEnvironment._to_fake_tensor
-    old_threads = torch.get_num_threads()
-    initial_cuda_state = torch.cuda.is_initialized()
-    torch.set_num_threads(1)
-
-    def initialize(env: Any, device: torch.device, *args: Any, **kwargs: Any) -> None:
-        assert device.type in ("cpu", "cuda")
-        old_init(env, torch.device("cuda:0"), *args, **kwargs)
-
-    def convert(env: Any, tensor: torch.Tensor, origin: Any) -> FakeTensor:
-        result = old_convert(env, tensor, origin)
-        assert isinstance(result, FakeTensor) and result.fake_mode is env.fake_mode
-        result.fake_device = torch.device("cuda:0")
-        return result
-
-    try:
-        with ExitStack() as stack:
-            stack.enter_context(_target())
-            stack.enter_context(
-                patch.object(CompileEnvironment, "__init__", initialize)
-            )
-            stack.enter_context(
-                patch.object(CompileEnvironment, "_to_fake_tensor", convert)
-            )
-            stack.enter_context(mock_cuda_unavailable())
-            stack.enter_context(
-                patch(
-                    "torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")
-                )
-            )
-            stack.enter_context(
-                patch("torch.cuda.get_device_capability", return_value=(10, 0))
-            )
-            stack.enter_context(
-                patch.object(
-                    DeviceProperties,
-                    "create",
-                    return_value=DeviceProperties(
-                        type="cuda",
-                        index=0,
-                        multi_processor_count=148,
-                        cc=100,
-                        major=10,
-                        regs_per_multiprocessor=65536,
-                        max_threads_per_multi_processor=2048,
-                        max_threads_per_block=1024,
-                        warp_size=32,
-                    ),
-                )
-            )
-            yield
-    finally:
-        torch.set_num_threads(old_threads)
-        assert torch.cuda.is_initialized() == initial_cuda_state
+    with cuda_metadata_trace():
+        yield
 
 
 def bind(

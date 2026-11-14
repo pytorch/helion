@@ -2,9 +2,9 @@
 
 ``cute_fragment_vector_io``: a host tensor window whose innermost logical
 coordinate walks a unit-stride tensor dimension in whole, aligned groups is
-moved as 16-byte packets (four fp32, eight 16-bit elements) instead of one
-scalar per element.  Unlike ``cute_fragment_packet_loads`` (which evaluates
-the scalar address recipe for every lane and compares the effective
+moved as 16-byte packets (four fp32, eight 16-bit, or sixteen byte elements)
+instead of one scalar per element. Unlike ``cute_fragment_packet_loads``
+(which evaluates the scalar address recipe for every lane and compares the effective
 addresses at run time), the packet here is proved at compile time:
 
 * the tensor's strides are static, the innermost indexed dimension has

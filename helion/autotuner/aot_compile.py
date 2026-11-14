@@ -282,6 +282,7 @@ def generate_standalone_file(
     user_key: Callable[..., object] | None = None,
     dynamic_groups: list[tuple[tuple[object, ...], list[int]]] | None = None,
     runtime_guards: tuple[RuntimeGuard, ...] = (),
+    runtime_guard_plans: tuple[tuple[RuntimeGuard, ...], ...] | None = None,
 ) -> Path:
     """
     Generate one standalone ``.py`` file containing every selected config.
@@ -302,6 +303,14 @@ def generate_standalone_file(
         dispatch_keys: Optional static call keys parallel to *triton_codes*.
         tensor_descriptor_guards: Include tensor-descriptor runtime predicates in
             static dispatch keys.
+        runtime_guards: Legacy single structural guard plan. Static keys are
+            ``(call_key, guard_key)``; dynamic-group keys wrap that pair as
+            ``("exact" | "dynamic", (call_key, guard_key))``.
+        runtime_guard_plans: Structural plans carried by static keys as
+            ``(plan, call_key, guard_key)`` and dynamic-group keys as
+            ``("exact" | "dynamic", (plan, call_key, guard_key))``. Every key's
+            plan must be listed. Do not combine explicit plans with nonempty
+            ``runtime_guards``.
 
     Returns:
         Path to the generated file.
@@ -320,6 +329,7 @@ def generate_standalone_file(
             user_key,
             dynamic_groups,
             runtime_guards,
+            runtime_guard_plans,
         )
     if dispatch_keys is not None:
         if len(dispatch_keys) != len(triton_codes):

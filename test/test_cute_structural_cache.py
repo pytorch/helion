@@ -11,14 +11,11 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test.cute_population_contracts import tcgen05_mma_support
-from test.test_cute_full_slice_matmul import _matmul
-from test.test_cute_structural_compatibility import _pointwise_bound
-
 import helion
-from helion._hardware import HardwareInfo
-from helion._testing import cpu_render_target
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_structural import _cpu_only  # noqa: F401
+from helion._testing.cute_structural import _search
+from helion._testing.cute_structural_kernels import _matmul
 from helion.autotuner.aot_cache import AOTAutotuneCache
 from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.local_cache import LocalAutotuneCache
@@ -30,53 +27,12 @@ from helion.autotuner.remote_cache import RemoteCacheBackend
 from helion.autotuner.remote_cache import StrictRemoteAutotuneCache
 from helion.runtime.cute.structural_config import CuteStructuralConfig
 from helion.runtime.cute.structural_config import StructuralPolicyError
-from helion.runtime.cute.structural_policy import CUTE_STRUCTURAL_SETTINGS
 from helion.runtime.cute.structural_policy import CuteStructuralPolicy
 
 pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
     from pathlib import Path
-
-
-@pytest.fixture(autouse=True)
-def _cpu_only(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
-    for name in CUTE_STRUCTURAL_SETTINGS:
-        monkeypatch.delenv(f"HELION_{name.upper()}", raising=False)
-    monkeypatch.delenv("HELION_BACKEND", raising=False)
-    monkeypatch.setenv("HELION_AUTOTUNE_RANDOM_SEED", "0")
-    previous_threads = torch.get_num_threads()
-    torch.set_num_threads(1)
-    # Share one undo stack with test bodies so their changes cannot restore
-    # fixture-local AOT settings after this fixture has finished.
-    monkeypatch.setenv("HELION_CACHE_DIR", str(tmp_path / "local"))
-    monkeypatch.setenv("HELION_AOT_DATA_DIR", str(tmp_path / "aot"))
-    monkeypatch.setenv("HELION_AOT_MODE", "collect")
-    monkeypatch.delenv("HELION_SKIP_CACHE", raising=False)
-    AOTAutotuneCache.clear_caches()
-    try:
-        with (
-            cpu_render_target(mma_support=tcgen05_mma_support()),
-            patch(
-                "helion.autotuner.aot_cache.get_hardware_info",
-                return_value=HardwareInfo(
-                    device_kind="cuda",
-                    hardware_name="CPU SM100 proof",
-                    runtime_version="13.0",
-                    compute_capability="sm100",
-                ),
-            ),
-        ):
-            yield
-    finally:
-        AOTAutotuneCache.clear_caches()
-        torch.set_num_threads(previous_threads)
-
-
-def _search(policy: CuteStructuralPolicy | None) -> BaseSearch:
-    bound = _pointwise_bound(policy)
-    return BaseSearch(bound, (torch.empty(37),))
 
 
 def _cache(

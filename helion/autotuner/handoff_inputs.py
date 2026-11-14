@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import types
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import NamedTuple
@@ -15,6 +16,8 @@ from torch.utils._pytree import tree_flatten
 from torch.utils._pytree import tree_map
 
 from .benchmark_provider import _clone_args
+from .kernel_args import _InputCloneGraph
+from .tensor_serialization import save_tensor_tree
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -96,7 +99,20 @@ def _clone_inputs(args: Sequence[object]) -> Sequence[object]:
     )
 
 
+def _require_callback_free_inputs(value: object) -> None:
+    # Reuse the supported argument graph, including declared record fields.
+    # Handoff replay cannot restore callback captures with tensor alignment.
+    graph = _InputCloneGraph()
+    if graph.copy_ids(value, lambda item: isinstance(item, types.FunctionType)):
+        raise TypeError(
+            "Standalone handoff inputs do not support Python callbacks; "
+            "pass their tensor and scalar operands explicitly."
+        )
+
+
 def _save_inputs(value: object, path: str | Path) -> None:
+    _require_callback_free_inputs(value)
+
     def encode(item: object) -> object:
         if is_namedtuple(item):
             item = cast("Any", item)
@@ -107,7 +123,7 @@ def _save_inputs(value: object, path: str | Path) -> None:
             )
         return item
 
-    torch.save(
+    save_tensor_tree(
         _SavedInputs(
             tree_map(encode, value, is_leaf=is_namedtuple), _storage_residues(value)
         ),
@@ -117,6 +133,9 @@ def _save_inputs(value: object, path: str | Path) -> None:
 
 def _load_inputs(path: str | Path) -> object:
     saved = torch.load(path, weights_only=False)
+    _require_callback_free_inputs(
+        saved.value if isinstance(saved, _SavedInputs) else saved
+    )
     if not isinstance(saved, _SavedInputs):
         return saved  # Older bundles stored the argument tree directly.
 
