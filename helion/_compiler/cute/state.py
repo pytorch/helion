@@ -483,6 +483,10 @@ class CuteLaneState:
     vloop_sink_stores: dict[str, CuteVloopStoreFact] = dataclasses.field(
         default_factory=dict
     )
+    # Persistent-reduction lane loops walking several V-wide chunks per
+    # thread, by lane variable: V.  The branch-local persistent vectorizer
+    # places one packet per chunk in them.
+    chunked_reduction_lanes: dict[str, int] = dataclasses.field(default_factory=dict)
     # ``cute_vloop_sink`` shaped the code ahead of the sink (it kept the
     # vectorized grid axis on thread x, or respelled a flattened tile's index
     # for it); when no V-loop is sunk after all, codegen restarts with the

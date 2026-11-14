@@ -8148,10 +8148,17 @@ class TestCuteAutotuner(TestCase):
         # elimination. The set still excludes Triton-style knobs that
         # the CuTe path does not consume.
         # Resident packet controls are explicit CuTe config fields; unseeded
-        # configs retain their false-only search domains.
+        # configs retain their false-only search domains.  On sm_100 the
+        # fp32 adds can pair into packed instructions.
+        pair_lane_math = (
+            {"cute_pair_lane_math"}
+            if gen.config_spec.cute_pair_lane_math_sites
+            else set()
+        )
         self.assertEqual(
             flat_keys,
-            {
+            pair_lane_math
+            | {
                 "block_sizes",
                 "num_threads",
                 "cute_compiler_pipeline",
@@ -8181,6 +8188,7 @@ class TestCuteAutotuner(TestCase):
                 "cute_unpadded_rows",
                 "cute_grid_lane_jam",
                 "cute_scratch_forwarding",
+                "cute_uniform_lane_compares",
                 "cute_pdl",
                 "cute_pdl_release",
                 "cute_pdl_spread",

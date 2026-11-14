@@ -77,6 +77,38 @@ def row_softmax_bwd(
     return out
 
 
+def row_softmax_bwd_recomputing(
+    grad: torch.Tensor,
+    logits: torch.Tensor,
+    bias: torch.Tensor,
+    row_max: torch.Tensor,
+    row_sum: torch.Tensor,
+) -> torch.Tensor:
+    """A softmax backward over rows whose first sweep stores ``grad * probs``
+    to a workspace and sums it, and whose second recomputes the
+    probabilities from the logits and the bias and reads the product back
+    (T5's encoder shape)."""
+    rows, n = logits.shape
+    product_ws = torch.empty([rows, n], dtype=torch.float32, device=logits.device)
+    out = torch.empty_like(logits)
+    for tile_r in hl.tile(rows):
+        probs = (
+            torch.exp(
+                logits[tile_r, :].to(torch.float32)
+                + bias[tile_r, :]
+                - row_max[tile_r][:, None]
+            )
+            / row_sum[tile_r][:, None]
+        )
+        product = grad[tile_r, :].to(torch.float32) * probs
+        product_ws[tile_r, :] = product
+        total = torch.sum(product, dim=-1, keepdim=True)
+        out[tile_r, :] = torch.ops.prims.fma(-probs, total, product_ws[tile_r, :]).to(
+            out.dtype
+        )
+    return out
+
+
 def row_softmax_bwd_keeping_workspace(
     grad: torch.Tensor,
     logits: torch.Tensor,

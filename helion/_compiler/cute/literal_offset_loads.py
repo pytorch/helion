@@ -31,10 +31,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-from torch.fx.experimental.symbolic_shapes import statically_known_true
 
 from ..compile_environment import CompileEnvironment
-from .memory_ops import tensor_has_specialized_base_alignment
+from .memory_ops import tensor_proven_base_alignment
 from .packet_access import match_packet_access
 from .scalar_recipe import PURE_HELPERS
 
@@ -134,8 +133,6 @@ def _tensor_facts(device_function: DeviceFunction) -> dict[str, _TensorFacts]:
     from ..device_function import TensorArg
 
     env = CompileEnvironment.current()
-    inputs = list(env.input_sources)
-    input_storages = {id(tensor.untyped_storage()) for tensor in inputs}
     proven = device_function.proven_tensor_stride_values()
     facts: dict[str, _TensorFacts] = {}
     for arg in device_function.arguments:
@@ -150,27 +147,7 @@ def _tensor_facts(device_function: DeviceFunction) -> dict[str, _TensorFacts]:
         for (name, dim), stride in proven.items():
             if name == arg.name:
                 strides.setdefault(dim, stride)
-        storage = id(tensor.untyped_storage())
-        offset = tensor.storage_offset() * tensor.element_size()
-        alignment = 1
-        for candidate in (16, 8, 4, 2):
-            aligned = storage not in input_storages and statically_known_true(
-                offset % candidate == 0
-            )
-            if not aligned:
-                aligned = any(
-                    id(source.untyped_storage()) == storage
-                    and tensor_has_specialized_base_alignment(env, source, candidate)
-                    and statically_known_true(
-                        (offset - source.storage_offset() * source.element_size())
-                        % candidate
-                        == 0
-                    )
-                    for source in inputs
-                )
-            if aligned:
-                alignment = candidate
-                break
+        alignment = tensor_proven_base_alignment(env, tensor, (16, 8, 4, 2)) or 1
         try:
             dtype = env.backend.dtype_str(tensor.dtype)
         except Exception:
@@ -181,13 +158,13 @@ def _tensor_facts(device_function: DeviceFunction) -> dict[str, _TensorFacts]:
     return facts
 
 
-def _add_terms(node: ast.expr) -> list[ast.expr]:
+def add_terms(node: ast.expr) -> list[ast.expr]:
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        return [*_add_terms(node.left), *_add_terms(node.right)]
+        return [*add_terms(node.left), *add_terms(node.right)]
     return [node]
 
 
-def _strip_int_cast(node: ast.expr) -> ast.expr:
+def strip_int_cast(node: ast.expr) -> ast.expr:
     while (
         isinstance(node, ast.Call)
         and len(node.args) == 1
@@ -199,7 +176,7 @@ def _strip_int_cast(node: ast.expr) -> ast.expr:
 
 
 def _stride_reference(node: ast.expr) -> tuple[str, int] | None:
-    node = _strip_int_cast(node)
+    node = strip_int_cast(node)
     if (
         isinstance(node, ast.Subscript)
         and isinstance(node.slice, ast.Constant)
@@ -214,7 +191,7 @@ def _stride_reference(node: ast.expr) -> tuple[str, int] | None:
     return None
 
 
-def _stride_term(node: ast.expr) -> tuple[ast.expr, str, int] | None:
+def stride_term(node: ast.expr) -> tuple[ast.expr, str, int] | None:
     """``coefficient * T.layout.stride[d]`` (either order) as ``(coefficient, T, d)``."""
     if not isinstance(node, ast.BinOp) or not isinstance(node.op, ast.Mult):
         return None
@@ -226,7 +203,7 @@ def _stride_term(node: ast.expr) -> tuple[ast.expr, str, int] | None:
 
 
 def _literal(node: ast.expr) -> int | None:
-    node = _strip_int_cast(node)
+    node = strip_int_cast(node)
     if isinstance(node, ast.Constant) and type(node.value) is int:
         return node.value
     return None
@@ -244,7 +221,7 @@ class _Pointer:
 
 
 def _pointer(node: ast.expr) -> _Pointer | None:
-    terms = _add_terms(node)
+    terms = add_terms(node)
     roots = [
         term.value.id
         for term in terms
@@ -262,7 +239,7 @@ def _pointer(node: ast.expr) -> _Pointer | None:
         if isinstance(term, ast.Attribute) and term.attr == "iterator":
             others.append(ast.dump(term))
             continue
-        stride = _stride_term(term)
+        stride = stride_term(term)
         if stride is None or stride[1] != tensor:
             return None
         coefficient, _, dim = stride
@@ -547,14 +524,14 @@ class _Merger:
         class Retarget(ast.NodeTransformer):
             def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
                 nonlocal retargeted
-                stride = _stride_term(node)
+                stride = stride_term(node)
                 if (
                     not retargeted
                     and stride is not None
                     and stride[2] == parsed.dim
                     and _literal(stride[0]) == first.literal
                 ):
-                    constant = _strip_int_cast(stride[0])
+                    constant = strip_int_cast(stride[0])
                     assert isinstance(constant, ast.Constant)
                     constant.value = target
                     retargeted = True

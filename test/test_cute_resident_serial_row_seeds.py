@@ -194,9 +194,13 @@ def _initial_population_with_legacy_prefix(
                 patch("helion._compiler.cute.autotune.heuristics." + registration)
             )
         old_bound = cpu_bind(bound.kernel, args)
-    _old_search, old, old_rng = _capture_initial_population(old_bound, args, seed)
+    old_search, old, old_rng = _capture_initial_population(old_bound, args, seed)
     search, delivered, rng = _capture_initial_population(bound, args, seed)
-    assert len(old) == 100
+    # The packed V-lane knob's witnesses, registered before the fragment
+    # groups, follow the 100 rows in both populations.
+    assert len(old) == 100 + sum(
+        outcome.outcome == "added" for outcome in old_search.compiler_coverage_outcomes
+    )
     assert delivered[: len(old)] == old
     assert rng == old_rng
     additions = delivered[len(old) :]
@@ -269,6 +273,8 @@ def test_entire_old_seed_prefix_and_default_are_preserved(
         for group in spec.compiler_coverage_groups
         if group.mechanism not in _FRAGMENT_COVERAGE_MECHANISMS
     ] == [
+        "cute.pair_lane_math",
+        "cute.uniform_lane_compares",
         "cute.resident_row_consumption",
         "cute.resident_terminal_product",
     ]

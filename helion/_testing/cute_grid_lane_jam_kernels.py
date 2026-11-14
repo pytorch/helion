@@ -53,6 +53,20 @@ def bias_softmax(scores: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def head_quotients(scores: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """``scores / bias + bias / (scores + 1)`` over a device loop of keys, with
+    ``bias_softmax``'s heads-innermost bias: two elementwise fp32 quotients a
+    key."""
+    batch, heads, q_len, k_len = bias.shape
+    out = torch.empty_like(scores)
+    for tile_b, tile_h, tile_q in hl.tile([batch, heads, q_len]):
+        for tile_k in hl.tile(k_len):
+            x = scores[tile_b, tile_h, tile_q, tile_k].to(torch.float32)
+            y = bias[tile_b, tile_h, tile_q, tile_k].to(torch.float32)
+            out[tile_b, tile_h, tile_q, tile_k] = (x / y + y / (x + 1.0)).to(out.dtype)
+    return out
+
+
 def nested_bias_exp(scores: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
     """``exp(scores + bias)`` with ``bias_softmax``'s heads-innermost bias, in
     a device loop over the keys nested in one over the queries."""
@@ -263,3 +277,45 @@ def hinted_head_rows(scores: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
             logits - torch.amax(logits, dim=-1, keepdim=True)
         ).to(out.dtype)
     return out
+
+
+def bucket_grad_scatter(
+    grads: torch.Tensor, buckets: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    """T5's relative-position-bias gradient, ``out[buckets[q, k], h] +=
+    grads[:, h, q, k].sum(0)``: under ``cute_privatize_atomics`` the adds go
+    to a shared-memory copy of the small ``out``."""
+    _, heads, q_len, k_len = grads.shape
+    for tile_h, tile_q, tile_k in hl.tile([heads, q_len, k_len]):
+        total = torch.sum(grads[:, tile_h, tile_q, tile_k].to(torch.float32), dim=0)
+        head = tile_h.index.unsqueeze(1).unsqueeze(2)
+        hl.atomic_add(out, [buckets[tile_q, tile_k].unsqueeze(0), head], total)
+    return out
+
+
+def bucket_grad_scatter_twice(
+    grads: torch.Tensor, buckets: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    """``bucket_grad_scatter`` adding each total twice, into its bucket and
+    into the next one."""
+    _, heads, q_len, k_len = grads.shape
+    num_buckets = out.size(0)
+    for tile_h, tile_q, tile_k in hl.tile([heads, q_len, k_len]):
+        total = torch.sum(grads[:, tile_h, tile_q, tile_k].to(torch.float32), dim=0)
+        head = tile_h.index.unsqueeze(1).unsqueeze(2)
+        bucket = buckets[tile_q, tile_k].unsqueeze(0)
+        hl.atomic_add(out, [bucket, head], total)
+        hl.atomic_add(out, [(bucket + 1) % num_buckets, head], total)
+    return out
+
+
+SCATTER_CONFIG = {
+    # One query row of one head per CTA: its 256 keys as 32 threads of eight
+    # consecutive keys, a lane loop around the batch sum's loop.
+    "block_sizes": [1, 1, 256],
+    "num_threads": [1, 1, 32, 1],
+    "reduction_loops": [8],
+    "cute_vector_widths": [1, 1, 8, 1],
+    "cute_privatize_atomics": True,
+}
+"""For ``bucket_grad_scatter`` over a batch of 16: two trips of the batch loop."""

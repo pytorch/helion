@@ -121,7 +121,7 @@ _BASE_VALID_KEYS = """
     cute_mma_dag_value_metadata_read_overlap
     cute_mma_dag_store cute_mma_dag_v_lag
     cute_mma_dag_warps
-    cute_mma_f32_conversion cute_packet_prefetch cute_pdl cute_pdl_capture_overlap cute_pdl_release
+    cute_mma_f32_conversion cute_packet_prefetch cute_pair_lane_math cute_pdl cute_pdl_capture_overlap cute_pdl_release
     cute_pointwise_pid_type cute_proven_bounds cute_radix_boundary_early_exit
     cute_radix_cached_payload_inverse cute_radix_candidate_capacity
     cute_radix_candidate_key_cache cute_radix_cluster_ctas cute_radix_defer_output
@@ -147,12 +147,13 @@ _BASE_VALID_KEYS = """
     cute_selection_algorithm cute_signed_bitfield_bf16
     cute_simt_mma cute_simt_mma_layout cute_split_k_finalizer_warps
     cute_split_k_partitions cute_split_k_schedule cute_split_k_stages
-    cute_split_k_workspace cute_store_policy cute_tiles_per_block
+    cute_split_k_workspace cute_store_policy cute_tail_peel cute_tiles_per_block
     cute_topk_coarse_keys cute_topk_defer_value_gathers cute_topk_key_dtype
     cute_topk_key_encoder cute_topk_key_recovery cute_topk_lanes_per_row
     cute_topk_merge_schedule cute_topk_output_vector_width cute_topk_rank_mode
     cute_topk_rows_per_block cute_topk_selection_layout cute_topk_sort_network
-    cute_topk_value_mode cute_topk_vector_width cute_unpadded_rows
+    cute_topk_value_mode cute_topk_vector_width cute_uniform_lane_compares
+    cute_unpadded_rows
     cute_vector_packet_unroll
     cute_vector_widths cute_vloop_sink cute_warp_aggregated_atomics
     cute_warp_fp32_redux cute_wide_packet_hints cute_warp_mma_warps epilogue_subtile flatten_loops
@@ -286,7 +287,7 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_mma_dag_value_metadata_read_overlap
     cute_mma_dag_store cute_mma_dag_v_lag
     cute_mma_dag_warps
-    cute_mma_f32_conversion cute_packet_prefetch cute_pdl cute_pdl_capture_overlap cute_pdl_release
+    cute_mma_f32_conversion cute_packet_prefetch cute_pair_lane_math cute_pdl cute_pdl_capture_overlap cute_pdl_release
     cute_pointwise_pid_type cute_proven_bounds cute_radix_boundary_early_exit
     cute_radix_cached_payload_inverse cute_radix_candidate_capacity
     cute_radix_candidate_key_cache cute_radix_cluster_ctas cute_radix_defer_output
@@ -312,12 +313,13 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_selection_algorithm cute_signed_bitfield_bf16
     cute_simt_mma cute_simt_mma_layout cute_split_k_finalizer_warps
     cute_split_k_partitions cute_split_k_schedule cute_split_k_stages
-    cute_split_k_workspace cute_store_policy cute_tiles_per_block
+    cute_split_k_workspace cute_store_policy cute_tail_peel cute_tiles_per_block
     cute_topk_coarse_keys cute_topk_defer_value_gathers cute_topk_key_dtype
     cute_topk_key_encoder cute_topk_key_recovery cute_topk_lanes_per_row
     cute_topk_merge_schedule cute_topk_output_vector_width cute_topk_rank_mode
     cute_topk_rows_per_block cute_topk_selection_layout cute_topk_sort_network
-    cute_topk_value_mode cute_topk_vector_width cute_unpadded_rows
+    cute_topk_value_mode cute_topk_vector_width cute_uniform_lane_compares
+    cute_unpadded_rows
     cute_vector_packet_unroll
     cute_vector_widths cute_vloop_sink cute_warp_aggregated_atomics
     cute_warp_fp32_redux cute_wide_packet_hints cute_warp_mma_warps host_tensor_descriptors
@@ -388,7 +390,7 @@ _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     cute_grid_lane_jam
     cute_host_paired_sum cute_independent_reduction cute_integer_loop_reduction
     cute_lane_unroll cute_materialized_operand_schedule cute_materialized_schedule
-    cute_packet_prefetch cute_pdl cute_pdl_capture_overlap cute_pdl_release cute_pointwise_pid_type
+    cute_packet_prefetch cute_pair_lane_math cute_pdl cute_pdl_capture_overlap cute_pdl_release cute_pointwise_pid_type
     cute_proven_bounds cute_radix_boundary_early_exit
     cute_radix_cached_payload_inverse cute_radix_candidate_capacity
     cute_radix_candidate_key_cache cute_radix_cluster_ctas cute_radix_defer_output
@@ -411,8 +413,8 @@ _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     cute_selection_algorithm cute_signed_bitfield_bf16
     cute_simt_mma cute_simt_mma_layout cute_split_k_finalizer_warps
     cute_split_k_partitions cute_split_k_schedule cute_split_k_stages
-    cute_split_k_workspace cute_store_policy cute_topk_coarse_keys
-    cute_topk_key_recovery cute_unpadded_rows
+    cute_split_k_workspace cute_store_policy cute_tail_peel cute_topk_coarse_keys
+    cute_topk_key_recovery cute_uniform_lane_compares cute_unpadded_rows
     cute_vector_packet_unroll cute_vloop_sink
     cute_warp_aggregated_atomics cute_warp_fp32_redux cute_wide_packet_hints flatten_loops indexing
     l2_groupings load_eviction_policies loop_orders maxnreg num_sm_multiplier
@@ -506,7 +508,7 @@ _BASE_CUTE_ACCEPTED = """
     cute_mma_dag_value_metadata_read_overlap
     cute_mma_dag_store cute_mma_dag_v_lag
     cute_mma_dag_warps
-    cute_mma_f32_conversion cute_packet_prefetch cute_pdl cute_pdl_capture_overlap cute_pdl_release
+    cute_mma_f32_conversion cute_packet_prefetch cute_pair_lane_math cute_pdl cute_pdl_capture_overlap cute_pdl_release
     cute_pointwise_pid_type cute_proven_bounds cute_radix_boundary_early_exit
     cute_radix_cached_payload_inverse cute_radix_candidate_capacity
     cute_radix_candidate_key_cache cute_radix_cluster_ctas cute_radix_defer_output
@@ -532,12 +534,13 @@ _BASE_CUTE_ACCEPTED = """
     cute_selection_algorithm cute_signed_bitfield_bf16
     cute_simt_mma cute_simt_mma_layout cute_split_k_finalizer_warps
     cute_split_k_partitions cute_split_k_schedule cute_split_k_stages
-    cute_split_k_workspace cute_store_policy cute_tiles_per_block
+    cute_split_k_workspace cute_store_policy cute_tail_peel cute_tiles_per_block
     cute_topk_coarse_keys cute_topk_defer_value_gathers cute_topk_key_dtype
     cute_topk_key_encoder cute_topk_key_recovery cute_topk_lanes_per_row
     cute_topk_merge_schedule cute_topk_output_vector_width cute_topk_rank_mode
     cute_topk_rows_per_block cute_topk_selection_layout cute_topk_sort_network
-    cute_topk_value_mode cute_topk_vector_width cute_unpadded_rows
+    cute_topk_value_mode cute_topk_vector_width cute_uniform_lane_compares
+    cute_unpadded_rows
     cute_vector_packet_unroll
     cute_vector_widths cute_vloop_sink cute_warp_aggregated_atomics
     cute_warp_fp32_redux cute_wide_packet_hints cute_warp_mma_warps epilogue_subtile flatten_loops indexing

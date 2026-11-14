@@ -3084,6 +3084,18 @@ class CuteBackend(Backend):
             "_cute_argreduce_index": "from helion._compiler.cute.reduce_helpers import _cute_argreduce_index",
             "_cute_nan_max": "from helion._compiler.cute.reduce_helpers import _cute_nan_max",
             "_cute_nan_min": "from helion._compiler.cute.reduce_helpers import _cute_nan_min",
+            "_cute_warp_reduce_max_redux": (
+                "from helion._compiler.cute.reduce_helpers import "
+                "_warp_reduce_max_native_fp32 as _cute_warp_reduce_max_redux"
+            ),
+            "_cute_warp_reduce_min_redux": (
+                "from helion._compiler.cute.reduce_helpers import "
+                "_warp_reduce_min_native_fp32 as _cute_warp_reduce_min_redux"
+            ),
+            "_cute_warp_reduce_or_redux": (
+                "from helion._compiler.cute.reduce_helpers import "
+                "_warp_reduce_or_native as _cute_warp_reduce_or_redux"
+            ),
             "_helion_pdl_spread_keep": "from helion._compiler.cute._pdl_spread_runtime import keep_smem_live as _helion_pdl_spread_keep",
             "_cute_aux_copy_layout": "from helion._compiler.cute.aux_copy_layout import select_aux_copy_layout as _cute_aux_copy_layout",
             "_cute_gelu_erf_exact_f32x2": (
@@ -3186,6 +3198,9 @@ class CuteBackend(Backend):
             "_cute_exact_div_bounds_f32": "from helion._compiler.cute.exact_division import exact_div_bounds_f32 as _cute_exact_div_bounds_f32",
             "_cute_exact_div_fast_f32": "from helion._compiler.cute.exact_division import exact_div_fast_f32 as _cute_exact_div_fast_f32",
             "_cute_exact_div_redo_f32": "from helion._compiler.cute.exact_division import exact_div_redo_f32 as _cute_exact_div_redo_f32",
+            "_cute_exact_div_fast_f32x2": "from helion._compiler.cute.device.ptx import exact_div_fast_f32x2 as _cute_exact_div_fast_f32x2",
+            "_cute_exp_f32x2_parts": "from helion._compiler.cute.device.ptx import exp_f32x2_parts as _cute_exp_f32x2_parts",
+            "_cute_half_packet_extremum_f32": "from helion._compiler.cute.device.half_extrema import half_packet_extremum_f32 as _cute_half_packet_extremum_f32",
             "_cute_copysign": "from helion._compiler.cute.copysign import copysign as _cute_copysign",
             "_cute_atomic_max_float32": "from helion._compiler.cute.atomic_helpers import atomic_max_float32 as _cute_atomic_max_float32",
             "_cute_atomic_min_float32": "from helion._compiler.cute.atomic_helpers import atomic_min_float32 as _cute_atomic_min_float32",

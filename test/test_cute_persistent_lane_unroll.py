@@ -14,11 +14,13 @@ LLVM contracts once the loads leave the arithmetic.
 from __future__ import annotations
 
 import functools
+from unittest.mock import patch
 
 import pytest
 import torch
 
 import helion
+from helion._compiler.cute import unroll_lane_loads
 from helion._compiler.cute.autotune.heuristics import CutePersistentLaneUnrollHeuristic
 from helion._testing import DEVICE
 from helion._testing import skipIfNotCUDA
@@ -56,7 +58,7 @@ def _bind(width: int) -> object:
         return cpu_bind(_dropout_residual_norm, dropout_residual_norm_args(width))
 
 
-def _render(width: int, unroll: int | None) -> str:
+def _render_once(width: int, unroll: int | None) -> str:
     bound = _bind(width)
     with mock_cuda_unavailable(), forbid_native_compile():
         return bound.to_code(  # pyrefly: ignore[missing-attribute]
@@ -64,6 +66,10 @@ def _render(width: int, unroll: int | None) -> str:
                 _config(unroll)
             )
         )
+
+
+# Each configuration renders once per module.
+_render = functools.cache(_render_once)
 
 
 @pytest.mark.parametrize("unroll", [4, 8])
@@ -85,12 +91,37 @@ def test_the_knob_off_code_is_the_code_without_the_knob() -> None:
     assert "range(24):" in code, code
 
 
-@pytest.mark.parametrize(("width", "kept"), [(768, 8), (32, 1), (600, 1)])
+@pytest.mark.parametrize(("unroll", "lanes"), [(2, 20), (8, 24)])
+def test_the_knob_unrolls_an_odd_row_over_its_live_lanes_rounded_up(
+    unroll: int, lanes: int
+) -> None:
+    # 600 columns over 32 threads hold elements in 19 lanes, which no unroll
+    # factor divides: the knob walks them rounded up to its multiple, masked
+    # as the trailing lanes are.
+    code = _render(600, unroll)
+    assert f"range({lanes // unroll}):" in code, code
+    assert f"cutlass.range_constexpr({unroll})" in code, code
+    assert "< 600" in code, code
+
+
+def test_the_knob_off_code_of_an_odd_row_walks_its_live_lanes() -> None:
+    assert "range(19):" in _render(600, 1)
+
+
+def test_a_knob_no_lane_loop_takes_keeps_the_live_lanes() -> None:
+    # The knob-off code is generated again where the unroll takes no loop
+    # (``LaneUnrollNotApplied``), and it walks the 19 live lanes.
+    with patch.object(unroll_lane_loads, "_unroll_factor", return_value=0):
+        assert _render_once(600, 8) == _render(600, 1)
+
+
+@pytest.mark.parametrize(("width", "kept"), [(768, 8), (32, 1), (600, 8)])
 def test_normalization_keeps_the_knob_where_a_lane_loop_takes_it(
     width: int, kept: int
 ) -> None:
-    # A row of one warp's width walks no synthetic lanes, and a 600-wide row
-    # walks 19 live lanes, which no unroll factor divides: the knob resets.
+    # A row of one warp's width walks no synthetic lanes: the knob resets.  A
+    # 600-wide row's 19 live lanes take no unroll factor, so under the knob
+    # it walks 24, which take one.
     bound = _bind(width)
     normalized = bound.config_spec.normalized_config(  # pyrefly: ignore
         _config(8)
@@ -155,8 +186,8 @@ def test_the_seed_and_the_search_choices(width: int, seeded: bool) -> None:
 
 
 @functools.cache
-def _outputs(unroll: int) -> tuple[torch.Tensor, ...]:
-    args = dropout_residual_norm_args(768, DEVICE)
+def _outputs(width: int, unroll: int) -> tuple[torch.Tensor, ...]:
+    args = dropout_residual_norm_args(width, DEVICE)
     bound = _dropout_residual_norm._bind_isolated(args)
     config = bound.config_spec.normalized_config(_config(unroll))
     assert ("_lane_unroll_loads_" in bound.to_code(config)) is (unroll > 1)
@@ -165,9 +196,12 @@ def _outputs(unroll: int) -> tuple[torch.Tensor, ...]:
 
 @pytest.mark.cuda
 @skipIfNotCUDA()
-def test_cuda_loads_first_lanes_match_the_rolled_lanes() -> None:
-    keep, centered, norm = _outputs(8)
-    rolled_keep, rolled_centered, rolled_norm = _outputs(1)
+# 600 columns: the knob unrolls the 19 live lanes rounded up to 24, the
+# knob-off code walks the 19.
+@pytest.mark.parametrize("width", [768, 600])
+def test_cuda_loads_first_lanes_match_the_rolled_lanes(width: int) -> None:
+    keep, centered, norm = _outputs(width, 8)
+    rolled_keep, rolled_centered, rolled_norm = _outputs(width, 1)
     assert torch.equal(keep.view(torch.uint8), rolled_keep.view(torch.uint8))
     # The contraction of ``residual + keep * x * c`` may change a rounding.
     torch.testing.assert_close(centered, rolled_centered, rtol=0, atol=1e-5)

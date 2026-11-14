@@ -16,13 +16,12 @@ import re
 from typing import TYPE_CHECKING
 
 import torch
-from torch.fx.experimental.symbolic_shapes import statically_known_true
 
 from ..ast_extension import iter_statements
 from ..ast_read_writes import ReadWrites
 from ..compile_environment import CompileEnvironment
 from ._ast_pass_utils import _bound_names
-from .memory_ops import tensor_has_specialized_base_alignment
+from .memory_ops import tensor_proven_base_alignment
 from .persistent_branch_vec import _DTYPE_INFO
 from .persistent_branch_vec import _and_terms
 from .persistent_branch_vec import _binding_write_roots
@@ -1430,8 +1429,6 @@ def vectorize_affine_tile_lanes(
     from ..device_function import TensorPropertyArg
 
     env = CompileEnvironment.current()
-    inputs = list(env.input_sources)
-    input_storages = {id(tensor.untyped_storage()) for tensor in inputs}
     strides = device_function.proven_tensor_stride_values()
     alignments = {}
     dtypes = {}
@@ -1449,26 +1446,9 @@ def vectorize_affine_tile_lanes(
         for dim, stride in enumerate(tensor.stride()):
             if isinstance(stride, int):
                 strides[arg.name, dim] = stride
-        storage = id(tensor.untyped_storage())
-        offset = tensor.storage_offset() * tensor.element_size()
-        for alignment in (16, 8, 4):
-            aligned = storage not in input_storages and statically_known_true(
-                offset % alignment == 0
-            )
-            if not aligned:
-                aligned = any(
-                    id(source.untyped_storage()) == storage
-                    and tensor_has_specialized_base_alignment(env, source, alignment)
-                    and statically_known_true(
-                        (offset - source.storage_offset() * source.element_size())
-                        % alignment
-                        == 0
-                    )
-                    for source in inputs
-                )
-            if aligned:
-                alignments[arg.name] = alignment
-                break
+        alignment = tensor_proven_base_alignment(env, tensor)
+        if alignment is not None:
+            alignments[arg.name] = alignment
     if env.config_spec.pointwise_facts:
         from .pure_lane_packets import _PacketVectorizer
 

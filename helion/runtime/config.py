@@ -178,9 +178,12 @@ class Config(Mapping[str, object]):
         cute_vloop_sink: bool | None = None,
         cute_grid_lane_jam: bool | None = None,
         cute_scratch_forwarding: bool | None = None,
+        cute_pair_lane_math: bool | None = None,
         cute_lane_unroll: int | None = None,
         cute_unpadded_rows: bool | None = None,
         cute_bool_byte_packets: bool | None = None,
+        cute_uniform_lane_compares: bool | None = None,
+        cute_tail_peel: bool | None = None,
         cute_wide_packet_hints: bool | None = None,
         cute_pdl: bool | None = None,
         cute_pdl_capture_overlap: bool | None = None,
@@ -279,9 +282,12 @@ class Config(Mapping[str, object]):
                 the device loops it wraps: the lanes' copies of each
                 statement run side by side, their loads of consecutive
                 elements become one vector load and their grouped reduces
-                one fragment reduce. The results are bitwise unchanged.
-                Disabled by default; a lane loop the pass cannot prove
-                independent across lanes keeps the knob-off code.
+                one fragment reduce. The results are bitwise unchanged,
+                except that the lanes' adds into a ``cute_privatize_atomics``
+                copy are summed per cell before one shared-memory add (that
+                knob leaves their order unspecified). Disabled by default; a
+                lane loop the pass cannot prove independent across lanes
+                keeps the knob-off code.
             cute_scratch_forwarding: Serve a later sweep's reload of what an
                 earlier sweep stored into a kernel-local scratch tensor (a
                 host ``torch.empty`` only the kernel's loads and stores
@@ -292,6 +298,16 @@ class Config(Mapping[str, object]):
                 register move, as the reload did.  It saves the workspace's
                 traffic but keeps its values live across the sweeps.
                 Disabled by default.
+            cute_pair_lane_math: Run the exps, exact divisions and fp32
+                products, sums, differences and fmas of adjacent vector
+                lanes together as Blackwell's packed fp32 instructions
+                (sm_100): fewer instructions per element, at the cost of
+                the registers the second lane holds early. The results are
+                bitwise unchanged. It also folds the maxima and minima of
+                bf16 and f16 vector lanes as packed half2 words. Disabled by
+                default; offered to the autotuner for kernels with fp32 exps,
+                sigmoids, divisions or arithmetic, or bf16/f16 max or min
+                reductions, without ``fast_math`` or a matmul.
             cute_lane_unroll: Unroll factor (1, 2, 4, 8, 16) for per-thread
                 lane loops: every unrolled lane's loads, the scalar loads of
                 its vector loop included, issue before the first of them
@@ -338,6 +354,38 @@ class Config(Mapping[str, object]):
                 of it there. Results are bitwise unchanged. Off by default;
                 offered to the autotuner for kernels whose looped reduction
                 reads a bool row.
+            cute_uniform_lane_compares: Compare a vector's lane base, once per
+                vector, instead of each lane where a lane index meets a
+                bound that is a multiple of the vector width (a chunk's tile
+                mask, the bounds of a de-linearized ``x[r // hw, r % hw]``):
+                no lane reaches the next multiple.  Both multiples are
+                proven on the generated code (constants, constexpr extents,
+                block sizes); a bound only known at run time, as under
+                dynamic shapes, keeps the per-lane compare.  The knob also
+                gives a Python remainder by a positive constant a known
+                factor, so quotients and remainders of one (``(e % 64) //
+                32``, ``(e % 64) % 32``) take the vector base's as well;
+                those are exact integer identities, behind the knob only so
+                that the code with it off is the code without it.  Integer
+                and boolean results, masks included, do not change.
+                Its only numeric effect is FMA contraction where per-lane
+                selects kept products unfused: with the masks one value per
+                vector, LLVM may fuse into one FMA a float multiply and add
+                that the knob-off code rounds separately, and those
+                elements can differ by about one ulp.  Off by default;
+                offered to the autotuner on kernels with CuTe lane loops.
+            cute_tail_peel: Run a device loop's complete tiles apart from its
+                partial last tile (a static extent that is not a multiple of
+                the tile, such as an odd vocabulary) so that their lanes load
+                8- or 16-byte packets instead of masked scalars; the last tile
+                keeps its masks.  Each value is computed as before, from the same
+                elements in the same order; like ``cute_uniform_lane_compares``
+                its only possible numeric effect is FMA contraction where
+                per-lane selects kept products unfused.  Off by default;
+                offered to the autotuner on kernels with an ``hl.tile`` loop
+                over a static extent that loads a float tensor along its tile
+                and no matmul, and elsewhere rejected (an explicit False is
+                dropped).
             cute_wide_packet_hints: Carry the ``l2_last`` / ``l1_l2_first`` /
                 ``l1_l2_last`` load eviction policies onto 32-byte CuTe packets
                 (``cute_vector_widths`` 8 for fp32, 16 for bf16/fp16) through
@@ -532,9 +580,12 @@ class Config(Mapping[str, object]):
             "cute_vloop_sink": cute_vloop_sink,
             "cute_grid_lane_jam": cute_grid_lane_jam,
             "cute_scratch_forwarding": cute_scratch_forwarding,
+            "cute_pair_lane_math": cute_pair_lane_math,
             "cute_lane_unroll": cute_lane_unroll,
             "cute_unpadded_rows": cute_unpadded_rows,
             "cute_bool_byte_packets": cute_bool_byte_packets,
+            "cute_uniform_lane_compares": cute_uniform_lane_compares,
+            "cute_tail_peel": cute_tail_peel,
             "cute_wide_packet_hints": cute_wide_packet_hints,
             "cute_pdl": cute_pdl,
             "cute_pdl_capture_overlap": cute_pdl_capture_overlap,

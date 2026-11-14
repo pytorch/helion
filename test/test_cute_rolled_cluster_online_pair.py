@@ -37,6 +37,8 @@ WARP_PAIR = "_cute_grouped_reduce_cluster_warp_online_pair("
 CLUSTER = "_cute_grouped_reduce_cluster("
 BLOCK = "_cute_grouped_reduce_block("
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _softmax(x: torch.Tensor) -> torch.Tensor:
     n, _m = x.size()
@@ -184,7 +186,9 @@ def test_seeds_set_only_the_knobs_the_sweep_structure_admits() -> None:
     sweep, so no seed turns them on (the knobs are not searched).  Under
     fast_math the cached pair pays, so the seeds carry it.  A scalar-output
     pair (logsumexp) seeds all three; a kernel without the pair (RMS norm)
-    seeds none of them.  ``cute_warp_fp32_redux`` stays seeded throughout."""
+    seeds none of them.  ``cute_warp_fp32_redux`` is seeded where it takes a
+    row's max natively (the softmaxes and the log-sum-exp on SM100), not on
+    the RMS norm, whose sums it leaves alone."""
     exact = _seed_values(softmax_exact)
     assert exact["cute_cluster_warp_online"] == {False}
     assert True not in exact["cute_register_row"]
@@ -209,9 +213,10 @@ def test_seeds_set_only_the_knobs_the_sweep_structure_admits() -> None:
     assert rms["cute_cluster_warp_online"] == {False}
     assert True not in rms["cute_register_row"]
     assert rms["cute_scalar_epilogue"] == {False}
-    assert True in rms["cute_warp_fp32_redux"]
+    assert True not in rms["cute_warp_fp32_redux"]
 
 
+@pytest.mark.cuda
 @skipIfNotCUDA()
 @onlyBackends(["cute"])
 class TestCuteRolledClusterOnlinePairCuda(TestCase):
@@ -227,7 +232,9 @@ class TestCuteRolledClusterOnlinePairCuda(TestCase):
         self.assertEqual(code.count(PAIR), 1)
         self.assertNotIn(CLUSTER, code)
         ref = torch.nn.functional.softmax(x, dim=1)
-        torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-3, equal_nan=True)
+        # The outputs are about 2**-15: an absolute tolerance near them would
+        # pass exponentials left in a CTA's own frame.
+        torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-6, equal_nan=True)
         self.assertTrue(torch.isnan(out[5]).all())
         self.assertEqual(out[3, :8192].abs().max().item(), 0.0)
 
@@ -237,4 +244,4 @@ class TestCuteRolledClusterOnlinePairCuda(TestCase):
         code, out = code_and_output(softmax_exact, (x,), **ROLLED)
         self.assertEqual(code.count(WARP_PAIR), 1)
         ref = torch.nn.functional.softmax(x, dim=1)
-        torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-4)
+        torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-6)

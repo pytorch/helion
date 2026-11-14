@@ -99,6 +99,9 @@ from helion._compiler.cute.autotune.heuristics.cute import (
 from helion._compiler.cute.autotune.heuristics.cute_full_chunk_row import (
     CuteFullChunkRowHeuristic,
 )
+from helion._compiler.cute.autotune.heuristics.cute_launch_bounds import (
+    CutePointwiseMinBlocksHeuristic,
+)
 from helion._compiler.cute.autotune.heuristics.cute_rolled_cluster_packet import (
     CuteRolledClusterPacketHeuristic,
 )
@@ -4352,6 +4355,7 @@ _CUTE_HEURISTIC_ORDER = (
     "cute_split_column_reduction",
     "cute_reduction_lane_jam",
     "cute_reduction_lane_jam_forwarding",
+    "cute_delinearized_row_reduction",
 )
 
 
@@ -4370,19 +4374,22 @@ class TestHeuristicRegistry(TestCase):
         self.assertEqual(CuteBackend().autotuner_heuristics(), CUTE_HEURISTICS)
 
     def test_cute_appended_families_stay_outside_the_ranked_tuple(self) -> None:
-        # Both are planted after every post-processing step, never ranked.
+        # They are planted after every post-processing step, never ranked.
         self.assertNotIn(CuteFullChunkRowHeuristic, CUTE_HEURISTICS)
         self.assertNotIn(CuteRolledClusterPacketHeuristic, CUTE_HEURISTICS)
-        self.assertEqual(CUTE_SEED_FACT_HEURISTICS, (CuteRolledClusterPacketHeuristic,))
+        self.assertNotIn(CutePointwiseMinBlocksHeuristic, CUTE_HEURISTICS)
+        self.assertEqual(
+            CUTE_SEED_FACT_HEURISTICS,
+            (CuteRolledClusterPacketHeuristic, CutePointwiseMinBlocksHeuristic),
+        )
         self.assertEqual(
             CuteBackend().seed_fact_heuristics(), CUTE_SEED_FACT_HEURISTICS
         )
-        self.assertEqual(
-            compiler_seed_specialization_facts(
-                "cute", (CuteRolledClusterPacketHeuristic.name,)
-            ),
-            CuteRolledClusterPacketHeuristic.CACHE_SPECIALIZATION_FACTS,
-        )
+        for heuristic in CUTE_SEED_FACT_HEURISTICS:
+            self.assertEqual(
+                compiler_seed_specialization_facts("cute", (heuristic.name,)),
+                heuristic.CACHE_SPECIALIZATION_FACTS,
+            )
 
     def test_other_backend_registries_are_pinned(self) -> None:
         expected = {

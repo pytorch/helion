@@ -242,18 +242,15 @@ _CUTE_REMAINDER_TARGETS: frozenset[object] = frozenset(
 )
 
 
-def match_cute_lane_remainder(node: object) -> tuple[Node, ...] | None:
-    """The tile indices added into ``e`` of a remainder index ``e % d``.
+def cute_lane_remainder_terms(
+    node: object,
+) -> tuple[int | torch.SymInt, tuple[tuple[object, int], ...]] | None:
+    """``(d, terms)`` of a remainder index ``e % d`` by a scalar ``d``.
 
-    ``x[e // d, e % d]`` with ``e = row * d + tile.index`` reads a flat
-    element ``e`` through the rows of ``d`` contiguous elements of a
-    de-linearized view.  The remainder is the lane coordinate of a packet
-    whose candidate lane blocks are the ``tile_index`` nodes this returns:
-    the ones ``e`` adds (not subtracts) as a term of its sum, behind
-    singleton axes, widening casts and a full-slice re-read of the index.
-    ``None`` when ``node`` is not a remainder by a scalar.  Whether the
-    packet is contiguous (the other terms and ``d`` multiples of the vector
-    width) is proved on the lowered expression, not here.
+    ``terms`` are the summands of ``e`` with their signs (1 added, -1
+    subtracted), each behind singleton axes, widening casts and a full-slice
+    re-read of the index.  ``None`` when ``node`` is not a remainder by a
+    scalar.
     """
     node = unwrap_cute_broadcast_index(node)
     if (
@@ -269,12 +266,14 @@ def match_cute_lane_remainder(node: object) -> tuple[Node, ...] | None:
         divisor = divisor.meta.get("val")
     if not isinstance(divisor, (int, torch.SymInt)):
         return None
-    tiles: list[Node] = []
+    terms: list[tuple[object, int]] = []
 
     def visit(term: object, sign: int) -> None:
-        term = unwrap_cute_broadcast_index(term)
-        if term is None or term.op != "call_function":
+        unwrapped = unwrap_cute_broadcast_index(term)
+        if unwrapped is None or unwrapped.op != "call_function":
+            terms.append((term, sign))
             return
+        term = unwrapped
         if (
             term.target is load
             and len(term.args) >= 2
@@ -289,11 +288,8 @@ def match_cute_lane_remainder(node: object) -> tuple[Node, ...] | None:
             # packets, which nothing here covers.
             source = unwrap_cute_broadcast_index(term.args[0])
             term = source if source is not None else term
-        if term.target is tile_index:
-            if sign > 0:
-                tiles.append(term)
-            return
         if term.kwargs.get("alpha", 1) != 1 or len(term.args) != 2:
+            terms.append((term, sign))
             return
         lhs, rhs = term.args
         if term.target in (operator.add, torch.ops.aten.add.Tensor):
@@ -302,9 +298,34 @@ def match_cute_lane_remainder(node: object) -> tuple[Node, ...] | None:
         elif term.target in (operator.sub, torch.ops.aten.sub.Tensor):
             visit(lhs, sign)
             visit(rhs, -sign)
+        else:
+            terms.append((term, sign))
 
     visit(dividend, 1)
-    return tuple(tiles)
+    return divisor, tuple(terms)
+
+
+def match_cute_lane_remainder(node: object) -> tuple[Node, ...] | None:
+    """The tile indices added into ``e`` of a remainder index ``e % d``.
+
+    ``x[e // d, e % d]`` with ``e = row * d + tile.index`` reads a flat
+    element ``e`` through the rows of ``d`` contiguous elements of a
+    de-linearized view.  The remainder is the lane coordinate of a packet
+    whose candidate lane blocks are the ``tile_index`` nodes this returns:
+    the ones ``e`` adds (not subtracts) as a term of its sum
+    (``cute_lane_remainder_terms``).  ``None`` when ``node`` is not a
+    remainder by a scalar.  Whether the packet is contiguous (the other
+    terms and ``d`` multiples of the vector width) is proved on the lowered
+    expression, not here.
+    """
+    parts = cute_lane_remainder_terms(node)
+    if parts is None:
+        return None
+    return tuple(
+        term
+        for term, sign in parts[1]
+        if sign > 0 and isinstance(term, Node) and term.target is tile_index
+    )
 
 
 def _match_constant_multiple(value: object) -> tuple[object, int]:

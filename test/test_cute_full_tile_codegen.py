@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from test.cute_population_contracts import checked_initial_population
 from test.cute_population_contracts import tcgen05_mma_support
 from test.test_cute_pure_lane_packets_codegen import _capture
 from test.test_cute_pure_lane_packets_codegen import _execute
@@ -264,7 +265,8 @@ def _population(bound, *, count=100, explicit=None):
                 == InitialPopulationStrategy.FROM_RANDOM
             )
             random.seed(2026091523)
-            flats = search._generate_initial_population_flat()
+            # The budgeted rows; compiler coverage witnesses follow them.
+            flats = checked_initial_population(search)[:count]
             configs = [search.config_gen.unflatten(flat) for flat in flats]
             assert len(configs) == len(set(configs)) == count
             assert [search.config_gen.flatten(config) for config in configs] == flats

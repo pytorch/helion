@@ -21,6 +21,7 @@ from helion._testing.scratch_kernels import RELU_SINK_CONFIG
 from helion._testing.scratch_kernels import ROW_SWEEPS_CONFIG
 from helion._testing.scratch_kernels import relu_spatial_mean
 from helion._testing.scratch_kernels import row_softmax_bwd
+from helion._testing.scratch_kernels import row_softmax_bwd_recomputing
 from helion._testing.scratch_kernels import unread_workspace
 
 
@@ -62,6 +63,65 @@ def test_a_forwarded_workspace_is_bitwise_the_reloaded_one(dtype: torch.dtype) -
     total = (grad.float() * probs).sum(-1, keepdim=True)
     reference = probs.to(dtype).float() * (grad.float() - total)
     torch.testing.assert_close(forwarded.float(), reference, rtol=2e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=str)
+def test_a_forwarded_packet_store_is_bitwise_the_reloaded_one(
+    dtype: torch.dtype,
+) -> None:
+    # The workspace flushed in packets of eight lanes and reloaded one lane
+    # at a time: each lane reads back its own value.
+    torch.manual_seed(0)
+    logits = torch.randn(64, 1024, device=DEVICE, dtype=torch.bfloat16) * 4
+    grad = torch.randn(64, 1024, device=DEVICE, dtype=torch.bfloat16)
+    row_max = logits.float().amax(-1)
+    row_sum = torch.exp(logits.float() - row_max[:, None]).sum(-1)
+    args = (grad, logits, row_max, row_sum, torch.empty(1, device=DEVICE, dtype=dtype))
+    kernels = [
+        helion.kernel(
+            row_softmax_bwd,
+            backend="cute",
+            static_shapes=True,
+            config=helion.Config(
+                **ROW_SWEEPS_CONFIG,
+                cute_reduction_reloads=["register"],
+                cute_scratch_forwarding=forwarding,
+                cute_vector_widths=[8, 1],
+            ),
+        )
+        for forwarding in (True, False)
+    ]
+    forwarded, reloaded = (kernel(*args) for kernel in kernels)
+    # On the GPU's target too, the workspace is neither flushed nor reloaded.
+    assert "probs_ws.iterator" not in kernels[0].bind(args).to_code()
+    assert torch.equal(forwarded.view(torch.int16), reloaded.view(torch.int16))
+
+
+def test_carried_lanes_are_bitwise_the_reloaded_and_recomputed_ones() -> None:
+    # In packets of eight: the forwarded product and the carried exp against
+    # the same kernel reloading the one and recomputing the other.
+    torch.manual_seed(0)
+    logits = torch.randn(64, 1024, device=DEVICE, dtype=torch.bfloat16) * 4
+    grad = torch.randn(64, 1024, device=DEVICE, dtype=torch.bfloat16)
+    bias = torch.randn(64, 1024, device=DEVICE)
+    row_max = (logits.float() + bias).amax(-1)
+    row_sum = torch.exp(logits.float() + bias - row_max[:, None]).sum(-1)
+    args = (grad, logits, bias, row_max, row_sum)
+    carried, recomputed = (
+        helion.kernel(
+            row_softmax_bwd_recomputing,
+            backend="cute",
+            static_shapes=True,
+            config=helion.Config(
+                **ROW_SWEEPS_CONFIG,
+                cute_reduction_reloads=[reload],
+                cute_scratch_forwarding=reload == "register",
+                cute_vector_widths=[8, 1],
+            ),
+        )(*args)
+        for reload in ("register", "gmem")
+    )
+    assert torch.equal(carried.view(torch.int16), recomputed.view(torch.int16))
 
 
 def test_a_kernel_without_its_dead_scratch_stores_matches_eager() -> None:

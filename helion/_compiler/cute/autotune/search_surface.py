@@ -91,10 +91,11 @@ from ..pdl_release import CUTE_PDL_RELEASE_DEFAULT
 from ..pdl_release import CUTE_PDL_SPREAD_KEY
 from ..reduction_lanes import WARP_THREADS
 from ..reduction_lanes import fit_reduction_threads
+from ..reduction_lanes import fits_row_packets
 from ..reduction_lanes import looped_reduction_lanes
 from ..reduction_lanes import synthetic_reduction_lanes
 from ..reduction_lanes import tiled_row_threads
-from ..reduction_lanes import trims_padded_lanes
+from ..reduction_lanes import whole_vector_lanes
 from ..ring_mma_dot import RING_DEFAULT_SPLIT
 from ..ring_mma_dot import RING_DEFAULT_STAGES
 from ..ring_mma_dot import RING_MMA_KEY
@@ -204,7 +205,8 @@ if TYPE_CHECKING:
     from ..loop_nesting import TileLoopPath
 
 
-# How a fp32 quotient by a loop-invariant divisor is lowered
+# How an fp32 quotient by a loop-invariant divisor, an elementwise fp32
+# quotient and an fp32 square root are lowered
 # (``_normalize_cute_exact_div_form``); ``guard`` was retired (a per-element
 # branch whose code shape changed ptxas's contraction of the surrounding fp32
 # chains, so it was not bit identical to ``plain``).
@@ -1150,18 +1152,18 @@ def _normalize_cute_exact_div_form(
     config_spec: ConfigSpec, config: dict[str, object], *, fix_invalid: bool
 ) -> None:
     """``cute_exact_div_form`` picks how an fp32 division by a
-    loop-invariant divisor is lowered on CuTe (both forms give the IEEE
-    quotient bit for bit): ``redo`` speculates the Markstein sequence
-    over the loop and re-runs the loop on a hard case, ``plain`` keeps
-    ``div.rn`` per element.  A recorded config carrying the retired
+    loop-invariant divisor is lowered on CuTe under
+    ``Settings.cute_exact_division`` (both forms give the IEEE quotient bit
+    for bit): ``redo`` speculates the Markstein sequence over the loop and
+    re-runs the loop on a hard case, ``plain`` keeps ``div.rn`` per
+    element.  A recorded config carrying the retired
     ``guard`` form is repaired to ``plain`` (fail closed: the plain
     division is what every form must equal), as is any unknown value
     under ``fix_invalid``.  A kernel without such a division has nothing
     for the knob to choose; it is dropped.  The gate
     (``has_hoistable_fp32_divisions``) is a graph-level necessary
-    condition: a kernel whose division the AST pass then proves
-    loop-carried at every loop keeps the knob, with both forms rendering
-    identically."""
+    condition: a kernel whose divisions the AST pass then declines keeps
+    the knob, with both forms rendering identically."""
     key = "cute_exact_div_form"
     if key not in config:
         return
@@ -1316,6 +1318,7 @@ def _normalize_cute_vector_reductions(
         "cute_vector_packet_unroll",
         "cute_grid_lane_jam",
         "cute_scratch_forwarding",
+        "cute_uniform_lane_compares",
     ):
         if key in config and type(config[key]) is not bool:
             if fix_invalid:
@@ -1343,17 +1346,23 @@ def _normalize_gated_boolean(
     enabled: bool,
     requirement: str,
     fix_invalid: bool,
+    fill: bool = True,
 ) -> None:
     """A boolean knob the search surface offers only when ``enabled``: off
-    (``False``) by default, and otherwise absent, an explicit value being an
-    error (``"{key} requires {requirement}"``) unless ``fix_invalid``."""
+    (``False``) by default, and otherwise absent.  Where it is not offered an
+    explicit ``True`` is an error (``"{key} requires {requirement}"``)
+    unless ``fix_invalid``, and an explicit ``False``, the knob-off code
+    that every config the search produced spells out, is dropped: a tuned
+    config stays valid where its kernel no longer offers the knob (a larger
+    target, aliased arguments).  ``fill=False`` leaves an absent knob absent,
+    its default implied as the plain lowering booleans leave theirs, so a
+    config without it (a compiler seed) normalizes to itself."""
     if not enabled:
-        # ``False`` is the knob-off code, which every config the search
-        # produced spells out: a tuned config stays valid where its kernel
-        # no longer offers the knob (a larger target, aliased arguments).
         if config.get(key, False) is not False and not fix_invalid:
             raise InvalidConfig(f"{key} requires {requirement}")
         config.pop(key, None)
+        return
+    if not fill and key not in config:
         return
     value = config.setdefault(key, False)
     if type(value) is not bool:
@@ -1522,7 +1531,7 @@ def _normalize_cute_bool_byte_packets(
 ) -> None:
     """``cute_bool_byte_packets`` is a boolean, absent meaning False, that the
     search surface offers only where a reduction ``reduction_loops`` may roll
-    reads a bool tensor along its dim (``cute_bool_byte_packet_sites``);
+    reads a bool tensor along its dim (``cute_bool_byte_packet_blocks``);
     elsewhere an explicit False (a config tuned for another binding) is
     dropped and True is an error unless ``fix_invalid``.  An absent knob
     stays absent, so a config without it (a compiler seed) normalizes to
@@ -1531,7 +1540,7 @@ def _normalize_cute_bool_byte_packets(
     key = "cute_bool_byte_packets"
     if key not in config:
         return
-    if not config_spec.cute_bool_byte_packet_sites or config_spec.matmul_facts:
+    if not config_spec.cute_bool_byte_packet_blocks:
         if config[key] is not False and not fix_invalid:
             raise InvalidConfig(
                 f"{key} requires a rollable reduction reading a bool tensor "
@@ -1857,19 +1866,17 @@ def _rolls_a_byte_packet_row(
     config_spec: ConfigSpec, config: Mapping[str, object]
 ) -> bool:
     """Whether ``config`` rolls one of the reductions along a bool row
-    (``cute_bool_byte_packet_sites``) at a vector width one packed integer
+    (``cute_bool_byte_packet_blocks``) in lanes of a width one packed integer
     holds (``_CUTE_BYTE_PACKET_WIDTHS``): where ``cute_bool_byte_packets``
-    takes effect."""
-    loops = config.get("reduction_loops")
-    widths = config.get("cute_vector_widths")
-    if not isinstance(loops, (list, tuple)) or not isinstance(widths, (list, tuple)):
-        return False
+    takes effect.  The width is the one the lanes take with the fitted
+    threads (``_CuteReductionPlan.rolled_width``), not the requested
+    ``cute_vector_widths`` entry: lanes of one element, where the threads
+    cover the chunk or the width does not divide each thread's elements,
+    load no packet."""
+    blocks = config_spec.cute_bool_byte_packet_blocks
     return any(
-        config_spec.reduction_loops.config_get(list(loops), block_id, None) is not None
-        and config_spec.cute_vector_widths.config_get(list(widths), block_id, 1)
-        in _CUTE_BYTE_PACKET_WIDTHS
-        for block_id in config_spec.cute_bool_byte_packet_sites
-        if block_id in config_spec.cute_vector_widths.valid_block_ids()
+        plan.block_id in blocks and plan.rolled_width in _CUTE_BYTE_PACKET_WIDTHS
+        for plan in _cute_reduction_plans(config_spec, config)
     )
 
 
@@ -1894,6 +1901,7 @@ def _cute_config_forms_lane_loop(
 class _CuteReductionPlan(NamedTuple):
     """How one reduction of a normalized config runs (``_cute_reduction_plans``)."""
 
+    block_id: int
     # A persistent row ``cute_unpadded_rows`` runs unpadded.
     unpadded: bool
     # A row of that layout whose threads the fit trimmed, which the emitter
@@ -1901,6 +1909,9 @@ class _CuteReductionPlan(NamedTuple):
     trimmed: bool
     # A lane loop some ``cute_lane_unroll`` factor unrolls.
     lane_loop: bool
+    # The vector width of a looped reduction's lanes (``looped_reduction_lanes``),
+    # 1 for a persistent row.
+    rolled_width: int
 
 
 def _cute_reduction_plans(
@@ -1927,10 +1938,10 @@ def _cute_reduction_plans(
     * Lane loop: a looped reduction walks ``looped_reduction_lanes``; a
       persistent row its threads do not cover walks its padded extent in
       synthetic lanes (``synthetic_reduction_lanes``; a masked row only the
-      lanes that hold an element), on one warp unless one vector per thread
-      covers the row, whose lanes are then the vector's elements.  It counts
-      only with an even number of lanes, the ones an unroll factor divides
-      (``_unrollable_lanes``).
+      lanes that hold an element, which the knob rounds up to its multiple),
+      on one warp unless one vector per thread covers the row, whose lanes are
+      then the vector's elements.  It counts only with an even number of
+      lanes, the ones an unroll factor divides (``_unrollable_lanes``).
 
     The fit multiplies the threads of every tile and reduction, where the
     code generator leaves out reductions in exclusive branches and gives a
@@ -1989,8 +2000,9 @@ def _cute_reduction_plans(
         )
         unpadded = exact and threads == requested
         lane_loop = False
+        rolled_width = 1
         if chunk is not None:
-            lanes, _ = looped_reduction_lanes(chunk, threads, vec)
+            lanes, rolled_width = looped_reduction_lanes(chunk, threads, vec)
             lane_loop = _unrollable_lanes(lanes)
         elif (
             not unpadded
@@ -2003,13 +2015,25 @@ def _cute_reduction_plans(
             # through the helpers it calls: threads whose lanes do not tile
             # the padded row drop to a power of two (``tiled_row_threads``);
             # the row then runs on one warp unless one vector per thread
-            # covers it; and a masked row walks only its live lanes
-            # (``trims_padded_lanes``).  The code also keeps every lane of a
-            # resident row and of a kernel that runs an ``hl.reduce`` (whose
+            # covers it; lanes that are whole vectors form a constexpr loop
+            # (``whole_vector_lanes``); and a masked row walks only its live
+            # lanes, unless the knob rounds them up to its multiple
+            # (``masked_row_lanes``).  The code also keeps every lane of a
+            # resident row and of a row an ``hl.reduce`` reduces (whose
             # ``other`` fills the padded slots), keeps a multi-warp register
-            # tile's or a partner's threads, and walks a symbolic row whole;
-            # no config records those, so there the knob can be kept without
-            # a loop that takes it (``LaneUnrollNotApplied``), or reset.
+            # tile's or a partner's threads, walks the row of a scan
+            # (``_block_is_scanned``; ``cute_scanned_block_ids`` records it),
+            # of a register tile or of a partner in scalar lanes rather than
+            # several vectors per thread, and walks a symbolic row whole.  No
+            # config records the others, so there the knob can be kept
+            # without a loop that takes it (``LaneUnrollNotApplied``), or
+            # reset: the scalar lanes of a resident row, a register tile's
+            # row or a partner's at such a V then run without it, as at V = 1
+            # without the knob.  Several vectors per thread hold packets only
+            # where every value on the row fits one (``fits_row_packets``),
+            # and at most ``MAX_VECTOR_ROW_LANES`` lanes of them
+            # (``whole_vector_lanes``); a row they do not fit keeps its scalar
+            # lanes, which the knob takes.
             if (tiled := tiled_row_threads(threads, size)) != threads:
                 threads = tiled
                 lanes = cast("int", synthetic_reduction_lanes(threads, size))
@@ -2017,17 +2041,29 @@ def _cute_reduction_plans(
                 if threads > WARP_THREADS:
                     threads = WARP_THREADS
                     lanes = cast("int", synthetic_reduction_lanes(threads, size))
-                if not (vector and lanes == vec):
-                    if masked and trims_padded_lanes(
-                        size,
-                        threads,
-                        proven_bounds=config.get("cute_proven_bounds") is True,
-                    ):
-                        # Only the lanes holding an element run
-                        # (``_live_lane_extent``).
-                        lanes = min(lanes, -(-size // threads))
+                if not (
+                    vector
+                    and whole_vector_lanes(lanes, vec)
+                    and (
+                        lanes == vec
+                        or block_id not in config_spec.cute_scanned_block_ids
+                        and fits_row_packets(
+                            config_spec.cute_row_itemsizes.get(block_id),
+                            vec,
+                            config_spec.target_device_capability,
+                        )
+                    )
+                ):
+                    # A masked row walks fewer lanes (``masked_row_lanes``),
+                    # but only a knob's lane loop is read here, and under the
+                    # knob that count is even, as the padded one is: both
+                    # form a lane loop.
                     lane_loop = _unrollable_lanes(lanes)
-        plans.append(_CuteReductionPlan(unpadded, exact and not unpadded, lane_loop))
+        plans.append(
+            _CuteReductionPlan(
+                block_id, unpadded, exact and not unpadded, lane_loop, rolled_width
+            )
+        )
         others *= threads
     return plans
 
@@ -2595,6 +2631,18 @@ def normalize_knobs(
     _normalize_cute_vector_reductions(config_spec, config, fix_invalid=fix_invalid)
     _normalize_gated_boolean(
         config,
+        "cute_pair_lane_math",
+        enabled=config_spec.cute_pair_lane_math_sites,
+        requirement=(
+            "an exp or sigmoid below fp64, a true division, fp32 arithmetic, or "
+            "a bf16/f16 max or min reduction, on sm_100 without fast_math, in a "
+            "kernel without a matmul"
+        ),
+        fix_invalid=fix_invalid,
+        fill=False,
+    )
+    _normalize_gated_boolean(
+        config,
         "cute_warp_aggregated_atomics",
         enabled=config_spec.cute_warp_aggregated_atomics_enabled,
         requirement="relaxed Int32 tickets",
@@ -2617,6 +2665,17 @@ def normalize_knobs(
     _normalize_cute_vloop_sink(config_spec, config, fix_invalid=fix_invalid)
     _normalize_cute_unpadded_rows(config_spec, config, fix_invalid=fix_invalid)
     _normalize_cute_bool_byte_packets(config_spec, config, fix_invalid=fix_invalid)
+    _normalize_gated_boolean(
+        config,
+        "cute_tail_peel",
+        enabled=bool(config_spec.cute_tail_peel_blocks),
+        requirement=(
+            "an hl.tile loop over a static extent that loads a float tensor "
+            "along its tile, in a kernel without a matmul"
+        ),
+        fix_invalid=fix_invalid,
+        fill=False,
+    )
     _normalize_cute_wide_packet_hints(config, fix_invalid=fix_invalid)
     _normalize_cute_pdl(config_spec, config, fix_invalid=fix_invalid)
     _normalize_cute_dot_fragment_mma(config_spec, config, fix_invalid=fix_invalid)
@@ -3833,16 +3892,27 @@ def cute_flat_fields(
                 else ("default", "streaming")
             )
         )
-        if config_spec.cute_bool_byte_packet_sites and not config_spec.matmul_facts:
+        if config_spec.cute_bool_byte_packet_blocks:
             # A looped reduction's bool rows as byte packets; bitwise
             # identical, fewer loads against the L2 reuse of a later sweep
             # that reloads the row.
             fields["cute_bool_byte_packets"] = BooleanFragment()
+        if config_spec.cute_tail_peel_blocks:
+            # A device loop's complete tiles apart from its partial last tile,
+            # their lanes loaded in packets; bitwise identical but for FMA
+            # contraction.  Where the shape or the config leaves nothing to
+            # split (no partial tile, no aligned packet, a shared-memory
+            # reduce in the loop) the loop stays whole (``peel_vector_tails``).
+            fields["cute_tail_peel"] = BooleanFragment()
         if config_spec.cute_exact_division_sites and not config_spec.matmul_facts:
-            # How an fp32 quotient by a loop-invariant divisor is
-            # lowered; bitwise identical forms, see
-            # ``_normalize_cute_exact_div_form``.
+            # How fp32 quotients and square roots are lowered; bitwise
+            # identical forms, see ``_normalize_cute_exact_div_form``.
             fields["cute_exact_div_form"] = EnumFragment(choices=CUTE_EXACT_DIV_FORMS)
+        if config_spec.cute_pair_lane_math_sites:
+            # Packed fp32 exps, exact divisions and arithmetic over vector
+            # lanes; bitwise identical, fewer instructions against more
+            # registers.
+            fields["cute_pair_lane_math"] = BooleanFragment()
         if config_spec.cute_async_load_pipeline_enabled:
             fields["cute_async_load_stages"] = EnumFragment(choices=(0, 3, 4, 5))
             fields["cute_async_load_lookahead"] = EnumFragment(choices=(4, 2, 3))
@@ -3983,12 +4053,18 @@ def cute_flat_fields(
         if config_spec.cute_privatize_atomics_enabled:
             fields["cute_privatize_atomics"] = BooleanFragment()
         if len(config_spec.cute_lane_layouts) > 0 and not config_spec.matmul_facts:
-            # Seeded, not searched: the masked rolled cluster seeds it only
-            # on some extents, and a search space that depends on the extent
-            # breaks ``autotune_multi``, which shares configs across the
-            # shapes of one structural fingerprint.
+            # The kernel's structure opens it, not its seeds: a max, a min or
+            # an ``any`` the knob reduces natively (``cute_native_redux_sites``),
+            # which its seeds (the masked rolled cluster's and the one-warp
+            # persistent row's) require too.  A search space that followed
+            # the seeds would depend on the extent and break
+            # ``autotune_multi``, which shares configs across the shapes of
+            # one structural fingerprint.
             fields["cute_warp_fp32_redux"] = EnumFragment(
-                (False, True), search_choices=(False,)
+                (False, True),
+                search_choices=(
+                    (False, True) if config_spec.cute_native_redux_sites else (False,)
+                ),
             )
             for key in (
                 "cute_independent_reduction",
@@ -4033,6 +4109,11 @@ def cute_flat_fields(
                 fields["cute_unpadded_rows"] = EnumFragment(
                     (False, True), search_choices=(False, True)
                 )
+            # One compare per vector where a lane index meets a bound that
+            # is a multiple of the vector width; its only numeric effect is
+            # FMA contraction.  Searched on every such kernel, with knob-on
+            # witnesses on the first vector seeds (``register_coverage_groups``).
+            fields["cute_uniform_lane_compares"] = BooleanFragment()
         fragment_mma_searchable = _cute_fragment_mma_searchable(config_spec)
         if fragment_mma_searchable:
             # The GEMV dot on mma.sync fragments; configs whose thread
@@ -4137,16 +4218,24 @@ def cute_flat_fields(
             fields["cute_cluster_n"] = EnumFragment(choices=(1, 2, 4, 8, 16))
         # Minimum resident CTAs per SM (ptxas ``minnctapersm``):
         # caps registers per thread so more CTAs fit, trading
-        # spills for occupancy.  0 leaves ptxas free.  6 is a
-        # hard squeeze (at 128 threads it caps registers at 85 ->
-        # 24 warps/SM); measured on B200 softmax rows, one extra
-        # resident CTA beats ~10 spilled registers.
+        # spills for occupancy.  0 leaves ptxas free.  6 caps
+        # 128-thread CTAs at 80 registers (24 warps/SM); measured
+        # on B200 softmax rows, one extra resident CTA beats ~10
+        # spilled registers.  8 and 10 cap them at 64 and 48
+        # registers (32 and 40 warps/SM): a latency-bound
+        # pointwise chain that ptxas leaves at 60 registers
+        # (better-benchmark's gsw_dHdT, one element per thread)
+        # measured faster at 48.  A count the block cannot reach (more than 2048
+        # threads per SM) is ignored by ptxas, as 6 already is for
+        # 512 threads.
         if (
             config_spec.supports_config_key("cute_min_blocks_per_mp")
             and len(config_spec.cute_lane_layouts) > 0
             and not config_spec.matmul_facts
         ):
-            fields["cute_min_blocks_per_mp"] = EnumFragment(choices=(0, 1, 2, 3, 4, 6))
+            fields["cute_min_blocks_per_mp"] = EnumFragment(
+                choices=(0, 1, 2, 3, 4, 6, 8, 10)
+            )
         # Several one-element grid tiles per CTA (thread sub-groups):
         # tiny-tile kernels are CTA-dispatch bound.
         if (
