@@ -177,6 +177,7 @@ class Config(Mapping[str, object]):
         cute_vector_packet_unroll: bool | None = None,
         cute_vloop_sink: bool | None = None,
         cute_grid_lane_jam: bool | None = None,
+        cute_scratch_forwarding: bool | None = None,
         cute_lane_unroll: int | None = None,
         cute_unpadded_rows: bool | None = None,
         cute_bool_byte_packets: bool | None = None,
@@ -281,6 +282,16 @@ class Config(Mapping[str, object]):
                 one fragment reduce. The results are bitwise unchanged.
                 Disabled by default; a lane loop the pass cannot prove
                 independent across lanes keeps the knob-off code.
+            cute_scratch_forwarding: Serve a later sweep's reload of what an
+                earlier sweep stored into a kernel-local scratch tensor (a
+                host ``torch.empty`` only the kernel's loads and stores
+                reach) from the earlier sweep's registers, and drop the
+                stores, the kernel argument and the allocation of a scratch
+                tensor nothing reads any more.  The results are bitwise
+                unchanged: the forwarded value passes through an opaque
+                register move, as the reload did.  It saves the workspace's
+                traffic but keeps its values live across the sweeps.
+                Disabled by default.
             cute_lane_unroll: Unroll factor (1, 2, 4, 8, 16) for per-thread
                 lane loops: every unrolled lane's loads, the scalar loads of
                 its vector loop included, issue before the first of them
@@ -520,6 +531,7 @@ class Config(Mapping[str, object]):
             "cute_vector_packet_unroll": cute_vector_packet_unroll,
             "cute_vloop_sink": cute_vloop_sink,
             "cute_grid_lane_jam": cute_grid_lane_jam,
+            "cute_scratch_forwarding": cute_scratch_forwarding,
             "cute_lane_unroll": cute_lane_unroll,
             "cute_unpadded_rows": cute_unpadded_rows,
             "cute_bool_byte_packets": cute_bool_byte_packets,

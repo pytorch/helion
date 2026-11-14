@@ -28,6 +28,8 @@ import torch
 from test._cute_kernels import _reduction_kernel
 
 import helion
+from helion._compiler.cute.fuse_two_pass_loads import _apart_across_threads
+from helion._compiler.cute.fuse_two_pass_loads import _thread_variant_names
 from helion._compiler.cute.fuse_two_pass_loads import fuse_two_pass_loads
 from helion._compiler.cute.persistent_branch_vec import (
     vectorize_branch_local_persistent_fragments,
@@ -563,6 +565,224 @@ for synthetic_lane_7 in range(8):
 """
     )
     assert "c = (x.iterator + idx).load()" in code
+
+
+@pytest.mark.cpu_only
+def test_store_through_a_carried_index_is_not_forwarded() -> None:
+    # The first sweep stores through the ``idx`` it carries, and the second
+    # sweep's ``idx`` is a load of its own: the same text names another
+    # element, so the second sweep reloads it instead of reading the value
+    # the first sweep stored.  Each lane of the first sweep stores to an
+    # element of its own (``idx + lane`` steps by two), so only the carried
+    # name keeps the store from being forwarded.
+    tensors = ("x", "ws", "offsets", "out")
+    result = fuse_two_pass_loads(
+        ast.parse(
+            """
+idx = 0
+for synthetic_lane_7 in range(8):
+    v = (x.iterator + synthetic_lane_7).load()
+    (ws.iterator + idx + synthetic_lane_7).store(v)
+    idx = idx + 1
+for synthetic_lane_7 in range(8):
+    idx = (offsets.iterator + synthetic_lane_7).load()
+    w = (ws.iterator + idx + synthetic_lane_7).load()
+    (out.iterator + synthetic_lane_7).store(w)
+"""
+        ).body,
+        tensor_dtypes={
+            "x": "cutlass.Float32",
+            "ws": "cutlass.Float32",
+            "offsets": "cutlass.Int32",
+            "out": "cutlass.Float32",
+        },
+        reload_modes={7: "register"},
+        proven_disjoint_tensor_pairs={
+            frozenset((a, b)) for a in tensors for b in tensors if a != b
+        },
+        forwardable_tensors=("ws",),
+    )
+    code = ast.unparse(ast.Module(body=result, type_ignores=[]))
+    assert "w = (ws.iterator + idx + synthetic_lane_7).load()" in code
+
+
+_LANE_SWEEPS = """
+for synthetic_lane_7 in range(8):
+    v = (x.iterator + synthetic_lane_7).load()
+    (ws.iterator + {address}).store(v)
+for synthetic_lane_7 in range(8):
+    w = (ws.iterator + {address}).load()
+    (out.iterator + synthetic_lane_7).store(w)
+"""
+_TRIP_SWEEPS = """
+for roffset_7 in range(0, {end}, 8):
+    for reduction_lane_7 in range(8):
+        v = (x.iterator + roffset_7 + reduction_lane_7).load()
+        (ws.iterator + {address}).store(v)
+for roffset_7 in range(0, {end}, 8):
+    for reduction_lane_7 in range(8):
+        w = (ws.iterator + {address}).load()
+        (out.iterator + roffset_7 + reduction_lane_7).store(w)
+"""
+# Sweeps over eight lanes; over four trips of eight lanes; over a constexpr
+# number of such trips.
+_STORING_SWEEPS = {
+    "lanes": (_LANE_SWEEPS, ""),
+    "trips": (_TRIP_SWEEPS, "32"),
+    "constexpr trips": (_TRIP_SWEEPS, "_TRIPS * 8"),
+}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("sweeps", "address", "forwarded"),
+    [
+        # Lanes 2k and 2k + 1 store to one element, and the even and the odd
+        # lanes to one each: the reload reads the last of their values.
+        ("lanes", "synthetic_lane_7 // 2", False),
+        ("lanes", "synthetic_lane_7 % 2", False),
+        ("lanes", "7 - synthetic_lane_7", True),
+        # One element for every lane: one slot, which each store overwrites
+        # as it does the element.
+        ("lanes", "3", True),
+        # Of the eight threads, thread t's lane 1 stores to thread t + 1's
+        # lane 0's element: its later sweep reads what thread t stored there.
+        ("lanes", "cutlass.Int32(cute.arch.thread_idx()[0]) + synthetic_lane_7", False),
+        # The threads' lanes interleave without meeting (T5's layout).
+        (
+            "lanes",
+            "cutlass.Int32(cute.arch.thread_idx()[0]) + 8 * synthetic_lane_7",
+            True,
+        ),
+        # A narrowing conversion proves no coefficient: ``cutlass.Int8(256)``
+        # wraps to 0, one element for every lane.
+        ("lanes", "synthetic_lane_7 * cutlass.Int8(256)", False),
+        ("lanes", "synthetic_lane_7 * cutlass.Int32(256)", True),
+        # Each trip stores to the same eight elements, and trip 1's lane 0 to
+        # trip 0's lane 4's.
+        ("trips", "reduction_lane_7", False),
+        ("trips", "roffset_7 + 2 * reduction_lane_7", False),
+        ("trips", "roffset_7 * 8 + reduction_lane_7", True),
+        # Under a constexpr trip count, each trip must step past all its
+        # lanes' elements.
+        ("constexpr trips", "roffset_7 + 2 * reduction_lane_7", False),
+        ("constexpr trips", "roffset_7 * 2 + reduction_lane_7", True),
+        # Each trip steps 2**32 elements, which an Int32 index wraps back
+        # onto the same eight.
+        ("trips", "cutlass.Int32(roffset_7 * 536870912) + reduction_lane_7", False),
+        (
+            "constexpr trips",
+            "cutlass.Int32(roffset_7 * 536870912) + reduction_lane_7",
+            False,
+        ),
+    ],
+)
+def test_a_store_is_forwarded_only_where_each_iteration_writes_its_own_element(
+    sweeps: str, address: str, forwarded: bool
+) -> None:
+    # A later sweep's load reads the last value stored to its element, the
+    # cache what its own iteration stored.
+    template, end = _STORING_SWEEPS[sweeps]
+    tensors = ("x", "ws", "out")
+    result = fuse_two_pass_loads(
+        ast.parse(template.format(end=end, address=address)).body,
+        tensor_dtypes=dict.fromkeys(tensors, "cutlass.Float32"),
+        reload_modes={7: "register"},
+        proven_disjoint_tensor_pairs={
+            frozenset((a, b)) for a in tensors for b in tensors if a != b
+        },
+        dynamic_trip_counts={"roffset_7": (4, "_TRIPS")},
+        thread_block_dims=(8, 1, 1),
+        forwardable_tensors=("ws",),
+    )
+    code = ast.unparse(ast.Module(body=result, type_ignores=[]))
+    # A forwarded value reaches the later sweep through a register move.
+    assert ("mov.b32" in code) is forwarded
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "base",
+    [
+        "base = (offsets.iterator + cutlass.Int32(cute.arch.thread_idx()[0])).load()",
+        "base = 8 if cute.arch.thread_idx()[0] > 0 else 0",
+    ],
+    ids=["loaded", "selected"],
+)
+def test_a_store_through_a_base_other_threads_differ_in_is_not_forwarded(
+    base: str,
+) -> None:
+    # Bases 0 and 8 would put thread 1's lane 0 on thread 0's lane 8: a
+    # loaded base may differ between threads, and one a thread coordinate
+    # selects is not affine in it.
+    tensors = ("x", "ws", "out", "offsets")
+    result = fuse_two_pass_loads(
+        ast.parse(
+            base + "\n" + _LANE_SWEEPS.format(address="base + synthetic_lane_7")
+        ).body,
+        tensor_dtypes={
+            **dict.fromkeys(tensors, "cutlass.Float32"),
+            "offsets": "cutlass.Int32",
+        },
+        reload_modes={7: "register"},
+        proven_disjoint_tensor_pairs={
+            frozenset((a, b)) for a in tensors for b in tensors if a != b
+        },
+        thread_block_dims=(8, 1, 1),
+        forwardable_tensors=("ws",),
+    )
+    code = ast.unparse(ast.Module(body=result, type_ignores=[]))
+    assert "mov.b32" not in code
+
+
+@pytest.mark.cpu_only
+def test_names_other_threads_may_bind_otherwise() -> None:
+    # A thread coordinate, a load, a register tensor's element, a name bound
+    # from one, and the names a branch or a loop on such a value binds; not
+    # the CTA's own coordinates, nor a loop over them.
+    body = ast.parse(
+        """
+tile = cutlass.Int32(cute.arch.block_idx()[0]) * 64
+row = tile + cutlass.Int32(cute.arch.thread_idx()[1])
+start = (offsets.iterator + tile).load()
+held = cache[0]
+for chunk in range(tile, tile + 64, 8):
+    acc = acc + chunk
+for step in range(row, 64, 8):
+    last = step
+if start > 0:
+    flag = 1
+"""
+    ).body
+    assert _thread_variant_names(body, str) == {
+        "row",
+        "start",
+        "held",
+        "step",
+        "last",
+        "flag",
+    }
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("slots", "threads", "apart"),
+    [
+        # Eight lanes eight elements apart beside eight threads: each element
+        # one thread's (T5's layout).
+        ([(8, 8)], [(1, 8)], True),
+        # Three lanes two apart and two threads three apart: elements 0, 2, 4
+        # and 3, 5, 7.  Four apart, 0, 2, 4 and 4, 6, 8 meet at 4.
+        ([(2, 3)], [(3, 2)], True),
+        ([(2, 3)], [(4, 2)], False),
+        # A coordinate the pointer is not affine in.
+        ([(1, 8)], [(None, 8)], False),
+    ],
+)
+def test_threads_store_apart_unless_an_element_is_two_threads(
+    slots: list[tuple[int, int]], threads: list[tuple[int | None, int]], apart: bool
+) -> None:
+    assert _apart_across_threads(slots, threads) is apart
 
 
 @pytest.mark.cpu_only

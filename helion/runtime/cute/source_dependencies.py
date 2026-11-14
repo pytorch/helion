@@ -46,6 +46,7 @@ _COMMON_DEPENDENCIES = (
     "_compiler/cute/device/sync.py",
     "_compiler/cute/vec_utils.py",
     "_compiler/cute/l2_policy.py",
+    "_compiler/cute/cache_hint_forms.py",
     "_compiler/cute/cutedsl_compat.py",
     "_compiler/cute/dtypes.py",
 )

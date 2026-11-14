@@ -160,6 +160,11 @@ _RESIZING_METHODS = frozenset({"append", "extend", "insert", "pop", "remove", "c
 
 # The grouped-reduce dispatchers by the name generated code calls them by.
 _REDUCE_SCOPES: dict[str, ReduceScope] = {scope.value: scope for scope in ReduceScope}
+# The forms that allocate no buffer: the warp form shuffles, and a cluster
+# exchange receives into buffers the body allocates.
+_UNBUFFERED_SCOPES = frozenset(
+    {ReduceScope.WARP, ReduceScope.CLUSTER, ReduceScope.CLUSTER_WARP_ONLINE_PAIR}
+)
 
 # Calls whose result views the storage of their first argument: binding one
 # reads nothing, and the storage is used only once the view is.
@@ -260,6 +265,25 @@ class _Facts:
 def _is_alloc_smem(call: ast.Call) -> bool:
     """Whether ``call`` is a ``cute.arch.alloc_smem``."""
     return isinstance(call.func, ast.Attribute) and call.func.attr == "alloc_smem"
+
+
+def allocates_smem(call: ast.Call) -> bool:
+    """Whether a traced ``call`` may take shared memory of its own, by what it
+    calls: ``cute.arch.alloc_smem``, the ``_OPAQUE_SMEM_CALLS``,
+    ``_cute_resident_sums`` and the grouped-reduce dispatchers but their
+    unbuffered forms.  These are the calls the walk sizes; a pass that copies
+    code must not copy one, since every traced copy allocates again.  The
+    resident sums allocate only above one warp, as the walk reads from their
+    thread count; this test names them at any count, conservatively (at one
+    warp they reduce through shuffles alone)."""
+    name = callee_name(call.func)
+    scope = _REDUCE_SCOPES.get(name) if name is not None else None
+    return (
+        _is_alloc_smem(call)
+        or name in _OPAQUE_SMEM_CALLS
+        or name == "_cute_resident_sums"
+        or (scope is not None and scope not in _UNBUFFERED_SCOPES)
+    )
 
 
 def _view_source(node: ast.expr) -> str | ast.Call | None:
@@ -1007,9 +1031,9 @@ class _Walk:
 
     def call(self, call: ast.Call) -> SmemFootprint:
         """What one traced ``call`` allocates itself (its arguments aside)."""
+        if not allocates_smem(call):
+            return SmemFootprint()
         name = callee_name(call.func)
-        if name in _OPAQUE_SMEM_CALLS:
-            return _UNKNOWN
         if _is_alloc_smem(call):
             if len(call.args) < 2:
                 return _UNKNOWN
@@ -1042,19 +1066,13 @@ class _Walk:
         scope = _REDUCE_SCOPES.get(name) if name is not None else None
         if scope is not None:
             return self.reduce_buffer(call, scope)
-        return SmemFootprint()
+        # ``_OPAQUE_SMEM_CALLS``, or another call ``allocates_smem`` names.
+        return _UNKNOWN
 
     def reduce_buffer(self, call: ast.Call, scope: ReduceScope) -> SmemFootprint:
-        """The buffer one traced call of a grouped-reduce dispatcher allocates
-        (typed like its identity), sized as the dispatcher sizes it; the warp
-        and cluster forms allocate none (a cluster exchange receives into
-        buffers the body allocates)."""
-        if scope in (
-            ReduceScope.WARP,
-            ReduceScope.CLUSTER,
-            ReduceScope.CLUSTER_WARP_ONLINE_PAIR,
-        ):
-            return SmemFootprint()
+        """The buffer one traced call of a grouped-reduce dispatcher's buffered
+        form allocates (typed like its identity), sized as the dispatcher
+        sizes it."""
         keywords = {item.arg: item.value for item in call.keywords}
 
         def keyword(name: str, default: int | None = None) -> int | None:

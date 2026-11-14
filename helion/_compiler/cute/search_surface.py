@@ -198,6 +198,14 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
         info.graph for info in device_ir.graphs
     )
 
+    # A reduction over a strided full slice beside a contiguous grid tile:
+    # sinking its V-loop and unrolling its lanes are tunable at every extent,
+    # though the seeds that sink it fit only some.
+    from .autotune.heuristics.cute import CuteStridedReductionHeuristic
+
+    config_spec.cute_strided_reduction_sites = (
+        CuteStridedReductionHeuristic.strided_reduction(env, device_ir) is not None
+    )
     config_spec.cute_signed_bitfield_bf16_available = (
         config_spec.target_device_capability == (10, 0)
         and any(has_signed_byte_field(info.graph) for info in device_ir.graphs)
@@ -851,6 +859,20 @@ def record_tile_loop_facts(
     from .mma_support import cute_fp32_dot_uses_tf32
 
     config_spec.cute_fp32_dot_exact = not cute_fp32_dot_uses_tf32()
+
+
+def record_scratch_forwarding_sites(
+    func: HostFunction | None, device_ir: DeviceIR, analysis: DeviceIRAnalysis | None
+) -> None:
+    """After the tile loop facts the lane jam's eligibility reads: whether
+    the kernel's structure takes ``cute_scratch_forwarding``
+    (``ConfigSpec.cute_scratch_forwarding_sites``)."""
+    from .autotune.heuristics.cute import CuteReductionLaneJamForwardingHeuristic
+
+    env = CompileEnvironment.current()
+    env.config_spec.cute_scratch_forwarding_sites = (
+        CuteReductionLaneJamForwardingHeuristic.is_eligible(env, device_ir)
+    )
 
 
 def register_matmul_alias_specializations(

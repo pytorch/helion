@@ -411,6 +411,8 @@ class _DeviceBodyState:
         self.sinking = False
         self.fold_sites: dict[str, set[str]] = {}
         self.folded_lanes: frozenset[str] = frozenset()
+        # ``_scratch_tensor_names``, once a step asked for them.
+        self.scratch_tensor_names: frozenset[str] | None = None
 
 
 class _KernelDefState:
@@ -616,7 +618,40 @@ def _fuse_two_pass_loads(s: _DeviceBodyState) -> None:
         dynamic_trip_counts=ctx.dynamic_trip_counts,
         binding_dtypes=s.fn.cute_state.uniform_cutoff_dtypes,
         rename_groups=ctx.rename_groups,
+        forwardable_tensors=(
+            _scratch_tensor_names(s)
+            if ctx.config.get("cute_scratch_forwarding", False)
+            else frozenset()
+        ),
     )
+
+
+def _scratch_tensor_names(s: _DeviceBodyState) -> frozenset[str]:
+    """The kernel arguments that are kernel-local scratch tensors (found
+    once; the forwarding and the store drop both ask).  Not a placeholder
+    argument: the kernel also reaches its memory through objects the host
+    wrapper builds (TMA descriptors), under other names."""
+    if s.scratch_tensor_names is None:
+        from ...scratch_tensors import kernel_local_scratch
+
+        scratch = kernel_local_scratch(HostFunction.current())
+        s.scratch_tensor_names = frozenset(
+            arg.name
+            for arg in s.fn.arguments
+            if isinstance(arg, TensorArg)
+            and arg.name not in s.fn.placeholder_args
+            and scratch.holds(arg.fake_value)
+        )
+    return s.scratch_tensor_names
+
+
+def _drop_scratch_stores(s: _DeviceBodyState) -> None:
+    # After the reloads ``fuse_two_pass_loads`` serves from registers: a
+    # kernel-local scratch tensor no load reads any more has dead stores.
+    from ..drop_scratch_stores import drop_scratch_stores
+
+    if names := _scratch_tensor_names(s):
+        s.kernel_body = drop_scratch_stores(s.kernel_body, names)
 
 
 def _vectorize_branch_local_persistent_fragments(s: _DeviceBodyState) -> None:
@@ -1136,7 +1171,35 @@ def _pack_bf16_recurrences(s: _DeviceBodyState) -> None:
     )
 
 
+# The gate of ``split_rolled_vector_sums``, which matches a rolled sum's loop
+# whole: ``peel_partial_chunks`` leaves the loops it would split to it.
+_independent_reduction = _config_flag("cute_independent_reduction")
+
+
+def _peel_partial_chunks(s: _DeviceBodyState) -> None:
+    from ..peel_partial_chunks import peel_partial_chunks
+    from ..vector_reduction_packets import rolled_sums_split_after
+
+    body = s.kernel_body
+    s.kernel_body = peel_partial_chunks(
+        body,
+        s.ctx.constexpr_values,
+        # The rolled sums ``split_rolled_vector_sums`` splits, which it
+        # finds in the body the bounds proofs leave.
+        keep_whole=rolled_sums_split_after(
+            body, lambda copy: _proven_bounds(s, _proven_loop_bounds(s, copy))
+        )
+        if _independent_reduction(s)
+        else None,
+    )
+
+
 def _simplify_proven_loop_bounds(s: _DeviceBodyState) -> None:
+    s.kernel_body = _proven_loop_bounds(s, s.kernel_body)
+
+
+def _proven_loop_bounds(s: _DeviceBodyState, body: list[ast.stmt]) -> list[ast.stmt]:
+    """``body`` after ``simplify_proven_loop_bounds`` with the kernel's facts."""
     from ...program_id import FlatProgramIDs
     from ...program_id import XYZProgramIDs
     from ..proven_loop_bounds import exact_static_grid
@@ -1160,13 +1223,19 @@ def _simplify_proven_loop_bounds(s: _DeviceBodyState) -> None:
             collective_grid = exact_static_grid(
                 fn.pid.codegen_grid(), ctx.constexpr_values
             )
-    s.kernel_body = simplify_proven_loop_bounds(
-        s.kernel_body,
+    return simplify_proven_loop_bounds(
+        body,
         enabled=bool(ctx.config.config.get("cute_proven_bounds", False)),
         thread_block_dims=ctx.exact_thread_block_dims,
         constexpr_values=ctx.constexpr_values,
         block_grid_dims=collective_grid,
     )
+
+
+def _merge_unproven_peels(s: _DeviceBodyState) -> None:
+    from ..peel_partial_chunks import merge_unproven_peels
+
+    s.kernel_body = merge_unproven_peels(s.kernel_body)
 
 
 def _divide_vector_bases(s: _DeviceBodyState) -> None:
@@ -1180,11 +1249,16 @@ def _divide_vector_bases(s: _DeviceBodyState) -> None:
 
 
 def _simplify_proven_bounds(s: _DeviceBodyState) -> None:
+    s.kernel_body = _proven_bounds(s, s.kernel_body)
+
+
+def _proven_bounds(s: _DeviceBodyState, body: list[ast.stmt]) -> list[ast.stmt]:
+    """``body`` after ``simplify_proven_bounds`` with the kernel's facts."""
     from ..simplify_proven_bounds import simplify_proven_bounds
 
     ctx = s.ctx
-    s.kernel_body = simplify_proven_bounds(
-        s.kernel_body,
+    return simplify_proven_bounds(
+        body,
         enabled=cast("bool", ctx.config.config.get("cute_proven_bounds", False)),
         exact_grid=ctx.exact_grid,
         thread_block_dims=ctx.exact_thread_block_dims,
@@ -1541,6 +1615,12 @@ DEVICE_BODY_PASSES: tuple[DeviceBodyPass, ...] = (
         provides=("two_pass_loads_fused",),
     ),
     DeviceBodyPass(
+        "drop_scratch_stores",
+        _config_flag("cute_scratch_forwarding"),
+        _drop_scratch_stores,
+        requires=("two_pass_loads_fused",),
+    ),
+    DeviceBodyPass(
         "vectorize_branch_local_persistent_fragments",
         _always,
         _vectorize_branch_local_persistent_fragments,
@@ -1679,10 +1759,24 @@ DEVICE_BODY_PASSES: tuple[DeviceBodyPass, ...] = (
     ),
     DeviceBodyPass("divide_vector_bases", _always, _divide_vector_bases),
     DeviceBodyPass(
+        "peel_partial_chunks",
+        _config_flag("cute_proven_bounds"),
+        _peel_partial_chunks,
+        provides=("partial_chunks_peeled",),
+    ),
+    DeviceBodyPass(
         "simplify_proven_loop_bounds",
         _always,
         _simplify_proven_loop_bounds,
         requires=(LAUNCH_SHAPE,),
+        provides=("loop_bounds_proven",),
+    ),
+    DeviceBodyPass(
+        "merge_unproven_peels",
+        _config_flag("cute_proven_bounds"),
+        _merge_unproven_peels,
+        # Rejoins the peeled loops whose complete chunks the proof left alone.
+        requires=("partial_chunks_peeled", "loop_bounds_proven"),
     ),
     DeviceBodyPass(
         "simplify_proven_bounds",
@@ -1713,7 +1807,7 @@ DEVICE_BODY_PASSES: tuple[DeviceBodyPass, ...] = (
     ),
     DeviceBodyPass(
         "split_rolled_vector_sums",
-        _config_flag("cute_independent_reduction"),
+        _independent_reduction,
         _split_rolled_vector_sums,
         provides=("independent_sums_split",),
     ),

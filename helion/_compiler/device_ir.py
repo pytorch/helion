@@ -1240,6 +1240,12 @@ class DeviceIR:
         # A CuTe codegen view can restrict reduction strategies to one launch.
         # Axis identities and configuration slots remain owned by the full IR.
         self.codegen_active_block_ids: frozenset[int] | None = None
+        # Reduction dims a backend rewrite removed reductions over (CuTe folds
+        # the sum of a one-hot row); the unused ones retire with merged dims.
+        self.retirable_reduction_block_ids: set[int] = set()
+        # The sums of a one-hot row CuTe folded into closed form, which leave
+        # the row's loads and stores as the kernel's traffic.
+        self.folded_one_hot_sums: int = 0
         # Owning HostFunction (captured in ``lower_to_device_ir``).
         self.host_function: HostFunction | None = None
         # Root ``for`` statements in source order (captured in ``lower_to_device_ir``).
@@ -4487,8 +4493,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         # Phase 1: roll + register the reduction_loops spec. The ReductionKernelFact is built
         # in Phase 3 (after analysis derives memory_op_facts) so it can read the enriched
         # load/store facts.
-        if merged_rdims:
-            # Merged dims can leave their per-dim rdims unused.  Stop treating
+        retirable_rdims = merged_rdims | device_ir.retirable_reduction_block_ids
+        if retirable_rdims:
+            # Merged dims can leave their per-dim rdims unused, and so can a
+            # rewrite that removed the reductions over a dim.  Stop treating
             # them as reductions, or they would gain unused tuning slots and
             # rolling analysis. CuTe would also claim a thread axis for each.
             # Only rdims nothing uses are demoted: a later slice of the same
@@ -4497,7 +4505,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
 
             unused_rdims = unused_block_ids(
                 device_ir.graphs,
-                merged_rdims,
+                retirable_rdims,
                 used_block_ids=device_ir.codegen_active_block_ids,
             )
             for block_id in unused_rdims:

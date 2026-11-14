@@ -1973,9 +1973,10 @@ def _masked_packet_load_expr(
 ) -> str:
     """``_cute_load_v16b_if(ptr, guard, vec_type[, priority])`` for the packet.
 
-    The L1 eviction priority of the site is kept (``'evict_first'`` /
-    ``'evict_last'``, or the streaming ``cop='cs'``); the inline-PTX L2
-    policy helpers have no predicated form, so their marker is dropped.
+    The cache hint of the site is kept: its L1 eviction priority
+    (``'evict_first'`` / ``'evict_last'``), the streaming ``cop='cs'``, or its
+    L2 policy family, which the predicated load carries as a ``createpolicy``
+    descriptor like the unpredicated L2 helpers.
     """
     return render_masked_packet_load(
         MASKED_PACKET_LOAD_HELPERS[vec_width * dtype.itemsize],

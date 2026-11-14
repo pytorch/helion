@@ -121,6 +121,7 @@ from .cute import CutePersistentLaneUnrollHeuristic
 from .cute import CutePersistentSubwarpRowsHeuristic
 from .cute import CutePersistentUnpaddedRowsHeuristic
 from .cute import CutePointwiseVecHeuristic
+from .cute import CuteReductionLaneJamForwardingHeuristic
 from .cute import CuteReductionLaneJamHeuristic
 from .cute import CuteReductionTileHeuristic
 from .cute import CuteReductionWideChunkHeuristic
@@ -255,6 +256,7 @@ _CUTE_HEURISTIC_CLASSES: tuple[AutotunerHeuristicType, ...] = (
     CuteRolledRowLoadsFirstHeuristic,
     CuteGridLaneJamHeuristic,
     CuteReductionLaneJamHeuristic,
+    CuteReductionLaneJamForwardingHeuristic,
     CuteRolledClusterLadderHeuristic,
     CuteMaskedRolledClusterHeuristic,
     CuteScanTileHeuristic,

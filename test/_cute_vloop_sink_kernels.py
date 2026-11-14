@@ -27,6 +27,22 @@ def _col_reduce_sum_fn(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def _col_reduce_sum_with_policy_fn(
+    x: torch.Tensor, policy: hl.constexpr
+) -> torch.Tensor:
+    m, n = x.size()
+    out = torch.zeros(n, dtype=x.dtype, device=x.device)
+    block_m = hl.register_block_size(m)
+    block_n = hl.register_block_size(n)
+    for tile_n in hl.tile(n, block_size=block_n):
+        col_acc = hl.zeros([tile_n], dtype=torch.float32)
+        for tile_m in hl.tile(m, block_size=block_m):
+            tile = hl.load(x, [tile_m, tile_n], eviction_policy=policy)
+            col_acc += torch.sum(tile.to(torch.float32), dim=0)
+        out[tile_n] = col_acc.to(out.dtype)
+    return out
+
+
 def _col_reduce_max_fn(x: torch.Tensor) -> torch.Tensor:
     m, n = x.size()
     out = torch.empty(n, dtype=x.dtype, device=x.device)
@@ -204,6 +220,9 @@ def _kernel(fn: Callable[..., Any], *, static_shapes: bool) -> helion.Kernel:
 
 col_reduce_sum_static = _kernel(_col_reduce_sum_fn, static_shapes=True)
 col_reduce_sum_dynamic = _kernel(_col_reduce_sum_fn, static_shapes=False)
+col_reduce_sum_with_policy_dynamic = _kernel(
+    _col_reduce_sum_with_policy_fn, static_shapes=False
+)
 col_reduce_max_dynamic = _kernel(_col_reduce_max_fn, static_shapes=False)
 col_reduce_sum_from8_static = _kernel(_col_reduce_sum_from8_fn, static_shapes=True)
 col_reduce_sum_from8_dynamic = _kernel(_col_reduce_sum_from8_fn, static_shapes=False)

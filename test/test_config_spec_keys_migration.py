@@ -143,7 +143,8 @@ _BASE_VALID_KEYS = """
     cute_scaled_mma cute_scaled_persistent cute_scaled_prepare
     cute_scaled_prepare_rows cute_scaled_sf_inplace cute_scaled_sf_tma
     cute_scaled_stages cute_scaled_swap_ab cute_scaled_tile_k cute_scaled_tile_m
-    cute_scaled_tile_n cute_selection_algorithm cute_signed_bitfield_bf16
+    cute_scaled_tile_n cute_scratch_forwarding
+    cute_selection_algorithm cute_signed_bitfield_bf16
     cute_simt_mma cute_simt_mma_layout cute_split_k_finalizer_warps
     cute_split_k_partitions cute_split_k_schedule cute_split_k_stages
     cute_split_k_workspace cute_store_policy cute_tiles_per_block
@@ -307,7 +308,8 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_scaled_mma cute_scaled_persistent cute_scaled_prepare
     cute_scaled_prepare_rows cute_scaled_sf_inplace cute_scaled_sf_tma
     cute_scaled_stages cute_scaled_swap_ab cute_scaled_tile_k cute_scaled_tile_m
-    cute_scaled_tile_n cute_selection_algorithm cute_signed_bitfield_bf16
+    cute_scaled_tile_n cute_scratch_forwarding
+    cute_selection_algorithm cute_signed_bitfield_bf16
     cute_simt_mma cute_simt_mma_layout cute_split_k_finalizer_warps
     cute_split_k_partitions cute_split_k_schedule cute_split_k_stages
     cute_split_k_workspace cute_store_policy cute_tiles_per_block
@@ -405,7 +407,8 @@ _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     cute_scaled_mma cute_scaled_persistent cute_scaled_prepare
     cute_scaled_prepare_rows cute_scaled_sf_inplace cute_scaled_sf_tma
     cute_scaled_stages cute_scaled_swap_ab cute_scaled_tile_k cute_scaled_tile_m
-    cute_scaled_tile_n cute_selection_algorithm cute_signed_bitfield_bf16
+    cute_scaled_tile_n cute_scratch_forwarding
+    cute_selection_algorithm cute_signed_bitfield_bf16
     cute_simt_mma cute_simt_mma_layout cute_split_k_finalizer_warps
     cute_split_k_partitions cute_split_k_schedule cute_split_k_stages
     cute_split_k_workspace cute_store_policy cute_topk_coarse_keys
@@ -525,7 +528,8 @@ _BASE_CUTE_ACCEPTED = """
     cute_scaled_mma cute_scaled_persistent cute_scaled_prepare
     cute_scaled_prepare_rows cute_scaled_sf_inplace cute_scaled_sf_tma
     cute_scaled_stages cute_scaled_swap_ab cute_scaled_tile_k cute_scaled_tile_m
-    cute_scaled_tile_n cute_selection_algorithm cute_signed_bitfield_bf16
+    cute_scaled_tile_n cute_scratch_forwarding
+    cute_selection_algorithm cute_signed_bitfield_bf16
     cute_simt_mma cute_simt_mma_layout cute_split_k_finalizer_warps
     cute_split_k_partitions cute_split_k_schedule cute_split_k_stages
     cute_split_k_workspace cute_store_policy cute_tiles_per_block

@@ -107,6 +107,7 @@ from .indexing import match_cute_lane_remainder
 from .indexing import match_cute_shifted_tile_index
 from .indexing import unwrap_cute_broadcast_index
 from .iota_utils import cute_free_arange_lanes
+from .store_only_loads import load_fill_is_dead
 from .tcgen05.store_epilogue import _codegen_cute_store_tcgen05_tile
 from .tile_ops import cute_masked_block_end
 from .tile_ops import cute_tile_begin_expr
@@ -6923,6 +6924,8 @@ def _(state: CodegenState) -> object:
         )
     load_expr: str | None = None
     load_placeholders: dict[str, ast.AST] = {}
+    # The finished value of a packet load that needs no masked-lane select.
+    value_expr: ast.AST | None = None
     branch_vec_candidate: tuple[int, int] | None = None
     vec_ctx = _cute_vector_load_ctx(
         state,
@@ -7145,9 +7148,47 @@ def _(state: CodegenState) -> object:
                     )
                 )
 
-            if _cute_defer_grid_vector_op(state, context, scalar_load, emit_tile_load):
-                load_placeholders["tile_vector_load"] = scalar_load
-                load_expr = "{tile_vector_load}"
+            # A packet lane the load masks off is a lane no store writes when
+            # the value reaches only stores of the same tiles
+            # (``store_only_loads``): the packet then goes without the
+            # per-lane select.  A scalar load keeps it, since there the
+            # select is what keeps a masked-off thread from reading.
+            fill_is_dead = site.mask_expr is not None and load_fill_is_dead(
+                state.fx_node
+            )
+
+            def emit_tile_value() -> ast.AST | None:
+                # A dead fill's packet lane is the load's whole value, so it
+                # still takes the rest of ``_cute_masked_value_expr``: a bool
+                # byte is compared against zero, as in every other bool load.
+                vector_load = emit_tile_load()
+                if vector_load is None or not fill_is_dead:
+                    return vector_load
+                return _cute_masked_value_expr(
+                    "{tile_vector_load}",
+                    None,
+                    dtype=tensor.dtype,
+                    zero=_cute_scalar_storage_dtype(tensor.dtype),
+                    tile_vector_load=vector_load,
+                )
+
+            deferred: ast.AST = scalar_load
+            if fill_is_dead:
+                # The packet replaces the whole masked value; the scalar
+                # fallback keeps its select.
+                deferred = _cute_masked_value_expr(
+                    "{tile_vector_load}",
+                    site.mask_expr,
+                    dtype=tensor.dtype,
+                    zero=_cute_scalar_storage_dtype(tensor.dtype),
+                    tile_vector_load=scalar_load,
+                )
+            if _cute_defer_grid_vector_op(state, context, deferred, emit_tile_value):
+                if fill_is_dead:
+                    value_expr = deferred
+                else:
+                    load_placeholders["tile_vector_load"] = scalar_load
+                    load_expr = "{tile_vector_load}"
                 # Should the grid keep the scalar load (one nested in a lane
                 # loop of another axis), the sinking pass may still widen it.
                 _cute_record_sinkable_scalar_load(
@@ -7159,9 +7200,16 @@ def _(state: CodegenState) -> object:
                     eviction_suffix,
                 )
             else:
-                vector_load = emit_tile_load()
+                vector_load = emit_tile_value()
                 if vector_load is not None:
-                    load_expr = ast.unparse(vector_load)
+                    if fill_is_dead:
+                        value_expr = vector_load
+                    else:
+                        load_expr = ast.unparse(vector_load)
+    if value_expr is not None:
+        assert isinstance(value_expr, ast.expr)
+        _cute_tag_access_regions(value_expr, site.tensor_name, site.regions)
+        return value_expr
     if load_expr is None:
         flat_gather = _cute_flat_gather_sink_pointer(
             state, tensor, subscript, site.index_exprs, site.tensor_name

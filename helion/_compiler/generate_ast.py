@@ -33,6 +33,8 @@ from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
 from .output_header import get_needed_import_lines
 from .program_id import ForEachProgramID
+from .scratch_tensors import drop_unused_scratch_arguments
+from .scratch_tensors import is_allocation_call
 from .tile_strategy import DeviceGridState
 from .tile_strategy import DeviceLoopState
 from .tile_strategy import EmitPipelineLoopState
@@ -41,6 +43,7 @@ from .variable_origin import ArgumentOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Collection
     from collections.abc import Iterator
 
     from torch.fx.node import Node
@@ -1321,8 +1324,13 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 return node
         return node
 
-    def host_dead_code_elimination(self) -> None:
-        dce_vars: OrderedSet[str] = OrderedSet()
+    def host_dead_code_elimination(
+        self, dead_allocations: Collection[str] = ()
+    ) -> None:
+        """``dead_allocations``: host names of scratch tensors whose kernel
+        parameter went (``drop_unused_scratch_arguments``); their unread
+        ``torch.empty``-family allocations go too."""
+        dce_vars: OrderedSet[str] = OrderedSet(dead_allocations)
         allow_compiler_shape_helpers = (
             self.device_function.config.cross_loop_pipeline != "barrier"
         )
@@ -1342,11 +1350,20 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     assert isinstance(name, ast.Name)
                     dce_vars.add(name.id)
 
-        # A host variable is a user's: beside its pure assignment it may have
-        # others with effects (``flag = 0`` and ``flag = x.add_(1)``, flag
-        # never read), which must run.
+        def removable(stmt: ast.Assign) -> bool:
+            # A host variable is a user's: beside its pure assignment it may
+            # have others with effects (``flag = 0`` and ``flag = x.add_(1)``,
+            # flag never read), which must run.  A dead scratch tensor's
+            # allocation goes too: its one binding (``kernel_local_scratch``),
+            # a factory call that runs no user code.
+            (target,) = stmt.targets
+            assert isinstance(target, ast.Name)
+            return pure(stmt) or (
+                target.id in dead_allocations and is_allocation_call(stmt.value)
+            )
+
         dead_assignment_elimination(
-            self.host_statements, list(dce_vars), removable=pure
+            self.host_statements, list(dce_vars), removable=removable
         )
         dead_expression_elimination(self.host_statements)
 
@@ -1409,7 +1426,8 @@ def generate_ast(
     ``GenerateAST`` (``prologue_first_indexing``), so a retry starts it afresh.
     """
     prefix_length = len(_host_prefix) if _host_prefix is not None else 0
-    policy = CompileEnvironment.current().backend.retry_policy()
+    backend = CompileEnvironment.current().backend
+    policy = backend.retry_policy()
     with policy.scope():
         while True:
             try:
@@ -1536,7 +1554,11 @@ def _generate_ast(
                 if failure is error:
                     raise
                 raise failure from error
-            codegen.host_dead_code_elimination()
+            codegen.host_dead_code_elimination(
+                drop_unused_scratch_arguments(
+                    func, codegen.device_function, kernel_def, codegen.host_statements
+                )
+            )
 
             # Retarget output-only tensor allocations to ``device='meta'`` so
             # the factory call produces a zero-storage metadata-only tensor

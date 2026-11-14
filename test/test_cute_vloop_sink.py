@@ -47,6 +47,7 @@ from test._cute_vloop_sink_kernels import col_reduce_sum_rescaled_const_static
 from test._cute_vloop_sink_kernels import col_reduce_sum_rescaled_dynamic
 from test._cute_vloop_sink_kernels import col_reduce_sum_rescaled_static
 from test._cute_vloop_sink_kernels import col_reduce_sum_static
+from test._cute_vloop_sink_kernels import col_reduce_sum_with_policy_dynamic
 from test._cute_vloop_sink_kernels import col_weighted_mean_dynamic
 from test._cute_vloop_sink_kernels import col_weighted_mean_static
 
@@ -59,6 +60,10 @@ from helion._compiler.cute.autotune.heuristics.cute import CuteColumnReductionHe
 from helion._compiler.cute.autotune.heuristics.cute import (
     CuteSplitColumnReductionHeuristic,
 )
+from helion._compiler.cute.autotune.search_surface import CUTE_EVICTION_POLICIES
+from helion._compiler.cute.cache_hint_forms import L1_PRIORITY_QUALIFIERS
+from helion._compiler.cute.cache_policy_loads import CachePolicy
+from helion._compiler.cute.cutedsl_compat import readonly_packet_load_supported
 from helion._compiler.cute.fuse_fma import fuse_fma
 from helion._compiler.cute.lane_loops import root_passes
 from helion._compiler.cute.sink_vector_loops import VloopSinkNotApplied
@@ -455,6 +460,90 @@ def test_sunk_loads_keep_the_cache_policy(cpu_only: None) -> None:
     assert "_vsink_vec = _cute_load_l2_evict_last(_vsink_ptr + " in code
     assert "load_v16b_l2_evict_last as _cute_load_l2_evict_last" in code
     assert "cute.arch.load(" not in code
+
+
+def test_every_searched_policy_renders_its_own_masked_packets(
+    cpu_only: None,
+) -> None:
+    """No ``load_eviction_policies`` value the search offers is a dead point
+    of the sink's predicated packets: each renders loads no other value does,
+    with the site's hint as the packet's priority (an L2 family keeps its
+    policy, the helper carrying its ``createpolicy`` descriptor, see
+    ``test_masked_packet_loads_carry_the_l2_policy``).  ``nc_l2_first`` on this
+    source nothing writes reaches the 8-byte predicated packets too, as
+    ``.nc`` loads, which the unpredicated 8-byte packets have no helper
+    for."""
+    x = torch.empty(4000, 4000, dtype=torch.bfloat16)
+    bound = cpu_bind(col_reduce_sum_dynamic, (x,))
+    values = bound.config_spec.load_eviction_policies.inner.search_values()
+    # Every searched value, nc_l2_first only where its read-only gate opens.
+    assert values is not None, values
+    assert (
+        set(CUTE_EVICTION_POLICIES) - {"nc_l2_first"}
+        <= set(values)
+        <= set(CUTE_EVICTION_POLICIES)
+    ), values
+    loads: dict[str, str] = {}
+    for value in values:
+        config = _sink_config(
+            block_sizes=[4096, 16], num_threads=[128, 4], vec=[1, 4], unroll=2
+        )
+        code = bound.to_code(
+            bound.config_spec.normalized_config(
+                helion.Config.from_dict({**config, "load_eviction_policies": [value]})
+            )
+        )
+        packets = _vector_loads(_loop(code, "lane_0").body)
+        priority = CachePolicy.tunable(value).masked_priority
+        tail = f", {priority!r})" if priority else "cutlass.Uint16.mlir_type))"
+        assert packets and all(
+            "_cute_load_v8b_if(_vsink_ptr + " in ast.unparse(load)
+            and ast.unparse(load).endswith(tail)
+            for load in packets
+        ), (value, [ast.unparse(load) for load in packets])
+        loads[value] = "\n".join(ast.unparse(load) for load in packets)
+    assert len(set(loads.values())) == len(values), loads
+
+
+def test_explicit_eviction_policies_reach_the_masked_packets(cpu_only: None) -> None:
+    """Every ``hl.load(..., eviction_policy=...)`` spelling reaches the
+    sink's predicated packets as their priority (each has a PTX form there,
+    see ``test_every_explicit_eviction_policy_has_a_masked_load_form``)."""
+    x = torch.empty(4000, 4000, dtype=torch.bfloat16)
+    config = _sink_config(
+        block_sizes=[4096, 16], num_threads=[128, 4], vec=[1, 4], unroll=2
+    )
+    for spelling in L1_PRIORITY_QUALIFIERS:
+        bound = cpu_bind(col_reduce_sum_with_policy_dynamic, (x, spelling))
+        code = bound.to_code(
+            bound.config_spec.normalized_config(helion.Config.from_dict(config))
+        )
+        packets = [
+            ast.unparse(load) for load in _vector_loads(_loop(code, "lane_0").body)
+        ]
+        assert packets and all(
+            "_cute_load_v8b_if(_vsink_ptr + " in load
+            and load.endswith(f", {spelling!r})")
+            for load in packets
+        ), (spelling, packets)
+
+
+def test_an_explicit_l2_family_spelling_is_refused(cpu_only: None) -> None:
+    """An ``hl.load(..., eviction_policy=...)`` spelling that is not an L1
+    priority is refused: the predicated packets read an L2 policy family's
+    name in the same argument, so ``nc_l2_first`` loaded noncoherently from
+    a tensor the kernel may write, past the read-only check the tunable
+    makes."""
+    x = torch.empty(4000, 4000, dtype=torch.bfloat16)
+    config = _sink_config(
+        block_sizes=[4096, 16], num_threads=[128, 4], vec=[1, 4], unroll=2
+    )
+    for spelling in ("nc_l2_first", "l2_last", "first"):
+        bound = cpu_bind(col_reduce_sum_with_policy_dynamic, (x, spelling))
+        with pytest.raises(helion.exc.BackendUnsupported, match="L1 eviction priority"):
+            bound.to_code(
+                bound.config_spec.normalized_config(helion.Config.from_dict(config))
+            )
 
 
 def test_rows_above_columns_uses_the_interleaved_fragment_reduce(
@@ -1544,6 +1633,265 @@ def test_strided_reduction_heuristic_seeds_the_tile_first_layout(
     assert re.search(r"_vsink_store_vals\w*\.append\(", code)
 
 
+def _bind_with_sink_seeds(
+    kernel: helion.Kernel, args: tuple[torch.Tensor, ...]
+) -> tuple[BoundKernel, list[dict[str, object]]]:
+    """``kernel`` bound on CPU, with the strided heuristic's (vloop-sink)
+    seed configs, of which there must be some."""
+    bound = cpu_bind(kernel, args)
+    seeds = [
+        seed.config
+        for seed in bound.config_spec.compiler_seed_configs
+        if seed.config.get("cute_vloop_sink")
+    ]
+    assert seeds
+    return bound, seeds
+
+
+def _seed_spans_a_line(seed: dict[str, object], itemsize: int) -> bool:
+    """Whether the seed's CTA rows cover at least one 128-byte L2 line."""
+    block_sizes = seed["block_sizes"]
+    assert isinstance(block_sizes, list)
+    return max(block_sizes) * itemsize >= 128
+
+
+def test_strided_reduction_seeds_stream_their_input_evict_first(
+    cpu_only: None,
+) -> None:
+    """A column sum streams its input through once (each CTA reads its own
+    columns, once): the strided seeds give its load slot the evict-first L2
+    policy, which the sink's predicated packets carry (1000 columns leave a
+    partial tile).  The narrow seed's CTA rows, under one 128-byte line,
+    share their lines with the neighboring CTAs and keep the default."""
+    bound, seeds = _bind_with_sink_seeds(
+        _column_sum, (torch.empty(2048, 1000, dtype=torch.bfloat16),)
+    )
+    wide = [seed for seed in seeds if _seed_spans_a_line(seed, 2)]
+    assert wide and len(wide) < len(seeds), seeds
+    for seed in seeds:
+        policies = seed.get("load_eviction_policies") or [""]
+        assert isinstance(policies, list)
+        assert policies[0] == ("l1_l2_first" if seed in wide else ""), seed
+    code = bound.to_code(bound.config_spec.normalized_config(helion.Config(**wide[0])))
+    assert re.search(r"_cute_load_v16b_if\(_vsink_ptr \+ .*'l1_l2_first'\)", code), code
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _spatial_mean_of_sum(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """The mean of each ``[N, H*W, C]`` column of ``x + y``."""
+    batch, _, channels = x.shape
+    out = torch.empty([batch, channels], dtype=torch.float32, device=x.device)
+    for tile_n, tile_c in hl.tile([batch, channels]):
+        out[tile_n, tile_c] = torch.mean(
+            x[tile_n, :, tile_c] + y[tile_n, :, tile_c].to(torch.float32), dim=1
+        )
+    return out
+
+
+def test_strided_reduction_seeds_check_each_inputs_lines(cpu_only: None) -> None:
+    """Each streamed input's CTA rows must cover a line in its own dtype:
+    the narrow seed's 32 columns span 128 bytes of the float32 ``x`` but 64
+    of the bfloat16 ``y``, which keeps the default policy there."""
+    _, seeds = _bind_with_sink_seeds(
+        _spatial_mean_of_sum,
+        (
+            torch.empty(256, 784, 128),
+            torch.empty(256, 784, 128, dtype=torch.bfloat16),
+        ),
+    )
+    spans = [
+        (_seed_spans_a_line(seed, 4), _seed_spans_a_line(seed, 2)) for seed in seeds
+    ]
+    assert (True, False) in spans and (True, True) in spans, seeds
+    for seed, (x_spans, y_spans) in zip(seeds, spans, strict=True):
+        policies = seed.get("load_eviction_policies") or ["", ""]
+        assert isinstance(policies, list)
+        assert policies[:2] == [
+            "l1_l2_first" if x_spans else "",
+            "l1_l2_first" if y_spans else "",
+        ], seed
+
+
+def test_strided_reduction_seeds_need_the_tile_on_each_inputs_stride_1_dim(
+    cpu_only: None,
+) -> None:
+    """An input whose stride-1 dim the batch indexes, not the channel tile,
+    has each CTA read its tile's elements one per line (a ``y`` permuted to
+    strides (1, 256, 200704)): it keeps the default policy, where ``x`` takes
+    evict-first as before."""
+    x = torch.empty(256, 784, 128)
+    y = torch.empty(128, 784, 256).permute(2, 1, 0)
+    _, seeds = _bind_with_sink_seeds(_spatial_mean_of_sum, (x, y))
+    hinted = [seed for seed in seeds if seed.get("load_eviction_policies")]
+    assert hinted, seeds
+    for seed in seeds:
+        policies = seed.get("load_eviction_policies") or ["", ""]
+        assert isinstance(policies, list)
+        assert policies[1] == "", seed
+    for seed in hinted:
+        policies = seed["load_eviction_policies"]
+        assert isinstance(policies, list)
+        assert policies[0] == "l1_l2_first", seed
+
+
+def test_strided_reduction_seeds_keep_the_lines_of_unaligned_rows(
+    cpu_only: None,
+) -> None:
+    """A CTA row of one 128-byte line owns it only if it starts on a line
+    boundary: the narrow seed's 32 float32 columns of 120-channel rows (480
+    bytes apart) straddle lines they share with the neighboring channel
+    tile and keep the default policy, those of 128-channel rows (512 bytes
+    apart) take evict-first.  Rows of two lines or more keep it either way."""
+    for channels, aligned in ((120, False), (128, True)):
+        _, seeds = _bind_with_sink_seeds(
+            _spatial_mean, (torch.empty(256, 784, channels),)
+        )
+        widths = []
+        for seed in seeds:
+            block_sizes = seed["block_sizes"]
+            assert isinstance(block_sizes, list)
+            widths.append(max(block_sizes))
+            policies = seed.get("load_eviction_policies") or [""]
+            assert isinstance(policies, list)
+            hinted = aligned or max(block_sizes) * 4 >= 256
+            assert policies[0] == ("l1_l2_first" if hinted else ""), (channels, seed)
+        assert 32 in widths, seeds
+
+
+def test_strided_reduction_search_space_is_the_same_at_every_extent(
+    cpu_only: None,
+) -> None:
+    """The strided seeds that sink a spatial mean fit some reduction extents
+    only (none over 4 rows), but its strided full slice opens
+    ``cute_vloop_sink`` and ``cute_lane_unroll`` at every extent:
+    ``autotune_multi`` needs one search space (``structural_fingerprint``)
+    across shapes."""
+    fingerprints = []
+    sinking = []
+    for rows in (4, 16, 784):
+        spec = cpu_bind(
+            _spatial_mean, (torch.empty(256, rows, 128, dtype=torch.bfloat16),)
+        ).config_spec
+        fingerprints.append(spec.structural_fingerprint())
+        sinking.append(
+            any(
+                seed.config.get("cute_vloop_sink")
+                for seed in spec.compiler_seed_configs
+            )
+        )
+    assert sinking == [False, True, True], sinking
+    assert fingerprints[0] == fingerprints[1] == fingerprints[2]
+
+
+def test_strided_reduction_seeds_record_what_runs(cpu_only: None) -> None:
+    """A chunk clamped to a short reduction keeps its seed only where the
+    single pass stays a rolled loop: from 8 rows, so a 7-row spatial mean,
+    which runs persistent, gets no sinking seed.  A kept seed records the
+    threads and lane unroll its code runs: at most one reduction thread a row
+    and an unroll no deeper than each thread's rows (the narrow seed of a
+    49-row spatial mean over 4 images: 64 threads, no unroll, the block its
+    code launches)."""
+    spec = cpu_bind(
+        _spatial_mean, (torch.empty(128, 7, 256, dtype=torch.bfloat16),)
+    ).config_spec
+    assert not any(
+        seed.config.get("cute_vloop_sink") for seed in spec.compiler_seed_configs
+    )
+    bound, seeds = _bind_with_sink_seeds(
+        _spatial_mean, (torch.empty(4, 49, 256, dtype=torch.bfloat16),)
+    )
+    (reduction,) = bound.config_spec.reduction_loops.valid_block_ids()
+    slot = list(bound.config_spec.num_threads.valid_block_ids()).index(reduction)
+    rows = []
+    for seed in seeds:
+        threads = seed["num_threads"]
+        chunks = seed["reduction_loops"]
+        assert isinstance(threads, list) and isinstance(chunks, list)
+        unroll = seed.get("cute_lane_unroll", 1)
+        assert isinstance(unroll, int)
+        assert threads[slot] * unroll <= chunks[0], seed
+        rows.append(threads[slot])
+    assert 64 in rows, seeds
+
+
+def test_strided_reduction_seeds_take_a_views_offset_as_line_aligned(
+    cpu_only: None,
+) -> None:
+    """The line check reads the strides: the channel slice ``[..., 4:124]`` of
+    a float32 [256, 784, 128] activation keeps 512-byte rows, so the narrow
+    seed's 32 columns take evict-first though the slice starts each row 16
+    bytes into a line.  The binding does not key on the storage offset, so a
+    check of the example's offset could leave a stale hint; the policy costs
+    bandwidth, never a value."""
+    _, seeds = _bind_with_sink_seeds(
+        _spatial_mean, (torch.empty(256, 784, 128)[..., 4:124],)
+    )
+    narrow = []
+    for seed in seeds:
+        block_sizes = seed["block_sizes"]
+        assert isinstance(block_sizes, list)
+        if max(block_sizes) == 32:
+            narrow.append(seed)
+    assert narrow, seeds
+    for seed in narrow:
+        policies = seed.get("load_eviction_policies") or [""]
+        assert isinstance(policies, list)
+        assert policies[0] == "l1_l2_first", seed
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _spatial_variance(x: torch.Tensor) -> torch.Tensor:
+    """The variance of each ``[N, H*W, C]`` column, its mean first: a
+    reduction that reads its input twice."""
+    batch, _, channels = x.shape
+    out = torch.empty([batch, channels], dtype=torch.float32, device=x.device)
+    for tile_n, tile_c in hl.tile([batch, channels]):
+        xt = x[tile_n, :, tile_c].to(torch.float32)
+        mean = torch.mean(xt, dim=1, keepdim=True)
+        out[tile_n, tile_c] = torch.mean((xt - mean) * (xt - mean), dim=1)
+    return out
+
+
+def test_strided_reduction_seeds_keep_the_lines_of_inputs_read_again(
+    cpu_only: None,
+) -> None:
+    """No evict-first for an input other CTAs or later passes read again: a
+    per-channel shift every CTA of a channel tile shares (the seeds' rolled
+    reduction lowers it ahead of its loop, into the first slot, while the
+    streamed ``x`` keeps the policy), an input broadcast over the batch
+    (every batch CTA reads the same lines), and the input of a mean then a
+    variance, which the rolled reduction reads in two passes."""
+    bound, seeds = _bind_with_sink_seeds(
+        _relu_and_spatial_mean,
+        (
+            torch.empty(8, 784, 120, dtype=torch.bfloat16),
+            torch.empty(120, dtype=torch.float32),
+        ),
+    )
+    wide = [seed for seed in seeds if _seed_spans_a_line(seed, 2)]
+    assert wide
+    for seed in wide:
+        policies = seed["load_eviction_policies"]
+        assert isinstance(policies, list)
+        assert policies[:2] == ["", "l1_l2_first"], seed
+    code = bound.to_code(bound.config_spec.normalized_config(helion.Config(**wide[0])))
+    shift_loads = [line for line in code.splitlines() if "shift.iterator" in line]
+    assert shift_loads, code
+    assert not any("first" in line for line in shift_loads), shift_loads
+    for kernel, x in (
+        (
+            _spatial_mean,
+            torch.empty(1, 784, 120, dtype=torch.bfloat16).expand(128, 784, 120),
+        ),
+        (_spatial_variance, torch.empty(8, 3136, 256, dtype=torch.bfloat16)),
+    ):
+        _, seeds = _bind_with_sink_seeds(kernel, (x,))
+        for seed in seeds:
+            policies = seed.get("load_eviction_policies") or ()
+            assert isinstance(policies, (list, tuple))
+            assert not any(policies), (kernel.name, seed)
+
+
 def test_strided_reduction_heuristic_leaves_short_reductions_to_the_register_tile(
     cpu_only: None,
 ) -> None:
@@ -1593,7 +1941,15 @@ def test_strided_reduction_heuristic_seeds_narrow_tiles_for_a_small_grid(
 
 @pytest.mark.parametrize(
     ("rows", "threads", "chunk"),
-    [(2048, 128, 1024), (3000, 256, 2048), (4096, 256, 2048), (36000, 512, 4096)],
+    [
+        (200, 128, 256),
+        (300, 128, 512),
+        (1000, 128, 1024),
+        (2048, 128, 1024),
+        (3000, 256, 2048),
+        (4096, 256, 2048),
+        (36000, 512, 4096),
+    ],
 )
 def test_strided_reduction_heuristic_widens_the_narrow_seed_on_a_tiny_grid(
     cpu_only: None, rows: int, threads: int, chunk: int
@@ -1601,7 +1957,10 @@ def test_strided_reduction_heuristic_widens_the_narrow_seed_on_a_tiny_grid(
     """512 fp32 columns over a lone grid axis: even one 4-wide vector per CTA
     launches only 128 CTAs, so the narrow seed takes up to 512 reduction
     threads (the thread count of the 4 CTAs per SM it cannot launch), as many
-    as keep its chunk of 8 rows a thread shorter than the reduction."""
+    as keep its chunk of 8 rows a thread shorter than the reduction.  Up to
+    1024 rows, the chunk of its 128 threads alone reaches the reduction's
+    length, and the seed runs the reduction in one pass of a chunk clamped
+    to the next power of two."""
     x = torch.empty(rows, 512, dtype=torch.float32)
     bound = cpu_bind(_column_sum, (x,))
     spec = bound.config_spec
@@ -1614,11 +1973,10 @@ def test_strided_reduction_heuristic_seeds_a_short_reduction_in_one_chunk(
 ) -> None:
     """129 to 256 rows fit one 256-row chunk: beside the 128-row chunks, a
     seed gives each of 16 reduction threads 16 rows in one pass with the
-    deepest lane unroll.  It is the only seed whose chunk covers the rows:
-    another seed whose chunk would reach a short reduction's rows is dropped,
-    not clamped into an unmeasured single pass, so 40 and 64 rows get no seed
-    and 100 and 128 rows only the 64-row chunks; 3136 rows get no one-chunk
-    seed."""
+    deepest lane unroll.  Up to 256 rows, a seed whose chunk would be longer
+    than the rows runs them in one pass of a chunk clamped to the next power
+    of two (40 and 64 rows get 64-row chunks, 100 and 128 rows 128-row chunks
+    beside the 64-row ones); 3136 rows get no one-chunk seed."""
     for rows in (40, 64, 100, 128, 196, 256, 3136):
         expected = 128 < rows <= 256
         x = torch.empty(8, rows, 120, dtype=torch.bfloat16)
@@ -1627,13 +1985,110 @@ def test_strided_reduction_heuristic_seeds_a_short_reduction_in_one_chunk(
         seeds = _sunk_seeds(
             spec, "reduction_loops", "cute_lane_unroll", "reduction_threads"
         )
-        covering = [seed for seed in seeds if seed[0][0] >= rows]
-        assert covering == ([([256], 16, 16)] if expected else []), (rows, seeds)
+        one_pass = 1 << (rows - 1).bit_length()
+        assert all(
+            seed[0][0] < rows or (seed[0][0] == one_pass and rows <= 256)
+            for seed in seeds
+        ), (rows, seeds)
+        # The narrow seed's threads walk one row each of a clamped chunk, so
+        # it records no unroll.
         if rows <= 64:
-            assert seeds == [], (rows, seeds)
+            assert [seed[:2] for seed in seeds] == [([64], 8), ([64], 4), ([64], 1)]
         elif rows <= 128:
-            assert [seed[:2] for seed in seeds] == [([64], 8)], (rows, seeds)
+            assert [seed[:2] for seed in seeds] == [
+                ([128], 8),
+                ([64], 8),
+                ([128], 4),
+                ([128], 1),
+            ], (rows, seeds)
         assert (([256], 16, 16) in seeds) is expected, (rows, seeds)
+
+
+# better-benchmark's channels-last BatchNorm training chain
+# (var_mean_var_mean_mean_0efb69a14422): Welford partials over 49 blocks of
+# 128 rows, their combine over the 49 blocks, and a spatial mean over 49
+# positions.
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _bn_welford_partials(
+    x_rows: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    splits, rows, channels = x_rows.shape
+    mean_p = torch.empty([splits, channels], dtype=torch.float32, device=x_rows.device)
+    m2_p = torch.empty([splits, channels], dtype=torch.float32, device=x_rows.device)
+    weight_p = torch.empty(
+        [splits, channels], dtype=torch.float32, device=x_rows.device
+    )
+    for tile_s, tile_c in hl.tile([splits, channels]):
+        values = x_rows[tile_s, :, tile_c].to(torch.float32)
+        block_mean = torch.mean(values, dim=1)
+        centered = values - block_mean[:, None, :]
+        mean_p[tile_s, tile_c] = block_mean
+        m2_p[tile_s, tile_c] = torch.sum(centered * centered, dim=1)
+        weight_p[tile_s, tile_c] = hl.full([tile_s, tile_c], rows, torch.float32)
+    return mean_p, m2_p, weight_p
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _bn_welford_combine(
+    mean_p: torch.Tensor, m2_p: torch.Tensor, weight_p: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    splits, channels = mean_p.shape
+    mean_out = torch.empty([channels], dtype=torch.float32, device=mean_p.device)
+    rstd_out = torch.empty([channels], dtype=torch.float32, device=mean_p.device)
+    for tile_c in hl.tile(channels):
+        means = mean_p[:, tile_c]
+        weights = weight_p[:, tile_c]
+        total = torch.sum(weights, dim=0)
+        mean = torch.sum(means * weights, dim=0) / total
+        delta = means - mean[None, :]
+        m2 = torch.sum(m2_p[:, tile_c] + weights * delta * delta, dim=0)
+        rstd_out[tile_c] = torch.rsqrt(m2 / total + 1e-05)
+        mean_out[tile_c] = mean
+    return mean_out, rstd_out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _bn_relu_spatial_mean(
+    x_rows: torch.Tensor, mean: torch.Tensor, rstd: torch.Tensor
+) -> torch.Tensor:
+    batch, hw, channels = x_rows.shape
+    pooled = torch.empty([batch, channels], dtype=x_rows.dtype, device=x_rows.device)
+    for tile_n, tile_c in hl.tile([batch, channels]):
+        y = (
+            x_rows[tile_n, :, tile_c].to(torch.float32) - mean[tile_c][None, None, :]
+        ) * rstd[tile_c][None, None, :]
+        pooled[tile_n, tile_c] = torch.mean(torch.relu(y), dim=1).to(pooled.dtype)
+    return pooled
+
+
+def test_strided_reduction_heuristic_seeds_every_kernel_of_a_batchnorm_chain(
+    cpu_only: None,
+) -> None:
+    """The 128-row partials keep their 128-row chunks clamped to one pass
+    beside the 64-row ones, and the 49-row combine and spatial mean get
+    64-row single-pass seeds: 4, 4 and 3, with ``cute_vloop_sink`` and
+    ``cute_lane_unroll`` open to the search.  The configs a cold autotune
+    found from these seeds ran the chain in 25.3 us, against 32.3 us for
+    those found without them (B200)."""
+    partials = torch.empty(49, 1408, dtype=torch.float32)
+    channels = torch.empty(1408, dtype=torch.float32)
+    for kernel, args, count in (
+        (_bn_welford_partials, (torch.empty(49, 128, 1408, dtype=torch.bfloat16),), 4),
+        (_bn_welford_combine, (partials, partials, partials), 4),
+        (
+            _bn_relu_spatial_mean,
+            (torch.empty(128, 49, 1408, dtype=torch.bfloat16), channels, channels),
+            3,
+        ),
+    ):
+        spec = cpu_bind(kernel, args).config_spec
+        seeds = _sunk_seeds(spec, "reduction_loops")
+        assert len(seeds) == count, (kernel.name, seeds)
+        fields = spec._flat_fields()
+        assert set(fields["cute_vloop_sink"].search_choices) == {False, True}
+        assert set(fields["cute_lane_unroll"].search_choices) == {1, 2, 4, 8, 16}
 
 
 @pytest.mark.parametrize(
@@ -2617,6 +3072,66 @@ class TestCuteVloopSink(TestCase):
             with self.subTest(block_sizes=seed.config["block_sizes"]):
                 out = bound.compile_config(seed)(x, 600)
                 torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-3)
+
+    def test_explicit_eviction_policies_load_the_unhinted_bits(self) -> None:
+        """The spellings a predicated packet had no PTX form for (a KeyError
+        as the kernel traced) assemble, and their packets load the same
+        values as without a hint: ``hl.load(..., eviction_policy=...)``
+        through the sink's 8-byte packets over partial tiles."""
+        x = torch.randn(1000, 1000, device=DEVICE, dtype=torch.bfloat16)
+        config = _sink_config(
+            block_sizes=[4096, 16], num_threads=[128, 4], vec=[1, 4], unroll=8
+        )
+        _, plain = code_and_output(
+            col_reduce_sum_with_policy_dynamic, (x, ""), **config
+        )
+        torch.testing.assert_close(plain, _col_sum(x), atol=2e-2, rtol=2e-2)
+        for spelling in ("evict_normal", "evict_unchanged", "evict_no_allocate"):
+            with self.subTest(spelling=spelling):
+                code, hinted = code_and_output(
+                    col_reduce_sum_with_policy_dynamic, (x, spelling), **config
+                )
+                self.assertIn(f", {spelling!r})", code)
+                self.assertTrue(torch.equal(hinted, plain))
+
+    def test_masked_l2_policy_loads_match_the_unhinted_bits(self) -> None:
+        """A masked row strip's predicated packets under an L2 policy family
+        (the ``createpolicy`` + ``.L2::cache_hint`` form) load the same values
+        as without a hint: the partial tiles leave masked lanes zero.  8-byte
+        packets (V=4) and 16-byte packets (V=8), each family at least once."""
+        x = torch.randn(1000, 1000, device=DEVICE, dtype=torch.bfloat16)
+        readonly = readonly_packet_load_supported(
+            torch.cuda.get_device_capability(), torch.version.cuda
+        )
+        for config, policies in (
+            (
+                _sink_config(
+                    block_sizes=[4096, 16], num_threads=[128, 4], vec=[1, 4], unroll=8
+                ),
+                ["l1_l2_first", "l2_last"],
+            ),
+            (
+                _sink_config(
+                    block_sizes=[4096, 16], num_threads=[256, 2], vec=[1, 8], unroll=4
+                ),
+                # The noncoherent form of a source nothing writes.
+                ["l1_l2_first", "l1_l2_last", *(["nc_l2_first"] if readonly else [])],
+            ),
+        ):
+            _, plain = code_and_output(
+                col_reduce_sum_dynamic, (x,), **config, load_eviction_policies=[""]
+            )
+            for policy in policies:
+                with self.subTest(policy=policy, vec=config["cute_vector_widths"]):
+                    code, hinted = code_and_output(
+                        col_reduce_sum_dynamic,
+                        (x,),
+                        **config,
+                        load_eviction_policies=[policy],
+                    )
+                    self.assertIn(f", {policy!r})", code)
+                    self.assertTrue(torch.equal(hinted, plain))
+            torch.testing.assert_close(plain, _col_sum(x), atol=2e-2, rtol=2e-2)
 
     def test_partial_tiles_on_both_axes(self) -> None:
         """1000 rows against a 4096-row block and 1000 columns against

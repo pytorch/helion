@@ -4351,6 +4351,7 @@ _CUTE_HEURISTIC_ORDER = (
     "cute_transposed_store_seeds",
     "cute_split_column_reduction",
     "cute_reduction_lane_jam",
+    "cute_reduction_lane_jam_forwarding",
 )
 
 
