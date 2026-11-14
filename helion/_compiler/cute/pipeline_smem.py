@@ -86,8 +86,8 @@ class Tcgen05PipelineSmemFacts(NamedTuple):
     must leave room for; ``ring_aux_itemsizes`` lists the operands those rings
     carry (``stages_through_smem_ring``: a boolean mask stays on the direct
     read, which the register mechanisms still prefetch and hoist).
-    ``epilogue_transcendental`` records a transcendental unary op in the chain
-    (``Tcgen05UnaryEpilogueChain.has_transcendental_op``).
+    ``epilogue_transcendental_ops`` counts the distinct transcendental unary
+    ops the chain applies (``Tcgen05UnaryEpilogueChain.transcendental_op_count``).
     """
 
     input_dtype_bytes: int
@@ -97,8 +97,13 @@ class Tcgen05PipelineSmemFacts(NamedTuple):
     has_auxiliary_loads: bool = False
     output_column_major: bool = False
     exact_aux_itemsizes: tuple[int, ...] = ()
-    epilogue_transcendental: bool = False
     ring_aux_itemsizes: tuple[int, ...] = ()
+    epilogue_transcendental_ops: int = 0
+
+    @property
+    def epilogue_transcendental(self) -> bool:
+        """Whether the chain applies a transcendental unary op."""
+        return self.epilogue_transcendental_ops > 0
 
 
 def pipeline_region_graphs(
@@ -283,8 +288,8 @@ def analyze_pipeline_smem_facts(
         has_auxiliary_loads=bool(chain.auxiliary_tensor_loads),
         output_column_major=candidate.output_column_major,
         exact_aux_itemsizes=tuple(exact_aux_itemsizes),
-        epilogue_transcendental=chain.has_transcendental_op,
         ring_aux_itemsizes=tuple(ring_aux_itemsizes),
+        epilogue_transcendental_ops=chain.transcendental_op_count,
     )
 
 

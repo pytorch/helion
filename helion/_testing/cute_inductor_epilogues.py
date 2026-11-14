@@ -244,6 +244,57 @@ def gelu_grad_mm_into(
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def two_mask_mm_into(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    drop: torch.Tensor,
+    keep: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """Dropout backward through a masked fill: two boolean operands."""
+    m, k = a.shape
+    n = b.shape[1]
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        kept = keep[rows, cols].to(torch.bool).to(torch.float32)
+        scaled = acc * (kept * hl.full([], 1.1111111111111112, dtype=torch.float32))
+        out[rows, cols] = torch.where(drop[rows, cols].to(torch.bool), 0.0, scaled).to(
+            out.dtype
+        )
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def masked_gelu_grad_mm_into(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    mask: torch.Tensor,
+    x: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """GELU (erf) backward under a dropout mask: ``acc * mask * 1.1111 *
+    (cdf(x) + x * pdf(x))``, a boolean and a bf16 operand."""
+    m, k = a.shape
+    n = b.shape[1]
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        keep = mask[rows, cols].to(torch.bool).to(torch.float32)
+        grad = acc * (keep * hl.full([], 1.1111111111111112, dtype=torch.float32))
+        v = x[rows, cols].to(torch.float32)
+        rsqrt2 = hl.full([], 0.7071067811865476, dtype=torch.float32)
+        one = hl.full([], 1.0, dtype=torch.float32)
+        half = hl.full([], 0.5, dtype=torch.float32)
+        neg_half = hl.full([], -0.5, dtype=torch.float32)
+        rsqrt2pi = hl.full([], 0.3989422804014327, dtype=torch.float32)
+        cdf = (torch.erf(v * rsqrt2) + one) * half
+        pdf = torch.exp(v * v * neg_half) * rsqrt2pi
+        out[rows, cols] = (grad * (cdf + v * pdf)).to(out.dtype)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def selu_grad_mm_into(
     a: torch.Tensor, b: torch.Tensor, x: torch.Tensor, out: torch.Tensor
 ) -> None:
@@ -390,10 +441,12 @@ class InductorEpilogue:
     # The output's dtype (an FP32 store under 16-bit operands traces the
     # epilogue to its store).
     out_dtype: torch.dtype = torch.bfloat16
-    # Whether the pair default runs two epilogue warp groups: a transcendental
-    # op in the chain (``epilogue_transcendental``) on the static full-tile
-    # TMA-store epilogue.
-    two_epilogue_groups: bool = False
+    # Whether the pair default runs several epilogue warp groups at the shapes
+    # the tests bind (K of at most 16 k-blocks): a transcendental op in the
+    # chain (``epilogue_transcendental``; three over its operand's capped
+    # ring), or an exact-shape operand on the register loads (two), on the
+    # static full-tile TMA-store epilogue.
+    multiple_epilogue_groups: bool = False
 
 
 INDUCTOR_EPILOGUES: tuple[InductorEpilogue, ...] = (
@@ -431,6 +484,7 @@ INDUCTOR_EPILOGUES: tuple[InductorEpilogue, ...] = (
         ("mask",),
         lambda acc, mask: acc * (mask.float() * 2.0),
         r"= tcgen05_aux_expr(?:_\d+)* \* 2\.0$",
+        multiple_epilogue_groups=True,
     ),
     InductorEpilogue(
         "keep_bias",
@@ -438,6 +492,7 @@ INDUCTOR_EPILOGUES: tuple[InductorEpilogue, ...] = (
         ("mask", "row"),
         lambda acc, mask, bias: mask.float() * acc + bias.float(),
         r"= tcgen05_aux_expr(?:_\d+)* \* tcgen05_acc_loaded(?:_\d+)*$",
+        multiple_epilogue_groups=True,
     ),
     InductorEpilogue(
         "relu_grad",
@@ -463,6 +518,7 @@ INDUCTOR_EPILOGUES: tuple[InductorEpilogue, ...] = (
         r"= cute\.where\(tcgen05_aux_loaded(?:_\d+)*, float\('-inf'\), "
         r"tcgen05_acc_loaded(?:_\d+)*\)$",
         out_dtype=torch.float32,
+        multiple_epilogue_groups=True,
     ),
     InductorEpilogue(
         "bf16_literal_where",
@@ -471,6 +527,7 @@ INDUCTOR_EPILOGUES: tuple[InductorEpilogue, ...] = (
         lambda acc, mask: torch.where(mask, acc.to(torch.bfloat16).float(), 0.5),
         r"= cute\.where\(tcgen05_aux_loaded(?:_\d+)*, tcgen05_chain_step(?:_\d+)*, "
         r"0\.5\)$",
+        multiple_epilogue_groups=True,
     ),
     InductorEpilogue(
         "gelu_tanh_grad",
@@ -478,7 +535,7 @@ INDUCTOR_EPILOGUES: tuple[InductorEpilogue, ...] = (
         ("tile",),
         lambda acc, x: _gelu_tanh_grad(acc, x.float()),
         r"= tcgen05_chain_step(?:_\d+)* \+ tcgen05_chain_step(?:_\d+)*$",
-        two_epilogue_groups=True,
+        multiple_epilogue_groups=True,
     ),
     InductorEpilogue(
         "gelu_grad",
@@ -486,7 +543,27 @@ INDUCTOR_EPILOGUES: tuple[InductorEpilogue, ...] = (
         ("tile",),
         lambda acc, x: acc * _gelu_grad_factor(x.float()),
         r"= tcgen05_acc_loaded(?:_\d+)* \* tcgen05_aux_expr(?:_\d+)*$",
-        two_epilogue_groups=True,
+        multiple_epilogue_groups=True,
+    ),
+    InductorEpilogue(
+        "two_mask",
+        two_mask_mm_into,
+        ("mask", "mask"),
+        lambda acc, drop, keep: torch.where(
+            drop, 0.0, acc * (keep.float() * 1.1111111111111112)
+        ),
+        r"= cute\.where\(tcgen05_aux_loaded(?:_\d+)*, 0\.0, tcgen05_chain_step",
+        multiple_epilogue_groups=True,
+    ),
+    InductorEpilogue(
+        "masked_gelu_grad",
+        masked_gelu_grad_mm_into,
+        ("mask", "tile"),
+        lambda acc, mask, x: (
+            acc * (mask.float() * 1.1111111111111112) * _gelu_grad_factor(x.float())
+        ),
+        r"= tcgen05_chain_step(?:_\d+)* \* tcgen05_aux_expr(?:_\d+)*$",
+        multiple_epilogue_groups=True,
     ),
     InductorEpilogue(
         "selu_grad",
@@ -499,7 +576,7 @@ INDUCTOR_EPILOGUES: tuple[InductorEpilogue, ...] = (
         ),
         r"= cute\.where\(tcgen05_aux_expr(?:_\d+)*, tcgen05_chain_step(?:_\d+)*, "
         r"tcgen05_chain_step(?:_\d+)*\)$",
-        two_epilogue_groups=True,
+        multiple_epilogue_groups=True,
     ),
     InductorEpilogue(
         "hardswish_grad",
@@ -516,6 +593,7 @@ INDUCTOR_EPILOGUES: tuple[InductorEpilogue, ...] = (
         lambda acc, mask, fill: torch.where(mask, fill, acc * 2.0),
         r"= cute\.where\(tcgen05_aux_loaded(?:_\d+)*, tcgen05_scalar(?:_\d+)*, "
         r"tcgen05_chain_step(?:_\d+)*\)$",
+        multiple_epilogue_groups=True,
     ),
     InductorEpilogue(
         "quick_gelu",
@@ -539,6 +617,7 @@ INDUCTOR_EPILOGUES: tuple[InductorEpilogue, ...] = (
         lambda acc, mask, bias: torch.where(mask, bias, 0.0) + acc,
         r"= cute\.where\(tcgen05_aux_loaded(?:_\d+)*, tcgen05_aux_loaded(?:_\d+)*, "
         r"0\.0\)$",
+        multiple_epilogue_groups=True,
     ),
     InductorEpilogue(
         "threshold_grad",
@@ -547,6 +626,7 @@ INDUCTOR_EPILOGUES: tuple[InductorEpilogue, ...] = (
         lambda acc, mask: torch.where(mask, 0.0, acc),
         r"= cute\.where\(tcgen05_aux_loaded(?:_\d+)*, 0\.0, "
         r"tcgen05_acc_loaded(?:_\d+)*\)$",
+        multiple_epilogue_groups=True,
     ),
 )
 
