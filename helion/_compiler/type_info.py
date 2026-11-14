@@ -87,7 +87,6 @@ if TYPE_CHECKING:
     from typing_extensions import Self
 
     from torch._ops import OpOverload
-    from torch._ops import OpOverloadPacket
 
     _T = TypeVar("_T")
 
@@ -172,6 +171,7 @@ def _is_known_host_value(value: object) -> bool:
 _NATIVE_TENSOR_CLASS = torch.Tensor
 _NATIVE_OP_OVERLOAD = torch._ops.OpOverload
 _NATIVE_OP_PACKET = torch._ops.OpOverloadPacket
+_RESOLVE_PACKET = torch._C._jit_resolve_packet
 _OPERATOR_HOOKS = (
     "__new__",
     "__init__",
@@ -268,20 +268,20 @@ def _is_known_host_call(
     if any(fn is split for split in _KNOWN_HOST_SPLITS):
         return bool(args) and type(args[0]) is FakeTensor
     if type(fn) is _NATIVE_OP_PACKET:
-        if fn._has_torchbind_op_overload or not _is_native_operator(fn):
+        if not _has_native_hooks(fn) or fn._has_torchbind_op_overload:
             return False
         # The overload the call dispatches to, by the same schema matching.
-        name = torch._C._jit_resolve_packet(fn._qualified_op_name, *args, **kwargs)
+        name = _RESOLVE_PACKET(fn._qualified_op_name, *args, **kwargs)
         if not _is_native_operator_lookup(fn, name):
             return False
         fn = getattr(fn, name)
     if type(fn) is _NATIVE_OP_OVERLOAD:
         # An operator writes only the arguments its schema marks, which the
         # tracker checks like a native Tensor method's; a registered effect
-        # reaches beyond them. The kernels registered for it (Python fake
-        # kernels from torch.library too) are trusted to honor the schema, as
+        # reaches beyond them. The kernels registered for it (Python ones from
+        # torch.library too) are trusted to honor the schema, as
         # functionalization and torch.compile trust them.
-        return _is_native_operator(fn) and _get_effect(fn) is None
+        return _has_native_hooks(fn) and _get_effect(fn) is None
     if type(fn) is types.MethodType:
         return fn.__func__ is _KNOWN_HOST_SPLITS[1] and type(fn.__self__) is FakeTensor
     if type(fn) is types.MethodDescriptorType:
@@ -315,7 +315,11 @@ def _is_known_host_call(
 
 def _has_native_hooks(value: object) -> bool:
     """Whether ``value`` is a ``torch.ops`` object whose class keeps the Python
-    hooks it had at import and that has no instance ``__getattr__``."""
+    hooks it had at import and that has no instance ``__getattr__``.
+
+    This guards the objects host code holds; torch's registry code behind those
+    hooks is trusted like any other torch call.
+    """
     kind = type(value)
     return any(
         kind is native
@@ -326,11 +330,6 @@ def _has_native_hooks(value: object) -> bool:
         and "__getattr__" not in vars(value)
         for native, hooks in _NATIVE_OPERATOR_TYPES
     )
-
-
-def _is_native_operator(op: OpOverload | OpOverloadPacket) -> bool:
-    """Whether calling a packet or overload runs its builtin dispatcher entry."""
-    return _has_native_hooks(op) and type(op._op) is types.BuiltinFunctionType
 
 
 def _is_native_operator_lookup(value: object, attr: str) -> bool:
