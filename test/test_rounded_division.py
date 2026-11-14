@@ -1,10 +1,10 @@
 """Truncating and flooring float division needs the correctly rounded quotient.
 
-The Triton backend compiles an fp32 ``/`` to ``div.full.f32`` (a reciprocal
-and a multiply, within 2 ulp), which gives 33 / 33 just below 1: truncated or
-floored, that is 0.  A quotient its node rounds to an integer is ``div.rn``
-instead (``GenerateASTFromInductor.truediv`` and ``div_rn``), and so is
-``addcdiv``'s without ``fast_math``.
+The Triton and CuTe backends compile an fp32 ``/`` to ``div.full.f32`` (a
+reciprocal and a multiply, within 2 ulp), which gives 33 / 33 just below 1:
+truncated or floored, that is 0.  A quotient its node rounds to an integer is
+``div.rn`` instead (``GenerateASTFromInductor.truediv`` and ``div_rn``), and
+so is ``addcdiv``'s without ``fast_math``.
 """
 
 from __future__ import annotations
@@ -30,16 +30,23 @@ from helion._testing import skipIfTileIR
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import cuda_fake
 import helion.language as hl
+from helion.runtime.settings import _get_backend
 
 # The source checks bind on CPU; the tests that compare results with eager's
 # are marked cuda and run in the GPU lane.
 pytestmark = pytest.mark.cpu_only
 
-# How the backend spells the round-to-nearest division, the approximate
+# How each backend spells the round-to-nearest division, the approximate
 # division of ``fast_math``, and a quotient rounded to fp16 and widened again.
-DIV_RN = "tl.div_rn("
-FAST_DIVISION = "fast_dividef("
-ROUNDED_TO_FP16 = ", tl.float16), tl.float32)"
+DIV_RN = {
+    "triton": "tl.div_rn(",
+    "cute": "rounding=cute.math.RoundingMode.NEAREST_EVEN",
+}
+FAST_DIVISION = {"triton": "fast_dividef(", "cute": "approx=True"}
+ROUNDED_TO_FP16 = {
+    "triton": ", tl.float16), tl.float32)",
+    "cute": "cutlass.Float32(cutlass.Float16(",
+}
 
 
 def _truncated(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -172,7 +179,7 @@ def _render(
         return bound.to_code(bound.config_spec.default_config())
 
 
-@onlyBackends(["triton"])
+@onlyBackends(["triton", "cute"])
 @skipIfTileIR("TileIR keeps `/` for a rounded quotient (tl.div_rn was not tried there)")
 class TestRoundedDivision(TestCase):
     @pytest.mark.cuda
@@ -241,10 +248,10 @@ class TestRoundedDivision(TestCase):
         "traces addcdiv on a fake CUDA device, which this torch build lacks",
     )
     def test_addcdiv_quotient_is_div_rn_without_fast_math(self) -> None:
-        self.assertIn(DIV_RN, _render(_addcdiv))
+        self.assertIn(DIV_RN[_get_backend()], _render(_addcdiv))
         # Nothing rounds addcdiv's quotient to an integer, so ``fast_math``
         # leaves it the backend's ``/``.
-        self.assertNotIn(DIV_RN, _render(_addcdiv, fast_math=True))
+        self.assertNotIn(DIV_RN[_get_backend()], _render(_addcdiv, fast_math=True))
 
     @skipIfRefEager("checks the generated code")
     def test_the_quotient_is_div_rn(self) -> None:
@@ -254,9 +261,9 @@ class TestRoundedDivision(TestCase):
             (_floored, torch.float32),
             (_floor_divided, torch.float32),
         ):
-            self.assertIn(DIV_RN, _render(fn, dtype))
+            self.assertIn(DIV_RN[_get_backend()], _render(fn, dtype))
         # A plain quotient keeps the backend's ``/``.
-        self.assertNotIn(DIV_RN, _render(_plain))
+        self.assertNotIn(DIV_RN[_get_backend()], _render(_plain))
 
     @skipIfRefEager("checks the generated code")
     def test_a_16_bit_quotient_is_rounded_where_eager_rounds_it(self) -> None:
@@ -264,14 +271,16 @@ class TestRoundedDivision(TestCase):
         # quotient is rounded to it before it is truncated.  With a host
         # scalar for a divisor it truncates an fp32 product: rounding that
         # quotient first gave 3 for 1999 / 666.5 in fp16, where eager has 2.
-        self.assertIn(ROUNDED_TO_FP16, _render(_truncated, torch.float16))
+        self.assertIn(
+            ROUNDED_TO_FP16[_get_backend()], _render(_truncated, torch.float16)
+        )
         scalar = _render(_truncated_by_a_scalar, torch.float16)
-        self.assertIn(DIV_RN, scalar)
-        self.assertNotIn(ROUNDED_TO_FP16, scalar)
+        self.assertIn(DIV_RN[_get_backend()], scalar)
+        self.assertNotIn(ROUNDED_TO_FP16[_get_backend()], scalar)
         # A float32 divisor promotes an in-place fp16 division to fp32.
         mixed = _render(_truncated_in_place, torch.float16, torch.float32)
-        self.assertIn(DIV_RN, mixed)
-        self.assertNotIn(ROUNDED_TO_FP16, mixed)
+        self.assertIn(DIV_RN[_get_backend()], mixed)
+        self.assertNotIn(ROUNDED_TO_FP16[_get_backend()], mixed)
 
     @skipIfRefEager("checks the generated code")
     def test_a_float64_divisor_divides_in_float64(self) -> None:
@@ -279,14 +288,16 @@ class TestRoundedDivision(TestCase):
         # the division: its operands must not be narrowed to fp32 for
         # ``tl.div_rn``, and float64 ``/`` is correctly rounded already.
         for fn in (_truncated_in_place, _floored_in_place):
-            self.assertIn(DIV_RN, _render(fn))
+            self.assertIn(DIV_RN[_get_backend()], _render(fn))
             code = _render(fn, divisor_dtype=torch.float64)
-            self.assertNotIn(DIV_RN, code)
+            self.assertNotIn(DIV_RN[_get_backend()], code)
             self.assertRegex(code, r" = \w+ / \w+\n")
         # Nor for the approximate division of ``fast_math``.
-        self.assertIn(FAST_DIVISION, _render(_divided_in_place, fast_math=True))
+        self.assertIn(
+            FAST_DIVISION[_get_backend()], _render(_divided_in_place, fast_math=True)
+        )
         code = _render(_divided_in_place, divisor_dtype=torch.float64, fast_math=True)
-        self.assertNotIn(FAST_DIVISION, code)
+        self.assertNotIn(FAST_DIVISION[_get_backend()], code)
         self.assertRegex(code, r" = \w+ / \w+\n")
 
     @skipIfRefEager("checks the generated code")
@@ -294,7 +305,7 @@ class TestRoundedDivision(TestCase):
         # ``fast_math`` approximates a plain quotient only: one that is then
         # truncated or floored is still correctly rounded.
         for fn in (_truncated, _floored, _floor_divided):
-            self.assertIn(DIV_RN, _render(fn, fast_math=True))
+            self.assertIn(DIV_RN[_get_backend()], _render(fn, fast_math=True))
 
 
 if __name__ == "__main__":

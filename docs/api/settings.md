@@ -153,24 +153,36 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
 .. autoattribute:: Settings.cute_exact_division
 
-   CuTe only. When ``True`` (the default) an fp32 division by a scalar that is
-   invariant across an element loop (a softmax row sum, a kernel-wide
-   temperature) hoists the divisor's correctly rounded reciprocal and its
-   admission window out of the loop and divides with the Markstein sequence
-   (``q = RN(x*y)``, ``r = RN(x - d*q)``, ``RN(q + r*y)``), speculated over the
-   loop: when some dividend left the window the loop runs again as written,
-   with ``div.rn.f32`` itself. The result is the IEEE round-to-nearest quotient
-   bit for bit (``helion/_compiler/cute/exact_division.py`` states the
-   argument); set ``cute_exact_division=False`` or
-   ``HELION_CUTE_EXACT_DIVISION=0`` to keep one ``div.rn`` expansion per
-   element; the config knob ``cute_exact_div_form`` (``"redo"``, ``"plain"``)
-   picks the form per kernel, so the autotuner can keep the plain division
-   where a kernel sits at the register cap (the knob is exposed for every
-   kernel whose traced graph divides fp32 by a scalar or a broadcast row value;
-   a loop the redo form cannot re-execute keeps its plain division, and where
-   the pass proves no divisor loop-invariant both forms render identically).
-   ``fast_math`` is unaffected: its fp32 division is the approximate
-   ``cute.math.div``.
+   CuTe only. By default (``False``) CuTe divides 32-bit and 16-bit floats as
+   the Triton backend does: ``div.full.f32``, within 2 ulp over the full range
+   (ptxas scales the operands, takes the divisor's reciprocal and multiplies;
+   there is no slow path, and the reciprocal of a loop-invariant divisor is
+   computed once). A 16-bit division is done in fp32 and rounded back. The
+   quotients are bit for bit the Triton backend's; about a quarter of fp32
+   quotients differ from eager PyTorch's in the last bits, 16-bit ones almost
+   never. The generated code keeps ``/``: the launcher compiles the kernel with
+   libNVVM's ``-prec-div=0``. A 32-bit or 16-bit quotient that is then
+   truncated or floored (``torch.div(..., rounding_mode=...)``, ``//``) is the
+   correctly rounded one in every mode, and float64 division is IEEE under
+   both division options.
+
+   When ``True`` (``HELION_CUTE_EXACT_DIVISION=1``) fp32 division is the IEEE
+   round-to-nearest quotient, eager's, bit for bit. An fp32 division by a
+   scalar that is invariant across an element loop (a softmax row sum, a
+   kernel-wide temperature) hoists the divisor's correctly rounded reciprocal
+   and its admission window out of the loop and divides with the Markstein
+   sequence (``q = RN(x*y)``, ``r = RN(x - d*q)``, ``RN(q + r*y)``), speculated
+   over the loop: when some dividend left the window the loop runs again as
+   written, with ``div.rn.f32`` itself
+   (``helion/_compiler/cute/exact_division.py`` states the argument); the
+   config knob ``cute_exact_div_form`` (``"redo"``, ``"plain"``) picks the form
+   per kernel, so the autotuner can keep the plain division where a kernel sits
+   at the register cap (the knob is exposed for every kernel whose traced graph
+   divides fp32 by a scalar or a broadcast row value; a loop the redo form
+   cannot re-execute keeps its plain division, and where the pass proves no
+   divisor loop-invariant both forms render identically). ``fast_math`` is
+   unaffected: its fp32 division is the approximate ``cute.math.div`` with or
+   without this setting.
 
 .. autoattribute:: Settings.static_shapes
 
@@ -551,7 +563,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_AUTOTUNE_PRECOMPILE_JOBS`` | ``autotune_precompile_jobs`` | Cap the number of concurrent Triton precompile subprocesses. |
 | ``HELION_CUTE_RNG_STREAM`` | ``cute_rng_stream`` | CuTe RNG policy: ``auto``, ``word0`` or ``philox4``. |
 | ``HELION_CUTE_GRAPH_CSE`` | ``cute_graph_cse`` | Set to ``0`` to keep duplicate reductions (and the pure chains between them) of the traced device IR as traced on CuTe, for bisecting structural-matcher regressions. Default ``1``; results are bitwise identical either way. |
-| ``HELION_CUTE_EXACT_DIVISION`` | ``cute_exact_division`` | Set to ``0`` to keep one ``div.rn.f32`` per element for fp32 divisions by a loop-invariant scalar on CuTe instead of the hoisted bit-exact Markstein sequence. Default ``1``; results are bitwise identical either way. |
+| ``HELION_CUTE_EXACT_DIVISION`` | ``cute_exact_division`` | Set to ``1`` for IEEE round-to-nearest fp32 division on CuTe (eager's quotient bit for bit; a division by a loop-invariant scalar goes through the hoisted Markstein sequence). Default ``0``: ``div.full.f32``, within 2 ulp, bit for bit the Triton backend's division. |
 | ``HELION_CUTE_PROMOTE_HALF_ATOMIC_OUTPUTS`` | ``cute_promote_half_atomic_outputs`` | Set to ``1`` to accumulate a fresh float16 ``hl.atomic_add`` output in float32 and cast once on return (more accurate, one extra kernel per call, differs from the Triton backend). Default ``0``: add into the float16 storage with native packed half reductions. |
 | ``HELION_AUTOTUNE_RANDOM_SEED`` | ``autotune_random_seed`` | Seed used for randomized autotuning searches. |
 | ``HELION_AUTOTUNE_MAX_GENERATIONS`` | ``autotune_max_generations`` | Upper bound on generations for Pattern Search and Differential Evolution. |

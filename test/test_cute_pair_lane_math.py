@@ -33,6 +33,7 @@ from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_native_compile
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_codegen import with_exact_division
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -1344,8 +1345,14 @@ def _stats_args() -> tuple[torch.Tensor]:
 
 def test_softmax_stats_pair_in_both_sweeps() -> None:
     code = _render(_softmax_stats, _stats_args(), _config(_STATS))
-    # The block sums' exps, the probability sweep's exps and exact
-    # divisions, and the exps of that sweep's exact-division redo copy.
+    # The block sums' exps and the probability sweep's; its quotients are
+    # the plain ``/`` (``div.full``), one per lane.
+    assert code.count(EXP_PAIR) == 2
+    assert DIV_PAIR not in code
+    assert code.count("cutlass.range_constexpr(8)") == 2
+    # Under ``cute_exact_division``: the probability sweep's exact divisions
+    # pair too, and so do the exps of its exact-division redo copy.
+    code = _render(with_exact_division(_softmax_stats), _stats_args(), _config(_STATS))
     assert code.count(EXP_PAIR) == 3
     assert code.count(DIV_PAIR) == 1
     assert code.count("cutlass.range_constexpr(8)") == 3

@@ -195,10 +195,12 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
 
     config_spec.cute_tile_pack_counts = tile_pack_counts(env, device_ir)
 
-    # An fp32 quotient by a scalar or a broadcast row value: the exact
-    # division hoist can apply, so its form is tunable.
-    config_spec.cute_exact_division_sites = has_hoistable_fp32_divisions(
-        info.graph for info in device_ir.graphs
+    # Under ``Settings.cute_exact_division``, an fp32 quotient by a scalar or
+    # a broadcast row value: the exact division hoist can apply, so its form
+    # is tunable.
+    config_spec.cute_exact_division_sites = (
+        env.settings.cute_exact_division
+        and has_hoistable_fp32_divisions(info.graph for info in device_ir.graphs)
     )
     # Exps (sigmoids lower through one), exact divisions or fp32 products,
     # sums and differences to pair over vector lanes in Blackwell's packed

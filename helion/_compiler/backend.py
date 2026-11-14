@@ -507,7 +507,7 @@ class Backend(abc.ABC):
         else None: one of ``FAST_MATH_SENSITIVE_TARGETS``, or a plain true
         division.  None does not promise the same lowering: a backend may
         also pass a fast-math flag to operations the warning does not count
-        (``tanh``, ``log``, ``log1p``, ``sqrt``)."""
+        (for example ``log1p``, and ``tanh`` on ROCm's Triton)."""
         from .inductor_lowering import _is_plain_true_division
 
         name = FAST_MATH_SENSITIVE_TARGETS.get(node.target)

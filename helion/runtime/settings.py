@@ -693,7 +693,7 @@ class _Settings:
     )
     cute_exact_division: bool = dataclasses.field(
         default_factory=functools.partial(
-            _env_get_bool, "HELION_CUTE_EXACT_DIVISION", True
+            _env_get_bool, "HELION_CUTE_EXACT_DIVISION", False
         )
     )
     cute_promote_half_atomic_outputs: bool = dataclasses.field(
@@ -1006,16 +1006,20 @@ class Settings(_Settings):
             "edge staging those tiles used before."
         ),
         "cute_exact_division": (
-            "If True (the default), an fp32 division by a loop-invariant scalar "
-            "(a row sum, a scalar kernel argument) on CuTe hoists the divisor's "
-            "correctly rounded reciprocal and admission window out of the "
-            "element loop and divides with the Markstein sequence, re-running "
-            "the loop with div.rn when a dividend left the window: the IEEE "
-            "round-to-nearest quotient bit for bit, without one div.rn "
-            "expansion per element. Set False (HELION_CUTE_EXACT_DIVISION=0) "
-            "to keep the plain per-element division; the config knob "
+            "CuTe divides 32-bit and 16-bit floats as the Triton backend does: "
+            "div.full.f32, within 2 ulp over the full range (a reciprocal and "
+            "a multiply, no slow path). If True, fp32 division is the IEEE "
+            "round-to-nearest quotient instead (div.rn, eager's), bit for bit: "
+            "a division by a loop-invariant scalar (a row sum, a scalar kernel "
+            "argument) hoists the divisor's correctly rounded reciprocal and "
+            "admission window out of the element loop and divides with the "
+            "Markstein sequence, re-running the loop with div.rn when a "
+            "dividend left the window, and the config knob "
             "cute_exact_div_form picks the form (redo / plain) per kernel. "
-            "Independent of fast_math, whose fp32 division is approximate."
+            "Default False; set "
+            "HELION_CUTE_EXACT_DIVISION=1 to enable. A quotient that is "
+            "truncated or floored is exact either way, and under fast_math an "
+            "fp32 division is div.approx.ftz either way."
         ),
         "cute_promote_half_atomic_outputs": (
             "If True, a fresh float16 allocation that the CuTe kernel only "

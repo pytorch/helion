@@ -61,10 +61,94 @@ def test_cute_float64_exponentials_do_not_count() -> None:
                 assert f"WARNING[FastMathUnused]: This kernel computes {name}," in text
 
 
+def _sqrt(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size()):
+        out[tile] = torch.sqrt(x[tile])
+    return out
+
+
+def _log(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size()):
+        out[tile] = torch.log(x[tile])
+    return out
+
+
+def _log2(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size()):
+        out[tile] = torch.log2(x[tile])
+    return out
+
+
+def _sin(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size()):
+        out[tile] = torch.sin(x[tile])
+    return out
+
+
+def _cos(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size()):
+        out[tile] = torch.cos(x[tile])
+    return out
+
+
+def _tanh(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size()):
+        out[tile] = torch.tanh(x[tile])
+    return out
+
+
+def _log1p(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size()):
+        out[tile] = torch.log1p(x[tile])
+    return out
+
+
+@skipIfRefEager("Warning emitted in compile mode only")
+def test_cute_counts_what_fast_math_changes_in_fp32() -> None:
+    """Under fast_math the CuTe backend takes ``sqrt.approx.ftz`` for the
+    IEEE square root and the approximate ``lg2``, ``sin``, ``cos`` and
+    ``tanh`` instructions for libdevice's routines (4% to 9% of a streaming
+    pointwise kernel's time): kernels computing them in 32 or 16 bits are
+    told, float64 ones and ``log1p`` (lowered the same way) are not."""
+    for fn, name in (
+        (_sqrt, "sqrt"),
+        (_log, "log"),
+        (_log2, "log2"),
+        (_sin, "sin"),
+        (_cos, "cos"),
+        (_tanh, "tanh"),
+        (_log1p, None),
+    ):
+        for dtype in (torch.float32, torch.bfloat16, torch.float64):
+            x = torch.empty([64, 128], dtype=dtype)
+            buffer = io.StringIO()
+            with contextlib.redirect_stderr(buffer):
+                cpu_bind(helion.kernel(fn, backend="cute", static_shapes=True), (x,))
+            text = buffer.getvalue()
+            if name is None or dtype == torch.float64:
+                assert "FastMathUnused" not in text, (name, dtype)
+                continue
+            assert f"WARNING[FastMathUnused]: This kernel computes {name}," in text
+            with cpu_target():
+                fast = helion.kernel(
+                    fn, backend="cute", static_shapes=True, fast_math=True
+                ).bind((x,))
+                code = fast.to_code(fast.config_spec.default_config())
+            # What the warning announces: the setting changes the lowering.
+            assert "fastmath=True" in code or "approx=True" in code, (name, dtype)
+
+
 @skipIfRefEager("Warning emitted in compile mode only")
 def test_cute_divisions_count_with_an_fp32_result_only() -> None:
-    """The CuTe backend divides approximately under fast_math only for an
-    fp32 result; a float64 or bf16 true division stays IEEE, so a kernel
+    """The CuTe backend takes ``div.approx.ftz`` under fast_math only for an
+    fp32 result; a float64 or bf16 true division keeps its ``/``, so a kernel
     whose only division is one of those is not told to set it."""
     for dtype in (torch.float64, torch.bfloat16, torch.float32):
         x = torch.empty([64, 128], dtype=dtype)
