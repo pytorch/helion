@@ -30,13 +30,17 @@ import dataclasses
 from typing import Iterator
 
 from ... import exc
+from .fragment_mma import SIMDGROUP
 from .fragment_mma import EarlyLoad
 from .fragment_mma import FragmentElement
 from .fragment_mma import emit_fragment_acc
 from .fragment_mma import emit_fragment_run
+from .fragment_mma import emit_split_combine
 from .fragment_mma import fragment_elements
 from .fragment_mma import is_fragment_acc
 from .fragment_mma import prefetch_loads
+from .fragment_mma import split_range
+from .fragment_mma import split_runs
 from .lane_fold import LANE_PUT
 from .lane_fold import load_mask_other
 from .lane_fold import tl_load
@@ -97,6 +101,12 @@ class EmitState:
     #: How many prefetch registers the kernel has named, which keeps their
     #: names unique.
     early_count: int = 0
+    #: The SIMD groups that split each fragment K loop (``fragment_mma``),
+    #: the offsets of the split loops being emitted, and the float slots
+    #: their combines pass accumulators through.
+    split: int = 1
+    split_loops: list[str] = dataclasses.field(default_factory=list)
+    split_slots: int = 0
     #: The element an element loop's ``_helion_mpp_put`` writes.
     put: str = "*_it"
 
@@ -149,12 +159,15 @@ def _emit_tl_store(
     parts: list[str],
     indent: int,
     subs: dict[str, str] | None = None,
+    split: int = 1,
 ) -> None:
     """Emit MSL for ``tl.store(ptr + offset, val, mask)``.
 
     Dereferences the pointer expression: ``*(ptr + offset) = val``.
     All three positional args (ptr, val, mask) are always present —
-    PointerIndexingStrategy emits them positionally.
+    PointerIndexingStrategy emits them positionally.  When ``split`` SIMD
+    groups split the fragment K loops, the first writes and the others,
+    which run the same code, don't (``fragment_mma``).
     """
     pad = " " * indent
     access = _ptr_access_expr(node.args[0], subs=subs)
@@ -165,6 +178,8 @@ def _emit_tl_store(
         # None mask = no masking
         if not (isinstance(mask_node, ast.Constant) and mask_node.value is None):
             mask = _ast_expr_to_msl(mask_node, subs=subs)
+    if split > 1:
+        mask = f"{SIMDGROUP} == 0" + ("" if mask is None else f" && ({mask})")
     if mask is not None:
         parts.extend(
             (
@@ -232,7 +247,7 @@ def _emit_stmts(
             # tl.store(ptr + offset, val, mask) → if (mask) { *(ptr+offset) = val; }
             if _is_tl_store_call(call):
                 assert isinstance(call, ast.Call)
-                _emit_tl_store(call, parts, indent=indent, subs=subs)
+                _emit_tl_store(call, parts, indent, subs, state.split)
             elif _is_call_to(call, LANE_PUT):
                 assert isinstance(call, ast.Call)
                 array, lane, value = (_ast_expr_to_msl(a, subs=subs) for a in call.args)
@@ -585,8 +600,12 @@ def _emit_for(
       _it != coop.end(); _it++)`` with the tensor's names substituted by
       ``(*_it)`` in the body, or a fragment group's unrolled loop over the
       elements each lane holds (``fragment_mma.fragment_elements``)
-    - ``_helion_mpp_fragments(acc, steps, facts, tables, k_step)`` → a
+    - ``_helion_mpp_fragments(acc, steps, facts, tables, k_step, split)`` → a
       fragment group's op over one K tile (``fragment_mma.emit_fragment_run``)
+
+    A range loop whose fragment runs SIMD groups split runs each from its
+    own tile over every ``split``-th one (``fragment_mma.split_range``),
+    then adds their accumulators (``fragment_mma.emit_split_combine``).
     """
     pad = " " * indent
     it = stmt.iter
@@ -689,6 +708,10 @@ def _emit_for(
         end = _ast_expr_to_msl(args[1], subs=subs)
         step = _ast_expr_to_msl(args[2], subs=subs)
 
+    runs = split_runs(stmt.body, loop_var)
+    if runs:
+        start, step = split_range(start, step, state.split)
+        state.split_loops.append(loop_var)
     before, top = prefetch_loads(stmt.body, loop_var, end, pad, state)
     parts += before
     parts.append(
@@ -699,6 +722,9 @@ def _emit_for(
         state.declare(loop_var)
         _emit_stmts(stmt.body, parts, indent=indent + 4, state=state, subs=subs)
     parts.append(f"{pad}}}")
+    if runs:
+        state.split_loops.pop()
+        emit_split_combine(runs, parts, pad, state)
 
 
 def _ptr_access_expr(ptr_node: ast.AST, subs: dict[str, str] | None = None) -> str:
