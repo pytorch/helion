@@ -92,6 +92,16 @@ def test_input_backed_size_stride_and_scalar_specialization_still_bind():
             ast.parse(bound.to_code(bound.config_spec.default_config()))
 
 
+@torch.library.custom_op("helion_test::passthrough", mutates_args=())
+def _passthrough(x: torch.Tensor) -> torch.Tensor:
+    return x.clone()
+
+
+@_passthrough.register_fake
+def _(x):
+    return torch.empty_like(x)
+
+
 def _after_operator(x, mode: hl.constexpr):
     hl.specialize(x.size())
     hl.specialize(x.stride())
@@ -102,6 +112,9 @@ def _after_operator(x, mode: hl.constexpr):
     elif mode == "permute":
         # Changes x's metadata, not flat's: checked like x.t_().
         torch.ops.aten.t_.default(x)
+    elif mode == "custom":
+        # A torch.library operator with a Python fake kernel.
+        torch.ops.helion_test.passthrough(x)
     elif mode == "restride":
         # Changes flat's own metadata, which the tracker sees.
         torch.ops.aten.as_strided_.default(flat, (flat.size(0) // 2,), (2,), 0)
@@ -117,7 +130,7 @@ def _after_operator(x, mode: hl.constexpr):
 # Triton passes a non-literal stride as a kernel argument; CuTe always reads
 # strides from the tensor layout, so its code shows no difference.
 @skipUnlessBackends(["triton"])
-@pytest.mark.parametrize("mode", ["packet", "permute", "restride", "effect"])
+@pytest.mark.parametrize("mode", ["packet", "permute", "custom", "restride", "effect"])
 def test_torch_ops_calls_keep_view_strides_unless_they_change(mode):
     # Looking up and calling a torch.ops operator keeps the exact layout of a
     # specialized input's view unless the call restrides it or the operator
