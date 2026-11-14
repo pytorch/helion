@@ -19,6 +19,7 @@ from helion._compiler.cute import cute_mma
 from helion._compiler.cute.dense_aligned_n import ALIGNED_N_CHOICES
 from helion._compiler.cute.dense_aligned_n import carrier_n
 from helion._compiler.cute.dense_aligned_n import dense_aligned_n_defaults
+from helion._compiler.cute.dense_aligned_n import pair_tile_wave_cost
 from helion._compiler.cute.pipeline_smem import Tcgen05PipelineSmemFacts
 from helion._compiler.cute.pipeline_smem import pipeline_smem_bytes
 from helion._compiler.cute.strategies import tcgen05_two_cta_m128_epilogue_tile_expr
@@ -129,6 +130,14 @@ def _source_c(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> torch.Tens
             acc = hl.dot(a[rows, inner], b[inner, cols], acc=acc)
         out[rows, cols] = acc.to(torch.bfloat16)
     return out
+
+
+def _seeded_widths(bound) -> set[int]:
+    return {
+        seed.config["tcgen05_tile_n"]
+        for seed in bound.config_spec.compiler_seed_configs
+        if seed.config.get("tcgen05_tile_n")
+    }
 
 
 @pytest.mark.parametrize("mode", (0, 1, 2, 3))
@@ -876,13 +885,14 @@ def test_sixteen_bit_pair_writes_physical_n_into_argument_output(rhs_k_major):
         # (128, 32) C subtiles leave room for seven 28 KiB stages; CuTe's
         # with-source (128, 64) subtile would cap the ring at six.
         assert plan.max_ab_stages == 7
-        # One deepest-ring seed per width that divides N.
+        # One deepest-ring seed per searched width: the widths dividing N.
         seeds = {
             s.config["tcgen05_tile_n"]: s.config["tcgen05_ab_stages"]
             for s in bound.config_spec.compiler_seed_configs
             if s.config.get("tcgen05_tile_n")
         }
-        assert set(seeds) == {96, 192} and seeds[192] == 7
+        assert set(seeds) == set(facts._dense_aligned_n_widths(state)) == {96, 192}
+        assert seeds[192] == 7
         # Two N tiles per pair split N evenly (A multicast).
         assert (
             facts._dense_aligned_n_plan(
@@ -954,6 +964,107 @@ def test_sixteen_bit_pair_prices_configured_epilogue_and_keeps_sampled_raster():
     assert narrow["tcgen05_cluster_n"] == 2
 
 
+def test_pair_tile_wave_cost():
+    def cost(m: int, n: int, k: int, width: int) -> float:
+        return pair_tile_wave_cost(m, n, k, width=width, block_m=256, sm_pairs=74)
+
+    # C4_15: one wave of 72 256x192 pairs against one of 48 256x256.
+    assert cost(3072, 1024, 6272, 192) / cost(3072, 1024, 6272, 256) == (
+        pytest.approx(0.78, abs=0.01)
+    )
+    assert cost(3072, 1024, 6272, 224) / cost(3072, 1024, 6272, 256) == (
+        pytest.approx(0.88, abs=0.01)
+    )
+    # Narrow tiles are stream-bound: one wave of 256x64 pairs beats the
+    # clipped 96-wide one.
+    assert cost(1024, 1024, 512, 64) < cost(1024, 1024, 512, 96)
+    # A fuller wave count costs whole waves: 2048^3 takes two of any width
+    # under 256.
+    assert cost(2048, 2048, 2048, 224) > cost(2048, 2048, 2048, 256)
+
+
+def test_sixteen_bit_pair_judges_full_tiles_at_its_width():
+    # 960 columns are five whole 192-wide tiles but no whole 256-wide ones:
+    # the full-tile rules (two epilogue warp groups here) judge the
+    # physical width, as codegen does, so the config renders.
+    bound = plain_mm_into._bind_isolated(bf16_mm_args(8192, 960, 768))
+    source = bound.to_code(
+        aligned_n_bf16_config(tcgen05_ab_stages=4, tcgen05_epi_warp_groups=2)
+    )
+    assert "_BLOCK_SIZE_1 = 192" in source
+
+
+def test_sixteen_bit_pair_n_tails_and_fp32_outputs():
+    # A weight gradient: bf16 operands into an fp32 output whose N (1024) no
+    # width divides. A width with a partial last N tile (its loads zero-fill,
+    # its TMA store clips) is admitted; the C ring takes the with-source
+    # subtile at the stored width and N tiles pair only when whole. Here no
+    # clipped width is seeded or searched: one wave of 256x64 pairs beats them.
+    x, y, out = bf16_mm_args(1024, 1024, 512)
+    for dtype in (torch.float32, torch.bfloat16):
+        bound = plain_mm_into._bind_isolated((x, y, out.to(dtype)))
+        state = bound.config_spec._cute_tcgen05_config
+        assert facts._dense_aligned_n_widths(state) == ()
+        assert _seeded_widths(bound) == set()
+        with bound.env:
+            plan = facts._dense_aligned_n_plan(state, aligned_n_bf16_config().config)
+            paired = facts._dense_aligned_n_plan(
+                state, aligned_n_bf16_config(tcgen05_cluster_n=2).config
+            )
+        assert plan is not None and plan.max_ab_stages == 6
+        assert paired is None
+        # both outputs render: the FP32 one is the C4_15 weight gradient's
+        source = bound.to_code(aligned_n_bf16_config(tcgen05_ab_stages=6))
+        assert "_BLOCK_SIZE_1 = 192" in source
+        assert "tcgen05_tma_store_atom" in source
+    # Multiple epilogue warp groups need whole physical tiles: refused as
+    # given, dropped when the autotuner repairs a sampled config.
+    groups = aligned_n_bf16_config(tcgen05_ab_stages=4, tcgen05_epi_warp_groups=2)
+    with pytest.raises(InvalidConfig, match="static full output tiles"):
+        bound.to_code(groups)
+    repaired = dict(groups.config)
+    bound.config_spec.normalize(repaired, _fix_invalid=True)
+    assert repaired["tcgen05_epi_warp_groups"] == 1
+    assert repaired["tcgen05_tile_n"] == 192
+    # 3072x1024x6272 (C4_15): one wave of 72 256x192 pairs against one of 48
+    # 256x256 (22% less by the cost model) is seeded; 224 (12%) is not.
+    x, y, out = bf16_mm_args(3072, 1024, 6272)
+    c4_15 = plain_mm_into._bind_isolated((x, y, out.float()))
+    assert _seeded_widths(c4_15) == {192}
+    assert facts._dense_aligned_n_widths(c4_15.config_spec._cute_tcgen05_config) == (
+        192,
+    )
+    # 2048^3: 64 256x256 pairs fill one wave; every clipped width takes two.
+    square = plain_mm_into._bind_isolated(bf16_mm_args(2048, 2048, 2048))
+    assert facts._dense_aligned_n_widths(square.config_spec._cute_tcgen05_config) == ()
+    # A width that divides N is always searched. An fp32 output still prices
+    # the with-source subtile (six stages); a 16-bit one keeps the (128, 32)
+    # ring and seven.
+    x, y, out = bf16_mm_args(1024, 768, 512)
+    for dtype, depth in ((torch.float32, 6), (torch.bfloat16, 7)):
+        bound = plain_mm_into._bind_isolated((x, y, out.to(dtype)))
+        state = bound.config_spec._cute_tcgen05_config
+        assert facts._dense_aligned_n_widths(state) == (96, 192)
+        with bound.env:
+            plan = facts._dense_aligned_n_plan(state, aligned_n_bf16_config().config)
+        assert plan is not None and plan.max_ab_stages == depth
+    # 160 columns: a clipped 96-wide tile has as many tiles as the 128-wide
+    # pairs and is not seeded.
+    assert (
+        _seeded_widths(plain_mm_into._bind_isolated(bf16_mm_args(1024, 160, 512)))
+        == set()
+    )
+    # The edge schedule needs whole K tiles: N and K tails together leave.
+    both = plain_mm_into._bind_isolated(bf16_mm_args(1024, 1024, 544))
+    with both.env:
+        assert (
+            facts._dense_aligned_n_plan(
+                both.config_spec._cute_tcgen05_config, aligned_n_bf16_config().config
+            )
+            is None
+        )
+
+
 def test_sixteen_bit_pair_rings_tails_and_refusals():
     # An argument output the epilogue also reads owns no store ring.
     for reader in (output_reading_mm, output_alias_reading_mm):
@@ -974,10 +1085,7 @@ def test_sixteen_bit_pair_rings_tails_and_refusals():
         (x, y, out.to(torch.float16)),
     ):
         half = plain_mm_into._bind_isolated(args)
-        assert facts._dense_aligned_n_widths(half.config_spec._cute_tcgen05_config) == (
-            96,
-            192,
-        )
+        assert _seeded_widths(half) == {96, 192}
     # A partial last M tile is clipped by the TMA store: 8320 rows keep the
     # family, its (128, 32) C ring and the full-tile TMA-store epilogue.
     tail = plain_mm_into._bind_isolated(bf16_mm_args(8320, 768, 768))
@@ -1021,11 +1129,7 @@ def test_sixteen_bit_pair_rings_tails_and_refusals():
         odd.to_code(
             aligned_n_bf16_config(tcgen05_tile_n=80, block_sizes=[256, 128, 64])
         )
-    assert {
-        s.config["tcgen05_tile_n"]
-        for s in odd.config_spec.compiler_seed_configs
-        if s.config.get("tcgen05_tile_n")
-    } == {96, 160, 192}
+    assert _seeded_widths(odd) == {96, 160, 192}
     # 960 columns split into five 192-wide tiles: no N pairing.
     with pytest.raises(InvalidConfig, match="tcgen05_tile_n"):
         odd.to_code(aligned_n_bf16_config(tcgen05_cluster_n=2))

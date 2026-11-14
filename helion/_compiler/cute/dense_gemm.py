@@ -33,6 +33,8 @@ class DenseGemmFacts:
     shape: tuple[int, int, int]
     input_dtype: torch.dtype
     capacity_bytes: int
+    # The stored element type: the C ring stages it.
+    output_dtype: torch.dtype
     output_column_major: bool = False
     plain_epilogue: bool = False
 
@@ -63,7 +65,11 @@ def _scale_view_supported(
 
 
 def prove_dense_gemm_facts(gemm: NativeGemm | None) -> DenseGemmFacts | None:
-    base = prove_full_tile_schedule_facts(gemm)
+    # A 16-bit pair may also store FP32 (a weight gradient's accumulator);
+    # its C ring is priced at the stored width.
+    base = prove_full_tile_schedule_facts(
+        gemm, output_dtypes=(torch.float16, torch.bfloat16, torch.float32)
+    )
     if (
         base is None
         or gemm is None
@@ -74,8 +80,7 @@ def prove_dense_gemm_facts(gemm: NativeGemm | None) -> DenseGemmFacts | None:
             base.dtype == torch.float8_e4m3fn
             and not (base.rhs_k_major and base.lhs_k_major)
         )
-        # The FP8 instruction stores a BF16 D ring (``prove_full_tile_schedule
-        # _facts`` already limits outputs to 16-bit floats).
+        # The FP8 instruction stores a BF16 D ring.
         or (base.dtype == torch.float8_e4m3fn and gemm.output.dtype != torch.bfloat16)
         # The TMA store clips at the destination's edge, not at the problem's.
         or tuple(gemm.output.shape) != gemm.shape[:2]
@@ -121,6 +126,7 @@ def prove_dense_gemm_facts(gemm: NativeGemm | None) -> DenseGemmFacts | None:
         base.shape,
         base.dtype,
         capacity,
-        gemm.candidate.output_column_major,
-        not gemm.chain.steps,
+        output_dtype=gemm.output.dtype,
+        output_column_major=gemm.candidate.output_column_major,
+        plain_epilogue=not gemm.chain.steps,
     )

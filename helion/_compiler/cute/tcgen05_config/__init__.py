@@ -202,6 +202,8 @@ class CuteTcgen05Config:
         # SM count of the bound device (0 when unknown); small-grid seeds use
         # it to decide whether the standard tiling can fill the machine.
         self.device_sm_count: int = 0
+        # (key, widths) of ``_dense_aligned_n_clipped_widths``.
+        self._dense_aligned_n_clipped_cache: tuple[object, frozenset[int]] | None = None
         # The register-MMA GEMM family (``cute_matmul_family="warp_mma"``):
         # admitted by the search plan (static latency-bound problem, one
         # matmul, supported layouts); its 16x8 tiles widen the M / N block
