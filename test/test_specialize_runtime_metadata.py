@@ -89,3 +89,28 @@ def test_input_backed_size_stride_and_scalar_specialization_still_bind():
         assert changed_scalar is not original
         for bound in (original, changed_stride, changed_scalar):
             ast.parse(bound.to_code(bound.config_spec.default_config()))
+
+
+def _after_operator(x, mode: hl.constexpr):
+    hl.specialize(x.size())
+    hl.specialize(x.stride())
+    flat = x.view(-1)
+    if mode == "pure":
+        torch.ops.aten.alias(x)
+    else:
+        torch.ops.aten.add_.Tensor(x, 1)
+    out = torch.empty_like(flat)
+    for tile in hl.tile(flat.size(0)):
+        out[tile] = flat[tile]
+    return out
+
+
+@pytest.mark.parametrize("mode", ["pure", "mutating"])
+def test_operator_schema_decides_whether_view_strides_stay_literal(mode):
+    # Looking up and calling a schema-pure torch.ops operator keeps the exact
+    # layout of a specialized input's view; a writing schema voids it.
+    kernel = helion.kernel(_after_operator, static_shapes=False)
+    with cpu_render_target():
+        bound = kernel.bind((torch.empty(4, 8), mode))
+        code = bound.to_code(bound.config_spec.default_config())
+    assert ("flat_stride_0" in code) == (mode == "mutating")

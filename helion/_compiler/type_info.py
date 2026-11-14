@@ -170,15 +170,16 @@ def _is_known_host_value(value: object) -> bool:
 
 # Capture Python-library identities before user code can replace module attrs.
 _NATIVE_TENSOR_CLASS = torch.Tensor
-# The receivers of an operator lookup (``torch.ops.prims.fma``), and with
-# the overload it ends in, the values such a lookup yields: torch's own
-# classes, whose attribute lookup and equality run no user protocol.
-_TORCH_OPS_LOOKUP_TYPES = (
-    type(torch.ops),
+# ``torch.ops``, its namespaces and their packets: attribute lookup resolves a
+# registered operator and runs none of its kernels (torch's own classes, whose
+# attribute lookup and equality run no user protocol).
+_NATIVE_OPERATOR_REGISTRY = (
+    torch._ops._Ops,
     torch._ops._OpNamespace,
     torch._ops.OpOverloadPacket,
 )
-_TORCH_OPS_VALUE_TYPES = (*_TORCH_OPS_LOOKUP_TYPES, torch._ops.OpOverload)
+# The values such a lookup yields.
+_TORCH_OPS_VALUE_TYPES = (*_NATIVE_OPERATOR_REGISTRY, torch._ops.OpOverload)
 _KNOWN_HOST_CONSTRUCTORS = (
     abs,
     all,
@@ -254,6 +255,16 @@ def _is_known_host_call(
         return True
     if any(fn is split for split in _KNOWN_HOST_SPLITS):
         return bool(args) and type(args[0]) is FakeTensor
+    if isinstance(fn, (torch._ops.OpOverload, torch._ops.OpOverloadPacket)):
+        # A schema without writes cannot change any tensor's storage or
+        # metadata (the contract functionalization relies on). A packet
+        # dispatches to any of its overloads.
+        overloads = (
+            [getattr(fn, name) for name in fn.overloads()]
+            if isinstance(fn, torch._ops.OpOverloadPacket)
+            else [fn]
+        )
+        return not any(overload._schema.is_mutable for overload in overloads)
     if type(fn) is types.MethodType:
         return fn.__func__ is _KNOWN_HOST_SPLITS[1] and type(fn.__self__) is FakeTensor
     if type(fn) is types.MethodDescriptorType:
@@ -1425,7 +1436,7 @@ class LiteralType(TypeInfo):
             # Native Tensor method lookup does not invoke a user descriptor.
             # Python replacements still go through opaque effect tracking.
             result = descriptor
-        elif any(type(self.value) is kind for kind in _TORCH_OPS_LOOKUP_TYPES):
+        elif any(type(self.value) is kind for kind in _NATIVE_OPERATOR_REGISTRY):
             # ``torch.ops.<namespace>.<op>.<overload>`` resolves a registered
             # operator: torch's own lookup, which runs no user protocol and
             # touches no tensor, so the storage proofs survive it.
