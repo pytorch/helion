@@ -40,6 +40,8 @@ from __future__ import annotations
 
 import ast
 import collections
+import copy
+from fractions import Fraction
 import math
 from typing import TYPE_CHECKING
 from typing import NoReturn
@@ -54,8 +56,12 @@ from ..ast_extension import expr_from_string
 from ..compile_environment import CompileEnvironment
 from .affine_fold import Affine
 from .affine_fold import Fact
+from .affine_fold import evaluate
 from .affine_fold import fold
+from .affine_fold import render
 from .backend import static_extent
+from .lane_fold import load_mask_other
+from .lane_fold import tl_load
 from .mpp_matmul import ACC_SEED
 from .mpp_matmul import FRAG_A
 from .mpp_matmul import FRAG_B
@@ -82,6 +88,7 @@ from .mpp_matmul import static_tile
 from .mpp_matmul import storage_key
 from .mpp_matmul import view_args
 from .mpp_matmul import virtual_thread
+from .search_surface import fragment_stages
 from .search_surface import metal_tabulate_max_entries
 from .tabulate import tabulate
 
@@ -282,6 +289,25 @@ def _static_int(expr: object) -> int | None:
     return None
 
 
+def _specialized(end: object) -> object:
+    """A loop end with the sizes ``hl.specialize`` pins substituted."""
+    if isinstance(end, sympy.Expr):
+        return CompileEnvironment.current().specialize_expr(end)
+    return end
+
+
+def loads_ahead(begin: object, end: object) -> bool:
+    """Whether a K loop from ``begin`` to ``end`` can load its fragment
+    runs' operands a tile ahead (``range_num_stages=2``): both are known,
+    the begin isn't negative and the end is past it, so the loop runs and
+    its first tile's loads can go before it.  ``register_search_surface``
+    offers the loop a stages slot only where its call's bounds pass, and
+    codegen checks its loop's again under the slot, refusing the config
+    (``BackendUnsupported``) where they don't."""
+    first, last = _static_int(begin), _static_int(end)
+    return first is not None and first >= 0 and last is not None and last > first
+
+
 def _static_loop(cg: GenerateAST, block: int) -> tuple[LoopDimInfo, int, int] | None:
     """The active loop over ``block``: its info, begin and block size, or
     None when no loop over it is active or its begin isn't known at
@@ -356,8 +382,10 @@ def codegen_fragment_run(
     ``k_live`` its live length, which masks a computed operand's K tail
     (None when every tile is whole), ``facts`` the tile offsets' ``(offset,
     multiple, least)`` (:func:`_offset_fact`), over which the run folds its
-    elements' index arithmetic, and ``tables`` the config's
-    ``metal_tabulate_max_entries``."""
+    elements' index arithmetic, ``tables`` the config's
+    ``metal_tabulate_max_entries``, and ``k_step`` the K loop's offset and
+    step when it loads its operands a tile ahead (``range_num_stages=2``),
+    else None."""
     backend = CompileEnvironment.current().backend
     m, n, k = static_tile(cg, (group.m_block, group.n_block, group.k_block))
     op = dict(zip((group.m_block, group.n_block), op_dims(group, m, n), strict=True))
@@ -408,11 +436,34 @@ def codegen_fragment_run(
         for block in (group.m_block, group.n_block, group.k_block)
         if (fact := _offset_fact(cg, block)) is not None
     ]
+    config = cg.device_function.config
+    stages = fragment_stages(
+        CompileEnvironment.current().config_spec, config, group.k_block
+    )
+    # Loading a tile ahead needs the K offset's first value, the least of
+    # its fact, which the first tile's loads before the loop read, and a
+    # loop that runs.  The search offers 2 stages only on a K loop whose
+    # call's bounds loads_ahead admits (``register_search_surface``); this
+    # checks the loop codegen sees.
+    k_step = None
+    if stages >= 2:
+        k_fact = _offset_fact(cg, group.k_block)
+        k_loop = _static_loop(cg, group.k_block)
+        if (
+            k_fact is None
+            or k_loop is None
+            or not loads_ahead(k_fact[2], _specialized(k_loop[0].end_expr))
+        ):
+            raise metal_unsupported(
+                "range_num_stages=2 on a K loop without known bounds it runs between"
+            )
+        k_step = (k_fact[0], k_loop[2])
     return expr_from_string(
         f"{RUN}({acc.id}, {group.gid}, {', '.join(parts)}, "
         f"anchors=[{anchor_list}], outer=[{', '.join(outers)}], steps={k // 8}, "
         f"k_live={k_live}, facts={facts!r}, "
         f"tables={metal_tabulate_max_entries(cg.device_function.config)}, "
+        f"k_step={k_step!r}, "
         f"fragment=[{', '.join(sides)}])"
     )
 
@@ -521,12 +572,12 @@ def fragment_run(
     its bindings, and is 0 past the K tile's live length; a view's is a
     masked load (:func:`_view_element`)."""
     grid = _keyword(acc_call, "fragment")
-    steps, k_live, facts, tables, sides = (
+    steps, k_live, facts, tables, k_step, sides = (
         _keyword(call, name)
-        for name in ("steps", "k_live", "facts", "tables", "fragment")
+        for name in ("steps", "k_live", "facts", "tables", "k_step", "fragment")
     )
     assert grid is not None and steps is not None and facts is not None
-    assert tables is not None
+    assert tables is not None and k_step is not None
     assert isinstance(sides, ast.List)
     _, _, flipped = ast.literal_eval(grid)
     outer = run_outer(call)
@@ -570,7 +621,7 @@ def fragment_run(
         ast.Name("_it", ast.Store()),
         ast.Call(
             ast.Name(FRAG_RUN, ast.Load()),
-            [call.args[0], steps, facts, tables],
+            [call.args[0], steps, facts, tables, k_step],
             [],
         ),
         body,
@@ -693,7 +744,7 @@ def _run_setup(
     over and its table cap (``metal_tabulate_max_entries``); ``root`` is its
     accumulator's."""
     assert isinstance(stmt.iter, ast.Call)
-    _, steps, facts_arg, tables = stmt.iter.args
+    _, steps, facts_arg, tables, _ = stmt.iter.args
     rows, cols, flipped = _grid(state, root)
     row, col = _element_names(flipped)
     a_loop, b_loop = stmt.body
@@ -725,6 +776,11 @@ def _run_setup(
     return n_steps, sides, facts, ast.literal_eval(tables)
 
 
+#: A fragment element's statements, its names' affine values and the facts
+#: they fold over (:func:`_element_body`).
+FragmentElement = tuple[list[ast.stmt], dict[str, object], dict[str, Fact]]
+
+
 def _element_body(
     loop: ast.For,
     decls: tuple[str, str],
@@ -733,20 +789,22 @@ def _element_body(
     facts: dict[str, Fact],
     tables: int,
     state: EmitState,
-) -> list[ast.stmt]:
+) -> FragmentElement:
     """Element ``i`` of step ``step``'s statements, its position bound and
     folded (``affine_fold``) over the run's facts and the kernel's integer
     constants, and its decodes tabulated (``tabulate``) under the cap
-    ``tables``."""
+    ``tables``; the affine values of its names; and the facts they fold
+    over, the run's and its floor terms'."""
     env: dict[str, object] = {
         name: Affine.of(value)
         for name, value in state.constants.items()
         if isinstance(value, int)
     }
     env |= {"_fs": Affine.of(step), "_fi": Affine.of(i)}
+    facts = dict(facts)
     positions = ast.parse("\n".join(decls)).body
     body = fold([*positions, *loop.body], env, facts)[len(positions) :]
-    return tabulate(body, state.constants, state.tables, tables)
+    return tabulate(body, state.constants, state.tables, tables), env, facts
 
 
 def emit_fragment_run(
@@ -776,7 +834,10 @@ def emit_fragment_run(
     scale, then read it through one expression, whose loads the compiler
     shares.  Under a table cap (``metal_tabulate_max_entries``) each folded
     element's chains from a low-bit field read their tables
-    (``tabulate``)."""
+    (``tabulate``).  In a K loop that loads a tile ahead
+    (``range_num_stages=2``), the run reuses the elements the prefetch
+    planner built (:func:`prefetch_loads`, through ``state.prefetch``), and
+    their early loads read the registers loaded the iteration before."""
     pad = " " * indent
     inner = pad + "    "
     assert isinstance(stmt.iter, ast.Call)
@@ -784,6 +845,7 @@ def emit_fragment_run(
     assert isinstance(acc, ast.Name)
     rows, cols, _ = _grid(state, state.coop[acc.id])
     n_steps, sides, facts, tables = _run_setup(stmt, state, state.coop[acc.id])
+    k, early, elements = state.prefetch.get(id(stmt), ("", {}, {}))
     saved = state.put
     for step in range(n_steps):
         parts += [
@@ -792,7 +854,7 @@ def emit_fragment_run(
             f"{inner}simdgroup_float8x8 _frag_a[{rows}];",
             f"{inner}simdgroup_float8x8 _frag_b[{cols}];",
         ]
-        for loop, array, count, decls in sides:
+        for side, (loop, array, count, decls) in enumerate(sides):
             state.put = f"{array}[_fi >> 1].thread_elements()[_fi & 1]"
             for i in range(2 * count):
                 lines = [
@@ -800,7 +862,12 @@ def emit_fragment_run(
                     f"{inner}    constexpr short _fi = {i};",
                     *(f"{inner}    int {decl};" for decl in decls),
                 ]
-                body = _element_body(loop, decls, step, i, facts, tables, state)
+                element = elements.get((side, step, i))
+                if element is None:
+                    element = _element_body(loop, decls, step, i, facts, tables, state)
+                body, env, element_facts = element
+                if early:
+                    body = _read_early(body, env, element_facts, k, early)
                 with state.isolated_scope():
                     emit_body(body, lines, indent + 8, state)
                 parts += [*lines, f"{inner}}}"]
@@ -812,6 +879,172 @@ def emit_fragment_run(
         ]
         parts.append(f"{pad}}}")
     state.put = saved
+
+
+#: A load a fragment run reads a K tile early: its tensor, its index without
+#: the K offset's term, and that term's coefficient.
+EarlyLoad = tuple[str, Affine, Fraction]
+
+
+def _assigned_from(body: list[ast.stmt]) -> list[set[str]]:
+    """For each statement of ``body``, the names it or a later statement
+    assigns (or binds).  ``env`` holds a name's last value, which a load in
+    such a statement may not read."""
+    out: list[set[str]] = []
+    names: set[str] = set()
+    for stmt in reversed(body):
+        names = names.union(*(assigned_names(n) for n in ast.walk(stmt)))
+        out.append(names)
+    return out[::-1]
+
+
+def _early_load(
+    node: ast.AST,
+    env: Mapping[str, object],
+    facts: Mapping[str, Fact],
+    k: str,
+    unstable: set[str],
+) -> EarlyLoad | None:
+    """``node``'s key when it is an unmasked load whose index is affine in
+    the K offset ``k`` and names the K loop doesn't change: the lane's,
+    the other tiles' offsets and floor terms of those.  It reads none of
+    the names ``unstable`` (:func:`_assigned_from`), whose values in ``env``
+    may not be the ones it reads."""
+    load = tl_load(node)
+    if not (
+        load is not None
+        and len(load.args) >= 1
+        and load_mask_other(load) is None
+        and isinstance(ptr := load.args[0], ast.BinOp)
+        and isinstance(ptr.op, ast.Add)
+        and isinstance(ptr.left, ast.Name)
+    ):
+        return None
+    if any(isinstance(n, ast.Name) and n.id in unstable for n in ast.walk(ptr.right)):
+        return None
+    facts = dict(facts)
+    index = evaluate(ptr.right, env, facts)
+    if index is None:
+        return None
+    terms = dict(index.terms)
+    coeff = terms.pop(k, Fraction(0))
+    # Every term is a fact's name: a lane coordinate, a tile offset or a
+    # floor term of those.  Of these, only the K offset and floor terms
+    # over it change in the K loop.
+    if not coeff or any(k in facts[name].depends for name in terms):
+        return None
+    return ptr.left.id, Affine(index.const, tuple(sorted(terms.items()))), coeff
+
+
+def _read_early(
+    body: list[ast.stmt],
+    env: Mapping[str, object],
+    facts: Mapping[str, Fact],
+    k: str,
+    early: Mapping[EarlyLoad, str],
+) -> list[ast.stmt]:
+    """``body`` with each load the K loop issued a tile early
+    (:func:`prefetch_loads`) read from the register that holds it."""
+
+    class Rewrite(ast.NodeTransformer):
+        def __init__(self, unstable: set[str]) -> None:
+            self.unstable = unstable
+
+        def visit_Call(self, node: ast.Call) -> ast.AST:
+            key = _early_load(node, env, facts, k, self.unstable)
+            name = None if key is None else early.get(key)
+            if name is not None:
+                return ast.Name(name, ast.Load())
+            return self.generic_visit(node)
+
+    return [
+        Rewrite(unstable).visit(copy.deepcopy(s))
+        for s, unstable in zip(body, _assigned_from(body), strict=True)
+    ]
+
+
+def prefetch_loads(
+    body: list[ast.stmt], loop_var: str, end: str, pad: str, state: EmitState
+) -> tuple[list[str], list[str]]:
+    """Software pipelining of the fragment runs in a K loop's ``body``: the
+    lines to emit before the loop and at the top of its body.  A run's
+    element loads that the loop may issue a tile early (:func:`_early_load`)
+    are each loaded for the first tile before the loop into a register,
+    and at the top of each iteration copied out and loaded for the next
+    tile, so the next tile's loads are in flight while this tile decodes and
+    multiplies.  The run's elements read the copies (:func:`_read_early`).
+    No such load reads a tensor the kernel writes: the planner stages a view
+    of one (``mpp_matmul._order_memory``), and ``check_fragment_group``
+    refuses a staged operand's loads of one."""
+    before: list[str] = []
+    top: list[str] = []
+    ahead: list[str] = []
+    # The loop's test for a next tile, once a run loads ahead.
+    next_tile: str | None = None
+    # The loop body's references to an accumulator (``acc_copy = acc``),
+    # which it declares before its runs.
+    alias = {
+        s.targets[0].id: s.value.id
+        for s in body
+        if isinstance(s, ast.Assign)
+        and len(s.targets) == 1
+        and isinstance(s.targets[0], ast.Name)
+        and isinstance(s.value, ast.Name)
+    }
+    for stmt in body:
+        if not (isinstance(stmt, ast.For) and call_name(stmt.iter) == FRAG_RUN):
+            continue
+        assert isinstance(stmt.iter, ast.Call)
+        k_step = ast.literal_eval(stmt.iter.args[4])
+        if k_step is None or k_step[0] != loop_var:
+            continue
+        k, step = k_step
+        acc = stmt.iter.args[0]
+        assert isinstance(acc, ast.Name)
+        root = acc.id
+        while root not in state.coop and root in alias:
+            root = alias[root]
+        if root not in state.coop:
+            # An accumulator the loop body declares: a run per tile.
+            continue
+        n_steps, sides, facts, tables = _run_setup(stmt, state, state.coop[root])
+        begin = facts[k].lo
+        assert begin is not None
+        early: dict[EarlyLoad, str] = {}
+        # The elements built here, which the run's emission reuses.
+        elements: dict[tuple[int, int, int], FragmentElement] = {}
+        for s in range(n_steps):
+            for side, (loop, _, count, decls) in enumerate(sides):
+                for i in range(2 * count):
+                    element = _element_body(loop, decls, s, i, facts, tables, state)
+                    elements[side, s, i] = element
+                    stmts, env, element_facts = element
+                    for line, unstable in zip(
+                        stmts, _assigned_from(stmts), strict=True
+                    ):
+                        for node in ast.walk(line):
+                            key = _early_load(node, env, element_facts, k, unstable)
+                            if key is not None and key not in early:
+                                early[key] = f"_early_{state.early_count + len(early)}"
+        # The emission reuses the elements whether or not any load moves.
+        state.prefetch[id(stmt)] = (k, early, elements)
+        if not early:
+            continue
+        next_tile = f"{loop_var} + {step} < {end}"
+        state.early_count += len(early)
+        for (ptr, rest, coeff), name in early.items():
+            first = rest + Affine.of(int(coeff * begin))
+            nxt = rest + Affine.term(k, 1).scale(coeff) + Affine.of(int(coeff * step))
+            before.append(
+                f"{pad}auto {name}_next = {ptr}[{ast.unparse(render(first))}];"
+            )
+            top.append(f"{pad}    auto {name} = {name}_next;")
+            ahead.append(
+                f"{pad}        {name}_next = {ptr}[{ast.unparse(render(nxt))}];"
+            )
+    if next_tile is not None:
+        top += [f"{pad}    if ({next_tile}) {{", *ahead, f"{pad}    }}"]
+    return before, top
 
 
 def kernel_constants(body: list[ast.stmt]) -> dict[str, int | float]:

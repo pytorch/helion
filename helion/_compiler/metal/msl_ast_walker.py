@@ -30,10 +30,13 @@ import dataclasses
 from typing import Iterator
 
 from ... import exc
+from .fragment_mma import EarlyLoad
+from .fragment_mma import FragmentElement
 from .fragment_mma import emit_fragment_acc
 from .fragment_mma import emit_fragment_run
 from .fragment_mma import fragment_elements
 from .fragment_mma import is_fragment_acc
+from .fragment_mma import prefetch_loads
 from .lane_fold import LANE_PUT
 from .lane_fold import load_mask_other
 from .lane_fold import tl_load
@@ -80,6 +83,20 @@ class EmitState:
     tables: dict[tuple[str, tuple[str, ...]], str] = dataclasses.field(
         default_factory=dict
     )
+    #: Each fragment run's K offset, the loads its K loop issues a tile
+    #: early, to the registers holding them, and the elements built to find
+    #: them (``fragment_mma``'s ``prefetch_loads``), by the run's id.
+    prefetch: dict[
+        int,
+        tuple[
+            str,
+            dict[EarlyLoad, str],
+            dict[tuple[int, int, int], FragmentElement],
+        ],
+    ] = dataclasses.field(default_factory=dict)
+    #: How many prefetch registers the kernel has named, which keeps their
+    #: names unique.
+    early_count: int = 0
     #: The element an element loop's ``_helion_mpp_put`` writes.
     put: str = "*_it"
 
@@ -568,8 +585,8 @@ def _emit_for(
       _it != coop.end(); _it++)`` with the tensor's names substituted by
       ``(*_it)`` in the body, or a fragment group's unrolled loop over the
       elements each lane holds (``fragment_mma.fragment_elements``)
-    - ``_helion_mpp_fragments(acc, steps, facts, tables)`` → a fragment
-      group's op over one K tile (``fragment_mma.emit_fragment_run``)
+    - ``_helion_mpp_fragments(acc, steps, facts, tables, k_step)`` → a
+      fragment group's op over one K tile (``fragment_mma.emit_fragment_run``)
     """
     pad = " " * indent
     it = stmt.iter
@@ -672,9 +689,12 @@ def _emit_for(
         end = _ast_expr_to_msl(args[1], subs=subs)
         step = _ast_expr_to_msl(args[2], subs=subs)
 
+    before, top = prefetch_loads(stmt.body, loop_var, end, pad, state)
+    parts += before
     parts.append(
         f"{pad}for (int {loop_var} = {start}; {loop_var} < {end}; {loop_var} += {step}) {{"
     )
+    parts += top
     with state.block_scope():
         state.declare(loop_var)
         _emit_stmts(stmt.body, parts, indent=indent + 4, state=state, subs=subs)
