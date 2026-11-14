@@ -375,6 +375,7 @@ def _generate_msl(
         required_threads_attr = (
             f"[[required_threads_per_threadgroup({tx}, {ty}, {tz})]] "
         )
+    kernel_at = len(msl_parts)
     msl_parts.append(
         f"{required_threads_attr}kernel void {kernel_name}(\n    {sig}\n) {{"
     )
@@ -415,6 +416,10 @@ def _generate_msl(
     )
 
     _emit_stmts(body_stmts, msl_parts, indent=4, state=state)
+    msl_parts[kernel_at:kernel_at] = [
+        f"constant {ctype} {name}[{len(entries)}] = {{{', '.join(entries)}}};"
+        for (ctype, entries), name in state.tables.items()
+    ]
 
     msl_parts.append("}")
     return "\n".join(msl_parts)

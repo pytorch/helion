@@ -569,7 +569,9 @@ class MetalBackend(Backend):
         whether every one of its K-loop matmuls lowers on fragments too
         (``search_surface.lowers_on_fragments``, which exposes
         ``metal_matmul`` to the search): the planner's fragment trial on
-        copies of the graphs, with no block spread over threads."""
+        copies of the graphs, with no block spread over threads.  Then the
+        sizes of the tables its fragment elements would read
+        (``metal_tabulate_max_entries``)."""
         from ..compile_environment import CompileEnvironment
         from ..compile_environment import FixedBlockSizeSource
         from ..device_ir import ForLoopGraphInfo
@@ -579,6 +581,7 @@ class MetalBackend(Backend):
         from .mpp_matmul import has_matmuls
         from .mpp_matmul import plan_mpp_matmuls
         from .search_surface import MetalKernelFacts
+        from .tabulate import table_sizes
 
         if not has_matmuls(device_ir.graphs):
             return
@@ -652,8 +655,19 @@ class MetalBackend(Backend):
             return
         blocks = tuple(sorted({group.k_block for group in plan.by_matmul.values()}))
         if blocks:
+            # The nodes the matmuls compute from, where fragment elements
+            # would read tables.
+            inputs: set[torch.fx.Node] = set()
+            todo = [group.matmul for group in plan.by_matmul.values()]
+            while todo:
+                for node in todo.pop().all_input_nodes:
+                    if node not in inputs:
+                        inputs.add(node)
+                        todo.append(node)
             config_spec.backend_facts = dataclasses.replace(
-                launch_facts, fragment_matmuls=True
+                launch_facts,
+                fragment_matmuls=True,
+                table_sizes=frozenset(table_sizes(inputs)),
             )
 
     def default_num_sm_multiplier(self) -> int:
