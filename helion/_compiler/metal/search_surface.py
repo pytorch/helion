@@ -63,6 +63,12 @@ class MetalKernelFacts:
     #: Those tiles a reduction contracts after their loop, which shrink to
     #: one thread (``blocks_reduced_after_loop``).
     reduced_after_loop: frozenset[int] = frozenset()
+    #: The K-loop MPP matmuls that stage one operand per K tile (a value the
+    #: Scalar layout computes, a dequantized weight) beside a device view:
+    #: ``(tall, narrow, k)`` blocks, the view's side (whose threads share
+    #: the staged tile), the staged operand's other side, and K
+    #: (``staged_matmul_heuristic``).
+    staged_matmuls: tuple[tuple[int, int, int], ...] = ()
 
 
 def kernel_facts(config_spec: ConfigSpec) -> MetalKernelFacts:
