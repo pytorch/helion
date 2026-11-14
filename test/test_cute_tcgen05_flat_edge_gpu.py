@@ -40,6 +40,8 @@ from helion._testing.cute_dense_tcgen05 import bias_mm_into
 from helion._testing.cute_dense_tcgen05 import plain_mm_into
 from helion._testing.cute_dense_tcgen05 import promoted_bias_mm_into
 from helion._testing.cute_dense_tcgen05 import scale_bias_mm_into
+from helion._testing.cute_dense_tcgen05 import scaled_bmm_args
+from helion._testing.cute_dense_tcgen05 import scaled_bmm_into
 import helion.language as hl
 
 pytestmark = pytest.mark.skipif(
@@ -897,10 +899,19 @@ class TestCuteTcgen05DefaultTilesGpu(RefEagerTestDisabled, TestCase):
     def test_small_grid_without_a_pair_splits_k(self) -> None:
         # A 64-row M and a K tail over long K loops: the flat 64x64x64 tile
         # splits K (four slices, eight) and the last arriving CTA adds the
-        # bias once.
-        for m, n, k, split in ((64, 4096, 4096, 4), (32, 1280, 4000, 8)):
+        # bias once; a K-major B into 65-column rows (no TensorMap) runs the
+        # tile unsplit over its eight k-blocks.
+        for m, n, k, split in (
+            (64, 4096, 4096, 4),
+            (32, 1280, 4000, 8),
+            (96, 65, 512, 1),
+        ):
             a = torch.randn(m, k, device=DEVICE, dtype=torch.bfloat16)
-            b = torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
+            b = (
+                torch.randn(n, k, device=DEVICE, dtype=torch.bfloat16).T
+                if n % 8
+                else torch.randn(k, n, device=DEVICE, dtype=torch.bfloat16)
+            )
             bias = torch.randn(n, device=DEVICE, dtype=torch.bfloat16)
             out = torch.empty(m, n, device=DEVICE, dtype=torch.bfloat16)
             bound = bias_mm_into.bind((a, b, bias, out))
@@ -914,6 +925,27 @@ class TestCuteTcgen05DefaultTilesGpu(RefEagerTestDisabled, TestCase):
                 rtol=1e-2,
                 atol=1e-1,
             )
+
+    def test_unaligned_rows_store_through_the_staged_tile(self) -> None:
+        # Attention scores into 201-element rows: the staged SMEM tile stores
+        # every tile, the 200-row / 200-column edges masked, over one k-block
+        # (one AB stage) and two, matching torch.
+        for k in (64, 128):
+            (a, b, mask, out), padded = scaled_bmm_args(
+                32, 200, 200, k, row=201, device=DEVICE
+            )
+            bound = scaled_bmm_into.bind((a, b, mask, out))
+            config = bound.config_spec.default_config()
+            self.assertIn("tcgen05_staged_tile", bound.to_code(config))
+            padded.fill_(7.0)
+            bound.set_config(config)
+            bound(a, b, mask, out)
+            expected = torch.bmm(a.float(), b.float()) * 0.125 + mask.float()
+            torch.testing.assert_close(
+                out, expected.to(out.dtype), rtol=1e-2, atol=1e-1
+            )
+            # the padding column past N stays untouched
+            self.assertTrue(bool((padded[..., 200:] == 7.0).all()))
 
     def test_batched_defaults_walk_batches_slowest(self) -> None:
         # The batched pair defaults and the narrow persistent one-CTA tile

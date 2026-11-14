@@ -150,6 +150,9 @@ class CuteTcgen05Config:
         # epilogue warps copy with ``cp.async`` beside a TMA-legal B
         # (``host_function_cp_async_a_provable``).
         self.cp_async_a_provable: bool = False
+        # Every MMA's A and B pass the TensorMap proof, whatever its output
+        # (``host_function_matmul_operands_tma_provable(outputs=False)``).
+        self.matmul_inputs_tma_provable: bool = True
         # The staging pass left such an A in place for the producer
         # (``stage_aligned_operands._cp_async_lhs_names``) where it would
         # otherwise have padded it: only then does a config off the
