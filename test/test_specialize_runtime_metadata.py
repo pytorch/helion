@@ -6,6 +6,7 @@ import pytest
 import torch
 
 import helion
+from helion._compiler import type_info
 from helion._testing import cpu_render_target
 from helion._testing import skipUnlessBackends
 from helion._testing.tunable_fragments import load_host_function
@@ -157,11 +158,16 @@ def _patched_operator(x, use_alias: hl.constexpr):
 
 
 @skipUnlessBackends(["triton"])
-@pytest.mark.parametrize("patch", ["descriptor", "call", "init", "dispatch"])
+@pytest.mark.parametrize(
+    "patch", ["descriptor", "call", "init", "dispatch", "no_effect_query"]
+)
 def test_patched_operator_hooks_stay_opaque(monkeypatch, patch):
-    # A Python hook on the registry may run anything on lookup or call.
+    # A Python hook on the registry may run anything on lookup or call; a torch
+    # without the effect query cannot prove a call free of effects.
     packet = torch._ops.OpOverloadPacket
-    if patch == "descriptor":
+    if patch == "no_effect_query":
+        monkeypatch.setattr(type_info, "_get_effect", None)
+    elif patch == "descriptor":
         monkeypatch.setattr(
             type(torch.ops.aten),
             "helion_test_alias",

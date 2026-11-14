@@ -22,7 +22,6 @@ import sympy
 import torch
 from torch._dynamo.source import TensorProperty
 from torch._dynamo.source import TensorPropertySource
-from torch._higher_order_ops.effects import _get_effect
 from torch._subclasses.fake_tensor import FakeTensor
 from torch.fx.experimental import proxy_tensor
 from torch.utils._python_dispatch import TorchDispatchMode
@@ -32,6 +31,11 @@ from torch.utils._sympy.functions import FloatTrueDiv
 from torch.utils._sympy.functions import FloorDiv
 from torch.utils._sympy.functions import IntTrueDiv
 from torch.utils._sympy.functions import ToFloat
+
+try:
+    from torch._higher_order_ops.effects import _get_effect
+except ImportError:  # older torch has no effect query: torch.ops calls stay opaque
+    _get_effect = None
 
 from .. import exc
 from .._utils import cdiv
@@ -284,7 +288,11 @@ def _is_known_host_call(
         # reaches beyond them. The kernels registered for it (Python ones from
         # torch.library too) are trusted to honor the schema, as
         # functionalization and torch.compile trust them.
-        if not (_registry_unpatched(fn) and _dispatches_natively(fn)):
+        if not (
+            _get_effect is not None
+            and _registry_unpatched(fn)
+            and _dispatches_natively(fn)
+        ):
             return False
         if type(fn) is _NATIVE_OP_OVERLOAD:
             return _get_effect(cast("OpOverload", fn)) is None
