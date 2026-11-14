@@ -157,9 +157,10 @@ def _patched_operator(x, use_alias: hl.constexpr):
 
 
 @skipUnlessBackends(["triton"])
-@pytest.mark.parametrize("patch", ["descriptor", "call"])
+@pytest.mark.parametrize("patch", ["descriptor", "call", "init", "dispatch"])
 def test_patched_operator_hooks_stay_opaque(monkeypatch, patch):
     # A Python hook on the registry may run anything on lookup or call.
+    packet = torch._ops.OpOverloadPacket
     if patch == "descriptor":
         monkeypatch.setattr(
             type(torch.ops.aten),
@@ -167,12 +168,24 @@ def test_patched_operator_hooks_stay_opaque(monkeypatch, patch):
             property(lambda self: torch.ops.aten.alias),
             raising=False,
         )
-    else:
-        call = torch._ops.OpOverloadPacket.__call__
+    elif patch == "call":
+        call = packet.__call__
         monkeypatch.setattr(
-            torch._ops.OpOverloadPacket,
+            packet,
             "__call__",
             lambda self, *args, **kwargs: call(self, *args, **kwargs),
+        )
+    elif patch == "init":
+        init = packet.__init__
+        monkeypatch.setattr(
+            packet,
+            "__init__",
+            lambda self, *args, **kwargs: init(self, *args, **kwargs),
+        )
+    else:
+        op = torch.ops.aten.clone._op
+        monkeypatch.setattr(
+            torch.ops.aten.clone, "_op", lambda *args, **kwargs: op(*args, **kwargs)
         )
     kernel = helion.kernel(_patched_operator, static_shapes=False)
     with cpu_render_target():
