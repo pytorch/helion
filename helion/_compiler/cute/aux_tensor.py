@@ -67,6 +67,21 @@ _TCGEN05_AUX_DETECTOR_MMA_TARGETS = (
 _TCGEN05_NATIVE_MMA_OPERAND_DTYPES = (torch.bfloat16, torch.float16)
 
 
+def stages_through_smem_ring(
+    broadcast_axis: int | None, host_tensor: torch.Tensor
+) -> bool:
+    """Whether the staged aux modes (the C-input warp's SMEM ring, the aux
+    TMA) carry an operand: an exact-shape rank-2 tensor. Broadcast rows and
+    rank-3 residuals stay on the direct per-thread read, and so does a boolean
+    mask: ``cutlass.Boolean`` is one bit wide against one byte of storage, so
+    a ring or copy atom of that type is too narrow."""
+    return (
+        broadcast_axis is None
+        and host_tensor.ndim == 2
+        and host_tensor.dtype is not torch.bool
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class Tcgen05AuxTensorDescriptor:
     """One auxiliary tensor reachable from a tcgen05 matmul anchor.
@@ -119,6 +134,11 @@ class Tcgen05AuxTensorDescriptor:
     host_tensor_val: torch.Tensor
     broadcast_axis: int | None
     store_value_node: torch.fx.Node
+
+    @property
+    def stages_through_smem_ring(self) -> bool:
+        """``stages_through_smem_ring`` of this operand."""
+        return stages_through_smem_ring(self.broadcast_axis, self.host_tensor_val)
 
 
 def _output_global_shape_from_store(
@@ -397,13 +417,13 @@ def host_function_has_tcgen05_aux_kernel_pattern(
 def host_function_tcgen05_exact_shape_aux_tensors(
     host_function: HostFunction,
 ) -> tuple[torch.Tensor, ...]:
-    """The exact-shape rank-2 auxiliary host tensors of the analyzed stores.
+    """The auxiliary host tensors the staged aux modes bulk-load.
 
-    The operands the staged aux modes bulk-load
+    The operands ``stages_through_smem_ring`` admits
     (``Tcgen05DeviceState.c_input_aux_tensor_descriptors``: a non-broadcast
-    rank-2 leaf of a tcgen05 store chain), each host tensor once; the
-    bind-time aux TMA proof (``cute_mma.host_function_exact_aux_tma_provable``)
-    runs over them.
+    rank-2 leaf of a tcgen05 store chain that is not a boolean mask), each
+    host tensor once; the bind-time aux TMA proof
+    (``cute_mma.host_function_exact_aux_tma_provable``) runs over them.
     """
     graphs = host_function.device_ir.graphs
     tensors: dict[int, torch.Tensor] = {}
@@ -413,10 +433,8 @@ def host_function_tcgen05_exact_shape_aux_tensors(
             continue
         for _store_node, chain in analyzed_stores:
             for leaf in chain.auxiliary_tensor_loads:
-                if leaf.broadcast_axis is not None:
-                    continue
                 host_tensor = _step_host_tensor(leaf)[1]
-                if host_tensor.ndim == 2:
+                if stages_through_smem_ring(leaf.broadcast_axis, host_tensor):
                     tensors.setdefault(id(host_tensor), host_tensor)
     return tuple(tensors.values())
 

@@ -37,6 +37,7 @@ from helion._compiler.cute.tcgen05_schedule_facts import (
 from helion._compiler.cute.tcgen05_schedule_facts import prove_full_tile_schedule_facts
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_codegen import full_and_edge_store_bodies
 from helion._testing.cute_dense_tcgen05 import atomic_output_mm
 from helion._testing.cute_dense_tcgen05 import bias_mm_into
 from helion._testing.cute_dense_tcgen05 import blackwell_capability
@@ -44,6 +45,7 @@ from helion._testing.cute_dense_tcgen05 import cpu_codegen_target
 from helion._testing.cute_dense_tcgen05 import extra_store_mm
 from helion._testing.cute_dense_tcgen05 import plain_mm
 from helion._testing.cute_dense_tcgen05 import plain_mm_into
+from helion._testing.cute_dense_tcgen05 import promoted_bias_mm_into
 from helion._testing.cute_dense_tcgen05 import scaled_args
 from helion._testing.cute_dense_tcgen05 import scaled_mm
 from helion._testing.cute_dense_tcgen05 import user_bound_mm
@@ -642,39 +644,82 @@ def test_default_tile_mn_major_b_skips_widths_off_whole_swizzle_rows() -> None:
 
 
 @pytest.mark.parametrize(
-    ("n", "placement", "tma_store"),
+    ("shape", "placement", "ab_stages", "staged", "tma_store"),
     (
         # 32 x 38 pair tiles: 17 per CTA pair
-        (9536, "post_acc_wait", True),
+        ((8192, 9536, 768), "post_acc_wait", 6, False, True),
         # 32 x 9: 4 per pair
-        (2112, "pre_acc_wait", False),
+        ((8192, 2112, 768), "pre_acc_wait", 6, False, False),
+        # 26 tiles per pair, two K tiles: the staged row beside the TMA store
+        ((4096, 30000, 128), "pre_acc_wait", 5, True, True),
+        # 6 tiles per pair, two K tiles
+        ((32768, 576, 128), "pre_acc_wait", 6, False, False),
     ),
 )
 def test_default_tile_bias_row_takes_the_tma_store_on_many_tiles(
-    n: int, placement: str, tma_store: bool
+    shape: tuple[int, int, int],
+    placement: str,
+    ab_stages: int,
+    staged: bool,
+    tma_store: bool,
 ) -> None:
-    """On an output edge, a ``pre_acc_wait`` bias row keeps every tile on the
-    SIMT store; from 16 tiles per CTA pair on the default takes
-    ``post_acc_wait``, which stores the full tiles through TMA (16384x30528x768
-    + bias: 0.63 -> 0.92 of cuBLAS; 32768x576x192, 6 tiles per pair, runs
-    0.50 on the SIMT store and 0.29 on TMA)."""
+    """On an output edge, a ``pre_acc_wait`` bias row at the seed's ring keeps
+    every tile on the SIMT store. From 16 tiles per CTA pair on the default
+    takes the TMA store: ``post_acc_wait`` (16384x30528x768 + bias: 0.63 ->
+    0.92 of cuBLAS; 32768x576x192, 6 tiles per pair, runs 0.50 on the SIMT
+    store and 0.29 on TMA), or, with at most two K tiles per output tile, a
+    ``pre_acc_wait`` ring one AB stage shallower that stages the promoted row
+    beside it (4096x30000x128 + bias: 136 -> 98 us on B200)."""
+    m, n, k = shape
     with patch(
         "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
         return_value=148,
     ):
         bound = bias_mm_into._bind_isolated(
             (
-                torch.empty((8192, 768), dtype=torch.bfloat16),
-                torch.empty((768, n), dtype=torch.bfloat16),
+                torch.empty((m, k), dtype=torch.bfloat16),
+                torch.empty((k, n), dtype=torch.bfloat16),
                 torch.empty((n,), dtype=torch.bfloat16),
-                torch.empty((8192, n), dtype=torch.bfloat16),
+                torch.empty((m, n), dtype=torch.bfloat16),
             )
         )
         config = bound.config_spec.default_config()
         code = bound.to_code(config)
     assert config.block_sizes == [256, 256, 64]
     assert config.config["tcgen05_aux_load_placement"] == placement
+    assert config.config["tcgen05_ab_stages"] == ab_stages
+    assert ("tcgen05_aux_rowvec_smem" in code) == staged
     assert ("tcgen05_tma_store_atom" in code) == tma_store
+
+
+def test_hybrid_store_edge_reads_a_staged_row_from_global_memory() -> None:
+    """A ``pre_acc_wait`` row stage lives in the full-tile branch of the
+    hybrid TMA/SIMT store; the SIMT edge branch reads the row from global
+    memory instead of the stage it never allocated (``NameError`` in the DSL
+    when the edge built its view over the stage)."""
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound = promoted_bias_mm_into._bind_isolated(
+            (
+                torch.empty((4096, 128), dtype=torch.bfloat16),
+                torch.empty((128, 30000), dtype=torch.bfloat16),
+                torch.empty((30000,), dtype=torch.bfloat16),
+                torch.empty((4096, 30000), dtype=torch.bfloat16),
+            )
+        )
+        config = bound.config_spec.default_config()
+        # ab5 leaves SMEM for the C ring and the row stage: the hybrid store
+        config.config.update(
+            tcgen05_aux_load_placement="pre_acc_wait", tcgen05_ab_stages=5
+        )
+        code = bound.to_code(config)
+    full, edge = full_and_edge_store_bodies(code)
+    assert "tcgen05_tma_store_atom" in full
+    assert "make_tensor(tcgen05_aux_rowvec_smem_0.iterator" in full
+    assert "tcgen05_aux_rowvec_smem" not in edge
+    assert "make_tensor(bias.iterator" in edge
 
 
 def _k_tail_bind(m: int, n: int, k: int) -> BoundKernel:
