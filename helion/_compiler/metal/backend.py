@@ -18,13 +18,16 @@ from ..backend import AutotuneGridPolicy
 from ..backend import Backend
 from ..backend import BackendState
 from ..backend import DeviceIRStage
-from ..backend import _largest_divisor_at_most
+from ..backend import largest_divisor_at_most
 from ._constants import MAX_THREAD_AXES
 from ._constants import MAX_THREADS_PER_THREADGROUP
 from ._constants import SIMD_WIDTH
 from .msl_expr import PURE_CALLS
 from .msl_expr import cast_source
 from .msl_expr import parse_msl_expression
+from .thread_counts import requested_threads
+from .thread_counts import serialize_auto_threads
+from .thread_counts import shrink_tile_threads
 
 if TYPE_CHECKING:
     import ast
@@ -1105,6 +1108,7 @@ class MetalBackend(Backend):
         )
         self._thread_budget = threadgroup_budget(config)
         self._num_warps = int(config.num_warps)
+        config = self._config_with_threads_within_blocks(config)
         # Cap tile thread counts so the reduction axes and free hl.arange axes
         # still fit alongside them.
         config = self._config_with_reduction_thread_budget(fn, block_ids, config)
@@ -1195,6 +1199,27 @@ class MetalBackend(Backend):
 
         return Config.from_dict({**config.config, "num_threads": num_threads})
 
+    def _config_with_threads_within_blocks(self, config: Config) -> Config:
+        """Cap every tile's explicit ``num_threads`` at its block, which is
+        what such a tile launches, so the passes below and the shared
+        planner count each tile at its threads: counting ``[1, 32, 0]`` over
+        ``[16, 16, 16]`` at 32 left the nested K tile one thread, and the
+        launch 16 threads."""
+        from ..compile_environment import CompileEnvironment
+
+        env = CompileEnvironment.current()
+        spec = env.config_spec.num_threads
+        num_threads = self._mutable_num_threads(config)
+        changed = False
+        for block_id in spec.valid_block_ids():
+            size = env.block_sizes[block_id].from_config(config)
+            if (
+                isinstance(size, int)
+                and num_threads[spec.block_id_to_index(block_id)] > size
+            ):
+                changed |= self._record_thread_count(env, num_threads, block_id, size)
+        return self._finalize_thread_config(config, num_threads, changed)
+
     def _config_with_divisible_thread_counts(
         self, block_ids: list[int], config: Config
     ) -> Config:
@@ -1222,7 +1247,7 @@ class MetalBackend(Backend):
             block_size = env.block_sizes[block_id].from_config(config)
             if not isinstance(block_size, int) or block_size % configured == 0:
                 continue
-            chosen = _largest_divisor_at_most(block_size, configured)
+            chosen = largest_divisor_at_most(block_size, configured)
             if self._record_thread_count(env, num_threads, block_id, chosen):
                 changed = True
         return self._finalize_thread_config(config, num_threads, changed)
@@ -1340,11 +1365,9 @@ class MetalBackend(Backend):
             configured = int(
                 env.config_spec.num_threads.config_get(config.num_threads, block_id, 0)
             )
-            # 0 means "use the block size"; anything larger than the block size
-            # is capped there because the axis has no more work than that.
-            requested = min(configured, axis_size) if configured > 0 else axis_size
+            requested = requested_threads(axis_size, configured)
             budget_left = max(1, budget // max(1, used))
-            chosen = _largest_divisor_at_most(axis_size, min(requested, budget_left))
+            chosen = largest_divisor_at_most(axis_size, min(requested, budget_left))
             used *= chosen
             if configured == 0 and chosen >= axis_size:
                 continue  # leave the auto sentinel alone
@@ -1391,29 +1414,30 @@ class MetalBackend(Backend):
         device_ir = HostFunction.current().device_ir
         grid_ids = {b for ids in device_ir.grid_block_ids for b in ids}
         after_loop = blocks_reduced_after_loop(device_ir)
-        changed = False
+        serial: list[tuple[int, int]] = []
         for block_id in block_ids:
-            if total <= budget:
-                break
             if block_id not in tunable or block_id in grid_ids:
                 continue
             if int(spec.config_get(config.num_threads, block_id, 0)) != 0:
                 continue
             size = env.block_sizes[block_id].from_config(config)
-            if not isinstance(size, int):
-                continue
-            # The tile pass may already have given the block fewer threads
-            # than its size; that count is its share of ``total``.
-            current = num_threads[spec.block_id_to_index(block_id)] or size
-            rest = total // current
-            if block_id in after_loop:
-                chosen = 1
-            else:
-                chosen = _largest_divisor_at_most(
-                    size, min(current, max(1, budget // rest))
-                )
-            total = rest * chosen
-            changed |= self._record_thread_count(env, num_threads, block_id, chosen)
+            if isinstance(size, int):
+                serial.append((block_id, size))
+        # The tile pass may already have given a block fewer threads than its
+        # size; that count is its share of ``total``.
+        current = [num_threads[spec.block_id_to_index(b)] or size for b, size in serial]
+        chosen, total = serialize_auto_threads(
+            [size for _, size in serial],
+            current,
+            range(len(serial)),
+            total,
+            budget,
+            to_one={i for i, (b, _) in enumerate(serial) if b in after_loop},
+        )
+        changed = False
+        for (block_id, _), was, count in zip(serial, current, chosen, strict=True):
+            if count != was:
+                changed |= self._record_thread_count(env, num_threads, block_id, count)
         literal = math.prod(
             size
             for block_id in block_ids
@@ -1449,23 +1473,17 @@ class MetalBackend(Backend):
             configured = int(
                 env.config_spec.num_threads.config_get(config.num_threads, block_id, 0)
             )
-            requested = min(configured, axis_size) if configured > 0 else axis_size
-            counts[block_id] = (axis_size, requested)
-        threads = {b: r for b, (_, r) in counts.items()}
+            counts[block_id] = (axis_size, requested_threads(axis_size, configured))
         after_loop = blocks_reduced_after_loop(HostFunction.current().device_ir)
-        while fixed * math.prod(threads.values()) > budget:
-            block_id = max(threads, key=lambda b: threads[b], default=None)
-            if block_id is None or threads[block_id] <= 1:
-                break
-            # A tile reduced after its loop needs one element per thread or
-            # one thread (``MetalBlockReductionStrategy``).
-            threads[block_id] = (
-                1
-                if block_id in after_loop
-                else _largest_divisor_at_most(
-                    counts[block_id][0], threads[block_id] - 1
-                )
-            )
+        ids = list(counts)
+        shrunk = shrink_tile_threads(
+            [counts[b][0] for b in ids],
+            [counts[b][1] for b in ids],
+            budget,
+            fixed=fixed,
+            to_one={i for i, b in enumerate(ids) if b in after_loop},
+        )
+        threads = dict(zip(ids, shrunk, strict=True))
         changed = False
         for block_id, chosen in threads.items():
             if chosen == counts[block_id][1]:

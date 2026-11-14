@@ -118,7 +118,7 @@ def free_block_threads(config: Config) -> dict[int, tuple[int, int]]:
     (``threadgroup_budget``): a block's ``num_threads`` is taken first, and
     blocks left on auto (0) get their size, shrunk largest first as the shared
     planner shrinks auto tiles, until the product fits; lanes walk the rest."""
-    from ..backend import _largest_divisor_at_most
+    from ..backend import largest_divisor_at_most
     from .backend import threadgroup_budget
 
     env = CompileEnvironment.current()
@@ -133,7 +133,7 @@ def free_block_threads(config: Config) -> dict[int, tuple[int, int]]:
             env.config_spec.num_threads.config_get(config.num_threads, block_id, 0)
         )
         if configured > 0:
-            threads[block_id] = _largest_divisor_at_most(
+            threads[block_id] = largest_divisor_at_most(
                 size, min(configured, size, max(1, budget // used))
             )
             used *= threads[block_id]
@@ -144,7 +144,7 @@ def free_block_threads(config: Config) -> dict[int, tuple[int, int]]:
         block_id = max(auto, key=lambda b: threads[b])
         if threads[block_id] <= 1:
             break
-        threads[block_id] = _largest_divisor_at_most(
+        threads[block_id] = largest_divisor_at_most(
             sizes[block_id], threads[block_id] - 1
         )
     return {b: (t, sizes[b] // t) for b, t in threads.items()}

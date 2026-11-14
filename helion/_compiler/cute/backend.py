@@ -48,7 +48,7 @@ from ..ast_extension import statement_from_string
 from ..backend import Backend
 from ..backend import BackendState
 from ..backend import DeviceIRStage
-from ..backend import _largest_divisor_at_most
+from ..backend import largest_divisor_at_most
 from ..backend import log
 from .analysis.attention_match import _attention_flash_gate_enabled
 from .analysis.attention_match import _attention_flash_supported
@@ -631,7 +631,7 @@ def _specialized_mma_root_thread_layout(
             if not root_thread_auto[idx]:
                 continue
             other_threads = root_thread_counts[1 - idx]
-            next_threads = _largest_divisor_at_most(
+            next_threads = largest_divisor_at_most(
                 root_block_sizes[idx], max(1024 // max(other_threads, 1), 1)
             )
             root_thread_counts[idx] = next_threads

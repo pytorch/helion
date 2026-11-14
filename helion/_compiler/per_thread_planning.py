@@ -32,8 +32,8 @@ import torch
 
 from .. import exc
 from .backend import _active_loop_block_ids
-from .backend import _largest_divisor_at_most
 from .backend import _loop_contains_matmul
+from .backend import largest_divisor_at_most
 
 # ``matmul_utils`` (the matmul operand facts) is imported at call time: this
 # module loads while ``compile_environment`` is still initializing.
@@ -613,7 +613,7 @@ def plan_per_thread_loop_strategy(
                 break
             block_idx = int_positions[shrink_idx]
             block_size = int_block_sizes[block_idx]
-            next_threads = _largest_divisor_at_most(
+            next_threads = largest_divisor_at_most(
                 block_size, resolved_threads[shrink_idx] - 1
             )
             if next_threads == resolved_threads[shrink_idx]:
@@ -876,7 +876,7 @@ def plan_per_thread_loop_strategy(
             per_axis_limit = free_budget
             while per_axis_limit > 1 and per_axis_limit**free_axes > free_budget:
                 per_axis_limit //= 2
-            flat_num_threads = _largest_divisor_at_most(
+            flat_num_threads = largest_divisor_at_most(
                 block_size, min(flat_num_threads, per_axis_limit)
             )
     if isinstance(block_size, int) and flat_num_threads > 0:
