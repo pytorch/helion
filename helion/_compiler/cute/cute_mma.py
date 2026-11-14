@@ -163,12 +163,12 @@ from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_EPI_TMA
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_SIMT
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
-from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
 from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_DEFAULT
 from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_VALIDATION_CHOICES
 from .tcgen05_constants import TCGEN05_AUX_STAGES_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_TMA_ILLEGAL_TENSOR_REASON
+from .tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_C_STORE_MODE_DIRECT
 from .tcgen05_constants import TCGEN05_C_STORE_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_CLC_QUERY_PACING_TILE
@@ -216,6 +216,7 @@ from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_NS
 from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_N
 from .tcgen05_constants import TCGEN05_RADIX_STORE_BOX_M
 from .tcgen05_constants import TCGEN05_RADIX_STORE_BOX_N
+from .tcgen05_constants import TCGEN05_ROW_LOOKAHEAD_SLOTS
 from .tcgen05_constants import TCGEN05_SPLIT_K_BARRIER_ID
 from .tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
@@ -1351,6 +1352,47 @@ def _tcgen05_mma_output_tma_store_provable(
         )
         for store in stores
     )
+
+
+def host_function_matmul_output_matches_extents(
+    env: CompileEnvironment, host_function: HostFunction
+) -> bool:
+    """Whether every store an MMA's accumulator reaches targets a tensor of
+    exactly the GEMM's static (M, N) extents.
+
+    Gates the persistent one-CTA N-edge tiles (``one_cta_n_edge_tiles``),
+    measured on exact-shape outputs only. (A larger rank-2 destination's
+    edge stores, row- or column-major, stop at the GEMM's extents,
+    ``store_epilogue._destination_gemm_extents``.)
+    """
+    device_ir = host_function.device_ir
+    with _host_function_tma_proof_scope(env, host_function):
+        for graph_info in device_ir.graphs:
+            for node in graph_info.graph.nodes:
+                candidate = analyze_cute_mma_node(node, device_ir=device_ir)
+                if candidate is None:
+                    continue
+                stores = _trace_mma_to_stores(node, device_ir.graphs)
+                if stores is None:
+                    return False
+                extents = (
+                    candidate.operands.lhs.matrix_rows,
+                    candidate.operands.rhs.matrix_cols,
+                )
+                for store in stores:
+                    tensor_node = store.args[0] if store.args else None
+                    tensor = (
+                        tensor_node.meta.get("val")
+                        if isinstance(tensor_node, Node)
+                        else None
+                    )
+                    if (
+                        not isinstance(tensor, torch.Tensor)
+                        or tensor.ndim < 2
+                        or tuple(tensor.shape[-2:]) != extents
+                    ):
+                        return False
+    return True
 
 
 def host_function_matmul_operands_tma_provable(
@@ -7944,6 +7986,7 @@ class Tcgen05PipelinePlan:
     tcgen05_runtime_n_specialization: bool
     tcgen05_runtime_mma_n: str | None
     tcgen05_runtime_instr_desc: str | None
+    tcgen05_simt_aux_partial_output: bool
 
     def tma_store_full_tiles_only_for(self, partial_output_tma_store: bool) -> bool:
         return _tma_store_full_tiles_only_for(
@@ -9581,12 +9624,50 @@ def plan_tcgen05_pipeline(
     # not role-local edge-TMA input loading. The mixed full-tile TMA-store plus
     # edge SIMT-store epilogue is validated for CtaGroup.TWO; enabling its
     # conditional store-pipeline state and tile counters for one CTA currently
-    # produces IR that NVVM rejects. One-CTA N-edge kernels therefore keep the
-    # predicated SIMT epilogue for every tile. This is an implementation
-    # boundary, not a tcgen05 hardware requirement.
+    # produces IR that NVVM rejects. This is an implementation boundary, not a
+    # tcgen05 hardware requirement. One CTA takes the edge TMA store only on
+    # the partial-output body (every tile through TMA, no conditional store
+    # state: ``tcgen05_partial_output_tma_store`` below), which register
+    # auxiliary loads take; other one-CTA N-edge kernels keep the predicated
+    # SIMT epilogue for every tile, which writes one 16-bit element per thread
+    # and instruction. 25216x576x192 + bias on persistent 128x256 tiles: 29.9
+    # us on the SIMT store (ab=4, whose ring leaves no room for the TMA
+    # store), 12.6 on the TMA store at ab=3 (cuBLAS: 12.5, a 192x128 one-CTA
+    # tile).
+    # Whether register auxiliary loads take the partial-output body; the
+    # partial-output decision below reads the same value, so the one-CTA
+    # admission and that body cannot disagree.
+    # (A column-major output with auxiliary operands keeps the split: there
+    # the staged and guarded auxiliary reads keep the R2S partition's register
+    # layout, not the accumulator's, and CuTe refuses their sum; a plain
+    # column-major output takes the body.)
+    tcgen05_simt_aux_partial_output = smem.simt_aux_partial_output_fits(
+        env.config_spec._cute_tcgen05_config,
+        df.config.config,
+        bm=tcgen05_source_bm,
+        bn=tcgen05_source_bn,
+        bk=bk,
+        cluster_m=tcgen05_cluster_m,
+        ab_stages=tcgen05_ab_stage_count_value,
+        c_stages=tcgen05_c_stage_count_value,
+        output_column_major=output_column_major,
+    )
+    tcgen05_one_cta_n_edge_tma_store = (
+        not tcgen05_is_two_cta
+        # the 16-bit family the search keeps persistent (FP8 one-CTA N-edge
+        # configs keep their SIMT edge store)
+        and input_dtype in (torch.float16, torch.bfloat16)
+        # At 64 rows the partial-output body's register auxiliary fragment
+        # does not match the accumulator's layout (``one_cta_n_edge_tiles``).
+        and bm == TCGEN05_ONE_CTA_MAX_BLOCK_M
+        and tcgen05_role_local_n_edge_tma
+        and n_size >= bn
+        and tcgen05_simt_aux_partial_output
+    )
     tcgen05_use_output_edge_tma_store_for_full_tiles = (
         tcgen05_role_local_m_edge_tma
         or (tcgen05_role_local_n_edge_tma and tcgen05_is_two_cta and n_size >= bn)
+        or tcgen05_one_cta_n_edge_tma_store
         or tcgen05_role_local_double_edge_tma
     ) and tcgen05_output_edge_tma_store_fits_smem
     store_outer_extent = bn if output_column_major else bm
@@ -11181,6 +11262,7 @@ def plan_tcgen05_pipeline(
         else None
     )
     return Tcgen05PipelinePlan(
+        tcgen05_simt_aux_partial_output=tcgen05_simt_aux_partial_output,
         candidate=candidate,
         output_column_major=output_column_major,
         knobs=knobs,
@@ -12613,30 +12695,9 @@ def _emit_mma_pipeline(
         # 9% longer and set the kernel's time (1.34 vs 1.46M cycles).
         # ``pre_acc_wait`` keeps the split (its per-subtile loads precede the
         # accumulator wait, which the partial-output body refuses), as does a
-        # row stage the SMEM arena cannot hold, and a column-major output:
-        # there the staged and guarded auxiliary reads keep the R2S
-        # partition's register layout, not the accumulator's, and CuTe
-        # refuses their sum ("profile of input tuples doesn't match").
-        tcgen05_simt_aux_partial_output = (
-            not plan.output_column_major
-            and df.config.get(
-                TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, TCGEN05_AUX_LOAD_MODE_SIMT
-            )
-            == TCGEN05_AUX_LOAD_MODE_SIMT
-            and df.config.get(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY)
-            != TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
-            and tcgen05_warp_spec.c_input_warps == 0
-            and smem.partial_output_row_stage_fits(
-                env.config_spec._cute_tcgen05_config,
-                df.config.config,
-                bm=plan.tcgen05_source_bm,
-                bn=plan.tcgen05_source_bn,
-                bk=plan.bk,
-                cluster_m=plan.tcgen05_cluster_m,
-                ab_stages=plan.tcgen05_ab_stage_count_value,
-                c_stages=plan.tcgen05_c_stage_count_value,
-            )
-        )
+        # row stage the SMEM arena cannot hold, and a column-major output
+        # with auxiliary loads (``tcgen05_simt_aux_partial_output``, planned
+        # in ``plan_tcgen05_pipeline``).
         tcgen05_partial_output_tma_store = (
             plan.tcgen05_use_tma_store_epilogue
             and plan.tcgen05_use_output_edge_tma_store_for_full_tiles
@@ -12647,7 +12708,7 @@ def _emit_mma_pipeline(
                     and aux_tma_productive_body_gate_open
                 )
                 or not aux_tensor_descriptors_value
-                or tcgen05_simt_aux_partial_output
+                or plan.tcgen05_simt_aux_partial_output
             )
         )
         tcgen05_tma_store_full_tiles_only = plan.tma_store_full_tiles_only_for(
@@ -16863,6 +16924,40 @@ def _emit_mma_pipeline(
                     orelse=[],
                 )
             )
+        # The partial-output store's staged rows load one tile ahead on the
+        # plain static role-local walk (``scheduler_pids``'
+        # ``_tcgen05_row_lookahead_stmts``), where the arena holds a second
+        # slot of each row; elsewhere each tile copies its rows itself.
+        tcgen05_partial_output_row_lookahead = (
+            tcgen05_partial_output_tma_store
+            and plan.tcgen05_use_role_local_epi
+            and bool(tma_store_role_tile_counter)
+            and plan.tcgen05_pid_is_persistent
+            and not tcgen05_matmul_plan.one_shot_role_scheduler
+            and not tcgen05_matmul_plan.is_clc_persistent
+            and tcgen05_matmul_plan.grouped is None
+            and tcgen05_matmul_plan.row_union is None
+            and tcgen05_matmul_plan.scheduler_warp_count == 0
+            and tcgen05_matmul_plan.c_input_warp_count == 0
+            and tcgen05_matmul_plan.store_warp_count == 0
+            and tcgen05_epi_warp_groups_value == 1
+            and segment_store_node is None
+            and df.config.get(
+                TCGEN05_C_STORE_MODE_CONFIG_KEY, TCGEN05_C_STORE_MODE_NORMAL
+            )
+            == TCGEN05_C_STORE_MODE_NORMAL
+            and smem.partial_output_row_stage_fits(
+                env.config_spec._cute_tcgen05_config,
+                df.config.config,
+                bm=plan.tcgen05_source_bm,
+                bn=plan.tcgen05_source_bn,
+                bk=plan.bk,
+                cluster_m=plan.tcgen05_cluster_m,
+                ab_stages=plan.tcgen05_ab_stage_count_value,
+                c_stages=plan.tcgen05_c_stage_count_value,
+                slots=TCGEN05_ROW_LOOKAHEAD_SLOTS,
+            )
+        )
         df.cute_state.register_tcgen05_store_value(
             result_var,
             CuteTcgen05StoreValue(
@@ -16900,6 +16995,7 @@ def _emit_mma_pipeline(
                 use_tma_store_epilogue=plan.tcgen05_use_tma_store_epilogue,
                 tma_store_full_tiles_only=tcgen05_tma_store_full_tiles_only,
                 partial_output_tma_store=tcgen05_partial_output_tma_store,
+                partial_output_row_lookahead=tcgen05_partial_output_row_lookahead,
                 # Mirror the value passed to `_make_tcgen05_layout_plan_setup`
                 # above; the store path compares this against `target_dtype`
                 # to enforce the kernel/store equality contract on

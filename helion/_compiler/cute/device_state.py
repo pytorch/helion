@@ -27,6 +27,7 @@ from .state import CuteTcgen05State
 
 if TYPE_CHECKING:
     import ast
+    from collections.abc import Callable
     from collections.abc import Sequence
 
     import torch
@@ -325,6 +326,9 @@ class CuteTcgen05StoreValue(_CuteTcgen05OrientationMixin):
     use_tma_store_epilogue: bool = False
     tma_store_full_tiles_only: bool = False
     partial_output_tma_store: bool = False
+    # The partial-output store's staged rows load one tile ahead
+    # (``cute_mma``'s ``tcgen05_partial_output_row_lookahead``).
+    partial_output_row_lookahead: bool = False
     # Output element dtype (cutlass type string, e.g. "cutlass.BFloat16")
     # used when computing the tcgen05 epilogue tile.
     epi_elem_dtype_str: str = ""
@@ -626,6 +630,25 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
             assert self.flat_role_launch_warp_count >= self.role_warp_count
             return (self.physical_m_threads * self.flat_role_launch_warp_count, 1, 1)
         return (self.physical_m_threads, self.launched_warp_count, 1)
+
+
+@dataclasses.dataclass(frozen=True)
+class Tcgen05EpiRowPrefetch:
+    """A staged row-vector operand the epilogue role loads one tile ahead.
+
+    ``program_id``'s static role-local while renders ``issue(translate,
+    slot, suffix)`` ahead of its loop for the role's first tile and at the
+    top of every iteration for the next one, on a lookahead copy of the
+    role's tile scheduler: ``translate`` maps each of ``coordinates`` (the
+    store lowering's expressions over the current tile's coordinates) onto
+    the lookahead tile's, ``slot`` is the SMEM row slot the asynchronous copy
+    fills and ``suffix`` keeps the two renderings' locals apart. The store
+    lowering then waits for the current tile's copy (``cp.async.wait_group
+    1``) where it used to copy the row synchronously.
+    """
+
+    coordinates: tuple[str, ...]
+    issue: Callable[[Callable[[str], str], str, str], str]
 
 
 @dataclasses.dataclass(frozen=True)

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from typing import TYPE_CHECKING
+from typing import cast
 from unittest.mock import patch
 
 import pytest
@@ -36,6 +37,7 @@ from helion._compiler.cute.tcgen05_schedule_facts import (
 )
 from helion._compiler.cute.tcgen05_schedule_facts import prove_full_tile_schedule_facts
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_aux import rank_two_aux
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import full_and_edge_store_bodies
 from helion._testing.cute_dense_tcgen05 import atomic_output_mm
@@ -46,6 +48,7 @@ from helion._testing.cute_dense_tcgen05 import extra_store_mm
 from helion._testing.cute_dense_tcgen05 import plain_mm
 from helion._testing.cute_dense_tcgen05 import plain_mm_into
 from helion._testing.cute_dense_tcgen05 import promoted_bias_mm_into
+from helion._testing.cute_dense_tcgen05 import scale_bias_mm_into
 from helion._testing.cute_dense_tcgen05 import scaled_args
 from helion._testing.cute_dense_tcgen05 import scaled_mm
 from helion._testing.cute_dense_tcgen05 import user_bound_mm
@@ -408,8 +411,9 @@ def _k_block_max(bound: BoundKernel) -> int:
 def test_output_edge_admits_two_cta_pairs_and_flattens_one_cta_partial_tiles() -> None:
     """Ragged M, whole K: persistent and CtaGroup.TWO search on 64-deep K tiles.
 
-    One-CTA persistent kernels run whole tiles only (the host multi-tile
-    guard), so the search flattens their partial-tile samples while the
+    One-CTA persistent kernels do not run ragged-M tiles (the host
+    multi-tile guard; only N-edge tiles take the one-CTA partial-output
+    store), so the search flattens their partial-tile samples while the
     two-CTA pairs keep their persistent schedule.
     """
     bound = _plain_bind(1000, 4096, 2880)
@@ -702,36 +706,28 @@ def test_rows_past_the_arena_keep_the_split_store() -> None:
 
 
 @pytest.mark.parametrize(
-    ("shape", "placement", "ab_stages", "staged", "tma_store", "simt_store"),
+    "shape",
     (
-        # 32 x 38 pair tiles: 17 per CTA pair; every tile takes the TMA store
-        # (the N=9536 tiles end 64 columns short), the row staged through a
-        # predicated copy
-        ((8192, 9536, 768), "post_acc_wait", 6, True, True, False),
+        # 32 x 38 pair tiles: 17 per CTA pair
+        (8192, 9536, 768),
         # 32 x 9: 4 per pair
-        ((8192, 2112, 768), "pre_acc_wait", 6, False, False, True),
-        # 26 tiles per pair, two K tiles: the staged row beside the full
-        # tiles' TMA store
-        ((4096, 30000, 128), "pre_acc_wait", 5, True, True, True),
+        (8192, 2112, 768),
+        # 26 tiles per pair, two K tiles (once the staged row beside the
+        # hybrid store)
+        (4096, 30000, 128),
         # 6 tiles per pair, two K tiles
-        ((32768, 576, 128), "pre_acc_wait", 6, False, False, True),
+        (32768, 576, 128),
     ),
 )
-def test_default_tile_bias_row_takes_the_tma_store_on_many_tiles(
+def test_default_tile_output_edge_bias_takes_the_partial_output_store(
     shape: tuple[int, int, int],
-    placement: str,
-    ab_stages: int,
-    staged: bool,
-    tma_store: bool,
-    simt_store: bool,
 ) -> None:
-    """On an output edge, a ``pre_acc_wait`` bias row at the seed's ring keeps
-    every tile on the SIMT store. From 16 tiles per CTA pair on the default
-    takes the TMA store: ``post_acc_wait`` (16384x30528x768 + bias: 0.63 ->
-    0.92 of cuBLAS; 32768x576x192, 6 tiles per pair, runs 0.50 on the SIMT
-    store and 0.29 on TMA), or, with at most two K tiles per output tile, a
-    ``pre_acc_wait`` ring one AB stage shallower that stages the promoted row
-    beside it (4096x30000x128 + bias: 136 -> 98 us on B200)."""
+    """An output-edge bias default stores every tile through TMA at any tile
+    count (``post_acc_wait`` at the seed's ring, the row staged per tile,
+    one tile ahead, through a predicated copy) instead of keeping fringe
+    tiles, or every tile, on the SIMT store: Inductor corpus + bias on B200,
+    of the ATen GEMM, 32768x576x192 0.50 -> 1.02, 25216x2304x768 0.69 ->
+    1.02, 4096x30000x128 0.79 -> 0.90 (1.06 with the row one tile ahead)."""
     m, n, k = shape
     with patch(
         "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
@@ -748,19 +744,228 @@ def test_default_tile_bias_row_takes_the_tma_store_on_many_tiles(
         config = bound.config_spec.default_config()
         code = bound.to_code(config)
     assert config.block_sizes == [256, 256, 64]
-    assert config.config["tcgen05_aux_load_placement"] == placement
-    assert config.config["tcgen05_ab_stages"] == ab_stages
-    assert ("tcgen05_aux_rowvec_smem" in code) == staged
-    assert ("tcgen05_tma_store_atom" in code) == tma_store
-    assert ("cute.nvgpu.CopyR2GOp()" in code) == simt_store
+    assert config.config["tcgen05_aux_load_placement"] == "post_acc_wait"
+    assert config.config["tcgen05_ab_stages"] == 6
+    assert "pred=tcgen05_aux_rowvec_smem_0_pf_pred_row_lookahead)" in code
+    assert "tcgen05_tma_store_atom" in code
+    assert "cute.nvgpu.CopyR2GOp()" not in code
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _three_row_mm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    r0: torch.Tensor,
+    r1: torch.Tensor,
+    r2: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """``acc`` plus three unpromoted BF16 rows."""
+    m, k = a.shape
+    n = b.shape[1]
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        acc = acc + r0[cols] + r1[cols] + r2[cols]
+        out[rows, cols] = acc.to(out.dtype)
+
+
+def test_rows_without_a_second_slot_keep_the_synchronous_copy() -> None:
+    """Three BF16 rows fit beside a 256x256 ab=6 pair in one slot each (1.5
+    KiB of stages: every tile stays on the partial-output TMA store) but not
+    in the two slots of the one-tile-ahead copy (3 KiB), so the epilogue
+    copies them at the top of each tile instead."""
+    m, n, k = 8192, 9536, 768
+    row = torch.empty((n,), dtype=torch.bfloat16)
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound = _three_row_mm._bind_isolated(
+            (
+                torch.empty((m, k), dtype=torch.bfloat16),
+                torch.empty((k, n), dtype=torch.bfloat16),
+                row,
+                row,
+                row,
+                torch.empty((m, n), dtype=torch.bfloat16),
+            )
+        )
+        config = bound.config_spec.default_config()
+        values = config.config
+        bm, bn, bk = cast("list[int]", values["block_sizes"])
+        fits = [
+            smem.partial_output_row_stage_fits(
+                bound.config_spec._cute_tcgen05_config,
+                values,
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                cluster_m=cast("int", values["tcgen05_cluster_m"]),
+                ab_stages=cast("int", values["tcgen05_ab_stages"]),
+                c_stages=cast("int", values["tcgen05_c_stages"]),
+                slots=slots,
+            )
+            for slots in (1, 2)
+        ]
+        code = bound.to_code(config)
+    assert values["block_sizes"] == [256, 256, 64]
+    assert values["tcgen05_cluster_m"] == 2
+    assert values["tcgen05_ab_stages"] == 6
+    assert fits == [True, False]
+    assert "cute.nvgpu.CopyR2GOp()" not in code
+    assert "row_lookahead" not in code
+    assert "pred=tcgen05_aux_rowvec_pred_0" in code
+
+
+def test_partial_output_rows_load_one_tile_ahead() -> None:
+    """On the persistent partial-output store the epilogue role loads its
+    staged rows one tile ahead: a lookahead copy of its tile scheduler issues
+    the next tile's ``cp.async`` row copies (one group per tile, two rows
+    here) into the other of two SMEM slots before this tile waits for its own
+    (``cp.async.wait_group 1``); the epilogue barrier then publishes them,
+    without a fence. A flat walk (one tile per CTA) has nothing to load
+    ahead."""
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        m, n, k = 2048, 3000, 128
+        bound = scale_bias_mm_into._bind_isolated(
+            (
+                torch.empty((m, k), dtype=torch.bfloat16),
+                torch.empty((k, n), dtype=torch.bfloat16),
+                torch.empty((n,), dtype=torch.bfloat16),
+                torch.empty((n,), dtype=torch.bfloat16),
+                torch.empty((m, n), dtype=torch.bfloat16),
+            )
+        )
+        spec = bound.config_spec
+        config = spec.default_config()
+        code = bound.to_code(config)
+        flat = helion.Config(
+            **{
+                **config.config,
+                "pid_type": "flat",
+                "block_sizes": [128, 256, 64],
+                "tcgen05_cluster_m": 1,
+            }
+        )
+        spec.normalize(flat, _fix_invalid=True)
+        flat_code = bound.to_code(flat)
+    assert config.config["pid_type"] == "persistent_interleaved"
+    # two rows, each issued ahead of the loop and at the top of every tile
+    assert code.count("cute.nvgpu.cpasync.CopyG2SOp()") == 4
+    assert code.count("cute.arch.cp_async_commit_group()") == 2
+    assert code.count("cute.arch.cp_async_wait_group(1)") == 1
+    assert code.count("make_layout((2, 256), stride=(256, 1))") == 2
+    assert code.count("tcgen05_tma_store_role_tile % cutlass.Int32(2), None]") == 2
+    assert "fence_acq_rel_cta" not in code
+    assert flat.config["pid_type"] == "flat"
+    assert "row_lookahead" not in flat_code
+    assert "cp_async" not in flat_code
+
+
+def test_m_edge_without_a_reachable_pair_keeps_the_flat_search() -> None:
+    """An M ragged for every one-CTA tile height runs persistent only
+    through the CtaGroup.TWO pairs: bf16 1000x128x2880 has four pairs, under
+    the quarter-wave gate, so the search stays flat with its 128-deep K
+    tiles (no whole-K cap), and a persistent one-CTA config is repaired to
+    the flat pid type. An M of whole 128-row tiles (1152x1792x4096, 35
+    pairs) keeps the persistent one-CTA tiles, as do an M of whole 64-row
+    tiles (1088x128x2880) and an N edge over whole 64-row tiles
+    (64x9000x4096)."""
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound, whole_rows, half_rows, n_edge = (
+            plain_mm._bind_isolated(
+                (
+                    torch.empty((m, k), dtype=torch.bfloat16),
+                    torch.empty((k, n), dtype=torch.bfloat16),
+                )
+            )
+            for m, n, k in (
+                (1000, 128, 2880),
+                (1152, 1792, 4096),
+                (1088, 128, 2880),
+                (64, 9000, 4096),
+            )
+        )
+        spec = bound.config_spec
+        persistent = {
+            "block_sizes": [128, 128, 64],
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 1,
+        }
+        spec.normalize(persistent, _fix_invalid=True)
+    assert spec.allowed_pid_types == ("flat",)
+    assert persistent["pid_type"] == "flat"
+    view = facts._matmul_block_fragments(spec.tcgen05)
+    assert view is not None
+    assert view[2].high == 128
+    for other in (whole_rows, half_rows, n_edge):
+        assert "persistent_interleaved" in other.config_spec.allowed_pid_types
+
+
+@pytest.mark.parametrize("column_major", [False, True])
+def test_output_wider_than_n_stores_stop_at_the_gemm_extents(
+    column_major: bool,
+) -> None:
+    """A 640-wide output written over N = 576, row- or column-major: the
+    edge stores stop at the GEMM's (M, N), not the destination's shape,
+    whose columns past N other writers own. The TMA store's TensorMap views
+    the GEMM's extents (``d_extents``) on the pair's partial-output store
+    and on the one-CTA N-edge tiles, and the SIMT edge predicate reads N."""
+    m, n, k = 25600, 576, 192
+    args = (
+        torch.empty((m, k), dtype=torch.bfloat16),
+        torch.empty((k, n), dtype=torch.bfloat16),
+        torch.empty((640, m), dtype=torch.bfloat16).T
+        if column_major
+        else torch.empty((m, 640), dtype=torch.bfloat16),
+    )
+    pair = helion.Config(
+        block_sizes=[256, 256, 64],
+        l2_groupings=[1],
+        pid_type="persistent_interleaved",
+        tcgen05_cluster_m=2,
+        tcgen05_ab_stages=4,
+        tcgen05_acc_stages=2,
+        tcgen05_c_stages=2,
+    )
+    one_cta = helion.Config(
+        block_sizes=[128, 256, 64],
+        l2_groupings=[1],
+        pid_type="persistent_interleaved",
+        tcgen05_cluster_m=1,
+        tcgen05_ab_stages=3,
+        tcgen05_acc_stages=2,
+        tcgen05_c_stages=2,
+    )
+    flat = helion.Config(block_sizes=[128, 256, 64], l2_groupings=[1])
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound = plain_mm_into._bind_isolated(args)
+        for config in (pair, one_cta):
+            code = bound.to_code(config)
+            assert f"'d_extents': [{m}, {n}]" in code
+        code = bound.to_code(flat)
+    if not column_major:
+        assert f"cute.elem_less(_coord, ({m}, {n}))" in code
 
 
 def test_output_edge_bias_default_tile_order() -> None:
-    """An output-edge bias GEMM with many tiles per CTA pair walks groups of
-    32 M tiles over more than 32 of them. A sampled persistent tile order
-    survives the search projection; the swizzle goes back to 1 where nothing
-    runs it: on a flat walk, and under ``tcgen05_cluster_n=2``, whose edge
-    schedule refuses it."""
+    """An output-edge bias GEMM walks groups of 32 M tiles on a long N sweep
+    and of 4 on a short one (the plain raster where the group is as tall as
+    the M tiles). A sampled persistent tile order survives the search
+    projection; the swizzle goes back to 1 where nothing runs it: on a flat
+    walk, and under ``tcgen05_cluster_n=2``, whose edge schedule refuses
+    it."""
     defaults = {}
     with patch(
         "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
@@ -846,13 +1051,13 @@ def test_output_edge_bias_default_tile_order() -> None:
         )
         plain.config_spec.normalize(plain_config, _fix_invalid=True)
         plain.to_code(plain_config)
-    # 128 M tiles over 32 and 38 N tiles; 32 M tiles (groups of 32 are the
-    # plain raster); 4 tiles per pair
+    # 128 M tiles over 32 and 38 N tiles; 32 M tiles (a group of 32 is the
+    # plain raster); 9 N tiles (a short sweep) over 32 M tiles
     assert defaults == {
         (32768, 8128): ([32], 1),
         (32768, 9536): ([32], 1),
         (8192, 9536): ([1], 1),
-        (8192, 2112): ([1], 1),
+        (8192, 2112): ([4], 1),
     }
     assert sampled == {
         "persistent": ("persistent_interleaved", 1, [4], 4),
@@ -913,6 +1118,369 @@ def test_direct_entry_drops_a_staged_fp32_row() -> None:
     assert "tcgen05_aux_load_placement" not in default.config
     assert sampled.config["tcgen05_tvm_ffi_launch"] is True
     assert sampled.config.get("tcgen05_aux_load_placement") is None
+
+
+def test_one_cta_n_edge_samples_stay_persistent_on_the_tma_store() -> None:
+    """A one-CTA persistent sample whose partial tiles are N-edge tiles
+    (25216x576: 128x256 tiles end 64 columns into the third) stays
+    persistent where register auxiliary loads take the partial-output TMA
+    store, and goes flat where they do not: ``pre_acc_wait``, the ``direct``
+    store (no TMA epilogue), 64-row tiles (1024x576, where they are
+    searchable: that body does not lay out their register auxiliary
+    fragment), a column-major output (nor its auxiliary reads), and operands
+    TMA cannot load (N=580: a 1160-byte row stride)."""
+    projected = {}
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        for name, m, n, column_major, overrides in (
+            ("post", 25216, 576, False, {}),
+            ("pre", 25216, 576, False, {"tcgen05_aux_load_placement": "pre_acc_wait"}),
+            ("direct", 25216, 576, False, {"tcgen05_c_store_mode": "direct"}),
+            ("64 rows", 1024, 576, False, {"block_sizes": [64, 256, 64]}),
+            ("column-major", 25216, 576, True, {}),
+            ("no TMA", 8192, 580, False, {}),
+        ):
+            out = (
+                torch.empty((n, m), dtype=torch.bfloat16).T
+                if column_major
+                else torch.empty((m, n), dtype=torch.bfloat16)
+            )
+            bound = bias_mm_into._bind_isolated(
+                (
+                    torch.empty((m, 192), dtype=torch.bfloat16),
+                    torch.empty((192, n), dtype=torch.bfloat16),
+                    torch.empty((n,), dtype=torch.bfloat16),
+                    out,
+                )
+            )
+            spec = bound.config_spec
+            config = spec.default_config()
+            config.config.update(
+                block_sizes=[128, 256, 64],
+                pid_type="persistent_interleaved",
+                tcgen05_cluster_m=1,
+                tcgen05_ab_stages=3,
+                tcgen05_aux_load_placement="post_acc_wait",
+            )
+            config.config.update(overrides)
+            spec.normalize(config, _fix_invalid=True)
+            projected[name] = (config.config["block_sizes"], config.config["pid_type"])
+            if name == "post":
+                code = bound.to_code(config)
+    assert projected == {
+        "post": ([128, 256, 64], "persistent_interleaved"),
+        "pre": ([128, 256, 64], "flat"),
+        "direct": ([128, 256, 64], "flat"),
+        "64 rows": ([64, 256, 64], "flat"),
+        "column-major": ([128, 256, 64], "flat"),
+        "no TMA": ([128, 256, 64], "flat"),
+    }
+    assert "tcgen05_tma_store_atom" in code
+    assert "cute.nvgpu.CopyR2GOp()" not in code
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _two_output_bias_mm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor,
+    out0: torch.Tensor,
+    out1: torch.Tensor,
+) -> None:
+    """One biased accumulator stored to two outputs (no store facts)."""
+    m, k = a.shape
+    n = b.shape[1]
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        value = acc + bias[cols].to(torch.float32)
+        out0[rows, cols] = value.to(out0.dtype)
+        out1[rows, cols] = value.to(out1.dtype)
+
+
+@pytest.mark.parametrize("aux_load_mode", ("simt", "tma", "epi_tma"))
+def test_one_cta_n_edge_sample_is_judged_on_its_final_epilogue(
+    aux_load_mode: str,
+) -> None:
+    """A persistent one-CTA N-edge sample keeps its persistence through the
+    auxiliary fixups that change its load mode (a sampled ``tma`` load ends
+    on ``simt``): the partial-output store is judged on the final config, so
+    the three modes leave the same persistent kernel."""
+    m, n, k = 25216, 576, 1024
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound = rank_two_aux._bind_isolated(
+            (
+                torch.empty((m, k), dtype=torch.bfloat16),
+                torch.empty((k, n), dtype=torch.bfloat16),
+                torch.empty((m, n), dtype=torch.bfloat16),
+            )
+        )
+        values = {
+            **bound.config_spec.default_config().config,
+            "block_sizes": [128, 256, 64],
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 1,
+            "tcgen05_ab_stages": 3,
+            "tcgen05_aux_load_placement": "post_acc_wait",
+            "tcgen05_aux_load_mode": aux_load_mode,
+        }
+        bound.config_spec.normalize(values, _fix_invalid=True)
+    assert values["pid_type"] == "persistent_interleaved"
+    assert values["block_sizes"] == [128, 256, 64]
+
+
+def test_one_cta_n_edge_admission_needs_known_store_facts() -> None:
+    """Two column-major outputs of a biased accumulator leave the search no
+    store facts: their persistent one-CTA N-edge sample goes flat instead of
+    running persistent on the SIMT store codegen gives a column-major
+    auxiliary epilogue."""
+    m, n, k = 8192, 576, 192
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound = _two_output_bias_mm._bind_isolated(
+            (
+                torch.empty((m, k), dtype=torch.bfloat16),
+                torch.empty((k, n), dtype=torch.bfloat16),
+                torch.empty((n,), dtype=torch.bfloat16),
+                torch.empty((n, m), dtype=torch.bfloat16).T,
+                torch.empty((n, m), dtype=torch.bfloat16).T,
+            )
+        )
+        spec = bound.config_spec
+        config = spec.default_config()
+        config.config.update(
+            block_sizes=[128, 256, 64],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=1,
+            tcgen05_ab_stages=3,
+            tcgen05_aux_load_placement="post_acc_wait",
+        )
+        spec.normalize(config, _fix_invalid=True)
+    assert spec._cute_tcgen05_config.pipeline_smem_facts is None
+    assert config.config["pid_type"] == "flat"
+
+
+@pytest.mark.parametrize(
+    ("m", "n", "block_sizes", "ab_stages"),
+    (
+        # one row of M tiles: 394 128x128 tiles (2.66 waves of 148) over 197
+        # 128x256 ones (1.33 waves)
+        (128, 50400, [128, 128, 64], 6),
+        # two rows: the 256x256 pair keeps the MMA width
+        (256, 50400, [256, 256, 64], 6),
+        # five rows of N-edge tiles keep the 128x256 tile (the 128-wide one
+        # is a single-row candidate only)
+        (640, 9000, [128, 256, 64], 3),
+    ),
+)
+def test_decode_bias_default_tile(
+    m: int, n: int, block_sizes: list[int], ab_stages: int
+) -> None:
+    """A decode GEMM (one row of M tiles) streams B: the MMA width buys
+    nothing and the N tiles' wave quantization decides, so 128x50400x4096 +
+    bias defaults to the persistent one-CTA 128x128 tile at the deepest ring
+    (0.99 of the ATen GEMM, against 0.83 on 128x256), storing every tile
+    through TMA; more rows of M tiles keep the wider tiles."""
+    k = 4096
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound = bias_mm_into._bind_isolated(
+            (
+                torch.empty((m, k), dtype=torch.bfloat16),
+                torch.empty((k, n), dtype=torch.bfloat16),
+                torch.empty((n,), dtype=torch.bfloat16),
+                torch.empty((m, n), dtype=torch.bfloat16),
+            )
+        )
+        config = bound.config_spec.default_config()
+        code = bound.to_code(config)
+    assert config.block_sizes == block_sizes
+    assert config.config["pid_type"] == "persistent_interleaved"
+    assert config.config["tcgen05_ab_stages"] == ab_stages
+    assert "tcgen05_tma_store_atom" in code
+    assert "cute.nvgpu.CopyR2GOp()" not in code
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _bf16_residual_f32_mm(
+    a: torch.Tensor, b: torch.Tensor, residual: torch.Tensor, out: torch.Tensor
+) -> None:
+    """An FP32 output plus a bf16 exact-shape residual (no dtype match)."""
+    m, k = a.shape
+    n = b.shape[1]
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        out[rows, cols] = acc + residual[rows, cols].to(torch.float32)
+
+
+def test_one_cta_n_edge_residual_default_needs_k_tiles() -> None:
+    """An exact-shape residual bounds the 256-wide tile's epilogue on few K
+    tiles: the one-CTA 128x256 N-edge default takes it from 8 K tiles
+    (25216x576x1024 + residual: 100 us against the flat default's 260), and
+    25216x576x192 keeps the flat default (78 us against 88 at K=256)."""
+    defaults = {}
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        for k in (192, 1024):
+            bound = rank_two_aux._bind_isolated(
+                (
+                    torch.empty((25216, k), dtype=torch.bfloat16),
+                    torch.empty((k, 576), dtype=torch.bfloat16),
+                    torch.empty((25216, 576), dtype=torch.bfloat16),
+                )
+            )
+            config = bound.config_spec.default_config().config
+            defaults[k] = (config["block_sizes"], config["pid_type"])
+    assert defaults[192][1] == "flat"
+    assert defaults[1024] == ([128, 256, 64], "persistent_interleaved")
+
+
+def test_one_cta_n_edge_residual_gate_ignores_the_residual_dtype() -> None:
+    """A bf16 residual of an FP32 output bounds the 256-wide tile's epilogue
+    as much as one of the output's dtype: 25216x576x192 keeps the flat
+    default too, though the aux-TMA detector (dtype match) declines it."""
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound = _bf16_residual_f32_mm._bind_isolated(
+            (
+                torch.empty((25216, 192), dtype=torch.bfloat16),
+                torch.empty((192, 576), dtype=torch.bfloat16),
+                torch.empty((25216, 576), dtype=torch.bfloat16),
+                torch.empty((25216, 576), dtype=torch.float32),
+            )
+        )
+        state = bound.config_spec._cute_tcgen05_config
+        config = bound.config_spec.default_config().config
+    assert not state.exact_shape_aux_kernel_detected
+    assert state.exact_shape_aux_operand_detected
+    assert config["pid_type"] == "flat"
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _bmm_into(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
+    """A batched GEMM: partial tiles only on the flat one-CTA pipeline."""
+    bsz, m, k = a.shape
+    n = b.shape[2]
+    for bi, rows, cols in hl.tile((bsz, m, n), block_size=[1, None, None]):
+        acc = hl.zeros((bi, rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.baddbmm(acc, a[bi, rows, inner], b[bi, inner, cols])
+        out[bi, rows, cols] = acc.to(out.dtype)
+
+
+def test_one_cta_n_edge_default_survives_the_search_fixups() -> None:
+    """The one-CTA 128x256 N-edge default is the deepest ring the search
+    fixups keep persistent (an auxiliary edge epilogue's C ring goes to 4
+    stages: K=768 takes ab=3), a sampled deeper AB ring shortens to it
+    instead of going flat, and batched GEMMs keep their flat default (a
+    persistent batched partial tile falls back to scalar code)."""
+    bf16 = torch.bfloat16
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bias = bias_mm_into._bind_isolated(
+            (
+                torch.empty((25216, 768), dtype=bf16),
+                torch.empty((768, 576), dtype=bf16),
+                torch.empty((576,), dtype=bf16),
+                torch.empty((25216, 576), dtype=bf16),
+            )
+        )
+        bias_config = bias.config_spec.default_config()
+        bias_code = bias.to_code(bias_config)
+        sampled = helion.Config(**{**bias_config.config, "tcgen05_ab_stages": 6})
+        bias.config_spec.normalize(sampled, _fix_invalid=True)
+        batched = _bmm_into._bind_isolated(
+            (
+                torch.empty((4, 1024, 192), dtype=bf16),
+                torch.empty((4, 192, 576), dtype=bf16),
+                torch.empty((4, 1024, 576), dtype=bf16),
+            )
+        )
+        batched_config = batched.config_spec.default_config()
+    assert bias_config.config["pid_type"] == "persistent_interleaved"
+    assert bias_config.config["tcgen05_ab_stages"] == 3
+    assert sampled.config["pid_type"] == "persistent_interleaved"
+    assert sampled.config["tcgen05_ab_stages"] == 3
+    assert "tcgen05_tma_store_atom" in bias_code
+    assert "cute.nvgpu.CopyR2GOp()" not in bias_code
+    assert batched_config.config["pid_type"] == "flat"
+
+
+def test_one_k_tile_n_edge_default_runs_one_ab_stage() -> None:
+    """With one K tile the one-CTA N-edge candidate runs one AB stage, and
+    the ring fixup keeps it persistent there (bf16 25216x576x64: 8.2 us
+    persistent at ab=1, 26.9 on the flat 128x16 default)."""
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound = plain_mm_into._bind_isolated(
+            (
+                torch.empty((25216, 64), dtype=torch.bfloat16),
+                torch.empty((64, 576), dtype=torch.bfloat16),
+                torch.empty((25216, 576), dtype=torch.bfloat16),
+            )
+        )
+        config = bound.config_spec.default_config().config
+    assert config["block_sizes"] == [128, 256, 64]
+    assert config["pid_type"] == "persistent_interleaved"
+    assert config["tcgen05_ab_stages"] == 1
+
+
+def test_one_cta_n_edge_rings_are_judged_after_the_ring_fixups() -> None:
+    """The persistence of a one-CTA N-edge sample follows its final rings:
+    samples the ring fixups leave identical (a sampled C ring of 4 goes to
+    2 on this plain one-CTA tile) project to the same persistent kernel on
+    the TMA store."""
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound = plain_mm_into._bind_isolated(
+            (
+                torch.empty((25216, 768), dtype=torch.bfloat16),
+                torch.empty((768, 576), dtype=torch.bfloat16),
+                torch.empty((25216, 576), dtype=torch.bfloat16),
+            )
+        )
+        spec = bound.config_spec
+        projected = []
+        for c_stages in (4, 2):
+            config = helion.Config(
+                **{
+                    **spec.default_config().config,
+                    "block_sizes": [128, 256, 64],
+                    "pid_type": "persistent_interleaved",
+                    "tcgen05_cluster_m": 1,
+                    "tcgen05_ab_stages": 4,
+                    "tcgen05_c_stages": c_stages,
+                }
+            )
+            spec.normalize(config, _fix_invalid=True)
+            projected.append(config)
+        code = bound.to_code(projected[0])
+    assert projected[0].config == projected[1].config
+    assert projected[0].config["pid_type"] == "persistent_interleaved"
+    assert "tcgen05_tma_store_atom" in code
+    assert "cute.nvgpu.CopyR2GOp()" not in code
 
 
 def test_hybrid_store_edge_reads_a_staged_row_from_global_memory() -> None:

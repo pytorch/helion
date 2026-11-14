@@ -109,6 +109,9 @@ class CuteTcgen05Config:
         self.matmul_explicit_epi_tile_compatible: bool | None = None
         self.aux_kernel_detected: bool = False
         self.exact_shape_aux_kernel_detected: bool = False
+        # Any exact-shape operand of the output's shape, whatever its dtype
+        # (``host_function_has_tcgen05_exact_shape_aux_operand``).
+        self.exact_shape_aux_operand_detected: bool = False
         # The device program's only side effect is one tile store
         # (``split_k_exchange.host_function_has_plain_store_body``): the
         # precondition of ``tcgen05_split_k``, whose last-arriver check
@@ -148,6 +151,10 @@ class CuteTcgen05Config:
         # search surface, the seeds and the normalizer mirror the proof.
         # Decided beside ``matmul_operands_tma_provable``.
         self.exact_aux_tma_provable: bool = True
+        # Every MMA store's destination is exactly the GEMM's (M, N)
+        # (``host_function_matmul_output_matches_extents``): the persistent
+        # one-CTA N-edge tiles were measured on exact-shape outputs only.
+        self.matmul_output_matches_extents: bool = True
         self.cluster_m_search_choices: tuple[int, ...] | None = None
         self.cluster_m2_search_constraints: Tcgen05ClusterM2SearchConstraints | None = (
             None
@@ -228,7 +235,9 @@ class CuteTcgen05Config:
         self.tcgen05_min_search_n: int = 8
         # A 16-bit output-edge GEMM (ragged M or N, K whole) admitted to the
         # persistent and CtaGroup.TWO schedules; persistent cluster_m=1 runs
-        # whole tiles only, so its partial-tile samples are flattened.
+        # whole tiles, or N-edge tiles on the partial-output TMA store
+        # (``one_cta_n_edge_partial_output``), so its other partial-tile
+        # samples are flattened.
         self.output_edge_persistent_admitted: bool = False
         # Block id of the leading passthrough (batch) axis, when any.
         self.matmul_leading_block_id: int | None = None

@@ -4233,10 +4233,13 @@ def _fix_cluster_m1_persistent_search_config(
         and isinstance(bn, int)
         and isinstance(bk, int)
         and not facts._static_full_tiles(state, bm=bm, bn=bn, bk=bk)
+        and not smem.one_cta_n_edge_shape(state, bm=bm, bn=bn, bk=bk)
     ):
         # The output-edge admission's persistent schedules belong to its
-        # CtaGroup.TWO pairs; one-CTA persistent kernels run whole tiles
-        # only (the host multi-tile guard), so partial tiles go flat.
+        # CtaGroup.TWO pairs; one CTA runs persistent partial tiles only
+        # where they are N-edge tiles on the partial-output TMA store,
+        # whose epilogue and rings ``fix_search_config`` judges after the
+        # later fixups (``_fix_one_cta_n_edge_rings_search_config``).
         config["pid_type"] = "flat"
 
 
@@ -5161,6 +5164,9 @@ def _validate_diagnostic_mode(
 
 def fix_search_config(state: CuteTcgen05Config, config: dict[str, object]) -> None:
     _fix_search_config_body(state, config)
+    if smem._fix_one_cta_n_edge_rings_search_config(state, config):
+        # flattened: project it again as a flat sample
+        _fix_search_config_body(state, config)
     _drop_unproved_n_edge_cluster_n(state, config)
     # These repairs read the repaired pid type, cluster and tile, so they
     # run last, on every path of the body (its early returns included:

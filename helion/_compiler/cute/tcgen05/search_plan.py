@@ -30,6 +30,7 @@ from ..cute_warp_mma_gemm import WARP_MMA_MIN_BN
 from ..tcgen05_config import facts
 from ..tcgen05_config import surface
 from ..tcgen05_constants import RAGGED_BATCHED_MIN_BLOCK_N
+from ..tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from ..tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from ..tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from ..tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_MIN_DIM
@@ -496,11 +497,13 @@ def enable_cute_tcgen05_search(
     # 16-bit output edges (M or N not a multiple of the widest tile, K whole)
     # that the persistent schedules run: TMA zero-fills the A/B rows past the
     # extent and clips the D store. A ragged M runs only through CtaGroup.TWO
-    # pairs (persistent cluster_m=1 needs whole tiles: the host multi-tile
+    # pairs (persistent cluster_m=1 needs whole M tiles: the host multi-tile
     # guard rejects it, so those samples are flattened by
     # ``_fix_cluster_m1_persistent_search_config``), so it needs the 256-row
     # pair tile; shapes ragged in both M and N stay on the flat pipeline.
     output_edge_shape = False
+    # the K tile ceiling before an output edge's whole-K cap below
+    flat_max_search_k = max_search_k
     if static_m is not None and static_n is not None and static_k is not None:
         # The edge + K-tail CtaGroup.TWO family (``allow_edge_cluster_m2_search``
         # below also asks for a K tail): ragged in both M and N, or, for
@@ -682,6 +685,23 @@ def enable_cute_tcgen05_search(
                 allow_edge_cluster_m2_search = False
                 allow_fp8_small_grid_cluster_m2_search = False
                 allow_one_wave_cluster_m2_search = False
+    if (
+        output_edge_shape
+        and allow_whole_k_persistent_pid_types
+        and static_m is not None
+        # every one-CTA tile height: 64 and 128 rows
+        and static_m % (TCGEN05_ONE_CTA_MAX_BLOCK_M // 2) != 0
+        and not allow_cluster_m2_search
+    ):
+        # An M ragged for every one-CTA tile height runs persistent only
+        # through the CtaGroup.TWO pairs: where none is reachable (bf16
+        # 1000x128x2880: four pairs, under the quarter-wave gate) the
+        # persistent pid types and the K cap would only cost the flat
+        # pipeline its 128-deep K tiles. The admission flag stays set, so
+        # the search repair still flattens a persistent one-CTA sample
+        # (``_fix_cluster_m1_persistent_search_config``).
+        allow_whole_k_persistent_pid_types = False
+        max_search_k = flat_max_search_k
     surface.narrow_autotune_to_validated_configs(
         spec.tcgen05,
         allow_persistent_pid_types=(
