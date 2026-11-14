@@ -2012,13 +2012,95 @@ def _reuse_guard_values(body: list[ast.stmt], candidates: set[int]) -> None:
         assign(target, number)
 
 
-def _stored_names(nodes: Iterable[ast.AST]) -> set[str]:
+def _stored_names(
+    nodes: Iterable[ast.AST], renames: Mapping[str, str] | None = None
+) -> set[str]:
+    """The names ``nodes`` store (as ``renames`` maps them)."""
+    renames = renames or {}
     return {
-        node.id
+        renames.get(node.id, node.id)
         for root in nodes
         for node in ast.walk(root)
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
     }
+
+
+def _free_reads(
+    statements: Sequence[ast.stmt],
+    bound: frozenset[str] = frozenset(),
+    skipped: frozenset[int] = frozenset(),
+    renames: Mapping[str, str] | None = None,
+) -> set[str]:
+    """The names ``statements`` may read before storing them (``bound`` is
+    stored on entry): a name stored on only some paths (one side of a branch,
+    a loop body) may still be read from before.  The bodies of the ``If``
+    nodes in ``skipped`` (by id) count as empty.  ``renames`` maps each name to
+    the one it will be emitted as: a value both branches of an ``if`` assign
+    has a name per branch until ``DeviceFunction``'s final rename merges them
+    (``DeviceFunction.variable_renames``)."""
+    return _read_and_stored(statements, bound, skipped, renames)[0]
+
+
+def _read_and_stored(
+    statements: Sequence[ast.stmt],
+    bound: frozenset[str],
+    skipped: frozenset[int] = frozenset(),
+    renames: Mapping[str, str] | None = None,
+) -> tuple[set[str], frozenset[str]]:
+    """(``_free_reads``, the names stored on every path through ``statements``
+    or in ``bound``)."""
+    renames = renames or {}
+
+    def loads(node: ast.AST) -> set[str]:
+        return {
+            renames.get(n.id, n.id)
+            for n in ast.walk(node)
+            if isinstance(n, ast.Name)
+            and (isinstance(n.ctx, ast.Load) or isinstance(node, ast.AugAssign))
+        }
+
+    free: set[str] = set()
+    stored = set(bound)
+    for statement in statements:
+        if isinstance(statement, ast.For):
+            free |= loads(statement.iter) - stored
+            inner = frozenset(stored | _stored_names([statement.target], renames))
+            free |= _read_and_stored(statement.body, inner, skipped, renames)[0]
+            free |= _read_and_stored(
+                statement.orelse, frozenset(stored), skipped, renames
+            )[0]
+        elif isinstance(statement, ast.While):
+            free |= loads(statement.test) - stored
+            free |= _read_and_stored(
+                statement.body, frozenset(stored), skipped, renames
+            )[0]
+            free |= _read_and_stored(
+                statement.orelse, frozenset(stored), skipped, renames
+            )[0]
+        elif isinstance(statement, ast.If):
+            free |= loads(statement.test) - stored
+            then_body = [] if id(statement) in skipped else statement.body
+            body, then = _read_and_stored(
+                then_body, frozenset(stored), skipped, renames
+            )
+            orelse, otherwise = _read_and_stored(
+                statement.orelse, frozenset(stored), skipped, renames
+            )
+            free |= body | orelse
+            stored |= then & otherwise
+        elif isinstance(statement, ast.With):
+            for item in statement.items:
+                free |= loads(item) - stored
+                stored |= _stored_names([item], renames)
+            body, always = _read_and_stored(
+                statement.body, frozenset(stored), skipped, renames
+            )
+            free |= body
+            stored |= always
+        else:
+            free |= loads(statement) - stored
+            stored |= _stored_names([statement], renames)
+    return free, frozenset(stored)
 
 
 def _all_names(nodes: Iterable[ast.AST]) -> set[str]:
@@ -2238,26 +2320,42 @@ def _dry_pass_rewrite(
 
 
 def _dry_pass_binds(
-    body: list[ast.stmt], guards: list[ast.If], bound: set[str]
+    body: list[ast.stmt],
+    guards: list[ast.If],
+    bound: set[str],
+    renames: Mapping[str, str] | None = None,
 ) -> bool:
-    """Whether every name a guard binds is read only under that guard."""
+    """Whether every name a guard binds is read only under that guard (names
+    as ``renames`` maps them, see ``_free_reads``)."""
+    renames = renames or {}
     guard_ids = {id(guard) for guard in guards}
+    bound = {renames.get(name, name) for name in bound}
     stores: dict[str, set[int]] = {name: {0} for name in bound}
     loads: list[tuple[str, int]] = []
 
     def visit(node: ast.AST, scope: int) -> None:
         scope = id(node) if id(node) in guard_ids else scope
         if isinstance(node, ast.Name):
+            name = renames.get(node.id, node.id)
             if isinstance(node.ctx, ast.Store):
-                stores.setdefault(node.id, set()).add(scope)
+                stores.setdefault(name, set()).add(scope)
             else:
-                loads.append((node.id, scope))
+                loads.append((name, scope))
         for child in ast.iter_child_nodes(node):
             visit(child, scope)
 
     for statement in body:
         visit(statement, 0)
-    return all(name not in stores or stores[name] & {0, scope} for name, scope in loads)
+    if not all(
+        name not in stores or stores[name] & {0, scope} for name, scope in loads
+    ):
+        return False
+    # A guard may not run: a name it binds that is read outside it must be
+    # bound on every path that skips the guards.
+    guarded = {name for name, scopes in stores.items() if scopes - {0}}
+    return not guarded or not (
+        _free_reads(body, frozenset(bound), frozenset(guard_ids), renames) & guarded
+    )
 
 
 def emit_cross_loop_schedule(
@@ -3298,7 +3396,10 @@ def emit_cross_loop_schedule(
                 frozenset(reachable),
                 guards,
             )
-            return rewritten if _dry_pass_binds(rewritten, guards, bound) else None
+            binds = _dry_pass_binds(
+                rewritten, guards, bound, device_function.variable_renames()
+            )
+            return rewritten if binds else None
 
         helper_bodies = {
             name: rewrite(helpers[name][1], set(helpers[name][0])) for name in reachable

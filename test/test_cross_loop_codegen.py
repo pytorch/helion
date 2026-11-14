@@ -26,6 +26,7 @@ from helion._compiler.cross_loop_codegen import (
 )
 from helion._compiler.cross_loop_codegen import _dry_pass_binds
 from helion._compiler.cross_loop_codegen import _dry_pass_rewrite
+from helion._compiler.cross_loop_codegen import _free_reads
 from helion._compiler.cross_loop_codegen import _outline_cross_loop_region
 from helion._compiler.cross_loop_codegen import _scope_wait
 from helion._compiler.cross_loop_codegen import _triton_root_requires_kernel_scope
@@ -1689,6 +1690,51 @@ class TestCrossLoopCodegenHelpers(TestCase):
         guards = []
         rewritten = _dry_pass_rewrite(body, "live", frozenset(), guards)
         self.assertFalse(_dry_pass_binds(rewritten, guards, set()))
+        # So does one a skipped atomic binds on one branch: no path may skip it.
+        for source, binds in (
+            (
+                "if c:\n    v = tl.load(p)\nelse:\n    v = tl.atomic_cas(p, 0, 1)\n",
+                False,
+            ),
+            ("v = tl.load(p)\nif c:\n    v = tl.atomic_cas(p, 0, 1)\n", True),
+        ):
+            guards = []
+            body = ast.parse(source + "tl.store(out, v)\n").body
+            rewritten = _dry_pass_rewrite(body, "live", frozenset(), guards)
+            self.assertIs(_dry_pass_binds(rewritten, guards, set()), binds)
+        # Generated code names the value per branch until the final rename
+        # merges them: the check compares the merged names.
+        source = (
+            "if c:\n    v_1 = tl.load(p)\nelse:\n    v_2 = tl.atomic_cas(p, 0, 1)\n"
+            "tl.store(out, v_1)\n"
+        )
+        guards = []
+        rewritten = _dry_pass_rewrite(
+            ast.parse(source).body, "live", frozenset(), guards
+        )
+        self.assertFalse(_dry_pass_binds(rewritten, guards, set(), {"v_2": "v_1"}))
+
+    def test_free_reads_count_only_stores_on_every_path(self) -> None:
+        # A store under a nested branch or in a loop body may not happen.
+        body = ast.parse(
+            "if a:\n"
+            "    if b:\n"
+            "        state = 0\n"
+            "else:\n"
+            "    for i in range(n):\n"
+            "        state = 0\n"
+            "state += 1\n"
+        ).body
+        self.assertEqual(_free_reads(body), {"a", "b", "n", "range", "state"})
+        body = ast.parse(
+            "if a:\n    state = 0\nelse:\n    state = 1\nout = state + 1\n"
+        ).body
+        self.assertEqual(_free_reads(body), {"a"})
+        self.assertEqual(_free_reads(body[1:], frozenset({"state"})), set())
+        # Branch names the final rename merges count as one name.
+        body = ast.parse("if a:\n    s_1 = 0\nelse:\n    s_2 = 1\nout = s_1 + 1\n").body
+        self.assertEqual(_free_reads(body), {"a", "s_1"})
+        self.assertEqual(_free_reads(body, renames={"s_2": "s_1"}), {"a"})
 
     def test_dry_pass_runs_helion_reduction_helpers(self) -> None:
         # max/min reductions lower to Helion's NaN-propagating helpers; they only
