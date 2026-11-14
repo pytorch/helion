@@ -4892,10 +4892,14 @@ def _run_lane_loops_once(
     per iteration of the enclosing loop, as in Helion's semantics.  A lane
     loop holding the op directly beside lane-variant register and staging
     work only (the op's own K tile, whose lanes compute a staged operand) is
-    split at the op.  A loop distributed around the op
-    (``_distribute_lane_loop``) has each staging run's lanes dealt out over
-    the threads that hold the same elements (``_Replicas.spread``) where
-    every thread reaches it.  Any other loop that reads its lane is jammed
+    split at the op.  The staging lane loops of a split, and of a loop
+    distributed around the op (``_distribute_lane_loop``), have their lanes
+    dealt out over the threads that hold the same elements
+    (``_Replicas.spread``) where every thread reaches them: a staged operand
+    that doesn't vary on a thread axis (a weight tile on the M threads) is
+    otherwise computed by that axis's thread 0 alone, the others idle at the
+    op's barrier.  A split loop left whole issues its loads first
+    (``_loads_first_all``).  Any other loop that reads its lane is jammed
     across its lanes (``_jam_lane_loop``), at most ``MAX_LANE_COPIES``
     copies of a statement deep."""
 
@@ -4925,9 +4929,13 @@ def _run_lane_loops_once(
                     if not any(lane in names_read(x) for x in s.body):
                         out.extend(s.body)
                     elif _split_schedulable(s, coop):
-                        parts = _split_lane_loop(s, lane, coop)
-                        split.extend(p for p in parts if is_lane_loop(p))
-                        out += parts
+                        for part in _split_lane_loop(s, lane, coop):
+                            if is_lane_loop(part):
+                                dealt = replicas.spread(part) if uniform else part
+                                if dealt is part:
+                                    split.append(part)
+                                part = dealt
+                            out.append(part)
                     elif (
                         distributed := _distribute_lane_loop(s, lane, coop)
                     ) is not None:

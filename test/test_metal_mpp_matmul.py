@@ -4753,10 +4753,12 @@ class TestMppStaging(_MppCase):
             else:
                 lhs = _nan_padded(a.to(DEVICE))
             with self.subTest(m=m, k=k, n=n, config=config, column_major=column_major):
-                out, _, msl = _run(int4_gemm, (lhs, _pack_int4(w).to(DEVICE)), config)
+                out, code, msl = _run(
+                    int4_gemm, (lhs, _pack_int4(w).to(DEVICE)), config
+                )
                 _close(out, (a.double() @ w.double()).to(bf16).double())
                 self._assert_staged(msl, "bfloat")
-                self.assertRegex(msl, r"_mpp_owner\w*\)\) \{ _mpp_tile")
+                _assert_one_writer(self, code, msl)
 
     def test_factored_k(self) -> None:
         """A K held as parts beyond int4_gemm: a stacked lhs, c = 3, two
@@ -16197,7 +16199,7 @@ class TestMppUniformLaunch(_MppCase):
                     self._launches(code, launch)
                     self.assertNotRegex(msl, r"\bmask_\d+")
                     self.assertNotRegex(msl, _masked_load("B"))
-                    self.assertRegex(msl, r"if \(_mpp_owner\w*\) \{ _mpp_tile\[")
+                    _assert_one_writer(self, code, msl)
                     if launch == (64, 1, 1):
                         self.assertRegex(
                             msl, r"auto b_tile = _mpp_lanes_\d+\[lane_\d+\];"
@@ -16381,6 +16383,21 @@ def two_pins(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(**S)
+def scaled_k_rhs(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """A rhs computed per K tile in the K loop holding the op, which the M
+    threads share: the K tile's lane loop is split at the op."""
+    m, k = x.size()
+    n = w.size(1)
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], (w[tk, tn] * 0.5).to(x.dtype))
+        out[tm, tn] = acc
+    return out
+
+
 def _spread_loops(msl: str) -> list[tuple[int, int, int, str]]:
     """Each lane loop that starts at a thread index: its thread axis, extent,
     step and body."""
@@ -16395,6 +16412,27 @@ def _spread_loops(msl: str) -> list[tuple[int, int, int, str]]:
         axis, extent, step = (int(g) for g in match.groups()[1:])
         loops.append((axis, extent, step, msl[match.end() : end]))
     return loops
+
+
+def _assert_one_writer(case: unittest.TestCase, code: str, msl: str) -> None:
+    """Each staged element has one writer: the threads that share the tile,
+    on the axes its owner test pins, deal its staging lanes out among
+    themselves when one such axis has several threads (``_Replicas.spread``),
+    and otherwise the owner test's thread writes it."""
+    owner = re.search(r"auto _mpp_owner\w* = (.*);", msl)
+    assert owner is not None, msl
+    launch = _launch(code)
+    pinned = [int(a) for a in re.findall(r"tid\[(\d)\] == 0", owner.group(1))]
+    wide = {a for a in pinned if launch[a] > 1}
+    loops = _spread_loops(msl)
+    if len(wide) == 1:
+        case.assertTrue(loops)
+        case.assertEqual({axis for axis, *_ in loops}, wide)
+        for *_, body in loops:
+            case.assertNotIn("_mpp_owner", body)
+    else:
+        case.assertFalse(loops)
+        case.assertRegex(msl, r"_mpp_owner\w*\)+ \{ _mpp_tile")
 
 
 #: A staging write that an owner test pins, in a lane loop from 0.
@@ -16483,6 +16521,22 @@ class TestMppStagingSpread(_MppCase):
                 out, code, msl = _run(gated_lhs, args, config)
                 _close(out, _mm(a, w))
                 self._spreads(code, msl, 1, 72)
+
+    def test_split_k_tile(self) -> None:
+        """A rhs staged per K tile from a split of the K tile's lane loop,
+        dealt out over the M threads (8 and 4 of them), with a K tail."""
+        h = torch.float16
+        x, w = torch.randn(70, 96, dtype=h), torch.randn(96, 40, dtype=h)
+        for config, extent in (
+            (helion.Config(block_sizes=[64, 32, 32], num_warps=2), 32),
+            (helion.Config(block_sizes=[32, 16, 64], num_warps=2), 64),
+        ):
+            with self.subTest(config=config):
+                out, code, msl = _run(
+                    scaled_k_rhs, (x.to(DEVICE), w.to(DEVICE)), config
+                )
+                _close(out, _mm(x, (w * 0.5).to(h)))
+                self._spreads(code, msl, 0, extent)
 
     def test_inside_a_lane_loop(self) -> None:
         """A staging loop nested in the M tile's lane loop: ``if_late``'s 64
