@@ -288,6 +288,52 @@ each native launch. Dynamic
 launch layouts and plans that require additional descriptor preparation are not
 yet supported.
 
+### Explicit kernel artifacts
+
+An explicitly selected artifact can skip Helion's frontend and source generation
+in a new process. Export the input signatures and configurations needed by the
+deployment, then load that file:
+
+```python
+# Preparation: compile the selected program and input signatures once.
+helion.export_artifact(
+    my_kernel,
+    [helion.ArtifactCase(args=(example_input,), config=selected_config)],
+    "my_kernel.json",
+)
+
+# Deployment: the original kernel function and its module are not required.
+compiled = helion.load_artifact("my_kernel.json")
+result = compiled(actual_input)
+```
+
+The artifact is a snapshot of the emitted program. Loading it does not inspect
+the original Python function, its globals, or the current compiler settings, and
+does not claim to reproduce a fresh compilation of them. After changing the
+program or its compilation settings, export and select a new artifact. This is
+an explicit deployment decision; ordinary `@helion.kernel` calls do not discover
+or load these files automatically.
+
+Each case uses a supplied configuration and static tensor shapes. The loader
+checks runtime and device compatibility. Calls must match the exported tensor
+types, dtypes, shapes, strides, storage offsets and sizes, alias relationships,
+and scalar/container values. Unexported inputs raise an error rather than
+triggering compilation. This initial API targets Triton inference kernels with
+ordinary `torch.Tensor` or `torch.nn.Parameter` inputs with `requires_grad=False`.
+Tensor subclasses, conjugate/negative views, Torch modes, autocast, distributed
+kernels, tensor-descriptor indexing, and runtime input specialization are
+unsupported. CPU examples can be exported for code inspection; execution requires
+accelerator tensors.
+
+Unsupported dependencies on the original Python module are rejected at export.
+Exporting a kernel does not precompile Triton's device binaries, so a cold Triton
+cache can still require device compilation.
+
+Artifacts contain executable Python and must come from a trusted producer. The
+digest detects corruption; it does not authenticate the producer or sandbox the
+code. The generated program continues to depend on the checked PyTorch and
+Triton runtime.
+
 ## Caching and Specialization
 
 Kernels are automatically cached based on:

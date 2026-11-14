@@ -22,9 +22,14 @@ launch wrappers can instead implement ``Backend.build_standalone_code``.
 from __future__ import annotations
 
 import ast
+import builtins
+import inspect
+import symtable
 from typing import TYPE_CHECKING
 from typing import Any
 
+from .._utils import cdiv
+from .._utils import next_power_of_2
 from .backend import dedupe_preserve_order
 from .backend import read_launcher_source
 
@@ -42,6 +47,214 @@ _SHIM_DOC = (
     "the ``helion`` namespace built from this function. The launcher is inlined in "
     "this private scope so its symbols can never collide with the kernel name."
 )
+_HOST_HELPERS = (cdiv, next_power_of_2)
+
+
+def _artifact_global_reads(table: symtable.SymbolTable) -> set[str]:
+    """Use Python's scope analysis, including nested functions and defaults."""
+    names = {
+        symbol.get_name()
+        for symbol in table.get_symbols()
+        if symbol.is_global() and symbol.is_referenced()
+    }
+    for child in table.get_children():
+        names.update(_artifact_global_reads(child))
+    return names
+
+
+def _artifact_annotation_reads(tree: ast.AST) -> set[str]:
+    # Future/quoted annotations are absent from Python's runtime symbol table,
+    # but may subsequently be evaluated by the backend or typing machinery.
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        annotation = None
+        if isinstance(node, (ast.arg, ast.AnnAssign)):
+            annotation = node.annotation
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            annotation = node.returns
+        if annotation is None:
+            continue
+        for value in ast.walk(annotation):
+            if isinstance(value, ast.Name):
+                names.add(value.id)
+            elif isinstance(value, ast.Constant) and isinstance(value.value, str):
+                try:
+                    expression = ast.parse(value.value, mode="eval")
+                except SyntaxError:
+                    continue
+                names.update(
+                    item.id
+                    for item in ast.walk(expression)
+                    if isinstance(item, ast.Name)
+                )
+    return names
+
+
+def _artifact_runtime_nodes(tree: ast.Module) -> set[ast.AST]:
+    """Recognize the exact compiler-owned runtime, including optional CUDA APIs."""
+    from .triton.backend import TritonBackend
+
+    canonical = _runtime_shim_statements(TritonBackend().dependency_free_launcher_info)[
+        0
+    ]
+    canonical_dump = ast.dump(canonical)
+    return {
+        child
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and ast.dump(node) == canonical_dump
+        for child in ast.walk(node)
+    }
+
+
+def _check_artifact_helion_namespace(tree: ast.Module) -> None:
+    """Reject references the inlined Helion namespace cannot satisfy."""
+    from .triton.backend import TritonBackend
+
+    info = TritonBackend().dependency_free_launcher_info
+    runtime_names = {*info.runtime_helper_names, info.launcher_symbol}
+    host_names = {helper.__name__ for helper in _HOST_HELPERS}
+    parents = {
+        child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)
+    }
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Name)
+            and node.id == "helion"
+            and isinstance(node.ctx, ast.Load)
+        ):
+            continue
+        attribute = parents.get(node)
+        if isinstance(attribute, ast.Attribute) and attribute.value is node:
+            if attribute.attr in host_names:
+                continue
+            if attribute.attr == "runtime":
+                runtime_attribute = parents.get(attribute)
+                if (
+                    isinstance(runtime_attribute, ast.Attribute)
+                    and runtime_attribute.value is attribute
+                    and runtime_attribute.attr in runtime_names
+                ):
+                    continue
+        raise ValueError(
+            "artifact source uses an unsupported Helion namespace reference"
+        )
+
+
+def close_artifact_source(source: str) -> str:
+    """Require emitted artifact code to depend only on its declared runtimes.
+
+    This checks the generated program, not equivalence to future executions of
+    the original Python kernel. Torch, Triton and the standard-library modules
+    used by native code generation are trusted runtime dependencies, as is the
+    exact native launcher (whose optional residency checks use CUDA bindings).
+    This is not a sandbox for untrusted source or a monkeypatched installation.
+    """
+    tree = ast.parse(source)
+    _check_artifact_helion_namespace(tree)
+    runtime_nodes = _artifact_runtime_nodes(tree)
+    source = ast.unparse(tree)
+    table = symtable.symtable(source, "<helion-artifact>", "exec")
+    referenced = _artifact_global_reads(table) | _artifact_annotation_reads(tree)
+    # These are dependencies of the emitted launcher/dispatcher, not an
+    # allowlist of operations in the source Helion kernel.
+    runtime_modules = {
+        "__future__",
+        "collections",
+        "contextvars",
+        "functools",
+        "inspect",
+        "math",
+        "operator",
+        "torch",
+        "triton",
+        "types",
+        "typing",
+        "weakref",
+    }
+    dynamic_names = {
+        "__import__",
+        "__builtins__",
+        "eval",
+        "exec",
+        "compile",
+        "globals",
+        "locals",
+        "import_module",
+        "load_module",
+        "exec_module",
+    }
+    for node in ast.walk(tree):
+        if node in runtime_nodes:
+            continue
+        if (
+            (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Load)
+                and node.id in dynamic_names
+            )
+            or isinstance(node, ast.Attribute)
+            and node.attr in dynamic_names
+        ):
+            raise ValueError("artifact source uses dynamic Python namespace access")
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "vars"
+            and not node.args
+        ):
+            raise ValueError("artifact source uses dynamic Python namespace access")
+    for node in tuple(ast.walk(tree)):
+        if node in runtime_nodes or not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        kept = []
+        for alias in node.names:
+            if alias.name in dynamic_names:
+                raise ValueError("artifact source uses dynamic Python namespace access")
+            module = alias.name if isinstance(node, ast.Import) else node.module or ""
+            if alias.name == "*" or isinstance(node, ast.ImportFrom) and node.level:
+                raise ValueError(
+                    "artifact source cannot use relative or wildcard imports"
+                )
+            if module.split(".")[0] in runtime_modules:
+                kept.append(alias)
+                continue
+            name = alias.asname or (
+                alias.name.split(".")[0] if isinstance(node, ast.Import) else alias.name
+            )
+            # Only discard compiler-emitted top-level imports. Nested imports
+            # are rejected conservatively; they may have runtime side effects.
+            if node not in tree.body or name in referenced:
+                raise ValueError(
+                    f"artifact source depends on external module {module!r}"
+                )
+        if kept:
+            node.names = kept
+        else:
+            tree.body.remove(node)
+    closed = ast.unparse(tree) + "\n"
+    closed_table = symtable.symtable(closed, "<helion-artifact>", "exec")
+    bound = {
+        symbol.get_name()
+        for symbol in closed_table.get_symbols()
+        if symbol.is_assigned() or symbol.is_imported() or symbol.is_namespace()
+    }
+    implicit = {
+        "__name__",
+        "__doc__",
+        "__package__",
+        "__file__",
+        "__spec__",
+        "__loader__",
+        "__cached__",
+    }
+    missing = (
+        _artifact_global_reads(closed_table) - bound - set(vars(builtins)) - implicit
+    )
+    if missing:
+        raise ValueError(
+            f"artifact source has unbound global names: {', '.join(sorted(missing))}"
+        )
+    return closed
 
 
 def build_dependency_free_code(
@@ -145,8 +358,9 @@ def _runtime_shim_statements(info: LauncherInfo) -> list[ast.stmt]:
     The launcher is inlined inside ``_make_helion_runtime`` -- a private function
     scope, so none of its symbols (``get_num_sm``, ``default_launcher``, ...) land at
     module level where they could clash with the generated kernel -- and re-exported
-    on a ``types.SimpleNamespace`` as ``helion.runtime`` so the body's verbatim
-    ``helion.runtime.<fn>(...)`` calls resolve against it.
+    on a ``types.SimpleNamespace`` as ``helion.runtime``. Pure host helpers are
+    embedded from their canonical implementations on the outer ``helion``
+    namespace, so generated host expressions need no Helion package either.
 
     Built by editing the AST: parse a small template, splice the launcher body into
     the function and the exports into the returned namespace -- no string surgery.
@@ -170,7 +384,7 @@ def _runtime_shim_statements(info: LauncherInfo) -> list[ast.stmt]:
     module = ast.parse(
         "def _make_helion_runtime():\n"
         "    return types.SimpleNamespace()\n"
-        "helion = types.SimpleNamespace(runtime=_make_helion_runtime())\n"
+        "helion = _make_helion_runtime()\n"
         f"{info.launcher_alias} = helion.runtime.{info.launcher_symbol}\n"
     )
     make_fn = module.body[0]
@@ -180,10 +394,31 @@ def _runtime_shim_statements(info: LauncherInfo) -> list[ast.stmt]:
     namespace_call = return_stmt.value
     assert isinstance(namespace_call, ast.Call)
     # Docstring explaining the shim, then the inlined launcher, then the return.
-    make_fn.body = [ast.Expr(ast.Constant(_SHIM_DOC)), *launcher_stmts, return_stmt]
+    host_helpers = [
+        ast.parse(inspect.getsource(helper)).body[0] for helper in _HOST_HELPERS
+    ]
+    make_fn.body = [
+        ast.Expr(ast.Constant(_SHIM_DOC)),
+        *launcher_stmts,
+        *host_helpers,
+        return_stmt,
+    ]
+    runtime_namespace = ast.Call(
+        func=namespace_call.func,
+        args=[],
+        keywords=[
+            ast.keyword(arg=name, value=ast.Name(id=name, ctx=ast.Load()))
+            for name in exports
+        ],
+    )
     namespace_call.keywords = [
-        ast.keyword(arg=name, value=ast.Name(id=name, ctx=ast.Load()))
-        for name in exports
+        ast.keyword(arg="runtime", value=runtime_namespace),
+        *(
+            ast.keyword(
+                arg=helper.__name__, value=ast.Name(id=helper.__name__, ctx=ast.Load())
+            )
+            for helper in _HOST_HELPERS
+        ),
     ]
     ast.fix_missing_locations(module)
     return module.body
