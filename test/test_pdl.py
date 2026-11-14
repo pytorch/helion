@@ -16,6 +16,16 @@ from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 import helion.language as hl
+from helion.runtime.settings import _get_backend
+
+
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def code_warm_add(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    hl.code_warm()
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] + 1
+    return out
 
 
 @helion.kernel(static_shapes=True, autotune_effort="none")
@@ -145,3 +155,14 @@ class TestPdl(RefEagerTestBase, TestCase):
                 self.assertRaises(helion.exc.PdlPlacement),
             ):
                 code_and_output(kernel, args, block_sizes=[64])
+
+
+class TestCodeWarmBackends(RefEagerTestBase, TestCase):
+    def test_code_warm_runs_on_every_backend(self) -> None:
+        # Only Triton and Gluon on sm_90+ emit the warm; elsewhere the call
+        # compiles to nothing.
+        x = torch.arange(256, device=DEVICE, dtype=torch.float32)
+        code, out = code_and_output(code_warm_add, (x,), block_sizes=[64])
+        torch.testing.assert_close(out, x + 1)
+        if _get_backend() not in ("triton", "gluon"):
+            self.assertNotIn("code_warm()", code)

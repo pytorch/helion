@@ -4,10 +4,14 @@ import inspect
 from typing import TYPE_CHECKING
 
 from .. import exc
+from .._compiler.ast_extension import expr_from_string
 from .._compiler.type_info import PdlResultType
 from . import _decorators
 
 if TYPE_CHECKING:
+    import ast
+
+    from .._compiler.inductor_lowering import CodegenState
     from .._compiler.variable_origin import Origin
 
 __all__ = ["code_warm", "pdl_launch_dependents", "pdl_wait"]
@@ -93,6 +97,13 @@ def _(origin: Origin, **kwargs: object) -> PdlResultType:
 @_decorators.ref(pdl_wait)
 def _() -> None:
     return None
+
+
+@_decorators.codegen(code_warm, "common")
+def _(state: CodegenState) -> ast.AST:
+    # DeviceFunction emits the warm (Triton and Gluon on sm_90+); every other
+    # backend compiles the call to nothing.
+    return expr_from_string("None")
 
 
 @_decorators.ref(code_warm)
