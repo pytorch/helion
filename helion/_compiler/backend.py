@@ -553,9 +553,10 @@ class Backend(abc.ABC):
 
     @property
     def places_pdl_markers(self) -> bool:
-        """Whether ``finalize_device_body`` takes the kernel's entry markers
-        (``hl.code_warm`` and the PDL entry ops) and exit ops in the body and
-        places them itself; otherwise they surround the final body."""
+        """Whether the backend's finalize hooks (``finalize_device_body`` and
+        ``finalize_kernel_def``) take the kernel's entry markers
+        (``hl.prefetch_code`` and the PDL entry ops) and exit ops in the body and
+        place them themselves; otherwise they surround the final body."""
         return False
 
     @property
@@ -2178,8 +2179,9 @@ class Backend(abc.ABC):
         """Rewrite the rendered kernel body before variable renaming.
 
         Called by ``DeviceFunction.codegen_function_def`` once every statement
-        of the kernel body (preambles and computation, without explicit PDL
-        markers) is rendered and before ``ast_rename`` applies the loop-carried aliases.
+        of the kernel body (preambles and computation, plus the entry and exit
+        markers when ``places_pdl_markers``) is rendered and before
+        ``ast_rename`` applies the loop-carried aliases.
         Returns the body and the kernel parameters to append to the signature
         (``ctx.args`` is the signature so far).  Facts for
         ``finalize_kernel_def`` go on ``ctx``.  The default changes nothing.

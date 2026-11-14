@@ -16,6 +16,16 @@ from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 import helion.language as hl
+from helion.runtime.settings import _get_backend
+
+
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def prefetch_code_add(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    hl.prefetch_code()
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] + 1
+    return out
 
 
 @helion.kernel(static_shapes=True, autotune_effort="none")
@@ -145,3 +155,14 @@ class TestPdl(RefEagerTestBase, TestCase):
                 self.assertRaises(helion.exc.PdlPlacement),
             ):
                 code_and_output(kernel, args, block_sizes=[64])
+
+
+class TestPrefetchCodeBackends(RefEagerTestBase, TestCase):
+    def test_prefetch_code_runs_on_every_backend(self) -> None:
+        # Only Triton and Gluon on sm_90+ emit the prefetch; elsewhere the call
+        # compiles to nothing.
+        x = torch.arange(256, device=DEVICE, dtype=torch.float32)
+        code, out = code_and_output(prefetch_code_add, (x,), block_sizes=[64])
+        torch.testing.assert_close(out, x + 1)
+        if _get_backend() not in ("triton", "gluon"):
+            self.assertNotIn("prefetch_code()", code)
