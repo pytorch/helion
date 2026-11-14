@@ -4547,15 +4547,31 @@ class TritonReductionHeuristic(AutotunerHeuristic):
     @staticmethod
     def _reread_eviction_policies(
         env: CompileEnvironment,
+        device_ir: DeviceIR,
+        seed: dict[str, Any],
         reread_slot: int | None,
     ) -> list[str] | None:
-        """Keep one re-read input in L2 and evict the other load slots first."""
+        """Keep one re-read input in L2 and evict the other load slots first.
+
+        ``reread_slot`` is the input's slot in ``memory_op_facts``, the order
+        of the configs that roll no reduction.  A seed that rolls the
+        reduction lowers the input in each loop that reads it, in an order of
+        its own (``DeviceIR.config_memory_op_fact_pairs``, which pairs each
+        copy with the input's slot): its first read keeps the lines, and the
+        later reads evict them like the other loads.
+        """
         n = env.config_spec.load_eviction_policies.length
         if reread_slot is None or not 0 <= reread_slot < n:
             return None
-        policy = ["first"] * n
-        policy[reread_slot] = "last"
-        return policy
+        pairs = device_ir.config_memory_op_fact_pairs(Config.from_dict(seed))
+        for persistent, fact in pairs:
+            # The seed's first copy of the input.
+            if persistent.eviction_index == reread_slot:
+                assert fact.eviction_index is not None
+                policy = ["first"] * n
+                policy[fact.eviction_index] = "last"
+                return policy
+        return None
 
     # ======================= candidate-resolved liveness allocator ====================== #
     @classmethod
@@ -5221,12 +5237,16 @@ class TritonReductionHeuristic(AutotunerHeuristic):
                 reduction_loops.append(None if width >= rl_spec.size_hint else width)
             seed["reduction_loops"] = reduction_loops
             if pd.row_reread and cls._has_floor_batched_nonresident_grid(env):
-                evict = cls._reread_eviction_policies(env, pd.reread_eviction_index)
+                evict = cls._reread_eviction_policies(
+                    env, device_ir, seed, pd.reread_eviction_index
+                )
                 if evict is not None:
                     seed["load_eviction_policies"] = evict
         elif kf.non_reduction_loop_block_ids or pd.row_reread:
             # A user-written reduction already emits its mutable width through block_sizes.
-            evict = cls._reread_eviction_policies(env, pd.reread_eviction_index)
+            evict = cls._reread_eviction_policies(
+                env, device_ir, seed, pd.reread_eviction_index
+            )
             if evict is not None:
                 seed["load_eviction_policies"] = evict
 

@@ -107,6 +107,10 @@ class TritonBackend(Backend):
         return True
 
     @property
+    def lowers_mask_select(self) -> bool:
+        return True
+
+    @property
     def merges_reduction_dims(self) -> bool:
         return True
 
@@ -345,6 +349,13 @@ class TritonBackend(Backend):
 
     def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
         return f"tl.where({mask}, {true_val}, {false_val})"
+
+    def mask_padded_range_lanes(
+        self, value: str, length: int, dim: int, ndim: int, identity: str
+    ) -> str | None:
+        from ..indexing_strategy import padded_lanes_mask
+
+        return self.where_expr(padded_lanes_mask(length, dim, ndim), value, identity)
 
     def minimum_expr(self, a: str, b: str) -> str:
         return f"tl.minimum({a}, {b})"

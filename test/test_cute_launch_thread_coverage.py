@@ -155,6 +155,52 @@ def test_collective_matmul_keeps_its_cooperative_launch(
         assert "warp.MmaTF32Op((16, 8, 8))" in source
 
 
+def _add_one_per_row(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for row in hl.grid(x.size(0)):
+        for a, b, c in hl.tile([x.size(1), x.size(2), x.size(3)]):
+            out[row, a, b, c] = x[row, a, b, c] + 1
+    return out
+
+
+@pytest.mark.parametrize(
+    "lane_layouts",
+    [["blocked", "strided", "strided", "blocked"], ["blocked"] * 4],
+    ids=["strided", "blocked"],
+)
+def test_lane_loop_thread_indices_count_toward_the_launch(
+    lane_layouts: list[str],
+) -> None:
+    """A device loop's nest (its header, the lane loops around its body and
+    their setup) is emitted once the loop is closed, but its thread indices
+    count on the loop's own axes, whatever the lane layout: two packed tiles
+    of 4 x 256 threads need 2048, so the launch, which fell back to the
+    packed axis alone, is refused; one tile per CTA still launches its 1024."""
+    inputs = (torch.empty((4, 64, 64, 256), dtype=torch.bfloat16, device=CPU_DEVICE),)
+    kernel = helion.kernel(
+        _add_one_per_row, backend="cute", static_shapes=True, autotune_effort="none"
+    )
+    bound = kernel._bind_isolated(inputs)
+
+    def config(tiles_per_block: int) -> helion.Config:
+        return helion.Config(
+            block_sizes=[32, 1, 256],
+            num_threads=[4, 0, 256],
+            loop_orders=[[2, 1, 0]],
+            flatten_loops=[True],
+            cute_vector_widths=[4, 8, 4, 4],
+            cute_lane_layouts=lane_layouts,
+            cute_tiles_per_block=tiles_per_block,
+        )
+
+    with pytest.raises(
+        helion.exc.BackendUnsupported,
+        match=r"required_thread_block_dims=\(2, 256, 4\)",
+    ):
+        bound.to_code(config(2))
+    assert "block=(256, 4, 1)" in bound.to_code(config(1))
+
+
 def _nested_copy(x: torch.Tensor) -> torch.Tensor:
     rows, columns = x.shape
     output = torch.empty_like(x)

@@ -29,6 +29,7 @@ from ...language._tracing_ops import _for_loop
 from ...language._tracing_ops import _for_loop_step
 from ...language._tracing_ops import _host_tensor
 from ...language._tracing_ops import _if
+from ...language._tracing_ops import _mask_select
 from ...language._tracing_ops import _mask_to
 from ...language._tracing_ops import _new_var
 from ...language._tracing_ops import _not
@@ -64,6 +65,7 @@ _PALLAS_LOOP_LOAD_COUNT_META = "_helion_pallas_loop_load_count"
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Collection
     from collections.abc import Iterator
     from collections.abc import Sequence
 
@@ -5897,19 +5899,23 @@ def _pipeline_physical_mask_bounds(
     return ()
 
 
-@_decorators.codegen(_mask_to, "pallas")
-def _(state: CodegenState) -> ast.AST:
-    tensor = state.proxy_arg(0)
-    assert isinstance(tensor, torch.Tensor)
-    other = state.proxy_arg(1)
-    assert isinstance(other, (int, float, bool))
+def _tile_mask_expr(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    block_ids: Collection[int] | None = None,
+) -> str | None:
+    """The mask of the active tiles over ``tensor``'s dims (of the canonical
+    ``block_ids`` only, if given) as a float tensor broadcast to its shape,
+    or None when no such dim has a masked tile."""
     mask_exprs: list[str] = []
     input_sizes = [*tensor.size()]
     env = CompileEnvironment.current()
     backend = env.backend
     for dim, size in enumerate(input_sizes):
         index = env.resolve_block_id(size)
-        if index is None:
+        if index is None or (
+            block_ids is not None and env.canonical_block_id(index) not in block_ids
+        ):
             continue
         mask_var = state.codegen.mask_var(index)
         physical_bounds = _pipeline_physical_mask_bounds(state, index)
@@ -5932,13 +5938,26 @@ def _(state: CodegenState) -> ast.AST:
         if expr not in mask_exprs:
             mask_exprs.append(expr)
     if not mask_exprs:
-        return state.ast_arg(0)
+        return None
     # Combine float masks via multiplication (equivalent to bool AND).
     mask_expr = " * ".join(mask_exprs)
     if len(mask_exprs) < len(input_sizes):
         mask_expr = backend.broadcast_to_expr(
             mask_expr, state.tile_strategy.shape_str(input_sizes)
         )
+    return mask_expr
+
+
+@_decorators.codegen(_mask_to, "pallas")
+def _(state: CodegenState) -> ast.AST:
+    tensor = state.proxy_arg(0)
+    assert isinstance(tensor, torch.Tensor)
+    other = state.proxy_arg(1)
+    assert isinstance(other, (int, float, bool))
+    mask_expr = _tile_mask_expr(state, tensor)
+    if mask_expr is None:
+        return state.ast_arg(0)
+    backend = CompileEnvironment.current().backend
     # Ensure the masked value literal matches the tensor dtype
     input_dtype = tensor.dtype
     other_typed = expr_from_string(
@@ -5948,4 +5967,26 @@ def _(state: CodegenState) -> ast.AST:
         backend.where_expr(mask_expr, "{expr}", "{other}"),
         expr=state.ast_arg(0),
         other=other_typed,
+    )
+
+
+@_decorators.codegen(_mask_select, "pallas")
+def _(state: CodegenState) -> ast.AST:
+    tensor = state.proxy_arg(0)
+    assert isinstance(tensor, torch.Tensor)
+    block_ids = state.proxy_arg(2)
+    assert isinstance(block_ids, tuple)
+    mask_expr = _tile_mask_expr(state, tensor, block_ids)
+    if mask_expr is None:
+        return state.ast_arg(0)
+    backend = CompileEnvironment.current().backend
+    other = state.proxy_arg(1)
+    return expr_from_string(
+        backend.where_expr(mask_expr, "{expr}", "{other}"),
+        expr=state.ast_arg(0),
+        other=expr_from_string(
+            backend.full_expr([], constant_repr(other), tensor.dtype)
+        )
+        if isinstance(other, (int, float, bool))
+        else state.ast_arg(1),
     )

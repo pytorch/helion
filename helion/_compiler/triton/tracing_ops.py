@@ -15,6 +15,7 @@ from torch._inductor.codegen.simd import constant_repr
 from torch._inductor.utils import triton_type
 
 from ...language import _decorators
+from ...language._tracing_ops import _mask_select
 from ...language._tracing_ops import _mask_to
 from ..ast_extension import expr_from_string
 from ..compile_environment import CompileEnvironment
@@ -79,4 +80,25 @@ def _(state: CodegenState) -> ast.AST:
         f"tl.where({mask_expr}, {{expr}}, {{other}})",
         expr=state.ast_arg(0),
         other=other_typed,
+    )
+
+
+@_decorators.codegen(_mask_select, "triton")
+def _(state: CodegenState) -> ast.AST:
+    tensor = state.proxy_arg(0)
+    assert isinstance(tensor, torch.Tensor)
+    block_ids = state.proxy_arg(2)
+    assert isinstance(block_ids, tuple)
+    mask_expr = _tile_mask_expr(state, tensor, block_ids)
+    if mask_expr is None:
+        return state.ast_arg(0)
+    other = state.proxy_arg(1)
+    return expr_from_string(
+        f"tl.where({mask_expr}, {{expr}}, {{other}})",
+        expr=state.ast_arg(0),
+        other=expr_from_string(
+            f"tl.full([], {constant_repr(other)}, {triton_type(tensor.dtype)})"
+        )
+        if isinstance(other, (int, float, bool))
+        else state.ast_arg(1),
     )

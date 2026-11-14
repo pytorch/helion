@@ -47,9 +47,13 @@ class BlockIDStrategyMapping:
         self._block_id_to_any_strategy: dict[int, TileStrategy] = {}
 
     def __setitem__(self, block_ids: tuple[int, ...], strategy: TileStrategy) -> None:
+        replaced = self._block_id_to_strategy.get(block_ids)
         self._block_id_to_strategy[block_ids] = strategy
         for block_id in block_ids:
-            self._block_id_to_any_strategy.setdefault(block_id, strategy)
+            # A block keeps the first strategy registered over it, unless
+            # that is the strategy this one replaces.
+            if self._block_id_to_any_strategy.get(block_id, replaced) is replaced:
+                self._block_id_to_any_strategy[block_id] = strategy
 
     def __getitem__(self, block_ids: tuple[int, ...]) -> TileStrategy:
         return self._block_id_to_strategy[block_ids]
@@ -234,18 +238,26 @@ class TileStrategyDispatch:
         for strategy in self.strategies:
             if not isinstance(strategy, PerThreadNDTileStrategy) or strategy.mma_mode:
                 continue
-            base_axis = self.thread_axis_for_strategy(strategy)
-            if base_axis is None:
+            # A strategy several roots run lies after each root's own grid
+            # (``_branches_of``), and widens only as far as every one of
+            # those axes reaches.
+            axes = [
+                self.thread_axis_for_strategy(strategy, branch[0])
+                for branch in self._branches_of(strategy, None)
+            ]
+            if not axes or None in axes:
                 continue
-            extents = {
-                block_id: dims[base_axis + local_axis]
-                for block_id, local_axis, size, _expr in self._iter_strategy_thread_axes(
-                    strategy
+            base_axes = {axis for axis in axes if axis is not None}
+            extents = {}
+            for block_id, local_axis, size, _expr in self._iter_strategy_thread_axes(
+                strategy
+            ):
+                widest = min(
+                    dims[axis + local_axis] if axis + local_axis < len(dims) else 0
+                    for axis in base_axes
                 )
-                if size is not None
-                and base_axis + local_axis < len(dims)
-                and dims[base_axis + local_axis] > size
-            }
+                if size is not None and widest > size:
+                    extents[block_id] = widest
             if extents:
                 updates.append((strategy, extents))
         for strategy, extents in updates:
@@ -276,6 +288,29 @@ class TileStrategyDispatch:
         self._register_strategy(block_ids, strategy)
 
     def _register_strategy(self, block_ids: list[int], strategy: TileStrategy) -> None:
+        replaced = self.block_id_to_strategy.get(tuple(block_ids))
+        if replaced is not None:
+            # Loops over the same blocks (two ``hl.tile`` loops, device or
+            # root, sharing an ``hl.register_block_size``) all run on the
+            # last strategy built for them, the one codegen finds by their
+            # block ids.  It takes the earlier one's place too: one left in
+            # ``self.strategies`` would miss what codegen decides on the
+            # shared one (a block demoted past the third thread axis), while
+            # the thread-extent queries that walk the list read it.  The list
+            # keeps an entry per loop, and its first ``len(grid_block_ids)``
+            # entries, registered first, stay the root loops' grids, which
+            # the root branches index: a device loop takes no root grid's
+            # place, as that root would be laid out on the device loop's
+            # thread axes (two root loops share theirs).  The map keeps
+            # naming the last strategy, though that root runs on its grid
+            # entry (``_root_grid_strategy``): a reader of the map inside the
+            # root (``direct_affine_lowering``) then names a variable the root
+            # never assigns, and declines its optimization.
+            roots = len(HostFunction.current().device_ir.grid_block_ids)
+            registering_root = len(self.strategies) < roots
+            for index, existing in enumerate(self.strategies):
+                if existing is replaced and (registering_root or index >= roots):
+                    self.strategies[index] = strategy
         self.strategies.append(strategy)
         self.block_id_to_strategy[tuple(block_ids)] = strategy
 
@@ -343,13 +378,35 @@ class TileStrategyDispatch:
         )
 
     def codegen_grid(self, state: CodegenState, block_ids: list[int]) -> None:
-        strategy = self.block_id_to_strategy[tuple(block_ids)]
+        strategy = self._root_grid_strategy(state, block_ids)
         state.codegen.active_device_loops.clear()
         grid_state = strategy.codegen_grid(state)
         state.codegen.set_active_loops(grid_state)
         for other_strategy in self.strategies:
             if other_strategy is not strategy:
                 other_strategy.codegen_preamble(state)
+
+    def _root_grid_strategy(
+        self, state: CodegenState, block_ids: list[int]
+    ) -> TileStrategy:
+        """The strategy the root loop being generated runs on: its own grid
+        entry, which no device loop over the same blocks in another root
+        replaces (``_register_strategy``), so the body lays the root out where
+        the root ranges do; else the strategy registered for its blocks."""
+        strategy = self._current_root_grid()
+        if strategy is not None and list(strategy.block_ids) == list(block_ids):
+            return strategy
+        return self.block_id_to_strategy[tuple(block_ids)]
+
+    def _current_root_grid(self) -> TileStrategy | None:
+        """The grid entry of the root loop being generated (the first
+        ``len(grid_block_ids)`` entries of ``self.strategies``), or ``None``
+        outside one."""
+        device_ir = HostFunction.current().device_ir
+        root_info = self._device_function.codegen.current_root_graph_info
+        if root_info is None or root_info.graph_id not in device_ir.root_ids:
+            return None
+        return self.strategies[device_ir.root_ids.index(root_info.graph_id)]
 
     def codegen_device_loop(
         self, state: CodegenState, block_ids: list[int]
@@ -575,7 +632,9 @@ class TileStrategyDispatch:
         registered on the host, which predates every root."""
         if len(HostFunction.current().device_ir.grid_block_ids) <= 1:
             return set()
-        counts = Counter(s for branch in self._root_branches() for s in branch)
+        counts = Counter(
+            s for branch in self._root_branches() for s in dict.fromkeys(branch)
+        )
         return {s for s, n in counts.items() if n > 1}
 
     def _root_loops(self) -> list[set[tuple[int, ...]]]:
@@ -700,16 +759,24 @@ class TileStrategyDispatch:
         """Return the explicit axis override for an independent collective sibling."""
         return self._collective_sibling_thread_axes.get(target)
 
-    def thread_axis_for_strategy(self, target: TileStrategy) -> int | None:
+    def thread_axis_for_strategy(
+        self, target: TileStrategy, root_grid: TileStrategy | None = None
+    ) -> int | None:
         """Return the starting thread-axis index for a strategy in its branch.
 
+        A strategy that several roots run (their device loops over one
+        registered block size) sits after each root's own grid axes, so it
+        is laid out in the branch of the root whose grid is ``root_grid``,
+        else of the root being generated, where it runs (``_branches_of``).
+
         Strategies that share their entire ``block_ids`` set with an
-        earlier strategy in the branch (e.g. two sibling ``hl.tile`` loops
-        over the same N-axis in a softmax kernel) reuse the earlier
-        strategy's thread axis — they are mutually exclusive in time, so
-        they map to the same hardware lane.  Without this dedup the
-        warp-per-row layout would assign one axis per inner tile loop
-        and bury M on axis 2 or 3.
+        earlier strategy in the branch reuse the earlier strategy's thread
+        axis — they are mutually exclusive in time, so they map to the same
+        hardware lane: the entries of sibling ``hl.tile`` loops over one
+        registered block size in a softmax kernel (one strategy listed once
+        per loop, ``_register_strategy``), and loops over the same blocks in
+        another order.  Without this dedup the warp-per-row layout would
+        assign one axis per inner tile loop and bury M on axis 2 or 3.
 
         This is the launch-side copy of the layout the kernel body emits
         (``BlockSizeTileStrategy._compute_thread_axis_offset``): a reduction
@@ -726,7 +793,9 @@ class TileStrategyDispatch:
         block's axis extent read the other reduction's threads.
 
         A threaded loop several grid roots run (over a block registered on the
-        host) is indexed with one axis, so roots that would place it on
+        host) is laid out in each root's branch where sibling loops share
+        thread axes (``Backend.shares_sibling_thread_axes``).  Elsewhere the
+        body indexes it with one axis, so roots that would place it on
         different axes raise BackendUnsupported.
         """
         sibling_axis = self.collective_sibling_thread_axis(target)
@@ -738,17 +807,20 @@ class TileStrategyDispatch:
         ):
             # A sibling full-slice block indexing another's axis
             # (``CutePersistentReductionEmitter.plan_axis_partner``).
-            return self.thread_axis_for_strategy(target._cute_axis_partner)
+            return self.thread_axis_for_strategy(target._cute_axis_partner, root_grid)
         reserved_axes = self.reserved_reduction_axes()
         reduction_axis_first = (
             CompileEnvironment.current().backend.reduction_axis_first()
         )
-        branches = [b for b in self._strategy_branches() if target in b]
+        branches = self._branches_of(target, root_grid)
         if not branches:
             return None
         if (
             target.thread_axes_used() == 0
             or target not in self._cross_root_strategies()
+            # Where sibling loops share thread axes, each root's body lays
+            # the loop out after its own grid (``_branches_of``).
+            or CompileEnvironment.current().backend.shares_sibling_thread_axes()
         ):
             return self._thread_axis_in_branch(
                 target, branches[0], reserved_axes, reduction_axis_first
@@ -869,11 +941,51 @@ class TileStrategyDispatch:
             any(candidate in branch for candidate in candidates) for branch in branches
         )
 
+    def _branches_of(
+        self, target: TileStrategy, root_grid: TileStrategy | None
+    ) -> list[list[TileStrategy]]:
+        """The branches holding ``target``, those of the root whose grid is
+        ``root_grid`` (else of the root being generated) first: in a kernel of
+        several roots each branch leads with its root's grid, and device
+        loops of several roots over one registered block size run on one
+        strategy, which each root's body lays out after its own grid."""
+        branches = [branch for branch in self._strategy_branches() if target in branch]
+        device_ir = HostFunction.current().device_ir
+        if len(device_ir.grid_block_ids) <= 1:
+            return branches
+        if root_grid is None:
+            root_grid = self._current_root_grid()
+            if root_grid is None:
+                return branches
+        return sorted(branches, key=lambda branch: branch[0] is not root_grid)
+
+    def _block_owners(self, target_block_id: int) -> list[TileStrategy]:
+        """The strategies to ask about ``target_block_id``: every strategy
+        tiling it, in order, or, where several do, the one codegen runs the
+        block's innermost active loop on.
+
+        Loops of several roots can tile one block (a root's grid over a
+        registered block size and another root's device loop over it, or a
+        device loop over more blocks), and inside such a loop the block is
+        laid out as the loop's strategy decides (a lane loop past the third
+        thread axis), whatever the first strategy registered for it says.
+        """
+        owners = [
+            strategy
+            for strategy in self.strategies
+            if target_block_id in strategy.block_ids
+        ]
+        if len(owners) > 1:
+            loops = self._device_function.codegen.active_device_loops.get(
+                target_block_id
+            )
+            if loops:
+                return [loops[-1].strategy]
+        return owners
+
     def thread_axis_for_block_id(self, target_block_id: int) -> int | None:
         """Return the launch thread axis assigned to a specific logical block id."""
-        for strategy in self.strategies:
-            if target_block_id not in strategy.block_ids:
-                continue
+        for strategy in self._block_owners(target_block_id):
             base_axis = self.thread_axis_for_strategy(strategy)
             if base_axis is None:
                 return None
@@ -931,9 +1043,7 @@ class TileStrategyDispatch:
 
     def thread_extent_for_block_id(self, target_block_id: int) -> int | None:
         """Return the live thread extent for a specific logical block id."""
-        for strategy in self.strategies:
-            if target_block_id not in strategy.block_ids:
-                continue
+        for strategy in self._block_owners(target_block_id):
             if isinstance(strategy, ReductionStrategy):
                 count = strategy._reduction_thread_count()
                 return count if count > 0 else None
@@ -1004,10 +1114,8 @@ class TileStrategyDispatch:
         uniform across the CTA, so extra launched threads only duplicate the
         owning thread's in-bounds work.
         """
-        for strategy in self.strategies:
-            if target_block_id not in strategy.block_ids or isinstance(
-                strategy, ReductionStrategy
-            ):
+        for strategy in self._block_owners(target_block_id):
+            if isinstance(strategy, ReductionStrategy):
                 continue
             base_axis = self.thread_axis_for_strategy(strategy)
             if base_axis is None:
@@ -1036,9 +1144,7 @@ class TileStrategyDispatch:
 
     def _thread_extent_expr_for_block_id(self, target_block_id: int) -> str | None:
         """Return the launch-time thread extent expression for a specific block id."""
-        for strategy in self.strategies:
-            if target_block_id not in strategy.block_ids:
-                continue
+        for strategy in self._block_owners(target_block_id):
             for block_id, _local_axis, _size, expr in self._iter_strategy_thread_axes(
                 strategy
             ):
@@ -1086,14 +1192,62 @@ class TileStrategyDispatch:
                 axes.setdefault(base_axis + local_axis, expr)
         return axes
 
+    def _strategy_thread_axis(
+        self,
+        strategy: TileStrategy,
+        target_block_id: int,
+        root_grid: TileStrategy | None = None,
+    ) -> int | None:
+        """The launch thread axis ``strategy`` lays ``target_block_id`` on.
+
+        :meth:`thread_axis_for_block_id` asks the block's first owner; the
+        launch asks each strategy, as loops over a shared registered block
+        size in different roots lay it out on different axes.
+        """
+        base_axis = self.thread_axis_for_strategy(strategy, root_grid)
+        if base_axis is None:
+            return None
+        local_axis_map = getattr(strategy, "_thread_axis_map", None)
+        if callable(local_axis_map):
+            axis_map = local_axis_map()
+            if isinstance(axis_map, dict):
+                local_axis = axis_map.get(target_block_id)
+                if local_axis is not None:
+                    return base_axis + local_axis
+        return base_axis if strategy.thread_axes_used() > 0 else None
+
+    def _strategy_thread_extent(
+        self, strategy: TileStrategy, target_block_id: int
+    ) -> tuple[int | None, str | None]:
+        """The thread extent of ``target_block_id`` under ``strategy``, and its
+        launch-time expression (:meth:`_strategy_thread_axis`); a reduction's
+        extent is its thread count, as in :meth:`thread_extent_for_block_id`."""
+        size: int | None = None
+        expr: str | None = None
+        for (
+            block_id,
+            _local_axis,
+            axis_size,
+            axis_expr,
+        ) in self._iter_strategy_thread_axes(strategy):
+            if block_id == target_block_id:
+                size, expr = axis_size, axis_expr
+                break
+        if isinstance(strategy, ReductionStrategy):
+            count = strategy._reduction_thread_count()
+            size = count if count > 0 else None
+        return size, expr
+
     def _thread_block_dims_for_strategies(
-        self, strategies: Iterable[TileStrategy]
+        self,
+        strategies: Iterable[TileStrategy],
+        root_grid: TileStrategy | None = None,
     ) -> tuple[int, int, int]:
         dims = [1, 1, 1]
         for strategy in strategies:
             for block_id in strategy.block_ids:
-                axis = self.thread_axis_for_block_id(block_id)
-                size = self.thread_extent_for_block_id(block_id)
+                axis = self._strategy_thread_axis(strategy, block_id, root_grid)
+                size = self._strategy_thread_extent(strategy, block_id)[0]
                 if (
                     axis is not None
                     and size is not None
@@ -1114,7 +1268,7 @@ class TileStrategyDispatch:
         dims = [1, 1, 1]
         for branch in branches:
             branch_dims = self._thread_block_dims_for_strategies(
-                self._ordered_strategies_for_branch(branch)
+                self._ordered_strategies_for_branch(branch), branch[0]
             )
             for axis, size in enumerate(branch_dims):
                 dims[axis] = max(dims[axis], size)
@@ -1133,8 +1287,8 @@ class TileStrategyDispatch:
         dims = ["1", "1", "1"]
         for strategy in self._ordered_strategies_for_branch(branches[0]):
             for block_id in strategy.block_ids:
-                axis = self.thread_axis_for_block_id(block_id)
-                size_expr = self._thread_extent_expr_for_block_id(block_id)
+                axis = self._strategy_thread_axis(strategy, block_id)
+                size_expr = self._strategy_thread_extent(strategy, block_id)[1]
                 if axis is None or size_expr is None:
                     continue
                 if axis >= len(dims):

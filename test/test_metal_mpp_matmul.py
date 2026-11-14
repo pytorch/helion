@@ -13383,6 +13383,23 @@ def dot_if_seed(x: torch.Tensor, w: torch.Tensor, flag: torch.Tensor) -> torch.T
 
 
 @helion.kernel(**S)
+def dot_in_else(x: torch.Tensor, y: torch.Tensor, flag: torch.Tensor) -> torch.Tensor:
+    """A dot in an else branch whose result leaves it.  The if branch writes
+    another variable: one that both branches assign is declared inside each
+    branch's block of the shader, out of scope for the code after them."""
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        bias = hl.zeros([tm, tn], dtype=torch.float32)
+        if flag[0] > 0:
+            bias = bias + 1.0
+        else:
+            acc = hl.dot(x[tm, :], y[:, tn])
+        out[tm, tn] = acc + bias
+    return out
+
+
+@helion.kernel(**S)
 def dot_f16_acc(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     out = torch.empty([x.size(0), y.size(1)], dtype=torch.float16, device=x.device)
     for tm, tn in hl.tile([x.size(0), y.size(1)]):
@@ -13458,6 +13475,40 @@ def dot_of_outer_dot(
         for _ in hl.tile(steps.size(0)):
             acc = hl.dot(p.to(w.dtype), w[:, tn], acc=acc * 0.5)
         out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def dot_of_if_dot(
+    x: torch.Tensor, u: torch.Tensor, w: torch.Tensor, flag: torch.Tensor
+) -> torch.Tensor:
+    """``p = x @ u`` in an if branch, then a dot that reads ``p``."""
+    hl.specialize(u.size(1))
+    out = torch.empty([x.size(0), w.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), w.size(1)]):
+        p = hl.zeros([tm, u.size(1)], dtype=torch.float32)
+        if flag[0] > 0:
+            p = hl.dot(x[tm, :], u[:, :])
+        out[tm, tn] = hl.dot(p.to(w.dtype), w[:, tn])
+    return out
+
+
+@helion.kernel(**S)
+def dot_of_else_dot(
+    x: torch.Tensor, u: torch.Tensor, w: torch.Tensor, flag: torch.Tensor
+) -> torch.Tensor:
+    """``p = x @ u`` in an else branch, then a dot that reads ``p``; the if
+    branch writes another variable (``dot_in_else``)."""
+    hl.specialize(u.size(1))
+    out = torch.empty([x.size(0), w.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), w.size(1)]):
+        p = hl.zeros([tm, u.size(1)], dtype=torch.float32)
+        bias = hl.zeros([tm, tn], dtype=torch.float32)
+        if flag[0] > 0:
+            bias = bias * 2.0
+        else:
+            p = hl.dot(x[tm, :], u[:, :])
+        out[tm, tn] = hl.dot(p.to(w.dtype), w[:, tn]) + bias
     return out
 
 
@@ -14372,6 +14423,17 @@ class TestMppWholeKDot(_WholeKDotCase):
         for config in (None, helion.Config(block_sizes=[32, 32, 16])):
             self._mpp(dot_if_seed, (x, w, flag), config, xd @ wd + 1)
 
+    def test_dot_in_an_else_branch(self) -> None:
+        """A dot in an else branch whose result leaves the branch, with an
+        if branch that writes another variable: the planner finds the result
+        the ``_if`` gives back for the dot among the else branch's, where it
+        has another slot than in the ``_if``'s results."""
+        x, y = _randn(32, 64), _randn(64, 48)
+        xd, yd = _cpu64(x, y)
+        for value, ref in ((0.0, xd @ yd), (1.0, torch.ones(32, 48).double())):
+            flag = torch.full([1], value, device=DEVICE)
+            self._mpp(dot_in_else, (x, y, flag), None, ref)
+
     def test_staging_budget(self) -> None:
         """Both float32 operands staged over a ``:`` K of 256 fit threadgroup
         memory at 16 x 16 tiles, not at the default 32 x 32."""
@@ -14509,8 +14571,8 @@ class TestMppWholeKDotRejects(_WholeKDotCase):
 
     def test_operand_computed_from_a_matmul(self) -> None:
         """A matmul's result that reaches an operand other than from that
-        matmul's element loop: from the enclosing graph and through a loop's
-        output."""
+        matmul's element loop: from the enclosing graph, through a loop's
+        output and out of an if or an else branch."""
         x, u, w = _randn(32, 16), _randn(16, 32), _randn(32, 16)
         xd, ud, wd = _cpu64(x, u, w)
         self._scalar(
@@ -14529,6 +14591,15 @@ class TestMppWholeKDotRejects(_WholeKDotCase):
         for config in (None, one):
             ref = (xd @ ud).half().double() @ wd
             self._scalar(dot_of_loop_dot, (x, u, w), config, ref)
+        x, u, w = _randn(32, 16), _randn(16, 32), _randn(32, 16)
+        xd, ud, wd = _cpu64(x, u, w)
+        ref = (xd @ ud).half().double() @ wd
+        full = helion.Config(block_sizes=[16, 16], num_warps=32)
+        for kernel, taken in ((dot_of_if_dot, 1.0), (dot_of_else_dot, 0.0)):
+            for value in (0.0, 1.0):
+                flag = torch.full([1], value, device=DEVICE)
+                expected = ref if value == taken else 0 * ref
+                self._scalar(kernel, (x, u, w, flag), full, expected)
 
     def test_colon_dims_past_one_op(self) -> None:
         """A ``:`` K of 8 is under the table's 16 and one of 257 over its

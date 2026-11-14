@@ -232,6 +232,10 @@ def statement_from_string(template: str, **placeholders: ast.AST) -> ast.stmt:
                         offset=offset_ast, mask=mask_ast)
         # In the f-string, {name} is interpolated to "my_tensor",
         # while {{offset}} becomes {offset} for placeholder replacement
+
+    A placeholder alone on a line may be an ``ast.stmt``, which is substituted
+    as that statement (an indented ``{store}`` line under ``if mask:``); a
+    statement anywhere else fails an assertion.
     """
     location: SourceLocation = current_location()
 
@@ -274,8 +278,22 @@ def statement_from_string(template: str, **placeholders: ast.AST) -> ast.stmt:
         if not isinstance(node, ast.AST):
             return node
 
+        # A statement placeholder on a line of its own is that statement:
+        # the line's ``Expr`` around it would render the statement after a
+        # blank line, and the passes that match the statement would miss
+        # ``Expr(value=<statement>)``.
+        if (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Name)
+            and isinstance(mapping.get(node.value.id), ast.stmt)
+        ):
+            return mapping[node.value.id]
+
         # Replace placeholder names with their corresponding AST nodes
         if isinstance(node, ast.Name) and node.id in mapping:
+            assert not isinstance(mapping[node.id], ast.stmt), (
+                f"statement placeholder in an expression: {template!r}"
+            )
             return mapping[node.id]
 
         # Recursively transform all child nodes and wrap in ExtendedAST subclass

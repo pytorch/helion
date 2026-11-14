@@ -25,6 +25,7 @@ from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import create
 from .compile_environment import CompileEnvironment
+from .compile_environment import FixedBlockSizeSource
 from .compile_environment import _constrain_unify
 from .compile_environment import warning
 from .fragment_comparison import guard_fragment_comparison
@@ -1735,5 +1736,19 @@ def propagate_types(func: HostFunction) -> None:
         prop = _create_type_propagation(func)
         for stmt in func.body:
             prop.visit(stmt)
+        env = CompileEnvironment.current()
+        env.inline_config_symbols = frozenset(
+            symbol
+            for symbol in env.config_value_expressions
+            if isinstance(symbol, sympy.Symbol) and symbol not in func.expr_to_origin
+        )
+        for info in env.block_sizes:
+            source = info.block_size_source
+            if isinstance(source, FixedBlockSizeSource) and isinstance(
+                source.value, torch.SymInt
+            ):
+                source.varies_with_config = bool(
+                    source.value._sympy_().free_symbols & env.inline_config_symbols
+                )
         _check_no_stmts_between_loops(func.body)
         _place_pdl_ops(func.body)

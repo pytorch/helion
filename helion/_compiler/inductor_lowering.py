@@ -16,6 +16,7 @@ from torch._dynamo.convert_frame import compile_lock
 from torch._inductor import config as inductor_config
 from torch._inductor import ir
 from torch._inductor.codegen.simd import SIMDKernelFeatures
+from torch._inductor.codegen.simd import constant_repr
 from torch._inductor.codegen.triton import TritonKernel
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer
@@ -1165,10 +1166,6 @@ class ReductionLowering(InductorLowering):
 
         if len(inputs) == 1:
             repr_input = inputs[0]
-        elif node.meta["orig_node"].target == torch.ops.aten.var_mean.correction:
-            assert len(inputs) == 2
-            # `inputs[0]` is the original input tensor to var_mean
-            repr_input = inputs[0]
         else:
             # TODO(jansel): combine multiple inputs into a single fake value
             raise NotImplementedError("reductions with >1 input")
@@ -1200,6 +1197,18 @@ class ReductionLowering(InductorLowering):
         env.backend.validate_reduction_input(strategy.block_index, repr_input)
         if (emitter := strategy.emitter) is not None:
             emitter.mark_cross_block_vec_lanes(state)
+        from .reduction_strategy import PersistentReductionStrategy
+
+        if isinstance(strategy, PersistentReductionStrategy):
+            output_name = self._mask_padded_range_lanes(
+                ctx,
+                node,
+                output_name,
+                reduction,
+                dims[0],
+                repr_input,
+                env.block_sizes[strategy.block_index].size,
+            )
         result_ast = strategy.codegen_reduction(
             state,
             output_name,
@@ -1234,6 +1243,50 @@ class ReductionLowering(InductorLowering):
             if value == 0:
                 return value
         return None
+
+    @staticmethod
+    def _mask_padded_range_lanes(
+        ctx: LoweringContext,
+        node: torch.fx.Node,
+        input_name: str,
+        reduction: Reduction,
+        dim: int,
+        fake_input: torch.Tensor,
+        block_size: object,
+    ) -> str:
+        """The reduction's input with the lanes of a padded ``hl.arange``
+        past its length set to the reduction's identity.
+
+        ``hl.load(x, [i, hl.arange(200)])`` has 256 lanes, and an op between
+        the load and the reduction makes the 56 past the range nonzero
+        (``row + 1.0``, an ``amax`` of a negative row): reduced, they would
+        count as elements, also in a mean that divides by 200.  A reduction
+        dim of the range's own length (a tile kernel's) masks them already, and
+        a backend that masks them itself leaves the input alone
+        (``Backend.mask_padded_range_lanes``).  ``codegen`` takes reductions
+        of one tensor input, whose fake value ``fake_input`` is.
+        """
+        from .inductor_lowering_extra import padded_range_lengths
+
+        (value,) = [
+            arg
+            for arg in node.all_input_nodes
+            if isinstance(arg.meta["val"], torch.Tensor)
+        ]
+        lengths = padded_range_lengths(value, fake_input.ndim)
+        if (length := lengths[dim]) is None or block_size == length:
+            return input_name
+        identity = Reduction.default_accumulator(
+            reduction.reduction_type, reduction.src_dtype
+        )
+        # A scalar, as ``add_input_mask`` asserts of every reduction.
+        assert isinstance(identity, (bool, int, float))
+        masked = CompileEnvironment.current().backend.mask_padded_range_lanes(
+            input_name, length, dim, fake_input.ndim, constant_repr(identity)
+        )
+        if masked is None:
+            return input_name
+        return ctx.cg.lift(expr_from_string(masked), prefix="padded_range_masked").id
 
     @staticmethod
     def _get_reduction_dims(node: torch.fx.Node, fake_input: torch.Tensor) -> list[int]:

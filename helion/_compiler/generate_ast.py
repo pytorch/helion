@@ -472,8 +472,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self,
         body: list[ast.AST],
         stmt: ast.AST | str | None,
+        axis_sizes: dict[int, int] | None = None,
     ) -> None:
-        """Append a statement while preserving its exact FX owner."""
+        """Append a statement while preserving its exact FX owner; its thread
+        indices count toward the launch on ``axis_sizes``, by default the
+        thread axes active where it is emitted."""
 
         if stmt is None:
             return
@@ -485,7 +488,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             self._statements_by_owner_node_id.setdefault(id(owner_node), []).append(
                 (body, stmt)
             )
-        self._record_statement_thread_references([stmt])
+        self._record_statement_thread_references([stmt], axis_sizes)
 
     def add_statement(self, stmt: ast.AST | str | None) -> None:
         self.append_statement(self.statements_stack[-1], stmt)
@@ -869,6 +872,10 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 for finalize in device_loop.body_finalizers:
                     finalize()
             finally:
+                # The loop's nest (its header, the lane loops around the body
+                # and their setup) is emitted below, once the loop is closed,
+                # but its thread indices run on the loop's own axes too.
+                nest_axis_sizes = self._current_active_thread_axis_sizes()
                 for idx in device_loop.block_ids:
                     self.active_device_loops[idx].pop()
         # The body is complete: the CuTe per-thread lane loops nested around
@@ -878,7 +885,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             for statement in self.device_function.cta_barrier():
                 self.add_statement(statement)
         self.statements_stack[-1].extend(device_loop.outer_prefix)
-        self.add_statement(device_loop.for_node)
+        self.append_statement(
+            self.statements_stack[-1], device_loop.for_node, nest_axis_sizes
+        )
         self.statements_stack[-1].extend(device_loop.outer_suffix)
 
     @contextlib.contextmanager
@@ -1228,7 +1237,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         elif isinstance(type_info := node._type_info, TileIndexType):
             return expr_from_string(
                 self.host_function.literal_expr(
-                    self.device_function.resolved_block_size(type_info.block_id)
+                    self.device_function.resolved_block_size(type_info.block_id),
+                    self.device_function.config,
                 )
             )
         elif isinstance(type_info, SequenceType) and all(
@@ -1244,7 +1254,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     [
                         self.device_function.resolved_block_size(x.block_id)
                         for x in values
-                    ]
+                    ],
+                    self.device_function.config,
                 )
             )
         elif isinstance(fn_type_info := func_node._type_info, CallableType) and (

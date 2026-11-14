@@ -21,6 +21,9 @@ from helion._compiler.flydsl.backend import FlyDSLBackend
 from helion._compiler.metal.backend import MetalBackend
 from helion._compiler.reduction_strategy import PersistentReductionStrategy
 from helion._testing import import_example
+from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import cpu_target
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.exc import ReductionOnNonTile
@@ -150,3 +153,26 @@ def test_pallas_block_size_slice_keeps_its_extent() -> None:
 
     bound = kernel.bind((torch.randn(32, 16),))
     assert not any(info.reduction for info in bound.env.block_sizes)
+
+
+def _tile_column_max_offsets(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_a, tile_b in hl.tile(x.size()):
+        tile = x[tile_a, tile_b]
+        out[tile_a, tile_b] = tile - tile.amax(0, keepdim=True)
+    return out
+
+
+@skipUnlessBackends(["triton", "cute"])
+@helion._testing.skipIfRefEager("requires compiler IR")
+def test_a_reduction_along_a_grid_tile_is_not_pointwise() -> None:
+    # The reduction seeds do not size a partial reduction along a grid tile,
+    # but the kernel depends on the tile: no pointwise fact, so CuTe does not
+    # re-offer the flatten choice type propagation dropped.
+    with cpu_target():
+        bound = cpu_bind(
+            helion.kernel(_tile_column_max_offsets, static_shapes=True),
+            (torch.randn(8, 32),),
+        )
+    assert not bound.config_spec.pointwise_facts
+    assert not bound.config_spec.flatten_loops

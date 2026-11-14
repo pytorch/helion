@@ -245,6 +245,8 @@ from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipUnlessTcgen05RuntimeNPtx
 from helion._testing.cute_repeated_axes import full_slice_tiled_dot
+from helion._testing.shared_block_kernels import root_beside_a_device_loop
+from helion._testing.shared_block_kernels import shared_block_softmax
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 import helion.language as hl
@@ -24048,6 +24050,14 @@ def _cute_four_nested_tiles(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+_cute_root_beside_a_device_loop = helion.kernel(
+    root_beside_a_device_loop, backend="cute", static_shapes=True
+)
+_cute_shared_block_softmax = helion.kernel(
+    shared_block_softmax, backend="cute", static_shapes=True
+)
+
+
 class TestHostTensorRoots(unittest.TestCase):
     """``collect_host_tensor_roots``: the storage a host name may share."""
 
@@ -24190,6 +24200,30 @@ class TestCuteFoldPermuteAndThreadAxes(unittest.TestCase):
         self.assertIn("block=(4, 4, 4)", code)
         self.assertRegex(code, r"for lane_\d+ in range\(4\)")
         torch.testing.assert_close(out, x * 2)
+
+    def test_block_two_loops_share_demotes_in_both(self) -> None:
+        # The grid takes the three launch axes, so the shared block runs as
+        # one thread's lane loop in both of its loops, and the row reductions
+        # over it must not combine lanes across the launch's other rows
+        # (test_cute_shared_block_loops.py checks the code).
+        torch.manual_seed(0)
+        x = torch.randn(2, 2, 2, 64, device=DEVICE)
+        out = code_and_output(
+            _cute_shared_block_softmax,
+            (x,),
+            block_sizes=[32, 2, 2, 2],
+            num_threads=[32, 2, 2, 2],
+        )[1]
+        torch.testing.assert_close(out, torch.softmax(x, dim=-1))
+
+    def test_device_loop_beside_a_root_sharing_its_block(self) -> None:
+        # The second root's device loop shares the first root's registered
+        # block size (test_cute_shared_block_loops.py checks the layout).
+        x = torch.randn(64, device=DEVICE)
+        y = torch.randn(8, 64, device=DEVICE)
+        doubled, shifted = code_and_output(_cute_root_beside_a_device_loop, (x, y))[1]
+        torch.testing.assert_close(doubled, x * 2)
+        torch.testing.assert_close(shifted, y + 1)
 
     def test_thread_axis_beyond_launch_rejected(self) -> None:
         backend = CuteBackend()

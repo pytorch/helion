@@ -1697,6 +1697,27 @@ class _PeerViewCapture(TorchDispatchMode):
         return result
 
 
+def _config_value_names(value: object) -> list[str]:
+    """The tunables the config values ``value`` reads derive from
+    (``config_value_expressions``), sorted."""
+    if not isinstance(value, torch.SymInt):
+        return []
+    expressions = CompileEnvironment.current().config_value_expressions
+    pending = [
+        expressions[symbol]
+        for symbol in value._sympy_().free_symbols
+        if symbol in expressions
+    ]
+    names: set[str] = set()
+    while pending:
+        for argument in pending.pop().arguments:
+            if isinstance(argument, ConfigValueExpression):
+                pending.append(argument)
+            elif isinstance(argument, str):
+                names.add(argument)
+    return sorted(names)
+
+
 class CallableType(LiteralType):
     # pyrefly: ignore [bad-override]
     value: Callable[..., object]
@@ -1737,6 +1758,19 @@ class CallableType(LiteralType):
             and origin.is_device()
         ):
             raise exc.UnsupportedSplitOperation(op="torch.tensor_split")
+        if origin.is_device() and self._config_value_operation() == "next_power_of_2":
+            # Device code would run the helper on the hints of the tunables it
+            # reads (8192), not on each config's values; the host records it
+            # per config.
+            for arg in [*args, *kwargs.values()]:
+                if isinstance(arg, SymIntType) and (
+                    names := _config_value_names(arg.value)
+                ):
+                    raise exc.NotAllowedOnDevice(
+                        f"next_power_of_2 over the tunable {names[0]!r}, which "
+                        "device code would compute at the tunable's hint whatever "
+                        "the config (compute it before the loop),"
+                    )
         if is_api_func(fn := self.value):
             if fn._is_device_only and origin.is_host():
                 raise exc.DeviceAPIOnHost(fn.__qualname__)

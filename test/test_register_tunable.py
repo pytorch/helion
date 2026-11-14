@@ -333,6 +333,28 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
             PowerOfTwoFragment,
         )
 
+    def test_inline_host_helper_block_size(self):
+        """A host helper over a tunable written inline in a block size has no
+        host variable naming its result; the tile takes the value the helper
+        gives for the config."""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel_with_inline_helper(x: torch.Tensor) -> torch.Tensor:
+            (n,) = x.size()
+            out = torch.empty_like(x)
+            foo = hl.register_tunable("foo", PowerOfTwoFragment(16, 256))
+            for tile_n in hl.tile([n], block_size=[helion.next_power_of_2(foo)]):
+                out[tile_n] = x[tile_n] * 2.0
+            return out
+
+        x = torch.randn(1000, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(kernel_with_inline_helper, (x,), foo=64)
+        torch.testing.assert_close(result, x * 2.0)
+        if not self._in_ref_eager_mode:
+            # Masking keeps the output right at any block size: check the one
+            # the config gives (the default foo is 16).
+            self.assertRegex(code, r"_BLOCK_SIZE_0 = (tl\.constexpr\()?64\b")
+
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @patch.object(loops, "_supports_warp_specialize", lambda: False)
     def test_integer_fragment(self):

@@ -14,7 +14,6 @@ import torch
 
 from .. import exc
 from .. import language as hl
-from ..autotuner.config_spec import SIZED_REDUCTION_CATEGORIES
 from ..autotuner.config_spec import AccumulatorFact
 from ..autotuner.config_spec import DotAxes
 from ..autotuner.config_spec import DotAxisKind
@@ -175,11 +174,16 @@ def _immovable_extent(
     spec: ConfigSpec,
     block_id: int,
 ) -> int | None:
-    """Return the per-program extent of an axis the config cannot move."""
+    """Return the per-program extent of an axis the config cannot move: not
+    one an inline host helper over tunables sizes, which each config gives
+    its own value (``FixedBlockSizeSource.varies_with_config``)."""
     if not (0 <= block_id < len(env.block_sizes)):
         return None
     info = env.block_sizes[block_id]
-    if not isinstance(info.block_size_source, FixedBlockSizeSource):
+    if (
+        not isinstance(info.block_size_source, FixedBlockSizeSource)
+        or info.block_size_source.varies_with_config
+    ):
         return None
     try:
         value = info.block_size_source.from_config(
@@ -940,7 +944,7 @@ def _store_axis_key(
 
 def _classify_load_dataflow(
     load_node: torch.fx.Node,
-    reduction_nodes: set[int],
+    reduction_nodes: Container[int],
     env: CompileEnvironment,
 ) -> tuple[set[int], tuple[tuple[int | None, ...], ...]]:
     """Trace a load forward to reductions and stores without crossing either."""
@@ -1577,146 +1581,178 @@ class DeviceIRAnalysis:
 
     def memory_op_facts(
         self,
+        device_ir: DeviceIR,
         env: CompileEnvironment,
         host: HostFunction,
     ) -> list[MemoryOpFact]:
-        """Record one fact for every load/store in indexing-slot order."""
+        """Record one fact for every load/store, in the order code generation
+        lowers them.
+
+        Code generation numbers the ``indexing`` and ``load_eviction_policies``
+        slots in the order it lowers the loads and stores
+        (``codegen_node_order``): a root's loads ahead of a nested loop take
+        their slots before the loop's.  This is the order of the configs that
+        roll no reduction; ``DeviceIR.config_memory_op_facts`` gives the
+        order of any config.  Codegen lowers a ``while`` condition ahead of the
+        loop and again at the end of its body: a load there has a fact for
+        each, unless the backend's loads keep their slots when lowered again
+        (``Backend.relowered_memory_ops_take_new_slots``).  A load of a
+        ``tile.index`` value or of a stack tensor takes no ``indexing`` slot
+        (``takes_indexing_slot``): its fact keeps its place and its
+        ``load_eviction_policies`` slot (the Pallas lowering gives it none,
+        but reads neither list), and has one of the ``indexing`` slots after
+        the others, which code generation never reads.  Each node keeps its
+        facts in ``MEMORY_OP_FACT_META``, which the copies a config's codegen
+        graphs make of it carry.
+
+        Where a config's block sizes decide an ``if``'s condition, the CuTe
+        lowering emits only the live branch: the loads of the other branch
+        take no ``load_eviction_policies`` slots in its code, and the loads
+        after them take earlier ones than here.
+        """
         from ..language import memory_ops
+        from .device_ir import MEMORY_OP_FACT_META
+        from .device_ir import memory_op_slots
 
         load_op = memory_ops.load
         store_op = memory_ops.store
         operand_positions = matmul_operand_positions()
         operands: dict[torch.fx.Node, str] = {}
         records: list[tuple[torch.fx.Node, MemoryOpFact]] = []
-        memory_op_index = 0
         eviction_index = 0
 
         for graph_analysis in self.graphs:
-            reduction_axis_by_id = graph_analysis.reduction_axis_by_node_id
-            reduction_nodes = set(reduction_axis_by_id)
             for node in graph_analysis.nodes:
-                if node.op != "call_function":
-                    continue
-
-                positions = operand_positions.get(node.target)
-                if positions is not None:
-                    for arg_index, operand in (
-                        (positions[0], "lhs"),
-                        (positions[1], "rhs"),
-                    ):
-                        if arg_index < len(node.args):
-                            load = trace_back_to_load(node.args[arg_index], load_op)
-                            if load is not None:
-                                operands.setdefault(load, operand)
-                    continue
-
-                is_load = node.target is load_op
-                if not (is_load or node.target is store_op):
-                    continue
-
-                this_eviction_index: int | None = None
-                if is_load and _load_needs_eviction_tunable(node):
-                    this_eviction_index = eviction_index
-                    eviction_index += 1
-
-                fake = _accessed_tensor_fake(node)
-                origin = host.tensor_to_origin.get(fake) if fake is not None else None
-
-                reductions_fed: tuple[tuple[int, int], ...] = ()
-                stores_fed: tuple[tuple[int | None, ...], ...] = ()
-                if is_load:
-                    feeds, stores_fed = _classify_load_dataflow(
-                        node,
-                        reduction_nodes,
-                        env,
-                    )
-                    per_axis: dict[int, int] = {}
-                    for fed_id in feeds:
-                        axis = reduction_axis_by_id[fed_id]
-                        per_axis[axis] = per_axis.get(axis, 0) + 1
-                    reductions_fed = tuple(sorted(per_axis.items()))
-
-                indexed_block_ids: tuple[int | None, ...] = ()
-                subscript_block_ids: tuple[int | None, ...] = ()
-                subscript_strides: tuple[int, ...] = ()
-                subscript_index_scales: tuple[int, ...] = ()
-                subscript_affine_block_ids: tuple[int | None, ...] = ()
-                subscript_extents: tuple[int, ...] = ()
-                inner_extent: int | None = None
-                accessed_numel = 0
-                if fake is not None:
-                    accessed_numel = 1
-                    fake_strides = fake.stride()
-                    for dim_index, dim_size in enumerate(fake.shape):
-                        if fake_strides[dim_index] != 0:
-                            accessed_numel *= env.size_hint(dim_size)
-                    index_list = node.args[1] if len(node.args) >= 2 else None
-                    if isinstance(index_list, (list, tuple)):
-                        indexed_positions = [
-                            position
-                            for position, subscript in enumerate(index_list)
-                            if not isinstance(subscript, int) and position < fake.ndim
-                        ]
-                        indexed_block_ids = tuple(
-                            env.resolve_block_id(fake.shape[position])
-                            for position in indexed_positions
-                        )
-                        subscript_block_ids = tuple(
-                            _subscript_block_id(env, index_list[position])
-                            for position in indexed_positions
-                        )
-                        subscript_strides = tuple(
-                            env.size_hint(fake_strides[position])
-                            for position in indexed_positions
-                        )
-                        affine = [
-                            subscript_index_scale(env, index_list[position])
-                            for position in indexed_positions
-                        ]
-                        subscript_affine_block_ids = tuple(
-                            block_id for block_id, _scale in affine
-                        )
-                        subscript_index_scales = tuple(
-                            scale for _block_id, scale in affine
-                        )
-                        subscript_extents = tuple(
-                            env.size_hint(fake.shape[position])
-                            for position in indexed_positions
-                        )
-                    if fake.ndim >= 2:
-                        inner_extent = env.size_hint(fake.shape[-1])
-
-                records.append(
-                    (
-                        node,
-                        MemoryOpFact(
-                            indexing_index=memory_op_index,
-                            kind="load" if is_load else "store",
-                            eviction_index=this_eviction_index,
-                            tensor_name=origin.root_rw_name() if origin else None,
-                            dtype=fake.dtype if fake is not None else None,
-                            ndim=fake.ndim if fake is not None else 0,
-                            num_reuses=len(node.users) if is_load else 0,
-                            matmul_operand=None,
-                            graph_id=graph_analysis.graph_id,
-                            reductions_fed=reductions_fed,
-                            stores_fed=stores_fed,
-                            indexed_block_ids=indexed_block_ids,
-                            inner_extent=inner_extent,
-                            subscript_block_ids=subscript_block_ids,
-                            subscript_strides=subscript_strides,
-                            subscript_index_scales=subscript_index_scales,
-                            subscript_affine_block_ids=subscript_affine_block_ids,
-                            subscript_extents=subscript_extents,
-                            accessed_numel=accessed_numel,
-                        ),
-                    )
+                positions = (
+                    operand_positions.get(node.target)
+                    if node.op == "call_function"
+                    else None
                 )
-                memory_op_index += 1
+                if positions is None:
+                    continue
+                for arg_index, operand in (
+                    (positions[0], "lhs"),
+                    (positions[1], "rhs"),
+                ):
+                    if arg_index < len(node.args):
+                        load = trace_back_to_load(node.args[arg_index], load_op)
+                        if load is not None:
+                            operands.setdefault(load, operand)
 
-        return [
-            fact._replace(matmul_operand=operands.get(node)) for node, fact in records
-        ]
+        for graph_id, node, memory_op_index in memory_op_slots(
+            device_ir.graphs, device_ir.root_ids
+        ):
+            is_load = node.target is load_op
+            if not (is_load or node.target is store_op):
+                continue
+            graph_analysis = self.by_id[graph_id]
+            reduction_axis_by_id = graph_analysis.reduction_axis_by_node_id
+            this_eviction_index: int | None = None
+            if is_load and _load_needs_eviction_tunable(node):
+                this_eviction_index = eviction_index
+                eviction_index += 1
+
+            fake = _accessed_tensor_fake(node)
+            origin = host.tensor_to_origin.get(fake) if fake is not None else None
+
+            reductions_fed: tuple[tuple[int, int], ...] = ()
+            stores_fed: tuple[tuple[int | None, ...], ...] = ()
+            if is_load:
+                feeds, stores_fed = _classify_load_dataflow(
+                    node,
+                    reduction_axis_by_id.keys(),
+                    env,
+                )
+                per_axis: dict[int, int] = {}
+                for fed_id in feeds:
+                    axis = reduction_axis_by_id[fed_id]
+                    per_axis[axis] = per_axis.get(axis, 0) + 1
+                reductions_fed = tuple(sorted(per_axis.items()))
+
+            indexed_block_ids: tuple[int | None, ...] = ()
+            subscript_block_ids: tuple[int | None, ...] = ()
+            subscript_strides: tuple[int, ...] = ()
+            subscript_index_scales: tuple[int, ...] = ()
+            subscript_affine_block_ids: tuple[int | None, ...] = ()
+            subscript_extents: tuple[int, ...] = ()
+            inner_extent: int | None = None
+            accessed_numel = 0
+            if fake is not None:
+                accessed_numel = 1
+                fake_strides = fake.stride()
+                for dim_index, dim_size in enumerate(fake.shape):
+                    if fake_strides[dim_index] != 0:
+                        accessed_numel *= env.size_hint(dim_size)
+                index_list = node.args[1] if len(node.args) >= 2 else None
+                if isinstance(index_list, (list, tuple)):
+                    indexed_positions = [
+                        position
+                        for position, subscript in enumerate(index_list)
+                        if not isinstance(subscript, int) and position < fake.ndim
+                    ]
+                    indexed_block_ids = tuple(
+                        env.resolve_block_id(fake.shape[position])
+                        for position in indexed_positions
+                    )
+                    subscript_block_ids = tuple(
+                        _subscript_block_id(env, index_list[position])
+                        for position in indexed_positions
+                    )
+                    subscript_strides = tuple(
+                        env.size_hint(fake_strides[position])
+                        for position in indexed_positions
+                    )
+                    affine = [
+                        subscript_index_scale(env, index_list[position])
+                        for position in indexed_positions
+                    ]
+                    subscript_affine_block_ids = tuple(
+                        block_id for block_id, _scale in affine
+                    )
+                    subscript_index_scales = tuple(scale for _block_id, scale in affine)
+                    subscript_extents = tuple(
+                        env.size_hint(fake.shape[position])
+                        for position in indexed_positions
+                    )
+                if fake.ndim >= 2:
+                    inner_extent = env.size_hint(fake.shape[-1])
+
+            records.append(
+                (
+                    node,
+                    MemoryOpFact(
+                        indexing_index=memory_op_index,
+                        kind="load" if is_load else "store",
+                        eviction_index=this_eviction_index,
+                        tensor_name=origin.root_rw_name() if origin else None,
+                        dtype=fake.dtype if fake is not None else None,
+                        ndim=fake.ndim if fake is not None else 0,
+                        num_reuses=len(node.users) if is_load else 0,
+                        matmul_operand=None,
+                        graph_id=graph_analysis.graph_id,
+                        reductions_fed=reductions_fed,
+                        stores_fed=stores_fed,
+                        indexed_block_ids=indexed_block_ids,
+                        inner_extent=inner_extent,
+                        subscript_block_ids=subscript_block_ids,
+                        subscript_strides=subscript_strides,
+                        subscript_index_scales=subscript_index_scales,
+                        subscript_affine_block_ids=subscript_affine_block_ids,
+                        subscript_extents=subscript_extents,
+                        accessed_numel=accessed_numel,
+                    ),
+                )
+            )
+
+        facts = []
+        node_facts: dict[torch.fx.Node, list[MemoryOpFact]] = {}
+        for node, fact in records:
+            fact = fact._replace(matmul_operand=operands.get(node))
+            node_facts.setdefault(node, []).append(fact)
+            facts.append(fact)
+        for node, lowered in node_facts.items():
+            node.meta[MEMORY_OP_FACT_META] = tuple(lowered)
+        return facts
 
     def tile_accesses(
         self,
@@ -1727,6 +1763,7 @@ class DeviceIRAnalysis:
         """Record allocation-coordinate accesses used for cross-root scheduling."""
         from ..language import memory_ops
         from ..language.atomic_ops import ATOMIC_OPS
+        from .device_ir import memory_op_slots
         from .tile_dependency import TileAccess
         from .tile_dependency import owner_roots_by_graph_id
 
@@ -1736,7 +1773,15 @@ class DeviceIRAnalysis:
         graph_owners = owner_roots_by_graph_id(device_ir)
         allocation_ids: dict[torch.UntypedStorage, int] = {}
         accesses: list[TileAccess] = []
-        memory_op_index = 0
+        # The indexing slot of each load and store: codegen numbers them in
+        # the order it lowers them (one in a ``while`` condition keeps its
+        # first slot here).
+        slots: dict[torch.fx.Node, int] = {}
+        for _graph_id, node, slot in memory_op_slots(
+            device_ir.graphs, device_ir.root_ids
+        ):
+            if node.target in (memory_ops.load, memory_ops.store):
+                slots.setdefault(node, slot)
 
         for graph_analysis in self.graphs:
             for graph_node_index, node in enumerate(graph_analysis.nodes):
@@ -1867,7 +1912,7 @@ class DeviceIRAnalysis:
                     accesses.append(
                         TileAccess(
                             access_id=len(accesses),
-                            memory_op_index=memory_op_index if not is_atomic else -1,
+                            memory_op_index=(slots[node] if not is_atomic else -1),
                             graph_id=graph_analysis.graph_id,
                             root=owner_root,
                             allocation_id=allocation_id,
@@ -1893,8 +1938,6 @@ class DeviceIRAnalysis:
                             affine_subscript_ranges=affine_subscript_ranges,
                         )
                     )
-                if not is_atomic:
-                    memory_op_index += 1
 
         return tuple(accesses)
 
@@ -1902,7 +1945,12 @@ class DeviceIRAnalysis:
         self,
         spec: ConfigSpec,
     ) -> PointwiseElementwiseFact | None:
-        """Build the fact for a pure, tile-independent elementwise kernel."""
+        """Build the fact for a pure, tile-independent elementwise kernel.
+
+        Any reduction rules it out, including the ones the reduction seeds do
+        not size (``SIZED_REDUCTION_CATEGORIES``): a partial one along a grid
+        tile (``tile.amax(0)``) depends on the tile.
+        """
         from ..language import memory_ops
         from ..language.atomic_ops import ATOMIC_OPS
         from ..language.inline_asm_ops import inline_asm_elementwise
@@ -1912,11 +1960,11 @@ class DeviceIRAnalysis:
         from ..language.scan_ops import _associative_scan
 
         reduction_fact = spec.reduction_kernel_fact
-        has_sized_reduction = reduction_fact is not None and any(
-            descriptor.category in SIZED_REDUCTION_CATEGORIES
-            for descriptor in reduction_fact.reductions
-        )
-        if has_sized_reduction or spec.matmul_facts or spec.accumulator_facts:
+        if (
+            (reduction_fact is not None and reduction_fact.reductions)
+            or spec.matmul_facts
+            or spec.accumulator_facts
+        ):
             return None
         if not spec.memory_op_facts or not spec.block_sizes:
             return None
