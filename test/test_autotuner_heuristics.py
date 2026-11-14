@@ -391,6 +391,18 @@ A100_HARDWARE = HardwareInfo(
     runtime_version="12.8",
     compute_capability="sm80",
 )
+A10G_HARDWARE = HardwareInfo(
+    device_kind="cuda",
+    hardware_name="NVIDIA A10G",
+    runtime_version="12.8",
+    compute_capability="sm86",
+)
+RTX5080_HARDWARE = HardwareInfo(
+    device_kind="cuda",
+    hardware_name="NVIDIA GeForce RTX 5080",
+    runtime_version="13.0",
+    compute_capability="sm120",
+)
 
 
 def _grouped_worklist_with_viewed_inputs(
@@ -5830,19 +5842,17 @@ class TestTritonReductionHeuristicUnit(TestCase):
 
     def test_not_eligible_without_single_reduction_tile(self) -> None:
         env = MagicMock()
-        # Pin the sm90 target so this exercises the STRUCTURAL gate, not the hardware gate
-        # (is_eligible now checks hardware first).
-        with patch("helion._hardware.get_hardware_info", return_value=HOPPER_HARDWARE):
-            # No reduction loop -> not a reduction.
-            spec = ConfigSpec(backend=TritonBackend())
-            spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))
-            env.config_spec = spec
-            self.assertFalse(TritonReductionHeuristic.is_eligible(env, MagicMock()))
-            # A matmul fact disqualifies even a 1-tile/1-reduction shape.
-            spec_mm = self._reduction_spec(reduction_size_hint=1024)
-            spec_mm.matmul_facts = [MagicMock()]
-            env.config_spec = spec_mm
-            self.assertFalse(TritonReductionHeuristic.is_eligible(env, MagicMock()))
+        # The structural gate runs before the hardware gate, so no hardware mock is needed.
+        # No reduction loop -> not a reduction.
+        spec = ConfigSpec(backend=TritonBackend())
+        spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))
+        env.config_spec = spec
+        self.assertFalse(TritonReductionHeuristic.is_eligible(env, MagicMock()))
+        # A matmul fact disqualifies even a 1-tile/1-reduction shape.
+        spec_mm = self._reduction_spec(reduction_size_hint=1024)
+        spec_mm.matmul_facts = [MagicMock()]
+        env.config_spec = spec_mm
+        self.assertFalse(TritonReductionHeuristic.is_eligible(env, MagicMock()))
 
     @onlyBackends(["triton"])
     @skipIfRefEager("Compiler heuristics are not collected in ref eager mode")
@@ -5923,15 +5933,7 @@ class TestTritonReductionHeuristicUnit(TestCase):
         cases = [
             (HOPPER_HARDWARE, TritonReductionHeuristic),
             (BLACKWELL_HARDWARE, TritonReductionHeuristic),
-            (
-                HardwareInfo(
-                    device_kind="cuda",
-                    hardware_name="NVIDIA A10G",
-                    runtime_version="12.8",
-                    compute_capability="sm86",
-                ),
-                TritonNarrowReductionHeuristic,
-            ),
+            (A10G_HARDWARE, TritonNarrowReductionHeuristic),
         ]
         tracks = [
             TritonReductionHeuristic,
@@ -5953,6 +5955,88 @@ class TestTritonReductionHeuristicUnit(TestCase):
                 self.assertIsNotNone(seed)
                 self.assertEqual(len(seed.config["block_sizes"]), 1)
                 self.assertGreaterEqual(seed.config["block_sizes"][0], 1)
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Compiler heuristics are not collected in ref eager mode")
+    def test_user_tiled_reduction_seeds_off_target_without_promotion(self) -> None:
+        # The narrow fallback claims only standard reductions, so the tuned class also seeds
+        # a user-tiled reduction on other CUDA arches. It promotes only on its tuned targets.
+        def two_pass_softmax(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            block_m = hl.register_block_size(m)
+            block_n = hl.register_block_size(n)
+            for tile_m in hl.tile(m, block_size=block_m):
+                mi = hl.full([tile_m], float("-inf"), dtype=torch.float32)
+                di = hl.zeros([tile_m], dtype=torch.float32)
+                for tile_n in hl.tile(n, block_size=block_n):
+                    values = x[tile_m, tile_n]
+                    mi_next = torch.maximum(mi, torch.amax(values, dim=1))
+                    di = di * torch.exp(mi - mi_next) + torch.exp(
+                        values - mi_next[:, None]
+                    ).sum(dim=1)
+                    mi = mi_next
+                for tile_n in hl.tile(n, block_size=block_n):
+                    values = x[tile_m, tile_n]
+                    out[tile_m, tile_n] = torch.exp(values - mi[:, None]) / di[:, None]
+            return out
+
+        x = torch.randn(256, 8192, device=DEVICE, dtype=HALF_DTYPE)
+        # (hardware, the seed becomes the autotune-off default).
+        cases = [
+            (HOPPER_HARDWARE, True),
+            (RTX5080_HARDWARE, False),
+            (A100_HARDWARE, False),
+        ]
+        for hardware, promoted in cases:
+            with (
+                self.subTest(arch=hardware.compute_capability),
+                patch("helion._hardware.get_hardware_info", return_value=hardware),
+                patch("helion.runtime.get_num_sm", return_value=132),
+            ):
+                bound = helion.kernel(two_pass_softmax, backend="triton").bind((x,))
+                env, device_ir = bound.env, bound.host_function.device_ir
+                spec = bound.config_spec
+                self.assertFalse(
+                    TritonNarrowReductionHeuristic.is_eligible(env, device_ir)
+                )
+                self.assertEqual(spec.autotuner_heuristics, ["triton_reduction"])
+                self.assertEqual(len(spec.compiler_seed_configs), 1)
+                seed = spec.compiler_seed_configs[0]
+                # One row per program; the column tile covers the whole row.
+                self.assertEqual(seed.config["block_sizes"], [1, 8192])
+                self.assertEqual(seed.config["num_warps"], 16)
+                self.assertIs(TritonReductionHeuristic.should_promote(env), promoted)
+                self.assertIs(
+                    spec.default_config() != spec.autotune_reference_config(),
+                    promoted,
+                )
+        # ROCm gets no seed: the occupancy model counts 32-lane warps against CUDA limits.
+        with patch("helion._hardware.get_hardware_info", return_value=MI350_HARDWARE):
+            spec = (
+                helion.kernel(two_pass_softmax, backend="triton").bind((x,)).config_spec
+            )
+            self.assertNotIn("triton_reduction", spec.autotuner_heuristics)
+            self.assertEqual(spec.compiler_seed_configs, [])
+
+    def test_occupancy_limits_follow_compute_capability(self) -> None:
+        # Consumer arches hold fewer resident threads and CTAs per SM than sm90/sm100.
+        env = MagicMock()
+        env.device = "cuda"
+        for hardware, limits in (
+            (HOPPER_HARDWARE, (2048, 32)),
+            (BLACKWELL_HARDWARE, (2048, 32)),
+            (A100_HARDWARE, (2048, 32)),
+            (A10G_HARDWARE, (1536, 16)),
+            (RTX5080_HARDWARE, (1536, 24)),
+        ):
+            with (
+                self.subTest(arch=hardware.compute_capability),
+                patch("helion._hardware.get_hardware_info", return_value=hardware),
+            ):
+                self.assertEqual(
+                    TritonReductionHeuristic.occupancy_limits_for(env), limits
+                )
 
 
 _FP8_SKINNY_M_SEED_BLOCK_SIZES = [1, 256]
