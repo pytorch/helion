@@ -92,6 +92,7 @@ from .knobs import TCGEN05_GROUPED_WORKLIST_NM_SHAPE_MISMATCH
 from .knobs import Tcgen05AbStagesThreeSearchConstraints
 
 if TYPE_CHECKING:
+    from ..tcgen05_constants import Tcgen05RowvecAuxFacts
     from . import CuteTcgen05Config
 
 
@@ -535,7 +536,7 @@ def default_layout_smem_bytes(
     chain is judged conservatively rather than refused. A staged aux load
     mode (``TCGEN05_AUX_LOAD_MODES_STAGED``) adds one ``aux_stages``-deep
     ring of the with-source epilogue subtile per exact-shape auxiliary
-    operand (``facts.exact_aux_count``). ``epi_subtile_n`` pins the C
+    operand (``facts.exact_aux_itemsizes``). ``epi_subtile_n`` pins the C
     subtile to ``(per-CTA M, epi_subtile_n)`` (``tcgen05_epi_subtile_n``,
     the explicit-tile path) and ``epi_warp_groups`` multiplies the C
     stages (each epilogue warp group owns ``c_stages`` stages of the
@@ -613,9 +614,8 @@ def default_layout_smem_bytes(
         aux_ring_bytes = tcgen05_aux_ring_smem_bytes_per_cta(
             epi_tile_m=ring_tile_m,
             epi_tile_n=ring_tile_n,
-            dtype_bytes=output_itemsize,
             aux_stages=aux_stages,
-            ring_count=facts.exact_aux_count,
+            ring_itemsizes=facts.exact_aux_itemsizes,
         )
     return (
         ab_bytes
@@ -1469,6 +1469,14 @@ def epilogue_subtile_count(
     return (rows // epi_tile_m) * (bn // epi_tile_n)
 
 
+def aux_fragment_itemsize(rowvec_facts: Tcgen05RowvecAuxFacts) -> int:
+    """Element size an exact-shape auxiliary fragment is priced at in the
+    register budgets (the hoist, the prefetch ring): the widest of the
+    output and the operands, so an FP32 residual of a BF16 output is not
+    priced at half its registers."""
+    return max((rowvec_facts.output_itemsize, *rowvec_facts.exact_aux_itemsizes))
+
+
 def aux_prefetch_depth_limit(
     state: CuteTcgen05Config, config: dict[str, object], *, region: int | None = None
 ) -> int | None:
@@ -1511,7 +1519,7 @@ def aux_prefetch_depth_limit(
     per_subtile = tcgen05_aux_subtile_fragment_bytes_per_thread(
         epi_tile_m=epi_tile_m,
         epi_tile_n=epi_tile_n,
-        itemsize=rowvec_facts.output_itemsize,
+        itemsize=aux_fragment_itemsize(rowvec_facts),
     )
     groups = epi_warp_groups_knob(config)
     local_count = -(-count // groups)

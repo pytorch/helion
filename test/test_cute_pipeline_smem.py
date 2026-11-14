@@ -379,7 +379,7 @@ def test_bias_rows_record_their_width_and_columns_decline() -> None:
         (a, b, row, out)
     ).config_spec._cute_tcgen05_config.pipeline_smem_facts
     assert facts is not None and facts.has_auxiliary_loads
-    assert facts.rows == () and facts.exact_aux_count == 0
+    assert facts.rows == () and facts.exact_aux_itemsizes == ()
 
 
 def test_other_pipeline_analyzer_callers_refuse_bias_rows() -> None:
@@ -508,7 +508,9 @@ def test_exact_shape_auxiliary_epilogue_keeps_the_paired_pipeline(
 
 
 _FACTS = [
-    Tcgen05PipelineSmemFacts(in_bytes, out_bytes, 232448, exact_aux_count=aux)
+    Tcgen05PipelineSmemFacts(
+        in_bytes, out_bytes, 232448, exact_aux_itemsizes=(out_bytes,) * aux
+    )
     for in_bytes, out_bytes, aux in itertools.product((1, 2), (2, 4), (0, 1))
 ]
 _TILES = list(itertools.product((64, 128, 256), (16, 64, 128, 256), (32, 64, 128, 256)))

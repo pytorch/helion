@@ -263,6 +263,18 @@ def emit_aux_tma(ctx: HostWrapperContext, plan: dict[str, object]) -> None:
         dtype=input_dtype,
         kernel_args=kernel_args,
         copy_op="cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()",
+        # The ring stages the kernel's epilogue subtile, which the
+        # epilogue (output) dtype sizes; an operand of another dtype keeps
+        # that subtile in its own element type. Without this a bf16
+        # residual of an FP32 output got a (128, 64) box beside the
+        # kernel's (128, 32) stage and wrote past its ring (illegal
+        # address).
+        epi_tile_raw_expr=tcgen05_default_epilogue_tile_expr(
+            bm,
+            bn,
+            str(plan["epi_dtype"]),
+            c_layout="cutlass.utils.layout.LayoutEnum.ROW_MAJOR",
+        ),
     )
 
 
@@ -530,8 +542,19 @@ def emit_ab_tma(ctx: HostWrapperContext, plan: dict[str, object]) -> None:
             "cute", "shared rank-2 RHS requires the N,M dynamic rank-2 worklist route"
         )
     kernel_args = [str(arg) for arg in cast("list[object]", plan["kernel_args"])]
-    assert len(kernel_args) == 4
-    tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b = kernel_args
+    # ``a_cp_async``: the kernel's epilogue warps copy A with ``cp.async``
+    # (``cute_mma``'s ``tcgen05_cp_async_a``; no TensorMap can address it), so
+    # the wrapper builds B's TMA atom only.
+    a_cp_async = bool(plan.get("a_cp_async"))
+    if a_cp_async:
+        assert len(kernel_args) == 2
+        tma_atom_b, tma_tensor_b = kernel_args
+        # No A atom: the wrapper locals below (``{tma_atom_a}_tiled_mma``, ...)
+        # take a prefix of their own.
+        tma_atom_a, tma_tensor_a = f"{tma_atom_b}_cpa", ""
+    else:
+        assert len(kernel_args) == 4
+        tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b = kernel_args
 
     # CtaGroup.TWO is selected when ``cluster_m == 2 and bm == 256`` —
     # the V=2 path. ``cluster_n`` extends the cluster along the N axis
@@ -720,7 +743,9 @@ def emit_ab_tma(ctx: HostWrapperContext, plan: dict[str, object]) -> None:
         ctx.append_permuted_cute_tensor_view(lhs_tma, lhs_idx, lhs_tma_order)
     if rhs_tma_order is not None:
         ctx.append_permuted_cute_tensor_view(rhs_tma, rhs_idx, rhs_tma_order)
-    lhs_tma_setup_lines = () if lhs_tma_order is not None else lhs_tma_setup
+    lhs_tma_setup_lines = (
+        () if lhs_tma_order is not None or a_cp_async else lhs_tma_setup
+    )
     rhs_tma_setup_lines = () if rhs_tma_order is not None else rhs_tma_setup
     ctx.body.extend(
         (
@@ -764,22 +789,28 @@ def emit_ab_tma(ctx: HostWrapperContext, plan: dict[str, object]) -> None:
             #   multicast is active (cluster_n>1). The cluster_n=1
             #   form is pinned by
             #   ``test_tcgen05_role_local_monolithic_codegen_markers``.
-            (
-                f"    {tma_atom_a}, {tma_tensor_a} = cute.nvgpu.make_tiled_tma_atom_A("
-                "cutlass.utils.blackwell_helpers.cluster_shape_to_tma_atom_A("
-                f"{cluster_shape}, {tiled_mma}.thr_id), "
-                f"{lhs_tma_arg}, "
-                f"cute.slice_({smem_a_layout}, (None, None, None, 0)), "
-                f"({bm}, {bn}, {bk}), {tiled_mma}"
-                + (
-                    f", cute.tiled_divide(cute.make_layout({row_profile.producer_cluster!r}), ({tiled_mma}.thr_id.shape,)).shape"
-                    if row_profile is not None
-                    else f", {cluster_layout_vmnk}.shape"
-                    if cluster_n > 1
-                    else ""
+            *(
+                ()
+                if a_cp_async
+                else (
+                    (
+                        f"    {tma_atom_a}, {tma_tensor_a} = cute.nvgpu.make_tiled_tma_atom_A("
+                        "cutlass.utils.blackwell_helpers.cluster_shape_to_tma_atom_A("
+                        f"{cluster_shape}, {tiled_mma}.thr_id), "
+                        f"{lhs_tma_arg}, "
+                        f"cute.slice_({smem_a_layout}, (None, None, None, 0)), "
+                        f"({bm}, {bn}, {bk}), {tiled_mma}"
+                        + (
+                            f", cute.tiled_divide(cute.make_layout({row_profile.producer_cluster!r}), ({tiled_mma}.thr_id.shape,)).shape"
+                            if row_profile is not None
+                            else f", {cluster_layout_vmnk}.shape"
+                            if cluster_n > 1
+                            else ""
+                        )
+                        + tma_internal_type_arg
+                        + ")"
+                    ),
                 )
-                + tma_internal_type_arg
-                + ")"
             ),
             # See the asymmetry comment above ``make_tiled_tma_atom_A``
             # for why ``_B`` always passes the cluster shape and ``_A``

@@ -22,6 +22,8 @@ from typing import cast
 import torch
 
 from ....exc import InvalidConfig
+from ..cp_async_operand import TCGEN05_CP_ASYNC_A_BLOCK_K
+from ..cp_async_operand import TCGEN05_CP_ASYNC_A_TILE_M
 from ..cute_epilogue import fanout_pre_wait_stages_rowvec_aux
 from ..cute_warp_mma_gemm import MATMUL_FAMILIES
 from ..cute_warp_mma_gemm import MATMUL_FAMILY_TCGEN05
@@ -227,6 +229,8 @@ from . import surface
 from .knobs import _stored_block_n
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from ..epilogue_fanout import PairedFanoutPlan
     from .knobs import Tcgen05ClusterM2SearchConstraints
 
@@ -2678,8 +2682,8 @@ def aux_fragment_hoist_admissible(
 
     The hoist reads an exact-shape auxiliary tile into registers before
     the accumulator wait, so it needs such an operand
-    (``exact_shape_aux_kernel_detected``: rank-2, the output's shape and
-    dtype), the ``pre_acc_wait`` placement, the SIMT aux load path and
+    (``exact_shape_aux_kernel_detected``: rank-2, the output's shape),
+    the ``pre_acc_wait`` placement, the SIMT aux load path and
     the normal TMA-store epilogue, and a per-thread fragment within
     ``TCGEN05_AUX_FRAGMENT_HOIST_MAX_BYTES_PER_THREAD`` (a CTA pair's
     epilogue owns half of the pair tile's rows per CTA).
@@ -2784,7 +2788,7 @@ def aux_fragment_hoist_admissible(
             tcgen05_aux_prefetch_bytes_per_thread(
                 epi_tile_m=epi_tile_m,
                 epi_tile_n=epi_tile_n,
-                itemsize=rowvec_facts.output_itemsize,
+                itemsize=smem.aux_fragment_itemsize(rowvec_facts),
                 depth=-(-count // groups) - 1,
             )
             <= TCGEN05_AUX_FRAGMENT_HOIST_MAX_BYTES_PER_THREAD
@@ -2793,7 +2797,7 @@ def aux_fragment_hoist_admissible(
         tcgen05_aux_fragment_bytes_per_thread(
             bm=rows,
             bn=bn,
-            itemsize=rowvec_facts.output_itemsize,
+            itemsize=smem.aux_fragment_itemsize(rowvec_facts),
             epi_warps=epi_warps_knob(config),
         )
         <= TCGEN05_AUX_FRAGMENT_HOIST_MAX_BYTES_PER_THREAD
@@ -3116,7 +3120,7 @@ def aux_prefetch_refusal(
     if not state.exact_shape_aux_kernel_detected:
         return (
             "the auxiliary prefetch ring needs an exact-shape rank-2 "
-            "auxiliary operand of the output's dtype in the epilogue chain"
+            "auxiliary operand in the epilogue chain"
         )
     if region is None and state.materialized_matmul_block_ids:
         return facts._chain_launch_refusal(
@@ -4109,8 +4113,113 @@ def _fix_aux_edge_search_config(
                     and not isinstance(bm, bool)
                     and bm > 128
                     and fact.static_m % bm != 0
+                    and not (
+                        state.cp_async_a_provable
+                        and cp_async_a_config_ok(state, config)
+                    )
                 ):
                     block_sizes[m_idx] = 128
+
+
+def cp_async_a_paired_rows_allowed(state: CuteTcgen05Config) -> bool:
+    """Whether the cp.async producer's 256-row tile (two 128-row
+    subtiles) can store its output: the output fanout of several stores
+    has no paired M subtiles (``memory_ops``), so a kernel with more than
+    one output store keeps the 128-row tile."""
+    facts = state.rowvec_aux_facts
+    return facts is not None and facts.output_count < 2
+
+
+def cp_async_a_config_ok(
+    state: CuteTcgen05Config, config: Mapping[str, object]
+) -> bool:
+    """Whether ``config`` runs the flat one-CTA kernel whose epilogue warps
+    copy A with ``cp.async`` (``cute_mma``'s ``tcgen05_cp_async_a``): one
+    CTA per 128-row tile, or per 256-row tile of two 128-row subtiles (in
+    the two accumulator stages, beside a single output store), by 64-deep
+    k-blocks, no cluster, no split K, the default SW128 A stage the
+    copies' views address, and the shared K loop whose epilogue warps
+    issue the refills (a persistent kernel's separate TMA-load role does
+    not)."""
+    view = facts._matmul_config_view(state, dict(config))
+    if view is None:
+        return False
+    blocks, m_index, _n_index, k_index = view
+    rows = (TCGEN05_CP_ASYNC_A_TILE_M, 2 * TCGEN05_CP_ASYNC_A_TILE_M)
+    return (
+        config.get("tcgen05_cluster_m", 1) == 1
+        and config.get("tcgen05_cluster_n", 1) == 1
+        and config.get("pid_type", "flat") == "flat"
+        and blocks[m_index]
+        in (rows if cp_async_a_paired_rows_allowed(state) else rows[:1])
+        # the 256-row tile's subtiles hold both accumulator stages
+        and (
+            blocks[m_index] == TCGEN05_CP_ASYNC_A_TILE_M
+            or config.get("tcgen05_acc_stages") in (None, 2)
+        )
+        and blocks[k_index] == TCGEN05_CP_ASYNC_A_BLOCK_K
+        and config.get(TCGEN05_SPLIT_K_CONFIG_KEY) in (None, 1)
+        and config.get(TCGEN05_LAYOUT_OVERRIDES_SWIZZLE_A_KEY) is None
+    )
+
+
+def validate_cp_async_a_config(
+    state: CuteTcgen05Config, config: dict[str, object], *, fix_invalid: bool
+) -> None:
+    """Keep a kernel whose A only the cp.async producer loads (the
+    staging pass left it in place, ``cp_async_a_provable``) inside that
+    producer's envelope (``cp_async_a_config_ok``): any other config
+    loads both operands with the scalar producers, ~18x slower
+    (30522x128x4096 with ``x.T`` as A at [128, 128, 128]: 5.83 ms, 0.32 ms
+    on the staged copy). A sample is projected onto the envelope; an
+    explicit config outside it is refused."""
+    if not state.cp_async_a_provable or cp_async_a_config_ok(state, config):
+        return
+    if fix_invalid:
+        _fix_cp_async_a_search_config(state, config)
+        return
+    if not state.cp_async_a_unstaged:
+        # An A the staging pass would not have padded either (a small
+        # operand, staging off) keeps the scalar producers it ran on.
+        return
+    raise InvalidConfig(
+        "the kernel's A operand loads through the epilogue warps' cp.async "
+        "producer (no TensorMap addresses it; the host left it unstaged), "
+        "which runs the flat one-CTA kernel on 128-row tiles (256-row with "
+        "two accumulator stages and one output store) by 64-deep k-blocks, "
+        "without split K, an A swizzle override or a separate TMA producer"
+    )
+
+
+def _fix_cp_async_a_search_config(
+    state: CuteTcgen05Config, config: dict[str, object]
+) -> None:
+    """Project a sample of a kernel whose A only the cp.async producer
+    loads onto that producer's envelope (``cp_async_a_config_ok``): any
+    other config loads both operands with scalar producers (the staging
+    pass left A in place), a kernel ~18x slower."""
+    if not state.cp_async_a_provable or cp_async_a_config_ok(state, config):
+        return
+    view = facts._matmul_config_view(state, config)
+    if view is None:
+        return
+    blocks, m_index, _n_index, k_index = view
+    bm = blocks[m_index]
+    blocks[m_index] = (
+        2 * TCGEN05_CP_ASYNC_A_TILE_M
+        if isinstance(bm, int)
+        and bm >= 2 * TCGEN05_CP_ASYNC_A_TILE_M
+        and cp_async_a_paired_rows_allowed(state)
+        else TCGEN05_CP_ASYNC_A_TILE_M
+    )
+    blocks[k_index] = TCGEN05_CP_ASYNC_A_BLOCK_K
+    if blocks[m_index] == 2 * TCGEN05_CP_ASYNC_A_TILE_M:
+        config["tcgen05_acc_stages"] = 2
+    config["pid_type"] = "flat"
+    config["tcgen05_cluster_m"] = 1
+    config["tcgen05_cluster_n"] = 1
+    config.pop(TCGEN05_SPLIT_K_CONFIG_KEY, None)
+    config.pop(TCGEN05_LAYOUT_OVERRIDES_SWIZZLE_A_KEY, None)
 
 
 def _set_aux_edge_monolithic_prefix(config: dict[str, object]) -> None:
@@ -4340,10 +4449,7 @@ def epi_tma_refusal(
     the aux rings by the region budgets.
     """
     if not state.exact_shape_aux_kernel_detected:
-        return (
-            "requires an exact-shape rank-2 auxiliary operand of the output's "
-            "dtype in the epilogue chain"
-        )
+        return "requires an exact-shape rank-2 auxiliary operand in the epilogue chain"
     if not state.exact_aux_tma_provable:
         return TCGEN05_AUX_TMA_ILLEGAL_TENSOR_REASON
     if state.matmul_has_leading_passthrough:
@@ -5226,6 +5332,7 @@ def _apply_paired_pipeline_surface(
 def _fix_search_config_body(
     state: CuteTcgen05Config, config: dict[str, object]
 ) -> None:
+    _fix_cp_async_a_search_config(state, config)
     if config.get(TILE_N_KEY, 0) != 0:
         _normalize_dense_aligned_n(state, config, fix_invalid=True)
         config.pop("epilogue_subtile", None)

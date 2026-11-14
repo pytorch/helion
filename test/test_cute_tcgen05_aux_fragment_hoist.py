@@ -248,7 +248,7 @@ def test_facts_distinguish_aux_on_every_store() -> None:
     assert gated.aux_kernel_detected and gated.exact_shape_aux_kernel_detected
     assert not gated.aux_loads_on_every_store
     assert gated.rowvec_aux_facts == Tcgen05RowvecAuxFacts(
-        output_itemsize=2, rows=(), output_count=2, exact_aux_count=1
+        output_itemsize=2, rows=(), output_count=2, exact_aux_itemsizes=(2,)
     )
     assert repair.pre_acc_wait_admissible_via_fanout(gated)
 
@@ -335,6 +335,46 @@ def test_placement_collapses_to_the_default_where_pre_acc_wait_is_unsampled() ->
     )
     with pytest.raises(InvalidConfig, match="no per-subtile auxiliary loads"):
         normalized(bound, base_config(PRE))
+
+
+def _fp32_residual(
+    x: torch.Tensor, w: torch.Tensor, residual: torch.Tensor
+) -> torch.Tensor:
+    """An FP32 exact-shape operand of an FP16 output."""
+    m, n = x.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(n):
+            acc = torch.addmm(acc, x[tile_m, tile_k], w[tile_k, tile_n])
+        out[tile_m, tile_n] = (acc + residual[tile_m, tile_n]).to(x.dtype)
+    return out
+
+
+def test_register_budgets_price_a_wider_operand_at_its_own_size() -> None:
+    """The register budgets price an FP32 residual of an FP16 output at four
+    bytes an element (``aux_fragment_itemsize``), not the output's two: the
+    prefetch ring the 128x128 tile admits is shallower than the FP16
+    residual's."""
+    narrow = state_of(bind(residual_single))
+    wide = state_of(
+        helion.kernel(
+            _fp32_residual, backend="cute", static_shapes=True, autotune_effort="full"
+        )._bind_isolated(
+            (
+                torch.empty((4096, 1024), dtype=torch.float16),
+                torch.empty((1024, 1024), dtype=torch.float16),
+                torch.empty((4096, 1024), dtype=torch.float32),
+            )
+        )
+    )
+    assert smem.aux_fragment_itemsize(narrow.rowvec_aux_facts) == 2
+    assert smem.aux_fragment_itemsize(wide.rowvec_aux_facts) == 4
+    config = base_config(PRE)
+    narrow_depth = smem.aux_prefetch_depth_limit(narrow, dict(config))
+    wide_depth = smem.aux_prefetch_depth_limit(wide, dict(config))
+    assert narrow_depth is not None and wide_depth is not None
+    assert wide_depth < narrow_depth
 
 
 def test_hoist_admission_is_strict_and_budgeted() -> None:

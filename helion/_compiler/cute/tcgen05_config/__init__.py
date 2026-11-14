@@ -109,9 +109,6 @@ class CuteTcgen05Config:
         self.matmul_explicit_epi_tile_compatible: bool | None = None
         self.aux_kernel_detected: bool = False
         self.exact_shape_aux_kernel_detected: bool = False
-        # Any exact-shape operand of the output's shape, whatever its dtype
-        # (``host_function_has_tcgen05_exact_shape_aux_operand``).
-        self.exact_shape_aux_operand_detected: bool = False
         # The device program's only side effect is one tile store
         # (``split_k_exchange.host_function_has_plain_store_body``): the
         # precondition of ``tcgen05_split_k``, whose last-arriver check
@@ -142,6 +139,15 @@ class CuteTcgen05Config:
         # the compiler-facts phase by
         # ``CuteTcgen05ClusterM2FfiHeuristic.register_facts``.
         self.matmul_operands_tma_provable: bool = True
+        # Every MMA's A is an unaligned operand the flat one-CTA kernel's
+        # epilogue warps copy with ``cp.async`` beside a TMA-legal B
+        # (``host_function_cp_async_a_provable``).
+        self.cp_async_a_provable: bool = False
+        # The staging pass left such an A in place for the producer
+        # (``stage_aligned_operands._cp_async_lhs_names``) where it would
+        # otherwise have padded it: only then does a config off the
+        # producer's envelope lose the staged copy's TMA pipeline.
+        self.cp_async_a_unstaged: bool = False
         # False when an exact-shape rank-2 auxiliary operand of the analyzed
         # store chains fails the aux TMA proof (a 16-byte base and outer
         # strides, a contiguous last axis: ``cute_mma``

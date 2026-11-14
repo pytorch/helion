@@ -636,7 +636,7 @@ def region_has_exact_aux(state: CuteTcgen05Config, region: int) -> bool:
         if region < len(state.materialized_pipeline_facts)
         else None
     )
-    return facts is not None and facts.exact_aux_count > 0
+    return facts is not None and bool(facts.exact_aux_itemsizes)
 
 
 def _configured_region_pid_types(
@@ -1186,7 +1186,7 @@ def _plain_narrow_subtile_facts(
         and constraints.dtype_bytes == 2
         and cluster_m == 2
         and bn in TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_NS
-        and facts.exact_aux_count == 0
+        and not facts.exact_aux_itemsizes
         and tcgen05_explicit_epilogue_tile_supported(
             is_two_cta=True,
             bm=bm,

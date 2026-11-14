@@ -79,11 +79,11 @@ class Tcgen05PipelineSmemFacts(NamedTuple):
     ``has_auxiliary_loads`` records the auxiliary operands of the epilogue
     chain (exact-shape tiles, broadcast rows; FP8 columns): register-resident
     SIMT loads under ``post_acc_wait`` that offer the aux-placement seeds.
-    ``exact_aux_count`` is the number of exact-shape rank-2 auxiliary
-    operands of the output's dtype: the staged aux load modes
-    (``tcgen05_aux_load_mode`` in ``TCGEN05_AUX_LOAD_MODES_STAGED``) keep one
-    ``tcgen05_aux_stages``-deep ring of epilogue subtiles per operand, which
-    the AB ring must leave room for.
+    ``exact_aux_itemsizes`` holds the element size of each exact-shape rank-2
+    auxiliary operand: the staged aux load modes (``tcgen05_aux_load_mode`` in
+    ``TCGEN05_AUX_LOAD_MODES_STAGED``) keep one ``tcgen05_aux_stages``-deep
+    ring of epilogue subtiles per operand in its own dtype, which the AB ring
+    must leave room for.
     """
 
     input_dtype_bytes: int
@@ -92,7 +92,7 @@ class Tcgen05PipelineSmemFacts(NamedTuple):
     rows: tuple[Tcgen05RowvecAuxRow, ...] = ()
     has_auxiliary_loads: bool = False
     output_column_major: bool = False
-    exact_aux_count: int = 0
+    exact_aux_itemsizes: tuple[int, ...] = ()
 
 
 def pipeline_region_graphs(
@@ -150,6 +150,7 @@ def analyze_pipeline_smem_facts(
     refusing them.
     """
     from .aux_tensor import analyze_tcgen05_matmul_store_chains
+    from .aux_tensor import stages_through_smem_ring
     from .cute_epilogue import tcgen05_rowvec_aux_row
     from .cute_mma import _tcgen05_tma_matrix_major
     from .radix_store import proven_radix_store_layout
@@ -253,17 +254,15 @@ def analyze_pipeline_smem_facts(
         or (output_major == "col") != candidate.output_column_major
     ):
         return None
-    exact_aux_count = 0
+    exact_aux_itemsizes: list[int] = []
     for leaf in chain.auxiliary_tensor_loads:
         source = leaf.load_node.args[0]
         tensor = source.meta.get("val") if isinstance(source, torch.fx.Node) else None
-        if (
-            leaf.broadcast_axis is None
-            and isinstance(tensor, torch.Tensor)
-            and tensor.ndim == 2
-            and tensor.dtype == output.dtype
+        # a boolean mask stays on the direct read (``stages_through_smem_ring``)
+        if isinstance(tensor, torch.Tensor) and stages_through_smem_ring(
+            leaf.broadcast_axis, tensor
         ):
-            exact_aux_count += 1
+            exact_aux_itemsizes.append(tensor.dtype.itemsize)
     return Tcgen05PipelineSmemFacts(
         operands.lhs.source_fake.dtype.itemsize,
         output.dtype.itemsize,
@@ -271,7 +270,7 @@ def analyze_pipeline_smem_facts(
         tuple(rows),
         bool(chain.auxiliary_tensor_loads),
         candidate.output_column_major,
-        exact_aux_count,
+        tuple(exact_aux_itemsizes),
     )
 
 
@@ -301,7 +300,7 @@ def pipeline_smem_bytes(
     pins it (below), and both families use the destination's actual row- or
     column-major layout.
     A staged aux load mode adds one ``aux_stages``-deep ring of epilogue
-    subtiles per exact-shape auxiliary operand (``facts.exact_aux_count``)
+    subtiles per exact-shape auxiliary operand (``facts.exact_aux_itemsizes``)
     plus its full/empty barriers.  ``epi_warp_groups`` multiplies the C
     stages (each epilogue warp group owns ``c_stages`` stages of the ring,
     ``tcgen05_epi_warp_groups``) and ``epi_subtile_n`` pins the 256-row
@@ -365,9 +364,8 @@ def pipeline_smem_bytes(
         tcgen05_aux_ring_smem_bytes_per_cta(
             epi_tile_m=epi_m,
             epi_tile_n=epi_n,
-            dtype_bytes=facts.output_dtype_bytes,
             aux_stages=aux_stages,
-            ring_count=facts.exact_aux_count,
+            ring_itemsizes=facts.exact_aux_itemsizes,
         )
         if aux_load_mode in TCGEN05_AUX_LOAD_MODES_STAGED
         else 0
@@ -433,7 +431,7 @@ def one_cta_pipeline_smem_bytes(
     and the flat 16-bit launches of an ordered barrier chain run the same
     role-local CtaGroup.ONE schedule).  A staged aux load mode adds one
     ``aux_stages``-deep ring of the DEFAULT epilogue subtile per exact-shape
-    auxiliary operand (``facts.exact_aux_count``), ``epi_warp_groups``
+    auxiliary operand (``facts.exact_aux_itemsizes``), ``epi_warp_groups``
     multiplies the C stages and ``epi_subtile_n`` pins the C subtile to
     ``(min(bm, 128), epi_subtile_n)`` (``tcgen05_epi_subtile_n``), as the
     paired model does.  This function does not change any legacy one- or
@@ -455,9 +453,8 @@ def one_cta_pipeline_smem_bytes(
         tcgen05_aux_ring_smem_bytes_per_cta(
             epi_tile_m=epi_m,
             epi_tile_n=epi_n,
-            dtype_bytes=facts.output_dtype_bytes,
             aux_stages=aux_stages,
-            ring_count=facts.exact_aux_count,
+            ring_itemsizes=facts.exact_aux_itemsizes,
         )
         if aux_load_mode in TCGEN05_AUX_LOAD_MODES_STAGED
         else 0
