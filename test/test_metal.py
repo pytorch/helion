@@ -36,6 +36,7 @@ from helion._compiler.metal.row_reduction_heuristic import MetalRowReductionHeur
 from helion._compiler.reduction_strategy import LoopedReductionStrategy
 from helion._testing import import_example
 from helion._testing import skipIfRefEager
+from helion._testing.metal import run_with_msl
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 
@@ -80,31 +81,9 @@ DEVICE = "mps"
 _DEFAULT_CONFIG = [helion.Config(block_sizes=[256], num_warps=4)]
 
 
-def _run_with_msl(
-    kernel: helion.Kernel,
-    args: tuple[object, ...],
-    config: helion.Config | None = None,
-) -> tuple[object, str, str]:
-    """Run *kernel* through the normal Helion pipeline; return its result, its
-    Python code and its MSL.
-
-    Uses PyCodeCache to load the generated module (same as Helion's runtime)
-    and calls the host function, which makes metal_jit generate the MSL.
-    """
-    code = kernel.bind(args).to_code(config)
-    module = PyCodeCache.load(code)
-    result = getattr(module, kernel.fn.__name__)(*args)
-    (msl,) = [
-        obj.msl_source
-        for obj in vars(module).values()
-        if isinstance(obj, _MetalKernel) and obj.msl_source is not None
-    ]
-    return result, code, msl
-
-
 def _get_msl(kernel: helion.Kernel, args: tuple[object, ...]) -> str:
     """The MSL *kernel* generates for *args*."""
-    return _run_with_msl(kernel, args)[2]
+    return run_with_msl(kernel, args)[2]
 
 
 def _element_loops(msl: str) -> list[str]:
@@ -685,11 +664,11 @@ class TestMetalScalarArgs(unittest.TestCase):
             with self.subTest(shape=shape):
                 x = torch.randn(*shape, device=DEVICE)
                 y = torch.randn(*shape, device=DEVICE)
-                out, _, msl = _run_with_msl(add_sized, (x, y))
+                out, _, msl = run_with_msl(add_sized, (x, y))
                 torch.testing.assert_close(out, x + y)
                 self.assertRegex(msl, r"constant long& \w+ \[\[buffer")
         x = torch.randn(1024, device=DEVICE)
-        _, _, msl = _run_with_msl(saxpy, (x, x, 2.5, -1.0))
+        _, _, msl = run_with_msl(saxpy, (x, x, 2.5, -1.0))
         self.assertIn("constant float& a [[buffer", msl)
 
 
@@ -946,7 +925,7 @@ class TestMetalBfloatConversion(unittest.TestCase):
         }
         for name, x in sources.items():
             with self.subTest(source=name):
-                out, _, msl = _run_with_msl(to_bfloat16, (x.to(DEVICE),))
+                out, _, msl = run_with_msl(to_bfloat16, (x.to(DEVICE),))
                 self.assertIn(_VIA_FLOAT, msl)
                 ref = x.to(torch.bfloat16)
                 self.assertFalse(_bits_mismatch(out.cpu(), ref).any())
@@ -980,7 +959,7 @@ class TestMetalBfloatConversion(unittest.TestCase):
         x = torch.randint(-1000, 1000, (1000,), device=DEVICE, dtype=torch.int32)
         for kernel, dtype in ((to_float16, "half"), (to_float32, "float")):
             with self.subTest(target=dtype):
-                out, _, msl = _run_with_msl(kernel, (x,))
+                out, _, msl = run_with_msl(kernel, (x,))
                 self.assertRegex(msl, rf"static_cast<{dtype}>\(load")
                 self.assertNotIn(f"static_cast<{dtype}>(static_cast<float>(", msl)
                 torch.testing.assert_close(out, x.to(out.dtype))
@@ -1274,7 +1253,7 @@ class TestMetalLargeBlock(unittest.TestCase):
         x = torch.randn(4096, device=DEVICE)
         y = torch.randn(4096, device=DEVICE)
         config = helion.Config(block_sizes=[2048], num_threads=[4096], num_warps=4)
-        out, code, _ = _run_with_msl(large_block_add, (x, y), config)
+        out, code, _ = run_with_msl(large_block_add, (x, y), config)
         self.assertIn("_block_dims=(128, 1, 1)", code)
         torch.testing.assert_close(out, x + y)
 
@@ -7472,7 +7451,7 @@ class TestMetalLaneArrays(unittest.TestCase):
             (helion.Config(block_sizes=[4], num_warps=16), False),
         ):
             with self.subTest(config=config):
-                out, code, msl = _run_with_msl(
+                out, code, msl = run_with_msl(
                     grid_online_attention, (q, k, v, scale), config
                 )
                 torch.testing.assert_close(
@@ -8061,7 +8040,7 @@ class TestMetalLaneFold(unittest.TestCase):
     ) -> tuple[object, str]:
         """Run *kernel* at *config*, checking it folds *lanes* lanes, and
         return its result and MSL."""
-        result, code, msl = _run_with_msl(kernel, args, config)
+        result, code, msl = run_with_msl(kernel, args, config)
         self.assertIn("_metal_lane_fold(", code)
         self.assertRegex(code, rf"for slice_lane_\d+ in range\({lanes}\)")
         self.assertIn("__lane1", msl)
@@ -8287,7 +8266,7 @@ class TestMetalLaneFold(unittest.TestCase):
                 q = torch.randn(m, d, device=DEVICE, dtype=dtype) / 4
                 kt = torch.randn(d, n, device=DEVICE, dtype=dtype) / 4
                 v = torch.randn(n, d, device=DEVICE, dtype=dtype)
-                out, code, msl = _run_with_msl(kernel, (q, kt, v), config)
+                out, code, msl = run_with_msl(kernel, (q, kt, v), config)
                 self.assertIn("_helion_mpp_run(", code)
                 self.assertNotIn("dot_product", code)
                 self.assertEqual(msl.count("matmul2d_descriptor("), 2)
@@ -8321,7 +8300,7 @@ class TestMetalLaneFold(unittest.TestCase):
                     "a lane loop around an MPP op would run 80 copies",
                 ),
             ):
-                _run_with_msl(kernel, (q, kt, v), config)
+                run_with_msl(kernel, (q, kt, v), config)
 
     def test_dot_k_beside_another_reduction_dim_rejects(self) -> None:
         c = torch.randn(64, 128, device=DEVICE, dtype=torch.float16)
@@ -8893,7 +8872,7 @@ class TestMetalPaddedTwin(unittest.TestCase):
         self, kernel: helion.Kernel, config: helion.Config, args: tuple[object, ...]
     ) -> tuple[object, str, str]:
         """Run *kernel* at *config*; return its result, code and MSL."""
-        result, code, msl = _run_with_msl(kernel, args, config)
+        result, code, msl = run_with_msl(kernel, args, config)
         if isinstance(result, tuple):
             result = tuple(t.cpu() for t in result if t is not None)
         return result, code, msl
@@ -9941,7 +9920,7 @@ class TestMetalAutotune(unittest.TestCase):
 
         x = torch.randn(128, 128, device=DEVICE)
         y = torch.randn(128, 128, device=DEVICE)
-        out, code, _ = _run_with_msl(matmul, (x, y))
+        out, code, _ = run_with_msl(matmul, (x, y))
         self.assertEqual(math.prod(_launch(code)), 128)
         torch.testing.assert_close(out, x @ y, rtol=1e-4, atol=1e-3)
 
@@ -10551,7 +10530,7 @@ class TestMetalLaneJam(unittest.TestCase):
         x = torch.randn(4, 64, device=DEVICE, dtype=torch.float16)
         w = torch.randn(48, 64, device=DEVICE, dtype=torch.float16)
         config = helion.Config(block_sizes=[8, 4, 16], num_threads=[8, 1, 16])
-        out, code, msl = _run_with_msl(rows_gemv, (x, w), config)
+        out, code, msl = run_with_msl(rows_gemv, (x, w), config)
         torch.testing.assert_close(
             out.cpu().double(),
             x.cpu().double() @ w.cpu().double().T,
@@ -10568,7 +10547,7 @@ class TestMetalLaneJam(unittest.TestCase):
         lane loop: jammed, the value would be added once."""
         z = torch.randn(8, 32, device=DEVICE)
         config = helion.Config(block_sizes=[8, 4, 8], num_threads=[1, 4, 8])
-        out, _, _ = _run_with_msl(lane_sum_of_row_sums, (z, 16), config)
+        out, _, _ = run_with_msl(lane_sum_of_row_sums, (z, 16), config)
         torch.testing.assert_close(
             out.cpu(), 16 * z.cpu().sum(-1), rtol=1e-4, atol=1e-4
         )
@@ -10627,9 +10606,7 @@ class TestMetalMaskedLoads(unittest.TestCase):
 
     def test_tail(self) -> None:
         x, y = (torch.randn(1000, device=DEVICE) for _ in range(2))
-        out, _, msl = _run_with_msl(
-            vector_add, (x, y), helion.Config(block_sizes=[256])
-        )
+        out, _, msl = run_with_msl(vector_add, (x, y), helion.Config(block_sizes=[256]))
         self.assertIn("inline auto _helion_masked(", msl)
         self.assertIn("_helion_masked(x[(mask_0 ? indices_0 : 0)], mask_0, 0)", msl)
         torch.testing.assert_close(out, x + y, atol=0, rtol=0)
@@ -10640,7 +10617,7 @@ class TestMetalMaskedLoads(unittest.TestCase):
         that writes it."""
         x = torch.randn(1000, device=DEVICE)
         expected = x * 2
-        _, _, msl = _run_with_msl(
+        _, _, msl = run_with_msl(
             double_in_place, (x,), helion.Config(block_sizes=[256])
         )
         self.assertNotIn("_helion_masked(", msl)
@@ -10743,9 +10720,7 @@ class TestMetalTileIndexIsSigned(unittest.TestCase):
 class TestMetalFmaFusion(unittest.TestCase):
     def test_float_multiply_add(self) -> None:
         x, w, r = (torch.randn(1000, device=DEVICE) for _ in range(3))
-        out, _, msl = _run_with_msl(
-            mul_add, (x, w, r), helion.Config(block_sizes=[256])
-        )
+        out, _, msl = run_with_msl(mul_add, (x, w, r), helion.Config(block_sizes=[256]))
         self.assertIn("metal::fma(", msl)
         torch.testing.assert_close(out, x * w + r, atol=1e-5, rtol=1e-5)
 
@@ -10753,7 +10728,7 @@ class TestMetalFmaFusion(unittest.TestCase):
         """The float16 rounding between the multiply and the add stays:
         bit-exact with eager."""
         x, w, r = (torch.randn(1000, device=DEVICE) for _ in range(3))
-        out, _, msl = _run_with_msl(
+        out, _, msl = run_with_msl(
             mul_round_add, (x, w, r), helion.Config(block_sizes=[256])
         )
         self.assertNotIn("metal::fma(", msl)
@@ -10807,7 +10782,7 @@ class TestMetalViewDtype(unittest.TestCase):
         words = (hi.view(torch.int16).to(torch.int32) << 16) | (
             lo.view(torch.int16).to(torch.int32) & 0xFFFF
         )
-        out, _, msl = _run_with_msl(
+        out, _, msl = run_with_msl(
             high_halves, (words.to(DEVICE),), helion.Config(block_sizes=[64])
         )
         self.assertIn("as_type<half>(static_cast<short>(", msl)
@@ -10823,7 +10798,7 @@ class TestMetalViewDtype(unittest.TestCase):
                 bits = torch.randn(6, 256).to(dtype).view(torch.int16)
                 bits[0, : len(special)] = torch.tensor(special).to(torch.int16)
                 x = bits.view(dtype)
-                out, _, msl = _run_with_msl(
+                out, _, msl = run_with_msl(
                     row_bit_sums,
                     (x.to(DEVICE),),
                     helion.Config(block_sizes=[2], num_warps=1),
@@ -10837,7 +10812,7 @@ class TestMetalViewDtype(unittest.TestCase):
         so the integer sum over the 100 columns of a 128-wide block keeps
         its mask."""
         t = torch.rand(8, 100, dtype=torch.float16) + 0.5
-        out, _, _ = _run_with_msl(
+        out, _, _ = run_with_msl(
             negated_row_bit_sums, (t.to(DEVICE),), helion.Config(block_sizes=[4])
         )
         expected = (-t).view(torch.int16).to(torch.int32).sum(-1, dtype=torch.int32)
@@ -14932,7 +14907,7 @@ class TestMetalThreadgroupBudget(unittest.TestCase):
         if isinstance(config, dict):
             default = kernel.bind(args).config_spec.default_config().config
             config = helion.Config(**{**default, **config})
-        return _run_with_msl(kernel, args, config)
+        return run_with_msl(kernel, args, config)
 
     def test_num_warps_sizes_the_launch(self) -> None:
         x = torch.randn(64, 64, device=DEVICE)
@@ -15053,7 +15028,7 @@ class TestMetalThreadgroupBudget(unittest.TestCase):
                 device_args = tuple(
                     a.to(DEVICE) if isinstance(a, torch.Tensor) else a for a in args
                 )
-                out, code, msl = _run_with_msl(gdn_fwd_h_metal, device_args, config)
+                out, code, msl = run_with_msl(gdn_fwd_h_metal, device_args, config)
                 self.assertEqual(_launch(code), (32, 4, 1))
                 torch.testing.assert_close(
                     out.cpu().double(), expected, rtol=1e-4, atol=1e-4
@@ -15112,7 +15087,7 @@ class TestMetalThreadgroupBudget(unittest.TestCase):
         for num_warps in (1, 4, 32):
             with self.subTest(num_warps=num_warps):
                 config = helion.Config(block_sizes=[4096, 1], num_warps=num_warps)
-                out, code, _ = _run_with_msl(sum_after_loop, (x,), config)
+                out, code, _ = run_with_msl(sum_after_loop, (x,), config)
                 self.assertEqual(_launch(code), (1, 1, 1))
                 torch.testing.assert_close(
                     out.cpu(), x.cpu().double().sum(-1).float(), rtol=1e-4, atol=1e-3
@@ -15202,7 +15177,7 @@ class TestMetalThreadgroupBudget(unittest.TestCase):
         device_args = tuple(
             a.to(DEVICE) if isinstance(a, torch.Tensor) else a for a in args
         )
-        out, code, msl = _run_with_msl(
+        out, code, msl = run_with_msl(
             gdn_fwd_h_transposed,
             device_args,
             helion.Config(block_sizes=[32], num_warps=1),
@@ -15359,7 +15334,7 @@ class TestMetalPersistentGrid(unittest.TestCase):
             with self.subTest(m=m, k=k, n=n):
                 a = torch.randn(m, k, device=DEVICE, dtype=torch.float16)
                 b = torch.randn(k, n, device=DEVICE, dtype=torch.float16)
-                out, code, _ = _run_with_msl(persistent_matmul, (a, b), config)
+                out, code, _ = run_with_msl(persistent_matmul, (a, b), config)
                 self.assertIn(
                     f"_launcher(_helion_persistent_matmul, ({workers},)", code
                 )
@@ -15443,7 +15418,7 @@ class TestMetalPersistentPid(unittest.TestCase):
                 for m, n in ((rows, 200), (40, 50)):
                     with self.subTest(pid_type=pid_type, multiplier=multiplier, m=m):
                         x = torch.randn(m, n, device=DEVICE)
-                        out, code, msl = _run_with_msl(tile_scale, (x,), config)
+                        out, code, msl = run_with_msl(tile_scale, (x,), config)
                         self.assertIn(f"_launcher(_helion_tile_scale, ({grid},)", code)
                         self.assertIn(f"constexpr int _NUM_SM = {cores};", msl)
                         self.assertIn("for (int virtual_pid = ", msl)
@@ -15458,7 +15433,7 @@ class TestMetalPersistentPid(unittest.TestCase):
         for pid_type in ("persistent_blocked", "persistent_interleaved"):
             config = helion.Config(block_sizes=[16, 16], pid_type=pid_type)
             with self.subTest(pid_type=pid_type):
-                out, code, msl = _run_with_msl(tile_scale, (x,), config)
+                out, code, msl = run_with_msl(tile_scale, (x,), config)
                 self.assertIn("_launcher(_helion_tile_scale, (_NUM_SM * 4,)", code)
                 self.assertIn(f"constexpr int _NUM_SM = {cores};", msl)
                 torch.testing.assert_close(out, x * 2)
@@ -15505,7 +15480,7 @@ class TestMetalPersistentPid(unittest.TestCase):
                     block_sizes=block_sizes, pid_type=pid_type, num_sm_multiplier=1
                 )
                 with self.subTest(kernel=kernel.name, pid_type=pid_type):
-                    _, _, msl = _run_with_msl(kernel, args, config)
+                    _, _, msl = run_with_msl(kernel, args, config)
                     self.assertIn("for (int virtual_pid = ", msl)
                     self.assertIn(feature, msl)
                     compiled = kernel.bind(args).compile_config(config)
@@ -15621,7 +15596,7 @@ class TestMetalConfigFixedScalars(unittest.TestCase):
         x = torch.randn(50, 40, device=DEVICE)
         for bm in (8, 16, 32):
             with self.subTest(bm=bm):
-                out, code, msl = _run_with_msl(
+                out, code, msl = run_with_msl(
                     tile_count_grid, (x,), helion.Config(block_sizes=[bm])
                 )
                 self.assertIn(f"constexpr int nt = {(50 + bm - 1) // bm};", msl)
@@ -15632,7 +15607,7 @@ class TestMetalConfigFixedScalars(unittest.TestCase):
         x = torch.randn(50, 40, device=DEVICE)
         for bk in (8, 16):
             with self.subTest(bk=bk):
-                out, _, msl = _run_with_msl(
+                out, _, msl = run_with_msl(
                     tile_count_device_loop, (x,), helion.Config(block_sizes=[bk, 16])
                 )
                 self.assertIn(f"constexpr int nk = {(40 + bk - 1) // bk};", msl)
@@ -15658,7 +15633,7 @@ class TestMetalConfigFixedScalars(unittest.TestCase):
             ),
         ):
             with self.subTest(kernel=kernel.name):
-                out, code, msl = _run_with_msl(kernel, args, config)
+                out, code, msl = run_with_msl(kernel, args, config)
                 self.assertIn(by_value[0], code)
                 self.assertIn(by_value[1], msl)
                 torch.testing.assert_close(out, expected)
@@ -15668,7 +15643,7 @@ class TestMetalConfigFixedScalars(unittest.TestCase):
         the config doesn't fix."""
         kernel = helion.kernel(tile_count_grid.fn, backend="metal", static_shapes=False)
         x = torch.randn(50, 40, device=DEVICE)
-        out, code, msl = _run_with_msl(kernel, (x,), helion.Config(block_sizes=[16]))
+        out, code, msl = run_with_msl(kernel, (x,), helion.Config(block_sizes=[16]))
         self.assertRegex(code, r"_launcher\(.*\bnt\b.*_by_value=\(\d+, \d+\)")
         self.assertIn("constant long& nt [[buffer", msl)
         torch.testing.assert_close(out, x * 2)
@@ -15746,7 +15721,7 @@ class TestMetalIntTrueDiv(unittest.TestCase):
                     block_sizes=[bm, 16] if kernel is tile_count_truediv else [bm]
                 )
                 with self.subTest(kernel=kernel.name, bm=bm):
-                    out, _, msl = _run_with_msl(kernel, (x,), config)
+                    out, _, msl = run_with_msl(kernel, (x,), config)
                     self.assertIn("static_cast<float>(c10::metal::floor_divide(", msl)
                     torch.testing.assert_close(out, x * ((50 + bm - 1) // bm / 3))
 
@@ -15754,7 +15729,7 @@ class TestMetalIntTrueDiv(unittest.TestCase):
         x = torch.randn(50, 40, device=DEVICE)
         for bm in (8, 16):
             with self.subTest(bm=bm):
-                out, _, msl = _run_with_msl(
+                out, _, msl = run_with_msl(
                     block_size_truediv, (x,), helion.Config(block_sizes=[bm, 16])
                 )
                 self.assertIn("static_cast<float>(_BLOCK_SIZE_0) / 3", msl)
@@ -15763,7 +15738,7 @@ class TestMetalIntTrueDiv(unittest.TestCase):
     def test_int_argument_truediv(self) -> None:
         """The argument is bound as a float already; the cast keeps it one."""
         x = torch.randn(50, 40, device=DEVICE)
-        out, _, msl = _run_with_msl(
+        out, _, msl = run_with_msl(
             int_arg_truediv, (x, 4), helion.Config(block_sizes=[16, 16])
         )
         self.assertIn("static_cast<float>(n) / 3", msl)
