@@ -415,6 +415,40 @@ def scatter_exchange_kernel(
 
 
 @helion.kernel(autotune_effort="none", static_shapes=True)
+def scatter_after_local_kernel(
+    symm: torch.Tensor,
+    x: torch.Tensor,
+    rows: torch.Tensor,
+    count: torch.Tensor,
+    group_name: hl.ProcessGroupName,
+) -> torch.Tensor:
+    """``scatter_exchange_kernel`` whose scatter stores rows a local root
+    scaled first."""
+    peers = _remote_views(symm, group_name)
+    scaled = torch.empty_like(x)
+    out = torch.empty(symm.size(), dtype=torch.float32, device=symm.device)
+    half = symm.size(1) // 2
+    for tile_t in hl.tile(x.size(0), block_size=1):
+        scaled[tile_t, :, :] = x[tile_t, :, :] * 2
+    for tile_h, tile_t in hl.tile([2, x.size(0)], block_size=[1, 1]):
+        if tile_t.begin < count[0]:
+            row = rows[tile_t.begin, :]
+            cols = tile_h.begin * half + hl.arange(half)
+            hl.store(
+                symm,
+                [row, cols],
+                scaled[tile_t.begin, :, cols],
+                extra_mask=(row >= 0)[:, None],
+            )
+    for tile_m, tile_c in hl.tile(symm.size(), block_size=[8, 32]):
+        acc = hl.zeros([tile_m, tile_c], dtype=torch.float32)
+        for peer in peers:
+            acc = acc + peer[tile_m, tile_c].to(torch.float32)
+        out[tile_m, tile_c] = acc
+    return out
+
+
+@helion.kernel(autotune_effort="none", static_shapes=True)
 def scatter_matmul_exchange_kernel(
     symm: torch.Tensor,
     x: torch.Tensor,
@@ -479,6 +513,41 @@ def tagged_ring_exchange_kernel(
             acc = hl.dot(z[tile_m, tile_k], w[tile_k, tile_n], acc=acc)
         out[tile_m, tile_n] = acc
     return out, total
+
+
+@helion.kernel(autotune_effort="none", static_shapes=True, backend="gluon")
+def scatter_ring_kernel(
+    symm: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    rows: torch.Tensor,
+    count: torch.Tensor,
+    group_name: hl.ProcessGroupName,
+) -> torch.Tensor:
+    """``scatter_after_local_kernel`` with a ring matmul in the scatter root:
+    its operand from the local root is gated, its weights are not."""
+    peers = _remote_views(symm, group_name)
+    scaled = torch.empty_like(x)
+    out = torch.empty(symm.size(), dtype=torch.float32, device=symm.device)
+    for tile_t in hl.tile(x.size(0), block_size=1):
+        scaled[tile_t, :, :] = x[tile_t, :, :] * 2
+    for tile_n, tile_t in hl.tile([w.size(1), x.size(0)], block_size=[None, 1]):
+        if tile_t.begin < count[0]:
+            row = rows[tile_t.begin, :]
+            acc = hl.zeros([row.size(0), tile_n], dtype=torch.float32)
+            for tile_k in hl.tile(x.size(2)):
+                acc = hl.dot(
+                    scaled[tile_t.begin, :, tile_k], w[tile_k, tile_n], acc=acc
+                )
+            hl.store(
+                symm, [row, tile_n], acc.to(symm.dtype), extra_mask=(row >= 0)[:, None]
+            )
+    for tile_m, tile_c in hl.tile(symm.size(), block_size=[128, 32]):
+        total = hl.zeros([tile_m, tile_c], dtype=torch.float32)
+        for peer in peers:
+            total = total + peer[tile_m, tile_c].to(torch.float32)
+        out[tile_m, tile_c] = total
+    return out
 
 
 # A ring configuration of tagged_ring_exchange_kernel: z is an MMA operand the
@@ -884,6 +953,20 @@ class TestDistributed(TestCase, MultiProcessTestCase):
     @skip_if_lt_x_gpu(4)
     @parametrize("dtype", (torch.bfloat16, torch.float32))
     def test_inband_scatter_reads_unwritten_rows(self, dtype: torch.dtype) -> None:
+        self._check_inband_scatter_reads_unwritten_rows(scatter_exchange_kernel, dtype)
+
+    @skipIfNotCUDA()
+    @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
+    @skip_if_lt_x_gpu(4)
+    def test_inband_scatter_after_a_local_root_reads_unwritten_rows(self) -> None:
+        # The launch hold waits in the scatter root's block, after a local root.
+        self._check_inband_scatter_reads_unwritten_rows(
+            scatter_after_local_kernel, torch.float32, scale=2
+        )
+
+    def _check_inband_scatter_reads_unwritten_rows(
+        self, kernel: helion.Kernel, dtype: torch.dtype, scale: int = 1
+    ) -> None:
         self._init_process()
         group = dist.group.WORLD
         world, tasks, lanes, cols = self.world_size, 4, 8, 64
@@ -900,7 +983,7 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         rows = torch.empty(tasks, lanes, device=self.device, dtype=torch.int32)
         count = torch.empty(1, device=self.device, dtype=torch.int32)
         args = (symm, x, rows, count, group.group_name)
-        bound = scatter_exchange_kernel.bind(args)
+        bound = kernel.bind(args)
         for step in range(6):
             generator = torch.Generator().manual_seed(step)
             plans = []
@@ -914,7 +997,7 @@ class TestDistributed(TestCase, MultiProcessTestCase):
                 values = ((index * (r + 1) + 3 * step) % 128).float()
                 for t in range(live):
                     written = row[t] >= 0
-                    mirror[r, row[t][written].long()] = values[t][written]
+                    mirror[r, row[t][written].long()] = scale * values[t][written]
                 plans.append((values, row, live))
             values, row, live = plans[self.rank]
             torch.cuda._sleep(100_000 * ((self.rank + step) % world))
@@ -2164,6 +2247,67 @@ class TestDistributedTileDependencies(TestCase):
         self.assertIn("_hold_after_fallback(tile_dependency_peer_state", code)
         # The record key must index the row block the reader computes.
         self.assertIn("% 64 // 32 * 1 + inband_offset_1 // 64 * 2", code)
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    def test_inband_scatter_hold_waits_before_the_first_scatter(self) -> None:
+        """The hold (wait for every rank to start this launch before a scatter
+        may overwrite rows the last launch read unwritten) runs where the
+        first scatter store's block starts: the roots before it write no
+        scatter row, so their loads issue without it.  The launch is
+        announced and the hold flag read before the first root's tasks."""
+        symm = torch.zeros(32, 64, device=DEVICE, dtype=torch.bfloat16)
+        x = torch.zeros(4, 8, 64, device=DEVICE, dtype=torch.bfloat16)
+        rows = torch.zeros(4, 8, device=DEVICE, dtype=torch.int32)
+        count = torch.zeros(1, device=DEVICE, dtype=torch.int32)
+        group = self._world(4, scatter_after_local_kernel)
+        bound = scatter_after_local_kernel.bind((symm, x, rows, count, group))
+        code = bound.to_triton_code()
+        self.assertEqual(code.count("_hold_after_fallback("), 1)
+        body = code[code.index("def _helion_scatter_after_local_kernel(") :]
+        # The task loops of roots 0 (local) and 1 (the scatter), in order.
+        local, scatter = (
+            m.start()
+            for m in itertools.islice(re.finditer("for virtual_pid in", body), 2)
+        )
+        self.assertLess(body.index("tile_dependency_peer_held = "), local)
+        announce = re.search(r"tile_dependency_every_rank(_\d+)? = ", body)
+        assert announce is not None
+        self.assertLess(announce.start(), local)
+        hold = body.index("_hold_after_fallback(tile_dependency_peer_state")
+        self.assertLess(local, hold)
+        self.assertLess(hold, scatter)
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    def test_inband_scatter_hold_waits_in_the_storing_partition(self) -> None:
+        """In a ring megakernel only the partition that issues the scatter
+        stores waits for the hold; the gated producer of the scattered rows'
+        operand waits only for that operand."""
+        if not supports_gluon():
+            self.skipTest("the gluon ring needs Blackwell and Triton >= 3.8")
+        symm = torch.zeros(512, 128, device=DEVICE, dtype=torch.bfloat16)
+        x = torch.zeros(4, 128, 256, device=DEVICE, dtype=torch.bfloat16)
+        w = torch.zeros(256, 128, device=DEVICE, dtype=torch.bfloat16)
+        rows = torch.zeros(4, 128, device=DEVICE, dtype=torch.int32)
+        count = torch.zeros(1, device=DEVICE, dtype=torch.int32)
+        group = self._world(4, scatter_ring_kernel)
+        bound = scatter_ring_kernel.bind((symm, x, w, rows, count, group))
+        config = bound.config_spec.default_config().config
+        config.pop("range_warp_specializes")
+        code = bound.to_triton_code(
+            helion.Config(**{**config, **TAGGED_RING, "block_sizes": [64, 64]})
+        )
+        name = "_helion_scatter_ring_kernel"
+        holds = {
+            function.group(1): function.group(2).count("_hold_after_fallback(")
+            for function in re.finditer(
+                rf"^def {name}(_\w+)?\((.*?)(?=^def |\Z)",
+                code,
+                re.MULTILINE | re.DOTALL,
+            )
+        }
+        self.assertIn("_producer1", holds)
+        self.assertEqual({part for part, n in holds.items() if n}, {"_body"}, holds)
+        self.assertEqual(holds["_body"], 1)
 
     @skipIfRefEager("peer views are recorded only in compiled mode")
     def test_peer_views_require_allocation_base(self) -> None:

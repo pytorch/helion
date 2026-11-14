@@ -2992,6 +2992,9 @@ def emit_cross_loop_schedule(
 
     dispatch_ticket: str | None = None
     peer_launch = ""
+    # This launch's announcement (before the first task loop) and the hold
+    # (before the first inband scatter store's block).
+    entry_announce: list[ast.stmt] = []
     entry_gate: list[ast.stmt] = []
     if not uses_packet_dispatch:
         assert state_arg is not None
@@ -3030,8 +3033,8 @@ def emit_cross_loop_schedule(
                 statement_from_string(f"{peer.epoch} = tl.load({peer_launch}) + 1")
             )
             if peer.scatters:
-                # Read the hold flag now; its wait runs once the first loop's
-                # prologue loads are in flight.
+                # Read the hold flag now; its wait runs where the first scatter
+                # store's block starts.
                 held = device_function.new_var("tile_dependency_peer_held", dce=False)
                 result.append(
                     statement_from_string(
@@ -3039,9 +3042,14 @@ def emit_cross_loop_schedule(
                         f" == {peer.epoch}"
                     )
                 )
-                # Announce this launch, then wait out last launch's reads of rows
-                # no task wrote, which this launch may now overwrite.
-                entry_gate = [
+                # Announce this launch where the first root's block starts;
+                # before the first scatter store's block, wait out last
+                # launch's reads of rows no task wrote, which this launch's
+                # scatters may now overwrite.  Until then the roots write no
+                # scatter row, so their loads need not wait; nor do partitions
+                # that access none of the scattered allocations (the wait
+                # covers those).
+                entry_announce = [
                     create(
                         ast.If,
                         test=expr_from_string(f"{worker} == 0"),
@@ -3055,12 +3063,26 @@ def emit_cross_loop_schedule(
                         ],
                         orelse=[],
                     ),
-                    _bound_wait(
-                        device_function,
-                        f"helion_dist_utils._hold_after_fallback({peer.state}, "
-                        f"{peer.started}, {world_size}, {peer.epoch}, {held})",
-                    ),
                 ]
+                assert dependency_graph is not None
+                scattered = frozenset(
+                    allocation
+                    for access_id, allocation in _access_allocations().items()
+                    if dependency_graph.accesses[access_id].allocation_id
+                    in peer.scatters
+                )
+                assert scattered, "an inband scatter allocation has its store"
+                entry_gate = _covering(
+                    device_function,
+                    [
+                        _bound_wait(
+                            device_function,
+                            f"helion_dist_utils._hold_after_fallback({peer.state}, "
+                            f"{peer.started}, {world_size}, {peer.epoch}, {held})",
+                        )
+                    ],
+                    scattered,
+                )
     else:
         assert dispatch_ticket_arg is not None
         raw_dispatch_ticket = device_function.new_var(
@@ -5281,6 +5303,7 @@ def emit_cross_loop_schedule(
         preamble: list[ast.stmt],
         blocks: dict[int, list[ast.stmt]],
         members: dict[int, frozenset[int] | None],
+        pinned: frozenset[int],
     ) -> list[ast.stmt]:
         """The resident roots' blocks, in order, with each root the config
         selects (``cross_loop_dry_passes``) also run once dry in an earlier
@@ -5304,7 +5327,9 @@ def emit_cross_loop_schedule(
         latest keeps the warmed code closest to its live run).  A root
         anchored at or before a fold's last root joins that fold if it still
         lowers with it; one anchored after opens the next.  A root no fold can
-        carry keeps its block.  ``preamble`` is the code before the blocks."""
+        carry keeps its block.  ``preamble`` is the code before the blocks;
+        ``pinned`` blocks run code on every worker (the launch hold), so a
+        fold never moves them after its loop."""
         order = list(blocks)
         selected = cast(
             "list[bool]",
@@ -5387,6 +5412,7 @@ def emit_cross_loop_schedule(
                 statements(end),
                 blocks,
                 members,
+                pinned,
             )
 
         def finish(dry: _DryFold, emitted: list[ast.stmt]) -> None:
@@ -5472,6 +5498,7 @@ def emit_cross_loop_schedule(
         suffix: list[ast.stmt],
         blocks: dict[int, list[ast.stmt]],
         members: dict[int, frozenset[int] | None],
+        pinned: frozenset[int],
     ) -> list[ast.stmt] | str:
         """One fold of ``static_dry_passes`` over ``region``'s blocks, or why it
         cannot carry them; ``prefix`` and ``suffix`` are the statements around
@@ -5480,7 +5507,11 @@ def emit_cross_loop_schedule(
         start = f"tl.program_id(0) // {1 << 29}"
         order = list(blocks)
         kept = _dry_fold_kept(
-            region, fold.anchors, members, frozenset(range(launch_worker_count))
+            region,
+            fold.anchors,
+            # A dry gate root's own block carries the hold into its live trip.
+            {**members, **dict.fromkeys(pinned - fold.anchors.keys())},
+            frozenset(range(launch_worker_count)),
         )
         # Like the packet path's dry passes, keep tl.dot roots out of the loop
         # (tl.range fails to compile around their tensor memory); ring sites
@@ -5547,10 +5578,33 @@ def emit_cross_loop_schedule(
         assert state_arg is not None
         blocks: dict[int, list[ast.stmt]] = {}
         members: dict[int, frozenset[int] | None] = {}
-        for root in static_pipeline_plan.resident_roots:
+        resident_roots = static_pipeline_plan.resident_roots
+        # A continuation root's tasks run in the block of whichever producer
+        # arrives last.
+        hosts: dict[int, set[int]] = {}
+        for plan in static_pipeline_plan.readiness_counters:
+            if (consumer := plan.continuation_consumer) is not None:
+                hosts.setdefault(consumer.consumer_root, set()).update(
+                    producer.producer_root for producer in plan.producers
+                )
+
+        def host(root: int) -> int:
+            """The earliest block that may run ``root``'s tasks (blocks follow
+            root order)."""
+            return min(map(host, hosts[root])) if root in hosts else root
+
+        gate_root = (
+            min(map(host, peer.scatter_roots), default=None)
+            if peer is not None
+            else None
+        )
+        for root in resident_roots:
             members[root] = static_members(root)
             body = static_root_body(root)
-            # The gate precedes the first task loop, after its hoisted loads.
+            # The gates precede the first task loop, after the loads hoisted
+            # above it, at kernel scope (a root on fewer workers than the
+            # launch has its loop inside the membership test: the gates open
+            # its block).
             first = next(
                 (
                     i
@@ -5559,10 +5613,15 @@ def emit_cross_loop_schedule(
                 ),
                 0,
             )
-            blocks[root] = [*body[:first], *entry_gate, *body[first:]]
-            entry_gate = []
-        assert not entry_gate, "inband scatters need a resident root"
-        result.extend(static_dry_passes(result, blocks, members))
+            gates = [
+                *(entry_announce if root == resident_roots[0] else ()),
+                *(entry_gate if root == gate_root else ()),
+            ]
+            blocks[root] = [*body[:first], *gates, *body[first:]]
+        # The hold runs on every worker: no dry pass moves its block behind a
+        # later root's live run.
+        pinned = frozenset(() if gate_root is None else (gate_root,))
+        result.extend(static_dry_passes(result, blocks, members, pinned))
         _reuse_guard_values(result, guard_statements)
         writes: list[ast.stmt] = [
             statement_from_string(f"tl.store({state_arg} + {worker}, {epoch_var})")
