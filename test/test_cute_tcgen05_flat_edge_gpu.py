@@ -231,18 +231,25 @@ class TestCuteTcgen05FlatEdgeGpu(RefEagerTestDisabled, TestCase):
         bound.set_config(config)
         torch.testing.assert_close(bound(a, b), torch.bmm(a, b), rtol=1e-2, atol=1e-1)
 
-    def test_ragged_batched_m_major_a_stays_off_the_search(self) -> None:
-        # The batched planner admits K-major operands only; an M-major A
-        # ([B, K, M] transposed) keeps the search off at full and ragged
-        # shapes alike, so the flat ragged pipeline never meets the shared
-        # scalar producer over partial batched tiles.
+    def test_ragged_batched_column_major_operands_load_through_tma(self) -> None:
+        # An M-major A ([B, K, M] transposed) and a K-major B ([B, N, K]
+        # transposed) load through their (M, K, L) and (N, K, L) TensorMap
+        # views, at full and ragged shapes alike, and match torch.
         for m in (1024, 1000):
             a = torch.randn(2, 1000, m, device=DEVICE, dtype=torch.bfloat16)
             b = torch.randn(2, 1000, 1000, device=DEVICE, dtype=torch.bfloat16)
-            bound = _bmm.bind((a.transpose(1, 2), b))
-            self.assertFalse(bound.config_spec.tcgen05.search_enabled)
-            with self.assertRaises(helion.exc.InvalidConfig):
-                bound.to_code(_flat_config([1, 128, 256, 64]))
+            for lhs, rhs in ((a.transpose(1, 2), b), (a.transpose(1, 2), b.mT)):
+                bound = _bmm.bind((lhs, rhs))
+                self.assertTrue(bound.config_spec.tcgen05.search_enabled)
+                config = _flat_config([1, 128, 256, 64])
+                code = bound.to_code(config)
+                self.assertIn("'a_k_major': False", code)
+                self.assertEqual("'b_k_major': True" in code, rhs.stride(1) == 1)
+                self.assertIn("tma_tensor_a", code)
+                bound.set_config(config)
+                torch.testing.assert_close(
+                    bound(lhs, rhs), torch.bmm(lhs, rhs), rtol=1e-2, atol=1e-1
+                )
 
 
 @onlyBackends(["cute"])
@@ -733,6 +740,21 @@ class TestCuteTcgen05RaggedTwoCtaSearch(RefEagerTestDisabled, TestCase):
             torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-1)
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fp8_bmm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    batch, m, k = a.shape
+    n = b.shape[2]
+    out = torch.empty((batch, m, n), dtype=torch.bfloat16, device=a.device)
+    for tile_b, tile_m, tile_n in hl.tile((batch, m, n)):
+        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.baddbmm(
+                acc, a[tile_b, tile_m, tile_k], b[tile_b, tile_k, tile_n]
+            )
+        out[tile_b, tile_m, tile_n] = acc.to(torch.bfloat16)
+    return out
+
+
 @onlyBackends(["cute"])
 @skipIfNotCUDA()
 @unittest.skipUnless(_promotes_b200_defaults(), "pins B200 default tiles")
@@ -770,6 +792,44 @@ class TestCuteTcgen05DefaultTilesGpu(RefEagerTestDisabled, TestCase):
                 bound.set_config(config)
                 bound(a, b, bias, out)
                 torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-1)
+
+    def test_fp8_bmm_defaults_match_torch(self) -> None:
+        # FP8 bmms with a K-major B take tcgen05 at their defaults, a K tail
+        # (K = 48 on 32-deep k-blocks) included.
+        for k in (48, 64):
+            with self.subTest(k=k):
+                a = torch.randn(64, 512, k, device=DEVICE).to(torch.float8_e4m3fn)
+                b = (
+                    torch.randn(64, 64, k, device=DEVICE)
+                    .to(torch.float8_e4m3fn)
+                    .transpose(1, 2)
+                )
+                bound = _fp8_bmm.bind((a, b))
+                bound.set_config(bound.config_spec.default_config())
+                torch.testing.assert_close(
+                    bound(a, b),
+                    torch.bmm(a.float(), b.float()).to(torch.bfloat16),
+                    rtol=1e-2,
+                    atol=1e-1,
+                )
+
+    def test_batched_m_major_a_defaults_match_torch(self) -> None:
+        # A batched M-major A stages through TMA, so its defaults are the
+        # pipeline's tiles, not the flat base tile.
+        for batch, m, n, k in ((8, 512, 64, 512), (2, 1024, 1024, 512)):
+            a = torch.randn(batch, k, m, device=DEVICE, dtype=torch.bfloat16)
+            b = torch.randn(batch, k, n, device=DEVICE, dtype=torch.bfloat16)
+            a = a.transpose(1, 2)
+            bound = _bmm.bind((a, b))
+            config = bound.config_spec.default_config()
+            self.assertNotEqual(config.config["pid_type"], "flat")
+            bound.set_config(config)
+            torch.testing.assert_close(
+                bound(a, b),
+                torch.bmm(a.float(), b.float()).to(torch.bfloat16),
+                rtol=1e-2,
+                atol=1e-1,
+            )
 
     def test_small_grid_default_runs_the_128_row_pair(self) -> None:
         # 36 128x128 tiles: the default is the 128-row pair with the most

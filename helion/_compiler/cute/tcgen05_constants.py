@@ -130,12 +130,13 @@ TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N = 256
 TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_NS = (192, TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N)
 # The C-ring subtile width of that rule: ``(128, 32)`` stages.
 TCGEN05_PLAIN_NARROW_SUBTILE_N = 32
-# The radix-store admission box, (128-lane accumulator rows, the plain narrow
-# rule's 32 columns): the pre-filter admits a hierarchical destination whose
-# innermost runs hold whole boxes of it, the epilogue tile the paired family
-# renders (the store lowering checks the configured tile; smaller explicit
-# tiles that it would also accept are not admitted).
-TCGEN05_RADIX_STORE_BOX_M = 128
+# The radix-store admission box, (the 64-row MMA tile's accumulator rows, the
+# plain narrow rule's 32 columns): the pre-filter admits a hierarchical
+# destination whose innermost runs hold whole boxes of it, the smallest
+# epilogue tile a tcgen05 tile renders (the store lowering checks the
+# configured tile, and refuses one that crosses a run: a batched head merge's
+# 64-row runs, ``[B * H, 64, S]`` tiles stored transposed, take 64-row tiles).
+TCGEN05_RADIX_STORE_BOX_M = 64
 TCGEN05_RADIX_STORE_BOX_N = TCGEN05_PLAIN_NARROW_SUBTILE_N
 # The wave-quantized pair-tile time that ranks 16-bit pair widths
 # (``facts._dense_aligned_n_clipped_widths``; rough constants). The
