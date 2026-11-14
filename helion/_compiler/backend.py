@@ -554,7 +554,7 @@ class Backend(abc.ABC):
     @property
     def places_pdl_markers(self) -> bool:
         """Whether ``finalize_device_body`` takes the kernel's entry markers
-        (``hl.code_warm`` and the PDL entry ops) and exit ops in the body and
+        (``hl.prefetch_code`` and the PDL entry ops) and exit ops in the body and
         places them itself; otherwise they surround the final body."""
         return False
 

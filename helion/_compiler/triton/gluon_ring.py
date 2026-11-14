@@ -1260,7 +1260,7 @@ class RingLowering:
                 f"a thread beside workers of {regs}"
             )
         roles = [role for role, _ in slices]
-        _move_code_warm(
+        _move_prefetch_code(
             body, partitions, workers, roles.index("mma") if "mma" in roles else None
         )
         setup = []
@@ -2217,25 +2217,29 @@ def _computes_tensors(body: list[ast.stmt]) -> bool:
     return False
 
 
-def _move_code_warm(
+def _move_prefetch_code(
     body: ast.FunctionDef,
     partitions: list[ast.FunctionDef],
     workers: list[tuple[int, bool]],
     mma: int | None,
 ) -> None:
-    """Move the entry code warm into the MMA partition (``mma``), idle until operands land."""
-    is_warm = functools.partial(
-        _is_tl_call, names=frozenset(["code_warm"]), modules=("helion_code_warm",)
+    """Move the entry code prefetch into the MMA partition (``mma``), idle until operands land."""
+    is_prefetch = functools.partial(
+        _is_tl_call,
+        names=frozenset(["prefetch_code"]),
+        modules=("helion_prefetch_code",),
     )
-    warm = [st for st in body.body if isinstance(st, ast.Expr) and is_warm(st.value)]
-    if mma is None or not warm:
+    prefetch = [
+        st for st in body.body if isinstance(st, ast.Expr) and is_prefetch(st.value)
+    ]
+    if mma is None or not prefetch:
         return
-    body.body = [st for st in body.body if st not in warm]
-    # Imported here: importing code_warm installs its compiler hook.
-    from ...runtime.triton.code_warm import code_warm_here
+    body.body = [st for st in body.body if st not in prefetch]
+    # Imported here: importing prefetch_code installs its compiler hook.
+    from ...runtime.triton.prefetch_code import prefetch_code_here
 
-    warm_here = code_warm_here(workers[mma][0])
-    partitions[mma].body.insert(0, statement_from_string(warm_here))
+    prefetch_here = prefetch_code_here(workers[mma][0])
+    partitions[mma].body.insert(0, statement_from_string(prefetch_here))
 
 
 # ---- regeneration and finalization ------------------------------------------------

@@ -1467,13 +1467,13 @@ class DeviceFunction:
             and "wait" not in env.pdl_entry
         ):
             raise exc.PdlStateWithoutWait
-        code_warm = (
-            [statement_from_string("helion_code_warm.code_warm()")]
-            if env.code_warm and backend.uses_triton_compiler
+        prefetch_code = (
+            [statement_from_string("helion_prefetch_code.prefetch_code()")]
+            if env.prefetch_code and backend.uses_triton_compiler
             else []
         )
         entry = [
-            *code_warm,
+            *prefetch_code,
             *[
                 statement_from_string(backend.pdl_instruction(op))
                 for op in env.pdl_entry

@@ -270,8 +270,8 @@ def scale_then_mm(
     y = torch.empty_like(x)
     out = torch.empty([m, n], dtype=torch.float32, device=x.device)
     # The next launch starts at once and waits for this one at its entry (its
-    # code warm ahead of the wait).
-    hl.code_warm()
+    # code prefetch ahead of the wait).
+    hl.prefetch_code()
     hl.pdl_wait()
     hl.pdl_launch_dependents()
     for tile_r, tile_c in hl.tile([m, k]):
@@ -703,10 +703,12 @@ class TestGluonRing(TestCase):
                     self.assertNotIn("gdc_wait()", fn)
                     self.assertNotIn("tl.store(tile_dependency_state", fn)
                 body = functions["_helion_scale_then_mm_body"]
-                # The code warm runs ahead of the wait (in the idle MMA partition
+                # The code prefetch runs ahead of the wait (in the idle MMA partition
                 # when there is one).
                 warm = functions["_helion_scale_then_mm_mma"] if specialize else body
-                at = warm.index("code warm here" if specialize else "code_warm()")
+                at = warm.index(
+                    "prefetch code here" if specialize else "prefetch_code()"
+                )
                 self.assertLess(at, warm.index("_launch("))
                 self.assertIn("return (tile_dependency_epoch,)", body)
                 self.assertNotIn("def _helion_scale_then_mm_claimer(", code)

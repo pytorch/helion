@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
     from .._compiler.variable_origin import Origin
 
-__all__ = ["code_warm", "pdl_launch_dependents", "pdl_wait"]
+__all__ = ["pdl_launch_dependents", "pdl_wait", "prefetch_code"]
 
 
 @_decorators.api(
@@ -59,13 +59,13 @@ def pdl_launch_dependents() -> None:
     cache_type=True,
     signature=inspect.signature(lambda: None),
 )
-def code_warm() -> None:
+def prefetch_code() -> None:
     """
-    L2-warm the kernel's own native code at entry.
+    Prefetch the kernel's own native code into L2 at entry.
 
     Call it on the host before the first loop. A megakernel's code outgrows the
     launch prefetch, and the weights streamed between its launches evict it from
-    L2, so its first tasks would fetch their instructions from DRAM; the warm
+    L2, so its first tasks would fetch their instructions from DRAM; the prefetch
     loads the code into L2 ahead of the body (and of any PDL wait). It does
     nothing outside the Triton and Gluon backends on NVIDIA GPUs of compute
     capability 9.0 or newer.
@@ -89,9 +89,9 @@ def _(origin: Origin, **kwargs: object) -> PdlResultType:
     return _pdl_type(origin, "launch_dependents")
 
 
-@_decorators.type_propagation(code_warm)
+@_decorators.type_propagation(prefetch_code)
 def _(origin: Origin, **kwargs: object) -> PdlResultType:
-    return _pdl_type(origin, "code_warm")
+    return _pdl_type(origin, "prefetch_code")
 
 
 @_decorators.ref(pdl_wait)
@@ -99,14 +99,14 @@ def _() -> None:
     return None
 
 
-@_decorators.codegen(code_warm, "common")
+@_decorators.codegen(prefetch_code, "common")
 def _(state: CodegenState) -> ast.AST:
-    # DeviceFunction emits the warm (Triton and Gluon on sm_90+); every other
+    # DeviceFunction emits the prefetch (Triton and Gluon on sm_90+); every other
     # backend compiles the call to nothing.
     return expr_from_string("None")
 
 
-@_decorators.ref(code_warm)
+@_decorators.ref(prefetch_code)
 def _() -> None:
     return None
 

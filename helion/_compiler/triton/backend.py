@@ -475,7 +475,7 @@ class TritonBackend(Backend):
             "libdevice": "from torch._inductor.runtime.triton_compat import libdevice",
             "_helion_tensor_descriptor": "from triton.tools.tensor_descriptor import TensorDescriptor as _helion_tensor_descriptor",
             "helion_dist_utils": "from helion.runtime.triton import dist_utils as helion_dist_utils",
-            "helion_code_warm": "from helion.runtime.triton import code_warm as helion_code_warm",
+            "helion_prefetch_code": "from helion.runtime.triton import prefetch_code as helion_prefetch_code",
             "helion_triton_helpers": "from helion.runtime.triton import helpers as helion_triton_helpers",
             "nvshmem": "import torch.distributed._symmetric_memory._nvshmem_triton as nvshmem",
             "requires_nvshmem": "from torch.distributed._symmetric_memory._nvshmem_triton import requires_nvshmem",
@@ -785,7 +785,7 @@ class GluonBackend(TritonBackend):
     @property
     def places_pdl_markers(self) -> bool:
         # The ring slices the body into partitions, each keeping the grid wait
-        # where its statements need it (and the code warm in an idle one).
+        # where its statements need it (and the code prefetch in an idle one).
         return True
 
     # Keys no Gluon compile pass reads (no loop flatten or accumulator
