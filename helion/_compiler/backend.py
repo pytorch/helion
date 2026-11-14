@@ -953,6 +953,16 @@ class Backend(abc.ABC):
         adds to every kernel's search space; ``{}`` for none."""
         return {}
 
+    def default_final_selection_regime(self) -> str | None:
+        """The regime the autotuner's final selection times finalists in
+        when neither ``HELION_AUTOTUNE_L2_FLUSH`` nor
+        ``HELION_AUTOTUNE_FINAL_L2_FLUSH`` names one (see
+        ``final_selection_l2_flush_mode``); a per-call flushed one (``call``
+        or ``kernel``) also times a warm selection's cold tie-break column
+        (``final_selection_second_regime``). ``None`` keeps the search's
+        regime and a ``call`` column."""
+        return None
+
     def autotuner_heuristics(self) -> tuple[AutotunerHeuristicType, ...]:
         """The compiler-seed heuristics this backend plants, in ranked order.
 
