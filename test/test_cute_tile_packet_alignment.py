@@ -226,3 +226,88 @@ def test_a_wrapper_view_at_half_a_packet_stays_scalar() -> None:
 def test_a_wrapper_byte_view_at_its_packet_size_is_packed() -> None:
     code = _wrapper_view_code(_int8_to_bf16_from_col_8, torch.int8)
     assert "cutlass.Uint64" in code
+
+
+def _double_bf16_tile_from(x: torch.Tensor, start: hl.constexpr) -> torch.Tensor:
+    k = x.shape[0]
+    out = torch.zeros_like(x)
+    for tk, tn in hl.tile([0, start], [k, start + 128]):
+        out[tk, tn] = x[tk, tn] * 2
+    return out
+
+
+def _double_bf16_loop_from(x: torch.Tensor, start: hl.constexpr) -> torch.Tensor:
+    k = x.shape[0]
+    out = torch.zeros_like(x)
+    for tk in hl.tile(k):
+        for tn in hl.tile(start, start + 128):
+            out[tk, tn] = x[tk, tn] * 2
+    return out
+
+
+def _double_bf16_tile_from_int(x: torch.Tensor, start: int) -> torch.Tensor:
+    k = x.shape[0]
+    out = torch.zeros_like(x)
+    for tk, tn in hl.tile([0, start], [k, start + 128]):
+        out[tk, tn] = x[tk, tn] * 2
+    return out
+
+
+def _double_bf16_loop_from_int(x: torch.Tensor, start: int) -> torch.Tensor:
+    k = x.shape[0]
+    out = torch.zeros_like(x)
+    for tk in hl.tile(k):
+        for tn in hl.tile(start, start + 128):
+            out[tk, tn] = x[tk, tn] * 2
+    return out
+
+
+@pytest.mark.parametrize(
+    "kernel",
+    [_double_bf16_tile_from_int, _double_bf16_loop_from_int],
+    ids=["grid", "loop"],
+)
+def test_a_tile_start_from_an_int_argument_stays_scalar(kernel: object) -> None:
+    """An ``int`` argument's start is not known to be a multiple of V, even
+    when the call passes one (8 here), so its tile emits no tile packet."""
+    bound = cpu_bind(
+        helion.kernel(
+            kernel, backend="cute", static_shapes=True, autotune_effort="none"
+        ),  # pyrefly: ignore
+        (torch.empty((64, 144), dtype=torch.bfloat16), 8),
+    )
+    config = helion.Config(
+        block_sizes=[8, 128], num_threads=[8, 16], cute_vector_widths=[1, 8]
+    )
+    with mock_cuda_unavailable():
+        code = bound.to_code(config)
+    assert "_tile_unroll_vec_" not in code
+    assert "_tile_store_vals_" not in code
+
+
+@pytest.mark.parametrize(
+    "kernel", [_double_bf16_tile_from, _double_bf16_loop_from], ids=["grid", "loop"]
+)
+@pytest.mark.parametrize(
+    ("start", "packed"), [(0, True), (1, False), (4, False), (8, True)]
+)
+def test_a_tile_start_off_a_packet_multiple_stays_scalar(
+    kernel: object, start: int, packed: bool
+) -> None:
+    """The lane base is the tile's start plus multiples of V: tiles from
+    column 1 or 4 would read and write every tile packet off its 16-byte
+    alignment, which faults on the GPU.  (A packet whose alignment the
+    kernel checks at run time may still take their place.)"""
+    bound = cpu_bind(
+        helion.kernel(
+            kernel, backend="cute", static_shapes=True, autotune_effort="none"
+        ),  # pyrefly: ignore
+        (torch.empty((64, 144), dtype=torch.bfloat16), start),
+    )
+    config = helion.Config(
+        block_sizes=[8, 128], num_threads=[8, 16], cute_vector_widths=[1, 8]
+    )
+    with mock_cuda_unavailable():
+        code = bound.to_code(config)
+    assert ("_tile_unroll_vec_" in code) is packed
+    assert ("_tile_store_vals_" in code) is packed

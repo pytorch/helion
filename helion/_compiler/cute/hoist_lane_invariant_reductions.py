@@ -51,6 +51,7 @@ from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
 from .fuse_two_pass_loads import _is_store_call
 from .fuse_two_pass_loads import _store_tensor_roots
 from .fuse_two_pass_loads import _tensor_arg_roots
+from .lane_loops.owner_guards import _is_atomic_call
 from .licm_profitability import repeated_work_is_profitable
 from .packet_access import match_packet_access
 from .scalar_recipe import PURE_HELPERS
@@ -279,13 +280,6 @@ def _statement_effects(stmt: ast.stmt) -> _Effects:
         if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
     }
     return _Effects(frozenset(reads), frozenset(writes))
-
-
-def _is_atomic_call(call: ast.Call) -> bool:
-    path = call_path_str(call.func)
-    return path is not None and (
-        path.split(".")[-1].startswith("atomic_") or path.startswith("_cute_atomic_")
-    )
 
 
 def _is_proven_scalar_bitcast(call: ast.Call) -> bool:

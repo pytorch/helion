@@ -16,8 +16,12 @@ This generalizes the CuTe flash-attention family in three directions:
   KV range of a query tile (columns every row masks are skipped).  Masked
   scores are replaced by 1.0 before the gate runs (their gate values are
   discarded) so TMA zero fill never sends the IEEE division down its slow
-  path.  ``exp`` feeding ``c + e`` uses the flush-to-zero ex2 (bit-identical
-  there); the division stays IEEE unless the ``fast_math`` setting is on.
+  path.  ``exp2`` feeding ``c + e`` uses the flush-to-zero ex2 (bit-identical
+  there); ``exp`` is the pointwise lowering's, as in the configs this body
+  declines: the exactly reduced ``cute.math.exp``, or ``ex2.approx`` of
+  ``x * log2(e)`` under the ``fast_math`` setting.  The division is the
+  pointwise lowering's too: IEEE, or ``div.approx.ftz`` for an fp32 quotient
+  under that setting.
 * **Row loads.** Two forms.  *Root form*: Q/K/V/O rows are
   ``x[tile.index + offset, lane, :]`` on a rank-3 host tensor whose leading
   coordinate is a singleton root axis (the head), with a loop-invariant scalar
@@ -46,11 +50,16 @@ This generalizes the CuTe flash-attention family in three directions:
 Intentional semantic deviations from the FX program:
 
 * The output store: rows whose gate is forced to zero by a row-only mask term
-  (``mask_q``) are not stored.  The frontend would store zeros there, which
-  for jagged layouts alias the next sequence's rows (a write race the
-  reference does not have); skipping them yields the reference values.  This
-  is only done when the accumulator starts at zero and the masked value is
-  the constant zero.
+  of the exact jagged-length form
+  (``mask_q = tile_q.index < off[b + 1] - off[b]``) are not stored when they
+  lie before the end of the last sequence and the sequences share an output
+  lane.  The frontend would store zeros there, which alias a later
+  sequence's rows (a write race the reference does not have); skipping them
+  yields the reference values.  Rows past the last sequence are no
+  sequence's, and with one sequence per output lane no later sequence stores
+  into the lane, so those rows get the frontend's zeros, as do the rows any
+  other row-only term masks.  This is only done when the accumulator starts
+  at zero and the masked value is the constant zero.
 * Non-finite V rows only (finite data is bit-identical): KV tiles that the P
   mask provably zeroes are skipped, so a NaN/inf V row inside such a tile no
   longer poisons the output through ``0 * V`` as it does in the frontend; and
@@ -97,15 +106,21 @@ from ..emitter_protocols import statements_and_reads_adapter
 from ..utils import is_full_slice
 from . import target_facts
 from .analysis.match_common import host_tensor_name
+from .analysis.match_common import root_grid_origin_is_canonical
 from .cute_flash import FLASH_KV_STAGE_KEY
 from .cute_flash import _flash_graph_host_tensors
 from .cute_flash import _flash_ws_qk_ahead
 from .cute_flash import emit_flash_module_statements
+from .dtypes import float_literal
+from .dtypes import narrow_common_dtype
+from .dtypes import promotion_operand
+from .dtypes import round_scalar
 from .flash_template_runs import FLASH_QKV_TMA_PARTITIONS
 from .flash_template_runs import flash_ws_p_store_partitions
 from .flash_template_runs import flash_ws_pv_step
 from .flash_template_runs import flash_ws_qk_step
 from .flash_template_runs import flash_ws_s_load_partitions
+from .math_templates import SIGMOID_TEMPLATE
 from .state import cute_codegen_state
 
 if TYPE_CHECKING:
@@ -239,7 +254,6 @@ _UNARY_MATH_TARGETS: dict[object, str] = {
     torch.ops.aten.exp.default: "exp",
     torch.ops.aten.exp2.default: "exp2",
     torch.ops.aten.sigmoid.default: "sigmoid",
-    torch.ops.aten.silu.default: "silu",
     torch.ops.aten.tanh.default: "tanh",
     torch.ops.aten.relu.default: "relu",
     torch.ops.aten.sqrt.default: "sqrt",
@@ -250,8 +264,8 @@ _UNARY_MATH_TARGETS: dict[object, str] = {
     operator.neg: "neg",
 }
 _MINMAX_TARGETS: dict[object, str] = {
-    torch.ops.aten.maximum.default: ">",
-    torch.ops.aten.minimum.default: "<",
+    torch.ops.aten.maximum.default: "max",
+    torch.ops.aten.minimum.default: "min",
 }
 _VIEW_TARGETS: frozenset[object] = frozenset(
     {
@@ -442,8 +456,11 @@ class GatedAttentionMatch:
     score_node: torch.fx.Node
     p_node: torch.fx.Node
     # ``where`` conjuncts of the exact jagged-length form
-    # ``tile_q.index < off[b + 1] - off[b]``: rows they mask belong to the next
-    # sequence (or padding), so the fused body skips their store.
+    # ``tile_q.index < off[b + 1] - off[b]``: rows they mask before the end of
+    # the last sequence belong to a later sequence, which stores them into
+    # the same output lane, so the fused body skips their store (the rows past
+    # it: ``rows_end``).  Empty for an unmasked store when each sequence has
+    # an output lane of its own.
     store_skip_terms: tuple[torch.fx.Node, ...]
     scope: _GraphScope
     # ``root``: the query tile is the last root axis (jagged_hstu_attn).
@@ -463,6 +480,12 @@ class GatedAttentionMatch:
     # tcgen05 body accumulates in TMEM and cannot honor it; the register row
     # programs do.
     pv_dtype: torch.dtype = torch.float32
+    # With ``store_skip_terms`` and a store the program does not mask itself:
+    # the ``off[b + 1]`` load of a skip term and the leading axis ``b`` runs
+    # over.  Rows from ``off[n]`` on (``n`` that axis's extent) are no
+    # sequence's, so the program's zero store there is its result and the
+    # fused body stores them too.
+    rows_end: tuple[torch.fx.Node, int] | None = None
 
     @property
     def leading_block_ids(self) -> tuple[int, ...]:
@@ -904,7 +927,11 @@ def _parse_row_access(
             continue
         row_index = resolved
         row_offset: torch.fx.Node | None = None
-        if resolved.target in _ADD_TARGETS and len(resolved.args) == 2:
+        if (
+            resolved.target in _ADD_TARGETS
+            and len(resolved.args) == 2
+            and resolved.kwargs.get("alpha", 1) == 1
+        ):
             lhs, rhs = (scope.resolve(arg) for arg in resolved.args)
             candidates = [(lhs, rhs), (rhs, lhs)]
             row_index = None
@@ -1037,7 +1064,7 @@ def _scalar_load_parts(node: object) -> tuple[str, object] | None:
     return None
 
 
-def _is_jagged_length_term(
+def _jagged_sequence_end(
     env: CompileEnvironment,
     scope: _GraphScope,
     term: torch.fx.Node,
@@ -1045,16 +1072,18 @@ def _is_jagged_length_term(
     row_offset: torch.fx.Node | None,
     q_block_id: int,
     leading_block_ids: tuple[int, ...],
-) -> bool:
-    """``tile_q.index < off[b + 1] - off[b]`` where ``off[b]`` is the row offset."""
+) -> tuple[torch.fx.Node, int] | None:
+    """The ``off[b + 1]`` load and the leading axis ``b`` runs over when
+    ``term`` is ``tile_q.index < off[b + 1] - off[b]`` and ``off[b]`` is the
+    row offset."""
     if row_offset is None:
-        return False
+        return None
     if term.target in _LT_TARGETS:
         index_side, length_side = term.args
     elif term.target in _GT_TARGETS:
         length_side, index_side = term.args
     else:
-        return False
+        return None
     index_node = scope.resolve(index_side)
     if (
         not isinstance(index_node, torch.fx.Node)
@@ -1062,7 +1091,7 @@ def _is_jagged_length_term(
         or index_node.target is not tile_ops.tile_index
         or _tile_index_block_id(env, index_node) != q_block_id
     ):
-        return False
+        return None
     length = scope.resolve(length_side)
     if (
         not isinstance(length, torch.fx.Node)
@@ -1071,15 +1100,19 @@ def _is_jagged_length_term(
         or len(length.args) != 2
         or length.kwargs.get("alpha", 1) != 1
     ):
-        return False
+        return None
     ends, starts = (scope.resolve(arg) for arg in length.args)
     if starts is not row_offset:
-        return False
+        return None
     starts_parts = _scalar_load_parts(starts)
     ends_parts = _scalar_load_parts(ends)
     if starts_parts is None or ends_parts is None or starts_parts[0] != ends_parts[0]:
-        return False
-    return _is_successor(env, scope, ends_parts[1], starts_parts[1], leading_block_ids)
+        return None
+    if not _is_successor(env, scope, ends_parts[1], starts_parts[1], leading_block_ids):
+        return None
+    block_id = _leading_axis_coordinate(env, scope, starts_parts[1], leading_block_ids)
+    assert isinstance(ends, torch.fx.Node) and block_id is not None
+    return ends, block_id
 
 
 def _unwrap_permute(node: object) -> torch.fx.Node | None:
@@ -1105,6 +1138,10 @@ def _unwrap_permute(node: object) -> torch.fx.Node | None:
 def match_gated_attention(device_ir: DeviceIR) -> GatedAttentionMatch | None:
     """Config-independent detector for the fused gated attention body (either
     form; see ``GatedAttentionMatch.form``)."""
+    # The fused bodies number the root grid's work items from 0 in steps of 1
+    # (``_GatedEmitter.tile_scalar_expr``).
+    if not root_grid_origin_is_canonical(device_ir):
+        return None
     match = _match_root_form(device_ir)
     if match is None:
         match = _match_sequence_form(device_ir)
@@ -1817,14 +1854,35 @@ def _match_root_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
         domain = checker.check(scalar)
         if domain is None or not domain <= allowed:
             return None
+    # The rows a jagged-length term masks (store skipping, below) belong to a
+    # later sequence only where it stores into the same output lane.  With the
+    # offsets indexed by the lane's own axis (``starts = off[tile_h.begin]``
+    # and ``out[tile_q.index + starts, tile_h.begin, :]``) every sequence has
+    # a lane of its own, so an unmasked store's zeros there are the program's
+    # result and the body stores them too.  A store masked by the sequence
+    # length still skips them, as the program does.
+    offset_load = _scalar_load_parts(scope.resolve(q_access.offset))
+    own_lane_sequences = (
+        o_access.extra_mask is None
+        and offset_load is not None
+        and q_access.lane_block_id is not None
+        and _leading_axis_coordinate(env, scope, offset_load[1], leading_block_ids)
+        == q_access.lane_block_id
+    )
     # Store skipping. A ``where`` conjunct of the exact jagged-length form
     # ``tile_q.index < off[b + 1] - off[b]`` (``off[b]`` being the row offset
     # and ``b`` a leading-axis coordinate, so consecutive entries bound the
-    # sequence) masks rows that belong to the next sequence or to padding; the
-    # frontend's zero store there races with that sequence's own store, so the
-    # fused body skips it. Every other row-only term keeps the frontend
-    # semantics: the gate zeroes P, so the zero accumulator is stored.
+    # sequence) masks rows that belong to a later sequence or lie past the
+    # last one. Before the end of the last sequence the frontend's zero store
+    # races with that sequence's own store, so the fused body skips it; past
+    # it (``rows_end``), with one sequence per output lane
+    # (``own_lane_sequences``: no later sequence stores into the lane), and for
+    # every other row-only term, the body keeps the frontend semantics: the
+    # gate zeroes P, so where the program stores, it stores the zero
+    # accumulator.
     store_skip_terms: list[torch.fx.Node] = []
+    # The ``off[b + 1]`` load and leading axis of the first of them.
+    sequence_end: tuple[torch.fx.Node, int] | None = None
     jagged_mask_blocks: set[int] = set()
     gate = p_node
     while isinstance(gate, torch.fx.Node) and gate.op == "call_function":
@@ -1848,17 +1906,20 @@ def _match_root_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
             ):
                 if checker.domains.get(resolved) != frozenset({domain}):
                     continue
-                if _is_jagged_length_term(
+                end = _jagged_sequence_end(
                     env,
                     scope,
                     resolved,
                     row_offset=q_access.offset,
                     q_block_id=block_id,
                     leading_block_ids=leading_block_ids,
-                ):
-                    jagged_mask_blocks.add(block_id)
-                    if block_id == q_block_id:
-                        store_skip_terms.append(resolved)
+                )
+                if end is None:
+                    continue
+                jagged_mask_blocks.add(block_id)
+                if block_id == q_block_id and not own_lane_sequences:
+                    store_skip_terms.append(resolved)
+                    sequence_end = sequence_end or end
 
     # Explicit row masks must be the same sequence bounds already enforced
     # by the gate. Q/K masked rows cannot affect retained scores or stores;
@@ -1877,7 +1938,7 @@ def _match_root_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
             block_id not in jagged_mask_blocks
             or checker.check(access.extra_mask) != frozenset({domain})
             or not isinstance(mask, torch.fx.Node)
-            or not _is_jagged_length_term(
+            or _jagged_sequence_end(
                 env,
                 scope,
                 mask,
@@ -1885,6 +1946,7 @@ def _match_root_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
                 q_block_id=block_id,
                 leading_block_ids=leading_block_ids,
             )
+            is None
         ):
             return None
         if access is v_access:
@@ -1893,6 +1955,10 @@ def _match_root_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
             )
             assert isinstance(bound, torch.fx.Node)
             v_row_bound = bound
+    # A store without a row mask of its own writes every row of the query
+    # tile, so the rows past the last sequence get the zero accumulator (see
+    # ``GatedAttentionMatch.rows_end``).
+    rows_end = sequence_end if o_access.extra_mask is None else None
 
     accounted: set[torch.fx.Node] = set(checker.domains)
     accounted.update(
@@ -1939,6 +2005,7 @@ def _match_root_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
         scope=scope,
         v_row_bound=v_row_bound,
         pv_dtype=pv_val.dtype,
+        rows_end=rows_end,
     )
 
 
@@ -2254,21 +2321,21 @@ def _dtype_kind(dtype: torch.dtype) -> str:
 
 def _exact_float_dtypes(value: float) -> frozenset[torch.dtype]:
     """Narrow dtypes in which the fp32 constant ``value`` is exactly representable."""
-    value = float(torch.tensor(value, dtype=torch.float32).item())
+    value = round_scalar(value, torch.float32)
     return frozenset(
-        dtype
-        for dtype in _NARROW_FLOAT_DTYPES
-        if float(torch.tensor(value, dtype=dtype).float().item()) == value
+        dtype for dtype in _NARROW_FLOAT_DTYPES if round_scalar(value, dtype) == value
     )
 
 
-def _approx_rcp_flags(vec: bool) -> str:
-    """``cute.math.rcp`` flags for the ``fast_math`` approximate reciprocal.
-
-    The vector form (``nvgpu.rcp``) only exists as approx+ftz; the scalar form
-    keeps the plain approximate reciprocal.
-    """
-    return "approx=True, ftz=True" if vec else "approx=True"
+def _float_const(value: float) -> _Value:
+    """The fp32 literal ``value``, a codegen-time constant (already rounded to
+    its dtype; an infinity or a NaN included)."""
+    return _Value(
+        f"cutlass.Float32({float_literal(value)})",
+        "f",
+        False,
+        _exact_float_dtypes(value),
+    )
 
 
 def _bcast(value: _Value) -> str:
@@ -2528,6 +2595,31 @@ def _select(cond: _Value, a: _Value, b: _Value, kind: str) -> _Value:
     )
 
 
+def _pointwise_extremum(a: _Value, b: _Value, reduction: str) -> _Value:
+    """The fp32 ``max`` or ``min`` (``reduction``) of ``a`` and ``b`` as the
+    pointwise lowering computes ``torch.maximum`` / ``torch.minimum``:
+    ``cute.math.max`` / ``min`` with ``propagate_nan=True``, NaN-propagating,
+    so a NaN operand gives NaN as torch's does (a select on ``a > b`` would
+    return ``b`` for a NaN ``a``).  It does not order signed zeros: a tie
+    returns ``b``, as the select did.  The op costs two compares and two
+    selects where the select took one of each; being the pointwise
+    lowering's own op, it keeps the configs the body declines equal bit for
+    bit (the one-instruction FMNMX of ``math_templates.nan_extremum_expr``
+    takes scalars only).  The result is one of the operands or NaN, so it is
+    exact where both are."""
+    a = _as_kind(a, "f")
+    b = _as_kind(b, "f")
+    vec = a.vec or b.vec
+    # The DSL op takes two scalars or two vectors of one shape.
+    x, y = (_bcast(a), _bcast(b)) if vec else (a.expr, b.expr)
+    return _Value(
+        f"cute.math.{reduction}({x}, {y}, propagate_nan=True)",
+        "f",
+        vec,
+        a.exact & b.exact,
+    )
+
+
 class _GatedEmitter:
     """Replay the captured FX programs as CuTe scalar statements.
 
@@ -2565,11 +2657,15 @@ class _GatedEmitter:
         self.value_section: dict[str, str] = {}
         self.final_mask_terms: tuple[str, ...] = ()
         self.values: dict[torch.fx.Node, _Value] = {}
+        # Operands rounded to a narrow common dtype (``_common_dtype_operands``),
+        # by expression, dtype and the section holding the rounding.
+        self.rounded_operands: dict[tuple[str, torch.dtype, str], _Value] = {}
         self.counter = 0
         self.tensor_names: set[str] = set()
         # Under the existing ``fast_math`` setting the gate uses the hardware
-        # ex2 without the denormal fixup and an approximate reciprocal for
-        # divisions (Triton's div.full contract); the default is IEEE.
+        # ex2 without the denormal fixup and divides fp32 as the pointwise
+        # lowering does (``div.approx.ftz``); the default, and the division of
+        # other dtypes, is IEEE.
         self.fast_math = bool(self.env.settings.fast_math)
 
     # -- helpers -----------------------------------------------------------
@@ -2669,9 +2765,7 @@ class _GatedEmitter:
         if isinstance(value, int):
             return _Value(f"cutlass.Int32({value})", "i")
         if isinstance(value, float):
-            return _Value(
-                f"cutlass.Float32({value!r})", "f", False, _exact_float_dtypes(value)
-            )
+            return _float_const(value)
         assert isinstance(value, torch.fx.Node), value
         node = value
         cached = self.values.get(node)
@@ -2695,10 +2789,7 @@ class _GatedEmitter:
             return _Value(f"cutlass.Int32({int(value)})", "i")  # pyrefly: ignore [bad-argument-type]
         # Constants are rounded to the node dtype at codegen time (round to
         # nearest even, like the device conversion would).
-        rounded = float(torch.tensor(float(value), dtype=dtype).float().item())  # pyrefly: ignore [bad-argument-type]
-        return _Value(
-            f"cutlass.Float32({rounded!r})", "f", False, _exact_float_dtypes(rounded)
-        )
+        return _float_const(round_scalar(value, dtype))  # pyrefly: ignore [bad-argument-type]
 
     def _node_result_dtype(self, node: torch.fx.Node) -> torch.dtype | None:
         val = _node_val(node)
@@ -2778,12 +2869,7 @@ class _GatedEmitter:
             dtype = self._node_result_dtype(node) or torch.float32
             in_tile = _Value("flash_elem_in_tile_m", "m")
             if inner.kind == "f":
-                fill = _Value(
-                    f"cutlass.Float32({float(other)!r})",  # pyrefly: ignore [bad-argument-type]
-                    "f",
-                    False,
-                    _exact_float_dtypes(float(other)),  # pyrefly: ignore [bad-argument-type]
-                )
+                fill = _float_const(float(other))  # pyrefly: ignore [bad-argument-type]
                 return self._bind(
                     "elem", _round_to_dtype(_select(in_tile, inner, fill, "f"), dtype)
                 )
@@ -2808,8 +2894,13 @@ class _GatedEmitter:
             return self._bind(section, selected)
         if target in _COMPARE_TARGETS:
             op = _COMPARE_TARGETS[target]
-            a = self.emit(node.args[0])
-            b = self.emit(node.args[1])
+            a, b = self._common_dtype_operands(
+                node,
+                section,
+                self.emit(node.args[0]),
+                self.emit(node.args[1]),
+                round_scalars=True,
+            )
             for col, other, cop in ((a, b, op), (b, a, _COL_COMPARE_FLIP[op])):
                 if (
                     col.col_offset is not None
@@ -2840,16 +2931,16 @@ class _GatedEmitter:
                 return bound
             return self._bind(section, self._binary_expr(a, b, symbol, "i", "i"))
         if target in _MINMAX_TARGETS:
-            op = _MINMAX_TARGETS[target]
+            reduction = _MINMAX_TARGETS[target]
             a = self.emit(node.args[0])
             b = self.emit(node.args[1])
             dtype = self._node_result_dtype(node) or torch.float32
-            kind = "f" if _dtype_kind(dtype) == "f" else "i"
-            cond = self._binary_expr(a, b, op, kind, "b")
-            selected = _select(cond, a, b, kind)
-            if kind == "f":
-                return self._bind(section, _round_to_dtype(selected, dtype))
-            return self._bind(section, selected)
+            if _dtype_kind(dtype) == "f":
+                extremum = _pointwise_extremum(a, b, reduction)
+                return self._bind(section, _round_to_dtype(extremum, dtype))
+            symbol = ">" if reduction == "max" else "<"
+            cond = self._binary_expr(a, b, symbol, "i", "b")
+            return self._bind(section, _select(cond, a, b, "i"))
         if (
             target in _ADD_TARGETS
             or target in _SUB_TARGETS
@@ -2878,10 +2969,74 @@ class _GatedEmitter:
             return _Value(f"({_bcast(a)} {symbol} {_bcast(b)})", out_kind, True)
         return _Value(f"({a.expr} {symbol} {b.expr})", out_kind, False)
 
+    def _common_dtype_operands(
+        self,
+        node: torch.fx.Node,
+        section: str,
+        a: _Value,
+        b: _Value,
+        *,
+        round_scalars: bool = False,
+    ) -> tuple[_Value, _Value]:
+        """The operands of the binary ``node`` converted as torch and the
+        pointwise lowering convert them when their common dtype is a 16-bit
+        float: a tensor operand of another dtype (a 0-d fp32 tensor beside
+        bf16 scores) is rounded to it first.  A Python scalar keeps its value
+        in most arithmetic (a wrapped number computes in opmath); with
+        ``round_scalars`` (a compare, a remainder or fmod) it is rounded too:
+        ``bf16 > 0.3`` tests against ``bf16(0.3)``."""
+        args = node.args[:2]
+        common = narrow_common_dtype(*args)
+        if common is None:
+            return a, b
+        converted = []
+        for arg, value in zip(args, (a, b), strict=True):
+            operand = promotion_operand(arg)
+            if isinstance(operand, torch.Tensor):
+                if operand.dtype not in (common, torch.bool):
+                    value = self._rounded_operand(value, common, section)
+            elif round_scalars and not isinstance(operand, bool):
+                value = self._rounded_scalar(arg, value, common, section)
+            converted.append(value)
+        return converted[0], converted[1]
+
+    def _rounded_scalar(
+        self, arg: object, value: _Value, dtype: torch.dtype, section: str
+    ) -> _Value:
+        """The Python or symbolic scalar ``arg`` (emitted as ``value``)
+        rounded to ``dtype``; a literal at codegen time."""
+        if isinstance(arg, (int, float)):
+            return _float_const(round_scalar(arg, dtype))
+        return self._rounded_operand(value, dtype, section)
+
+    def _rounded_operand(
+        self, value: _Value, dtype: torch.dtype, section: str
+    ) -> _Value:
+        """``value`` rounded to ``dtype``, bound once where ``value`` is (a
+        per-CTA or per-row scalar beside per-element operands).  An unbound
+        expression (an index, a constant) is rounded once per section that
+        uses it: a section runs before the later ones (``row`` before
+        ``elem``), so another section must not read its binding."""
+        rounded = _round_to_dtype(_as_kind(value, "f"), dtype)
+        if rounded is value:
+            return value
+        bind_section = self.value_section.get(value.expr, section)
+        key = (value.expr, dtype, bind_section)
+        if key not in self.rounded_operands:
+            self.rounded_operands[key] = self._bind(bind_section, rounded)
+        return self.rounded_operands[key]
+
     def _emit_binary(self, node: torch.fx.Node, section: str) -> _Value:
         target = node.target
-        a = self.emit(node.args[0])
-        b = self.emit(node.args[1])
+        # Eager remainder and fmod convert a scalar operand to the tensor's
+        # dtype first (bf16 remainder(1, 0.3) is 1 - 3 * bf16(0.3)).
+        a, b = self._common_dtype_operands(
+            node,
+            section,
+            self.emit(node.args[0]),
+            self.emit(node.args[1]),
+            round_scalars=target in _MOD_TARGETS,
+        )
         dtype = self._node_result_dtype(node)
         assert dtype is not None
         kind = _dtype_kind(dtype)
@@ -2899,12 +3054,25 @@ class _GatedEmitter:
             symbol = "%"
         if target in _MOD_TARGETS:
             return self._emit_floor_mod(a, b, kind, dtype, section)
-        if target in _DIV_TARGETS and self.fast_math:
+        if target in _DIV_TARGETS and self.fast_math and dtype == torch.float32:
             fa, fb = _as_kind(a, "f"), _as_kind(b, "f")
-            rcp = _Value(
-                f"cute.math.rcp({fb.expr}, {_approx_rcp_flags(fb.vec)})", "f", fb.vec
-            )
-            expr = self._binary_expr(fa, rcp, "*", "f", "f")
+            if fa.vec or fb.vec:
+                # The DSL's div.approx takes scalars only.  ptxas lowers
+                # div.approx.ftz to rcp.approx.ftz and a flush-to-zero
+                # multiply, which zeroes a subnormal dividend or product
+                # that a plain ``*`` keeps.
+                rcp = _Value(
+                    f"cute.math.rcp({fb.expr}, approx=True, ftz=True)", "f", fb.vec
+                )
+                expr = _Value(
+                    f"_helion_flash_rt.gated_mul_ftz_vec({_bcast(fa)}, {_bcast(rcp)})",
+                    "f",
+                    True,
+                )
+            else:
+                expr = _Value(
+                    f"cute.math.div({fa.expr}, {fb.expr}, approx=True, ftz=True)", "f"
+                )
             return self._bind(section, _round_to_dtype(expr, dtype))
         if kind == "f" or target in _DIV_TARGETS:
             expr = self._binary_expr(a, b, symbol, "f", "f")
@@ -3088,13 +3256,15 @@ class _GatedEmitter:
         return self._bind(section, expr)
 
     def _exp_feeds_add_one(self, node: torch.fx.Node) -> bool:
-        """Whether ``exp(...)`` is consumed only by ``e + c`` with ``|c| >= 2**-100``.
+        """Whether ``exp2(...)`` is consumed only by ``e + c`` with ``|c| >= 2**-100``.
 
         At such a site the ex2 denormal handling is dead: a flushed result
         (``e < 2**-126``) and the unflushed one both round ``c + e`` to ``c``
         (``ulp(c) / 2 > 2**-125``), and a denormal argument gives exactly 1.0
         either way.  The result is therefore bit-identical with the
         ``ex2.approx.ftz`` form, which saves the range check and two scalings.
+        (Not so for ``exp``: the exactly reduced ``cute.math.exp`` it lowers
+        to does not round ``x * log2(e)``.)
         """
         users = list(node.users)
         if len(users) != 1:
@@ -3134,36 +3304,31 @@ class _GatedEmitter:
             )
         x = _as_kind(inner, "f")
         vec = x.vec
-        one = _Value("cutlass.Float32(1.0)", "f")
-
-        def sigmoid() -> _Value:
-            # The exp2 feeds ``1 + e`` directly, so the ftz form is exact here.
-            e = self._exp2(
-                _Value(f"((-({x.expr})) * {_LOG2_E!r})", "f", vec), ftz_exact=True
-            )
-            denom = self._binary_expr(e, one, "+", "f", "f")
-            if self.fast_math:
-                return _Value(
-                    f"cute.math.rcp({denom.expr}, {_approx_rcp_flags(vec)})", "f", vec
-                )
-            return _Value(f"cute.math.rcp({denom.expr})", "f", vec)
-
         if op == "exp":
-            expr = self._exp2(
-                _Value(f"(({x.expr}) * {_LOG2_E!r})", "f", vec),
-                ftz_exact=self._exp_feeds_add_one(node),
-            )
+            # The pointwise lowering's exp, as in the configs this body
+            # declines: ``ex2.approx`` of the rounded product under
+            # fast_math, else the exactly reduced ``cute.math.exp``, at
+            # ``c + e`` sites too (an exp2 of the rounded ``x * log2(e)`` is
+            # not output-identical to it there either).
+            if self.fast_math:
+                expr = self._exp2(
+                    _Value(f"(({x.expr}) * {_LOG2_E!r})", "f", vec), ftz_exact=False
+                )
+            else:
+                expr = _Value(f"cute.math.exp({x.expr})", "f", vec)
         elif op == "exp2":
             expr = self._exp2(x, ftz_exact=self._exp_feeds_add_one(node))
         elif op == "sigmoid":
-            expr = sigmoid()
-        elif op == "silu":
-            expr = self._binary_expr(x, sigmoid(), "*", "f", "f")
+            # The pointwise lowering's sigmoid (rcp.approx.ftz of ex2.approx.ftz
+            # with or without fast_math), so the configs this body declines
+            # compute the same gate.
+            expr = _Value(SIGMOID_TEMPLATE.format(x=x.expr), "f", vec)
         elif op == "tanh":
             expr = _Value(f"cute.math.tanh({x.expr})", "f", vec)
         elif op == "relu":
+            # ``maximum(x, 0)``, as the pointwise lowering computes it.
             zero = _Value("cutlass.Float32(0.0)", "f", False, _exact_float_dtypes(0.0))
-            expr = _select(self._binary_expr(x, zero, ">", "f", "b"), x, zero, "f")
+            expr = _pointwise_extremum(x, zero, "max")
         elif op == "sqrt":
             expr = _Value(f"cute.math.sqrt({x.expr})", "f", vec)
         elif op == "rsqrt":
@@ -3172,30 +3337,54 @@ class _GatedEmitter:
             expr = _Value(f"cute.math.log({x.expr})", "f", vec)
         else:
             assert op == "reciprocal"
-            if self.fast_math:
-                expr = _Value(
-                    f"cute.math.rcp({x.expr}, {_approx_rcp_flags(vec)})", "f", vec
-                )
-            else:
-                expr = _Value(f"cute.math.rcp({x.expr})", "f", vec)
+            # The pointwise lowering's ``1 / x``: under fast_math, an fp32
+            # div.approx.ftz, which is one rcp.approx.ftz.
+            flags = (
+                ", approx=True, ftz=True"
+                if self.fast_math and dtype == torch.float32
+                else ""
+            )
+            expr = _Value(f"cute.math.rcp({x.expr}{flags})", "f", vec)
         return self._bind(section, _round_to_dtype(expr, dtype))
 
+    def store_row_terms(self) -> list[str]:
+        """The output store's row conditions: the store-skip terms, each also
+        true from the end of the last sequence on when the program stores
+        those rows (``GatedAttentionMatch.rows_end``).  They read
+        ``flash_o_row``, the absolute output row."""
+        terms = [_to_b(self.emit(term)) for term in self.match.store_skip_terms]
+        if self.match.rows_end is None:
+            return terms
+        rows_end = _to_i(self.last_sequence_end(*self.match.rows_end))
+        return [f"({term} | (flash_o_row >= {rows_end}))" for term in terms]
+
+    def last_sequence_end(self, ends: torch.fx.Node, block_id: int) -> _Value:
+        """``off[n]`` for the rank-1 offsets load ``ends`` (``off[b + 1]``) and
+        the extent ``n`` of the leading axis ``b``: the row the last sequence
+        ends at."""
+        return self._load_element(ends, [self.extent_expr(block_id)])
+
     def _emit_scalar_load(self, node: torch.fx.Node) -> _Value:
-        host_tensors = _flash_graph_host_tensors(self.scope.infos)
-        name = host_tensor_name(node.args[0])
-        assert name is not None
-        fake = host_tensors[name]
-        arg = self.df.tensor_arg(fake, prefer_name=name)
-        self.tensor_names.add(arg.name)
         indices = node.args[1]
         assert isinstance(indices, (list, tuple))
+        return self._load_element(node, [_to_i(self.emit(index)) for index in indices])
+
+    def _load_element(self, load: torch.fx.Node, indices: list[str]) -> _Value:
+        """The element at the index expressions ``indices`` of the tensor the
+        scalar load ``load`` reads, a CTA-level fp32 or int32 value as
+        ``load``'s dtype is floating or not."""
+        host_tensors = _flash_graph_host_tensors(self.scope.infos)
+        name = host_tensor_name(load.args[0])
+        assert name is not None
+        arg = self.df.tensor_arg(host_tensors[name], prefer_name=name)
+        self.tensor_names.add(arg.name)
         # 64-bit element offsets: the tensor may exceed 2**31 elements.
         terms = [
-            f"cutlass.Int64({_to_i(self.emit(index))}) * cutlass.Int64({arg.name}.layout.stride[{dim}])"
+            f"cutlass.Int64({index}) * cutlass.Int64({arg.name}.layout.stride[{dim}])"
             for dim, index in enumerate(indices)
         ]
         pointer = f"({arg.name}.iterator + {' + '.join(terms)})"
-        val = _node_val(node)
+        val = _node_val(load)
         assert isinstance(val, torch.Tensor)
         if val.dtype.is_floating_point:
             return self._bind("cta", _Value(f"cutlass.Float32({pointer}.load())", "f"))
@@ -3863,7 +4052,7 @@ def _emit_gated_flash_device_body(
             assert match.q.lane_constant is not None
             lane_expr = f"cutlass.Int32({match.q.lane_constant})"
     predicate_value = emitter.emit(match.if_predicate)
-    row_terms = [_to_b(emitter.emit(term)) for term in match.store_skip_terms]
+    row_terms = emitter.store_row_terms()
     v_row_bound = (
         None
         if match.v_row_bound is None

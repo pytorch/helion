@@ -10,7 +10,8 @@ pinned by ``test/test_cute_ast_pass_utils.py`` against the legacy copies:
   ``ast.walk``; ``is_name_assign`` / ``assigned_name`` / ``name_assignment``
   for ``NAME = value``; ``resolve_alias`` follows a rename map to its root.
 * call paths -- ``call_path`` (tuple) and ``call_path_str`` (dotted) of a
-  ``Name``/``Attribute`` chain; ``cutlass_scalar_type`` for ``cutlass.X``.
+  ``Name``/``Attribute`` chain, ``callee_name`` (its last component);
+  ``cutlass_scalar_type`` for ``cutlass.X``.
 * expressions -- ``same_expr`` (structural equality without positions),
   ``parse_expr`` / ``reparse_expr`` (plain-``ast`` expression clones; use
   ``expr_from_string`` when Helion ``ExtendedAST`` metadata is required),
@@ -19,12 +20,16 @@ pinned by ``test/test_cute_ast_pass_utils.py`` against the legacy copies:
 * loops -- ``loop_extent`` with the one canonical literal-extent predicate and
   ``is_vloop`` for ``cutlass.range_constexpr(<int>)`` V-loops;
   ``constexpr_v_loop`` keeps the looser grammar of the warp-reduce hoist and
-  the sibling V-loop merge.
+  the sibling V-loop merge; ``is_staged_loop`` / ``is_trace_time_test``
+  tell the loops and tests the DSL preprocessor stages from the ones it
+  runs as Python.
 * memory -- ``tensor_roots_may_alias`` over the passes' tensor-root facts.
 * rewrites -- ``replace_node`` (identity), ``replace_call`` (structural or
   textual match), ``substitute_names`` / ``rename_names`` / ``expand_lane``;
   every rewrite that inserts a subtree takes the caller's clone callable so
-  pass-specific markers survive.
+  pass-specific markers survive.  ``deep_clone`` copies a subtree with those
+  markers and ``dealias_shared_nodes`` gives every position of a tree its own
+  node.
 * dataflow -- ``exposed_reads`` (forward, with explicit branch/loop/define
   policies) and ``live_in`` (backward, zero-trip loops).
 
@@ -45,7 +50,9 @@ from typing import TYPE_CHECKING
 from typing import Literal
 from typing import TypeGuard
 from typing import TypeVar
+from typing import cast
 
+from ..ast_extension import ExtendedAST
 from ..ast_extension import expr_from_string
 from ..ast_read_writes import ReadWrites
 from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
@@ -189,6 +196,16 @@ def call_path_str(node: ast.AST) -> str | None:
     return None if path is None else ".".join(path)
 
 
+def callee_name(node: ast.AST) -> str | None:
+    """The last component of a ``Name`` / ``Attribute`` callee (``a().b``
+    included), the way the DSL preprocessor matches loops and tests."""
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Name):
+        return node.id
+    return None
+
+
 def cutlass_scalar_type(node: ast.AST) -> str | None:
     """``cutlass.Float32`` -> ``"Float32"``; None unless a two-part
     ``cutlass.<X>`` path (callers test membership in their own type sets)."""
@@ -254,6 +271,30 @@ def comparison_is_always_true(
 # --------------------------------------------------------------------------
 # Loops
 # --------------------------------------------------------------------------
+
+# The DSL preprocessor stages a ``for`` over a call of these (``range``,
+# ``cutlass.range``, ``range_dynamic``, under any prefix) as a dynamic loop
+# and unrolls every other ``for`` (``cutlass.range_constexpr``, a Python
+# iterable) while tracing; an ``if`` / ``while`` whose test calls one of
+# ``_TRACE_TIME_TESTS`` (``cutlass.const_expr(...)``) runs as Python.
+_STAGED_RANGE_CALLS = frozenset({"range", "range_dynamic"})
+_TRACE_TIME_TESTS = frozenset({"const_expr", "target_version"})
+
+
+def is_staged_loop(node: ast.For) -> bool:
+    """Whether the DSL stages ``node`` as a dynamic loop, its body traced
+    once, rather than unrolling it while tracing (see above)."""
+    return (
+        isinstance(node.iter, ast.Call)
+        and callee_name(node.iter.func) in _STAGED_RANGE_CALLS
+    )
+
+
+def is_trace_time_test(test: ast.expr) -> bool:
+    """Whether the DSL runs an ``if`` / ``while`` on ``test`` as Python
+    while tracing (``cutlass.const_expr(...)``) rather than staging it."""
+    return isinstance(test, ast.Call) and callee_name(test.func) in _TRACE_TIME_TESTS
+
 
 LoopKind = Literal["range", "constexpr"]
 _LOOP_CALLEES: dict[str, tuple[str, ...]] = {
@@ -353,6 +394,77 @@ def tensor_roots_may_alias(
 # --------------------------------------------------------------------------
 # Rewrites
 # --------------------------------------------------------------------------
+
+
+# ``ExtendedAST.new`` carries these itself; every other non-field attribute
+# of a node (the ``_helion_*`` markers passes leave on loops and statements)
+# is copied by ``deep_clone``.
+_EXTENDED_AST_INTERNALS = frozenset(
+    {"_location", "_type_info", "_loop_type", "_is_kernel_call", "_root_id"}
+)
+
+
+def deep_clone(node: _A) -> _A:
+    """A fresh copy of ``node``'s whole subtree that also keeps the marker
+    attributes set on its nodes (``clone_ast`` keeps Helion's source metadata
+    but not those; ``scalar_recipe._clone`` copies fields only), so the copy
+    is indistinguishable from the original to every later pass."""
+
+    def clone_field(value: object) -> object:
+        if isinstance(value, ast.AST):
+            return deep_clone(value)
+        if isinstance(value, list):
+            return [clone_field(item) for item in value]
+        return value
+
+    fields = {name: clone_field(value) for name, value in ast.iter_fields(node)}
+    if isinstance(node, ExtendedAST):
+        result = node.new(fields)
+    else:
+        result = ast.copy_location(type(node)(**fields), node)
+    skip = set(node._fields) | set(node._attributes) | _EXTENDED_AST_INTERNALS
+    for key, value in vars(node).items():
+        if key not in skip and key not in vars(result):
+            setattr(result, key, value)
+    return cast("_A", result)
+
+
+def dealias_shared_nodes(body: list[ast.stmt]) -> None:
+    """Give every position in the tree its own node object, in place.
+
+    The passes key analyses by node identity and rewrite nodes in place, so
+    one statement object placed at two positions (say in two sweeps) would
+    share one position's facts and take both positions' rewrites.  Every
+    repeated node reached through a field or a body list is replaced by a
+    ``deep_clone``, and a body list held by two nodes by its own list; the
+    rendered text is unchanged.
+    """
+    seen: set[int] = set()
+    seen_lists: set[int] = set()
+
+    def visit(node: ast.AST) -> None:
+        for field, value in ast.iter_fields(node):
+            if isinstance(value, list):
+                if id(value) in seen_lists:
+                    value = list(value)
+                    setattr(node, field, value)
+                seen_lists.add(id(value))
+                for index, item in enumerate(value):
+                    if isinstance(item, ast.AST):
+                        value[index] = fresh(item)
+            elif isinstance(value, ast.AST):
+                setattr(node, field, fresh(value))
+
+    def fresh(node: ast.AST) -> ast.AST:
+        if id(node) in seen:
+            # The clone's subtree is new to the tree; no need to walk it.
+            return deep_clone(node)
+        seen.add(id(node))
+        visit(node)
+        return node
+
+    for index, stmt in enumerate(body):
+        body[index] = cast("ast.stmt", fresh(stmt))
 
 
 class _ReplaceNode(ast.NodeTransformer):

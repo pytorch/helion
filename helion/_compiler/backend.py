@@ -265,6 +265,21 @@ class DeviceIRStage(enum.Enum):
     AFTER_POINTWISE_FACTS = "after_pointwise_facts"
 
 
+# Operations whose lowering has a faster approximate form under the fast_math
+# setting on the Triton and CuTe backends (``inductor_lowering`` and the cute
+# ``exp2_fastmath`` / ``exact_division`` / gelu templates), by the name
+# ``exc.FastMathUnused`` reports them under; a backend can count more, or
+# fewer (``Backend.fast_math_name``).
+FAST_MATH_SENSITIVE_TARGETS: dict[object, str] = {
+    torch.ops.aten.reciprocal.default: "reciprocal",
+    torch.ops.aten.exp.default: "exp",
+    torch.ops.aten.exp2.default: "exp2",
+    torch.ops.aten.rsqrt.default: "rsqrt",
+    torch.ops.aten.erf.default: "erf",
+    torch.ops.aten.gelu.default: "gelu",
+}
+
+
 class Backend(abc.ABC):
     """Abstract base class for Helion code generation backends.
 
@@ -486,6 +501,20 @@ class Backend(abc.ABC):
         ``fast_math`` setting is off (``exc.FastMathUnused``)."""
         return False
 
+    def fast_math_name(self, node: torch.fx.Node) -> str | None:
+        """The name ``exc.FastMathUnused`` reports ``node``, a floating-point
+        operation, under when the ``fast_math`` setting changes how it lowers,
+        else None: one of ``FAST_MATH_SENSITIVE_TARGETS``, or a plain true
+        division.  None does not promise the same lowering: a backend may
+        also pass a fast-math flag to operations the warning does not count
+        (``tanh``, ``log``, ``log1p``, ``sqrt``)."""
+        from .inductor_lowering import _is_plain_true_division
+
+        name = FAST_MATH_SENSITIVE_TARGETS.get(node.target)
+        if name is None and _is_plain_true_division(node):
+            return "fp32 division"
+        return name
+
     @property
     def supports_autotune_multi(self) -> bool:
         """Whether ``Kernel.autotune_multi`` can run on this backend."""
@@ -509,6 +538,21 @@ class Backend(abc.ABC):
         only bypasses Helion's repeated binding and specialization lookup.  The
         default is conservative because some backends own call-time behavior in
         :meth:`Kernel.__call__` before the wrapper is reached.
+        """
+        return False
+
+    @property
+    def binds_inductor_call_facts(self) -> bool:
+        """Whether code generated for an Inductor graph reads facts its calls
+        may not hold: base alignment past ``GPU_ALIGN_BYTES``, the binding's
+        dispatch guards, the traced strides of inputs the graph keeps
+        symbolic.
+
+        Such a backend renders and tunes for the graph under the graph's
+        facts (``inductor_call_facts``), tunes on a binding of its own and
+        keys its configs by those facts.  A backend whose code reads none of
+        them keeps one binding, and one tuned config, for eager calls and
+        Inductor renders alike.
         """
         return False
 
@@ -1829,11 +1873,10 @@ class Backend(abc.ABC):
         roots must agree on its axis)."""
         return False
 
-    def inactive_broadcast_alias_block_ids(
-        self, fn: DeviceFunction, strategies: Sequence[TileStrategy]
-    ) -> set[int]:
-        """Reduction blocks that merely alias an existing tile's coordinates
-        (register broadcasting) and get no reduction strategy of their own."""
+    def inactive_broadcast_alias_block_ids(self, fn: DeviceFunction) -> set[int]:
+        """Reduction blocks that merely alias a grid tile's coordinates
+        (register broadcasting) and get no reduction strategy of their own,
+        so the per-thread planner reserves no thread axis for them either."""
         return set()
 
     def roots_may_reserve_distinct_thread_axes(self) -> bool:
@@ -1896,6 +1939,26 @@ class Backend(abc.ABC):
                 )
                 total_threads *= nt if nt > 0 else bs
         return total_threads
+
+    def thread_axis_extent_limits(self) -> tuple[int, ...] | None:
+        """The most threads each launch axis takes (CUDA: 1024, 1024, 64): the
+        per-thread planner caps an automatic thread count it places on a
+        narrower axis and walks the rest of the tile in a lane loop, and in a
+        kernel of several root loops a reduction whose shared-launch threads
+        would push a tile past its axis's extent keeps the backend's budget
+        (``TileStrategyDispatch.shared_launch_reduction_threads``); ``None``
+        when no axis is narrower than the per-block thread limit."""
+        return None
+
+    def per_thread_reduction_lays_out_tiles(
+        self, config_spec: ConfigSpec, config: Config, tile_threads: int
+    ) -> bool:
+        """Whether a reduction under ``config``, beside tiles of
+        ``tile_threads`` threads, lays the tiles' thread axes out itself (a
+        CuTe register tile puts them below its own axis), so the per-thread
+        planner cannot tell which launch axis a tile lands on and caps no
+        automatic thread count (``thread_axis_extent_limits``)."""
+        return False
 
     def packed_grid_block(self, config: Config) -> tuple[int, int] | None:
         """``(block_id, tiles_per_block)`` of the grid axis packed several
@@ -2572,13 +2635,8 @@ class Backend(abc.ABC):
 
         env = CompileEnvironment.current()
         block_size_infos = [env.block_sizes[i] for i in block_ids]
-        # A registered tile can also appear in a multidimensional loop.
-        # Its permutation applies only there; a one-dimensional loop has
-        # no order to configure.
-        loop_order = (
-            env.config_spec.loop_orders.config_get(config.loop_orders, block_ids[0])
-            if len(block_ids) > 1
-            else None
+        loop_order = env.config_spec.loop_orders.config_get_for_tile(
+            config.loop_orders, block_ids
         ) or [*range(len(block_ids))]
         l2_grouping = env.config_spec.l2_groupings.config_get(
             config.l2_groupings, block_ids[0], 1

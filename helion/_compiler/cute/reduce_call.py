@@ -9,7 +9,10 @@ cutlass, so it is never imported from here) and the role-based name sets the
 passes consume; :class:`ReduceCall` records one call of the scalar family
 (``(input, 'op', identity, lane, ...)``) and renders it back to the exact
 text the emitters write.  ``test/test_cute_reduce_call.py`` asserts the
-table against the dispatchers and ``CuteBackend.library_imports``.
+table against the dispatchers and ``CuteBackend.library_imports``.  The
+routing of the shared two-stage dispatcher (``use_serial_block_reduce``,
+``use_interleaved_shared_reduce``) lives here too: ``reduce_helpers``
+dispatches on it and ``smem_footprint`` sizes each form's buffer by it.
 """
 
 from __future__ import annotations
@@ -82,9 +85,46 @@ FP32_REDUX_REDUCES: frozenset[str] = _names(
 )
 # Shared-memory reduces keyed on the flattened CTA thread id with
 # ``group_span`` / ``group_count`` (resized once the launch shape is known).
+# The fragment form is resized like the scalar reduces it replaces, so both
+# pick the same combine order (the serial form takes a single group).
 GROUPED_SHARED_REDUCES: frozenset[str] = _names(
-    ReduceScope.SHARED_TWO_STAGE, ReduceScope.SHARED_COLUMNS
+    ReduceScope.SHARED_TWO_STAGE,
+    ReduceScope.SHARED_COLUMNS,
+    ReduceScope.SHARED_TWO_STAGE_FRAGMENT,
 )
+
+# Above this many warps the serial fold's per-thread chain outgrows the
+# two-stage form's constant shuffle cost.
+_SERIAL_MAX_WARPS = 8
+
+
+def use_serial_block_reduce(pre: int, group_span: int, group_count: int) -> bool:
+    """Whether ``_cute_grouped_reduce_shared_two_stage`` takes the serial
+    form: one group of 2 to 8 warps spanning the whole CTA."""
+    # group_count == 1 with pre == 1 means ONE group spanning the whole
+    # CTA at every current emitter (they all size group_count as
+    # num_threads // group_span); the serial body's warp indexing relies
+    # on that invariant.
+    return (
+        pre == 1
+        and group_count == 1
+        and group_span % 32 == 0
+        and 2 <= group_span // 32 <= _SERIAL_MAX_WARPS
+    )
+
+
+def use_interleaved_shared_reduce(pre: int, group_span: int) -> bool:
+    """Whether ``_cute_grouped_reduce_shared_two_stage`` takes an interleaved
+    form (the warp form below 32 siblings, the block form from 32): a
+    power-of-two sibling count ``pre`` dividing a whole-warp span."""
+    return (
+        pre > 1
+        and pre & (pre - 1) == 0
+        and group_span % 32 == 0
+        and group_span % pre == 0
+        and (pre < 32 or pre % 32 == 0)
+    )
+
 
 _SCALAR_SCOPES: dict[str, ReduceScope] = {
     scope.value: scope

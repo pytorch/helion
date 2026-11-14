@@ -11,6 +11,7 @@ from . import cluster_online_pair as pair
 from ._ast_pass_utils import is_name_assign
 from .analysis.online_pair import OnlinePairMatcher
 from .analysis.online_pair import _assigned_name
+from .analysis.online_pair import _exponential_src
 from .analysis.online_pair import _wrap_sites
 from .analysis.online_pair import rolled_pair_gate
 from .hoist_warp_reduce import _static_trip_count
@@ -234,10 +235,13 @@ def lower_register_row_reduction(
             and _assigned_name(statement) == ast.unparse(site_b.call.args[3])
         ]
         sum_tail = site_b.for_node.body[site_b.stmt_idx + 1 :]
+        # Only the sum (at least one in the warp's frame) reads these, so an
+        # exp2 drops its denormal fixup.
         site_b.for_node.body = [
             *lane_assignments,
             pair._stmt(
-                f"{exponents} = cute.math.exp2(({values} - {frame}) * {scale!r}, fastmath=True)"
+                f"{exponents} = "
+                + _exponential_src(f"{values} - {frame}", scale, ftz=True)
             ),
             pair._stmt(
                 f"{sum_acc.id} = cutlass.Float32({exponents}.reduce(cute.ReductionOp.ADD, "

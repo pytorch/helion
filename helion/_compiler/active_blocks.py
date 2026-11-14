@@ -7,13 +7,17 @@ from typing import TYPE_CHECKING
 import sympy
 import torch
 
+from ..language import _MEMORY_OPS
 from ..language import memory_ops
 from ..language.matmul_ops import MATMUL_FACT_ID_META
 from .compile_environment import CompileEnvironment
 from .device_ir import ForLoopGraphInfo
+from .host_function import HostFunction
+from .indexing_strategy import is_block_size_index
 from .inductor_lowering import ReductionLowering
 from .loop_dependency_checker import memory_write_target
 from .utils import compute_slice_size
+from .utils import indexed_dims
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -99,6 +103,38 @@ def _memory_slice_extents(node: Node) -> Iterator[int | torch.SymInt]:
     for size, index in zip(tensor.shape, indices, strict=True):
         if isinstance(index, slice):
             yield compute_slice_size(index, size)
+
+
+def full_slice_block_ids(node: torch.fx.Node) -> set[int]:
+    """The canonical blocks whose variable sizes a host tensor dim that
+    ``node``, a memory access, slices in full (``buf[tile_m, :]`` of
+    ``buf = x.new_empty([m, block_n])``).
+
+    Such a slice indexes a reduction block that reuses the variable
+    (``CompileEnvironment.allocate_reduction_dimension``), so
+    :func:`active_block_ids` records its uses as the uses of the block whose
+    variable it is.
+    """
+    if node.op != "call_function" or node.target not in _MEMORY_OPS:
+        return set()
+    tensor, index = torch.fx.map_arg(node.args[:2], lambda arg: arg.meta["val"])
+    if isinstance(tensor, (list, tuple)):
+        # A stack tensor's ``(tensor_like, pointers)``.
+        tensor = tensor[0]
+    assert isinstance(tensor, torch.Tensor) and isinstance(index, (list, tuple))
+    if tensor not in HostFunction.current().tensor_to_origin:
+        return set()
+    env = CompileEnvironment.current()
+    blocks: set[int] = set()
+    for idx, dim in zip(index, indexed_dims(tensor.ndim, index), strict=True):
+        if isinstance(idx, slice) and dim is not None and dim < tensor.ndim:
+            extent = compute_slice_size(idx, tensor.shape[dim])
+            if (
+                is_block_size_index(extent)
+                and (block_id := env.get_block_id(extent)) is not None
+            ):
+                blocks.add(env.canonical_block_id(block_id))
+    return blocks
 
 
 def unused_block_ids(

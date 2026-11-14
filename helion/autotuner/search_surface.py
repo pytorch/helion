@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     from .config_fragment import ConfigSpecFragment
     from .config_generation import ConfigGeneration
     from .config_generation import FlatConfig
+    from .config_spec import BlockSizeSpec
     from .config_spec import ConfigSpec
     from .config_spec import ReductionLoopSpec
 
@@ -250,6 +251,15 @@ class BackendSearchSurface:
         before flattening (``None`` is the persistent reduction); the default
         keeps the value as given."""
         return value
+
+    def block_size_default(
+        self, config_spec: ConfigSpec, block: BlockSizeSpec, default: int
+    ) -> int:
+        """The default (non-autotuned) size of ``block``.  ``default`` is what
+        ``generic_block_size_default`` gives for the spec's block count and
+        the product of its padded reduction-loop extents; the base surface
+        keeps it."""
+        return default
 
     def family_fragments(
         self, config_spec: ConfigSpec, family: str

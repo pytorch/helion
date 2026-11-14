@@ -21,10 +21,19 @@ import helion
 from helion._compiler import tile_strategy
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute import scan_ops
+from helion._compiler.cute.lane_loops.markers import _ascending_lane_loop_form
 from helion._compiler.cute.lane_loops.markers import _create_lane_loop
+from helion._compiler.cute.lane_loops.markers import _lane_loop_extent
 from helion._compiler.cute.lane_loops.markers import _reverse_lane_loop_iter
+from helion._compiler.cute.lane_loops.markers import _static_lane_loop_extent
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_reverse_scan_kernels import reverse_scan_then_centering
+from helion._testing.cute_reverse_scan_kernels import (
+    reverse_scan_then_centering_with_totals,
+)
+from helion._testing.cute_reverse_scan_kernels import reverse_scan_then_column_sums
+from helion._testing.cute_reverse_scan_kernels import reverse_scan_then_row_sums
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -370,6 +379,38 @@ def test_blocked_multi_element_thread_split_keeps_serial_fallback() -> None:
     )
     assert _SERIAL_RESCAN in body
     assert "shuffle_sync" not in body
+
+
+def _add_as_fp32(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    return left.float() + right.float()
+
+
+def _fp16_column_scan(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_e, tile_f in hl.tile(x.size()):
+        out[tile_e, tile_f] = hl.associative_scan(
+            _add_as_fp32, x[tile_e, tile_f], dim=0
+        )
+    return out
+
+
+def test_serial_fallback_casts_a_combine_result_back_to_its_stream() -> None:
+    # The combine returns fp32 for fp16 values.  The rescan carries each
+    # stream in its own dtype, as the parallel scan's merge does, so it
+    # casts the combined value back; a combine of the stream's dtype is not
+    # cast.
+    config = {
+        "block_sizes": [32, 128],
+        "num_threads": [4, 32],
+        "cute_lane_layouts": ["blocked", "blocked"],
+    }
+    x = torch.zeros(4096, 128, dtype=torch.float16, device=CPU_DEVICE)
+    body = _codegen(_fp16_column_scan, (x,), **config)
+    assert _SERIAL_RESCAN in body
+    assert re.search(r"scan_next = cutlass\.Float16\(scan_combine_\d+\) if", body)
+    body = _codegen(_segment_scan, _segment_args(), **config)
+    assert _SERIAL_RESCAN in body
+    assert re.search(r"scan_next = scan_combine_\d+ if", body)
 
 
 def test_cross_warp_scan_exchanges_warp_totals_through_smem() -> None:
@@ -857,3 +898,174 @@ def test_wrap_body_refuses_to_reverse_a_vector_partition() -> None:
         pytest.raises(helion.exc.BackendUnsupported, match="vectorised lane loop"),
     ):
         grid.wrap_body(cast("list[ast.AST]", list(body)))
+
+
+# ---------------------------------------------------------------------------
+# Reversed lane loops: extent, and the interchanged reductions they wrap
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("constexpr", [False, True])
+def test_static_extent_reads_a_reversed_lane_loop(constexpr: bool) -> None:
+    loop = _create_lane_loop(
+        "lane_0", 8, [_for("for i in x:\n    pass")], constexpr=constexpr
+    )
+    assert _static_lane_loop_extent(loop) == 8
+    assert _reverse_lane_loop_iter(loop)
+    # The reversed bounds parse as negated literals, not as constants.
+    assert isinstance(cast("ast.Call", loop.iter).args[1], ast.UnaryOp)
+    assert _static_lane_loop_extent(loop) == 8
+    assert _lane_loop_extent(loop) == 8
+    # Passes that re-emit the lanes ascending match only the ascending form.
+    assert _ascending_lane_loop_form(loop) is None
+
+
+def test_lane_loop_extent_reads_a_reversed_one_lane_loop() -> None:
+    """``_reverse_lane_loop_iter`` turns ``range(1)`` into ``range(0, -1, -1)``,
+    whose extent read asserted a single range argument."""
+    loop = _create_lane_loop("lane_0", 1, [_for("for i in x:\n    pass")])
+    assert _lane_loop_extent(loop) == 1
+    assert _reverse_lane_loop_iter(loop)
+    assert ast.unparse(loop.iter) == "range(0, -1, -1)"
+    assert _lane_loop_extent(loop) == 1
+
+
+@pytest.mark.parametrize(
+    "iterator",
+    [
+        "range(1)",
+        "range(0, -1, -1)",
+        "range(7, -1, -2)",
+        "range(7, 0, -1)",
+        "range(7, --1, -1)",
+        "range(n - 1, -1, -1)",
+        "range(0, 8)",
+        "cutlass.range(8)",
+    ],
+)
+def test_static_extent_rejects_other_lane_loop_iterators(iterator: str) -> None:
+    loop = _for(f"for lane_0 in {iterator}:\n    pass")
+    assert _static_lane_loop_extent(loop) is None
+
+
+def _rows_and_slabs() -> tuple[torch.Tensor, ...]:
+    return (
+        torch.zeros(64, 128, device=CPU_DEVICE),
+        torch.zeros(64, 32, 128, device=CPU_DEVICE),
+    )
+
+
+# One thread walks the 128 scanned columns of a row: a grid lane loop that
+# also wraps the device loop over ``tile_k``.
+_ROW_LANES = {"block_sizes": [32, 32], "num_threads": [32, 32, 1]}
+# Eight rows of a tile on one thread: a lane loop around the column loop.
+_COLUMN_LANES = {
+    "block_sizes": [8, 32],
+    "num_threads": [1, 32],
+    "cute_vector_widths": [1, 1],
+    "cute_lane_layouts": ["strided", "strided"],
+}
+
+
+def test_reversed_lane_loop_drops_interchanged_first_pass_stores() -> None:
+    # The device loop's sums over the reversed lanes are interchanged: a
+    # second nest runs the lanes inside ``tile_k``, so the first nest's
+    # per-lane partial stores of ``totals`` (and the loads feeding them) are
+    # overwritten and go, as they do for an ascending lane loop.
+    # Their emptied loop over ``tile_k`` goes too: the first nest keeps the scan.
+    body = _codegen(reverse_scan_then_row_sums, _rows_and_slabs(), **_ROW_LANES)
+    assert body.count("for synthetic_lane_1 in range(127, -1, -1):") == 2
+    assert "scan_rest = scan_pos != cutlass.Int32(127)" in body
+    assert "scan_carry = scan_out" in body
+    assert body.count("(totals.iterator") == 1
+    assert body.count("(y.iterator") == 1
+    assert body.count("for tile_offset_2 in range(") == 1
+    assert "sum_1_lane_acc = sum_1_lane_acc + cutlass.Float32(" in body
+
+
+def test_reversed_lane_loop_drops_a_first_pass_left_without_effects() -> None:
+    # The atomic consumer leaves the first nest; its column loop then holds
+    # only dead loads and goes, and the reversed lane loop keeps the scan.
+    body = _codegen(
+        reverse_scan_then_column_sums,
+        (torch.zeros(37, 100, device=CPU_DEVICE), torch.zeros(37, device=CPU_DEVICE)),
+        **_COLUMN_LANES,
+    )
+    assert body.count("for lane_0 in range(7, -1, -1):") == 2
+    assert "scan_carry_valid = scan_valid" in body
+    assert body.count("for tile_offset_1 in range(") == 1
+    assert body.count("(x.iterator") == 1
+    assert body.count("cute.arch.atomic_add(") == 1
+
+
+def test_reversed_interchanged_in_place_update_drops_its_partial_store() -> None:
+    # The final nest loads ``y``, so the first nest's partial store of it goes
+    # (the final nest would read it back) and the final nest updates ``y`` in
+    # place over the descending lanes; the first nest keeps only the scan.
+    body = _codegen(reverse_scan_then_centering, _rows_and_slabs(), **_ROW_LANES)
+    assert body.count("for synthetic_lane_1 in range(127, -1, -1):") == 3
+    assert "scan_carry = scan_out" in body
+    assert body.count("for tile_offset_2 in range(") == 1
+    # The final nest's accumulate load and its consume load and store.
+    assert body.count("(y.iterator") == 3
+    # ``out`` (the scan) and ``y`` (the update).
+    assert body.count(").store(") == 2
+
+
+def _reverse_scan_then_recentering(
+    x: torch.Tensor, y: torch.Tensor, passes: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Every pass re-centers the same rows in place and adds up what it read.
+    out = torch.empty_like(x)
+    totals = torch.empty_like(x)
+    for i in hl.tile(x.size(0)):
+        out[i, :] = hl.cumsum(x[i, :], dim=1, reverse=True)
+        acc = hl.zeros([i, y.size(1)], dtype=torch.float32)
+        for _ in hl.grid(passes):
+            row = y[i, :]
+            acc = acc + row
+            y[i, :] = row - row.sum(-1, keepdim=True)
+        totals[i, :] = acc
+    return out, y, totals
+
+
+# One thread walks a row's 128 scanned columns around the ``hl.grid`` loop.
+_ROW_LANES_AROUND_A_GRID = {"num_threads": [32, 1]}
+
+
+def test_reversed_interchanged_in_place_update_keeps_a_load_of_its_own_row() -> None:
+    # The first nest adds up the rows it loads ahead of the update.  Each
+    # iteration loads only the row ``y[i, k, :]`` it updates, which no other
+    # iteration writes, so the load still reads what the kernel started from
+    # once the partial store is dropped.
+    body = _codegen(
+        reverse_scan_then_centering_with_totals,
+        (
+            torch.zeros(64, 128, device=CPU_DEVICE),
+            torch.zeros(64, 8, 128, device=CPU_DEVICE),
+        ),
+        **_ROW_LANES_AROUND_A_GRID,
+    )
+    assert body.count("for synthetic_lane_1 in range(127, -1, -1):") == 3
+    # The first nest's load and the final nest's accumulate and consume
+    # loads and store.
+    assert body.count("(y.iterator") == 4
+    # ``out``, ``totals`` and ``y`` once each.
+    assert body.count(").store(") == 3
+
+
+def test_reversed_interchanged_update_of_the_same_row_in_every_pass_is_refused() -> (
+    None
+):
+    # Every pass of the loop loads the row the previous one updated; the
+    # first nest's load would read the value the kernel started from.
+    with pytest.raises(helion.exc.BackendUnsupported, match="another serial iteration"):
+        _codegen(
+            _reverse_scan_then_recentering,
+            (
+                torch.zeros(64, 128, device=CPU_DEVICE),
+                torch.zeros(64, 128, device=CPU_DEVICE),
+                3,
+            ),
+            **_ROW_LANES_AROUND_A_GRID,
+        )

@@ -17,7 +17,6 @@ from __future__ import annotations
 import ast
 import dataclasses
 from typing import TYPE_CHECKING
-from typing import cast
 
 from .... import exc
 from ...ast_extension import create
@@ -38,12 +37,45 @@ def _lane_loop_iter(extent: int) -> ast.AST:
     return expr_from_string(f"range({extent})")
 
 
-def _static_lane_loop_extent(loop: ast.For) -> int | None:
-    """Trip count of a synthetic lane loop, or ``None`` for any other loop.
+def _int_literal(node: ast.AST) -> int | None:
+    """The value of an ``int`` literal, through signs and integer casts, else
+    ``None``.
 
-    Recognizes the ascending ``range(N)`` form and the descending
+    The parser reads ``-1`` as ``UnaryOp(USub, Constant(1))``, so the
+    descending lane-loop bounds are not plain constants.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, int):
+        return node.value
+    if isinstance(node, ast.UnaryOp):
+        value = _int_literal(node.operand)
+        if value is None:
+            return None
+        if isinstance(node.op, ast.USub):
+            return -value
+        if isinstance(node.op, ast.UAdd):
+            return value
+    if isinstance(node, ast.Call) and len(node.args) == 1 and not node.keywords:
+        is_builtin_int = isinstance(node.func, ast.Name) and node.func.id == "int"
+        is_cutlass_int = (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "cutlass"
+            and node.func.attr in ("Int32", "Int64")
+        )
+        if is_builtin_int or is_cutlass_int:
+            return _int_literal(node.args[0])
+    return None
+
+
+def _literal_lane_loop_extent(loop: ast.For) -> int | None:
+    """Trip count of a lane loop with literal bounds (:func:`_int_literal`,
+    which also reads integer casts, ``+N`` and bools, none of which a lane
+    loop spells), or ``None``.
+
+    Reads the ascending ``range(N)`` form and the descending
     ``range(N - 1, -1, -1)`` form produced by :func:`_reverse_lane_loop_iter`
-    for reverse scans; both visit the same ``N`` lanes.
+    for reverse scans (both also as ``cutlass.range_constexpr``); both visit
+    the same ``N`` lanes, one included (``range(0, -1, -1)``).
     """
     iterator = loop.iter
     if not isinstance(iterator, ast.Call) or iterator.keywords:
@@ -51,19 +83,24 @@ def _static_lane_loop_extent(loop: ast.For) -> int | None:
     function = ast.unparse(iterator.func)
     if function not in ("range", "cutlass.range_constexpr"):
         return None
-    args = iterator.args
-    if not all(
-        isinstance(arg, ast.Constant) and isinstance(arg.value, int) for arg in args
-    ):
-        return None
-    values = [cast("int", cast("ast.Constant", arg).value) for arg in args]
-    if len(values) == 1:
-        extent = values[0]
-    elif len(values) == 3 and values[1] == -1 and values[2] == -1:
-        extent = values[0] + 1
-    else:
-        return None
-    if extent <= 1:
+    values = [_int_literal(arg) for arg in iterator.args]
+    if len(values) == 1 and values[0] is not None:
+        return values[0]
+    if len(values) == 3 and values[0] is not None and values[1] == values[2] == -1:
+        return values[0] + 1
+    return None
+
+
+def _static_lane_loop_extent(loop: ast.For) -> int | None:
+    """Trip count of a synthetic lane loop of at least two lanes, or ``None``
+    for any other loop (:func:`_literal_lane_loop_extent`).
+
+    A caller that rebuilds the loop or renumbers its lanes in ascending order
+    must match :func:`_ascending_lane_loop_form` instead: the reverse scan
+    carried across the lanes needs the descending order.
+    """
+    extent = _literal_lane_loop_extent(loop)
+    if extent is None or extent <= 1:
         return None
     return extent
 
@@ -787,7 +824,8 @@ def restore_unprocessed_lane_reduce_markers(
 
 
 def _lane_loop_extent(loop: ast.For) -> int:
-    call = loop.iter
-    assert isinstance(call, ast.Call)
-    assert len(call.args) == 1
-    return int(ast.literal_eval(call.args[0]))
+    """Trip count of a lane loop known to have literal bounds, in either
+    direction (:func:`_literal_lane_loop_extent`)."""
+    extent = _literal_lane_loop_extent(loop)
+    assert extent is not None, ast.unparse(loop.iter)
+    return extent

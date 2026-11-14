@@ -58,6 +58,7 @@ from helion._testing import TestCase
 from helion._testing import cpu_render_target
 from helion._testing import import_example
 from helion._testing import onlyBackends
+from helion._testing import patch_target_facts
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
 from helion._testing.cute_codegen import cpu_bind
@@ -978,28 +979,39 @@ def test_the_spread_pad_sizes_the_kernel_to_one_wave() -> None:
     # 128 CTAs on 148 SMs run one per SM: the pad raises a 25600-byte body to
     # the smallest footprint at which two CTAs, each with the system's
     # reserved slice, no longer fit an SM while one still does.
-    pad = spread_pad_bytes(128, 148, 25600)
+    pad = spread_pad_bytes(128, 148, 25600, 25600)
     assert pad is not None
     footprint = 25600 + pad
     assert footprint == 115713
     assert 2 * (footprint + SMEM_RESERVED_PER_CTA) > DEFAULT_SMEM_PER_SM
     assert footprint + SMEM_RESERVED_PER_CTA <= DEFAULT_SMEM_PER_SM
     # Two per SM (296 CTAs): three no longer fit, two still do.
-    pad = spread_pad_bytes(296, 148, 0)
+    pad = spread_pad_bytes(296, 148, 0, 0)
     assert pad is not None
     assert 3 * (pad + SMEM_RESERVED_PER_CTA) > DEFAULT_SMEM_PER_SM
     assert 2 * (pad + SMEM_RESERVED_PER_CTA) <= DEFAULT_SMEM_PER_SM
+    # A body the compiler may keep anywhere between 25600 and 65536 bytes of:
+    # at one CTA per SM the pad tops up the least it keeps, so the kernel
+    # reaches the footprint whatever is dropped (more costs no CTA up to the
+    # per-block maximum, which the most must stay within); at two per SM so
+    # large a pad would leave room for one CTA when everything is kept, and
+    # it tops up the most instead.
+    assert spread_pad_bytes(128, 148, 25600, 65536) == 115713 - 25600
+    assert spread_pad_bytes(128, 148, 0, 131072) is None
+    assert spread_pad_bytes(296, 148, 0, 25600) == 76801 - 25600
     # A body whose own allocation already holds the CTAs to that density
     # needs no pad (the 164 KB output kernel of the linear attention
     # forward), nor does a kernel dense enough that the footprint drops
     # below what it allocates.
-    assert spread_pad_bytes(128, 148, 167936) is None
-    assert spread_pad_bytes(148 * 16, 148, 16384) is None
-    # No grid, no SMs, or a footprint past the per-block maximum: no pad.
-    assert spread_pad_bytes(0, 148, 0) is None
-    assert spread_pad_bytes(128, 0, 0) is None
-    assert spread_pad_bytes(128, 148, 0, max_smem_per_block=65536) is None
-    assert spread_pad_bytes(128, 148, 0, smem_per_sm=2000) is None
+    assert spread_pad_bytes(128, 148, 167936, 167936) is None
+    assert spread_pad_bytes(148 * 16, 148, 16384, 16384) is None
+    # No grid, no SMs, no ordered bounds, or a footprint past the per-block
+    # maximum: no pad.
+    assert spread_pad_bytes(0, 148, 0, 0) is None
+    assert spread_pad_bytes(128, 0, 0, 0) is None
+    assert spread_pad_bytes(128, 148, 1024, 0) is None
+    assert spread_pad_bytes(128, 148, 0, 0, max_smem_per_block=65536) is None
+    assert spread_pad_bytes(128, 148, 0, 0, smem_per_sm=2000) is None
     # Every resident CTA keeps one 1 KB unit of slack beyond its footprint
     # (rounded up to the 128-byte allocation unit), so the alignment padding
     # of the body's allocations or a helper's own allocation cannot cost a
@@ -1009,59 +1021,112 @@ def test_the_spread_pad_sizes_the_kernel_to_one_wave() -> None:
     from helion._compiler.cute.pdl_release import SPREAD_SLACK_PER_CTA
 
     for cap in range(1, 15):
-        pad = spread_pad_bytes(148 * cap, 148, 0)
+        pad = spread_pad_bytes(148 * cap, 148, 0, 0)
         assert pad is not None, cap
         allocated = -(-pad // SMEM_ALLOCATION_UNIT) * SMEM_ALLOCATION_UNIT
         per_cta = allocated + SMEM_RESERVED_PER_CTA
         assert (cap + 1) * per_cta > DEFAULT_SMEM_PER_SM
         assert cap * (per_cta + SPREAD_SLACK_PER_CTA) <= DEFAULT_SMEM_PER_SM
-    assert spread_pad_bytes(148 * 15, 148, 0) is None
-    assert spread_pad_bytes(148 * 32, 148, 0) is None
+    assert spread_pad_bytes(148 * 15, 148, 0, 0) is None
+    assert spread_pad_bytes(148 * 32, 148, 0, 0) is None
 
 
-def test_the_spread_pad_declines_storage_the_sum_cannot_see() -> None:
-    # The sum sees the body's literal ``alloc_smem`` calls; a body that
-    # reserves shared memory through the DSL's ``SmemAllocator`` (the fa4
-    # flash families, the tcgen05 GEMMs: a struct carved out at trace time,
-    # already at the per-block maximum), the dynamic shared memory base, or
-    # a size that is not a literal gets no pad at all: a pad sized against
-    # storage of unknown size would fail every launch past the maximum.
-    from helion._compiler.cute.passes.pdl import _literal_smem_bytes
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def row_max_plus_sum(x: torch.Tensor) -> torch.Tensor:
+    """Two block reduces per row block (``torch.amax`` and ``torch.sum``)."""
+    n, v = x.size()
+    out = torch.empty([n], dtype=torch.float32, device=x.device)
+    for tile_n in hl.tile(n):
+        row_max = hl.full([tile_n], float("-inf"), dtype=torch.float32)
+        row_sum = hl.zeros([tile_n], dtype=torch.float32)
+        for tile_v in hl.tile(v):
+            vals = x[tile_n, tile_v].to(torch.float32)
+            row_max = torch.maximum(row_max, torch.amax(vals, dim=-1))
+            row_sum = row_sum + torch.sum(vals, dim=-1)
+        out[tile_n] = row_max + row_sum
+    return out
 
-    def statements(source: str) -> list[ast.AST]:
-        return list(ast.parse(source).body)
 
-    assert _literal_smem_bytes(statements("x = 1")) == 0
-    assert (
-        _literal_smem_bytes(
-            statements(
-                "a = cute.arch.alloc_smem(cutlass.Uint8, 25600, alignment=128)\n"
-                "b = cute.arch.alloc_smem(cutlass.Float32, 512, alignment=16)\n"
-                "c = cute.arch.alloc_smem(cutlass.BFloat16, 8192)\n"
+def test_the_spread_pad_counts_the_reduce_buffers_of_every_lane(
+    cpu_only: None,
+) -> None:
+    # One CTA of 256 x 4 threads over 4096 rows: the 4 threads of a row
+    # combine its 1024 columns with a shared-memory reduce, and each of the
+    # V unrolled row lanes (``cute_vector_widths[0]``) traces its own copy
+    # of both reduces, a 5120-byte buffer each (the interleaved block form,
+    # ``pre=256, group_span=1024``).
+    x = torch.empty(4096, 1024, dtype=torch.bfloat16)
+    bound = cpu_bind(row_max_plus_sum, (x,))
+    spec = bound.config_spec
+
+    def render(width: int, spread: bool) -> str:
+        return bound.to_code(
+            spec.normalized_config(
+                helion.Config(
+                    block_sizes=[4096, 1024],
+                    num_threads=[256, 4],
+                    cute_vector_widths=[width, 1],
+                    cute_pdl=True,
+                    cute_pdl_spread=spread,
+                )
             )
         )
-        == 25600 + 512 * 4 + 8192 * 2
+
+    # Four lanes hold eight buffers: the pad raises their 40960 bytes to the
+    # one-CTA-per-SM footprint.
+    code = render(4, True)
+    assert code.count("_cute_grouped_reduce_shared_two_stage(") == 2
+    assert _PAD.format(115713 - 8 * 5120) in code
+    # Sixteen lanes hold 32 buffers, 163840 bytes, which already keep one
+    # CTA per SM: no pad.  The pad sized against the body's literal
+    # allocations alone (115713 bytes) took this kernel to 279553 bytes,
+    # past the 232448-byte per-block maximum, and libNVVM failed.
+    assert render(16, True) == render(16, False)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def two_row_sums(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Two roots, each a block reduce of its rows."""
+    m, n = x.size()
+    out_x = torch.empty([m], dtype=torch.float32, device=x.device)
+    out_y = torch.empty([m], dtype=torch.float32, device=x.device)
+    for tile_m in hl.tile(m):
+        out_x[tile_m] = torch.sum(x[tile_m, :].to(torch.float32), dim=-1)
+    for tile_m in hl.tile(m):
+        out_y[tile_m] = torch.sum(y[tile_m, :].to(torch.float32), dim=-1)
+    return out_x, out_y
+
+
+def test_the_spread_pad_counts_the_buffers_of_every_root(cpu_only: None) -> None:
+    # 2048 CTAs of 1024 threads on 148 SMs (fourteen per SM): a 14541-byte
+    # footprint.  The launch dispatches the two roots on the block index
+    # (``if pid_shared < 1024``), so the DSL traces both and the pad leaves
+    # room for both roots' 132-byte reduce buffers (33 fp32 slots of the
+    # two-stage form over 32 warps).
+    x = torch.empty(1024, 1024, dtype=torch.bfloat16)
+    bound = cpu_bind(two_row_sums, (x, x.clone()))
+    spec = bound.config_spec
+    base = {
+        key: value
+        for key, value in spec.default_config().config.items()
+        if key != "cute_pdl"
+    }
+    code = bound.to_code(
+        spec.normalized_config(
+            helion.Config(**base, cute_pdl=True, cute_pdl_spread=True)
+        )
     )
-    for opaque in (
-        (
-            "smem = cutlass_utils_flash.SmemAllocator()\n"
-            "storage = smem.allocate(_fbwd_storage_cls)\n"
-        ),
-        "alloc = cutlass.utils.SmemAllocator()\n",
-        "t = smem.allocate_tensor(cutlass.Float32, layout, 128)\n",
-        "p = smem.allocate_array(cutlass.Int64, 4)\n",
-        "base = cute.arch.get_dyn_smem(cutlass.Uint8, alignment=128)\n",
-        "a = cute.arch.alloc_smem(cutlass.Uint8, size, alignment=128)\n",
-        "a = cute.arch.alloc_smem(dtype, 1024)\n",
-    ):
-        assert _literal_smem_bytes(statements(opaque)) is None, opaque
+    assert code.count("_cute_grouped_reduce_shared_two_stage(") == 2
+    assert _PAD.format(14541 - 2 * 132) in code
 
 
 def test_the_spread_knob_pads_the_kernel_after_its_release(cpu_only: None) -> None:
-    # 64 CTAs of 512 threads on 148 SMs: one per SM.  The body allocates no
-    # shared memory itself, so the pad is the whole 115713-byte footprint,
-    # placed right after the wait and the release and kept live by the
-    # helper the module imports; everything else is the knob-on code.
+    # 64 CTAs of 512 threads on 148 SMs: one per SM.  The body's only shared
+    # memory is its column reduce's buffer (the fragment two-stage over 16
+    # warps, 4 x 4 slots of partials each plus the results: 1088 bytes), so
+    # the pad raises it to the 115713-byte footprint, placed right after the
+    # wait and the release and kept live by the helper the module imports;
+    # everything else is the knob-on code.
     x = torch.empty(1024, 1024, dtype=torch.bfloat16)
     bound = cpu_bind(col_reduce_sum_static, (x,))
     spec = bound.config_spec
@@ -1078,7 +1143,7 @@ def test_the_spread_knob_pads_the_kernel_after_its_release(cpu_only: None) -> No
     index = statements.index(_WAIT)
     assert statements[index + 1 : index + 4] == [
         _RELEASE,
-        _PAD.format(115713),
+        _PAD.format(115713 - 1088),
         _KEEP,
     ]
     assert _without_spread_pad(spread) == ast.unparse(ast.parse(on))
@@ -1106,13 +1171,20 @@ def test_the_spread_knob_pads_the_kernel_after_its_release(cpu_only: None) -> No
         statements = [ast.unparse(statement) for statement in _kernel_def(code).body]
         index = statements.index(_WAIT)
         assert _last_wave_guard(code) == "if pdl_cta >= 4:"
-        assert statements[index + 3 : index + 5] == [_PAD.format(37889), _KEEP]
+        assert statements[index + 3 : index + 5] == [
+            _PAD.format(37889 - 1088),
+            _KEEP,
+        ]
         assert spread_rendered(code)
     # An unknown SM count (CPU targets) or a device whose shared memory
     # cannot hold the footprint leaves the body alone.
     with patch.object(spec, "num_sm", 1):
         assert bound.to_code(cfg) == on
     with patch("helion._compiler.cute.passes.pdl._smem_per_sm", return_value=2000):
+        assert bound.to_code(cfg) == on
+    # Nor does a block maximum below the footprint (a modelled 99 KiB part):
+    # the pad reads the maximum the per-block check enforces.
+    with patch_target_facts(smem_capacity_bytes=101376):
         assert bound.to_code(cfg) == on
 
 

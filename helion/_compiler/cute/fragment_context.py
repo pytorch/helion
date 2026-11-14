@@ -39,6 +39,7 @@ from ..compile_environment import CompileEnvironment
 from ..host_function import HostFunction
 from ..inductor_lowering import PointwiseLowering
 from ..inductor_lowering import ReductionLowering
+from ..inductor_lowering import size1_reduction_positions
 from ..variable_origin import GridOrigin
 from ..variable_origin import TileBeginOrigin
 from ..variable_origin import TileEndOrigin
@@ -415,6 +416,18 @@ def _fragment_logical_shape(
                     ):
                         return None
                     broadcast_shape[axis] = size
+            if rank > value.ndim:
+                # A reduction over extent-1 dims, which inductor lowers
+                # element-wise: the result keeps its input's other dims.
+                widest = max((n.meta["val"] for n in tensors), key=lambda t: t.ndim)
+                positions = size1_reduction_positions(widest.shape, value.shape)
+                if positions is None:
+                    return None
+                kept: list[sympy.Expr] = [sympy.Integer(1)] * value.ndim
+                for axis, position in enumerate(positions):
+                    if position >= 0:
+                        kept[position] = broadcast_shape[axis]
+                return tuple(kept)
             return tuple(broadcast_shape)
         return None
 

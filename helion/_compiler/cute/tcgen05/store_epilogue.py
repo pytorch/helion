@@ -248,10 +248,10 @@ def _check_tcgen05_tma_store_destination(
     SIMT store otherwise; this is the last line for the paths it does not
     gate (grouped and row-union stores, untraced fan-outs).  A static stride
     or storage offset that is not a 16-byte multiple, an argument whose
-    bound base residue is not zero, or a plain MN destination whose
-    contiguous axis is not the one the staged D layout assumes would be
-    stored silently wrong, so fail loudly instead.  Unknown (symbolic)
-    facts are not judged here.
+    bound base residue (its address modulo 32) is not a 16-byte multiple, or
+    a plain MN destination whose contiguous axis is not the one the staged
+    D layout assumes would be stored silently wrong, so fail loudly instead.
+    Unknown (symbolic) facts are not judged here.
     """
     from ..cute_mma import _tcgen05_tma_matrix_major
     from ..memory_ops import _bound_vec_alignment_signature
@@ -266,7 +266,7 @@ def _check_tcgen05_tma_store_destination(
     if type(offset) is int and (offset * element_size) % 16:
         problems.append(f"storage_offset={offset} ({offset * element_size} B)")
     signature = _bound_vec_alignment_signature(env, env.tensor_input_source(tensor))
-    if signature is not None and signature[0] != 0:
+    if signature is not None and signature[0] % 16:
         problems.append(f"base address residue {signature[0]} B")
     if not transposed_store and tensor.ndim in (2, 3):
         expected_major = "col" if output_column_major else "row"

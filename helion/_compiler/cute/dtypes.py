@@ -15,11 +15,21 @@ never needs the CuTe DSL; ``cutlass_pointer_dtype`` resolves the object
 lazily.  The Helion-free standalone launcher carries a frozen copy of the
 pointer table keyed by ``str(dtype)``
 (``helion/runtime/cute/standalone_launcher.py``); a test keeps the two equal.
+
+``promotion_operand`` and ``narrow_common_dtype`` say which dtype torch
+computes a binary op in, for the fused-body emitters that must round operands
+to a 16-bit common dtype as torch does, ``round_scalar`` rounds a Python
+scalar to a dtype at codegen time, and ``float_literal`` spells such a value
+in generated source.
 """
 
 from __future__ import annotations
 
+import math
+
 import torch
+from torch._subclasses.fake_tensor import unset_fake_temporarily
+from torch.fx import Node
 
 from ... import exc
 
@@ -66,3 +76,55 @@ def cutlass_pointer_dtype(dtype: torch.dtype) -> object:
     if cutlass_dtype is None:
         raise exc.BackendUnsupported("cute", f"dtype: {dtype}")
     return cutlass_dtype
+
+
+def promotion_operand(arg: object) -> torch.Tensor | bool | int | float | None:
+    """``arg``, an FX node or a Python value, as ``torch.result_type`` sees
+    it: the node's tensor, or a number (a symbolic scalar counts as one of
+    its category); None for anything else, such as a list of dims."""
+    value = arg.meta.get("val") if isinstance(arg, Node) else arg
+    if isinstance(value, (torch.Tensor, bool, int, float)):
+        return value
+    if isinstance(value, torch.SymBool):
+        return True
+    if isinstance(value, torch.SymInt):
+        return 1
+    if isinstance(value, torch.SymFloat):
+        return 1.0
+    return None
+
+
+def narrow_common_dtype(lhs: object, rhs: object) -> torch.dtype | None:
+    """The 16-bit float dtype torch computes a binary op of ``lhs`` and ``rhs``
+    (FX nodes or Python values) in, else None (another dtype, or arguments
+    that are not a tensor beside a tensor or number).  Torch converts a
+    tensor operand of another dtype to it first (a 0-d fp32 tensor beside
+    bf16), and a compare converts a Python scalar too (``bf16 > 0.3`` tests
+    against ``bf16(0.3)``)."""
+    a = promotion_operand(lhs)
+    b = promotion_operand(rhs)
+    if (
+        a is None
+        or b is None
+        or not (isinstance(a, torch.Tensor) or isinstance(b, torch.Tensor))
+    ):
+        return None
+    common = torch.result_type(a, b)
+    return common if common in (torch.float16, torch.bfloat16) else None
+
+
+def round_scalar(value: float, dtype: torch.dtype) -> float:
+    """``value`` rounded to ``dtype`` at codegen time, to nearest even as the
+    device conversion rounds (inf past the type's range).  The tensor is a
+    real CPU one even while a kernel binds, under fake-tensor mode and a
+    meta default device, where its ``item()`` would be an unbacked symbol
+    or fail."""
+    with unset_fake_temporarily():
+        return float(torch.tensor(float(value), dtype=dtype, device="cpu").item())
+
+
+def float_literal(value: float) -> str:
+    """Python source for the float ``value``: ``repr`` spells inf and nan as
+    bare names, undefined in the generated module, so those are
+    ``float(...)`` calls."""
+    return repr(value) if math.isfinite(value) else f"float('{value}')"

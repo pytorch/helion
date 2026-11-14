@@ -118,8 +118,8 @@ def _environment(
         resident_regions=(),
         attribution_complete=True,
     )
-    spec.cute_tile_loop_paths = tuple(
-        (pair, (k,)) for pair, k in zip(pairs, (2, 3), strict=True)
+    spec.cute_tile_loop_path_reductions = dict.fromkeys(
+        ((pair, (k,)) for pair, k in zip(pairs, (2, 3), strict=True)), frozenset()
     )
     env = SimpleNamespace(
         config_spec=spec,

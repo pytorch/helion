@@ -1075,6 +1075,26 @@ class TestCuteVloopSink(TestCase):
         )
         self.assertIn("pre=8, group_span=128", code)
 
+    def test_interleaved_fragment_combine_matches_the_knob_off_bits(self) -> None:
+        """The fragment combine of eight interleaved column threads over four
+        warps adds the threads' fp32 sums in the order of the per-lane reduces
+        it replaces."""
+        x = torch.randn(1000, 56, device=DEVICE, dtype=torch.float32)
+        layout = {
+            "block_sizes": [2048, 16],
+            "num_threads": [16, 8],
+            "vec": [1, 2],
+            "layouts": ["blocked", "blocked"],
+        }
+        code, sunk = code_and_output(
+            col_reduce_sum_dynamic, (x,), **_sink_config(**layout, unroll=4)
+        )
+        self.assertIn("count=2, pre=8, group_span=128", code)
+        _, plain = code_and_output(
+            col_reduce_sum_dynamic, (x,), **_sink_config(**layout, sink=False)
+        )
+        self.assertTrue(torch.equal(sunk, plain))
+
     def test_static_shapes_and_unroll_depths(self) -> None:
         x = torch.randn(2048, 512, device=DEVICE, dtype=torch.bfloat16)
         for unroll in (1, 2, 16):

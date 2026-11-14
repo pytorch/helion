@@ -15,6 +15,7 @@ import torch
 from test._cute_kernels import softmax_two_pass_kernel
 
 import helion
+from helion._compiler.cute.reduce_call import use_serial_block_reduce
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
@@ -211,8 +212,8 @@ class TestCuteClusterOnlinePair(TestCase):
 
     @skipIfRefEager("checks the generated code")
     def test_default_pair_matches_the_unclustered_formula(self) -> None:
-        """Without fast_math each output is ``exp2((x - max) * C) / sum`` as
-        in the unclustered kernel; only the row sum is reassociated (CTA
+        """Without fast_math each output is ``exp(x - max) / sum`` as in the
+        unclustered kernel; only the row sum is reassociated (CTA
         sums folded with the online rescale).  So per row the ratio to the
         unclustered output is one constant, bf16 outputs are at most one
         ulp apart, and -inf slices, -inf rows, NaN and +inf rows agree."""
@@ -333,19 +334,17 @@ class TestCuteClusterOnlinePair(TestCase):
         """Pin the serial-vs-two-stage dispatch contract: the cheap serial
         cross-warp combine only serves single whole-CTA groups of 2..8
         warps; everything else must keep the two-stage form."""
-        from helion._compiler.cute.reduce_helpers import _use_serial_block_reduce
-
-        self.assertTrue(_use_serial_block_reduce(1, 128, 1))
-        self.assertTrue(_use_serial_block_reduce(1, 256, 1))
+        self.assertTrue(use_serial_block_reduce(1, 128, 1))
+        self.assertTrue(use_serial_block_reduce(1, 256, 1))
         # 16 warps: serial chain outgrows the two-stage shuffle cost.
-        self.assertFalse(_use_serial_block_reduce(1, 512, 1))
+        self.assertFalse(use_serial_block_reduce(1, 512, 1))
         # single warp: the warp path handles it without shared memory.
-        self.assertFalse(_use_serial_block_reduce(1, 32, 1))
+        self.assertFalse(use_serial_block_reduce(1, 32, 1))
         # pre-grouped or multi-group reductions keep the two-stage form.
-        self.assertFalse(_use_serial_block_reduce(2, 128, 1))
-        self.assertFalse(_use_serial_block_reduce(1, 128, 4))
+        self.assertFalse(use_serial_block_reduce(2, 128, 1))
+        self.assertFalse(use_serial_block_reduce(1, 128, 4))
         # non-warp-multiple spans keep the two-stage form.
-        self.assertFalse(_use_serial_block_reduce(1, 48, 1))
+        self.assertFalse(use_serial_block_reduce(1, 48, 1))
 
     def test_single_site_keeps_two_exchange_form(self) -> None:
         """A cluster kernel without the (max, sum-of-exp) pair keeps the

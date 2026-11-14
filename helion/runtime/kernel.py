@@ -3937,10 +3937,21 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
     def extra_cache_key(self) -> str:
         """Return extra data folded into the disk-cache key.
 
-        Returns ``""`` by default, leaving the cache key unchanged.
+        Returns ``""`` by default, leaving the cache key unchanged.  Code
+        generated for calls that hold fewer facts than the binding's own
+        launches (an Inductor render, ``inductor_call_facts``) keys by those
+        facts: a config tuned for one set of calls may be refused for another.
         """
         policy = self.kernel.cute_structural_policy
-        return "" if policy is None else f"cute_structural_policy:{policy.identity()}"
+        key = "" if policy is None else f"cute_structural_policy:{policy.identity()}"
+        env = self.env
+        if env.input_alignment_limit is not None or not env.dispatch_guards_enforced:
+            strides = sorted(map(repr, env.symbolic_stride_sources))
+            key += (
+                f"call_facts:{env.input_alignment_limit}:"
+                f"{env.dispatch_guards_enforced}:{strides}"
+            )
+        return key
 
     def supports_subprocess_benchmark(self) -> bool:
         return True

@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 from typing import cast
 
 import torch
+from torch._prims_common import get_computation_dtype
 from torch.fx.node import Node
 
 from ... import exc
@@ -251,12 +252,37 @@ def _reads(arg: object, placeholder: Node) -> bool:
 
 
 def _sums_dims(node: Node, dims: list[int]) -> bool:
-    """Whether the sum ``node`` reduces every dim in ``dims`` of its input."""
+    """Whether the sum ``node`` reduces every dim in ``dims`` of its input,
+    adding its elements in their own dtype (``_sum_dtype_change``)."""
     source = node.args[0]
     reduced = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim")
     if not isinstance(source, Node) or not isinstance(reduced, (list, tuple)):
         return False
     value = source.meta.get("val")
     assert isinstance(value, torch.Tensor)
+    if _sum_dtype_change(node) is not None:
+        return False
     normalized = {cast("int", dim) % value.ndim for dim in reduced}
     return all(dim in normalized for dim in dims)
+
+
+def _sum_dtype_change(node: Node) -> str | None:
+    """How the sum ``node`` changes the dtype its input's elements are added
+    in, or None.  The fold adds a thread's lanes in the carry's dtype, so a
+    wider sum (an ``int32`` carry summed as ``int64``, a half-precision one
+    accumulated in ``float32``) would have them overflow or round there
+    first, and a narrower one (``acc.sum(-1, dtype=torch.float16)`` of a
+    ``float32`` carry) casts each thread's folded total instead of each
+    lane."""
+    source = node.args[0]
+    assert isinstance(source, Node)
+    value = source.meta.get("val")
+    result = node.meta.get("val")
+    assert isinstance(value, torch.Tensor) and isinstance(result, torch.Tensor)
+    # The dtype the sum accumulates in (``reduction_acc_dtype``).
+    accumulated = get_computation_dtype(result.dtype)
+    if accumulated != value.dtype:
+        return f"{node.name} adds it in {accumulated}, not in the carry's {value.dtype}"
+    if result.dtype != value.dtype:
+        return f"{node.name} casts it to {result.dtype} before adding it"
+    return None

@@ -9000,9 +9000,9 @@ class TestCuteLowerings(unittest.TestCase):
         shape; ``_classify_silu`` in
         ``helion/_compiler/cute/cute_epilogue.py`` collapses the
         whole div / add / exp / neg subgraph into a single chain step
-        rendered with the same ``cute.math.exp2``-based sigmoid form
-        Inductor's cutedsl op overrides use. Mirrors the activation
-        target Quack's bench labels ``silu`` (T13 / T17 in
+        rendered with the ``cute.math.exp`` the pointwise lowering of
+        ``torch.exp`` uses. Mirrors the activation target Quack's bench
+        labels ``silu`` (T13 / T17 in
         ``benchmarks/cute/cute_autotune_sweep.py``).
         """
 
@@ -9082,20 +9082,17 @@ class TestCuteLowerings(unittest.TestCase):
         expected = torch.nn.functional.silu((x @ y).float()).to(x.dtype)
         torch.testing.assert_close(out, expected, atol=2e-1, rtol=1e-2)
 
-    def test_tcgen05_fused_silu_epilogue_codegen_marker(self) -> None:
-        """The spliced silu chain step renders the
-        ``cute.math.exp2``-based sigmoid form inline against the
-        already-bound chain carrier.
+    def test_tcgen05_fused_silu_matches_the_pointwise_lowering(self) -> None:
+        """Both fused silu forms compute bit for bit what the pointwise
+        lowering computes for them (a config without the fused epilogue),
+        with and without ``fast_math``.
 
-        Pins the silu rendering — ``cute.math.exp2`` plus the
-        ``LOG2_E`` constant — and that the splice substitutes the
-        rendered expression for the multi-node FX subgraph (no
-        ``aten.div`` survives the splice; the chain analyzer
-        collapsed the whole ``div(x, 1 + exp(-x))`` decomposition
-        into one ``tcgen05_chain_step`` local). The constant is
-        spelled as the same literal Inductor's cutedsl sigmoid
-        override uses (``torch/_inductor/codegen/cutedsl/cutedsl_op_overrides.py``)
-        so a future drift between the two paths is caught here.
+        ``acc = x @ I`` is exactly ``x``, and the fp32 outputs keep every
+        rounding visible.  At ``x = -88`` the sigmoid is denormal: the
+        sigmoid contract flushes it (``-0``) where a reciprocal of the exact
+        ``exp`` kept it (about ``-5.3e-37``, which survives a bf16 cast).
+        The renderings are compared on CPU in
+        ``test_cute_native_sigmoid.py``.
         """
 
         from helion._compiler.cute.mma_support import get_cute_mma_support
@@ -9103,36 +9100,76 @@ class TestCuteLowerings(unittest.TestCase):
         if not get_cute_mma_support().tcgen05_f16bf16:
             self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
 
-        @helion.kernel(backend="cute")
-        def cute_matmul_silu_marker(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        def matmul_silu(
+            x: torch.Tensor, y: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
             m, k = x.size()
             _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            division = torch.empty([m, n], dtype=torch.float32, device=x.device)
+            product = torch.empty_like(division)
             for tile_m, tile_n in hl.tile([m, n]):
                 acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
                 for tile_k in hl.tile(k):
                     acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = torch.nn.functional.silu(acc).to(x.dtype)
-            return out
+                division[tile_m, tile_n] = torch.nn.functional.silu(acc)
+                product[tile_m, tile_n] = acc * torch.sigmoid(acc)
+            return division, product
 
-        x = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
-        y = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
-        with patch_cute_mma_support():
-            bound = cute_matmul_silu_marker.bind((x, y))
-            bound.env.config_spec.tcgen05.search_enabled = True
-            cfg = _make_tcgen05_persistent_config(
-                block_sizes=[128, 128, 32],
-                pid_type="persistent_interleaved",
-            )
-            bound.set_config(cfg)
-            code = bound.to_code(cfg)
-        # The chain analyzer accepted the decomposed silu; the splice
-        # site emitted the sigmoid form (``cute.math.exp2`` + LOG2_E)
-        # at the per-thread T2R register.
-        self.assertIn("cute.math.exp2", code)
-        self.assertIn("tcgen05_acc_loaded", code)
-        self.assertIn("tcgen05_chain_step", code)
-        self.assertIn("1.4426950408889634", code)
+        def pointwise_silu(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            division = torch.empty_like(x)
+            product = torch.empty_like(x)
+            for tile in hl.tile(x.numel()):
+                value = x[tile]
+                division[tile] = torch.nn.functional.silu(value)
+                product[tile] = value * torch.sigmoid(value)
+            return division, product
+
+        # Nonzero normal inputs only: under fast_math the pointwise
+        # ``div.approx.ftz`` also flushes a denormal product, and the
+        # accumulator of a signed zero row sums zeros of both signs.
+        special = torch.tensor([-88.0, -87.5, -90.0, -104.0, 1.0, 88.0, 100.0])
+        values = torch.linspace(-110.0, 40.0, 128 * 128 - special.numel())
+        x = torch.cat([special, values]).reshape(128, 128)
+        x = x.to(device=DEVICE, dtype=torch.bfloat16)
+        identity = torch.eye(128, dtype=torch.bfloat16, device=DEVICE)
+        for fast_math in (False, True):
+            with self.subTest(fast_math=fast_math):
+                bound = helion.kernel(
+                    matmul_silu, backend="cute", fast_math=fast_math
+                ).bind((x, identity))
+                bound.env.config_spec.tcgen05.search_enabled = True
+                config = _make_tcgen05_persistent_config(
+                    block_sizes=[128, 128, 32],
+                    pid_type="persistent_interleaved",
+                )
+                bound.set_config(config)
+                # Each output is a fused chain step; a config that dropped
+                # the fused epilogue would compare the pointwise lowering
+                # with itself.
+                self.assertEqual(
+                    len(
+                        re.findall(
+                            r"^ *tcgen05_chain_step_\d+ = ",
+                            bound.to_code(config),
+                            re.MULTILINE,
+                        )
+                    ),
+                    2,
+                )
+                fused = bound(x, identity)
+                unfused = helion.kernel(
+                    pointwise_silu,
+                    backend="cute",
+                    fast_math=fast_math,
+                    config=helion.Config(block_sizes=[256]),
+                )(x.float().flatten())
+                for fused_out, unfused_out in zip(fused, unfused, strict=True):
+                    torch.testing.assert_close(
+                        fused_out.flatten().view(torch.int32),
+                        unfused_out.view(torch.int32),
+                        rtol=0,
+                        atol=0,
+                    )
 
     def test_tcgen05_fused_sigmoid_epilogue_runtime_correctness_bf16(self) -> None:
         """``out[tile] = torch.sigmoid(acc).to(x.dtype)`` after a bf16 tcgen05
@@ -9214,11 +9251,10 @@ class TestCuteLowerings(unittest.TestCase):
         non-scalar binary multiply rejection.
 
         Confirms the chain step lands at the splice site by reading
-        the generated code: the rendered silu form (``cute.math.exp2``
-        + the carrier appearing twice — once for the outer ``x *``
-        and once inside the exp2 argument) survives only if the mul
-        arm of ``_classify_silu`` matched; otherwise the splice
-        falls through to the loud-failure path and ``to_code``
+        the generated code: the rendered silu form (the carrier times
+        the sigmoid contract's expression of the carrier) survives only
+        if the mul arm of ``_classify_silu`` matched; otherwise the
+        splice falls through to the loud-failure path and ``to_code``
         raises ``BackendUnsupported`` before returning.
         """
 
@@ -9261,32 +9297,15 @@ class TestCuteLowerings(unittest.TestCase):
         # ``_classify_silu`` had not matched, the chain analyzer
         # would have returned ``None`` and the store would have
         # raised ``BackendUnsupported`` before producing this code.
-        self.assertIn("cute.math.exp2", code)
-        self.assertIn("1.4426950408889634", code)
-        self.assertIn("tcgen05_chain_step", code)
-        # The standalone sigmoid template renders the bare
-        # ``1.0 / (1.0 + ...)`` without an outer ``x *`` factor; the
-        # silu template wraps it in ``(carrier) * (1.0 / ...)``. A
-        # successful mul-arm match emits the silu template, which
-        # references the carrier-local twice in one rendered chain
-        # step (once for the outer mul, once inside the exp2
-        # argument). Reject any rendering that lacks both
-        # occurrences inside a single chain-step block — that would
-        # indicate the splice degenerated to the plain sigmoid
-        # template plus a free-standing outer mul.
-        chain_step_index = code.find("tcgen05_chain_step")
-        # The renderer emits ``<chain_step_var> = (carrier) * (1.0 / (1.0 +
-        # cute.math.exp2(...)))`` on a single line; the assignment line
-        # must reference both the outer ``*`` and the ``exp2`` call
-        # ahead of the next chain-step assignment.
-        next_chain_step = code.find("tcgen05_chain_step", chain_step_index + 1)
-        chain_step_line_end = code.find("\n", chain_step_index)
-        if next_chain_step == -1 or next_chain_step > chain_step_line_end:
-            single_step = code[chain_step_index:chain_step_line_end]
-        else:
-            single_step = code[chain_step_index:next_chain_step]
-        self.assertIn("*", single_step)
-        self.assertIn("cute.math.exp2", single_step)
+        # One chain step multiplies the carrier by the sigmoid contract's
+        # expression of the same carrier (the pointwise ``x *
+        # torch.sigmoid(x)``), not a bare sigmoid step.
+        self.assertRegex(
+            code,
+            r"tcgen05_chain_step_\d+ = (tcgen05_acc_loaded_\d+) \* cute\.math\.rcp\("
+            r"1\.0 \+ cute\.math\.exp2\(\1 \* -1\.4426950408889634, fastmath=True\), "
+            r"approx=True, ftz=True\)",
+        )
         out = bound(x, y)
         ref = x @ y
         expected = (ref * torch.sigmoid(ref)).to(x.dtype)
@@ -13839,7 +13858,10 @@ class TestCuteLowerings(unittest.TestCase):
                 cute_flash_bwd_search_enabled=False,
                 cute_flash_gated_search_enabled=False,
                 num_threads=SimpleNamespace(config_get=lambda *args: 0),
-                loop_orders=SimpleNamespace(config_get=lambda *args: None),
+                loop_orders=SimpleNamespace(
+                    config_get=lambda *args: None,
+                    config_get_for_tile=lambda *args: None,
+                ),
                 l2_groupings=SimpleNamespace(config_get=lambda *args: 1),
             ),
         )
@@ -13862,6 +13884,7 @@ class TestCuteLowerings(unittest.TestCase):
                         grid_block_ids=[[2]],
                         root_ids=[0],
                         codegen_active_block_ids=None,
+                        noncanonical_task_origin_block_ids=set(),
                     )
                 ),
             ),
@@ -13876,6 +13899,10 @@ class TestCuteLowerings(unittest.TestCase):
             patch(
                 "helion._compiler.cute.backend._detect_specialized_mma_loop",
                 return_value=True,
+            ),
+            # The fake config spec models no tile aliases.
+            patch.object(
+                backend, "inactive_broadcast_alias_block_ids", return_value=set()
             ),
         ):
             strategy = backend.create_loop_strategy(fn, [0, 1], config)

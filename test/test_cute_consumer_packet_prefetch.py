@@ -259,6 +259,30 @@ def test_unproved_motion_declines_without_ast_changes(old: str, new: str) -> Non
     assert dumped(run_pass(text)) == dumped(ast.parse(text).body)
 
 
+@pytest.mark.parametrize(
+    "binding",
+    [
+        "shift = cutlass.Int32(0)\nshift = shift + 0",
+        "offs = cute.make_rmem_tensor(1, cutlass.Int32)\noffs[0] = 0\nshift = offs[0]",
+        "k = cutlass.Int32(0)\nshift = k * 2\nk = 1",
+    ],
+    ids=("self-update", "element", "rebound-operand"),
+)
+def test_names_bound_before_the_sweeps_reach_a_prefetch(binding: str) -> None:
+    """A prefetch reads ``shift`` in the region, where nothing rebinds it,
+    so it needs a bound name, not a definition that still spells its value
+    as ``fuse_two_pass_loads`` keys need one."""
+    text = source().replace(
+        "cute.arch.griddepcontrol_wait()",
+        f"cute.arch.griddepcontrol_wait()\n{binding}",
+    )
+    text = text.replace(
+        "        after = roffset_1 + cute.arch.thread_idx()[0] * 4 + lane * 32",
+        "        after = roffset_1 + cute.arch.thread_idx()[0] * 4 + lane * 32 + shift",
+    )
+    assert admitted(run_pass(text))
+
+
 def test_distinct_arguments_are_not_alias_proof() -> None:
     text = source()
     assert not admitted(run_pass(text, disjoint=False))

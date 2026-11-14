@@ -598,9 +598,17 @@ def _cute_inline_combine_graph(
             rhs = operand(node.args[1])
             emit(node, f"({lhs}) if ({lhs}) > ({rhs}) else ({rhs})")
         elif target is torch.ops.prims.convert_element_type.default:
-            # Per-lane scalars are already in their storage dtype; treat the
-            # cast as a pass-through (matches the load/store scalar pipeline).
-            env_map[node] = operand(node.args[0])
+            # A cast the combine function writes, or type promotion adds:
+            # ``right.float() > left.float()`` of int64 operands compares
+            # their fp32 roundings, which values 1 apart above 2**24 share.
+            dtype = node.args[1]
+            assert isinstance(dtype, torch.dtype)
+            emit(
+                node,
+                env.backend.cast_expr(
+                    operand(node.args[0]), env.backend.dtype_str(dtype)
+                ),
+            )
         else:
             raise exc.BackendUnsupported(
                 "cute", f"associative_scan combine function: {target}"
@@ -680,6 +688,7 @@ def _cute_codegen_serial_scan(
     from ..ast_extension import expr_from_string
     from ..ast_extension import statement_from_string
     from ..compile_environment import CompileEnvironment
+    from ..device_ir import HelperFunctionGraphInfo
     from .indexing import CuteSortableLoad
 
     # Fake-tensor metadata lives on the per-stream input nodes (the scan node
@@ -753,6 +762,20 @@ def _cute_codegen_serial_scan(
     combine_lines, combine_exprs = _cute_inline_combine_graph(
         state, helper_graph_info, acc_vars, value_vars
     )
+    # A combine that returns another dtype than its stream's (`l.float() +
+    # r.float()` of fp16 values) casts back, as the parallel scan's merge
+    # does: the loop carries each stream in its own dtype.
+    assert isinstance(helper_graph_info, HelperFunctionGraphInfo)
+    output = next(n for n in helper_graph_info.graph.nodes if n.op == "output")
+    outputs = output.args[0]
+    if not isinstance(outputs, (tuple, list)):
+        outputs = [outputs]
+    combine_exprs = [
+        env.backend.cast_expr(expr, env.backend.dtype_str(val.dtype))
+        if isinstance(out, torch.fx.Node) and out.meta["val"].dtype != val.dtype
+        else expr
+        for expr, out, val in zip(combine_exprs, outputs, vals, strict=True)
+    ]
     # Fold: when this position is included and we already have a running prefix,
     # combine; on the first included element seed the accumulator with the
     # value.  Stage combined results so reads of the old accumulator inside the

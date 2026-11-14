@@ -9,10 +9,10 @@ import helion
 from helion._compiler.cute.autotune.heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
-from helion._testing.cute_collective import collective_config as _config
-from helion._testing.cute_collective import collective_kernel as _kernel
-from helion._testing.cute_collective import jagged_inputs as _jagged_inputs
-from helion._testing.cute_collective import round_tf32 as _round_tf32
+from helion._testing.cute_collective import collective_config
+from helion._testing.cute_collective import collective_kernel
+from helion._testing.cute_collective import jagged_inputs
+from helion._testing.cute_collective import round_tf32
 from helion._testing.cute_flash import seeds_per_codegen_branch
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 
@@ -28,8 +28,8 @@ def test_original_jagged_shapes_have_native_and_warp_fp32_seeds(
     shape: tuple[int, int, int, int],
 ) -> None:
     batch, rows, k, n = shape
-    arguments = _jagged_inputs(batch=batch, rows=rows, k=k, n=n)
-    bound = cpu_bind(_kernel(), arguments)
+    arguments = jagged_inputs(batch=batch, rows=rows, k=k, n=n)
+    bound = cpu_bind(collective_kernel(), arguments)
     assert bound.host_function is not None
     assert bound.host_function.device_ir.grid_block_ids == [[0, 2]]
     assert "input_tensor_metadata" in bound.env.compiler_fact_specialization_facts
@@ -78,22 +78,23 @@ def test_original_jagged_shapes_have_native_and_warp_fp32_seeds(
 @pytest.mark.parametrize("precision", ["ieee", "tf32x3"])
 def test_exact_fp32_precision_keeps_scalar_fallback(precision: str) -> None:
     bound = cpu_bind(
-        _kernel(precision=precision), _jagged_inputs(batch=3, rows=137, k=78, n=128)
+        collective_kernel(precision=precision),
+        jagged_inputs(batch=3, rows=137, k=78, n=128),
     )
     assert bound.host_function is not None
     with bound.env:
         assert not CuteCollectiveMatmulHeuristic.get_seed_configs(
             bound.env, bound.host_function.device_ir
         )
-    source = bound.to_code(_config())
+    source = bound.to_code(collective_config())
     assert "cvt_f32_tf32" not in source
     assert "cute.gemm(" not in source
     assert "cutlass.Float16" not in source and "cutlass.BFloat16" not in source
 
 
 def test_fp32_does_not_fall_through_to_half_warp_mma() -> None:
-    bound = cpu_bind(_kernel(), _jagged_inputs(batch=3, rows=137, k=78, n=128))
-    source = bound.to_code(_config(compute="warp"))
+    bound = cpu_bind(collective_kernel(), jagged_inputs(batch=3, rows=137, k=78, n=128))
+    source = bound.to_code(collective_config(compute="warp"))
     assert "warp.MmaTF32Op((16, 8, 8))" in source
     assert "cute.gemm(" in source
     assert "MmaF16BF16Op" not in source
@@ -106,10 +107,10 @@ def test_computed_batched_fp32_tail_uses_native_collective(
     tile: tuple[int, int, int], static_shapes: bool
 ) -> None:
     bound = cpu_bind(
-        _kernel(batched=True, static_shapes=static_shapes),
+        collective_kernel(batched=True, static_shapes=static_shapes),
         (torch.empty((3, 130, 78)), torch.empty((3, 78, 70))),
     )
-    source = bound.to_code(_config(*tile))
+    source = bound.to_code(collective_config(*tile))
     assert "tcgen05.CtaGroup.ONE" in source
     assert "cvt_f32_tf32" in source
     assert "0.75" in source and "0.25" in source
@@ -119,9 +120,10 @@ def test_computed_batched_fp32_tail_uses_native_collective(
 
 def test_multiple_batch_elements_cannot_share_one_collective_tile() -> None:
     bound = cpu_bind(
-        _kernel(batched=True), (torch.empty((3, 130, 78)), torch.empty((3, 78, 70)))
+        collective_kernel(batched=True),
+        (torch.empty((3, 130, 78)), torch.empty((3, 78, 70))),
     )
-    config = _config()
+    config = collective_config()
     config.block_sizes[0] = 2
     source = bound.to_code(config)
     assert "cute.gemm(" not in source
@@ -163,7 +165,7 @@ def test_original_jagged_fp32_and_mutating_metadata(
     lengths[: rows % batch] += 1
     lengths[1] += lengths[0]
     lengths[0] = 0
-    arguments = _jagged_inputs(batch=batch, rows=rows, k=k, n=n, device=CUDA_DEVICE)
+    arguments = jagged_inputs(batch=batch, rows=rows, k=k, n=n, device=CUDA_DEVICE)
     offsets, a, b, bias = arguments
 
     def mutate() -> None:
@@ -176,7 +178,7 @@ def test_original_jagged_fp32_and_mutating_metadata(
         bias.normal_()
 
     def expected() -> torch.Tensor:
-        left, right = _round_tf32(a).double(), _round_tf32(b).double()
+        left, right = round_tf32(a).double(), round_tf32(b).double()
         pieces = []
         begin = 0
         for group, count in enumerate(lengths.tolist()):
@@ -186,9 +188,9 @@ def test_original_jagged_fp32_and_mutating_metadata(
         return torch.cat(pieces)
 
     mutate()
-    kernel = _kernel()
+    kernel = collective_kernel()
     bound = kernel.bind(arguments)
-    config = _config(
+    config = collective_config(
         128 if compute == "tcgen05" else 32,
         32 if n == 32 else 64,
         64,
@@ -258,7 +260,7 @@ def test_jagged_fp32_reduction_tail_ignores_backing_storage(
     assert a.is_contiguous() and a.stride() == (k, 1)
     assert a.data_ptr() == backing.data_ptr()
 
-    left, right = _round_tf32(a).double(), _round_tf32(b).double()
+    left, right = round_tf32(a).double(), round_tf32(b).double()
     pieces = []
     begin = 0
     for group, count in enumerate(lengths.tolist()):
@@ -268,8 +270,8 @@ def test_jagged_fp32_reduction_tail_ignores_backing_storage(
     expected = torch.cat(pieces)
     assert torch.isfinite(expected).all()
 
-    bound = _kernel().bind(arguments)
-    config = _config(
+    bound = collective_kernel().bind(arguments)
+    config = collective_config(
         128 if compute == "tcgen05" else 32,
         n,
         bk,
@@ -311,9 +313,9 @@ def test_computed_fp32_mixed_copy_and_tails(static_shapes: bool, layout: str) ->
         b = torch.randn((3, 78, 72), device=CUDA_DEVICE)[:, :, :70]
     else:
         b = torch.randn(3 * 78 * 70 + 1, device=CUDA_DEVICE)[1:].view(3, 78, 70)
-    kernel = _kernel(batched=True, static_shapes=static_shapes)
+    kernel = collective_kernel(batched=True, static_shapes=static_shapes)
     bound = kernel.bind((a, b))
-    config = _config(128, 64, 128, copy="async_cached")
+    config = collective_config(128, 64, 128, copy="async_cached")
     source = bound.to_code(config)
     assert "tcgen05.CtaGroup.ONE" in source
     # The transformed left operand must keep recipe staging and TF32 rounding.
@@ -323,8 +325,8 @@ def test_computed_fp32_mixed_copy_and_tails(static_shapes: bool, layout: str) ->
     bound.set_config(config)
 
     def expected() -> torch.Tensor:
-        left = _round_tf32(a * 0.75).double()
-        right = _round_tf32(b).double()
+        left = round_tf32(a * 0.75).double()
+        right = round_tf32(b).double()
         return torch.bmm(left, right).float() + 0.25
 
     def run() -> torch.Tensor:
@@ -344,9 +346,9 @@ def test_fp32_empty_reduction_preserves_epilogue(copy: str) -> None:
     _require_sm100()
     a = torch.empty((3, 130, 0), device=CUDA_DEVICE)
     b = torch.empty((3, 0, 70), device=CUDA_DEVICE)
-    kernel = _kernel(batched=True)
+    kernel = collective_kernel(batched=True)
     bound = kernel.bind((a, b))
-    bound.set_config(_config(copy=copy))
+    bound.set_config(collective_config(copy=copy))
     torch.testing.assert_close(
         bound(a, b), torch.full((3, 130, 70), 0.25, device=CUDA_DEVICE), rtol=0, atol=0
     )

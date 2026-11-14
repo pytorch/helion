@@ -250,7 +250,7 @@ def _tensor_shapes_match(
     ):
         return None
 
-    if "input_tensor_metadata" not in env.compiler_fact_specialization_facts:
+    if not env.exact_input_metadata_holds():
         return None
     runtime_values = tuple(env.runtime_value_for_tensor(tensor) for tensor in tensors)
     if not all(isinstance(tensor, torch.Tensor) for tensor in runtime_values):

@@ -42,8 +42,8 @@ _CAST_TARGETS = frozenset(
     }
 )
 
-# Static ``alloc_smem`` without an opt-in carve-out; a larger exchange buffer
-# fails in the NVVM backend rather than at this check.
+# The exchange buffer is a static ``alloc_smem``: 48 KiB, the static limit on
+# sm_8x and a conservative cap from sm_90 (``static_smem_budget``).
 _SPLIT_SMEM_BUDGET_BYTES = static_smem_budget()
 
 
@@ -119,7 +119,7 @@ def _split_leaf_expr(
         inner = _split_leaf_expr(ctx, source, flat_index)
         if inner is None:
             return None
-        return CompileEnvironment.current().backend.cast_ast(inner, value.dtype)
+        return _cast_reread(ctx, inner, source, value.dtype)
     if node.target is memory_ops.load:
         from ..generate_ast import GenerateAST
 
@@ -128,6 +128,25 @@ def _split_leaf_expr(
             return None
         return cute_reindexed_scalar_load_expr(ctx.cg, node, flat_index)
     return None
+
+
+def _cast_reread(
+    ctx: LoweringContext, inner: ast.AST, source: torch.fx.Node, dtype: torch.dtype
+) -> ast.AST:
+    """``inner``, a re-read of ``source``, cast to ``dtype`` as the chain's
+    cast does: an integer or a bool through ``integer_to_float_expr``."""
+    from .handler_ops import integer_to_float_expr
+
+    src = source.meta.get("val")
+    converted = integer_to_float_expr(
+        inner,
+        dtype,
+        src.dtype if isinstance(src, torch.Tensor) else None,
+        ctx.cg.device_function,
+    )
+    if converted is not None:
+        return converted
+    return CompileEnvironment.current().backend.cast_ast(inner, dtype)
 
 
 def _fold_split_halves(

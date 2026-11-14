@@ -29,6 +29,7 @@ from ...autotuner.config_spec import CuteReductionReloadSpec
 from ...autotuner.config_spec import CuteVectorWidthSpec
 from ...autotuner.config_spec import NumThreadsSpec
 from ..compile_environment import CompileEnvironment
+from ..compile_environment import FixedBlockSizeSource
 from . import target_facts
 from .autotune.flash_surface import enable_cute_flash_gated_search
 from .autotune.flash_surface import enable_cute_flash_search
@@ -774,14 +775,36 @@ def restrict_tcgen05_multi_root_search(
 def record_tile_loop_facts(
     func: HostFunction | None, device_ir: DeviceIR, analysis: DeviceIRAnalysis | None
 ) -> None:
-    """After the structural analysis: tile loop paths, boundary-only grid
-    blocks and whether an fp32 dot is exact on this target."""
+    """After the structural analysis: tile loop paths, the reduction blocks
+    on each and the path of each tile strategy, boundary-only grid blocks,
+    the sizes of the paths' fixed blocks and whether an fp32 dot is exact on
+    this target."""
     env = CompileEnvironment.current()
     config_spec = env.config_spec
     from .loop_nesting import boundary_only_grid_blocks
-    from .loop_nesting import tile_loop_paths
+    from .loop_nesting import tile_loop_facts
 
-    config_spec.cute_tile_loop_paths = tile_loop_paths(device_ir, device_ir.graphs)
+    path_reductions, strategy_paths = tile_loop_facts(
+        env, device_ir, device_ir.graphs, config_spec.reduction_block_ids
+    )
+    config_spec.cute_tile_loop_path_reductions = path_reductions
+    config_spec.cute_tile_strategy_paths = strategy_paths
+    fixed = {
+        block_id: source.value
+        for path in config_spec.cute_tile_loop_paths
+        for level in path
+        for block_id in level
+        if isinstance(
+            source := env.block_sizes[block_id].block_size_source,
+            FixedBlockSizeSource,
+        )
+    }
+    config_spec.cute_tile_fixed_block_sizes = {
+        block_id: value for block_id, value in fixed.items() if type(value) is int
+    }
+    config_spec.cute_tile_symbolic_fixed_blocks = frozenset(
+        block_id for block_id, value in fixed.items() if type(value) is not int
+    )
     config_spec.cute_inactive_tile_block_ids = boundary_only_grid_blocks(
         env, device_ir, device_ir.graphs
     )

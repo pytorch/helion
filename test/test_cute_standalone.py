@@ -15,6 +15,9 @@ import torch
 import helion
 from helion._testing import DEVICE
 from helion._testing import import_example
+from helion._testing.cuda_context import clear_current_context
+from helion._testing.cuda_context import current_context
+from helion._testing.cuda_context import on_new_thread
 import helion.language as hl
 
 attention_output = import_example("attention").attention_output
@@ -92,6 +95,39 @@ def test_pointwise(tmp_path: Path, layout: str) -> None:
     if layout == "contiguous":
         with pytest.raises(ValueError, match="tensor layout"):
             exported._pointwise(torch.randn(129, device=DEVICE)[1:], 2.0)
+        _check_new_thread_relaunch(exported, x)
+
+
+def _check_new_thread_relaunch(exported: ModuleType, x: torch.Tensor) -> None:
+    """Relaunch ``exported._pointwise`` on a new thread, which has no current
+    CUDA context (as PyTorch's autograd device thread has none): the
+    launcher makes the device's primary context, the main thread's, current
+    before the compiled host code runs, and again on the next launch after
+    other code cleared the thread's context."""
+    main_context = current_context()
+    (key,) = exported._STANDALONE_COMPILED
+    compiled = exported._STANDALONE_COMPILED[key]
+    contexts: list[int] = []
+
+    def recording(*args: object) -> object:
+        contexts.append(current_context())
+        return compiled(*args)
+
+    def launch() -> tuple[int, torch.Tensor, torch.Tensor]:
+        start = current_context()
+        first = exported._pointwise(x, 2.0)
+        clear_current_context()
+        return start, first, exported._pointwise(x, 2.0)
+
+    exported._STANDALONE_COMPILED[key] = recording
+    try:
+        start, first, second = on_new_thread(launch)
+    finally:
+        exported._STANDALONE_COMPILED[key] = compiled
+    assert start == 0
+    assert contexts == [main_context, main_context]
+    torch.testing.assert_close(first, x * 2.0 + 1.0)
+    torch.testing.assert_close(second, x * 2.0 + 1.0)
 
 
 @helion.kernel(backend="cute", autotune_effort="none", static_shapes=True)

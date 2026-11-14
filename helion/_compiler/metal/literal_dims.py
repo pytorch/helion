@@ -209,7 +209,7 @@ class _MetalLiteralDims(LiteralDimAnalysis):
         consumer = rebound_consumer_dims(node)
         if consumer is None or node.target is torch.ops.aten.gather.default:
             return self.default(value), None
-        sizes, lower_rank_by_block_id = consumer
+        sizes, pointwise_placement = consumer
         block_ids = [
             self.env.get_block_id(size) if isinstance(size, torch.SymInt) else None
             for size in sizes
@@ -239,7 +239,7 @@ class _MetalLiteralDims(LiteralDimAnalysis):
                 operand_val,
                 sizes,
                 block_ids,
-                lower_rank_by_block_id=lower_rank_by_block_id,
+                pointwise_placement=pointwise_placement,
             )
             for dim, position in enumerate(positions):
                 holder = self.dim_holder(operand, dim)

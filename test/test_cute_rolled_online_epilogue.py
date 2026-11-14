@@ -229,3 +229,25 @@ def test_warp_pair_and_owner_match_logsumexp(columns, dtype):
         actual, x.double().logsumexp(-1).float(), atol=1e-5, rtol=2e-5
     )
     assert "_cute_grouped_reduce_cluster_warp_online_pair(" in code
+
+
+@skipIfNotCUDA()
+@pytest.mark.cuda
+@skipUnlessBackends(["cute"])
+def test_register_row_matches_logsumexp():
+    """Each thread exponentiates its register slice of the row as one vector
+    with ``torch.exp``'s natural exp, and the warp pair rescales in that base."""
+    x = torch.randn((3, 32000), device=DEVICE, dtype=torch.bfloat16)
+    config = _config()
+    config.config.update(
+        reduction_loops=[16384],
+        cute_lane_layouts=["strided", "blocked"],
+        cute_register_row=True,
+        cute_warp_fp32_redux=True,
+    )
+    code, actual = code_and_output(row_logsumexp, (x,), **config.config)
+    torch.testing.assert_close(
+        actual, x.double().logsumexp(-1).float(), atol=1e-5, rtol=2e-5
+    )
+    assert "_register_exponents = cute.math.exp(" in code
+    assert "scale=None, fastmath=False" in code

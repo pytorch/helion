@@ -14,8 +14,16 @@ tcgen05 contractions (a tile narrower than 128 rows is replicated across the
 TMEM quadrants so every SM sub-partition shares the per-chunk epilogue), the
 epilogue warps issue both MMAs themselves, the ``w``/``k``/``u`` chunk tiles
 stream through a TMA-fed shared-memory ring, and the gating and the fp32
-rescale are exact (``exp`` is the ordinary ``exp2(x * log2 e)`` lowering,
-never approximate).
+rescale keep denormals (``exp2(x * log2 e)``, never the fast-math
+``ex2.approx.ftz``).  The rounded product costs ``|x| * 2^-24`` of relative
+error, below the bf16 rounding of the gated values and the stored state;
+the pointwise lowering's exact ``cute.math.exp``, even for the per-stage
+rescale alone, spills registers in the widest token slices.  Tuned configs
+must not change numerics, so without ``fast_math`` the configs this lowering
+declines (the SIMT and MMA-DAG fallbacks) compute the two exps the same way
+(:func:`mark_gdn_recurrence_exponentials`): a kernel's configs differ only
+in their reduction order.  (Under ``fast_math``, which lets configs change
+numerics, those take ``ex2.approx`` and the FMA scale hoist.)
 
 Admission is fail-closed: SM100, static shapes, contiguous CUDA tensors, bf16
 ``k``/``w``/``u``/``h`` with fp32 ``g``, ``dhead`` in {16, 32, 64}, a
@@ -49,6 +57,7 @@ from .autotune.config_keys import CUTE_GDN_RECURRENCE_STAGES_KEY
 from .autotune.config_keys import CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY
 from .cute_mma_dag import MMA_DAG_KEY
 from .cute_mma_dag import MMA_DAG_OFF
+from .exp2_fastmath import TEMPLATE_EXP2_META_KEY
 from .fx_matcher import _binary_args
 from .fx_matcher import _canonical_root_axis_ids
 from .fx_matcher import _is_call
@@ -109,6 +118,8 @@ class _GdnRecurrenceMatch:
     g: _TensorRef
     h: _TensorRef
     grid_block_ids: tuple[int, int, int]
+    # The gate ``exp(g_last - g_chunk)`` and rescale ``exp(g_last)`` nodes.
+    exponentials: tuple[torch.fx.Node, torch.fx.Node]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -678,7 +689,15 @@ def _match_gdn_recurrence_graphs(
         g=g,
         h=h,
         grid_block_ids=cast("tuple[int, int, int]", tuple(grid_ids)),
+        exponentials=(
+            cast("torch.fx.Node", gate_exp),
+            cast("torch.fx.Node", rescale_exp),
+        ),
     )
+
+
+# A matched recurrence and the dstate tiles the schedule admits for it.
+_GdnAdmission = tuple[_GdnRecurrenceMatch, tuple[int, ...]]
 
 
 def _geometry_admitted(geometry: GdnRecurrenceGeometry, block_v: int) -> bool:
@@ -690,18 +709,60 @@ def _geometry_admitted(geometry: GdnRecurrenceGeometry, block_v: int) -> bool:
     )
 
 
-def detect_gdn_recurrence_search_geometry(
-    graphs: Sequence[GraphInfo],
-) -> GdnRecurrenceGeometry | None:
-    """Recognize the recurrence before config generation (any dstate tile)."""
-
+def _admitted_gdn_recurrence(
+    graphs: Sequence[GraphInfo], target: tuple[int, int] | None
+) -> _GdnAdmission | None:
+    """The recurrence in ``graphs`` and the dstate tiles the schedule admits
+    for its geometry (``gdn_admitted_block_sizes``; a config still picks the
+    tile), when the ``target`` capability is SM100 and there is one."""
+    if target is None or target[0] != 10:
+        return None
     match = _match_gdn_recurrence_graphs(graphs)
     if match is None:
         return None
-    geometry = match.geometry
-    if not gdn_admitted_block_sizes(geometry):
+    block_sizes = gdn_admitted_block_sizes(match.geometry)
+    if not block_sizes:
         return None
-    return geometry
+    return match, block_sizes
+
+
+def detect_gdn_recurrence_search_geometry(
+    graphs: Sequence[GraphInfo], target: tuple[int, int] | None
+) -> GdnRecurrenceGeometry | None:
+    """Recognize the recurrence before config generation (any dstate tile).
+
+    ``target`` is the capability of the config spec being seeded: the seed
+    heuristics take their environment as an argument, not the current one.
+    """
+
+    admitted = _admitted_gdn_recurrence(graphs, target)
+    return None if admitted is None else admitted[0].geometry
+
+
+def mark_gdn_recurrence_exponentials(
+    graphs: Sequence[GraphInfo],
+) -> _GdnAdmission | None:
+    """Mark the gate and rescale exps of a recurrence on an SM100 target
+    (``TEMPLATE_EXP2_META_KEY``) in the graphs a config generates code from
+    (``CuteBackend.pre_codegen``), when the schedule admits a dstate tile for
+    its geometry, and return that admission for ``plan_gdn_recurrence``.
+
+    The schedule computes them as ``exp2(x * log2 e)`` keeping denormals;
+    without ``fast_math`` the configs it declines (the SIMT and MMA-DAG
+    lowerings) lower the marked nodes the same way, so a kernel's configs
+    differ only in their reduction order.  The planner's per-config checks
+    (the grid and 32-bit offset limits) can still decline every config; the
+    configs then keep the marked form with no schedule to match, which
+    costs accuracy but not agreement.  Elsewhere, and on other targets,
+    ``exp`` keeps the exactly reduced ``cute.math.exp``.
+    """
+    admitted = _admitted_gdn_recurrence(
+        graphs, CompileEnvironment.current().config_spec.target_device_capability
+    )
+    if admitted is not None:
+        for node in admitted[0].exponentials:
+            node.meta[TEMPLATE_EXP2_META_KEY] = True
+    return admitted
 
 
 def gdn_admitted_block_sizes(geometry: GdnRecurrenceGeometry) -> tuple[int, ...]:
@@ -815,7 +876,7 @@ def gdn_recurrence_warp_choices(
 
 
 def _plan_gdn_recurrence(
-    graphs: Sequence[GraphInfo],
+    admitted: _GdnAdmission | None,
     _tile_strategy: TileStrategyDispatch,
 ) -> CuteGdnRecurrencePlan | None:
     from ..device_function import DeviceFunction
@@ -828,19 +889,15 @@ def _plan_gdn_recurrence(
         # (``cute_mma_dag``): the search decides between the two whole-root
         # lowerings of this recurrence, and that knob is its choice.
         return None
-    match = _match_gdn_recurrence_graphs(graphs)
-    if match is None:
+    if admitted is None:
         return None
-    env = CompileEnvironment.current()
-    target = env.config_spec.target_device_capability
-    if target is None or target[0] != 10:
-        return None
+    match, admitted_block_sizes = admitted
     geometry = match.geometry
     resolved = [df.resolved_block_size(block_id) for block_id in match.grid_block_ids]
     if resolved[0] != 1 or resolved[1] != 1:
         return None
     block_v = resolved[2]
-    if type(block_v) is not int or block_v not in gdn_admitted_block_sizes(geometry):
+    if type(block_v) is not int or block_v not in admitted_block_sizes:
         return None
     tmem = gdn_tmem_layout(geometry.dhead, geometry.chunk)
     if tmem is None:
@@ -916,12 +973,14 @@ def _plan_gdn_recurrence(
 
 
 def plan_gdn_recurrence(
-    graphs: Sequence[GraphInfo], tile_strategy: TileStrategyDispatch
+    admitted: _GdnAdmission | None, tile_strategy: TileStrategyDispatch
 ) -> None:
+    """Plan the schedule for the config's recurrence, ``admitted`` being what
+    ``mark_gdn_recurrence_exponentials`` matched in the same graphs."""
     from ..device_function import DeviceFunction
 
     DeviceFunction.current().cute_state.root_plans.gdn_recurrence_plan = (
-        _plan_gdn_recurrence(graphs, tile_strategy)
+        _plan_gdn_recurrence(admitted, tile_strategy)
     )
 
 
@@ -1000,5 +1059,6 @@ __all__ = [
     "gdn_recurrence_token_group_choices_by_tile",
     "gdn_recurrence_warp_choices",
     "gdn_seed_block_sizes",
+    "mark_gdn_recurrence_exponentials",
     "plan_gdn_recurrence",
 ]

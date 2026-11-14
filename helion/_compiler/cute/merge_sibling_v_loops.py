@@ -17,7 +17,7 @@ constexpr V-loops:
           ...
           values = bitcast(_tile_unroll_vec_*[vec_lane])     # REDUNDANT
           ...
-          _helion_vfold_acc_1 += exp2((Float32(values) - mi_next) * 1.44)
+          _helion_vfold_acc_1 += exp(Float32(values) - mi_next)
 
 The two V-loops always share the SAME prefix of statements (same induction
 variable, same `vec_lane` reads of the same hoist var, same masks).  The

@@ -20,8 +20,11 @@ from helion._compiler.cute.scaled_sub_fusion import SCALED_SUBTRACTION_ATTR
 from helion._compiler.cute.scaled_sub_fusion import (
     contract_distributed_scale_subtractions,
 )
+from helion._testing import cpu_render_target
 from helion._testing import import_example
 from helion._testing import pairwise
+from helion._testing.cute_codegen import cpu_bind
+import helion.language as hl
 
 pytestmark = pytest.mark.cpu_only
 
@@ -350,3 +353,170 @@ def test_scaled_sub_fusion_exact_masked_and_vector_replays(fast_math, dtype, lay
         layout=layout,
     )
     run_guarded_cache_case(case, fast_math=fast_math)
+
+
+# One call's result is the product's left operand, so that call alone
+# decides whether ``t = a * e; out = t + e`` contracts (``e`` is fp32).
+_MATH_RESULT = """
+i32 = cutlass.Int32(i)
+j32 = cutlass.Int32(j)
+f32 = cutlass.Float32(x)
+g32 = cutlass.Float32(y)
+e = cutlass.Float32(z)
+a = {call}
+t = a * e
+out = t + e
+"""
+
+
+# One case per function and operand type: each function is typed by its own
+# rule, and a misclassified one must fail on its own.
+@pytest.mark.parametrize(
+    ("call", "contracted"),
+    [
+        # Integer operands give an integer, also passed by keyword.
+        ("cute.math.max(i32, j32)", False),
+        ("cute.math.min(x=i32, y=j32, propagate_nan=True)", False),
+        ("cute.math.clamp(i32, j32, j32)", False),
+        ("cute.math.abs(i32)", False),
+        ("cute.math.absf(x=i32)", False),
+        # fp32 operands give fp32.
+        ("cute.math.max(f32, g32)", True),
+        ("cute.math.min(x=f32, y=g32, propagate_nan=True)", True),
+        ("cute.math.clamp(f32, 0.0, 1.0)", True),
+        ("cute.math.absf(x=f32)", True),
+        # 16-bit operands give a 16-bit value (a bf16 relu's max).
+        ("cute.math.max(cutlass.BFloat16(x), cutlass.BFloat16(y))", False),
+        # Integer and bool results, whatever the operands.
+        ("cute.math.absi(i32)", False),
+        ("cute.math.ipowi(i32, j32)", False),
+        ("cute.math.isnan(f32)", False),
+        ("cute.math.isfinite(f32)", False),
+        # A float-only call returns its operands' width.
+        ("cute.math.exp(f32)", True),
+        ("cute.math.exp(cutlass.Float64(x))", False),
+        ("cute.math.rsqrt(-cutlass.BFloat16(x), fastmath=True)", False),
+        ("cute.math.pow(base=cutlass.Float16(x), exponent=g32)", False),
+        # fpowi's base alone: its exponent is an integer.
+        ("cute.math.fpowi(f32, i32)", True),
+        ("cute.math.fpowi(base=cutlass.Float64(x), exponent=i32)", False),
+    ],
+)
+def test_math_call_results_contract_by_their_type(call, contracted):
+    """``max``, ``min``, ``clamp``, ``abs`` and ``absf`` return their
+    operands' type, ``absi``, ``ipowi`` and the ``isnan``-style tests an
+    integer or a bool, and a float-only call such as ``exp`` a Float64 or a
+    16-bit value for such an operand: ``math.fma`` takes one type, so only
+    fp32 results contract with the fp32 ``e``."""
+    source = _MATH_RESULT.format(call=call)
+    assert _count_fmas(fuse_fma(ast.parse(source).body)) == int(contracted)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        """
+v_0 = x_load[idx]
+v_1 = cutlass.Float32(y)
+d = cute.math.div(v_0, v_1, approx=True, ftz=True)
+e = cutlass.Float32(z)
+t = d * e
+out = t + e
+""",
+        """
+v_1 = cutlass.Float32(x)
+e = cutlass.Float32(y)
+m = cute.math.max(v_1 * e, 0.0)
+t = m * e
+out = t + e
+""",
+        """
+p = cutlass.Float32(x)
+q = cutlass.Float32(y)
+a = cute.math.max(p, -1.0)
+t = a * q
+out = t + p
+""",
+    ],
+    ids=["float_only_div", "arithmetic_operand", "negated_operand"],
+)
+def test_fp32_math_calls_still_contract(source):
+    """A float-only call such as ``cute.math.div`` stays fp32 unless an
+    operand is proven not to be (``v_0``, a load, is not), and an operand of
+    a polymorphic call is fp32 as an expression is: arithmetic of fp32
+    values, or one negated, such as ``-1.0``."""
+    assert _count_fmas(fuse_fma(ast.parse(source).body)) == 1
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        """
+v_0 = cutlass.Float64(x)
+a = cute.math.tanh(v_0)
+e = cutlass.Float32(y)
+t = a * e
+out = t + e
+""",
+        """
+v_0 = cutlass.Float64(x)
+v_2 = cute.math.max(cutlass.Float64(v_0), cutlass.Float64(0.0), propagate_nan=True)
+a = cute.math.sqrt(v_2)
+e = cutlass.Float32(y)
+t = a * e
+out = t + e
+""",
+        """
+v = cutlass.Float64(x) if c else cutlass.Float64(y)
+a = cute.math.tanh(v)
+e = cutlass.Float32(z)
+t = a * e
+out = t + e
+""",
+    ],
+    ids=["cast_in_a_temporary", "declined_call_in_a_temporary", "selected_casts"],
+)
+def test_non_fp32_values_stay_so_through_names(source):
+    """Codegen casts into a temporary and reads it by name, a call the pass
+    proves no fp32 value feeds the next one by name, and ``torch.where``
+    selects between two casts: no ``a`` is fp32, so no product contracts
+    with the fp32 ``e``."""
+    assert _count_fmas(fuse_fma(ast.parse(source).body)) == 0
+
+
+def test_a_subscript_target_names_nothing_non_fp32():
+    """A store of a float64 value into ``buf[k]`` assigns no name: ``k``
+    stays unproven, so the fp32 ``exp`` it feeds contracts."""
+    source = """
+buf[k] = cutlass.Float64(x)
+f = cutlass.Float32(y)
+a = cute.math.exp(f * k)
+e = cutlass.Float32(z)
+t = a * e
+out = t + e
+"""
+    assert _count_fmas(fuse_fma(ast.parse(source).body)) == 1
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _float64_affine(x: torch.Tensor, relu_first: hl.constexpr) -> torch.Tensor:
+    out = torch.empty(x.shape, dtype=torch.float64, device=x.device)
+    for tile in hl.tile(x.size(0)):
+        wide = x[tile].to(torch.float64)
+        if relu_first:
+            value = torch.sqrt(torch.relu(wide))
+        else:
+            value = torch.tanh(wide)
+        out[tile] = value * 2.0 + 1.0
+    return out
+
+
+@pytest.mark.parametrize("relu_first", [False, True], ids=["tanh", "sqrt_relu"])
+def test_float64_math_results_do_not_contract_with_fp32_constants(relu_first):
+    """``tanh`` and ``sqrt`` of a float64 cast return float64 values, held in
+    temporaries: ``math.fma`` takes one type, so neither contracts with the
+    fp32 constants (the DSL rejects ``fma(Float64, Float32, Float32)``)."""
+    with cpu_render_target():
+        bound = cpu_bind(_float64_affine, (torch.empty(1024), relu_first))
+        code = bound.to_code(bound.config_spec.default_config())
+    assert "cute.math.fma" not in code

@@ -138,21 +138,62 @@ class TargetFacts:
         )
 
 
+# The static ``cute.arch.alloc_smem`` allocations libNVVM compiles below
+# sm_90.  The DSL opts every kernel in to the device's per-block maximum
+# (``max_dynamic_shared_size_bytes``), and libNVVM compiles a kernel's static
+# allocations up to 48 KiB on sm_8x and up to the per-block opt-in maximum
+# from sm_90 (232448 bytes on sm_90, sm_100 and sm_103, 101376 on sm_120),
+# failing past them ("NVVM backend compilation failed").  A hardware and
+# toolchain limit, which ``max_smem_per_block`` checks kernels against.
+SM8X_STATIC_SMEM_LIMIT_BYTES = 48 * 1024
+# The opt-in maximum per block of the sm_90 / sm_100 parts (227 KiB) and of
+# the sm_120 parts (99 KiB), for a target whose device cannot be queried (a
+# CPU bind, an offline ``CUTE_DSL_ARCH`` compile).
+DEFAULT_MAX_SMEM_PER_BLOCK = 232448
+SM12X_MAX_SMEM_PER_BLOCK = 101376
+
+
+def static_smem_limit(capability: tuple[int, int] | None) -> int | None:
+    """The cap libNVVM puts on a kernel of ``capability``'s static shared
+    memory (bytes) below the per-block maximum: 48 KiB below sm_90, none
+    from sm_90 (or when the capability is unknown)."""
+    if capability is not None and capability < (9, 0):
+        return SM8X_STATIC_SMEM_LIMIT_BYTES
+    return None
+
+
+def max_smem_per_block(device: torch.device, capability: tuple[int, int] | None) -> int:
+    """The shared memory one block of ``device`` may allocate the way the DSL
+    allocates it, statically: the opt-in capacity
+    (``per_cta_smem_capacity_bytes``, the seam the device models patch; when
+    it cannot be queried, the maximum of ``capability``'s parts, or of the
+    sm_90 / sm_100 ones when that is unknown), and no more than the static
+    allocations libNVVM compiles for ``capability`` (``static_smem_limit``:
+    48 KiB below sm_90)."""
+    capacity = per_cta_smem_capacity_bytes(device) or (
+        SM12X_MAX_SMEM_PER_BLOCK
+        if capability is not None and capability[0] == 12
+        else DEFAULT_MAX_SMEM_PER_BLOCK
+    )
+    limit = static_smem_limit(capability)
+    return capacity if limit is None else min(capacity, limit)
+
+
 # The static ``cute.arch.alloc_smem`` budget of the planners that size a
-# shared-memory exchange or staging buffer at compile time without the
-# opt-in dynamic carve-out (``hl.split`` exchanges, the ``cp.async`` state
-# ring, the row-resident and row-matrix-transport stagings): the 48 KiB
-# every supported capability grants a launch without
-# ``cudaFuncAttributeMaxDynamicSharedMemorySize``.  A larger static
-# allocation fails in the NVVM backend rather than at the planner's check.
-_STATIC_SMEM_BUDGET_BYTES = 48 * 1024
+# shared-memory exchange or staging buffer at compile time (``hl.split``
+# exchanges, the ``cp.async`` state ring, the row-resident and
+# row-matrix-transport stagings): the sm_8x static limit on every target.
+# From sm_90 it is a conservative cap that leaves the rest of the block's
+# maximum to the kernel's other allocations, which these planners do not
+# count (``smem_footprint`` checks the kernel's total against the maximum).
+_STATIC_SMEM_BUDGET_BYTES = SM8X_STATIC_SMEM_LIMIT_BYTES
 
 
 def static_smem_budget() -> int:
-    """The static shared-memory budget (bytes) of a planner: the 48 KiB
-    static-allocation limit is the same on every CUDA capability, so the
-    budget takes no target; a per-capability value belongs here when one
-    exists."""
+    """The static shared-memory budget (bytes) of a planner: the sm_8x
+    static limit on every target (the comment above), so the budget takes
+    no target; a per-capability value belongs here when a planner needs more
+    on sm_90+, and leaves the libNVVM limit (``static_smem_limit``) alone."""
     return _STATIC_SMEM_BUDGET_BYTES
 
 

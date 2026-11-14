@@ -72,6 +72,8 @@ from helion._testing.cute_mma_dag import cast_tensor
 from helion._testing.cute_mma_dag import run_cute
 from helion._testing.cute_mma_dag import run_triton
 from helion._testing.cute_mma_dag import tensors
+from helion._testing.cute_sass import cute_launcher_cubins
+from helion._testing.cute_sass import cute_launcher_sass
 from helion.autotuner.config_fragment import EnumFragment
 from helion.runtime.cute import sass_check
 from helion.runtime.cute.standalone_launcher import _standalone_validate_mma_dag_aliases
@@ -12696,17 +12698,7 @@ def test_the_hinted_decode_kernels_sass_has_no_collision_under_several_configs()
         compiled = bound.compile_config(normalized)
         (out,) = tensors(compiled(*args))
         torch.cuda.synchronize()
-        module = sys.modules[compiled.__module__]
-        cute_kernel = next(
-            value
-            for value in vars(module).values()
-            if getattr(value, "_helion_cute_sass_checks", ())
-        )
-        (launcher,) = cute_kernel._helion_cute_compiled_launchers.values()
-        sass = "\n".join(
-            sass_check.disassemble(blob)
-            for blob in sass_check._cubin_blobs(launcher._compiled.ir_module)
-        )
+        sass = cute_launcher_sass(compiled)
         (texts,) = sass_check.functions(sass)
         ldgsts = [text for text in texts if text.startswith("LDGSTS")]
         assert ldgsts, (block_n, warps)
@@ -12722,12 +12714,7 @@ def test_the_hinted_decode_kernels_sass_has_no_collision_under_several_configs()
         assert all(
             ur in written for text in ldgsts for ur in re.findall(r"\bUR\d+\b", text)
         ), (ldgsts, sorted(written))
-        assert (
-            sass_check.assembler(
-                next(iter(sass_check._cubin_blobs(launcher._compiled.ir_module)))
-            )
-            is not None
-        )
+        assert sass_check.assembler(cute_launcher_cubins(compiled)[0]) is not None
         _, (plain,) = _run_cute(fn, args, _device_config([1, block_n], warps, 4))
         assert torch.equal(out, plain), (block_n, warps)
 

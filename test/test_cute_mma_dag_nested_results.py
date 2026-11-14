@@ -99,7 +99,8 @@ def test_child_loop_results_feed_parent_carries(mode: str, kind: str) -> None:
         if mode == "warp":
             # Alpha is computed in this iteration and may reuse the old max
             # slot. Rescaling the output at iteration entry would read -inf.
-            assert source.index("cute.math.exp2") < source.index("md_c0_0_0_0 *")
+            # (``cute.math.exp``: the exact exponential, not exp2(x * log2(e)).)
+            assert source.index("cute.math.exp(") < source.index("md_c0_0_0_0 *")
 
 
 def _nested_swap(

@@ -44,7 +44,6 @@ from ..ast_extension import statement_from_string
 from ..ast_read_writes import ReadWrites
 from ..compile_environment import CompileEnvironment
 from ..compile_environment import RuntimeInputSpecialization
-from ..compile_environment import _replay_tensor_input_source
 from ..compile_environment import _symint_expr
 from ..compile_environment import _to_sympy
 from ..indexing_strategy import _get_tile_with_offset_info
@@ -216,13 +215,13 @@ def register_persistent_vec_alignment_specializations(
 ) -> None:
     """Specialize vector-packet candidates on runtime pointer alignment.
 
-    Dynamic FakeTensors intentionally carry symbolic storage offsets.  The
-    branch-local vectorizer therefore consults the real input tensor during
-    codegen, and the tile-packet admission reads the bound residues.  Register
-    the address/stride residue of every input whose dtype has a packet
-    lowering (explicit vectors, unroll carriers and byte packets) in the bound
-    kernel cache key before any config is compiled, so a later unaligned view
-    can never reuse code emitted for an aligned tensor.
+    Dynamic FakeTensors intentionally carry symbolic storage offsets, so the
+    branch-local vectorizer and the tile-packet admission read the bound
+    residues instead, whether or not the example inputs are still alive.
+    Register the address/stride residue of every input whose dtype has a
+    packet lowering (explicit vectors, unroll carriers and byte packets) in
+    the bound kernel cache key before any config is compiled, so a later
+    unaligned view can never reuse code emitted for an aligned tensor.
     """
     sources = tuple(
         source
@@ -257,32 +256,36 @@ def runtime_tensor_has_specialized_alignment(
     tensor: torch.Tensor,
     required_alignment: int,
 ) -> bool:
-    """Return a cache-key-backed runtime base-pointer alignment proof."""
-    if required_alignment <= 0 or _CUTE_ALIGNMENT_MAX_BYTES % required_alignment:
+    """``tensor_has_specialized_base_alignment``, refusing a live example
+    input whose own signature (base residue, size residues and strides)
+    differs from the bound one, and every input of a binding from an outer
+    trace's FakeTensors, alive or not.
+
+    The bound signature decides, so the proof does not depend on which of the
+    bound kernel's weakly held example inputs a direct ``to_code`` still finds
+    alive.  The refusal is for callers that go on to read live sizes and
+    strides (the direct affine lowering, the rank-1 recurrences): an example
+    input whose metadata changed in place after binding is not a call the
+    bound kernel serves.  Each input the signature covers is compared, at the
+    signature's residues, where it is still alive.
+    """
+    if not tensor_has_specialized_base_alignment(env, tensor, required_alignment):
         return False
-    runtime_tensor = env.runtime_value_for_tensor(tensor)
-    if not isinstance(runtime_tensor, torch.Tensor) or isinstance(
-        runtime_tensor, FakeTensor
-    ):
+    if env._binds_outer_trace_inputs:
+        # An outer trace's inputs (Dynamo, make_fx): those callers would read
+        # that trace's chosen sizes and strides as this tensor's.
         return False
-    source = env.tensor_input_source(tensor)
     specialization = env.runtime_input_specializations.get(
         _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
     )
-    if source is None or specialization is None or source not in specialization.sources:
-        return False
-    runtime_values = tuple(
-        _replay_tensor_input_source(item, env.runtime_arg_values_by_name)
-        for item in specialization.sources
-    )
-    facts = specialization.classifier(runtime_values)
-    return (
-        env.runtime_input_specialization_matches_bound(
-            _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY,
-            facts,
-        )
-        and int(runtime_tensor.data_ptr()) % required_alignment == 0
-    )
+    assert specialization is not None  # the base alignment above read it
+    for source in specialization.sources:
+        live = env.live_example_input(source)
+        if live is not None and _persistent_vec_alignment_signature(
+            (live,)
+        ) != _bound_vec_alignment_signature(env, source):
+            return False
+    return True
 
 
 def tensor_has_specialized_tma_alignment(
@@ -293,28 +296,20 @@ def tensor_has_specialized_tma_alignment(
 
     Use the immutable binding facts: code generation may run after the weakly
     held example inputs have expired. The dispatch cache checks these same
-    facts before reusing this specialization with later tensors. Physical
-    alignment is unchanged by logical axis permutations or group indexing.
+    facts before reusing this specialization with later tensors, so a
+    symbolic stride's residue holds only while its dispatch guards are
+    enforced (``CompileEnvironment.dispatch_guards_enforced``; Inductor's
+    render of a dynamic-shape graph took it from a placeholder's stride of
+    1), and a static traced stride only where it is the graph's own
+    (``CompileEnvironment.traced_strides_hold``). Physical alignment is
+    unchanged by logical axis permutations or group indexing.
     """
-    source = env.tensor_input_source(tensor)
-    specialization = env.runtime_input_specializations.get(
-        _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
-    )
-    facts = env.bound_runtime_input_specialization_results.get(
-        _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
-    )
-    if (
-        source is None
-        or specialization is None
-        or source not in specialization.sources
-        or facts is None
+    if not env.traced_strides_hold(tensor) or (
+        not env.dispatch_guards_enforced
+        and not all(isinstance(stride, int) for stride in tensor.stride())
     ):
         return False
-    signatures = cast(
-        "tuple[tuple[int, tuple[int, ...], tuple[tuple[bool, int], ...]] | None, ...]",
-        facts,
-    )
-    signature = signatures[specialization.sources.index(source)]
+    signature = _bound_vec_alignment_signature(env, env.tensor_input_source(tensor))
     if signature is None:
         return False
     base_residue, _size_residues, stride_facts = signature
@@ -322,6 +317,7 @@ def tensor_has_specialized_tma_alignment(
     # TensorMap bases and non-contiguous strides require 16-byte alignment.
     return (
         base_residue % 16 == 0
+        and env.input_residues_hold_modulo(16)
         and sum(unit_stride for unit_stride, _residue in stride_facts) == 1
         and all(
             unit_stride or residue % 16 == 0 for unit_stride, residue in stride_facts
@@ -362,8 +358,18 @@ def _bound_vec_alignment_signature(
 def tensor_has_specialized_base_alignment(
     env: CompileEnvironment, tensor: torch.Tensor, alignment: int
 ) -> bool:
-    """Read a cache-key-backed pointer residue without retaining example inputs."""
-    if alignment <= 0 or _CUTE_ALIGNMENT_MAX_BYTES % alignment:
+    """Read a cache-key-backed pointer residue without retaining example inputs.
+
+    Every packet a caller admits on this also reads the tensor's traced
+    strides, so a tensor whose traced strides are a dynamic graph's
+    placeholders (``CompileEnvironment.traced_strides_hold``) proves nothing.
+    """
+    if (
+        alignment <= 0
+        or _CUTE_ALIGNMENT_MAX_BYTES % alignment
+        or not env.input_residues_hold_modulo(alignment)
+        or not env.traced_strides_hold(tensor)
+    ):
         return False
     signature = _bound_vec_alignment_signature(env, env.tensor_input_source(tensor))
     return signature is not None and signature[0] % alignment == 0
@@ -378,9 +384,17 @@ def tensor_has_specialized_dim_multiple(
     tensor's dtype (16 bf16/fp16 lanes, 8 fp32 lanes), so any vector width up
     to that maximum is decidable.  The bound kernel is keyed on that residue:
     a later call whose size has a different residue binds separately and
-    never reuses this code.
+    never reuses this code.  That holds only while the binding's dispatch
+    guards are enforced (``CompileEnvironment.dispatch_guards_enforced``):
+    Inductor's render of a dynamic-shape graph took the residue from a
+    placeholder input and runs at every size the graph accepts.
     """
-    if multiple <= 0 or dim < 0 or dim >= tensor.ndim:
+    if (
+        not env.dispatch_guards_enforced
+        or multiple <= 0
+        or dim < 0
+        or dim >= tensor.ndim
+    ):
         return False
     max_vector_elements = max(_CUTE_ALIGNMENT_MAX_BYTES // tensor.dtype.itemsize, 1)
     if max_vector_elements % multiple:
@@ -399,9 +413,16 @@ def tensor_has_specialized_stride_multiple(
     """Read a cache-key-backed proof that ``tensor.stride(dim) % multiple == 0``.
 
     The signature records each stride in bytes modulo the widest vector
-    transaction, so any vector width of the tensor's dtype is decidable.
+    transaction, so any vector width of the tensor's dtype is decidable,
+    while the binding's dispatch guards are enforced (as for
+    ``tensor_has_specialized_dim_multiple``).
     """
-    if multiple <= 0 or dim < 0 or dim >= tensor.ndim:
+    if (
+        not env.dispatch_guards_enforced
+        or multiple <= 0
+        or dim < 0
+        or dim >= tensor.ndim
+    ):
         return False
     vector_bytes = multiple * tensor.dtype.itemsize
     if _CUTE_ALIGNMENT_MAX_BYTES % vector_bytes:
@@ -424,12 +445,22 @@ def cute_tensor_base_is_aligned(
     bound pointer residue plus the view's static byte offset, and a fresh
     wrapper allocation is aligned to the allocator granularity less its
     static storage offset.  Anything else (a view of two inputs' shared
-    storage, say) is refused rather than trusted.
+    storage, say) is refused rather than trusted.  So is a tensor whose traced
+    strides are a dynamic graph's placeholders
+    (``CompileEnvironment.traced_strides_hold``): every packet admitted on
+    this proof also reads them (the unit lane stride, the other strides'
+    residues).
     """
-    if alignment <= 0 or _CUTE_ALIGNMENT_MAX_BYTES % alignment:
+    if (
+        alignment <= 0
+        or _CUTE_ALIGNMENT_MAX_BYTES % alignment
+        or not env.traced_strides_hold(tensor)
+    ):
         return False
     owner = env.tensor_alignment_owner(tensor)
     if owner is not None:
+        if not env.input_residues_hold_modulo(alignment):
+            return False
         source, offset_bytes = owner
         signature = _bound_vec_alignment_signature(env, source)
         return signature is not None and (signature[0] + offset_bytes) % alignment == 0
@@ -486,7 +517,8 @@ def cute_known_multiple(env: CompileEnvironment, extent: object, multiple: int) 
     Static extents use the shape environment.  A symbolic extent is matched
     against the symbolic sizes of the kernel's input tensors and proven from
     their bound residues (``tensor_has_specialized_dim_multiple``); the
-    dispatch cache key already separates inputs whose residues differ.
+    dispatch cache key already separates inputs whose residues differ, while
+    its guards are enforced.
     """
     if multiple <= 0:
         return False
@@ -1094,41 +1126,37 @@ def _persistent_vec_is_exact_aligned(
         return False
 
     env = CompileEnvironment.current()
-    runtime_tensor = env.runtime_value_for_tensor(tensor)
-    if isinstance(runtime_tensor, torch.Tensor) and not isinstance(
-        runtime_tensor, FakeTensor
-    ):
-        strides = tuple(int(stride) for stride in runtime_tensor.stride())
-        sizes = tuple(int(size) for size in runtime_tensor.shape)
-        element_size = runtime_tensor.element_size()
-        required_alignment = vec_width * element_size
-        if not runtime_tensor_has_specialized_alignment(
-            env, tensor, required_alignment
-        ):
-            return False
-    else:
-        strides = tensor.stride()
-        sizes = tensor.shape
-        element_size = tensor.element_size()
-        required_alignment = vec_width * element_size
-        # Lacking an input source does not make a tensor kernel-owned: a
-        # host-side view of an input inherits that input's runtime base.
-        if not cute_tensor_base_is_aligned(env, tensor, required_alignment):
-            return False
-
+    element_size = tensor.element_size()
+    required_alignment = vec_width * element_size
+    # The cache key decides, never a live example input, so a direct
+    # ``to_code`` renders the same packets whichever of them the caller still
+    # holds.  Lacking an input source does not make a tensor kernel-owned: a
+    # host-side view of an input inherits that input's runtime base.
+    if not cute_tensor_base_is_aligned(env, tensor, required_alignment):
+        return False
+    strides = tensor.stride()
     if len(strides) != len(rebased):
         return False
     lane_dim = dependent[0][0]
 
-    lane_size = _specialized_int(env, sizes[lane_dim])
-    if lane_size is None or lane_size % vec_width:
+    # Without ``static_shapes`` a size or stride may be symbolic; the
+    # tensor's bound signature records it modulo the packet width.
+    lane_size = _specialized_int(env, tensor.shape[lane_dim])
+    if lane_size is None:
+        if not tensor_has_specialized_dim_multiple(env, tensor, lane_dim, vec_width):
+            return False
+    elif lane_size % vec_width:
         return False
     for dim, stride in enumerate(strides):
         stride_value = _specialized_int(env, stride)
-        if stride_value is None:
-            return False
         if dim == lane_dim:
+            # A symbolic stride is 1 at binding only through inner dims of
+            # size 1, and the innermost one's literal stride of 1 then fails
+            # the packet anyway, so a symbolic lane stride is not proven.
             if stride_value != 1:
+                return False
+        elif stride_value is None:
+            if not tensor_has_specialized_stride_multiple(env, tensor, dim, vec_width):
                 return False
         elif stride_value * element_size % required_alignment:
             return False
@@ -1874,6 +1902,7 @@ def _cute_reread_leaf(
     through the chain below it."""
     from .cute_reshape import _resolve_shape_chain_expr
     from .view_ops import _CAST_TARGETS
+    from .view_ops import _cast_reread
     from .view_ops import _tensor_written_anywhere
 
     source = node.args[0] if node.args else None
@@ -1886,7 +1915,7 @@ def _cute_reread_leaf(
         inner = _resolve_shape_chain_expr(ctx, source, flat_index, _cute_reread_leaf)
         if inner is None or node.target is torch.ops.aten.clone.default:
             return inner
-        return CompileEnvironment.current().backend.cast_ast(inner, value.dtype)
+        return _cast_reread(ctx, inner, source, value.dtype)
     cg = cast("GenerateAST", ctx.cg)
     if node.target is not load or _tensor_written_anywhere(cg, node):
         return None
@@ -3450,11 +3479,27 @@ def _(state: CodegenState) -> ast.AST:
     site, value_readdressed, topk = _store_access_site(
         state, tensor, subscript, ast_subscript, extra_mask
     )
+    from .handler_ops import integer_to_float_expr
+    from .handler_ops import scalar_value_dtype
+
     backend = CompileEnvironment.current().backend
     target_dtype = backend.dtype_str(tensor.dtype)
-    value = expr_from_string(
-        backend.ast_to_dtype_expr("{value}", target_dtype),
-        value=value,
+    # An integer or a bool scalar (a SymInt) becomes a float as in the
+    # pointwise lowering, where MLIR could fold an 8-bit float conversion into
+    # it; a tensor value already has the target's dtype.
+    converted = integer_to_float_expr(
+        value,
+        tensor.dtype,
+        scalar_value_dtype(state.proxy_arg(2)),
+        state.device_function,
+    )
+    value = (
+        expr_from_string(
+            backend.ast_to_dtype_expr("{value}", target_dtype),
+            value=value,
+        )
+        if converted is None
+        else converted
     )
     assert isinstance(value, ast.expr)
     store_uses_pointer = "None" not in site.index_exprs
@@ -4253,7 +4298,6 @@ def _cute_lane_base_is_vec_aligned(
     """
     from ..tile_strategy import PerThreadNDTileStrategy
 
-    env = CompileEnvironment.current()
     if not isinstance(strategy, PerThreadNDTileStrategy):
         return False
     if block_id not in strategy.block_ids:
@@ -4269,6 +4313,14 @@ def _cute_lane_base_is_vec_aligned(
     cluster_n = strategy.lane_context(block_id).cluster_n
     if cluster_n > 1 and (static_block // cluster_n) % vec_width != 0:
         return False
+    return _cute_tile_begins_at_multiple(owner, block_id, vec_width)
+
+
+def _cute_tile_begins_at_multiple(
+    owner: DeviceLoopOrGridState, block_id: int, vec_width: int
+) -> bool:
+    """Whether ``owner``'s tile of ``block_id`` begins at a known multiple of
+    ``vec_width``."""
     info = owner.block_id_to_info.get(block_id)
     if info is None:
         return False
@@ -4276,7 +4328,9 @@ def _cute_lane_base_is_vec_aligned(
         # A grid without an explicit begin starts at zero; a lifted begin
         # without a symbolic value is data dependent.
         return info.begin_var_name is None
-    return info.begin_expr == 0 or env.known_multiple(info.begin_expr, vec_width)
+    return info.begin_expr == 0 or CompileEnvironment.current().known_multiple(
+        info.begin_expr, vec_width
+    )
 
 
 def _cute_clone_expr(node: ast.AST) -> ast.expr:
@@ -4978,9 +5032,10 @@ def _cute_tile_packet_is_aligned(
     """Prove a tile packet's addresses from the bound pointer/stride residues.
 
     The hoist reads ``vec_width`` contiguous elements at a lane base that is
-    a multiple of V, so the packet is naturally aligned exactly when the
-    tensor base is aligned to the packet and every other stride is a multiple
-    of V elements (``cute_reduction_vector_layout_aligned``); a flat packet
+    a multiple of V (``_cute_tile_start_is_multiple``), so the packet is
+    naturally aligned exactly when the tensor base is aligned to the packet
+    and every other stride is a multiple of V elements
+    (``cute_reduction_vector_layout_aligned``); a flat packet
     addresses a contiguous tensor (``_cute_flat_multi_cover_ok``) and needs
     only the base.  A 132-wide bf16 row or a view four elements into its
     storage faults the 16-byte access, so an unprovable site stays on scalar
@@ -5000,6 +5055,19 @@ def _cute_tile_packet_is_aligned(
     if not isinstance(lane_stride, int) or lane_stride != 1:
         return False
     return cute_reduction_vector_layout_aligned(env, tensor, lane_axis, vec_width)
+
+
+def _cute_tile_start_is_multiple(
+    state: CodegenState, block_id: int, vec_width: int
+) -> bool:
+    """Whether the current tile of ``block_id`` starts at a known multiple of
+    ``vec_width``.  A tile packet's lane base is that start plus multiples of
+    V, so the packets of ``hl.tile(1, n)`` all sit one element off their
+    alignment; a start read from a tensor is not known.
+    """
+    # The grid's blocks are active device loops too, with the grid state.
+    loops = state.codegen.active_device_loops.get(block_id)
+    return bool(loops) and _cute_tile_begins_at_multiple(loops[-1], block_id, vec_width)
 
 
 def _cute_tile_axis_block_id(idx: torch.SymInt) -> int | None:
@@ -5426,6 +5494,11 @@ def _cute_vector_load_ctx(
             # and stays scalar.
             if not env.block_sizes[inner_block_id].known_multiple(vec_width):
                 return None
+        if not _cute_tile_start_is_multiple(state, inner_block_id, vec_width):
+            # A tile from column 1 would read and write every packet one
+            # element off its alignment.  (A flattened multi-dim tile always
+            # begins at 0.)
+            return None
         if not _cute_tile_packet_is_aligned(
             env, tensor, stride1_tensor_dim, vec_width, flat=flat_multi
         ):
