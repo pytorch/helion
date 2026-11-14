@@ -12,9 +12,11 @@ across its lanes and the cross-thread combine runs once per row tile.
 
 from __future__ import annotations
 
+import contextlib
 import re
 from typing import TYPE_CHECKING
 from typing import Callable
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -26,6 +28,7 @@ from helion._testing import code_and_output
 from helion._testing import import_example
 from helion._testing import onlyBackends
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.lane_stash_kernels import online_softmax_stats
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -952,3 +955,39 @@ def test_a_column_zeroed_before_its_copy_is_never_left_zero() -> None:
             result = compiled(x)
             out = result[0] if isinstance(result, tuple) else result
             torch.testing.assert_close(out, x, rtol=0, atol=0)
+
+
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_the_sum_pass_reusing_the_max_passs_loads_is_bitwise_neutral() -> None:
+    """The online softmax's sum pass reads the elements the max pass loaded
+    from a trace-time stash (``cute/stash_lane_loads.py``) instead of loading
+    them again: the results are bit for bit those of the reloading code."""
+    # Rows ending mid-vector keep the loads per element, four 8-wide lanes
+    # per thread, a CTA-wide reduction between the passes.
+    x = torch.randn(64, 8200, device=DEVICE, dtype=torch.bfloat16)[:, :8195]
+    config = helion.Config(
+        block_sizes=[1, 2048],
+        num_threads=[1, 64],
+        cute_vector_widths=[1, 8],
+        cute_lane_layouts=["blocked", "strided"],
+    )
+    results = []
+    for stash in (True, False):
+        with (
+            contextlib.nullcontext()
+            if stash
+            else patch(
+                "helion._compiler.cute.stash_lane_loads.stash_sibling_lane_loads",
+                lambda body, new_var, **_: body,
+            )
+        ):
+            kernel = helion.kernel(
+                online_softmax_stats, backend="cute", static_shapes=True, config=config
+            )
+            code = kernel.bind((x,)).to_code(config)
+            assert ("_lane_stash_loads_" in code) is stash
+            results.append(kernel(x))
+    for stashed, reloaded in zip(*results, strict=True):
+        assert torch.equal(stashed, reloaded)
+    torch.testing.assert_close(results[0][0], x.float().amax(-1), rtol=0, atol=0)

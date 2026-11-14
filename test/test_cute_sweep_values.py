@@ -5,7 +5,8 @@ elementwise chain in each.  ``fuse_two_pass_loads`` (with ``sweep_values``)
 reads a later sweep's copy of the first sweep's pure inline-asm results, the
 Philox chain of a word0 ``hl.rand`` draw, from a per-thread fragment, and with
 the explicit ``register`` reload policy its transcendentals too; the ``gmem``
-policy still recomputes them.  A lane-invariant load takes one fragment slot.
+policy still recomputes them.  A lane-invariant load takes one fragment slot,
+and a scalar load that names its dtype (an fp8 row's raw bytes) caches in it.
 The kernels render on CPU; ``test_cute_fuse_two_pass_loads.py`` checks on the
 GPU that the carried masks match the recomputed ones bit for bit.
 """
@@ -21,6 +22,9 @@ import pytest
 import torch
 
 import helion
+from helion._compiler.cute.fuse_two_pass_loads import _arch_scalar_dtype
+from helion._compiler.cute.fuse_two_pass_loads import _load_kind
+from helion._compiler.cute.fuse_two_pass_loads import _scalar_load_key
 from helion._compiler.cute.fuse_two_pass_loads import fuse_two_pass_loads
 from helion._compiler.cute.sweep_values import CACHE_DTYPES
 from helion._compiler.cute.sweep_values import SweepValues
@@ -28,6 +32,8 @@ from helion._compiler.cute.sweep_values import _promoted
 from helion._compiler.cute.sweep_values import _scalar_dtype
 from helion._testing import cpu_render_target
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_sweep_kernels import center_fp8_row
+from helion._testing.cute_sweep_kernels import center_fp8_row_config
 from helion._testing.cute_sweep_kernels import dropout_layernorm
 import helion.language as hl
 
@@ -230,6 +236,120 @@ def test_lane_invariant_load_takes_one_slot() -> None:
     assert "cute.make_rmem_tensor(1, cutlass.Float32)" in code
     assert re.search(r"_fuse_cache_\d+\[0\] = ", sweeps[0])
     assert re.search(r"= _fuse_cache_\d+\[0\]", sweeps[1])
+
+
+def test_raw_byte_loads_cache_in_the_dtype_they_name() -> None:
+    """A rolled fp8 row loads raw bytes (``cute.arch.load(ptr, cutlass.Uint8)``);
+    the consume sweep reads the reduce sweep's from a ``Uint8`` fragment
+    instead of loading them again (the fp8 dtype would convert them)."""
+    with cpu_render_target(reduction_smem_budget_bytes=232448):
+        kernel = helion.kernel(center_fp8_row, backend="cute", static_shapes=True)
+        bound = cpu_bind(kernel, (torch.empty(8, 4096, dtype=torch.float8_e4m3fn),))
+        code = bound.to_code(center_fp8_row_config(bound.config_spec))
+    # Four 1024-element chunks of eight lanes per thread.
+    assert "cute.make_rmem_tensor(32, cutlass.Uint8)" in code
+    assert code.count("cute.arch.load(x.iterator") == 1
+
+
+@pytest.mark.parametrize(
+    ("expr", "kind", "dtype"),
+    [
+        # A plain scalar load caches in its tensor's dtype (looked up later).
+        ("(x.iterator + i).load()", "unmasked", None),
+        # A scalar ``cute.arch.load`` names its dtype: a hinted fp32 load, a
+        # byte-packed bool/int8/fp8 packet, an fp8 raw byte.
+        (
+            "cute.arch.load(x.iterator + i, cutlass.Float32, cop='cs')",
+            "unmasked",
+            "cutlass.Float32",
+        ),
+        (
+            "cute.arch.load(x.iterator + i, cutlass.Uint16)",
+            "unmasked",
+            "cutlass.Uint16",
+        ),
+        ("cute.arch.load(x.iterator + i, cutlass.Uint8)", "unmasked", "cutlass.Uint8"),
+        # A packet caches lane by lane in its element type.
+        (
+            "cute.arch.load(x.iterator + i, ir.VectorType.get([2], cutlass.Uint16.mlir_type))",
+            "vec",
+            None,
+        ),
+        # A vector whose width is no literal is neither: no cache.
+        (
+            "cute.arch.load(x.iterator + i, ir.VectorType.get([n], cutlass.Uint16.mlir_type))",
+            None,
+            None,
+        ),
+    ],
+)
+def test_scalar_arch_loads_cache_in_the_dtype_they_name(
+    expr: str, kind: str | None, dtype: str | None
+) -> None:
+    node = ast.parse(expr, mode="eval").body
+    assert _load_kind(node) == kind
+    assert _arch_scalar_dtype(node) == dtype
+
+
+@pytest.mark.parametrize(
+    ("later", "fused"),
+    [
+        # The unhinted twin of a hinted fp32 load reads its cache.
+        ("(x.iterator + lane).load()", True),
+        ("cute.arch.load(x.iterator + lane, cutlass.Float32, cop='cs')", True),
+        # A load naming another dtype at the same address is no reuse: a
+        # ``Uint64`` from the ``Float32`` fragment would keep 4 of 8 bytes,
+        # an ``Int32`` would convert the bits it reinterprets.
+        ("cute.arch.load(x.iterator + lane, cutlass.Uint64)", False),
+        ("cute.arch.load(x.iterator + lane, cutlass.Uint32)", False),
+        ("cute.arch.load(x.iterator + lane, cutlass.Int32)", False),
+        ("cute.arch.load(x.iterator + lane, cutlass.Float64)", False),
+    ],
+)
+def test_a_later_load_reuses_a_cache_only_of_its_own_dtype(
+    later: str, fused: bool
+) -> None:
+    code = _fused_twin(
+        "cute.arch.load(x.iterator + lane, cutlass.Float32, cop='cs')",
+        later,
+        "cutlass.Float32",
+    )
+    assert ("after = _fuse_cache_" in code) is fused, code
+    assert code.count("x.iterator + lane") == (1 if fused else 2), code
+
+
+def test_a_vector_load_of_unknown_width_has_no_scalar_key() -> None:
+    # ``ir.VectorType.get([n], ...)`` is a vector whatever ``n`` is: it keys
+    # as no scalar load, so it cannot collide with the plain load's key.
+    vector = "cute.arch.load(x.iterator + i, ir.VectorType.get([n], cutlass.Int16.mlir_type))"
+    plain = "(x.iterator + i).load()"
+    dtypes = {"x": "cutlass.Int16"}
+    assert _scalar_load_key(ast.parse(vector, mode="eval").body, dtypes) is None
+    assert (
+        _scalar_load_key(ast.parse(plain, mode="eval").body, dtypes)
+        == "__scalar_load__(x.iterator + i, cutlass.Int16)"
+    )
+
+
+def _fused_twin(before: str, later: str, dtype: str) -> str:
+    """Two lane sweeps loading the same address of ``x`` (``dtype``),
+    ``before`` in the first and ``later`` in the second, through the fusion."""
+    body = ast.parse(
+        f"""
+for synthetic_lane_3 in range(8):
+    before = {before}
+for synthetic_lane_3 in range(8):
+    after = {later}
+"""
+    ).body
+    return ast.unparse(
+        ast.Module(
+            body=fuse_two_pass_loads(
+                body, tensor_dtypes={"x": dtype}, reload_modes={3: "register"}
+            ),
+            type_ignores=[],
+        )
+    )
 
 
 # A pure asm chain long enough to be worth carrying (16 instructions).

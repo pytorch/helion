@@ -207,6 +207,7 @@ def uniform_packet_mask(
         [loop],
         loop,
         _CuteLaneIndexFacts(_assigned_name(index), base, loop.target.id, width, True),
+        index_var=_assigned_name(index),
     )
     expression = _cute_lane_uniform_mask(scope, ast.unparse(mask.value))
     if expression is None:

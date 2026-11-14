@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
 
+from .launch_descriptor import preferred_smem_carveout
 from .launch_descriptor import use_pdl
 from .source_dependencies import referenced_helper_sources
 from .source_dependencies import sass_check_source_dependencies
@@ -459,6 +460,7 @@ def disk_cache_key(
             block,
             wrapper_plans,
             repr(cluster_shape),
+            preferred_smem_carveout(cute_kernel, plans),
             compile_options or "",
             cache_relevant_env(),
             cutlass_version,

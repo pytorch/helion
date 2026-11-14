@@ -41,7 +41,7 @@ _BASE_VALID_KEYS = """
     advanced_controls_file atomic_indexing block_sizes cross_loop_pipeline
     cute_affine_scan_schedule cute_async_load_cache cute_async_load_group_rows
     cute_async_load_lookahead cute_async_load_stages cute_async_store_policy
-    cute_bf16x2_recurrence cute_chunk_prepare_schedule
+    cute_bf16x2_recurrence cute_bool_byte_packets cute_chunk_prepare_schedule
     cute_chunk_recurrence_dv_partitions cute_chunk_recurrence_register_cap
     cute_cluster_n cute_cluster_warp_online cute_collective_compute
     cute_collective_copy cute_collective_epilogue cute_collective_mma
@@ -106,6 +106,7 @@ _BASE_VALID_KEYS = """
     cute_fragment_warp_scan cute_gathered_mma_n cute_gathered_mma_stages
     cute_gdn_recurrence_epilogue_warps cute_gdn_recurrence_mma_m
     cute_gdn_recurrence_stages cute_gdn_recurrence_token_groups
+    cute_grid_lane_jam
     cute_grouped_ab_stages cute_grouped_ctas_per_sm cute_grouped_descriptor_policy
     cute_grouped_prefix_scan cute_grouped_rna_block_k cute_grouped_rna_warps
     cute_host_paired_sum cute_independent_reduction cute_integer_loop_reduction
@@ -150,7 +151,8 @@ _BASE_VALID_KEYS = """
     cute_topk_key_encoder cute_topk_key_recovery cute_topk_lanes_per_row
     cute_topk_merge_schedule cute_topk_output_vector_width cute_topk_rank_mode
     cute_topk_rows_per_block cute_topk_selection_layout cute_topk_sort_network
-    cute_topk_value_mode cute_topk_vector_width cute_vector_packet_unroll
+    cute_topk_value_mode cute_topk_vector_width cute_unpadded_rows
+    cute_vector_packet_unroll
     cute_vector_widths cute_vloop_sink cute_warp_aggregated_atomics
     cute_warp_fp32_redux cute_wide_packet_hints cute_warp_mma_warps epilogue_subtile flatten_loops
     host_tensor_descriptors indexing l2_groupings load_cache_modifiers
@@ -202,7 +204,8 @@ _BASE_VALID_KEYS = """
 _BASE_BACKEND_SPECIFIC_KEYS = """
     cross_loop_pipeline cute_affine_scan_schedule cute_async_load_cache
     cute_async_load_group_rows cute_async_load_lookahead cute_async_load_stages
-    cute_async_store_policy cute_bf16x2_recurrence cute_chunk_prepare_schedule
+    cute_async_store_policy cute_bf16x2_recurrence
+    cute_bool_byte_packets cute_chunk_prepare_schedule
     cute_chunk_recurrence_dv_partitions cute_chunk_recurrence_register_cap
     cute_cluster_n cute_cluster_warp_online cute_collective_compute
     cute_collective_copy cute_collective_epilogue cute_collective_mma
@@ -267,6 +270,7 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_fragment_warp_scan cute_gathered_mma_n cute_gathered_mma_stages
     cute_gdn_recurrence_epilogue_warps cute_gdn_recurrence_mma_m
     cute_gdn_recurrence_stages cute_gdn_recurrence_token_groups
+    cute_grid_lane_jam
     cute_grouped_ab_stages cute_grouped_ctas_per_sm cute_grouped_descriptor_policy
     cute_grouped_prefix_scan cute_grouped_rna_block_k cute_grouped_rna_warps
     cute_host_paired_sum cute_independent_reduction cute_integer_loop_reduction
@@ -311,7 +315,8 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_topk_key_encoder cute_topk_key_recovery cute_topk_lanes_per_row
     cute_topk_merge_schedule cute_topk_output_vector_width cute_topk_rank_mode
     cute_topk_rows_per_block cute_topk_selection_layout cute_topk_sort_network
-    cute_topk_value_mode cute_topk_vector_width cute_vector_packet_unroll
+    cute_topk_value_mode cute_topk_vector_width cute_unpadded_rows
+    cute_vector_packet_unroll
     cute_vector_widths cute_vloop_sink cute_warp_aggregated_atomics
     cute_warp_fp32_redux cute_wide_packet_hints cute_warp_mma_warps host_tensor_descriptors
     load_cache_modifiers matrix_instr_nonkdim num_ctas num_threads occupancy
@@ -358,7 +363,8 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
 _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     atomic_indexing cute_async_load_cache cute_async_load_group_rows
     cute_async_load_lookahead cute_async_load_stages cute_async_store_policy
-    cute_bf16x2_recurrence cute_cluster_warp_online cute_collective_compute
+    cute_bf16x2_recurrence
+    cute_bool_byte_packets cute_cluster_warp_online cute_collective_compute
     cute_collective_copy cute_collective_epilogue cute_collective_mma
     cute_collective_native_seeded cute_collective_operand_packets
     cute_collective_recipe cute_collective_stages cute_collective_static_layouts
@@ -377,6 +383,7 @@ _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     cute_fragment_topk_network cute_fragment_unrolled_loops cute_fragment_vector_io
     cute_fragment_warp_producer_regions cute_fragment_warp_results
     cute_fragment_warp_scan cute_gathered_mma_n cute_gathered_mma_stages
+    cute_grid_lane_jam
     cute_host_paired_sum cute_independent_reduction cute_integer_loop_reduction
     cute_lane_unroll cute_materialized_operand_schedule cute_materialized_schedule
     cute_packet_prefetch cute_pdl cute_pdl_capture_overlap cute_pdl_release cute_pointwise_pid_type
@@ -402,7 +409,8 @@ _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     cute_simt_mma cute_simt_mma_layout cute_split_k_finalizer_warps
     cute_split_k_partitions cute_split_k_schedule cute_split_k_stages
     cute_split_k_workspace cute_store_policy cute_topk_coarse_keys
-    cute_topk_key_recovery cute_vector_packet_unroll cute_vloop_sink
+    cute_topk_key_recovery cute_unpadded_rows
+    cute_vector_packet_unroll cute_vloop_sink
     cute_warp_aggregated_atomics cute_warp_fp32_redux cute_wide_packet_hints flatten_loops indexing
     l2_groupings load_eviction_policies loop_orders maxnreg num_sm_multiplier
     num_stages num_warps pid_type range_flattens range_multi_buffers
@@ -415,7 +423,7 @@ _BASE_CUTE_ACCEPTED = """
     advanced_controls_file atomic_indexing block_sizes cross_loop_pipeline
     cute_affine_scan_schedule cute_async_load_cache cute_async_load_group_rows
     cute_async_load_lookahead cute_async_load_stages cute_async_store_policy
-    cute_bf16x2_recurrence cute_chunk_prepare_schedule
+    cute_bf16x2_recurrence cute_bool_byte_packets cute_chunk_prepare_schedule
     cute_chunk_recurrence_dv_partitions cute_chunk_recurrence_register_cap
     cute_cluster_n cute_cluster_warp_online cute_collective_compute
     cute_collective_copy cute_collective_epilogue cute_collective_mma
@@ -480,6 +488,7 @@ _BASE_CUTE_ACCEPTED = """
     cute_fragment_warp_scan cute_gathered_mma_n cute_gathered_mma_stages
     cute_gdn_recurrence_epilogue_warps cute_gdn_recurrence_mma_m
     cute_gdn_recurrence_stages cute_gdn_recurrence_token_groups
+    cute_grid_lane_jam
     cute_grouped_ab_stages cute_grouped_ctas_per_sm cute_grouped_descriptor_policy
     cute_grouped_prefix_scan cute_grouped_rna_block_k cute_grouped_rna_warps
     cute_host_paired_sum cute_independent_reduction cute_integer_loop_reduction
@@ -524,7 +533,8 @@ _BASE_CUTE_ACCEPTED = """
     cute_topk_key_encoder cute_topk_key_recovery cute_topk_lanes_per_row
     cute_topk_merge_schedule cute_topk_output_vector_width cute_topk_rank_mode
     cute_topk_rows_per_block cute_topk_selection_layout cute_topk_sort_network
-    cute_topk_value_mode cute_topk_vector_width cute_vector_packet_unroll
+    cute_topk_value_mode cute_topk_vector_width cute_unpadded_rows
+    cute_vector_packet_unroll
     cute_vector_widths cute_vloop_sink cute_warp_aggregated_atomics
     cute_warp_fp32_redux cute_wide_packet_hints cute_warp_mma_warps epilogue_subtile flatten_loops indexing
     l2_groupings load_eviction_policies loop_orders maxnreg num_sm_multiplier

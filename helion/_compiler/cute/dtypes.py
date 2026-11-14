@@ -57,6 +57,24 @@ CUTLASS_POINTER_DTYPE_NAME: dict[torch.dtype, str] = {
     torch.bool: "cutlass.Uint8",
 }
 
+# The integer and boolean scalar types as generated code spells them: every
+# type above that is not a float, and the unsigned 16- and 64-bit carriers no
+# torch dtype maps to.
+CUTLASS_INTEGER_TYPE_NAMES = frozenset(
+    f"cutlass.{name}"
+    for name in (
+        "Boolean",
+        "Int8",
+        "Int16",
+        "Int32",
+        "Int64",
+        "Uint8",
+        "Uint16",
+        "Uint32",
+        "Uint64",
+    )
+)
+
 _CUTLASS_POINTER_DTYPES: dict[torch.dtype, object] | None = None
 
 

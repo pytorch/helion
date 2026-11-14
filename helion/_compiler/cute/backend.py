@@ -76,6 +76,8 @@ from .math_templates import nan_extremum_expr
 from .pdl_release import ZERO_FILL_KERNEL_PREFIX
 from .pdl_release import generic_release_rendered
 from .pdl_release import spread_rendered
+from .reduction_lanes import fit_reduction_threads
+from .reduction_lanes import synthetic_reduction_lanes
 from .state import cute_codegen_state
 from .state import cute_env_state
 from .state import new_codegen_state
@@ -3870,24 +3872,14 @@ class CuteBackend(Backend):
                 for size in strategy.thread_block_sizes():
                     if size > 1:
                         other_threads *= size
-        while other_threads * requested > MAX_THREADS_PER_BLOCK and requested > 1:
-            requested //= 2
-        return requested
+        return fit_reduction_threads(requested, other_threads)
 
     def create_synthetic_reduction_lanes(
         self,
         thread_count: int,
         size_hint: int,
     ) -> int | None:
-        from torch._inductor.runtime.runtime_utils import next_power_of_2
-
-        if thread_count <= 0:
-            return None
-        padded_size = next_power_of_2(max(1, size_hint))
-        if padded_size > thread_count:
-            # Whole-warp thread counts need not divide the padded extent.
-            return (padded_size + thread_count - 1) // thread_count
-        return None
+        return synthetic_reduction_lanes(thread_count, size_hint)
 
     def reduction_axis_first(self) -> bool:
         return True

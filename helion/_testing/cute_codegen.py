@@ -25,6 +25,7 @@ from torch.utils._pytree import tree_leaves
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.cute.cutedsl_compat import _cute_backend_requirement_error
 from .._compiler.cute.full_tile_bounds import prove_full_tile_launch
+from .._compiler.cute.lane_loops.barriers import is_barrier as is_barrier
 from .._compiler.cute.target_facts import B200
 from .._utils import triton_is_available
 from ..runtime.config import Config
@@ -141,6 +142,20 @@ def codegen_skip_reason(backend: str) -> str | None:
     return None
 
 
+def kernel_body(code: str) -> str:
+    """The ``@cute.kernel`` function of rendered module ``code``, up to the
+    next top-level function (the host function), without the ``# src[...]``
+    comments that quote the kernel's source."""
+    start = code.index("@cute.kernel")
+    kernel_def = code.index("\ndef ", start)
+    end = code.find("\ndef ", kernel_def + 1)
+    return "\n".join(
+        line
+        for line in code[start : end if end >= 0 else len(code)].splitlines()
+        if "# src[" not in line
+    )
+
+
 def cpu_bind(
     kernel: Kernel[object],
     args: tuple[object, ...],
@@ -156,6 +171,21 @@ def cpu_bind(
         raise SkipTest(reason)
     with patch_target_facts(capability=capability, num_sm=148, is_hip=False):
         return kernel._bind_isolated(args)
+
+
+def roll_loops(code: str, target: str = "roffset_1") -> list[ast.For]:
+    """The loops over ``target`` in the kernel of rendered module ``code``,
+    in order: a looped reduction's sweeps (reduce, then consume)."""
+    kernel = next(
+        node
+        for node in ast.parse(code).body
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("_helion_")
+    )
+    return [
+        node
+        for node in ast.walk(kernel)
+        if isinstance(node, ast.For) and ast.unparse(node.target) == target
+    ]
 
 
 @contextmanager

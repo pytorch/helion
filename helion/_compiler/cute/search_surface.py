@@ -202,6 +202,13 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
         config_spec.target_device_capability == (10, 0)
         and any(has_signed_byte_field(info.graph) for info in device_ir.graphs)
     )
+    # The reductions that may roll along a bool row a load reads: their byte
+    # packets are tunable (``cute_bool_byte_packets``).
+    from .memory_ops import bool_reduction_row_blocks
+
+    config_spec.cute_bool_byte_packet_sites = bool_reduction_row_blocks(
+        device_ir, config_spec
+    )
     # Enable the flash-attention autotune surface when
     # the dense flash dataflow is detected, analogous to how a matmul
     # detection sets ``tcgen05.search_enabled``. Default-off
@@ -607,6 +614,17 @@ def register_reduction_layout_slots(
     vector_blocks = set(env.config_spec.cute_vector_widths.valid_block_ids())
     lane_layout_blocks = set(env.config_spec.cute_lane_layouts.valid_block_ids())
     reload_blocks = set(env.config_spec.cute_reduction_reloads.valid_block_ids())
+    # The blocks the ``hl.reduce`` calls reduce, None for a call that reduces
+    # every dim or a dim of no block (``_block_has_user_reduce``).
+    from ...language.reduce_ops import _reduce
+    from .reduction_emitter import _reduced_block_id
+
+    user_reduced = [
+        _reduced_block_id(node)
+        for graph_info in device_ir.graphs
+        for node in graph_info.graph.nodes
+        if node.target is _reduce
+    ]
     for rdim in rdims:
         # Reduction lowering materializes output-range blocks even
         # when the range is exactly an already-active tile symbol.
@@ -618,6 +636,16 @@ def register_reduction_layout_slots(
         if not isinstance(rdim.size, (int, torch.SymInt)):
             continue
         size_hint = rdim.size_hint()
+        # The extent ``PersistentReductionStrategy`` plans from: only a
+        # static one may run unpadded (``plan_unpadded_extent``).
+        numel = env.specialize_expr(rdim.numel)
+        if isinstance(numel, (int, sympy.Integer)):
+            env.config_spec.cute_static_reduction_extents[rdim.block_id] = int(numel)
+        if any(
+            block_id is None or env.canonical_block_id(block_id) == rdim.block_id
+            for block_id in user_reduced
+        ):
+            env.config_spec.cute_user_reduce_block_ids.add(rdim.block_id)
         if rdim.block_id not in num_thread_blocks:
             env.config_spec.num_threads.append(
                 NumThreadsSpec(

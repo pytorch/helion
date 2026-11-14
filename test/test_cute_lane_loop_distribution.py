@@ -45,6 +45,7 @@ from test.test_cute_scan_lowering import _segment_scan_reverse
 import helion
 from helion import exc
 from helion._compiler.ast_read_writes import HELION_ACCESS_REGIONS_ATTR
+from helion._compiler.ast_read_writes import HELION_RAW_BARRIER_TENSORS_ATTR
 from helion._compiler.cute.block_uniform import block_uniform
 from helion._compiler.cute.lane_loops import placement as lane_placement
 from helion._compiler.cute.lane_loops.barriers import add_thread_barriers
@@ -65,6 +66,7 @@ from helion._testing import import_example
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import is_barrier
 from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 from helion.language import _tracing_ops
@@ -1275,16 +1277,8 @@ _INNER_THREADED_COLUMNS_CONFIG = {
 }
 
 
-def _is_barrier(node: ast.AST) -> bool:
-    return (
-        isinstance(node, ast.Expr)
-        and isinstance(node.value, ast.Call)
-        and ast.unparse(node.value.func) == "cute.arch.sync_threads"
-    )
-
-
 def _barriers(node: ast.AST) -> list[ast.Expr]:
-    return [child for child in ast.walk(node) if _is_barrier(child)]  # pyrefly: ignore [bad-return]
+    return [child for child in ast.walk(node) if is_barrier(child)]  # pyrefly: ignore [bad-return]
 
 
 def _index_of(body: Sequence[ast.AST], text: str, *, after: int = -1) -> int:
@@ -1300,9 +1294,7 @@ def _one_barrier_between(body: Sequence[ast.AST], first: str, second: str) -> No
     """``body`` holds one barrier, between the statements mentioning ``first`` and ``second``."""
     start = _index_of(body, first)
     end = _index_of(body, second, after=start)
-    positions = [
-        index for index, statement in enumerate(body) if _is_barrier(statement)
-    ]
+    positions = [index for index, statement in enumerate(body) if is_barrier(statement)]
     assert positions and all(start < p < end for p in positions), (
         [ast.unparse(s)[:60] for s in body],
     )
@@ -1325,7 +1317,7 @@ def test_uniform_read_before_per_lane_stores_on_a_shared_axis_gets_a_barrier(
     (column_loop,) = _loops(row_loop, "lane_1")
     assert len(_barriers(function)) == 1, code
     load = _index_of(row_loop.body, "tile_offset_1")
-    barrier = next(i for i, s in enumerate(row_loop.body) if _is_barrier(s))
+    barrier = next(i for i, s in enumerate(row_loop.body) if is_barrier(s))
     assert load < barrier < row_loop.body.index(column_loop), code
 
 
@@ -1401,7 +1393,7 @@ def test_uniform_read_on_a_thread_axis_without_a_lane_loop_gets_a_barrier() -> N
     (column_loop,) = _loops(function, "lane_1")
     (vloop,) = _loops(column_loop, "vec_lane_1")
     assert len(_barriers(function)) == 1, code
-    barrier = next(i for i, s in enumerate(column_loop.body) if _is_barrier(s))
+    barrier = next(i for i, s in enumerate(column_loop.body) if is_barrier(s))
     flush = _index_of(column_loop.body, "_cute_store_u32_vec")
     assert column_loop.body.index(vloop) < barrier < flush, code
     # Scalar lanes: load and store are statements of the column loop's body.
@@ -1439,7 +1431,7 @@ def test_uniform_store_before_per_lane_stores_gets_a_barrier(
     (column_loop,) = _loops(row_loop, "lane_1")
     assert len(_barriers(function)) == 1, code
     store = _index_of(row_loop.body, ".store(")
-    barrier = next(i for i, s in enumerate(row_loop.body) if _is_barrier(s))
+    barrier = next(i for i, s in enumerate(row_loop.body) if is_barrier(s))
     assert store < barrier < row_loop.body.index(column_loop), code
 
 
@@ -1457,8 +1449,46 @@ def test_idempotent_uniform_stores_need_no_barrier() -> None:
     (row_loop,) = _loops(function, "lane_0")
     (column_loop,) = _loops(row_loop, "lane_1")
     assert len(_barriers(function)) == 1, code
-    assert not any(_is_barrier(s) for s in row_loop.body), code
+    assert not any(is_barrier(s) for s in row_loop.body), code
     assert _barriers(column_loop), code
+
+
+@pytest.mark.parametrize("gathered", [True, False])
+def test_barrier_pass_untags_a_read_after_write_barrier_it_counts_on(
+    gathered: bool,
+) -> None:
+    """A thread's store of ``c`` and another thread's gathered load of it need
+    a barrier between them: a load's read-after-write barrier there counts,
+    and it loses its tag (``HELION_RAW_BARRIER_TENSORS_ATTR``), since it now
+    orders more than the stores of the tensor it names.  A load of another
+    tensor needs none, and the barrier keeps its tag."""
+    load = (
+        "(c.iterator + cutlass.Int32(column)).load()"
+        if gathered
+        else "(d.iterator + indices_1).load()"
+    )
+    body: list = ast.parse(
+        "(c.iterator + indices_1).store(v)\n"
+        "column = (perm.iterator + indices_1).load()\n"
+        "cute.arch.sync_threads()\n"
+        f"g = {load}\n"
+    ).body
+    barrier = body[2]
+    setattr(
+        barrier, HELION_RAW_BARRIER_TENSORS_ATTR, frozenset({"c" if gathered else "d"})
+    )
+    add_thread_barriers(
+        body,
+        [],
+        rename_groups={},
+        axis_sizes={0: 64},
+        definitions=ast.parse(
+            "indices_1 = tile_offset_1 + cutlass.Int32(cute.arch.thread_idx()[0])"
+        ).body,
+        masks=frozenset(),
+    )
+    assert len(body) == 4, ast.unparse(ast.Module(body=body, type_ignores=[]))
+    assert (getattr(barrier, HELION_RAW_BARRIER_TENSORS_ATTR, None) is None) is gathered
 
 
 @pytest.mark.parametrize(
@@ -1481,7 +1511,7 @@ def test_uniform_read_hoisted_out_of_the_innermost_shared_loop_gets_a_barrier(
     (column_loop,) = _loops(outer, "lane_2")
     assert len(_barriers(function)) == 1, code
     load = _index_of(outer.body, "tile_offset_2")
-    barrier = next(i for i, s in enumerate(outer.body) if _is_barrier(s))
+    barrier = next(i for i, s in enumerate(outer.body) if is_barrier(s))
     assert load < barrier < outer.body.index(column_loop), code
 
 
@@ -1637,7 +1667,7 @@ def test_thread_barrier_rules_after_the_loop() -> None:
         (row,) = items
         assert isinstance(row, LanePlacement)
         assert [
-            _is_barrier(item) for item in row.items if isinstance(item, ast.AST)
+            is_barrier(item) for item in row.items if isinstance(item, ast.AST)
         ] == ([True, False] if barrier else [False]), statement
 
 
@@ -1704,7 +1734,7 @@ def test_racing_access_before_a_branch_gets_a_barrier_before_the_branch() -> Non
     (column_loop,) = _loops(row_loop, "lane_1")
     assert len(_barriers(function)) == 1, code
     load = _index_of(row_loop.body, "tile_offset_1")
-    barrier = next(i for i, s in enumerate(row_loop.body) if _is_barrier(s))
+    barrier = next(i for i, s in enumerate(row_loop.body) if is_barrier(s))
     assert load < barrier < row_loop.body.index(column_loop), code
 
 
@@ -2481,7 +2511,7 @@ def test_loop_invariant_read_in_a_device_loop_gets_a_barrier_closing_the_body() 
     function = _kernel_function(code)
     (device_loop,) = _loops(function, "tile_offset_1")
     assert len(_barriers(function)) == 2, code
-    positions = [i for i, s in enumerate(device_loop.body) if _is_barrier(s)]
+    positions = [i for i, s in enumerate(device_loop.body) if is_barrier(s)]
     load = _index_of(device_loop.body, "cutlass.Int32(0) *")
     store = _index_of(device_loop.body, ".store(")
     assert load < store, code
@@ -2588,7 +2618,7 @@ def _kinds(items: list[ast.AST | LanePlacement]) -> list[str]:
         "loop"
         if isinstance(item, LanePlacement)
         else "sync"
-        if _is_barrier(item)
+        if is_barrier(item)
         else "stmt"
         for item in items
     ]
@@ -3623,7 +3653,7 @@ _COLUMN_LANES_ON_ONE_THREAD_CONFIG = {
 
 
 def _barrier_positions(body: Sequence[ast.AST]) -> list[int]:
-    return [index for index, statement in enumerate(body) if _is_barrier(statement)]
+    return [index for index, statement in enumerate(body) if is_barrier(statement)]
 
 
 def test_carry_from_the_previous_tile_closes_the_device_loop_body() -> None:
@@ -3959,7 +3989,7 @@ def test_staging_access_of_another_threads_element_is_rejected(probe: str) -> No
     (branch,) = items
     assert isinstance(branch, ast.If)
     fence = next(
-        index for index, statement in enumerate(branch.orelse) if _is_barrier(statement)
+        index for index, statement in enumerate(branch.orelse) if is_barrier(statement)
     )
     branch.orelse.insert(fence, ast.parse(probe).body[0])
     with pytest.raises(exc.BackendUnsupported, match="inside a branch"):
@@ -4269,6 +4299,149 @@ def _loop_header(text: str) -> ast.For:
     (header,) = ast.parse(f"{text}:\n    pass\n").body
     assert isinstance(header, ast.For)
     return header
+
+
+def _rolled_lanes(
+    body: str,
+    *definitions: str,
+    chunk_shifts: dict[sympy.Symbol, sympy.Expr | None] | None = None,
+    chunks: int = 4,
+    start: str | None = None,
+) -> list[ast.AST | LanePlacement]:
+    """``body`` as one element of a looped reduction's consume sweep: 1024
+    columns a chunk, 64 threads, 16 lanes a thread (``rindex_1``).  The lane
+    loop is a per-thread loop around the body, one of the device loop's;
+    ``chunk_shifts`` makes the device loop's iterations ``chunks`` chunks,
+    from 0 or from ``start``, a uniform value (a cluster split's slice)."""
+    offset = "" if start is None else f"{start} + "
+    headers = [
+        _loop_header(
+            f"for roffset_1 in range(cutlass.Int32({start or 0}),"
+            f" cutlass.Int32({offset}{chunks * 1024}), cutlass.Int32(1024))"
+        ),
+        _loop_header("for reduction_lane_1 in range(16)"),
+    ]
+    items: list[ast.AST | LanePlacement] = list(ast.parse(body).body)
+    add_thread_barriers(
+        items,
+        [],
+        rename_groups={},
+        axis_sizes={0: 64},
+        definitions=ast.parse(
+            "rindex_1 = roffset_1 + cutlass.Int32(cute.arch.thread_idx()[0])"
+            " + cutlass.Int32(reduction_lane_1) * 64\n" + "".join(definitions)
+        ).body,
+        masks=frozenset(),
+        loop_variables=frozenset({"roffset_1", "reduction_lane_1"}),
+        loop_body=items,
+        loop_headers=headers,
+        lane_variables=frozenset({"reduction_lane_1"}),
+        chunk_shifts=chunk_shifts,
+    )
+    return items
+
+
+def test_rolled_lanes_reject_a_pair_meeting_in_two_lanes() -> None:
+    # A lane's own element is never another lane's: the load and the store
+    # need nothing.  A gathered load beside the store may read an element an
+    # earlier lane of the same thread stored, which the program reads before
+    # any store; no barrier orders a thread's own lanes.
+    store = f"{_pointer('out', 'rindex_1')}.store(v + 1.0)\n"
+    own = _rolled_lanes(f"v = {_pointer('out', 'rindex_1')}.load()\n" + store)
+    assert _kinds(own) == ["stmt", "stmt"], _kinds(own)
+    gather = (
+        f"column = {_pointer('idx', 'rindex_1')}.load()\n"
+        f"v = {_pointer('out', 'cutlass.Int32(column)')}.load()\n"
+    )
+    with pytest.raises(exc.BackendUnsupported, match="two lanes"):
+        _rolled_lanes(gather + store)
+
+
+def test_rolled_lanes_take_a_value_loaded_per_lane_as_the_lanes_own() -> None:
+    # ``shift`` is loaded around the body at an address only the lane
+    # variable names, which every thread loads alike: one value within a
+    # lane, but another lane's may differ, so ``rindex_1 + shift`` of two
+    # lanes may be one element and the read-modify-write meets itself
+    # across them.  So may two stores through two such values: with
+    # ``shift_a`` of lane 1 equal to ``shift_b`` of lane 0, lane 1's first
+    # store overwrites lane 0's second, where the program's second store
+    # comes last.
+    address = "rindex_1 + cutlass.Int32(shift)"
+    body = (
+        f"v = {_pointer('out', address)}.load()\n"
+        f"{_pointer('out', address)}.store(v + 1.0)\n"
+    )
+    with pytest.raises(exc.BackendUnsupported, match="two lanes"):
+        _rolled_lanes(
+            body, f"shift = {_pointer('shifts', 'reduction_lane_1')}.load()\n"
+        )
+    # Loaded at an address no lane variable names, ``shift`` is one value in
+    # every lane, and the read-modify-write is the lane's own element.
+    items = _rolled_lanes(body, f"shift = {_pointer('shifts', '0')}.load()\n")
+    assert _kinds(items) == ["stmt", "stmt"], _kinds(items)
+    stores = (
+        f"{_pointer('out', 'cutlass.Int32(shift_a)')}.store(1.0)\n"
+        f"{_pointer('out', 'cutlass.Int32(shift_b)')}.store(2.0)\n"
+    )
+    with pytest.raises(exc.BackendUnsupported, match="two lanes"):
+        _rolled_lanes(
+            stores,
+            f"shift_a = {_pointer('shifts_a', 'reduction_lane_1')}.load()\n",
+            f"shift_b = {_pointer('shifts_b', 'reduction_lane_1')}.load()\n",
+        )
+
+
+def test_rolled_lanes_keep_the_barrier_closing_the_body_across_chunks() -> None:
+    # Thread t's second store writes the element thread t + 1's first store
+    # writes, within a lane and, as neither address names the lane, from one
+    # lane to the next: a barrier between the stores and one closing the
+    # body.  The chunk rule, which only rejects, must leave both: the
+    # barrier pass pairs the body's iterations by every loop variable, the
+    # lanes' included, not only by the chunks the rule checks.
+    tid = "cutlass.Int32(cute.arch.thread_idx()[0])"
+    body = (
+        f"{_pointer('out', f'roffset_1 + {tid}')}.store(1.0)\n"
+        f"{_pointer('out', f'roffset_1 + ({tid} + 1) % 64')}.store(2.0)\n"
+    )
+    for chunk_shifts in (None, {}):
+        items = _rolled_lanes(body, chunk_shifts=chunk_shifts)
+        assert _kinds(items) == ["stmt", "sync", "stmt", "sync"], _kinds(items)
+
+
+def _shifted(load: str, store: str) -> str:
+    """A load of ``out`` at ``load`` and a store of it at ``store``."""
+    return (
+        f"v = {_pointer('out', load)}.load()\n{_pointer('out', store)}.store(v + 1.0)\n"
+    )
+
+
+def test_rolled_lanes_reject_a_pair_meeting_in_two_chunks_unless_one() -> None:
+    # Chunk i stores ``out[rindex_1 + 1024]``, the element chunk i + 1 loads
+    # at ``out[rindex_1]``, where the program loads every element before
+    # storing any: no barrier orders chunks, whatever the addresses, from
+    # chunk 0 or from a cluster slice's first.  A slice's walk of one chunk
+    # (its start a uniform value the terms do not model) has no later chunk,
+    # and the lanes of a chunk never meet (16 lanes of 64 columns); the
+    # barrier closing the body orders the threads across lanes, as the
+    # terms do not know the chunk.
+    body = _shifted("rindex_1", "rindex_1 + 1024")
+    for start in (None, "base"):
+        with pytest.raises(exc.BackendUnsupported, match="two chunks"):
+            _rolled_lanes(body, chunk_shifts={}, start=start)
+    items = _rolled_lanes(body, chunk_shifts={}, chunks=1, start="base")
+    assert _kinds(items) == ["stmt", "stmt", "sync"], _kinds(items)
+
+
+def test_rolled_lanes_tell_which_chunk_reaches_the_other_first() -> None:
+    # Loaded at ``out[rindex_1 + 1024]`` and stored at ``out[rindex_1]``,
+    # an element is loaded one chunk before it is stored, as the program
+    # orders the two.  Stored at ``out[rindex_1 + 1088]``, it is loaded in
+    # the next chunk by the next lane: the chunks meet in two lanes, which
+    # no chunk forces equal.
+    items = _rolled_lanes(_shifted("rindex_1 + 1024", "rindex_1"), chunk_shifts={})
+    assert _kinds(items) == ["stmt", "stmt"], _kinds(items)
+    with pytest.raises(exc.BackendUnsupported, match="two chunks"):
+        _rolled_lanes(_shifted("rindex_1", "rindex_1 + 1088"), chunk_shifts={})
 
 
 _ENCLOSING_LOOP_HEADERS = (
@@ -6042,10 +6215,14 @@ def test_full_slice_store_beside_a_rolled_reduction_of_another_extent_shares_its
         (lane,) = lanes
         assert f"{index} + cutlass.Int32(synthetic_lane_4) * 64\n" in code
         assert _accesses(lane, "dq") and not _accesses(lane, "flag"), code
+        # A block indexing its partner's axis walks D's live lanes on the
+        # partner's threads (192 / 64), its padded fourth dropped
+        # (``plan_synthetic_lanes``).
+        assert ast.unparse(lane.iter) == "range(3)", code
     else:
         assert not lanes and f"{index}\n" in code, code
-    # The lanes cover D's power-of-two padding: unmasked only where the 64
-    # threads cover D exactly.
+    # The mask comes from D's power-of-two padding: only D = 64, which the 64
+    # threads cover without padding, drops it (D = 192's 3 lanes keep it).
     assert ("mask_4 = indices_4 < " in code) == (d != 64)
 
 

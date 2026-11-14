@@ -48,6 +48,7 @@ from ._ast_pass_utils import names_read
 from ._ast_pass_utils import rename_names
 from ._ast_pass_utils import resolve_alias
 from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
+from .fuse_two_pass_loads import FUSE_CACHE_PREFIX
 from .fuse_two_pass_loads import _is_store_call
 from .fuse_two_pass_loads import _store_tensor_roots
 from .fuse_two_pass_loads import _tensor_arg_roots
@@ -397,7 +398,7 @@ def _is_hoistable_statement(stmt: ast.stmt, tensor_names: set[str]) -> bool:
             if not (
                 isinstance(target, ast.Subscript)
                 and isinstance(target.value, ast.Name)
-                and target.value.id.startswith("_fuse_cache_")
+                and target.value.id.startswith(FUSE_CACHE_PREFIX)
             ):
                 return False
     elif isinstance(stmt, ast.For):

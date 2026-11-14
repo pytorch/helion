@@ -19,11 +19,14 @@ from copy import deepcopy
 import operator
 from typing import TYPE_CHECKING
 
+from .....autotuner.compiler_coverage import MAX_COMPILER_COVERAGE_CONFIGS
 from .....autotuner.compiler_coverage import CompilerCoverageGroup
 from .....autotuner.compiler_coverage import CoverageDependency
 from .....autotuner.compiler_coverage import CoverageWitness
+from .....exc import InvalidConfig
 from .....runtime.config import Config
 from ....autotuner_heuristics.common import dedupe_configs
+from ...emitters.lane_packets import _CUTE_BYTE_PACK_TYPE
 from ...grouped_row_union import AB_STAGES_KEY as GROUPED_ROW_UNION_AB_STAGES_KEY
 from ...grouped_row_union import CONFIG_KEY as GROUPED_ROW_UNION_KEY
 from ...grouped_row_union import LEGACY_SCHEDULE
@@ -35,6 +38,7 @@ from ...grouped_row_union import (
 from ...grouped_row_union import SCHEDULE_KEY as GROUPED_ROW_UNION_SCHEDULE_KEY
 from ...grouped_row_union import STARTUP_PREFILL_KEY
 from ...grouped_row_union import TRANSPOSED_SCHEDULE
+from ...memory_ops import bool_reduction_row_blocks
 from ...split_k_cluster_config import FINALIZER_KEY
 from ...tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
 from ...tcgen05_constants import TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY
@@ -109,11 +113,15 @@ from .cute import CuteFlashAttentionHeuristic
 from .cute import CuteFlashGatedAttentionHeuristic
 from .cute import CuteFp8GemmSkinnyMHeuristic
 from .cute import CuteGdnRecurrenceHeuristic
+from .cute import CuteGridLaneJamHeuristic
 from .cute import CuteMaskedRolledClusterHeuristic
 from .cute import CuteNestedRowHeuristic
 from .cute import CutePackedSingleTokenRank1Heuristic
+from .cute import CutePersistentLaneUnrollHeuristic
 from .cute import CutePersistentSubwarpRowsHeuristic
+from .cute import CutePersistentUnpaddedRowsHeuristic
 from .cute import CutePointwiseVecHeuristic
+from .cute import CuteReductionLaneJamHeuristic
 from .cute import CuteReductionTileHeuristic
 from .cute import CuteReductionWideChunkHeuristic
 from .cute import CuteRegisterTileHeuristic
@@ -122,8 +130,10 @@ from .cute import CuteResidentRowHeuristic
 from .cute import CuteResidentRowWideClusterHeuristic
 from .cute import CuteRolledClusterLadderHeuristic
 from .cute import CuteRolledRowLadderHeuristic
+from .cute import CuteRolledRowLoadsFirstHeuristic
 from .cute import CuteScanTileHeuristic
 from .cute import CuteSiblingRowHeuristic
+from .cute import CuteSplitColumnReductionHeuristic
 from .cute import CuteStridedReductionHeuristic
 from .cute import CuteTcgen05ClusterM2FfiHeuristic
 from .cute import CuteTcgen05ClusterM2Heuristic
@@ -189,9 +199,11 @@ from .cute_tcgen05_schedule import CuteTcgen05ScheduleHeuristic
 from .cute_tile_packing import CuteTilePackWarpPerRowHeuristic
 from .cute_topk_coarse_keys import register_topk_coarse_keys_coverage
 from .cute_topk_coarse_keys import register_topk_key_recovery_coverage
+from .cute_transposed_store_seeds import CuteTransposedStoreSeedsHeuristic
 from .cute_warp_atomic import CuteWarpAtomicHeuristic
 
 if TYPE_CHECKING:
+    from .....autotuner.config_spec import ConfigSpec
     from ....autotuner_heuristics.registry import AutotunerHeuristicType
     from ....autotuner_heuristics.registry import CompilerHeuristicSpecializationFact
     from ....compile_environment import CompileEnvironment
@@ -237,7 +249,12 @@ _CUTE_HEURISTIC_CLASSES: tuple[AutotunerHeuristicType, ...] = (
     CuteResidentSequenceHeuristic,
     CutePersistentSubwarpRowsHeuristic,
     CuteAsyncPersistentSubwarpRowsHeuristic,
+    CutePersistentLaneUnrollHeuristic,
+    CutePersistentUnpaddedRowsHeuristic,
     CuteRolledRowLadderHeuristic,
+    CuteRolledRowLoadsFirstHeuristic,
+    CuteGridLaneJamHeuristic,
+    CuteReductionLaneJamHeuristic,
     CuteRolledClusterLadderHeuristic,
     CuteMaskedRolledClusterHeuristic,
     CuteScanTileHeuristic,
@@ -248,6 +265,7 @@ _CUTE_HEURISTIC_CLASSES: tuple[AutotunerHeuristicType, ...] = (
     CuteGemvFragmentMmaHeuristic,
     CuteGemvRingMmaHeuristic,
     CuteColumnReductionHeuristic,
+    CuteSplitColumnReductionHeuristic,
     CuteSiblingRowHeuristic,
     CuteNestedRowHeuristic,
     CuteResidentRowHeuristic,
@@ -295,6 +313,7 @@ _CUTE_HEURISTIC_CLASSES: tuple[AutotunerHeuristicType, ...] = (
     CuteFragmentHalfMmaHeuristic,
     CuteStridedReductionHeuristic,
     CutePrivatizeAtomicsHeuristic,
+    CuteTransposedStoreSeedsHeuristic,
 )
 
 
@@ -756,3 +775,75 @@ def register_coverage_groups(env: CompileEnvironment, device_ir: DeviceIR) -> No
     register_radix_selection_coverage(env, device_ir)
 
     register_mxfp8_epilogue_coverage(env)
+    register_bool_byte_packets_coverage(env, device_ir)
+
+
+# The vector widths of bool bytes one packed integer holds
+# (``_CUTE_BYTE_PACK_TYPE`` past its one-byte entry).
+_BYTE_PACKET_WIDTHS = frozenset(_CUTE_BYTE_PACK_TYPE) - {1}
+
+
+def _rolls_a_byte_packet_row(
+    spec: ConfigSpec, config: Config, blocks: frozenset[int]
+) -> bool:
+    """Whether ``config`` rolls one of ``blocks``, the reductions reading a
+    bool row (``bool_reduction_row_blocks``), at a vector width one packed
+    integer holds (``_BYTE_PACKET_WIDTHS``)."""
+    loops = config.config.get("reduction_loops")
+    widths = config.config.get("cute_vector_widths")
+    if not isinstance(loops, (list, tuple)) or not isinstance(widths, (list, tuple)):
+        return False
+    return any(
+        spec.reduction_loops.config_get(list(loops), block_id, None) is not None
+        and spec.cute_vector_widths.config_get(list(widths), block_id, 1)
+        in _BYTE_PACKET_WIDTHS
+        for block_id in blocks
+        if block_id in spec.cute_vector_widths.valid_block_ids()
+    )
+
+
+def register_bool_byte_packets_coverage(
+    env: CompileEnvironment, device_ir: DeviceIR
+) -> None:
+    """Cover ``cute_bool_byte_packets`` on the first compiler seeds whose
+    looped reductions can take a bool row's byte packets.
+
+    The knob is off by default, so every seed renders as before.  The
+    witnesses are extra candidates, measured like any other: the packets win
+    where no later sweep reloads the row from memory (a single sweep, or
+    register reloads) and can lose where one reloads it from L2 (the cheaper
+    first sweep leaves less of the row there).  A carrier rolls a reduction at
+    a vector width one packed integer holds; each is the seed as the search
+    canonicalizes it, kept only when its witness transfers strictly.
+    """
+    spec = env.config_spec
+    if not spec.cute_bool_byte_packet_sites or spec.matmul_facts:
+        return
+    blocks = bool_reduction_row_blocks(device_ir, spec)
+    generation = spec.create_config_generation()
+    carriers: list[Config] = []
+    for _flat, seed in generation.seed_flat_config_pairs():
+        if not _rolls_a_byte_packet_row(spec, seed, blocks):
+            continue
+        try:
+            generation.strict_config_pair(
+                Config.from_dict(
+                    deepcopy(seed.config) | {"cute_bool_byte_packets": True}
+                )
+            )
+        except InvalidConfig:
+            continue
+        carriers.append(seed)
+        if len(carriers) == MAX_COMPILER_COVERAGE_CONFIGS:
+            break
+    if carriers:
+        spec.register_compiler_coverage_group(
+            CompilerCoverageGroup(
+                mechanism="cute.bool_byte_packets",
+                version=1,
+                key="cute_bool_byte_packets",
+                domain=(False, True),
+                legacy=False,
+                witnesses=tuple(CoverageWitness(seed, True) for seed in carriers),
+            )
+        )

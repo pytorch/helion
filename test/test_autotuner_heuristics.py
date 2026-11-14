@@ -4344,6 +4344,13 @@ _CUTE_HEURISTIC_ORDER = (
     "cute_fragment_half_mma",
     "cute_strided_reduction",
     "cute_privatize_atomics",
+    "cute_rolled_row_loads_first",
+    "cute_persistent_lane_unroll",
+    "cute_persistent_unpadded_rows",
+    "cute_grid_lane_jam",
+    "cute_transposed_store_seeds",
+    "cute_split_column_reduction",
+    "cute_reduction_lane_jam",
 )
 
 

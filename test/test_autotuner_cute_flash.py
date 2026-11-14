@@ -8178,6 +8178,8 @@ class TestCuteAutotuner(TestCase):
                 "cute_vector_packet_unroll",
                 "cute_vloop_sink",
                 "cute_lane_unroll",
+                "cute_unpadded_rows",
+                "cute_grid_lane_jam",
                 "cute_pdl",
                 "cute_pdl_release",
                 "cute_pdl_spread",

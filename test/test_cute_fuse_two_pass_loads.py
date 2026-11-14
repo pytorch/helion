@@ -37,7 +37,13 @@ from helion._testing import HALF_DTYPE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing.cute_sweep_kernels import center_fp8_row
+from helion._testing.cute_sweep_kernels import center_fp8_row_config
 from helion._testing.cute_sweep_kernels import dropout_layernorm
+from helion._testing.cute_sweep_kernels import scaled_workspace_config
+from helion._testing.cute_sweep_kernels import scaled_workspace_reload
+from helion._testing.cute_sweep_kernels import workspace_chunk_config
+from helion._testing.cute_sweep_kernels import workspace_reload
 
 cutlass = pytest.importorskip("cutlass")
 cute = pytest.importorskip("cutlass.cute")
@@ -1320,7 +1326,7 @@ def test_hinted_vector_load_helpers_key_like_plain_loads() -> None:
     # Cross-sweep matching keys on the load text with hints stripped: a
     # hinted helper packet keys as the plain ``cute.arch.load`` it stands for.
     from helion._compiler.cute.fuse_two_pass_loads import _load_kind
-    from helion._compiler.cute.fuse_two_pass_loads import _node_text
+    from helion._compiler.cute.fuse_two_pass_loads import _normalized_load_text
 
     vector_type = "ir.VectorType.get([4], cutlass.Uint16.mlir_type)"
     plain = ast.parse(f"cute.arch.load(x.iterator + i, {vector_type})", mode="eval")
@@ -1329,9 +1335,13 @@ def test_hinted_vector_load_helpers_key_like_plain_loads() -> None:
     )
     assert _load_kind(plain.body) == "vec"
     assert _load_kind(hinted.body) == "vec"
-    assert _node_text(plain.body) == _node_text(hinted.body)
+
+    def key(node: ast.Expression) -> str:
+        return _normalized_load_text(node.body, {})
+
+    assert key(plain) == key(hinted)
     other = ast.parse(f"cute.arch.load(y.iterator + i, {vector_type})", mode="eval")
-    assert _node_text(other.body) != _node_text(hinted.body)
+    assert key(other) != key(hinted)
 
 
 @pytest.fixture(autouse=True)
@@ -1345,6 +1355,92 @@ def _disable_online_to_3pass(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @onlyBackends(["cute"])
+def test_fp8_raw_bytes_carried_across_sweeps_match_eager() -> None:
+    # The consume sweep reads the reduce sweep's raw fp8 bytes back from a
+    # ``Uint8`` fragment instead of loading them again, and decodes them
+    # exactly as the load it replaces would.
+    torch.manual_seed(0)
+    x = torch.randn(8, 4096, device=DEVICE).to(torch.float8_e4m3fn)
+    kernel = helion.kernel(center_fp8_row, backend="cute", static_shapes=True)
+    bound = kernel.bind((x,))
+    config = center_fp8_row_config(bound.config_spec)
+    code = bound.to_code(config)
+    assert "cute.make_rmem_tensor(32, cutlass.Uint8)" in code
+    assert code.count("cute.arch.load(x.iterator") == 1
+    out = bound.compile_config(config)(x)
+    v = x.float()
+    expected = (v - v.sum(-1, keepdim=True)).to(torch.bfloat16)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@onlyBackends(["cute"])
+def test_workspace_reload_matches_eager() -> None:
+    # The barrier ordering the first sweep's workspace stores before the
+    # second sweep's loads sits in each lane.  Each thread reads back only its
+    # own stores here, and the row sum between the sweeps synchronizes the CTA
+    # too.
+    torch.manual_seed(0)
+    x = torch.randn(8, 4096, device=DEVICE, dtype=torch.bfloat16)
+    kernel = helion.kernel(workspace_reload, backend="cute", static_shapes=True)
+    bound = kernel.bind((x,))
+    config = workspace_chunk_config(bound.config_spec)
+    out = bound.compile_config(config)(x)
+    v = x.float()
+    expected = (v * v - v.sum(-1, keepdim=True)).to(x.dtype)
+    torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-1)
+
+
+@onlyBackends(["cute"])
+def test_scaled_workspace_reload_ragged_byte_packets_match_eager() -> None:
+    # Rows that end inside their last 1024-element chunk load ``keep`` as
+    # byte packets too: 3000 columns (whole packets in a masked chunk) and
+    # 3001 of rows padded to 3008 (the straddling packet's in-bounds lanes
+    # reread one by one), as ``grad``'s carrier packets do.
+    torch.manual_seed(0)
+    kernel = helion.kernel(scaled_workspace_reload, backend="cute", static_shapes=True)
+    for n, padded in ((3000, 3000), (3001, 3008)):
+        x = torch.randn(8, padded, device=DEVICE, dtype=torch.bfloat16)[:, :n]
+        grad = torch.randn(8, padded, device=DEVICE, dtype=torch.bfloat16)[:, :n]
+        keep = (torch.rand(8, padded, device=DEVICE) > 0.1)[:, :n]
+        bound = kernel.bind((x, grad, keep))
+        config = scaled_workspace_config(
+            bound.config_spec, "auto", bool_byte_packets=True
+        )
+        assert "cute.arch.load(keep.iterator" in bound.to_code(config)
+        out = bound.compile_config(config)(x, grad, keep)
+        v = x.float()
+        scaled = grad.float() * (keep.float() * 1.1111111111111112)
+        expected = (v * v * scaled - (scaled * v).sum(-1, keepdim=True)).to(x.dtype)
+        torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-1)
+
+
+@onlyBackends(["cute"])
+def test_scaled_workspace_reload_packets_match_eager() -> None:
+    # Both sweeps load ``grad`` and, under ``cute_bool_byte_packets``, the
+    # bool ``keep`` as packets: the reduce sweep's after the workspace store's
+    # append, the consume sweep's behind the barrier that orders the workspace
+    # reload; with register reloads the consume sweep reads the reduce sweep's
+    # packets from a fragment (``test_cute_rolled_packet_hoist.py`` checks the
+    # code).
+    torch.manual_seed(0)
+    rows, n = 8, 4096
+    x = torch.randn(rows, n, device=DEVICE, dtype=torch.bfloat16)
+    grad = torch.randn(rows, n, device=DEVICE, dtype=torch.bfloat16)
+    keep = torch.rand(rows, n, device=DEVICE) > 0.1
+    kernel = helion.kernel(scaled_workspace_reload, backend="cute", static_shapes=True)
+    bound = kernel.bind((x, grad, keep))
+    v = x.float()
+    scaled = grad.float() * (keep.float() * 1.1111111111111112)
+    expected = (v * v * scaled - (scaled * v).sum(-1, keepdim=True)).to(x.dtype)
+    for reloads in ("auto", "register"):
+        for bool_byte_packets in (False, True):
+            config = scaled_workspace_config(
+                bound.config_spec, reloads, bool_byte_packets=bool_byte_packets
+            )
+            out = bound.compile_config(config)(x, grad, keep)
+            torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-1)
+
+
 class TestCuteFuseTwoPassLoads(TestCase):
     def test_fuser_fires_with_vec_hoist(self) -> None:
         """When the vec hoist runs, the two sweeps' loads use names like

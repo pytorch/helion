@@ -1744,7 +1744,8 @@ def test_looped_retry_matches_reference(
     # the config keeps the reduction persistent.  When the split rejects the
     # body, the retry compiles the looped reduction (reduction_loops=[128],
     # 64 reduction threads) the geometry meant before register tiles existed;
-    # with ``cute_vloop_sink`` the guarded column sum sinks its V-loop there.
+    # with ``cute_vloop_sink`` the column sums sink their V-loops there, and
+    # the sink's tile-first layout puts the 8 tile threads on thread axis 0.
     torch.manual_seed(0)
     tensors = tuple(torch.randn(1024, 4096, device=DEVICE) for _ in range(inputs))
     bound = kernel.bind((*tensors, *extra))
@@ -1755,8 +1756,8 @@ def test_looped_retry_matches_reference(
     code = bound.to_code(config)
     assert "synthetic_lane_1" not in code
     assert "_REDUCTION_BLOCK_1" in code
-    assert "block=(64, 8, 1)" in code
-    if sink and kernel is col_sum_guarded:
+    assert ("block=(8, 64, 1)" if sink else "block=(64, 8, 1)") in code
+    if sink:
         assert "_vsink_" in code
     compiled = bound.compile_config(config)
     for _ in range(2):
