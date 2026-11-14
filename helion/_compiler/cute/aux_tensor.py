@@ -25,21 +25,28 @@ matmul are supported (chains with several aux ops, e.g.
 from __future__ import annotations
 
 import dataclasses
+import operator
 from typing import TYPE_CHECKING
 
 import torch
 
+from ...language import _tracing_ops
 from ...language import matmul_ops
 from ...language import memory_ops
 from ..compile_environment import CompileEnvironment
 from ..fx_load_trace import trace_to_load
 from .cute_epilogue import Tcgen05UnaryEpilogueChain
 from .cute_epilogue import _AuxiliaryTensorLoadExpr
+from .cute_epilogue import analyze_tcgen05_aux_only_store_chain
 from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
 from .cute_epilogue import aux_leaf_takes_promoted_f32_stage
+from .cute_epilogue import store_tile_index_nodes
 from .cute_epilogue import tcgen05_rowvec_aux_row
 from .cute_fx_walk import build_inner_outputs_index_from_graphs
 from .cute_fx_walk import reach_matmul_anchors
+from .register_loads import has_opaque_inline_asm
+from .register_loads import host_load_is_readonly
+from .register_loads import host_storage_is_exclusive
 from .tcgen05_constants import Tcgen05RowvecAuxFacts
 from .tcgen05_constants import Tcgen05RowvecAuxRow
 
@@ -160,12 +167,25 @@ def _output_global_shape_from_store(
 def analyze_tcgen05_matmul_store_chains(
     graphs: Sequence[GraphInfo],
     matmul_fx_node: torch.fx.Node,
+    *,
+    adopt_aux_only: bool = True,
+    prove_aux_only_reorder: bool = True,
 ) -> tuple[tuple[torch.fx.Node, Tcgen05UnaryEpilogueChain], ...] | None:
-    """Analyze every store that transitively consumes ``matmul_fx_node``.
+    """Analyze every store of ``matmul_fx_node``'s epilogue: each store that
+    transitively consumes it, then (``adopt_aux_only``) the stores of
+    epilogue inputs alone that the epilogue adopts
+    (``tcgen05_aux_only_epilogue_stores``), whose chains do not read the
+    accumulator (``Tcgen05UnaryEpilogueChain.reads_accumulator``). Their
+    alias proof reads the host function's arguments, so with adoption on this
+    runs inside the host function; without ``prove_aux_only_reorder`` the
+    stores that structurally qualify join ahead of that proof, which the
+    structural facts recorded outside it use to price their C rings.
 
     Returns ``None`` when there is no consuming store or any reachable store is
     outside the tcgen05 epilogue whitelist. Each successful entry pairs the
     store node with the same chain representation used by store codegen.
+    Only the tcgen05 store epilogue lowers an adopted store; the other
+    lowerings decline it, and a family priced for one output sees a second.
     """
     inner_outputs = build_inner_outputs_index_from_graphs(graphs)
     target_fx_nodes = {matmul_fx_node}
@@ -191,7 +211,183 @@ def analyze_tcgen05_matmul_store_chains(
             if anchor is not matmul_fx_node:
                 return None
             analyzed_stores.append((store_node, chain))
-    return tuple(analyzed_stores) if analyzed_stores else None
+    if not analyzed_stores:
+        return None
+    if not adopt_aux_only:
+        return tuple(analyzed_stores)
+    return (
+        *analyzed_stores,
+        *tcgen05_aux_only_epilogue_stores(
+            graphs,
+            matmul_fx_node,
+            [store for store, _chain in analyzed_stores],
+            prove_reorder=prove_aux_only_reorder,
+        ),
+    )
+
+
+def tcgen05_aux_only_epilogue_stores(
+    graphs: Sequence[GraphInfo],
+    matmul_fx_node: torch.fx.Node,
+    output_stores: Sequence[torch.fx.Node],
+    *,
+    prove_reorder: bool = True,
+) -> tuple[tuple[torch.fx.Node, Tcgen05UnaryEpilogueChain], ...]:
+    """The stores of epilogue inputs alone that join ``matmul_fx_node``'s
+    epilogue, with their one-step chains, in graph order.
+
+    ``output_stores`` are the stores that consume the accumulator. A
+    collective matmul runs the rest of its tile body once per thread, so a
+    store such as ``out1[tile] = in2[tile].to(torch.float32)`` next to them
+    reads a placeholder (``cutlass.BFloat16(0)``) instead of ``in2``
+    (``memory_ops._cute_load_has_placeholder_value``) and is refused; the
+    epilogue stores it instead, walking the output tile's subtiles with its
+    own C ring and reading ``in2`` through the accumulator's partition. A
+    store joins when it is a plain store in the accumulator stores' graph
+    (their execution scope) of the same exact output tile, it and its loads
+    come after the loop that produces the accumulator (one ahead of it
+    lowers before the matmul registers its epilogue and reads a
+    placeholder), its value reaches no matmul and is an auxiliary expression
+    of exact-shape loads (``analyze_tcgen05_aux_only_store_chain``), and no
+    other matmul stores in that graph (the store would have no unique
+    epilogue).
+
+    The epilogue's reads and writes run as asynchronous TMA stores and
+    per-subtile loads, so the store's loads (its device scalars included)
+    must read no storage a store or atomic of the kernel may write
+    (``register_loads.host_load_is_readonly``), and nothing but the store
+    may read, write or atomically update a storage that may alias its
+    destination (``register_loads.host_storage_is_exclusive``): adopting
+    ``copy_out[tile] = acc_out[tile]`` after ``acc_out[tile] = acc`` reads
+    ``acc_out`` while its TMA stores are in flight, and a persistent 128x128
+    tile with four C stages hangs on it. Inline assembly that could hide a
+    store (``register_loads.has_opaque_inline_asm``) defeats both proofs.
+    ``prove_reorder=False`` skips them (see
+    ``analyze_tcgen05_matmul_store_chains``).
+    """
+    if not output_stores:
+        return ()
+    graph = output_stores[0].graph
+    if not any(
+        node.target is memory_ops.store and node not in output_stores
+        for node in graph.nodes
+    ):
+        return ()
+    # The output tile's index nodes, which every accumulator store shares.
+    tiles = {store_tile_index_nodes(store) for store in output_stores}
+    if any(store.graph is not graph for store in output_stores) or len(tiles) != 1:
+        return ()
+    (tile,) = tiles
+    if tile is None:
+        return ()
+    inner_outputs = build_inner_outputs_index_from_graphs(graphs)
+    mma_nodes = _tcgen05_aux_detector_mma_nodes(graphs)
+    order = {node: index for index, node in enumerate(graph.nodes)}
+    accumulator_ready = _accumulator_ready_position(
+        graph, matmul_fx_node, inner_outputs, order
+    )
+    if accumulator_ready is None:
+        return ()
+    candidates: list[tuple[torch.fx.Node, Tcgen05UnaryEpilogueChain]] = []
+    for store_node, store_value in _store_value_pairs_from_graph(graph):
+        if store_node in output_stores:
+            continue
+        if reached := reach_matmul_anchors(
+            store_value,
+            target_fx_nodes=mma_nodes,
+            inner_outputs_by_graph_id=inner_outputs,
+        ):
+            if reached - {matmul_fx_node}:
+                return ()  # another matmul's epilogue shares the graph
+            continue
+        if (
+            order[store_node] < accumulator_ready
+            or store_tile_index_nodes(store_node) != tile
+        ):
+            continue
+        chain = analyze_tcgen05_aux_only_store_chain(store_node)
+        if chain is not None and all(
+            leaf.load_node.graph is graph and order[leaf.load_node] > accumulator_ready
+            for leaf in chain.auxiliary_tensor_loads
+        ):
+            candidates.append((store_node, chain))
+    if not candidates or not prove_reorder:
+        return tuple(candidates)
+    if has_opaque_inline_asm(graphs):
+        return ()
+    env = CompileEnvironment.current()
+    # The matmul's operand loads read their tiles in other CTAs' main loops
+    # whatever the epilogue does: a destination aliasing an operand is a race
+    # in the source program already, not one the epilogue's order creates.
+    operand_loads = _matmul_operand_loads(matmul_fx_node)
+    return tuple(
+        (store_node, chain)
+        for store_node, chain in candidates
+        if all(
+            host_load_is_readonly(load, env, graphs, allow_unbound=True)
+            for load in (
+                *(leaf.load_node for leaf in chain.auxiliary_tensor_loads),
+                *(
+                    scalar.source
+                    for scalar in chain.runtime_scalars
+                    if isinstance(scalar.source, torch.fx.Node)
+                ),
+            )
+        )
+        and (destination := _output_tensor_from_store_node(store_node)) is not None
+        and host_storage_is_exclusive(
+            destination,
+            {store_node, *operand_loads},
+            env,
+            graphs,
+            allow_unbound=True,
+        )
+    )
+
+
+def _accumulator_ready_position(
+    graph: torch.fx.Graph,
+    matmul_fx_node: torch.fx.Node,
+    inner_outputs: dict[int, tuple[torch.fx.Node | None, ...]],
+    order: dict[torch.fx.Node, int],
+) -> int | None:
+    """Where ``matmul_fx_node``'s accumulator becomes available in ``graph``:
+    the matmul itself, or the first result of the loop around it."""
+    if matmul_fx_node.graph is graph:
+        return order[matmul_fx_node]
+    return min(
+        (
+            order[node]
+            for node in graph.nodes
+            if node.op == "call_function"
+            and node.target is operator.getitem
+            and isinstance(base := node.args[0], torch.fx.Node)
+            and _tracing_ops.is_for_loop_target(base.target)
+            and matmul_fx_node
+            in reach_matmul_anchors(
+                node,
+                target_fx_nodes={matmul_fx_node},
+                inner_outputs_by_graph_id=inner_outputs,
+            )
+        ),
+        default=None,
+    )
+
+
+def _matmul_operand_loads(matmul_fx_node: torch.fx.Node) -> set[torch.fx.Node]:
+    """The loads in ``matmul_fx_node``'s graph that feed its operands."""
+    loads: set[torch.fx.Node] = set()
+    seen: set[torch.fx.Node] = set()
+    stack = list(matmul_fx_node.all_input_nodes)
+    while stack:
+        node = stack.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        if node.target is memory_ops.load:
+            loads.add(node)
+        stack.extend(node.all_input_nodes)
+    return loads
 
 
 def _step_host_tensor(
@@ -406,7 +602,12 @@ def host_function_has_tcgen05_aux_kernel_pattern(
     if not mma_nodes:
         return False
     for mma_node in mma_nodes:
-        analyzed_stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
+        # A store of epilogue inputs alone the epilogue may adopt reads its
+        # operand through the same guarded per-subtile loads (ahead of the
+        # alias proof the structural facts cannot run).
+        analyzed_stores = analyze_tcgen05_matmul_store_chains(
+            graphs, mma_node, prove_aux_only_reorder=False
+        )
         if analyzed_stores is not None and any(
             chain.auxiliary_tensor_loads for _, chain in analyzed_stores
         ):
@@ -428,7 +629,12 @@ def host_function_tcgen05_exact_shape_aux_tensors(
     graphs = host_function.device_ir.graphs
     tensors: dict[int, torch.Tensor] = {}
     for mma_node in _tcgen05_aux_detector_mma_nodes(graphs):
-        analyzed_stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
+        # The stores of epilogue inputs alone the epilogue may adopt included
+        # (ahead of their alias proof): a superset of the operands the codegen
+        # descriptors (``discover_tcgen05_aux_tensor_descriptors``) stage.
+        analyzed_stores = analyze_tcgen05_matmul_store_chains(
+            graphs, mma_node, prove_aux_only_reorder=False
+        )
         if analyzed_stores is None:
             continue
         for _store_node, chain in analyzed_stores:
@@ -463,7 +669,13 @@ def host_function_tcgen05_rowvec_aux_facts(
     exact_aux_itemsizes: tuple[int, ...] = ()
     ring_aux_itemsizes: tuple[int, ...] = ()
     for mma_node in _tcgen05_aux_detector_mma_nodes(graphs):
-        analyzed_stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
+        # Every store that owns a C ring, the stores of epilogue inputs alone
+        # the epilogue may adopt included: the structural facts run without the
+        # host function their alias proof reads, and pricing every candidate's
+        # ring only overestimates.
+        analyzed_stores = analyze_tcgen05_matmul_store_chains(
+            graphs, mma_node, prove_aux_only_reorder=False
+        )
         if analyzed_stores is None:
             continue
         output_count = max(output_count, len(analyzed_stores))
@@ -535,7 +747,10 @@ def host_function_tcgen05_aux_loads_on_every_store(
         return False
     found = False
     for mma_node in _tcgen05_aux_detector_mma_nodes(graphs):
-        analyzed_stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
+        # An adopted store of epilogue inputs always loads one.
+        analyzed_stores = analyze_tcgen05_matmul_store_chains(
+            graphs, mma_node, adopt_aux_only=False
+        )
         if analyzed_stores is None:
             continue
         found = True

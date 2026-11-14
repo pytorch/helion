@@ -222,6 +222,9 @@ from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
 )
 from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT,
+)
+from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY,
 )
 from helion._compiler.cute.tcgen05_constants import (
@@ -10626,7 +10629,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
 
     @onlyBackends(["cute"])
-    def test_cute_tcgen05_aux_tma_seed_rejects_unrelated_exact_aux_store(
+    def test_cute_tcgen05_aux_tma_seed_skips_an_adopted_aux_only_store(
         self,
     ) -> None:
         @helion.kernel(backend="cute")
@@ -10656,13 +10659,20 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             bound = cute_matmul_and_elementwise_store.bind(args)
 
         spec = bound.config_spec
-        # The residual load belongs to a separate elementwise store, not the
-        # matmul epilogue, so no aux-only matmul search axis is productive.
-        self.assertFalse(spec.tcgen05.aux_kernel_detected)
+        # The matmul's epilogue adopts the store of the residual alone, so the
+        # epilogue reads an aux operand (``aux_kernel_detected``); but the
+        # residual reaches no accumulator chain, so no aux TMA seed stages it,
+        # and no seed hoists aux loads ahead of the accumulator wait (``out``
+        # has none to hoist).
+        self.assertTrue(spec.tcgen05.aux_kernel_detected)
         self.assertFalse(spec.tcgen05.exact_shape_aux_kernel_detected)
-        self.assertNotIn(
-            TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
-            {key for key, _count, _is_sequence in spec.flat_key_layout()},
+        self.assertFalse(spec.tcgen05.aux_loads_on_every_store)
+        self.assertFalse(
+            any(
+                config.config.get(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY)
+                == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+                for config in spec.compiler_seed_configs
+            )
         )
         self.assertFalse(
             any(

@@ -57,6 +57,7 @@ from ._ast_pass_utils import names_read
 from .cache_policy_loads import CachePolicy
 from .cache_policy_loads import hint_wide_packets
 from .cute_epilogue import _ZERO_ARG_TARGETS
+from .cute_epilogue import analyze_tcgen05_aux_only_store_chain
 from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
 from .cute_fx_walk import build_inner_outputs_index
 from .cute_fx_walk import reach_matmul_anchors
@@ -130,6 +131,7 @@ if TYPE_CHECKING:
     from ..tile_strategy import DeviceLoopOrGridState
     from ..tile_strategy import PerThreadFlattenedTileStrategy
     from ..tile_strategy import PerThreadNDTileStrategy
+    from .cute_epilogue import Tcgen05UnaryEpilogueChain
     from .device_state import CuteVloopWrapperFact
 
     CuteLaneTileStrategy = PerThreadNDTileStrategy | PerThreadFlattenedTileStrategy
@@ -2937,14 +2939,84 @@ def _try_splice_tcgen05_unary_epilogue(
     # left in the prologue they are global reads ahead of every role wait and
     # force ``cute_pdl`` to wait at kernel entry instead of in the roles.
     state.codegen.allow_dead_assignments_owned_by_nodes(
-        (
-            *_pure_epilogue_ancestors(value_node),
-            *(
-                leaf.source
-                for leaf in chain.runtime_scalars
-                if isinstance(leaf.source, torch.fx.Node)
-            ),
+        _spliced_value_nodes(value_node, chain)
+    )
+    stmts = rewritten_stmt if isinstance(rewritten_stmt, list) else [rewritten_stmt]
+    for stmt in stmts:
+        state.add_statement(stmt)
+    return ast.Constant(value=None)
+
+
+def _spliced_value_nodes(
+    value_node: torch.fx.Node, chain: Tcgen05UnaryEpilogueChain
+) -> tuple[torch.fx.Node, ...]:
+    """The nodes a spliced store's scalar lowering computed that the epilogue
+    recomputes: the pure ancestors of its value and the chain's rank-0 device
+    scalar loads (``scale[()]``), which the epilogue re-reads per tile."""
+    return (
+        *_pure_epilogue_ancestors(value_node),
+        *(
+            leaf.source
+            for leaf in chain.runtime_scalars
+            if isinstance(leaf.source, torch.fx.Node)
+        ),
+    )
+
+
+def _try_splice_tcgen05_aux_only_epilogue(
+    state: CodegenState,
+    tensor: object,
+    subscript: list[object] | tuple[object, ...],
+    ast_subscript: list[object] | tuple[object, ...],
+    extra_mask: ast.AST | None,
+    value_node: torch.fx.Node | None,
+) -> ast.AST | None:
+    """Splice ``out1[tile] = in2[tile].to(torch.float32)``, a store of
+    epilogue inputs alone, into the epilogue of the matmul that adopted it
+    (``tcgen05_aux_only_store_anchor``).
+
+    Its load is a placeholder (``cutlass.BFloat16(0)``) once the collective
+    matmul suppresses the lane loops, and the generic store has no per-element
+    coordinates either; the epilogue walks the matmul's output subtiles and
+    reads ``in2`` through the accumulator's partition as an auxiliary leaf.
+    Returns the splice sentinel, or ``None`` when the store is not adopted.
+    """
+    if (
+        state.fx_node is None
+        or value_node is None
+        or (anchor := tcgen05_aux_only_store_anchor(state, state.fx_node)) is None
+    ):
+        return None
+    chain = analyze_tcgen05_aux_only_store_chain(state.fx_node)
+    if chain is None or extra_mask is not None:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{state.fx_node.name} lost the proof that adopted it into a "
+            "collective matmul's epilogue",
         )
+    assert isinstance(tensor, torch.Tensor)  # the adopted store's host tensor
+    result_var = state.device_function.cute_state.tcgen05.matmul_fx_node_result_vars[
+        anchor
+    ]
+    rewritten_stmt = _codegen_cute_store_tcgen05_tile(
+        state,
+        tensor,
+        subscript,
+        ast_subscript,
+        extra_mask,
+        result_var,
+        epilogue_chain=chain,
+    )
+    if rewritten_stmt is None:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{state.fx_node.name} stores epilogue inputs alone beside a "
+            "collective matmul, whose epilogue could not render it",
+        )
+    # The scalar lowering of the value read the placeholder loads; the
+    # epilogue re-reads them, so the definitions above them are dead.
+    state.codegen.allow_dead_assignments_owned_by_nodes(
+        _spliced_value_nodes(value_node, chain)
     )
     stmts = rewritten_stmt if isinstance(rewritten_stmt, list) else [rewritten_stmt]
     for stmt in stmts:
@@ -3370,6 +3442,8 @@ def _(state: CodegenState) -> ast.AST:
     # splice off and fall through to the loud-failure backstop
     # below.
     spliced = _try_splice_tcgen05_unary_epilogue(
+        state, tensor, subscript, ast_subscript, extra_mask, value_node
+    ) or _try_splice_tcgen05_aux_only_epilogue(
         state, tensor, subscript, ast_subscript, extra_mask, value_node
     )
     if spliced is not None:
@@ -6058,9 +6132,8 @@ def _cute_load_source_is_readonly(state: CodegenState) -> bool:
     (``host_load_is_readonly``).  Inline assembly outside the scalar
     arithmetic envelope could hide a store and declines the hint as well.
     """
-    from ...language.inline_asm_ops import inline_asm_elementwise
     from .cutedsl_compat import readonly_packet_load_supported
-    from .pure_lane_packets import is_pure_scalar_assembly
+    from .register_loads import has_opaque_inline_asm
     from .register_loads import host_load_is_readonly
 
     env = CompileEnvironment.current()
@@ -6071,12 +6144,7 @@ def _cute_load_source_is_readonly(state: CodegenState) -> bool:
             env.config_spec.target_device_capability, torch.version.cuda
         )
         and host_load_is_readonly(state.fx_node, env, graphs)
-        and not any(
-            node.target is inline_asm_elementwise
-            and not is_pure_scalar_assembly(node.args[0], node.args[1], node.args[4])
-            for graph in graphs
-            for node in graph.graph.nodes
-        )
+        and not has_opaque_inline_asm(graphs)
     )
 
 
@@ -6112,12 +6180,44 @@ def _cute_load_has_placeholder_value(state: CodegenState) -> bool:
     return True
 
 
+def tcgen05_aux_only_store_anchor(
+    state: CodegenState, store_node: torch.fx.Node
+) -> torch.fx.Node | None:
+    """The tcgen05 matmul whose epilogue stores ``store_node``, a store of
+    epilogue inputs alone (``aux_tensor.tcgen05_aux_only_epilogue_stores``,
+    which put it in the matmul's ``output_stores``), or ``None``."""
+    anchor = _tcgen05_output_store_anchor(state, store_node)
+    value = store_node.args[2] if len(store_node.args) > 2 else None
+    if (
+        anchor is None
+        or not isinstance(value, torch.fx.Node)
+        or reach_tcgen05_matmul_anchors(state, value)
+    ):
+        return None
+    return anchor
+
+
+def _tcgen05_output_store_anchor(
+    state: CodegenState, store_node: torch.fx.Node
+) -> torch.fx.Node | None:
+    """The registered tcgen05 matmul whose ``output_stores`` hold
+    ``store_node``, or ``None``."""
+    tcgen05 = state.device_function.cute_state.tcgen05
+    for anchor, result_var in tcgen05.matmul_fx_node_result_vars.items():
+        store_value = tcgen05.store_values.get(result_var)
+        if store_value is not None and store_node in (store_value.output_stores or ()):
+            return anchor
+    return None
+
+
 def _cute_value_reaches_beyond_matmul_epilogue(
     state: CodegenState, node: torch.fx.Node
 ) -> bool:
     """Whether a value computed from ``node`` reaches anything but the value
-    of a store or atomic whose value depends on a collective matmul: another
-    store or atomic, an address, control flow or a graph output."""
+    of a store or atomic whose value depends on a collective matmul, or of a
+    store of epilogue inputs alone that the matmul's epilogue stores
+    (``tcgen05_aux_only_store_anchor``): another store or atomic, an address,
+    control flow or a graph output."""
     seen: set[torch.fx.Node] = set()
     stack = [node]
     while stack:
@@ -6126,8 +6226,11 @@ def _cute_value_reaches_beyond_matmul_epilogue(
             if user.target is store or user.target in ATOMIC_OPS:
                 addressing: list[torch.fx.Node] = []
                 map_arg((user.args[:2], user.args[3:]), addressing.append)
-                if current in addressing or not reach_tcgen05_matmul_anchors(
-                    state, cast("torch.fx.Node", user.args[2])
+                if current in addressing or (
+                    not reach_tcgen05_matmul_anchors(
+                        state, cast("torch.fx.Node", user.args[2])
+                    )
+                    and _tcgen05_output_store_anchor(state, user) is None
                 ):
                     return True
                 continue

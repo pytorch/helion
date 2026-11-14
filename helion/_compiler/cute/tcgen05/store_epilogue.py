@@ -1208,6 +1208,21 @@ def _codegen_cute_store_tcgen05_tile(
     aux_steps_in_chain: tuple[_AuxiliaryTensorLoadExpr, ...] = (
         epilogue_chain.auxiliary_tensor_loads if epilogue_chain is not None else ()
     )
+    # A store of epilogue inputs alone (``out1[tile] = in2[tile].to(f32)``,
+    # ``analyze_tcgen05_aux_only_store_chain``) reads no accumulator, so its
+    # subtiles read only the auxiliary operand:
+    #
+    #   cute.autovec_copy(tcgen05_tTR_gAux_subtile, tcgen05_aux_rmem)
+    #   tcgen05_aux_loaded = tcgen05_aux_rmem.load()
+    #   tcgen05_acc_vec = tcgen05_aux_loaded.to(cutlass.Float32)
+    #
+    # instead of also issuing ``cute.copy(tcgen05_tiled_copy_t2r,
+    # tcgen05_tTR_tAcc_mn, tcgen05_tTR_rAcc)`` and
+    # ``tcgen05_acc_loaded = tcgen05_tRS_rAcc.load()`` into registers
+    # nothing reads. It keeps the fanout protocol: as the first store it
+    # waits for the accumulator, as the final one it releases it after the
+    # other stores' TMEM loads.
+    chain_reads_accumulator = epilogue_chain is None or epilogue_chain.reads_accumulator
     # Rank-0 device scalars of the chain (``acc * scale[()]``) bind once per
     # output tile in the per-tile setup, ahead of the accumulator wait, instead
     # of re-reading global memory inside every subtile iteration.
@@ -3322,7 +3337,11 @@ def _codegen_cute_store_tcgen05_tile(
                 late_prelude = coord_prelude + worklist_valid_prelude
             return "", late_prelude, f"({rhs}).to({target_dtype})"
         loaded = df.new_var("tcgen05_acc_loaded")
-        prelude_load = f"{prelude_indent}{loaded} = {load_expr}\n"
+        prelude_load = (
+            f"{prelude_indent}{loaded} = {load_expr}\n"
+            if chain_reads_accumulator
+            else ""
+        )
         early_aux_prelude = _aux_subtile_load_source(
             prelude_indent,
             carrier_name,
@@ -4463,7 +4482,11 @@ def _codegen_cute_store_tcgen05_tile(
                 else ""
             )
             + (f"{simt_early_aux}{simt_acc_wait}" if prefetch_simt_aux else "")
-            + f"        cute.copy({tiled_copy_t2r}, {ttr_tacc_mn}, {ttr_racc})\n"
+            + (
+                f"        cute.copy({tiled_copy_t2r}, {ttr_tacc_mn}, {ttr_racc})\n"
+                if chain_reads_accumulator
+                else ""
+            )
             + (
                 f"{simt_late_prelude}"
                 if prefetch_simt_aux
@@ -5296,11 +5319,16 @@ def _codegen_cute_store_tcgen05_tile(
                 | runtime_scalar_locals,
                 pre_wait_aux=pre_wait_aux,
             )
+        tmem_read = (
+            f"        {ttr_tacc_mn} = {ttr_tacc}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
+            f"        cute.copy({tiled_copy_t2r}, {ttr_tacc_mn}, {ttr_racc})\n"
+            if chain_reads_accumulator
+            else ""
+        )
         return (
             f"{early_aux_prelude if pre_wait_aux else ''}"
             f"{acc_wait}"
-            f"        {ttr_tacc_mn} = {ttr_tacc}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
-            f"        cute.copy({tiled_copy_t2r}, {ttr_tacc_mn}, {ttr_racc})\n"
+            f"{tmem_read}"
             f"{store_source}"
         )
 

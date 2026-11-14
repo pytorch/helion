@@ -15,6 +15,8 @@ from ...language import memory_ops
 from ..indexing_strategy import SubscriptIndexing
 
 if TYPE_CHECKING:
+    from collections.abc import Collection
+    from collections.abc import Iterator
     from collections.abc import Sequence
 
     from ..compile_environment import CompileEnvironment
@@ -114,10 +116,7 @@ def host_load_is_readonly(
     not an address or cross-lane ordering proof. Local shared atomics cannot
     alias a host storage; their normal initialization/update barriers remain.
     """
-    from ...language import creation_ops
-    from ..runtime_tensor_guards import tensors_have_proven_disjoint_storage
     from .local_atomic import _reachable_graphs
-    from .local_atomic import atomic_target_origins
 
     source_node = node.args[0]
     if not isinstance(source_node, Node):
@@ -130,36 +129,115 @@ def host_load_is_readonly(
     graphs = _reachable_graphs(list(graphs))
     if not any(node.graph is graph.graph for graph in graphs):
         return False
-    nodes = [item for graph in graphs for item in graph.graph.nodes]
-    atomic_targets = atomic_target_origins(list(graphs))
-    source_storage = source.untyped_storage()
-    for effect in nodes:
-        if (
-            effect.target is not memory_ops.store
-            and effect.target not in atomic_ops.ATOMIC_OPS
-        ):
-            continue
-        target_node = atomic_targets.get(effect, effect.args[0])
-        if not isinstance(target_node, Node):
-            # Stack tensors carry indirect pointer tuples. Their pointees may
-            # alias the source even when the pointer tensor itself is disjoint.
-            return False
-        if effect in atomic_targets and target_node.target is creation_ops.full:
-            # The complete-fragment ownership proof certifies these fresh
-            # CTA-local shared allocations and their identity-preserving carries.
-            continue
-        if target_node.target is not _tracing_ops._host_tensor:
-            return False
-        target = target_node.meta.get("val")
-        if not isinstance(target, torch.Tensor):
-            return False
-        target_storage = target.untyped_storage()
-        if source_storage == target_storage:
-            return False
-        # Check every possible origin: synthetic join storage can alias a
-        # fresh allocation, and invalidated input facts cannot be reused.
-        if not tensors_have_proven_disjoint_storage(
+    return all(
+        target is not None
+        and not host_storages_may_alias(
             env, source, target, allow_unbound=allow_unbound
-        ):
-            return False
-    return True
+        )
+        for _effect, target in _host_memory_effects(graphs, loads=False)
+    )
+
+
+def _host_memory_effects(
+    graphs: Sequence[GraphInfo], *, loads: bool
+) -> Iterator[tuple[Node, torch.Tensor | None]]:
+    """Each store and atomic of ``graphs`` (and each load, with ``loads``)
+    with the host tensor it touches, or ``None`` when none can be named."""
+    from ...language import creation_ops
+    from .local_atomic import atomic_target_origins
+
+    atomic_targets = atomic_target_origins(list(graphs))
+    for graph in graphs:
+        for effect in graph.graph.nodes:
+            if not (
+                effect.target is memory_ops.store
+                or effect.target in atomic_ops.ATOMIC_OPS
+                or (loads and effect.target is memory_ops.load)
+            ):
+                continue
+            target_node = atomic_targets.get(effect, effect.args[0])
+            if not isinstance(target_node, Node):
+                # Stack tensors carry indirect pointer tuples. Their pointees
+                # may alias any storage even when the pointer tensor itself is
+                # disjoint.
+                yield effect, None
+                continue
+            if effect in atomic_targets and target_node.target is creation_ops.full:
+                # The complete-fragment ownership proof certifies these fresh
+                # CTA-local shared allocations and their identity-preserving
+                # carries.
+                continue
+            target = target_node.meta.get("val")
+            yield (
+                effect,
+                target
+                if target_node.target is _tracing_ops._host_tensor
+                and isinstance(target, torch.Tensor)
+                else None,
+            )
+
+
+def host_storages_may_alias(
+    env: CompileEnvironment,
+    left: torch.Tensor,
+    right: torch.Tensor,
+    *,
+    allow_unbound: bool = False,
+) -> bool:
+    """Whether the runtime storages of two host tensors may overlap.
+
+    Fake storage inequality alone does not prove that two runtime arguments
+    are disjoint (including distinct DLPack wrappers). Every possible origin
+    is checked: synthetic join storage can alias a fresh allocation, and
+    invalidated input facts cannot be reused
+    (``tensors_have_proven_disjoint_storage``).
+    """
+    from ..runtime_tensor_guards import tensors_have_proven_disjoint_storage
+
+    if left.untyped_storage() == right.untyped_storage():
+        return True
+    return not tensors_have_proven_disjoint_storage(
+        env, left, right, allow_unbound=allow_unbound
+    )
+
+
+def host_storage_is_exclusive(
+    tensor: torch.Tensor,
+    exempt: Collection[Node],
+    env: CompileEnvironment,
+    graphs: Sequence[GraphInfo],
+    *,
+    allow_unbound: bool = False,
+) -> bool:
+    """No load, atomic or store of the region outside ``exempt`` may touch
+    ``tensor``'s storage: the destination-side companion of
+    :func:`host_load_is_readonly`, over the same reachable graphs and atomic
+    targets."""
+    from .local_atomic import _reachable_graphs
+
+    return all(
+        effect in exempt
+        or (
+            target is not None
+            and not host_storages_may_alias(
+                env, target, tensor, allow_unbound=allow_unbound
+            )
+        )
+        for effect, target in _host_memory_effects(
+            _reachable_graphs(list(graphs)), loads=True
+        )
+    )
+
+
+def has_opaque_inline_asm(graphs: Sequence[GraphInfo]) -> bool:
+    """Inline assembly outside the scalar arithmetic envelope could hide a
+    store no read-only or exclusivity proof sees."""
+    from ...language.inline_asm_ops import inline_asm_elementwise
+    from .pure_lane_packets import is_pure_scalar_assembly
+
+    return any(
+        node.target is inline_asm_elementwise
+        and not is_pure_scalar_assembly(node.args[0], node.args[1], node.args[4])
+        for graph in graphs
+        for node in graph.graph.nodes
+    )
