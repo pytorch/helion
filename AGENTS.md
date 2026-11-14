@@ -22,6 +22,12 @@ lives here; step-by-step procedures live in the skills under `.agents/skills/`.
   in the tree. Both accept paths.
 - Run tests: `pytest <filename>`; a subset: `pytest <filename> -k name_substring`.
   The lanes CI runs, sharded across GPUs: `scripts/run_tests.py` (see Testing).
+- Run `scripts/run_tests.py` and `scripts/shard_durations.py`, which run
+  pytest or import `helion`, with the interpreter of the environment Helion
+  is installed in, e.g. `.venv/bin/python scripts/run_tests.py ...`. Their
+  `#!/usr/bin/env python3` line runs the first `python3` on `PATH`, which
+  may lack Helion's test dependencies; pytest then stops with
+  "unrecognized arguments: --timeout".
 - Build docs: `make -C docs html` (writes HTML under `site/`)
 
 ## Coding Style & Naming Conventions
@@ -78,7 +84,8 @@ requests, `git push` to any branch, landing or merging, and `git reset --hard`,
   `--force`, no plain pytest to get past `run_tests.py`, no local patches to
   the tool. Fixing the tool is fine when that is the task or the user asks.
   A tool doing its job is not broken: a review finding, a test failure, a
-  board refusing busy GPUs or a lint error is work to do.
+  board refusing busy GPUs or a lint error is work to do, and autoreview's
+  exit status 3 (the tree changed during the review) means review again.
 - Report bugs in these instructions the same way. When `AGENTS.md` or a skill
   is wrong, outdated, contradicts itself or another project's instructions,
   or sends you down a path that does not work, say so in your reply: quote
@@ -405,9 +412,12 @@ needs no second review, while bigger fixes get another run. The reviewers run Cl
 at effort `xhigh`; `--claude-model`, `--claude-effort`, `--codex-model` and
 `--codex-effort` (or `HELION_AUTOREVIEW_*` variables) change that, e.g.
 `--claude-model fable --claude-effort max` for a deeper pass on risky work.
-A run that fails (a non-zero exit, a reviewer's `ERROR:` line, a timeout) is a
-broken tool: report it rather than skipping the review or reviewing it
-yourself instead.
+A run that fails (a non-zero exit other than 3, a reviewer's `ERROR:` line, a
+timeout) is a broken tool: report it rather than skipping the review or
+reviewing it yourself instead. Exit status 3 says the working tree changed
+while the review ran: that run is not a pass, but the tool works. See what
+changed (`git status`, `git log`), restore it, and review again; don't edit a
+checkout while it is being reviewed (use a worktree).
 A recognized Codex sandbox startup failure is retried once with the same
 settings. `HELION_AUTOREVIEW_TIMEOUT` applies per attempt, so a retry can take
 twice that timeout plus bounded cleanup.

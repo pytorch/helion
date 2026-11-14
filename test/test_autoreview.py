@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
@@ -48,6 +49,15 @@ autoreview = _load()
 supervision = autoreview.process_supervisor
 
 WAITID_CAPABILITIES = ("waitid", "P_PID", "WEXITED", "WNOHANG", "WNOWAIT")
+GIT = shutil.which("git")
+
+
+def _git_init(path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make path a git repository for the review's working-tree check. No
+    user or system git config (commit signing, hooks) applies."""
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
 
 
 @pytest.fixture
@@ -234,6 +244,10 @@ def review(tmp_path, monkeypatch, capsys):
     monkeypatch.delenv(autoreview.SESSION_MARKER, raising=False)
     monkeypatch.setattr(autoreview, "LOGS_BASE", tmp_path / "logs")
     monkeypatch.setattr(autoreview, "REPO_ROOT", tmp_path)
+    # The fakes' bookkeeping files, the logs and the bin directories are
+    # ignored, so the working-tree check sees no change.
+    _git_init(tmp_path, monkeypatch)
+    (tmp_path / ".gitignore").write_text("/*\n!/.gitignore\n")
 
     def run(*installed: str, args: tuple[str, ...] = ()) -> tuple[int, str, str]:
         bin_dir = tmp_path / ("bin-" + "-".join(installed))
@@ -242,6 +256,8 @@ def review(tmp_path, monkeypatch, capsys):
             path = bin_dir / name
             path.write_text({"claude": FAKE_CLAUDE, "codex": FAKE_CODEX}[name])
             path.chmod(0o755)
+        if not (bin_dir / "git").exists():
+            (bin_dir / "git").symlink_to(GIT)
         monkeypatch.setenv("PATH", str(bin_dir))
         monkeypatch.setenv("FAKE_CODEX_ARGV", str(tmp_path / "codex-argv.json"))
         monkeypatch.setenv("FAKE_CODEX_HISTORY", str(tmp_path / "codex-history.jsonl"))
@@ -306,13 +322,7 @@ def test_fix_needs_claude(review):
     [
         (("claude", "codex"), (), "LGTM", ("claude", "codex"), None),
         (("claude",), (), "LGTM", ("claude",), "codex"),
-        (
-            ("codex",),
-            ("--codex-sandbox", "workspace-write"),
-            "LGTM",
-            ("codex",),
-            "claude",
-        ),
+        (("codex",), ("--codex-sandbox", "read-only"), "LGTM", ("codex",), "claude"),
         (("claude", "codex"), ("--no-codex",), "LGTM", ("claude",), None),
         (("claude", "codex"), (), "Fix the reported bug", ("claude", "codex"), None),
     ],
@@ -343,6 +353,9 @@ def test_main_selection_and_review_record_without_processes(
     monkeypatch.setattr(autoreview.ClaudeSession, "send", claude_send)
     monkeypatch.setattr(autoreview, "run_codex_review", codex_review)
     monkeypatch.setattr(autoreview.subprocess, "Popen", forbidden_process)
+    # The working-tree check runs git; test_tree_changed_during_review_is_not_a_pass
+    # covers it.
+    monkeypatch.setattr(autoreview, "tree_state", lambda: b"unchanged")
     monkeypatch.setattr(
         sys, "argv", ["autoreview.py", "--no-meta", *args, "origin/main..HEAD"]
     )
@@ -354,7 +367,7 @@ def test_main_selection_and_review_record_without_processes(
     for name, _prompt, sandbox in initial:
         if name == "codex":
             assert sandbox == (
-                "workspace-write" if "workspace-write" in args else "read-only"
+                "read-only" if "read-only" in args else "workspace-write"
             )
     if missing is None:
         assert "WARNING" not in output.err
@@ -368,6 +381,82 @@ def test_main_selection_and_review_record_without_processes(
             "review",
             "combination",
         ]
+
+
+@pytest.mark.parametrize("change", [None, "write", "commit", "break-git"])
+def test_tree_changed_during_review_is_not_a_pass(
+    tmp_path, monkeypatch, capsys, change
+):
+    """codex may write (workspace-write) and claude skips permissions, so a
+    review during which the tree changed is shown but exits 3 without the
+    commit line; an unchanged tree still passes.  A reviewer that leaves git
+    failing changed the tree too: exit 3, not the broken-tool exit 2."""
+
+    def claude_send(self, prompt, *, phase="review", cancelled=None):
+        return "LGTM"
+
+    def codex_review(prompt, log_path, meta, **kwargs):
+        if change == "write":
+            (tmp_path / "written-by-codex.txt").write_text("x")
+        elif change == "commit":  # leaves no diff, but moves HEAD
+            subprocess.run(
+                [
+                    *("git", "-c", "user.name=x", "-c", "user.email=x@x"),
+                    *("commit", "-q", "--allow-empty", "-m", "x"),
+                ],
+                cwd=tmp_path,
+                check=True,
+            )
+        elif change == "break-git":
+            (tmp_path / ".git" / "HEAD").write_text("garbage\n")
+        return "LGTM"
+
+    monkeypatch.delenv(autoreview.SESSION_MARKER, raising=False)
+    monkeypatch.setattr(autoreview, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(autoreview, "LOGS_BASE", tmp_path / "logs")
+    _git_init(tmp_path, monkeypatch)
+    (tmp_path / ".gitignore").write_text("logs/\n")
+    monkeypatch.setattr(autoreview.shutil, "which", lambda name: name)
+    monkeypatch.setattr(autoreview.ClaudeSession, "send", claude_send)
+    monkeypatch.setattr(autoreview, "run_codex_review", codex_review)
+    monkeypatch.setattr(sys, "argv", ["autoreview.py", "--no-meta", "x.py"])
+    code = autoreview.main()
+    output = capsys.readouterr()
+    assert output.out.strip() == "LGTM"  # the review itself is still shown
+    if change is None:
+        assert code == 0
+        assert output.err.rstrip().endswith("autoreview passed: claude, codex")
+    else:
+        assert code == autoreview.TREE_CHANGED_EXIT
+        assert "NOT A PASS: the working tree changed during the review" in output.err
+        assert "autoreview passed:" not in output.err
+        if change == "break-git":
+            assert "failed" in output.err
+
+
+def test_tree_state_covers_untracked_links_and_nested_repos(tmp_path, monkeypatch):
+    monkeypatch.setattr(autoreview, "REPO_ROOT", tmp_path)
+    _git_init(tmp_path, monkeypatch)
+    (tmp_path / "nested").mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path / "nested", check=True)
+    (tmp_path / "dangling").symlink_to(tmp_path / "missing")
+    (tmp_path / "dirlink").symlink_to(tmp_path / "nested")
+    before = autoreview.tree_state()
+    assert autoreview.tree_state() == before
+    (tmp_path / "dangling").unlink()
+    (tmp_path / "dangling").symlink_to(tmp_path / "elsewhere")
+    assert autoreview.tree_state() != before
+    (tmp_path / "script.sh").write_text("x")
+    before = autoreview.tree_state()
+    (tmp_path / "script.sh").chmod(0o755)  # same contents, now executable
+    assert autoreview.tree_state() != before
+
+
+def test_tree_state_fails_outside_a_repository(tmp_path, monkeypatch):
+    monkeypatch.setattr(autoreview, "REPO_ROOT", tmp_path)
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+    with pytest.raises(autoreview.ReviewAbort, match="git .* failed"):
+        autoreview.tree_state()
 
 
 @pytest.mark.parametrize(
@@ -551,7 +640,7 @@ def test_codex_no_sandbox_uses_meta_launcher_flags_only_with_meta(review, tmp_pa
     assert "--dangerously-enable-internet-mode" in argv
     review("codex")
     argv = json.loads(argv_file.read_text())
-    assert argv[argv.index("-s") + 1] == "read-only"
+    assert argv[argv.index("-s") + 1] == "workspace-write"
 
 
 @pytest.mark.slow
@@ -2127,7 +2216,7 @@ else:
 
 @pytest.mark.slow
 @pytest.mark.skipif(os.name != "posix", reason="POSIX SIGCHLD inheritance")
-def test_cli_restores_inherited_ignored_sigchld(tmp_path):
+def test_cli_restores_inherited_ignored_sigchld(tmp_path, monkeypatch):
     # Exec the real CLI in a private checkout so its logs stay in the fixture.
     script = tmp_path / "scripts" / "autoreview.py"
     script.parent.mkdir()
@@ -2145,6 +2234,10 @@ def test_cli_restores_inherited_ignored_sigchld(tmp_path):
         "Path(sys.argv[sys.argv.index('-o') + 1]).write_text('LGTM')\n"
     )
     codex.chmod(0o755)
+    (bin_dir / "git").symlink_to(GIT)
+    # The CLI checks that the review left the working tree unchanged.
+    _git_init(tmp_path, monkeypatch)
+    (tmp_path / ".gitignore").write_text("/*\n!/.gitignore\n")
     driver = (
         "import os, signal, sys\n"
         "signal.signal(signal.SIGCHLD, signal.SIG_IGN)\n"

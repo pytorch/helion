@@ -6,6 +6,11 @@ Usage:
     scripts/autoreview.py --head           # review last commit (git diff HEAD~ HEAD)
     scripts/autoreview.py FILE_OR_URL      # review the thing described by args
     scripts/autoreview.py --no-codex       # skip codex
+    scripts/autoreview.py --codex-sandbox read-only  # codex may not write anywhere
+    scripts/autoreview.py --fix            # ask claude to fix the reported issues
+    scripts/autoreview.py --fix --add      # also `git add` modified files after fixing
+    scripts/autoreview.py --meta           # add Meta-internal launcher flags
+    scripts/autoreview.py --claude-model fable --claude-effort max   # deeper review
 
 Either reviewer is enough: when only one of the claude and codex CLIs is
 installed, the review runs with that one and prints a warning that the agent
@@ -14,11 +19,11 @@ must pass on to the user. With neither installed it fails.
 When the review finds nothing (LGTM), the script prints the line that records
 it in the reviewed commits' messages, naming the reviewers that ran:
     autoreview passed: claude, codex
-    scripts/autoreview.py --codex-sandbox workspace-write  # codex may write /tmp
-    scripts/autoreview.py --fix            # ask claude to fix the reported issues
-    scripts/autoreview.py --fix --add      # also `git add` modified files after fixing
-    scripts/autoreview.py --meta           # add Meta-internal launcher flags
-    scripts/autoreview.py --claude-model fable --claude-effort max   # deeper review
+
+Exit status: 0 for a finished review (findings or LGTM); 2 when the run failed
+(a reviewer error, a timeout); 3 when the working tree changed while the review
+ran, which is not a pass (restore the tree and review again). Ctrl-C, SIGTERM
+and SIGHUP stop the reviewers and end the run with 128 + the signal number.
 
 Reviewer models and efforts (flags, or the environment variables in brackets):
     claude: --claude-model opus [HELION_AUTOREVIEW_CLAUDE_MODEL], an alias for the
@@ -40,6 +45,7 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import wait
 from contextlib import contextmanager
 from datetime import datetime
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -99,6 +105,9 @@ def _timeout_default() -> float:
 
 SUBPROCESS_TIMEOUT_SECONDS = _timeout_default()
 SESSION_MARKER = "HELION_AUTOREVIEW_SESSION"
+# Exit status of a review during which the working tree changed: not a pass,
+# and not a broken tool either (a failed run exits 2).
+TREE_CHANGED_EXIT = 3
 
 PROMPT_DIFF_PREFIX = (
     "Review the staged and uncommitted changes since HEAD, if there are no "
@@ -598,12 +607,59 @@ class ClaudeSession:
         return body
 
 
+def tree_state() -> bytes:
+    """HEAD, the checked-out branch, tracked and staged changes, and untracked
+    entries with their contents and executable bit, so a review can tell
+    whether the tree changed while it ran.  Symlinks count by their target and
+    directories (a nested repository) by their name.  Paths git ignores (such
+    as ``.logs/``, ``__pycache__`` or an in-repo ``.venv``) are not compared."""
+
+    def git(*args: str, ok: tuple[int, ...] = (0,)) -> bytes:
+        proc = subprocess.run(["git", *args], cwd=REPO_ROOT, capture_output=True)
+        if proc.returncode not in ok:
+            raise ReviewAbort(
+                f"git {' '.join(args)} failed: {proc.stderr.decode(errors='replace')}"
+            )
+        return proc.stdout
+
+    # No external diff drivers or textconv: their output need not reflect the
+    # content (or may differ on every run).
+    diff = ("diff", "--binary", "--no-ext-diff", "--no-textconv")
+    parts = [
+        git("rev-parse", "-q", "--verify", "HEAD", ok=(0, 1)),  # 1: unborn HEAD
+        git("symbolic-ref", "-q", "HEAD", ok=(0, 1)),  # 1: detached HEAD
+        git(*diff),
+        git(*diff, "--cached"),
+    ]
+    for name in git("ls-files", "--others", "--exclude-standard", "-z").split(b"\0"):
+        if not name:
+            continue
+        path = REPO_ROOT / os.fsdecode(name)
+        if path.is_symlink():
+            entry = b"link " + os.fsencode(os.readlink(path))
+        elif path.is_file():
+            digest = hashlib.sha256()
+            try:
+                with path.open("rb") as f:
+                    if os.fstat(f.fileno()).st_mode & 0o111:
+                        digest.update(b"+x ")
+                    for chunk in iter(lambda: f.read(1 << 20), b""):
+                        digest.update(chunk)
+            except OSError as e:  # removed meanwhile, or unreadable
+                digest.update(str(e).encode())
+            entry = b"file " + digest.hexdigest().encode()
+        else:
+            entry = b"other"
+        parts.append(name + b" " + entry)
+    return b"\n".join(parts)
+
+
 def run_codex_review(
     prompt: str,
     log_path: Path,
     meta: bool,
     no_sandbox: bool = False,
-    sandbox: str = "read-only",
+    sandbox: str = "workspace-write",
     model: str = CODEX_MODEL,
     effort: str = CODEX_REASONING_EFFORT,
     *,
@@ -611,13 +667,15 @@ def run_codex_review(
     cancelled: threading.Event | None = None,
 ) -> str:
     """Run codex one-shot, return the last message text. Codex only ever
-    reviews — fixes are performed by the claude session — so by default the
-    sandbox is read-only regardless of how the parent script was invoked.
+    reviews — fixes are performed by the claude session.
 
-    ``sandbox="workspace-write"`` also lets codex write under the workdir and
-    ``/tmp``.  The read-only sandbox has no writable temporary directory, and
-    importing torch creates its cache directory under ``tempfile`` at import
-    time, so a read-only codex cannot run any Python that imports Helion.
+    The default ``sandbox="workspace-write"`` lets codex write under the
+    workdir and the temporary directories: the read-only sandbox has no
+    writable temporary directory, so codex there cannot run a shell
+    here-document or any Python that imports torch (its cache directory is
+    created under ``tempfile`` at import), and its reviews end in an error
+    instead of a verified finding.  main() checks that the working tree is
+    unchanged after the review.  ``sandbox="read-only"`` remains available.
 
     ``no_sandbox=True`` is a trust-the-model escape hatch for hosts where
     Codex's sandbox cannot run (no bubblewrap): it switches Codex to
@@ -852,12 +910,13 @@ def _main() -> int:
     parser.add_argument(
         "--codex-sandbox",
         choices=("read-only", "workspace-write"),
-        default="read-only",
+        default="workspace-write",
         help=(
-            "Codex sandbox (default: read-only). workspace-write also allows "
-            "writes under the workdir and /tmp, which codex needs to run any "
-            "Python that imports torch (its cache directory is created under "
-            "tempfile at import)."
+            "Codex sandbox (default: workspace-write, which allows writes under "
+            "the workdir and the temporary directories; codex needs them to run "
+            "a shell here-document or any Python that imports torch). The "
+            "review does not count as a pass if the working tree changed. "
+            "read-only forbids all writes."
         ),
     )
     parser.add_argument(
@@ -991,6 +1050,10 @@ def _main() -> int:
                 log=spinner.log,
                 cancelled=cancelled,
             )
+        # The reviewers can write (codex's workspace-write sandbox, claude's
+        # skipped permissions) so that they can run code; a review during
+        # which the tree changed does not count as a pass.
+        before = tree_state()
         results = run_parallel(spinner, jobs)
         claude_review = results.get("claude review")
         codex_review = results.get("codex review")
@@ -1017,6 +1080,21 @@ def _main() -> int:
         else:
             combined = claude_review
         spinner.emit_stdout(combined)
+        try:
+            changed = tree_state() != before
+        except ReviewAbort as e:
+            # git failing now that it worked before the review means a
+            # reviewer damaged the repository: a changed tree, not a broken
+            # tool.
+            sys.stderr.write(f"\nautoreview.py: {e}\n")
+            changed = True
+        if changed:
+            sys.stderr.write(
+                "\nautoreview.py: NOT A PASS: the working tree changed during the "
+                "review (a reviewer, or an edit made meanwhile). Check `git "
+                "status` and `git log`, then review again.\n"
+            )
+            return TREE_CHANGED_EXIT
 
         if args.fix and combined.strip() != "LGTM":
             fix_prompt = PROMPT_FIX + (PROMPT_FIX_ADD_SUFFIX if args.add else "")

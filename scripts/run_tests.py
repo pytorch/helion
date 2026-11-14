@@ -1203,7 +1203,9 @@ def pytest_uses_pyargs(paths: Sequence[str], extra: Sequence[str]) -> bool:
             setup["override_ini"] = []
         try:
             config = determine_setup(**setup)[2]
-        except UsageError as error:
+        # Before 9.2, pytest opens a -c file without first checking that it
+        # exists, so a missing or unreadable file raises OSError, not UsageError.
+        except (UsageError, OSError) as error:
             raise SystemExit(f"run_tests: invalid pytest options: {error}") from error
         addopts = config.get("addopts", "")
         addopts = getattr(addopts, "value", addopts)
