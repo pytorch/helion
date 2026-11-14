@@ -89,6 +89,7 @@ if TYPE_CHECKING:
     from typing_extensions import Self
 
     from torch._ops import OpOverload
+    from torch._ops import OpOverloadPacket
 
     _T = TypeVar("_T")
 
@@ -173,15 +174,24 @@ def _is_known_host_value(value: object) -> bool:
 _NATIVE_TENSOR_CLASS = torch.Tensor
 _NATIVE_OP_OVERLOAD = torch._ops.OpOverload
 _NATIVE_OP_PACKET = torch._ops.OpOverloadPacket
-# ``torch.ops``, its namespaces and their packets, with the attribute hooks each
-# had at import: those resolve a registered operator and run none of its kernels.
-_NATIVE_OPERATOR_REGISTRY = tuple(
-    (
-        kind,
-        getattr_static(kind, "__getattribute__"),
-        getattr_static(kind, "__getattr__"),
+_OPERATOR_HOOKS = (
+    "__new__",
+    "__init__",
+    "__getattribute__",
+    "__getattr__",
+    "__setattr__",
+    "__call__",
+)
+# ``torch.ops``, its namespaces, packets and overloads, with the Python hooks
+# each class had at import (None where it has none).
+_NATIVE_OPERATOR_TYPES = tuple(
+    (kind, tuple(getattr_static(kind, hook, None) for hook in _OPERATOR_HOOKS))
+    for kind in (
+        torch._ops._Ops,
+        torch._ops._OpNamespace,
+        _NATIVE_OP_PACKET,
+        _NATIVE_OP_OVERLOAD,
     )
-    for kind in (torch._ops._Ops, torch._ops._OpNamespace, _NATIVE_OP_PACKET)
 )
 _NO_ATTRIBUTE = object()
 # The values such a lookup yields: torch's own classes, whose attribute lookup
@@ -267,16 +277,21 @@ def _is_known_host_call(
         return True
     if any(fn is split for split in _KNOWN_HOST_SPLITS):
         return bool(args) and type(args[0]) is FakeTensor
-    if type(fn) is _NATIVE_OP_PACKET and not fn._has_torchbind_op_overload:
+    if type(fn) is _NATIVE_OP_PACKET:
+        if fn._has_torchbind_op_overload or not _is_native_operator(fn):
+            return False
         # The overload the call dispatches to, by the same schema matching.
-        fn = getattr(
-            fn, torch._C._jit_resolve_packet(fn._qualified_op_name, *args, **kwargs)
-        )
+        name = torch._C._jit_resolve_packet(fn._qualified_op_name, *args, **kwargs)
+        if not _is_native_operator_lookup(fn, name):
+            return False
+        fn = getattr(fn, name)
     if type(fn) is _NATIVE_OP_OVERLOAD:
         # An operator writes only the arguments its schema marks, which the
         # tracker checks like a native Tensor method's; a registered effect
-        # reaches beyond them.
-        return _get_effect(fn) is None
+        # reaches beyond them. The kernels registered for it (Python fake
+        # kernels from torch.library too) are trusted to honor the schema, as
+        # functionalization and torch.compile trust them.
+        return _is_native_operator(fn) and _get_effect(fn) is None
     if type(fn) is types.MethodType:
         return fn.__func__ is _KNOWN_HOST_SPLITS[1] and type(fn.__self__) is FakeTensor
     if type(fn) is types.MethodDescriptorType:
@@ -308,24 +323,37 @@ def _is_known_host_call(
     )
 
 
-def _is_native_operator_lookup(value: object, attr: str) -> bool:
-    """Whether ``value.attr`` is a stock ``torch.ops`` registry lookup."""
+def _has_native_hooks(value: object) -> bool:
+    """Whether ``value`` is a ``torch.ops`` object whose class keeps the Python
+    hooks it had at import and that has no instance ``__getattr__``."""
     kind = type(value)
-    for native, getattribute, getattr_hook in _NATIVE_OPERATOR_REGISTRY:
-        if kind is native:
-            # Python consults the class's __getattribute__ and descriptors
-            # before the instance dict, and a module's own __getattr__ before
-            # the class hook: none of them may intercept the lookup.
-            return (
-                getattr_static(kind, "__getattribute__") is getattribute
-                and getattr_static(kind, attr, _NO_ATTRIBUTE) is _NO_ATTRIBUTE
-                and "__getattr__" not in vars(value)
-                and (
-                    attr in vars(value)
-                    or getattr_static(kind, "__getattr__") is getattr_hook
-                )
-            )
-    return False
+    return any(
+        kind is native
+        and all(
+            getattr_static(kind, hook, None) is original
+            for hook, original in zip(_OPERATOR_HOOKS, hooks, strict=True)
+        )
+        and "__getattr__" not in vars(value)
+        for native, hooks in _NATIVE_OPERATOR_TYPES
+    )
+
+
+def _is_native_operator(op: OpOverload | OpOverloadPacket) -> bool:
+    """Whether calling a packet or overload runs its builtin dispatcher entry."""
+    return _has_native_hooks(op) and type(op._op) is types.BuiltinFunctionType
+
+
+def _is_native_operator_lookup(value: object, attr: str) -> bool:
+    """Whether ``value.attr`` is a stock ``torch.ops`` registry lookup: it
+    resolves (and caches) a registered operator and runs none of its kernels."""
+    # Without a class attribute of that name (descriptors come before the
+    # instance dict), the lookup reads the cached entry or runs the class's
+    # import-time __getattr__.
+    return (
+        type(value) is not _NATIVE_OP_OVERLOAD
+        and _has_native_hooks(value)
+        and getattr_static(type(value), attr, _NO_ATTRIBUTE) is _NO_ATTRIBUTE
+    )
 
 
 @contextlib.contextmanager
