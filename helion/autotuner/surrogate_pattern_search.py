@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import importlib.util
 import json
 import math
 import operator
 import random
 from typing import TYPE_CHECKING
 from typing import cast
+
+import numpy as np
 
 from .. import exc
 from ..runtime.config import _config_key
@@ -52,6 +55,8 @@ if TYPE_CHECKING:
     from collections.abc import MutableSet
     from collections.abc import Sequence
 
+    from sklearn.ensemble import RandomForestClassifier
+
     from .._compiler.cute.autotune.config_generation_ext import (
         CuteConfigGenerationExtension,
     )
@@ -65,14 +70,10 @@ if TYPE_CHECKING:
     from .config_generation import CoordinateNeighborProjection
     from .config_generation import FlatConfig
 
-try:
-    import numpy as np
-    from sklearn.ensemble import RandomForestClassifier
-
-    HAS_ML_DEPS = True
-except ImportError as e:
-    HAS_ML_DEPS = False
-    _IMPORT_ERROR = e
+# scikit-learn also loads SciPy and is slow to import. Only check here that it
+# is installed, and import it when a surrogate is fit.
+HAS_ML_DEPS = importlib.util.find_spec("sklearn") is not None
+SKLEARN_INSTALL_HINT = "Install it with: pip install scikit-learn"
 
 
 def flash_terminal_measurement_is_valid(
@@ -225,9 +226,8 @@ class LFBOPatternSearch(PatternSearch):
     ) -> None:
         if not HAS_ML_DEPS:
             raise exc.AutotuneError(
-                "LFBOPatternSearch requires numpy and scikit-learn."
-                "Install them with: pip install helion[surrogate]"
-            ) from _IMPORT_ERROR
+                f"LFBOPatternSearch requires scikit-learn. {SKLEARN_INSTALL_HINT}"
+            )
 
         super().__init__(
             kernel=kernel,
@@ -506,6 +506,8 @@ class LFBOPatternSearch(PatternSearch):
             self.log(
                 f"Fitting surrogate: {len(train_x)} points, {len(train_y)} targets"
             )
+            from sklearn.ensemble import RandomForestClassifier
+
             self.surrogate = RandomForestClassifier(
                 criterion="log_loss",
                 random_state=42,
