@@ -236,6 +236,29 @@ def inband_rule_kernel(
     return out
 
 
+@helion.kernel(autotune_effort="none", static_shapes=True)
+def inband_view_kernel(
+    symm: torch.Tensor,
+    x: torch.Tensor,
+    group_name: hl.ProcessGroupName,
+    view: hl.constexpr,
+) -> torch.Tensor:
+    """The store fills the buffer through another view than the peer loads."""
+    peers = _remote_views(symm, group_name)
+    out = torch.empty_like(symm)
+    # The store fills the buffer through a [16, 16] view, in either order.
+    symm2 = symm.view(16, -1).t() if view == "cols" else symm.view(-1, 16)
+    x2 = x.view(16, -1).t() if view == "cols" else x.view(-1, 16)
+    for rows, cols in hl.tile(symm2.size()):
+        symm2[rows, cols] = x2[rows, cols]
+    for tile in hl.tile(symm.size(0)):
+        acc = hl.zeros([tile], dtype=x.dtype)
+        for r in hl.static_range(len(peers)):
+            acc = acc + peers[r][tile]
+        out[tile] = acc
+    return out
+
+
 @helion.kernel(autotune_effort="none", static_shapes=False)
 def specialized_inband_kernel(
     symm: torch.Tensor, x: torch.Tensor, group_name: hl.ProcessGroupName
@@ -1816,6 +1839,22 @@ class TestDistributedTileDependencies(TestCase):
             diagonal_store_kernel.bind((symm, x, group))
         (line,) = logs.output
         self.assertIn("on peers/symm use peer_counter (R1:", line)
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    def test_inband_store_through_another_view(self) -> None:
+        """Pushes and polls address words by storage offset, so the store's
+        view may differ from the peer loads' in shape and order (R2)."""
+        group = self._world(2, inband_view_kernel)
+        for view in ("rows", "cols"):
+            # bf16 packs two row-adjacent elements per word where rows allow.
+            symm, x = torch.zeros(2, 256, device=DEVICE, dtype=torch.bfloat16)
+            with (
+                self.subTest(view=view),
+                self.assertLogs(tile_dependency.log, "INFO") as logs,
+            ):
+                inband_view_kernel.bind((symm, x, group, view))
+            (line,) = logs.output
+            self.assertIn("on peers/symm2 use inband", line)
 
     @skipIfRefEager("tile dependencies are built only in compiled mode")
     def test_inband_places_views_from_symmetric_base(self) -> None:
