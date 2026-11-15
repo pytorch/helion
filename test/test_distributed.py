@@ -1038,6 +1038,12 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         count = torch.empty(1, device=self.device, dtype=torch.int32)
         args = (symm, x, rows, count, group.group_name)
         bound = kernel.bind(args)
+        if dtype.itemsize < 4:
+            # The scatter's polls read whole words (unwritten ones from the
+            # peer's buffer too), not one word per element.
+            self.assertNotRegex(
+                bound.to_triton_code(), r">> tl\.cast\(inband_offset_\d+ %"
+            )
         for step in range(6):
             generator = torch.Generator().manual_seed(step)
             plans = []

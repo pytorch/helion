@@ -1579,7 +1579,9 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
         decode = "" if key is None else f" ^ {_lane_constant(key, dtype)}"
         scatter = peer.scatters.get(access.allocation_id)
         words = None
-        if lanes > 1 and scatter is None:
+        # A scatter's fallback keys a word by its first lane: every lane of a
+        # word must fall in one key.
+        if lanes > 1 and (scatter is None or scatter.extents[-1] % lanes == 0):
             words = _word_poll(
                 state, fake_tensor, indexing, output_size, extra_mask, access, lanes
             )
@@ -1589,6 +1591,13 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
         element_text = f"{ast.unparse(offset)}, words={words is not None}"
         if words is not None:
             offset = expr_from_string(words[0])
+            if scatter is not None:
+                # The fallback reads whole words: each at its first lane's element.
+                element = state.codegen.lift(
+                    expr_from_string(f"({words[0]}) * {lanes}"),
+                    dce=True,
+                    prefix="inband_offset",
+                ).id
         elif lanes > 1 or scatter is not None:
             element = state.codegen.lift(offset, dce=True, prefix="inband_offset").id
             offset = expr_from_string(element)
