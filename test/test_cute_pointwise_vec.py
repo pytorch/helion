@@ -17,6 +17,7 @@ Covers both strategies (``PerThreadNDTileStrategy`` for N-D tiles,
 
 from __future__ import annotations
 
+from typing import cast
 import unittest
 
 import pytest
@@ -30,6 +31,7 @@ from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing.sink_softmax_kernels import sink_normalize
 import helion.language as hl
 
 cutlass = pytest.importorskip("cutlass")
@@ -105,6 +107,11 @@ def _gather_rows(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     for tile_b, tile_e in hl.tile([x.size(0), weight.size(1)]):
         out[tile_b, tile_e] = weight[x[tile_b], tile_e]
     return out
+
+
+# The sink-softmax normalize whose seeds test_cute_pointwise_resident_seeds.py
+# pins, run here.
+_sink_normalize = helion.kernel(sink_normalize, backend="cute", static_shapes=True)
 
 
 @helion.kernel(backend="cute", static_shapes=True)
@@ -319,6 +326,43 @@ class TestCutePointwiseVec(TestCase):
                 code, out = code_and_output(_gather_rows, (idx, weight), **seed.config)
                 self.assertIn("ir.VectorType.get([16], cutlass.Uint16.mlir_type)", code)
                 self.assertTrue(torch.equal(out, weight[idx]))
+
+    def test_whole_row_tile_seed_matches_the_flattened_seed(self) -> None:
+        """The whole-row tile seed of a 1000-wide bf16 row (a packet per
+        thread across the row, the lanes' exps and divisions paired) computes
+        what the flattened primary seed computes, bit for bit, the +0 of a
+        masked column's underflowed exp included."""
+        heads, rows, width = 4, 64, 1000
+        x = torch.randn(heads, rows, width, device=DEVICE, dtype=torch.bfloat16)
+        column = torch.arange(width, device=DEVICE)
+        row = torch.arange(rows, device=DEVICE)
+        mask = torch.where(
+            column[None, :] <= row[:, None] * 16,
+            0.0,
+            torch.finfo(torch.bfloat16).min,
+        ).to(torch.bfloat16)
+        total = torch.rand(heads, rows, device=DEVICE) * 100 + 1
+        args = (x, mask, total)
+        seeds = _sink_normalize.bind(args).config_spec.compiler_seed_configs
+        # Only a guard that this run takes the seed: its row tile, the one
+        # unflattened tile of 1024 (the CPU test
+        # test_narrow_rows_seed_a_whole_row_tile pins it).
+        (seed,) = [
+            s
+            for s in seeds
+            if cast("list[int]", s.config["block_sizes"])[-1] == 1024
+            and not any(cast("list[bool]", s.config.get("flatten_loops") or []))
+            and not s.config.get("cute_proven_bounds")
+        ]
+        _, flattened = code_and_output(_sink_normalize, args, **seeds[0].config)
+        code, out = code_and_output(_sink_normalize, args, **seed.config)
+        # The lanes pair on capability 10.0 and up only
+        # (``cute_pair_lane_math_sites``).
+        if seed.config.get("cute_pair_lane_math"):
+            self.assertIn("_cute_exp_f32x2_parts(", code)
+        self.assertTrue(torch.equal(out.view(torch.int16), flattened.view(torch.int16)))
+        expected = torch.exp(x.float() + mask.float()[None]) / total[:, :, None]
+        torch.testing.assert_close(out, expected.to(torch.bfloat16))
 
     def test_index_independent_store_keeps_wrapper(self) -> None:
         """Regression: a store whose VALUE reads no per-lane vars must keep

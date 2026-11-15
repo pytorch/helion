@@ -15,7 +15,7 @@ import torch
 from test._cute_kernels import softmax_two_pass_kernel
 
 import helion
-from helion._compiler.cute.reduce_call import use_serial_block_reduce
+from helion._compiler.cute.reduce_routing import use_serial_block_reduce
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output

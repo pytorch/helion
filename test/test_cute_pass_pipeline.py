@@ -42,6 +42,7 @@ DEVICE_BODY_PASS_NAMES = [
     "hoist_warp_reduce_from_vloop",
     "eliminate_duplicate_cluster_maxima",
     "bounded_cache_cache",
+    "peel_vector_tails",
     "vectorize_affine_tile_lanes",
     "merge_literal_offset_loads",
     "fuse_fp4_pair_dot",
@@ -83,6 +84,7 @@ DEVICE_BODY_PASS_NAMES = [
     "lower_scalar_epilogue",
     "lower_philox_packets",
     "hoist_exact_invariant_divisions",
+    "cut_carried_values",
     "jam_grid_lanes",
 ]
 
@@ -95,6 +97,9 @@ KERNEL_DEF_PASS_NAMES = [
     "lower_scalar_policy_loads",
     "lower_packet_store_policy",
     "validate_shared_arenas",
+    "pack_half_extremum_folds",
+    "pair_lane_math",
+    "select_native_warp_reductions",
 ]
 
 

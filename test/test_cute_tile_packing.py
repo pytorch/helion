@@ -8,36 +8,13 @@ import torch
 import helion
 from helion._testing import DEVICE
 from helion._testing import import_example
+from helion._testing.nvfp4_gemv_args import nvfp4_gemv_args
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import InvalidConfig
 import helion.language as hl
 
 _examples_nvfp4_gemv = import_example("nvfp4_gemv")
 _nvfp4_gemv_fp4in_body = _examples_nvfp4_gemv._nvfp4_gemv_fp4in_body
-make_fp8_scales = _examples_nvfp4_gemv.make_fp8_scales
-reference_nvfp4_gemv_fp4in = _examples_nvfp4_gemv.reference_nvfp4_gemv_fp4in
-
-
-def _gemv_args(rows: int, kbytes: int) -> tuple[tuple[object, ...], torch.Tensor]:
-    torch.manual_seed(0)
-    groups = kbytes // 8
-    weight = torch.randint(0, 256, (rows, kbytes), dtype=torch.uint8, device=DEVICE)
-    weight = weight.view(torch.float4_e2m1fn_x2)
-    x = torch.randint(0, 256, (kbytes,), dtype=torch.uint8, device=DEVICE)
-    x = x.view(torch.float4_e2m1fn_x2)
-    wscale = make_fp8_scales((rows, groups), DEVICE)
-    xscale = make_fp8_scales((groups,), DEVICE)
-    expected = reference_nvfp4_gemv_fp4in(weight, x, wscale, xscale)
-    out = torch.empty(rows, dtype=torch.bfloat16, device=DEVICE)
-    args = (
-        weight.view(rows, groups, 8),
-        x.view(groups, 8),
-        wscale.reshape(-1),
-        xscale.reshape(-1),
-        out,
-        1.0,
-    )
-    return args, expected
 
 
 def _config(groups: int, threads: int, pack: int, **extra: object) -> helion.Config:
@@ -54,7 +31,7 @@ def _config(groups: int, threads: int, pack: int, **extra: object) -> helion.Con
 def test_pack_counts_and_knob_rules() -> None:
     """The one-element grid axis of the gemv is packable; the knob needs a
     flat pid type, no cluster split and a divisor of the tile count."""
-    args, _ = _gemv_args(2048, 512)
+    args, _ = nvfp4_gemv_args(2048, 512)
     kernel = helion.kernel(_nvfp4_gemv_fp4in_body, backend="cute", static_shapes=True)
     bound = kernel.bind(args)
     spec = bound.config_spec
@@ -81,7 +58,7 @@ def test_packed_tiles_share_a_cta(pack: int) -> None:
     ``pack``, the K reduction sees ``pack`` interleaved siblings, and the result
     is exact."""
     rows, kbytes = 256, 128
-    args, expected = _gemv_args(rows, kbytes)
+    args, expected = nvfp4_gemv_args(rows, kbytes)
     kernel = helion.kernel(
         _nvfp4_gemv_fp4in_body,
         backend="cute",
@@ -104,7 +81,7 @@ def test_packed_tiles_share_a_cta(pack: int) -> None:
 
 def test_unpacked_config_is_unchanged() -> None:
     rows, kbytes = 256, 128
-    args, expected = _gemv_args(rows, kbytes)
+    args, expected = nvfp4_gemv_args(rows, kbytes)
     kernel = helion.kernel(
         _nvfp4_gemv_fp4in_body,
         backend="cute",
@@ -124,7 +101,7 @@ def test_warp_wide_tiles_pack_one_warp_per_row(pack: int) -> None:
     above the body's axis (``block=(32, pack, 1)``): every warp owns one row,
     the K reduction is a single warp shuffle, and the result is exact."""
     rows, kbytes = 256, 256
-    args, expected = _gemv_args(rows, kbytes)
+    args, expected = nvfp4_gemv_args(rows, kbytes)
     kernel = helion.kernel(
         _nvfp4_gemv_fp4in_body,
         backend="cute",
@@ -151,7 +128,7 @@ def test_tile_pack_seed_opens_the_lane_unroll_search() -> None:
     unpacked 32-thread form for tall inputs) with the lane unroll set, which
     is what lets the search explore ``cute_lane_unroll`` at all."""
     rows, kbytes = 2048, 2048
-    args, _expected = _gemv_args(rows, kbytes)
+    args, _expected = nvfp4_gemv_args(rows, kbytes)
     kernel = helion.kernel(_nvfp4_gemv_fp4in_body, backend="cute", static_shapes=True)
     spec = kernel.bind(args).config_spec
     assert "cute_tile_pack_warp_per_row" in spec.autotuner_heuristics

@@ -91,8 +91,8 @@ from ._ast_pass_utils import is_staged_loop
 from ._ast_pass_utils import is_trace_time_test
 from .reduce_call import ReduceScope
 from .reduce_call import shared_columns_elements
-from .reduce_call import use_interleaved_shared_reduce
-from .reduce_call import use_serial_block_reduce
+from .reduce_routing import use_interleaved_shared_reduce
+from .reduce_routing import use_serial_block_reduce
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -530,7 +530,7 @@ def _sequence_lengths(statements: Iterable[ast.AST]) -> dict[str, int]:
 def _shared_two_stage_elements(pre: int, group_span: int, group_count: int) -> int:
     """The elements of the buffer ``_cute_grouped_reduce_shared_two_stage``
     allocates, by the form it routes the group shape to (the predicates it
-    shares with ``reduce_call``): the serial form one slot per warp, the
+    shares with ``reduce_routing``): the serial form one slot per warp, the
     interleaved block form (from 32 siblings) every thread's value plus the
     results, the interleaved warp form and the two-stage form the per-warp
     partials of every sibling plus the results."""

@@ -915,12 +915,13 @@ class PersistentReductionStrategy(ReductionStrategy):
         self._synthetic_cute_lane_var: str | None = None
         self._synthetic_cute_lane_extent = 1
         # Persistent reductions expose the same unroll-vec protocol as rolled
-        # reductions when one V-wide vector exactly covers each thread's
-        # synthetic slice.  Restricting the first implementation to one vector
-        # per thread avoids introducing a second loop-carried reduction level;
-        # wider slices keep the established scalar synthetic-lane path.
+        # reductions when V-wide vectors cover each thread's synthetic slice:
+        # one vector, or ``_cute_reduction_vec_chunks`` of them ``threads * V``
+        # elements apart (the rolled strided layout), all walked by one
+        # constexpr lane loop.  Other slices keep the scalar synthetic lanes.
         self._cute_reduction_lane_extent = 1
         self._cute_reduction_vec_width = 1
+        self._cute_reduction_vec_chunks = 1
         # The synthetic lane's V-loop and lane body, filled in by the
         # emitter's ``emit_synthetic_lane_preamble`` for the memory lowering
         # (``lane_loop_context.py``).

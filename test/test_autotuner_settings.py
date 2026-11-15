@@ -32,6 +32,7 @@ from helion import exc
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
+from helion._testing import matchesBackends
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfXPU
@@ -2405,12 +2406,16 @@ class TestBudgetedInitialPopulation(TestCase):
     def _make_bound(
         self, **settings: object
     ) -> tuple[object, tuple[torch.Tensor, torch.Tensor]]:
+        # CuTe's heuristics append coverage witnesses (``cute_pair_lane_math``)
+        # to this add's populations, which these tests count from the random
+        # draws alone.
         @helion.kernel(
             autotune_log_level=logging.CRITICAL,
             autotune_precompile=None,
             autotune_benchmark_subprocess=False,
             autotune_baseline_fn=operator.add,
             autotune_random_seed=1234,
+            disable_autotuner_heuristics=matchesBackends(["cute"]),
             **settings,
         )
         def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:

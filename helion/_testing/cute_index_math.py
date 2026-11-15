@@ -1,7 +1,9 @@
 """The kernels shared by the CuTe index-math tests: the per-channel gather of a
 flat NCHW tile, ``scale[(i // (H * W)) % C]`` (one quotient per vector, proven
-unsigned and unguarded), and a row index scaled past Int32 under int32 and
-int64 indexing."""
+unsigned and unguarded), a row index scaled past Int32 under int32 and int64
+indexing, and the split moments of an NCHW input read through a
+de-linearized ``x[r // (H * W), r % (H * W), c]`` (its masks compared once
+per vector under ``cute_uniform_lane_compares``)."""
 
 from __future__ import annotations
 
@@ -77,3 +79,77 @@ row_scale = {
     )
     for index_dtype in (torch.int32, torch.int64)
 }
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def split_row_moments(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # x: [N, H*W, C], a permuted view of an NCHW tensor (H*W has stride 1).
+    # Split s of 4 sums the flat (n, h, w) elements s * rows onwards in a
+    # device loop, as BatchNorm's split Welford partials do: per channel,
+    # the count, the sum and the sum of squares of each split's elements.
+    batch, hw, channels = x.shape
+    total = batch * hw
+    rows = (total + 3) // 4
+    count = torch.empty([4, channels], dtype=torch.float32, device=x.device)
+    sums = torch.empty_like(count)
+    squares = torch.empty_like(count)
+    for tile_s, tile_c in hl.tile([4, channels]):
+        n = hl.zeros([tile_s, tile_c], dtype=torch.float32)
+        s1 = hl.zeros([tile_s, tile_c], dtype=torch.float32)
+        s2 = hl.zeros([tile_s, tile_c], dtype=torch.float32)
+        for tile_r in hl.tile(rows):
+            r = tile_s.index[:, None] * rows + tile_r.index[None, :]
+            valid = (r < total) & (tile_r.index[None, :] < rows)
+            values = hl.load(
+                x, [r // hw, r % hw, tile_c], extra_mask=valid[:, :, None]
+            ).to(torch.float32)
+            n = n + torch.sum(valid.to(torch.float32), dim=1)[:, None]
+            s1 = s1 + torch.sum(values, dim=1)
+            s2 = s2 + torch.sum(values * values, dim=1)
+        count[tile_s, tile_c] = n
+        sums[tile_s, tile_c] = s1
+        squares[tile_s, tile_c] = s2
+    return count, sums, squares
+
+
+# The same kernel under dynamic shapes: the split length and the row bounds
+# are kernel arguments.
+split_row_moments_dynamic = helion.kernel(
+    split_row_moments.fn, backend="cute", static_shapes=False, autotune_effort="none"
+)
+
+
+def split_row_config(
+    bound: BoundKernel[Any], *, uniform_compares: bool | None = False
+) -> helion.Config:
+    """128-row chunks of the device loop over 16 threads in 8-wide vectors;
+    ``cute_uniform_lane_compares`` left out when ``uniform_compares`` is
+    None."""
+    return bound.config_spec.normalized_config(
+        helion.Config(
+            block_sizes=[1, 1, 128],
+            num_threads=[1, 0, 16],
+            cute_vector_widths=[1, 1, 8],
+            cute_uniform_lane_compares=uniform_compares,
+        )
+    )
+
+
+def split_row_input(
+    batch: int, hw: int, device: torch.device | str = "cpu"
+) -> torch.Tensor:
+    """A [batch, 16, hw] bf16 NCHW input read as [batch, hw, 16]."""
+    planes = torch.randn(batch, 16, hw, device=device).to(torch.bfloat16)
+    return planes.permute(0, 2, 1)
+
+
+def split_row_code(*, uniform_compares: bool | None = False) -> str:
+    """The source ``split_row_moments`` renders on CPU for a [6, 16, 192]
+    input (splits of 288 rows: two whole chunks and a partial one) under
+    ``split_row_config``."""
+    bound = cpu_bind(
+        cast("Kernel[object]", split_row_moments), (split_row_input(6, 192),)
+    )
+    return bound.to_code(split_row_config(bound, uniform_compares=uniform_compares))

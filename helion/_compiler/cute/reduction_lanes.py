@@ -14,8 +14,14 @@ follow the code they predict.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+from typing import cast
+
 from ..._utils import next_power_of_2
 from ..per_thread_planning import MAX_THREADS_PER_BLOCK
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 # Threads of one warp: argmin/argmax reduce within one
 # (``CutePersistentReductionEmitter.plan_max_threads``), a persistent row with
@@ -75,14 +81,99 @@ def tiled_row_threads(threads: int, size: int) -> int:
     return 1 << (threads.bit_length() - 1)
 
 
-def trims_padded_lanes(size: int, threads: int, *, proven_bounds: bool) -> bool:
+def fits_row_packets(
+    row_itemsize: int | None, vector_width: int, capability: tuple[int, int] | None
+) -> bool:
+    """Whether ``vector_width`` of the widest elements a persistent row loads
+    or stores, ``row_itemsize`` bytes each (``cute_row_itemsizes``; None when
+    not recorded, which fits), fit one packet: 16 bytes, 32 on SM100+, as the
+    memory ops' packet gate requires.  Only then does a row of several
+    vectors per thread (``whole_vector_lanes``) hold them as packets
+    ``threads * vector_width`` elements apart: a value no packet fits would
+    be read an element per thread, the threads ``vector_width`` elements
+    apart, so a warp instruction would span ``threads * vector_width``
+    elements where the cyclic lanes read ``threads`` consecutive ones.  It
+    sizes the packets only: a row whose accesses the packet gate refuses for
+    their dtype or alignment still counts, and runs the chunked layout's
+    order on scalar accesses."""
+    if row_itemsize is None:
+        return True
+    max_bytes = 32 if capability is not None and capability >= (10, 0) else 16
+    return vector_width * row_itemsize <= max_bytes
+
+
+# The most lanes a persistent row's thread walks as several vectors
+# (``whole_vector_lanes``).
+MAX_VECTOR_ROW_LANES = 32
+
+
+def whole_vector_lanes(lanes: int | None, vector_width: int) -> bool:
+    """Whether the synthetic lanes a persistent row walks on one warp (or on
+    whole warps, one vector per thread) are whole vectors of
+    ``vector_width`` elements: one per thread, or several ``threads *
+    vector_width`` elements apart (``plan_synthetic_lanes``' chunked rows),
+    at most ``MAX_VECTOR_ROW_LANES`` lanes.  Either way one constexpr loop
+    walks them, which ``cute_lane_unroll`` does not take.  Each vector's
+    packet is loaded ahead of that loop, which unrolls every lane in every
+    sweep, so more lanes (512 on a 16384-wide row on one warp at V = 2)
+    keep the cyclic scalar lanes and their runtime loop."""
+    return (
+        lanes is not None
+        and vector_width > 1
+        and lanes % vector_width == 0
+        and lanes <= MAX_VECTOR_ROW_LANES
+    )
+
+
+def requested_lane_unroll(config: Mapping[str, object]) -> int:
+    """The ``cute_lane_unroll`` a masked persistent row plans its lanes for:
+    1 under ``cute_vloop_sink``, a trade-off, since the sinking pass usually
+    gives the knob to the sunk nest's lane loops
+    (``_normalize_cute_lane_knobs``) and never generates the code again
+    without it; where it leaves the nest rolled, the grid's lane loops take
+    the knob, and an odd row keeps its live lanes with no unroll."""
+    if config.get("cute_vloop_sink"):
+        return 1
+    return cast("int", config.get("cute_lane_unroll", 1))
+
+
+def walks_live_lanes(
+    size: int, threads: int, *, proven_bounds: bool, unroll: int
+) -> bool:
     """Whether a masked persistent row of static ``size`` elements on
-    ``threads`` threads walks only its live lanes (``plan_synthetic_lanes``'
-    ``_live_lane_extent``): those before ``ceil(size / threads)``, after
-    which every thread is masked.  Under ``cute_proven_bounds`` a row whose
-    live lanes cover it exactly (``size`` a multiple of ``threads``) keeps
-    its padded lanes: the proven-bounds cleanup would fold their masks,
-    dropping the masked loads' branches, and LLVM may then contract the
-    multiply-adds around them differently, so that config keeps its padded
-    count and its results."""
-    return not (proven_bounds and size % threads == 0)
+    ``threads`` threads walks exactly its live lanes (``masked_row_lanes``):
+    those before ``ceil(size / threads)``, after which every thread is
+    masked.  Two rows walk more:
+    - under ``cute_proven_bounds``, a row whose live lanes cover it exactly
+      (``size`` a multiple of ``threads``): the proven-bounds cleanup would
+      fold their masks, dropping the masked loads' branches, and LLVM may
+      then contract the multiply-adds around them differently, so that
+      config keeps its padded count and its results;
+    - under a lane unroll (``unroll`` above 1, ``requested_lane_unroll``), a
+      row whose live lanes are odd in number: the unroll factors are powers
+      of two that divide the lane count (``unroll_lane_loads._unroll_factor``),
+      so the row walks its live lanes rounded up to a multiple of ``unroll``,
+      which every factor up to it divides.  Only an odd count is rounded:
+      the knob of 8 unrolls a 600-wide row's 19 live lanes, rounded to 24,
+      by 8, but a 700-wide row's 22 by 2, the largest factor dividing 22.
+      Rounding every count would make the knob uniform, but would change
+      the code of rows whose live lanes already take a factor."""
+    if proven_bounds and size % threads == 0:
+        return False
+    return unroll <= 1 or -(-size // threads) % 2 == 0
+
+
+def masked_row_lanes(
+    size: int, threads: int, lanes: int, *, proven_bounds: bool, unroll: int
+) -> int:
+    """The lanes a masked persistent row of static ``size`` elements on
+    ``threads`` threads walks of its ``lanes`` padded ones: its live lanes,
+    or where it walks more (``walks_live_lanes``) its padded count under
+    ``cute_proven_bounds``, and under a lane unroll its odd live count
+    rounded up to a multiple of ``unroll``, never past the padded count."""
+    if proven_bounds and size % threads == 0:
+        return lanes
+    live = -(-size // threads)
+    if unroll > 1 and live % 2:
+        live = -(-live // unroll) * unroll
+    return min(lanes, live)

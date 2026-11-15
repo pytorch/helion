@@ -2462,6 +2462,232 @@ def test_sunk_channel_operands_contract_like_the_unsunk_kernel(
     assert _value_statements(sunk) == _value_statements(unsunk)
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _grn_apply(
+    x: torch.Tensor,
+    beta: torch.Tensor,
+    gamma: torch.Tensor,
+    gx: torch.Tensor,
+    denom: torch.Tensor,
+) -> torch.Tensor:
+    """ConvNeXt-V2's GRN apply on a channels-last ``[n, hw, c]`` view: each
+    element reads its channel's ``beta`` and ``gamma``, its image's channel
+    of ``gx`` and its image's ``denom``, none of them per spatial row."""
+    out = torch.empty_like(x)
+    for tile_n, tile_hw, tile_c in hl.tile(x.size()):
+        v = x[tile_n, tile_hw, tile_c].to(torch.float32)
+        nx = gx[tile_n, tile_c] / denom[tile_n][:, None]
+        y = torch.addcmul(beta[tile_c], gamma[tile_c], v * nx[:, None, :])
+        out[tile_n, tile_hw, tile_c] = (v + y).to(out.dtype)
+    return out
+
+
+def _grn_args(
+    device: str = "cpu", images: int = 8, rows: int = 196, channels: int = 256
+) -> tuple[torch.Tensor, ...]:
+    # 196 spatial rows end the seed's 64-row tiles ragged.
+    x = torch.randn(images, rows, channels, dtype=torch.bfloat16, device=device)
+    beta, gamma = (torch.randn(channels, device=device) for _ in range(2))
+    gx = torch.rand(images, channels, device=device)
+    denom = torch.rand(images, device=device) + 0.5
+    return x, beta, gamma, gx, denom
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _add_channel_bias(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_n, tile_hw, tile_c in hl.tile(x.size()):
+        out[tile_n, tile_hw, tile_c] = x[tile_n, tile_hw, tile_c] + bias[tile_c]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _add_volumes(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_n, tile_hw, tile_c in hl.tile(x.size()):
+        out[tile_n, tile_hw, tile_c] = (
+            x[tile_n, tile_hw, tile_c] + y[tile_n, tile_hw, tile_c]
+        )
+    return out
+
+
+def test_pointwise_heuristic_seeds_spatial_rows_beside_image_and_channel_operands(
+    cpu_only: None,
+) -> None:
+    """Three tile axes: the spatial rows, which only ``x`` indexes, take the
+    seed's rows, and the image axis its smallest tile with a thread per
+    image.  ``gx / denom``, ``beta`` and ``gamma`` load (and divide) once
+    per thread before the rows; each of the thread's eight rows loads and
+    stores one 16-byte packet under its mask."""
+    bound = cpu_bind(_grn_apply, _grn_args())
+    seeds = _hoist_seeds(bound)
+    assert [
+        (seed["block_sizes"], seed["num_threads"], seed.get("cute_min_blocks_per_mp"))
+        for seed in seeds
+    ] == [([1, 64, 128], [1, 8, 16], 3)]
+    (seed,) = seeds
+    assert seed["cute_vector_widths"] == [1, 1, 8]
+    assert seed["cute_lane_layouts"] == ["blocked", "blocked", "strided"]
+    assert seed["loop_orders"] == [[2, 1, 0]]
+    assert seed["cute_lane_unroll"] == 8
+    code = bound.to_code(bound.config_spec.normalized_config(helion.Config(**seed)))
+    rows = ast.unparse(_loop(code, "lane_1"))
+    assert ast.unparse(_loop(code, "lane_1").iter) == "range(1)", code
+    assert " / " in code
+    assert " / " not in rows
+    for operand in ("gx", "beta", "gamma", "denom"):
+        assert f"{operand}.iterator" not in rows
+    assert rows.count("ir.VectorType.get([8], cutlass.Uint16.mlir_type)") == 8
+    assert rows.count("_cute_store_u16_vec(") == 8
+
+
+def test_pointwise_heuristic_hoists_image_operands_with_images_on_threads(
+    cpu_only: None,
+) -> None:
+    """At GRN's batch of 128 images the seed puts four images on threads
+    beside the spatial rows: ``gx / denom``, which vary over the images,
+    still load and divide once per thread, before its rows."""
+    bound = cpu_bind(_grn_apply, _grn_args(images=128))
+    (seed,) = _hoist_seeds(bound)
+    assert (seed["block_sizes"], seed["num_threads"]) == ([4, 16, 128], [4, 2, 16])
+    code = bound.to_code(bound.config_spec.normalized_config(helion.Config(**seed)))
+    assert "_vsink_vec" in code
+    rows = ast.unparse(_loop(code, "lane_1"))
+    assert " / " not in rows
+    for operand in ("gx", "beta", "gamma", "denom"):
+        assert f"{operand}.iterator" not in rows
+
+
+@pytest.mark.parametrize(
+    ("shape", "block_sizes", "num_threads"),
+    [
+        # A 512-image batch's smallest image tile, 16 images on a thread each,
+        # leaves the spatial rows no thread: the images take the rows, the
+        # spatial axis its smallest tile of 2.
+        ((512, 64, 256), [32, 2, 128], [4, 2, 16]),
+        # One spatial row cannot hold 16 rows: the images take them.
+        ((512, 1, 256), [64, 1, 128], [8, 1, 16]),
+    ],
+)
+def test_pointwise_heuristic_moves_the_hoist_rows_where_the_smallest_tiles_fit(
+    cpu_only: None,
+    shape: tuple[int, int, int],
+    block_sizes: list[int],
+    num_threads: list[int],
+) -> None:
+    """The occupancy floor of a large grid raises the smallest tile of the
+    axes beside the rows; the seed moves its rows to the next outer axis
+    where they fit."""
+    x = torch.empty(shape, dtype=torch.bfloat16)
+    bias = torch.empty(shape[-1], dtype=torch.bfloat16)
+    bound = cpu_bind(_add_channel_bias, (x, bias))
+    (seed,) = _hoist_seeds(bound)
+    assert (seed["block_sizes"], seed["num_threads"]) == (block_sizes, num_threads)
+    code = bound.to_code(bound.config_spec.normalized_config(helion.Config(**seed)))
+    assert "_vsink_vec" in code
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _shift_rows_exp(
+    scores: torch.Tensor, mask: torch.Tensor, row_max: torch.Tensor
+) -> torch.Tensor:
+    """The shape of gpt-oss's sink softmax normalize: ``mask`` does not vary
+    over the heads, ``row_max`` not over the columns."""
+    out = torch.empty_like(scores)
+    for tile_h, tile_q, tile_k in hl.tile(scores.size()):
+        x = scores[tile_h, tile_q, tile_k] + mask[tile_q, tile_k][None, :, :]
+        out[tile_h, tile_q, tile_k] = torch.exp(x - row_max[tile_h, tile_q][:, :, None])
+    return out
+
+
+def test_pointwise_heuristic_skips_the_hoist_where_no_rows_fit(
+    cpu_only: None,
+) -> None:
+    """Neither outer axis fits the seed's rows beside the other axis's
+    smallest tile: 16 images beside the spatial rows (and 8 spatial rows
+    under the images' 16), 16 query rows beside the heads (and no operand
+    along the columns that the query rows leave out).  A thread walking
+    those tiles would hold 1024 elements, so there is no seed."""
+    grn = (
+        torch.empty(512, 196, 256, dtype=torch.bfloat16),
+        torch.empty(256),
+        torch.empty(256),
+        torch.empty(512, 256),
+        torch.empty(512),
+    )
+    assert _hoist_seeds(cpu_bind(_grn_apply, grn)) == []
+    scores = torch.empty(64, 1000, 1000, dtype=torch.bfloat16)
+    mask = torch.empty(1000, 1000, dtype=torch.bfloat16)
+    row_max = torch.empty(64, 1000, dtype=torch.float32)
+    assert _hoist_seeds(cpu_bind(_shift_rows_exp, (scores, mask, row_max))) == []
+
+
+def test_pointwise_heuristic_skips_the_hoist_when_every_operand_varies_by_row(
+    cpu_only: None,
+) -> None:
+    x = torch.empty(8, 196, 256, dtype=torch.bfloat16)
+    assert _hoist_seeds(cpu_bind(_add_volumes, (x, x))) == []
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _add_channel_bias_in_a_loop(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_n, tile_hw in hl.tile([x.size(0), x.size(1)]):
+        for tile_c in hl.tile(x.size(2)):
+            out[tile_n, tile_hw, tile_c] = x[tile_n, tile_hw, tile_c] + bias[tile_c]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _add_row_bias_in_a_loop(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_n in hl.tile(x.size(0)):
+        for tile_c in hl.tile(x.size(1)):
+            out[tile_n, tile_c] = x[tile_n, tile_c] + bias[tile_c]
+    return out
+
+
+def test_pointwise_heuristic_skips_the_hoist_for_an_inner_device_loop(
+    cpu_only: None,
+) -> None:
+    """The channels an inner device loop tiles are no grid axis, whose
+    vector loop the sinking pass sinks: a hoist seed would run the knob-off
+    code."""
+    x = torch.empty(8, 196, 256, dtype=torch.bfloat16)
+    bias = torch.empty(256, dtype=torch.bfloat16)
+    assert _hoist_seeds(cpu_bind(_add_channel_bias_in_a_loop, (x, bias))) == []
+    rows = torch.empty(4096, 256, dtype=torch.bfloat16)
+    assert _hoist_seeds(cpu_bind(_add_row_bias_in_a_loop, (rows, bias))) == []
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _add_bias_4d(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_a, tile_b, tile_c, tile_d in hl.tile(x.size()):
+        out[tile_a, tile_b, tile_c, tile_d] = (
+            x[tile_a, tile_b, tile_c, tile_d] + bias[tile_d]
+        )
+    return out
+
+
+def test_pointwise_heuristic_keeps_the_hoist_within_three_thread_axes(
+    cpu_only: None,
+) -> None:
+    """Over four axes every fit threads the rows, the columns and both other
+    outer axes (their smallest tiles are 2 here): a CTA has three thread
+    axes, and the fourth would run as a serial lane loop that the lane unroll
+    takes, so there is no seed."""
+    x = torch.empty(32, 32, 32, 256, dtype=torch.bfloat16)
+    bound = cpu_bind(_add_bias_4d, (x, torch.empty(256)))
+    assert [
+        bound.config_spec.block_sizes.block_id_lookup(block_id)
+        ._fragment(bound.config_spec)
+        .low
+        for block_id in range(3)
+    ] == [2, 2, 2]
+    assert _hoist_seeds(bound) == []
+
+
 _FILLED_FRAGMENTS = """
 w_frag = cute.make_rmem_tensor(8, cutlass.Float32)
 b_frag = cute.make_rmem_tensor(8, cutlass.Float32)
@@ -2859,6 +3085,101 @@ split_column_sum_dynamic = helion.kernel(
 )
 
 
+# Eight columns of each split on one thread (``num_threads`` 1 along the column
+# tile, 32 threads along the rows).
+_ONE_THREAD_COLUMNS = {
+    "block_sizes": [1, 8, 256],
+    "num_threads": [1, 1, 32],
+    "cute_vector_widths": [1, 8, 1],
+    "cute_lane_layouts": ["blocked", "blocked", "strided"],
+    "cute_vloop_sink": True,
+    "cute_lane_unroll": 8,
+}
+
+
+def test_a_one_thread_column_tile_sinks_its_vector_loop(cpu_only: None) -> None:
+    """A column tile on one thread walks its block as V-wide vector lanes,
+    as a thread's blocked span does: the row loop loads one 8-column packet
+    per row instead of eight 2-byte scalars."""
+    x = torch.empty(4700, 64, dtype=torch.bfloat16)
+    code = _cpu_code(split_column_sum_static, (x, 600), **_ONE_THREAD_COLUMNS)
+    _assert_defined_before_use(code)
+    assert "_vsink_vec" in code
+    lane_loop = _loop(code, "lane_2")
+    loads = _vector_loads(lane_loop.body)
+    assert len(loads) == 8
+    assert all(
+        "ir.VectorType.get([8], cutlass.Uint16.mlir_type)" in ast.unparse(stmt)
+        for stmt in loads
+    )
+    assert ".load()" not in ast.unparse(lane_loop)
+    assert "block=(32, 1, 1)" in code
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _add_4d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_a, tile_b, tile_c, tile_d in hl.tile(x.size()):
+        out[tile_a, tile_b, tile_c, tile_d] = (
+            x[tile_a, tile_b, tile_c, tile_d] + y[tile_a, tile_b, tile_c, tile_d]
+        )
+    return out
+
+
+# Threads on all four axes: the first three take the launch's x/y/z axes, and
+# the fourth is demoted to one thread whose lane loop walks its 64 elements.
+_DEMOTED_FOURTH_AXIS = {
+    "block_sizes": [2, 2, 2, 64],
+    "num_threads": [2, 2, 2, 8],
+    "cute_vector_widths": [1, 1, 1, 8],
+}
+
+
+def test_a_block_demoted_past_the_third_thread_axis_loads_packets(
+    cpu_only: None,
+) -> None:
+    """A block that loses its thread axis to the launch's three walks its
+    block as V-wide lanes, as a configured one-thread axis does: one 8-wide
+    packet per operand instead of scalar loads."""
+    x = torch.empty(4, 4, 4, 128, dtype=torch.bfloat16)
+    code = _cpu_code(_add_4d, (x, x), **_DEMOTED_FOURTH_AXIS)
+    assert "block=(2, 2, 2)" in code
+    assert code.count("ir.VectorType.get([8], cutlass.Uint16.mlir_type)") == 2
+    assert ".load()" not in code
+
+
+@helion.kernel(backend="cute", static_shapes=False, autotune_effort="none")
+def _col_reduce_sum_dim_minus_2(x: torch.Tensor) -> torch.Tensor:
+    """``col_reduce_sum_dynamic`` with the rows summed as ``dim=-2``."""
+    m, n = x.size()
+    out = torch.zeros(n, dtype=x.dtype, device=x.device)
+    block_m = hl.register_block_size(m)
+    block_n = hl.register_block_size(n)
+    for tile_n in hl.tile(n, block_size=block_n):
+        col_acc = hl.zeros([tile_n], dtype=torch.float32)
+        for tile_m in hl.tile(m, block_size=block_m):
+            col_acc += torch.sum(x[tile_m, tile_n].to(torch.float32), dim=-2)
+        out[tile_n] = col_acc.to(out.dtype)
+    return out
+
+
+def test_column_reduction_heuristic_takes_the_rows_summed_as_dim_minus_2(
+    cpu_only: None,
+) -> None:
+    """``dim=-2`` names the rows of the ``[tile_m, tile_n]`` tile as ``dim=0``
+    does: the column heuristic seeds that sum the same coalesced layouts."""
+    x = torch.empty(4096, 4096, dtype=torch.bfloat16)
+    seeds = [
+        [
+            seed.config
+            for seed in cpu_bind(kernel, (x,)).config_spec.compiler_seed_configs
+            if seed.config.get("cute_vloop_sink")
+        ]
+        for kernel in (col_reduce_sum_dynamic, _col_reduce_sum_dim_minus_2)
+    ]
+    assert seeds[0] and seeds[1] == seeds[0]
+
+
 def test_split_column_reduction_heuristic_seeds_the_coalesced_layout(
     cpu_only: None,
 ) -> None:
@@ -3132,6 +3453,38 @@ class TestCuteVloopSink(TestCase):
                     self.assertIn(f", {policy!r})", code)
                     self.assertTrue(torch.equal(hinted, plain))
             torch.testing.assert_close(plain, _col_sum(x), atol=2e-2, rtol=2e-2)
+
+    def test_one_thread_column_tile_matches_the_scalar_bits(self) -> None:
+        """Eight columns per thread as one vector lane against the same
+        layout without the vector: the column sums add the same rows in the
+        same order.  60 columns leave a partial last column tile."""
+        for columns in (64, 60):
+            with self.subTest(columns=columns):
+                x = torch.randn(4700, columns, device=DEVICE, dtype=torch.bfloat16)
+                bound = split_column_sum_static.bind((x, 600))
+                vector = bound.compile_config(helion.Config(**_ONE_THREAD_COLUMNS))(
+                    x, 600
+                )
+                scalar = bound.compile_config(
+                    helion.Config(
+                        **{**_ONE_THREAD_COLUMNS, "cute_vector_widths": [1, 1, 1]}
+                    )
+                )(x, 600)
+                self.assertTrue(torch.equal(vector, scalar))
+                expected = torch.stack(
+                    [x[row : row + 600].float().sum(0) for row in range(0, 4700, 600)]
+                )
+                torch.testing.assert_close(vector, expected, rtol=1e-4, atol=1e-3)
+
+    def test_demoted_fourth_axis_packets_match_torch(self) -> None:
+        """The demoted block's 8-wide packets add the same elements as
+        torch, with a partial last block on the demoted axis: 100 of 128
+        elements of 256-byte rows, so the packets stay aligned."""
+        x = torch.randn(4, 4, 4, 128, device=DEVICE, dtype=torch.bfloat16)[..., :100]
+        y = torch.randn(4, 4, 4, 128, device=DEVICE, dtype=torch.bfloat16)[..., :100]
+        code, out = code_and_output(_add_4d, (x, y), **_DEMOTED_FOURTH_AXIS)
+        self.assertIn("ir.VectorType.get([8], cutlass.Uint16.mlir_type)", code)
+        self.assertTrue(torch.equal(out, x + y))
 
     def test_partial_tiles_on_both_axes(self) -> None:
         """1000 rows against a 4096-row block and 1000 columns against
@@ -3503,24 +3856,34 @@ class TestCuteVloopSink(TestCase):
         self.assertIn("_cute_load_v4b_if(", bound.to_code(seed))
         torch.testing.assert_close(bound(x), x.float().sum(0), atol=1e-2, rtol=1e-3)
 
-    def _check_channel_affine(self, rows: int, config: dict[str, Any]) -> None:
-        """``config`` matches eager, and its output with the channel operands
-        hoisted (``cute_vloop_sink``) is bitwise the knob-off kernel's."""
-        args = _channel_affine_args(DEVICE, rows=rows)
+    def _check_hoist(
+        self,
+        kernel: helion.Kernel,
+        args: tuple[torch.Tensor, ...],
+        config: dict[str, Any],
+        expected: torch.Tensor,
+    ) -> None:
+        """``config`` matches ``expected``, and its output with the operands
+        hoisted out of the row loop (``cute_vloop_sink``) is bitwise the
+        knob-off kernel's."""
         outputs = []
         for sink in (True, False):
             code, out = code_and_output(
-                _channel_affine_relu, args, **(config | {"cute_vloop_sink": sink})
+                kernel, args, **(config | {"cute_vloop_sink": sink})
             )
             self.assertEqual("_vsink_vec" in code, sink)
             outputs.append(out)
         sunk, unsunk = outputs
         torch.testing.assert_close(sunk, unsunk, atol=0, rtol=0)
-        x, mean, var, weight, bias = (t.float() for t in args)
-        expected = torch.relu((x - mean) * torch.rsqrt(var + 1e-05) * weight + bias)
         torch.testing.assert_close(
             sunk, expected.to(torch.bfloat16), atol=1e-2, rtol=1e-2
         )
+
+    def _check_channel_affine(self, rows: int, config: dict[str, Any]) -> None:
+        args = _channel_affine_args(DEVICE, rows=rows)
+        x, mean, var, weight, bias = (t.float() for t in args)
+        expected = torch.relu((x - mean) * torch.rsqrt(var + 1e-05) * weight + bias)
+        self._check_hoist(_channel_affine_relu, args, config, expected)
 
     def test_channel_affine_with_parameters_hoisted_out_of_the_row_loop(self) -> None:
         self._check_channel_affine(512, dict(_channel_affine_config(sink=True).config))
@@ -3531,3 +3894,16 @@ class TestCuteVloopSink(TestCase):
         for rows in (4096, 500):
             bound = _channel_affine_relu.bind(_channel_affine_args(DEVICE, rows=rows))
             self._check_channel_affine(rows, _hoist_seeds(bound)[0])
+
+    def test_grn_apply_hoist_seed(self) -> None:
+        """The three-axis seeds match eager, and their output is bitwise the
+        knob-off kernel's: on ragged spatial rows, with four images on
+        threads beside them (128 images), and with the rows moved to the
+        images (512 images of 64 rows)."""
+        for images, rows, channels in ((8, 196, 256), (128, 196, 256), (512, 64, 512)):
+            args = _grn_args(DEVICE, images=images, rows=rows, channels=channels)
+            seed = _hoist_seeds(_grn_apply.bind(args))[0]
+            x, beta, gamma, gx, denom = (t.float() for t in args)
+            nx = (gx / denom[:, None])[:, None, :]
+            expected = x + torch.addcmul(beta, gamma, x * nx)
+            self._check_hoist(_grn_apply, args, seed, expected)

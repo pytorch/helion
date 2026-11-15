@@ -34,11 +34,13 @@ from __future__ import annotations
 
 import ast
 from typing import TYPE_CHECKING
+from typing import NamedTuple
 
 from ..ast_extension import _STATEMENT_LIST_FIELDS
 from ._ast_pass_utils import call_path_str
 from ._ast_pass_utils import deep_clone
 from .reduce_call import GROUPED_REDUCE_HELPERS
+from .reduce_call import ReduceScope
 from .smem_footprint import allocates_smem
 
 if TYPE_CHECKING:
@@ -64,7 +66,7 @@ def _int_cast_arg(node: ast.expr) -> ast.expr | None:
     return None
 
 
-def _static_int(node: ast.expr, constexpr_values: Mapping[str, int]) -> int | None:
+def static_int(node: ast.expr, constexpr_values: Mapping[str, int]) -> int | None:
     while (arg := _int_cast_arg(node)) is not None:
         node = arg
     if isinstance(node, ast.Constant) and type(node.value) is int:
@@ -74,26 +76,57 @@ def _static_int(node: ast.expr, constexpr_values: Mapping[str, int]) -> int | No
     return None
 
 
-def _keeps_loop_whole(call: ast.Call) -> bool:
+def _keeps_loop_whole(call: ast.Call, *, warp_reduces_keep_whole: bool = True) -> bool:
     """Whether ``call`` keeps its loop whole: shared memory it may take
     (``allocates_smem``) every copy would take again.  An mbarrier's
     initialization and the reduces across threads that allocate nothing (the
-    warp and cluster grouped-reduce dispatchers, the DSL's warp reduction)
-    keep it whole too, conservatively: they claim nothing per call site."""
+    cluster grouped-reduce dispatcher, and with ``warp_reduces_keep_whole`` the warp
+    one and the DSL's warp reduction) keep it whole too, conservatively:
+    they claim nothing per call site.  A warp reduction exchanges registers
+    through shuffles only, so a copy of its loop runs it once more."""
     if allocates_smem(call):
         return True
     path = call_path_str(call.func)
-    return path is not None and (
-        path == "cute.arch.mbarrier_init"
-        or path in GROUPED_REDUCE_HELPERS
-        or path.startswith("cute.arch.warp_reduction")
+    if path is None:
+        return False
+    if path == ReduceScope.WARP.value or path.startswith("cute.arch.warp_reduction"):
+        return warp_reduces_keep_whole
+    return path == "cute.arch.mbarrier_init" or path in GROUPED_REDUCE_HELPERS
+
+
+class _Split(NamedTuple):
+    """Where a loop ``range(start, end, step)`` splits: its complete chunks
+    end at ``full_end``."""
+
+    start: int
+    end: int
+    full_end: int
+    step: int
+
+
+def _compares_end(body: list[ast.stmt], end: int) -> bool:
+    """Whether ``body`` compares anything against ``end``."""
+    return any(
+        isinstance(node, ast.Compare)
+        and any(
+            isinstance(right, ast.Constant) and right.value == end
+            for right in node.comparators
+        )
+        for node in ast.walk(ast.Module(body=body, type_ignores=[]))
     )
 
 
-def _peelable(
-    loop: ast.For, constexpr_values: Mapping[str, int]
-) -> tuple[int, int, int] | None:
-    """``(start, end, full_end)`` of a loop to split, or ``None``."""
+def peelable(
+    loop: ast.For,
+    constexpr_values: Mapping[str, int],
+    *,
+    warp_reduces_keep_whole: bool = True,
+    needs: Callable[[list[ast.stmt], int], bool] = _compares_end,
+) -> _Split | None:
+    """Where to split ``loop``, or ``None``: a static ``range`` whose step
+    does not divide it, with no early exit and no call that keeps the loop
+    whole (``_keeps_loop_whole``), whose body ``needs`` the split given its
+    end."""
     call = loop.iter
     if (
         loop.orelse
@@ -104,9 +137,9 @@ def _peelable(
         or call.keywords
     ):
         return None
-    start, step = (_static_int(call.args[i], constexpr_values) for i in (0, 2))
+    start, step = (static_int(call.args[i], constexpr_values) for i in (0, 2))
     # The body compares against a literal end (a name for it never matches).
-    end = _static_int(call.args[1], {})
+    end = static_int(call.args[1], {})
     if (
         start is None
         or end is None
@@ -116,20 +149,16 @@ def _peelable(
         or (end - start) % step == 0
     ):
         return None
-    compares_end = False
     for node in ast.walk(ast.Module(body=loop.body, type_ignores=[])):
         if isinstance(node, (ast.Break, ast.Continue, ast.Return)):
             return None
-        if isinstance(node, ast.Call) and _keeps_loop_whole(node):
-            return None
-        if isinstance(node, ast.Compare) and any(
-            isinstance(right, ast.Constant) and right.value == end
-            for right in node.comparators
+        if isinstance(node, ast.Call) and _keeps_loop_whole(
+            node, warp_reduces_keep_whole=warp_reduces_keep_whole
         ):
-            compares_end = True
-    if not compares_end:
+            return None
+    if not needs(loop.body, end):
         return None
-    return start, end, end - (end - start) % step
+    return _Split(start, end, end - (end - start) % step, step)
 
 
 def _rebound(bound: ast.expr, value: int) -> ast.expr:
@@ -143,12 +172,15 @@ def _rebound(bound: ast.expr, value: int) -> ast.expr:
     return ast.copy_location(ast.Constant(value=value), bound)
 
 
-def _with_bounds(loop: ast.For, start: int, end: int) -> ast.For:
+def with_bounds(loop: ast.For, start: int, end: int, *, mark: bool = True) -> ast.For:
+    """A copy of ``loop`` over ``range(start, end)``, marked as one of its
+    peeled copies (for ``merge_unproven_peels``) when ``mark``."""
     copy = deep_clone(loop)
     assert isinstance(copy.iter, ast.Call)
     begin, stop, step = copy.iter.args
     copy.iter.args = [_rebound(begin, start), _rebound(stop, end), step]
-    setattr(copy, _PEELED, loop)
+    if mark:
+        setattr(copy, _PEELED, loop)
     return copy
 
 
@@ -187,7 +219,7 @@ def _peel(
         split = (
             None
             if inner or not isinstance(statement, ast.For)
-            else _peelable(statement, constexpr_values)
+            else peelable(statement, constexpr_values)
         )
         previous = statement
         peeled = peeled or inner
@@ -195,11 +227,10 @@ def _peel(
             result.append(statement)
             continue
         assert isinstance(statement, ast.For)
-        start, end, full_end = split
         result.extend(
             (
-                _with_bounds(statement, start, full_end),
-                _with_bounds(statement, full_end, end),
+                with_bounds(statement, split.start, split.full_end),
+                with_bounds(statement, split.full_end, split.end),
             )
         )
         peeled = True

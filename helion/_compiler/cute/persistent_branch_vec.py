@@ -15,9 +15,12 @@ from collections import Counter
 import dataclasses
 from functools import cache
 from functools import partial
+from itertools import pairwise
 import math
+import operator
 import re
 from typing import TYPE_CHECKING
+from typing import cast
 
 from ..ast_read_writes import ReadWrites
 from ._ast_pass_utils import loop_extent
@@ -37,6 +40,7 @@ from .packet_access import render_packet_load
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Mapping
+    from collections.abc import Sequence
 
 _LOAD_MARKER = PERSISTENT_BRANCH_VEC_LOAD
 _STORE_MARKER = PERSISTENT_BRANCH_VEC_STORE
@@ -648,14 +652,6 @@ def _scalar_pointer_calls_are_known(node: ast.AST) -> bool:
     return True
 
 
-def _scalar_pointer_is_known_affine(node: ast.AST, lane_var: str) -> bool:
-    """Reject pointer expressions whose affine semantics are not transparent."""
-    if not _scalar_pointer_calls_are_known(node):
-        return False
-    depends, affine = _is_affine_in_lane(node, lane_var)
-    return depends and affine
-
-
 def _lane_step_separates(step: int, modulus: int, width: int) -> bool:
     """Whether a lane offset of ``step`` (mod ``modulus``) cannot overlap a
     ``width``-element access at the other lane."""
@@ -663,78 +659,173 @@ def _lane_step_separates(step: int, modulus: int, width: int) -> bool:
     return min(remainder, modulus - remainder) >= width
 
 
-def _scalar_lane_mapping_is_injective(
+def _exact_divisor(
+    node: ast.AST, proven_tensor_stride_values: Mapping[tuple[str, int], int]
+) -> int | None:
+    """The value of a divisor whose runtime value is exactly known: a literal
+    or a cache-safe exact tensor stride (possibly cast), in [1, 2**31), where
+    Int32 arithmetic cannot have wrapped it."""
+    while (
+        isinstance(node, ast.Call)
+        and len(node.args) == 1
+        and not node.keywords
+        and ast.unparse(node.func) in ("cutlass.Int32", "cutlass.Int64")
+    ):
+        node = node.args[0]
+    if isinstance(node, ast.Constant):
+        value = node.value
+        if not isinstance(value, int) or isinstance(value, bool):
+            return None
+    else:
+        stride = _tensor_stride_reference(node)
+        value = proven_tensor_stride_values.get(stride) if stride is not None else None
+    return value if value is not None and 1 <= value < 1 << 31 else None
+
+
+def _lane_offsets(
     node: ast.AST,
     lane_var: str,
-    lane_extent: int,
+    lanes: Sequence[int],
     proven_tensor_stride_values: Mapping[tuple[str, int], int],
-    width: int = 1,
-) -> bool:
-    """Prove distinct lanes produce distinct scalar pointer offsets.
+) -> list[int] | None:
+    """The offset ``node`` takes at each of ``lanes`` (the lane variable's
+    values), up to a shift all lanes share, or None.
 
-    ``width`` > 1 additionally requires the lanes' ``width``-element
-    fragments not to overlap (hoisted vector packets and flushes).
+    ``node`` must be integer arithmetic of the lane (``+``, ``-``, ``*``,
+    ``//``, ``%`` and ``cutlass.Int32`` / ``Int64`` casts) whose
+    lane-independent terms are known (literals, cache-safe exact tensor
+    strides) wherever they scale, divide or reduce a lane-dependent one; an
+    unknown term may only be added, which shifts every lane alike.  A
+    division or remainder needs the lane-dependent operand's own values, not
+    shifted, non-negative and below 2**31, computed without leaving the Int32
+    range on the way (the Int32 arithmetic agrees with them only modulo
+    2**32), and an exactly known divisor (``_exact_divisor``).  That covers
+    the chunked persistent lanes' ``lane // V * threads * V + lane % V``,
+    which is not affine in the lane.
     """
+    lanes = list(lanes)
+    if not lanes:
+        return []
 
-    def visit(expr: ast.AST) -> tuple[bool, int | None]:
-        if isinstance(expr, ast.Name):
-            return (True, 1) if expr.id == lane_var else (False, 0)
-        if isinstance(expr, ast.UnaryOp):
-            depends, coefficient = visit(expr.operand)
-            if not isinstance(expr.op, (ast.UAdd, ast.USub)):
-                return depends, None if depends else 0
-            if coefficient is None:
-                return depends, None
-            return depends, coefficient if isinstance(
-                expr.op, ast.UAdd
-            ) else -coefficient
-        if isinstance(expr, ast.BinOp):
-            left_depends, left_coefficient = visit(expr.left)
-            right_depends, right_coefficient = visit(expr.right)
-            if not left_depends and not right_depends:
-                return False, 0
-            if left_depends and right_depends:
-                return True, None
-            coefficient = left_coefficient if left_depends else right_coefficient
-            if coefficient is None:
-                return True, None
-            if isinstance(expr.op, ast.Add):
-                return True, coefficient
-            if isinstance(expr.op, ast.Sub):
-                return True, coefficient if left_depends else -coefficient
-            if isinstance(expr.op, ast.Mult):
-                scale = expr.right if left_depends else expr.left
-                scale_value = _lane_scale_value(scale, proven_tensor_stride_values)
-                return (
-                    True,
-                    None if scale_value is None else coefficient * scale_value,
-                )
-            return True, None
+    def depends(expr: ast.AST) -> bool:
+        return any(
+            isinstance(child, ast.Name) and child.id == lane_var
+            for child in ast.walk(expr)
+        )
+
+    # ``(values, exact)``: per-lane values, exact unless shifted by an
+    # unknown addend; ``(None, value)`` for a lane-independent term, ``value``
+    # None when it is not known.
+    def visit(expr: ast.AST) -> tuple[list[int] | None, object] | None:
+        if isinstance(expr, ast.Name) and expr.id == lane_var:
+            return lanes, True
+        if not depends(expr):
+            return None, _lane_scale_value(expr, proven_tensor_stride_values)
         if isinstance(expr, ast.Call):
-            dependencies = [visit(arg) for arg in expr.args]
-            depends = any(item[0] for item in dependencies)
-            if not depends:
-                return False, 0
-            is_integer_cast = (
+            if (
                 len(expr.args) == 1
                 and not expr.keywords
                 and ast.unparse(expr.func) in ("cutlass.Int32", "cutlass.Int64")
-            )
-            return True, dependencies[0][1] if is_integer_cast else None
-        dependencies = [visit(child) for child in ast.iter_child_nodes(expr)]
-        depends = any(item[0] for item in dependencies)
-        return depends, 0 if not depends else None
+            ):
+                return visit_in_range(expr.args[0])
+            return None
+        if isinstance(expr, ast.UnaryOp) and isinstance(expr.op, (ast.UAdd, ast.USub)):
+            inner = visit_in_range(expr.operand)
+            if inner is None or (values := inner[0]) is None:
+                return None
+            if isinstance(expr.op, ast.USub):
+                values = [-v for v in values]
+            return values, inner[1]
+        if not isinstance(expr, ast.BinOp):
+            return None
+        left, right = visit_in_range(expr.left), visit_in_range(expr.right)
+        if left is None or right is None:
+            return None
+        if isinstance(expr.op, (ast.Add, ast.Sub)):
+            sign = 1 if isinstance(expr.op, ast.Add) else -1
+            if left[0] is not None and right[0] is not None:
+                return (
+                    [a + sign * b for a, b in zip(left[0], right[0], strict=True)],
+                    bool(left[1]) and bool(right[1]),
+                )
+            if left[0] is not None:
+                if isinstance(right[1], int):
+                    return [a + sign * right[1] for a in left[0]], left[1]
+                return left[0], False
+            assert right[0] is not None
+            values = [sign * b for b in right[0]]
+            if isinstance(left[1], int):
+                return [left[1] + v for v in values], right[1]
+            return values, False
+        if isinstance(expr.op, ast.Mult):
+            if left[0] is not None and right[0] is not None:
+                if left[1] is True and right[1] is True:
+                    return (
+                        [a * b for a, b in zip(left[0], right[0], strict=True)],
+                        True,
+                    )
+                return None
+            lane_side, other = (left, right) if left[0] is not None else (right, left)
+            if not isinstance(other[1], int) or lane_side[0] is None:
+                return None
+            return [v * other[1] for v in lane_side[0]], lane_side[1]
+        if isinstance(expr.op, (ast.FloorDiv, ast.Mod)):
+            divisor = _exact_divisor(expr.right, proven_tensor_stride_values)
+            if (
+                left[0] is None
+                or right[0] is not None
+                or left[1] is not True
+                or divisor is None
+                or min(left[0]) < 0
+                or max(left[0]) >= 1 << 31
+            ):
+                return None
+            if isinstance(expr.op, ast.FloorDiv):
+                return [v // divisor for v in left[0]], True
+            return [v % divisor for v in left[0]], True
+        return None
 
-    depends, coefficient = visit(node)
-    if not depends or coefficient in (None, 0):
+    def visit_in_range(expr: ast.AST) -> tuple[list[int] | None, object] | None:
+        result = visit(expr)
+        if result is None:
+            return None
+        # Int32 arithmetic would have wrapped a value outside its range: what
+        # follows agrees with these values only modulo 2**32.
+        values, exact = result
+        if (
+            values is not None
+            and exact is True
+            and not all(-(1 << 31) <= v < 1 << 31 for v in values)
+        ):
+            return values, False
+        return result
+
+    result = visit_in_range(node)
+    if result is None or result[0] is None:
+        return None
+    return result[0]
+
+
+def _lane_offsets_separate(
+    node: ast.AST,
+    lane_var: str,
+    lanes: Sequence[int],
+    proven_tensor_stride_values: Mapping[tuple[str, int], int],
+    width: int = 1,
+) -> bool:
+    """Whether distinct lanes' ``width``-element accesses at ``node``
+    (``_lane_offsets``) are apart, modulo the Int32 index range.  ``lanes``
+    are the lane variable's values."""
+    values = _lane_offsets(node, lane_var, lanes, proven_tensor_stride_values)
+    if values is None:
         return False
-    # Generated scalar indices may narrow through Int32.  Checking every
-    # finite lane delta modulo 2**32 proves injectivity even when a known
-    # coefficient itself wraps; it is conservative for wider arithmetic.
-    return all(
-        _lane_step_separates(coefficient * delta, 1 << 32, width)
-        for delta in range(1, lane_extent)
-    )
+    if not values:
+        return True
+    modulus = 1 << 32
+    ordered = sorted(value % modulus for value in values)
+    gaps = [b - a for a, b in pairwise(ordered)]
+    gaps.append(ordered[0] + modulus - ordered[-1])
+    return min(gaps) >= width
 
 
 def _pointer_integer_affine_form(
@@ -853,6 +944,7 @@ def _scalar_pointers_are_modularly_lane_disjoint(
     proven_tensor_stride_values: Mapping[tuple[str, int], int],
     unstable_names: set[str],
     width: int = 1,
+    lane_step: int = 1,
 ) -> bool:
     """Prove cross-lane disjointness despite different row/checkpoint bases.
 
@@ -860,8 +952,9 @@ def _scalar_pointers_are_modularly_lane_disjoint(
     difference between their lane-independent bases is a multiple of ``M``, a
     cross-iteration dependence is impossible when ``step * delta`` is nonzero
     modulo ``M`` for every live lane delta (at least ``width`` elements away
-    from zero for vector accesses).  Including the Int32 modulus keeps the
-    proof sound under generated index narrowing.
+    from zero for vector accesses): the ``lane_extent`` lane values are
+    ``lane_step`` apart.  Including the Int32 modulus keeps the proof sound
+    under generated index narrowing.
     """
     load_root = _single_tensor_iterator_root(load_pointer)
     store_root = _single_tensor_iterator_root(store_pointer)
@@ -902,7 +995,7 @@ def _scalar_pointers_are_modularly_lane_disjoint(
     for coefficient in base_coefficients.values():
         modulus = math.gcd(modulus, abs(coefficient))
     return modulus > 1 and all(
-        _lane_step_separates(lane_coefficient * delta, modulus, width)
+        _lane_step_separates(lane_coefficient * lane_step * delta, modulus, width)
         for delta in range(1, lane_extent)
     )
 
@@ -960,19 +1053,32 @@ def _lane_accesses_are_iteration_independent(
     store_definitions: dict[str, ast.expr],
     proven_tensor_stride_values: Mapping[tuple[str, int], int] | None = None,
     loop_carried_names: set[str] | None = None,
+    lane_start: int = 0,
+    lane_step: int = 1,
 ) -> bool:
     """Prove an exact load/store pair cannot communicate across lane iterations.
 
-    Persistent vector markers prove injectivity through their matching exact-
-    fragment metadata.  Plain scalar accesses instead require one known tensor
-    iterator, stable address aliases, an identical affine pointer function, and
-    an injective lane step backed by literals and cache-safe exact tensor-stride
-    values.  Both paths preserve same-iteration load-before-store order while
+    Both paths need the load and the store to share one lane-dependent
+    pointer function over stable address aliases.  Distinct lanes then reach
+    distinct elements when their enumerated offsets are apart
+    (``_lane_offsets_separate``, backed by literals and cache-safe exact
+    tensor-stride values: an affine pointer with an injective step, or a
+    chunked persistent row's ``lane // V * threads * V + lane % V``, which
+    is not affine in the lane), or else when the pointers are modularly
+    lane-disjoint (``_scalar_pointers_are_modularly_lane_disjoint``).  The
+    lanes are the lane variable's values: ``lane_extent`` of them from
+    ``lane_start`` in steps of ``lane_step``.  Plain scalar accesses also
+    need one known tensor iterator and known pointer calls.
+    Persistent vector markers need matching blocks, widths and dtypes, a
+    width dividing the lane extent (one fragment per lane loop, or one per
+    chunk), and take the affine proof only for one fragment covering every
+    lane.  Both paths preserve same-iteration load-before-store order while
     proving that iteration ``i`` cannot access iteration ``j``'s element.
     Shifted/unknown scalar accesses and atomics deliberately fail closed.
     """
     if lane_extent is None:
         return False
+    lanes = range(lane_start, lane_start + lane_step * lane_extent, lane_step)
     load_marker = _marker_call(load_call, _LOAD_MARKER, 6)
     store_marker = _marker_call(store_call, _STORE_MARKER, 6)
     if (load_marker is None) != (store_marker is None):
@@ -994,7 +1100,7 @@ def _lane_accesses_are_iteration_independent(
         expanded_store = _lane_dependent_alias_expansion(
             store_pointer, store_definitions, lane_var
         )
-        exact_mapping = (
+        same_mapping = (
             ast.dump(expanded_load, include_attributes=False)
             == ast.dump(expanded_store, include_attributes=False)
             and _single_tensor_iterator_root(expanded_load) is not None
@@ -1009,12 +1115,12 @@ def _lane_accesses_are_iteration_independent(
                 lane_var,
                 unstable_names,
             )
-            and _scalar_pointer_is_known_affine(expanded_load, lane_var)
+            and _scalar_pointer_calls_are_known(expanded_load)
         )
-        if exact_mapping and _scalar_lane_mapping_is_injective(
+        if same_mapping and _lane_offsets_separate(
             expanded_load,
             lane_var,
-            lane_extent,
+            lanes,
             proven_tensor_stride_values or {},
             width,
         ):
@@ -1027,6 +1133,7 @@ def _lane_accesses_are_iteration_independent(
             proven_tensor_stride_values=proven_tensor_stride_values or {},
             unstable_names=unstable_names,
             width=width,
+            lane_step=lane_step,
         )
     assert store_marker is not None
     load_block = _literal(load_marker.args[0], int)
@@ -1043,7 +1150,9 @@ def _lane_accesses_are_iteration_independent(
         or load_block != int(lane_match.group(1))
         or not isinstance(load_width, int)
         or load_width != store_width
-        or load_width != lane_extent
+        # One fragment per lane loop, or one per chunk of a chunked
+        # persistent row (``CuteLaneState.chunked_reduction_lanes``).
+        or lane_extent % load_width
         or load_dtype != store_dtype
     ):
         return False
@@ -1071,7 +1180,13 @@ def _lane_accesses_are_iteration_independent(
         unstable_names,
     ):
         depends, affine = _is_affine_in_lane(expanded_load, lane_var)
-        if depends and affine:
+        if depends and affine and load_width == lane_extent:
+            return True
+        # The chunks of a chunked row: each lane one element, the lanes' own
+        # elements distinct (``lane // V * threads * V + lane % V``).
+        if _lane_offsets_separate(
+            expanded_load, lane_var, lanes, proven_tensor_stride_values or {}
+        ):
             return True
     return _scalar_pointers_are_modularly_lane_disjoint(
         expanded_load,
@@ -1080,6 +1195,7 @@ def _lane_accesses_are_iteration_independent(
         lane_extent=lane_extent,
         proven_tensor_stride_values=proven_tensor_stride_values or {},
         unstable_names=unstable_names,
+        lane_step=lane_step,
     )
 
 
@@ -1094,7 +1210,12 @@ def _store_accesses_are_iteration_independent(
     proven_tensor_stride_values: Mapping[tuple[str, int], int],
     unstable_names: set[str],
 ) -> bool:
-    """Prove two ordinary exact-fragment stores independent across lanes."""
+    """Prove two ordinary exact-fragment stores independent across lanes.
+
+    Only markers as wide as the lane loop qualify (one vector per thread):
+    two stores of a chunked row that may alias keep their scalar stores,
+    which is safe.  The enumerated proof that admits a chunked row's load
+    and store (``_lane_offsets_separate``) is not applied to two stores."""
     first_marker = _marker_call(first_call, _STORE_MARKER, 6)
     second_marker = _marker_call(second_call, _STORE_MARKER, 6)
     if first_marker is None or second_marker is None:
@@ -1204,8 +1325,12 @@ def _uniform_guard(
     width: int,
     local_writes: set[str],
     canonical: Callable[[str], str],
+    first_lane: int = 0,
 ) -> tuple[bool, ast.expr | None]:
-    """``local_writes`` holds canonical names (``canonical``)."""
+    """Whether ``mask`` admits the fragment of ``width`` lanes starting at
+    ``first_lane`` as a whole, and the guard that decides it outside the
+    loop (None when every lane is live).  ``local_writes`` holds canonical
+    names (``canonical``)."""
     if mask is None:
         return True, None
     expanded = _expand(mask, definitions, lane_var)
@@ -1221,12 +1346,12 @@ def _uniform_guard(
             # User masks (an FP8 packet store's ``extra_mask``) lower to
             # ``operator`` calls, so a lane-dependent one is rejected above.
             endpoints = (
-                _expand(term, definitions, lane_var, ast.Constant(value=0)),
+                _expand(term, definitions, lane_var, ast.Constant(value=first_lane)),
                 _expand(
                     term,
                     definitions,
                     lane_var,
-                    ast.Constant(value=width - 1),
+                    ast.Constant(value=first_lane + width - 1),
                 ),
             )
             if any(
@@ -1276,12 +1401,15 @@ def _safe_base_pointer(
     local_writes: set[str],
     guard: ast.expr | None,
     canonical: Callable[[str], str],
+    lane: int = 0,
 ) -> ast.expr | None:
-    """``local_writes`` holds canonical names (``canonical``)."""
+    """The address ``pointer`` takes at lane ``lane`` (a packet's first lane),
+    or None when it does not vary with the lane or reads names the loop
+    writes.  ``local_writes`` holds canonical names (``canonical``)."""
     expanded_with_lane = _expand(pointer, definitions, lane_var)
     if lane_var not in set(ReadWrites.from_ast(expanded_with_lane).reads):
         return None
-    base = _expand(pointer, definitions, lane_var, ast.Constant(value=0))
+    base = _expand(pointer, definitions, lane_var, ast.Constant(value=lane))
     if {canonical(name) for name in ReadWrites.from_ast(base).reads} & local_writes:
         return None
     if any(
@@ -1322,6 +1450,101 @@ def _safe_base_pointer(
             orelse=ast.parse("cutlass.Int32(0)", mode="eval").body,
         ),
     )
+
+
+_INT_FOLDS: dict[type[ast.operator], Callable[[int, int], int]] = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+}
+
+
+class _FoldIntConstants(ast.NodeTransformer):
+    """Fold integer arithmetic on literals: a chunk's address substitutes its
+    first lane into ``lane // V * stride + lane % V``."""
+
+    def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
+        self.generic_visit(node)
+        fold = _INT_FOLDS.get(type(node.op))
+        if (
+            fold is not None
+            and isinstance(node.left, ast.Constant)
+            and isinstance(node.right, ast.Constant)
+            and type(node.left.value) is int
+            and type(node.right.value) is int
+            and not (
+                isinstance(node.op, (ast.FloorDiv, ast.Mod)) and node.right.value == 0
+            )
+        ):
+            return ast.copy_location(
+                ast.Constant(value=fold(node.left.value, node.right.value)), node
+            )
+        return node
+
+
+def _chunk_guards_and_bases(
+    mask: object,
+    pointer: object,
+    *,
+    chunks: int,
+    width: int,
+    definitions: dict[str, ast.expr],
+    lane_var: str,
+    local_writes: set[str],
+    canonical: Callable[[str], str],
+    guarded_bases: bool,
+) -> tuple[list[ast.expr | None], list[ast.expr | None]]:
+    """Each chunk's packet guard and base pointer, decided at its first lane
+    (``chunk * width``): its packet of ``width`` lanes is live as a whole
+    under the guard (``_uniform_guard``), and its base is None when no guard
+    decides that or ``pointer`` has no safe base (``_safe_base_pointer``).
+    With ``guarded_bases`` a base reads its offset under the guard (a load's
+    packet); otherwise it is formed unguarded (a store's flush tests the
+    guard itself).  Each chunk substitutes its first lane into
+    ``lane // V * stride + lane % V``; with more than one chunk, the literal
+    arithmetic of every chunk's guard and base is folded."""
+    guards: list[ast.expr | None] = []
+    bases: list[ast.expr | None] = []
+    for chunk in range(chunks):
+        first_lane = chunk * width
+        guard_ok, guard = (
+            _uniform_guard(
+                mask,
+                definitions,
+                lane_var,
+                width,
+                local_writes,
+                canonical,
+                first_lane=first_lane,
+            )
+            if isinstance(mask, (ast.expr, type(None)))
+            else (False, None)
+        )
+        base = (
+            _safe_base_pointer(
+                pointer,
+                definitions,
+                lane_var,
+                local_writes,
+                guard if guarded_bases else None,
+                canonical,
+                lane=first_lane,
+            )
+            if guard_ok and isinstance(pointer, ast.expr)
+            else None
+        )
+        if chunks > 1:
+            guard = None if guard is None else _fold_int_constants(guard)
+            base = None if base is None else _fold_int_constants(base)
+        guards.append(guard)
+        bases.append(base)
+    return guards, bases
+
+
+def _fold_int_constants(expr: ast.expr) -> ast.expr:
+    return cast("ast.expr", _FoldIntConstants().visit(_clone_expr(expr)))
 
 
 def _scalar_load_and_mask(node: ast.expr) -> tuple[ast.Call, ast.expr | None] | None:
@@ -1370,6 +1593,7 @@ class _BranchLocalPersistentVectorizer:
         proven_tensor_stride_values: Mapping[tuple[str, int], int],
         wide_packet_hints: bool = False,
         rename_groups: Mapping[str, str] | None = None,
+        chunked_lanes: Mapping[str, int] | None = None,
     ) -> None:
         self.name_counts = Counter(
             node.id
@@ -1384,6 +1608,9 @@ class _BranchLocalPersistentVectorizer:
         # Hinted 32-byte packets take their ``_32b`` helpers
         # (``cache_policy_loads.hint_wide_packets`` of the config).
         self.wide_packet_hints = wide_packet_hints
+        # Lane loops walking several V-wide chunks per thread, by lane
+        # variable: V (``CuteLaneState.chunked_reduction_lanes``).
+        self.chunked_lanes = chunked_lanes or {}
         # Packets hoisted earlier in the statement list being transformed,
         # by (block, width, dtype, address): the consume loop of a split
         # persistent reduction reads the packet its accumulate loop loaded.
@@ -1394,6 +1621,20 @@ class _BranchLocalPersistentVectorizer:
 
     def _canonical(self, name: str) -> str:
         return self.rename_groups.get(name, name)
+
+    def _packet_chunks(self, lane_var: str, extent: int, width: object) -> int:
+        """The packets of a marker of ``width`` lanes in a lane loop of
+        ``extent``: one when the marker covers the loop, one per chunk of a
+        chunked persistent row, else 0 (the marker stays scalar)."""
+        if width == extent:
+            return 1
+        if (
+            isinstance(width, int)
+            and self.chunked_lanes.get(lane_var) == width
+            and extent % width == 0
+        ):
+            return extent // width
+        return 0
 
     def _fresh(self, prefix: str) -> str:
         while True:
@@ -1687,9 +1928,10 @@ class _BranchLocalPersistentVectorizer:
                     else None
                 )
                 dtype_info = _DTYPE_INFO.get(dtype) if isinstance(dtype, str) else None
+                chunks = self._packet_chunks(lane_var, width, marker_width)
                 if (
                     marker_block == block_id
-                    and marker_width == width
+                    and chunks
                     and isinstance(eviction, str)
                     and dtype_info is not None
                     and load_info is not None
@@ -1702,39 +1944,35 @@ class _BranchLocalPersistentVectorizer:
                         address_definitions(),
                     )
                 ):
+                    assert isinstance(marker_width, int)
                     scalar_load, mask = load_info
-                    guard_ok, guard = _uniform_guard(
+                    _guards, bases = _chunk_guards_and_bases(
                         mask,
-                        definitions,
-                        lane_var,
-                        width,
-                        all_local_writes,
-                        self._canonical,
+                        marker.args[4],
+                        chunks=chunks,
+                        width=marker_width,
+                        definitions=definitions,
+                        lane_var=lane_var,
+                        local_writes=all_local_writes,
+                        canonical=self._canonical,
+                        guarded_bases=True,
                     )
-                    base = (
-                        _safe_base_pointer(
-                            marker.args[4],
-                            definitions,
-                            lane_var,
-                            all_local_writes,
-                            guard,
-                            self._canonical,
-                        )
-                        if guard_ok and isinstance(marker.args[4], ast.expr)
-                        else None
-                    )
-                    if base is not None:
+                    if all(base is not None for base in bases):
                         carrier, itemsize, _store_helper = dtype_info
                         assert isinstance(dtype, str)
-                        key = (block_id, width, dtype, ast.unparse(base))
-                        hoisted = self.hoisted.get(key)
-                        if hoisted is not None:
-                            # Nothing since the earlier loop's packet was
-                            # loaded may have written it or rebound a name of
-                            # its address (``_invalidate_hoisted``).
-                            vec_name = hoisted.name
-                        else:
+                        vec_names: list[str] = []
+                        for base in bases:
+                            assert base is not None
+                            key = (block_id, marker_width, dtype, ast.unparse(base))
+                            hoisted = self.hoisted.get(key)
+                            if hoisted is not None:
+                                # Nothing since the earlier loop's packet was
+                                # loaded may have written it or rebound a
+                                # name of its address (``_invalidate_hoisted``).
+                                vec_names.append(hoisted.name)
+                                continue
                             vec_name = self._fresh("_persistent_branch_vec")
+                            vec_names.append(vec_name)
                             # An L2-policy hint is not a ``cute.arch.load``
                             # kwarg: the packet goes through the inline-PTX
                             # helper of its width (32 bytes: nc_l2_first, and
@@ -1742,10 +1980,10 @@ class _BranchLocalPersistentVectorizer:
                             policy = CachePolicy.from_suffix(eviction)
                             load_source = render_packet_load(
                                 ast.unparse(base),
-                                width,
+                                marker_width,
                                 carrier,
                                 helper=policy.vector_helper(
-                                    width * itemsize,
+                                    marker_width * itemsize,
                                     wide_packets=self.wide_packet_hints,
                                 ),
                                 kwargs=policy.load_kwargs,
@@ -1767,8 +2005,14 @@ class _BranchLocalPersistentVectorizer:
                                     for node in ast.walk(base)
                                 ),
                             )
+                        element = (
+                            f"{vec_names[0]}[{lane_var}]"
+                            if chunks == 1
+                            else f"({', '.join(vec_names)})"
+                            f"[{lane_var} // {marker_width}][{lane_var} % {marker_width}]"
+                        )
                         extract = ast.parse(
-                            f"{carrier}({vec_name}[{lane_var}]).bitcast({dtype})",
+                            f"{carrier}({element}).bitcast({dtype})",
                             mode="eval",
                         ).body
                         replacement, _ = replace_call(
@@ -1800,35 +2044,24 @@ class _BranchLocalPersistentVectorizer:
                     if isinstance(mask_arg, ast.Constant) and mask_arg.value is None
                     else mask_arg
                 )
-                guard_ok, guard = (
-                    _uniform_guard(
-                        mask,
-                        definitions,
-                        lane_var,
-                        width,
-                        all_local_writes,
-                        self._canonical,
-                    )
-                    if isinstance(mask, (ast.expr, type(None)))
-                    else (False, None)
-                )
-                base = (
-                    _safe_base_pointer(
-                        store_marker.args[3],
-                        definitions,
-                        lane_var,
-                        all_local_writes,
-                        None,
-                        self._canonical,
-                    )
-                    if guard_ok and isinstance(store_marker.args[3], ast.expr)
-                    else None
+                chunks = self._packet_chunks(lane_var, width, marker_width)
+                # Each chunk's flush decides its own lanes.
+                guards, bases = _chunk_guards_and_bases(
+                    mask,
+                    store_marker.args[3],
+                    chunks=chunks,
+                    width=cast("int", marker_width),
+                    definitions=definitions,
+                    lane_var=lane_var,
+                    local_writes=all_local_writes,
+                    canonical=self._canonical,
+                    guarded_bases=False,
                 )
                 if (
                     marker_block == block_id
-                    and marker_width == width
+                    and chunks
                     and dtype_info is not None
-                    and base is not None
+                    and all(base is not None for base in bases)
                     and not self._has_other_aliasing_access_in_loop(
                         loop.body,
                         store_marker,
@@ -1881,21 +2114,39 @@ class _BranchLocalPersistentVectorizer:
                         )
                     )
                     stmt = append
-                    flush = ast.Expr(
-                        value=ast.Call(
-                            func=ast.Name(id=store_helper, ctx=ast.Load()),
-                            args=[
-                                base,
-                                ast.Name(id=values_name, ctx=ast.Load()),
-                            ],
-                            keywords=[],
+                    assert isinstance(marker_width, int)
+                    for chunk, (base, guard) in enumerate(
+                        zip(bases, guards, strict=True)
+                    ):
+                        assert base is not None
+                        # Several chunks flush constant slices of the one
+                        # collector (``packet_store_policy._store_call``).
+                        values: ast.expr = ast.Name(id=values_name, ctx=ast.Load())
+                        if chunks > 1:
+                            values = ast.Subscript(
+                                value=values,
+                                slice=ast.Slice(
+                                    lower=ast.Constant(value=chunk * marker_width),
+                                    upper=ast.Constant(
+                                        value=(chunk + 1) * marker_width
+                                    ),
+                                ),
+                                ctx=ast.Load(),
+                            )
+                        flush = ast.Expr(
+                            value=ast.Call(
+                                func=ast.Name(id=store_helper, ctx=ast.Load()),
+                                args=[base, values],
+                                keywords=[],
+                            )
                         )
-                    )
-                    after.append(
-                        flush
-                        if guard is None
-                        else ast.If(test=_clone_expr(guard), body=[flush], orelse=[])
-                    )
+                        after.append(
+                            flush
+                            if guard is None
+                            else ast.If(
+                                test=_clone_expr(guard), body=[flush], orelse=[]
+                            )
+                        )
                 else:
                     rewritten_body.extend(self._restore_store(store_marker))
                     continue
@@ -2081,12 +2332,15 @@ def vectorize_branch_local_persistent_fragments(
     proven_tensor_stride_values: Mapping[tuple[str, int], int] | None = None,
     wide_packet_hints: bool = False,
     rename_groups: Mapping[str, str] | None = None,
+    chunked_lanes: Mapping[str, int] | None = None,
 ) -> list[ast.stmt]:
     """Vectorize marked exact fragments and erase every unhandled marker.
 
     ``wide_packet_hints`` (``cache_policy_loads.hint_wide_packets`` of the
     config) lets a hinted 32-byte packet take its ``_32b`` helper.
-    ``rename_groups`` maps each name to the one the final rename gives it."""
+    ``rename_groups`` maps each name to the one the final rename gives it;
+    ``chunked_lanes`` names the lane loops of chunked persistent rows (lane
+    variable -> V), which take one packet per V-wide chunk."""
     if not any(
         isinstance(node, ast.Name) and node.id in (_LOAD_MARKER, _STORE_MARKER)
         for stmt in body
@@ -2102,6 +2356,7 @@ def vectorize_branch_local_persistent_fragments(
         proven_tensor_stride_values or {},
         wide_packet_hints,
         rename_groups,
+        chunked_lanes,
     )
     transformed = vectorizer.transform_body(body)
     # Most kernels have no persistent-fragment load markers.  Avoid running an

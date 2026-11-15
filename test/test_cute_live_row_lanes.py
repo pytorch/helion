@@ -279,14 +279,15 @@ def _lane_loops_and_results(
     live: bool,
 ) -> tuple[list[str], tuple[torch.Tensor, ...]]:
     """``bound``'s lane loops and results at ``config``: with its live lanes,
-    or with ``_live_lane_extent`` the identity, all of the padded ones."""
+    or with ``_live_lane_extent`` the identity (whatever its keywords), all
+    of the padded ones."""
     with contextlib.ExitStack() as stack:
         if not live:
             stack.enter_context(
                 patch.object(
                     reduction_emitter,
                     "_live_lane_extent",
-                    lambda lane_extent, numel, threads: lane_extent,
+                    lambda lane_extent, numel, threads, **_: lane_extent,
                 )
             )
         loops = _lane_loops(bound.to_code(config))

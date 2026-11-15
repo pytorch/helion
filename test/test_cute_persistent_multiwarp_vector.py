@@ -663,13 +663,18 @@ def test_capped_row_keeps_one_warp_vector_loads(
     )
 
 
-def test_mismatched_vector_width_keeps_single_warp_lane_loop() -> None:
+def test_mismatched_vector_width_keeps_one_warp_of_chunked_packets() -> None:
     # 64 threads would give each thread 16 elements, not one V=8 vector: the
-    # established one-warp scalar lane loop is kept.
+    # lane loop keeps one warp, and its 32 elements per thread are four V=8
+    # packets 256 elements apart.
     bound, _arguments = _bind_rms_norm(256, 1024, torch.bfloat16)
     code = bound.to_code(_row_config(bound, reduction_threads=64, vec=8))
     assert "block=(32, 1, 1)" in code
-    assert "for synthetic_lane_1 in range(32):" in code
+    assert "for synthetic_lane_1 in cutlass.range_constexpr(32):" in code
+    assert "synthetic_lane_1 // 8 * 256 + synthetic_lane_1 % 8" in code
+    # Four packets of x and four of the weight; four flushes of the output.
+    assert code.count("ir.VectorType.get([8], cutlass.Uint16.mlir_type)") == 8, code
+    assert code.count("_cute_store_u16_vec(") == 4, code
     assert "threads_in_group=32" in code
     assert TWO_STAGE not in code
 

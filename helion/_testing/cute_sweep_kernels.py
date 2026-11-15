@@ -11,7 +11,10 @@ has its second sweep read back the workspace its first sweep stored,
 behind the read-after-write barrier its loads put before
 them.  ``scaled_workspace_reload`` adds the inputs both
 sweeps read after a workspace store or behind that barrier
-(``test/test_cute_rolled_packet_hoist.py``).
+(``test/test_cute_rolled_packet_hoist.py``).  ``third_softmax``'s first
+sweep reads its scaled row twice and its store sweep once, so only the store
+sweep's ``x / 3 - 0.5`` contracts into an FMA: the codegen test checks that
+the store sweep keeps its own exp.
 """
 
 from __future__ import annotations
@@ -151,3 +154,26 @@ def scaled_workspace_config(
     if bool_byte_packets:
         values["cute_bool_byte_packets"] = True
     return helion.Config(**values)
+
+
+def third_softmax(x: torch.Tensor) -> torch.Tensor:
+    """A softmax of a third of each row whose row sum also adds the scaled
+    row, so the first sweep reads the product twice and the store sweep once
+    (only the store sweep's ``x / 3 - 0.5`` contracts into an FMA)."""
+    rows, n = x.shape
+    out = torch.empty([rows, n], dtype=torch.float32, device=x.device)
+    for tile_r in hl.tile(rows):
+        third = x[tile_r, :].to(torch.float32) * (1.0 / 3.0)
+        e = torch.exp(third - 0.5)
+        out[tile_r, :] = e / torch.sum(e + third, dim=-1, keepdim=True)
+    return out
+
+
+# ``third_softmax`` on [64, 512] fp16 rows: one 512-element chunk of 128
+# threads at V4.
+THIRD_SOFTMAX_CONFIG: dict[str, object] = {
+    "block_sizes": [1],
+    "num_threads": [1, 128],
+    "reduction_loops": [512],
+    "cute_vector_widths": [4, 1],
+}

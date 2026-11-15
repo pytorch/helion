@@ -11,14 +11,19 @@ GPU twin is ``test_cute_scratch_forwarding_cuda.py``.
 
 from __future__ import annotations
 
+import ast
 import re
 from typing import TYPE_CHECKING
+from typing import cast
 
 import pytest
 import torch
 
 import helion
 from helion._compiler.cute.autotune.heuristics.cute import _reloads_scratch
+from helion._compiler.cute.fuse_two_pass_loads import _AnalysisCache
+from helion._compiler.cute.fuse_two_pass_loads import _canonical_load_text
+from helion._compiler.cute.fuse_two_pass_loads import _CuteFuseTwoPassLoads
 from helion._compiler.device_function import DeviceFunction
 from helion._testing import cpu_render_target
 from helion._testing.cute_codegen import cpu_bind
@@ -27,6 +32,7 @@ from helion._testing.cute_grid_lane_jam_kernels import head_bias_softmax_bwd
 from helion._testing.scratch_kernels import ROW_SWEEPS_CONFIG
 from helion._testing.scratch_kernels import row_softmax_bwd
 from helion._testing.scratch_kernels import row_softmax_bwd_keeping_workspace
+from helion._testing.scratch_kernels import row_softmax_bwd_recomputing
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -41,10 +47,13 @@ def _code(
     dtype: torch.dtype = torch.float32,
     *,
     forwarding: bool = True,
+    rows: torch.Tensor | None = None,
+    **knobs: object,
 ) -> str:
     kernel = helion.kernel(fn, backend="cute", static_shapes=True)
     with cpu_render_target(reduction_smem_budget_bytes=232448):
-        rows = torch.empty(64, 1024, dtype=torch.bfloat16)
+        if rows is None:
+            rows = torch.empty(64, 1024, dtype=torch.bfloat16)
         args = (
             rows,
             rows,
@@ -59,6 +68,7 @@ def _code(
                     **ROW_SWEEPS_CONFIG,
                     cute_reduction_reloads=[reloads],
                     cute_scratch_forwarding=forwarding,
+                    **knobs,
                 )
             )
         )
@@ -88,6 +98,367 @@ def test_the_second_sweep_reads_the_stored_value_through_an_opaque_move(
     code = _code(row_softmax_bwd, "register", dtype)
     assert _workspace_loads(code) == 0
     assert code.count(move) == 1
+
+
+@pytest.mark.parametrize(
+    ("dtype", "element", "move"),
+    [
+        (torch.float32, "Float32", "mov.b32"),
+        (torch.bfloat16, "BFloat16", "mov.b16"),
+    ],
+    ids=["fp32", "bf16"],
+)
+@pytest.mark.parametrize("width", [2, 8])
+def test_a_packet_store_is_forwarded_lane_by_lane(
+    width: int, dtype: torch.dtype, element: str, move: str
+) -> None:
+    # Each thread's eight elements in packets of ``width``: the first sweep
+    # flushes the workspace in packets of the values its V-loop's lanes
+    # gather, the second loads it one lane at a time in its own V-loop.
+    # Each lane caches its value next to its append (in the first sweep and
+    # in the exact division's copy of it) and reads it back; the unread
+    # flush goes.
+    code = _code(row_softmax_bwd, "register", dtype, cute_vector_widths=[width, 1])
+    assert _workspace_loads(code) == 0
+    assert "probs_ws.iterator" not in code
+    assert code.count(f"asm='{move} $0, $1;'") == 1
+    cache_writes = [
+        line.strip()
+        for line in code.splitlines()
+        if line.strip().startswith("_fuse_cache_")
+        and f"] = cutlass.{element}(v_" in line
+    ]
+    assert len(cache_writes) == 2
+    assert all(f"* {width} + reduction_vec_lane_1]" in line for line in cache_writes)
+
+
+@pytest.mark.skip(
+    reason="needs the read-after-write barrier out of the lane loops (hoist dropped)"
+)
+def test_a_recomputed_exp_is_carried_beside_a_forwarded_packet() -> None:
+    # T5's encoder shape in packets of eight: the second sweep reads the
+    # product the first flushed and the exp the first computed, each from a
+    # fragment of a slot per lane, instead of reloading the one and
+    # recomputing the other.
+    kernel = helion.kernel(
+        row_softmax_bwd_recomputing, backend="cute", static_shapes=True
+    )
+    with cpu_render_target(reduction_smem_budget_bytes=232448):
+        rows = torch.empty(64, 1024, dtype=torch.bfloat16)
+        bound = cpu_bind(
+            kernel,
+            (rows, rows, torch.empty(64, 1024), torch.empty(64), torch.empty(64)),
+        )
+        code = bound.to_code(
+            bound.config_spec.normalized_config(
+                helion.Config(
+                    **ROW_SWEEPS_CONFIG,
+                    cute_reduction_reloads=["register"],
+                    cute_scratch_forwarding=True,
+                    cute_vector_widths=[8, 1],
+                )
+            )
+        )
+    assert "product_ws.iterator" not in code
+    # The first sweep and the exact division's copies of both sweeps; the
+    # second sweep itself reads it.
+    assert code.count("cute.math.exp(") == 3
+
+
+def test_gmem_reloads_keep_reading_a_packet_store() -> None:
+    code = _code(row_softmax_bwd, "gmem", cute_vector_widths=[8, 1])
+    assert _workspace_loads(code) == 1
+    assert "mov.b" not in code
+
+
+@pytest.mark.parametrize(("columns", "forwarded"), [(16384, True), (262144, False)])
+def test_a_packet_fragment_stays_within_the_cap(columns: int, forwarded: bool) -> None:
+    # Rows one element off alignment load in scalars, while the workspace
+    # takes packets of eight: a slot per lane, 8 per sweep step, is 128 or
+    # 2048 elements, which ``register`` caps at 1024.
+    rows = torch.empty(4, columns + 1, dtype=torch.bfloat16)[:, 1:]
+    code = _code(row_softmax_bwd, "register", rows=rows, cute_vector_widths=[8, 1])
+    assert "VectorType.get(" not in code
+    assert (_workspace_loads(code) == 0) is forwarded
+    assert ("cute.make_rmem_tensor(128, cutlass.Float32)" in code) is forwarded
+
+
+_LANE_INDEX = "rindex = base + cutlass.Int32(vl)"
+_APPEND = "vals.append(cutlass.Float32(v).bitcast(cutlass.Uint32))"
+
+
+@pytest.mark.parametrize(
+    ("before", "body", "forwarded"),
+    [
+        (["vals = []"], [_LANE_INDEX, _APPEND], True),
+        # Nothing empties the list here: it may hold earlier values.
+        ([], [_LANE_INDEX, _APPEND], False),
+        # A value appended before the loop's lands in lane 0's element.
+        (["vals = []", "vals.append(y)"], [_LANE_INDEX, _APPEND], False),
+        # Emptied in the loop: the flush writes the last lane's value alone.
+        (["vals = []"], [_LANE_INDEX, "vals = []", _APPEND], False),
+        # An expression, which the cache write would evaluate again.
+        (
+            ["vals = []"],
+            [
+                _LANE_INDEX,
+                "vals.append(cutlass.Float32(v * y).bitcast(cutlass.Uint32))",
+            ],
+            False,
+        ),
+    ],
+    ids=["emptied", "not-emptied", "appended-before", "emptied-in-loop", "expression"],
+)
+def test_a_packet_store_forwards_the_values_its_lanes_append(
+    before: list[str], body: list[str], forwarded: bool
+) -> None:
+    container = ast.parse(
+        "\n".join(
+            [
+                *before,
+                "for vl in cutlass.range_constexpr(2):",
+                *(f"    {line}" for line in body),
+                "_cute_store_u32_vec(ws.iterator + cutlass.Int32(base), vals)",
+            ]
+        )
+    ).body
+    fuser = _CuteFuseTwoPassLoads(
+        tensor_dtypes={"ws": "cutlass.Float32"}, forwardable_tensors={"ws"}
+    )
+    packet = fuser._forwardable_packet_store(container, len(container) - 1)
+    assert (packet is not None) is forwarded
+
+
+@pytest.mark.parametrize(
+    ("loop", "body", "between", "pointer", "forwarded"),
+    [
+        ("range_constexpr(2)", [_LANE_INDEX, _APPEND], [], "base", True),
+        # The base moves before the flush, in the loop or after it.
+        (
+            "range_constexpr(2)",
+            [_LANE_INDEX, _APPEND, "base = base + 8"],
+            [],
+            "base",
+            False,
+        ),
+        (
+            "range_constexpr(2)",
+            [_LANE_INDEX, _APPEND],
+            ["base = base + 8"],
+            "base",
+            False,
+        ),
+        # Bound in the loop before the lane's index: the key adds each lane to
+        # its own base, while the flush starts at the last lane's.
+        (
+            "range_constexpr(2)",
+            ["base = off + cutlass.Int32(vl)", _LANE_INDEX, _APPEND],
+            [],
+            "base",
+            False,
+        ),
+        # The pointer reads the loop's variable, the last lane at the flush.
+        ("range_constexpr(2)", [_LANE_INDEX, _APPEND], [], "base + vl", False),
+        # The loop rebinds its variable: its lanes run in another order.
+        (
+            "range_constexpr(2)",
+            ["vl = 1 - vl", _LANE_INDEX, _APPEND],
+            [],
+            "base",
+            False,
+        ),
+        # A lane that ends early appends nothing, and the flush packs fewer
+        # values than the later sweep reads lanes.
+        (
+            "range_constexpr(2)",
+            [_LANE_INDEX, "if vl == 0:", "    continue", _APPEND],
+            [],
+            "base",
+            False,
+        ),
+        (
+            "range_constexpr(2)",
+            [_LANE_INDEX, _APPEND, "if vl == 0:", "    break"],
+            [],
+            "base",
+            False,
+        ),
+        # Two elements per step of the base, while the packet's lanes are one
+        # element apart.
+        ("range_constexpr(2)", [_LANE_INDEX, _APPEND], [], "2 * base", False),
+        ("range_constexpr(0)", [_LANE_INDEX, _APPEND], [], "base", False),
+    ],
+    ids=[
+        "one-apart",
+        "base-moved-in-loop",
+        "base-moved-after",
+        "base-moved-before-append",
+        "lane-in-pointer",
+        "rebound-lane",
+        "continue",
+        "break",
+        "scaled",
+        "no-lanes",
+    ],
+)
+def test_a_packet_store_forwards_the_elements_its_lanes_store(
+    loop: str, body: list[str], between: list[str], pointer: str, forwarded: bool
+) -> None:
+    container = ast.parse(
+        "\n".join(
+            [
+                "vals = []",
+                f"for vl in cutlass.{loop}:",
+                *(f"    {line}" for line in body),
+                *between,
+                f"_cute_store_u32_vec(ws.iterator + cutlass.Int32({pointer}), vals)",
+            ]
+        )
+    ).body
+    fuser = _CuteFuseTwoPassLoads(
+        tensor_dtypes={"ws": "cutlass.Float32"}, forwardable_tensors={"ws"}
+    )
+    packet = fuser._forwardable_packet_store(container, len(container) - 1)
+    assert (packet is not None) is forwarded
+    # Each lane's element is the base plus the lane, whatever names it.
+    if packet is not None:
+        assert ast.unparse(packet.load) == (
+            "(ws.iterator + cutlass.Int32(base + cutlass.Int32(vl))).load()"
+        )
+
+
+def test_a_packet_base_spelled_like_an_attribute_is_substituted_as_a_name() -> None:
+    # The base ``iterator`` is the pointer's one name ``iterator``; the
+    # attribute of ``ws.iterator`` stays what it is.
+    container = ast.parse(
+        "\n".join(
+            [
+                "vals = []",
+                "for vl in cutlass.range_constexpr(2):",
+                "    rindex = iterator + cutlass.Int32(vl)",
+                f"    {_APPEND}",
+                "_cute_store_u32_vec(ws.iterator + cutlass.Int32(iterator), vals)",
+            ]
+        )
+    ).body
+    fuser = _CuteFuseTwoPassLoads(
+        tensor_dtypes={"ws": "cutlass.Float32"}, forwardable_tensors={"ws"}
+    )
+    packet = fuser._forwardable_packet_store(container, len(container) - 1)
+    assert packet is not None
+    assert ast.unparse(packet.load) == (
+        "(ws.iterator + cutlass.Int32(iterator + cutlass.Int32(vl))).load()"
+    )
+
+
+@pytest.mark.parametrize(
+    ("element", "distinct"),
+    [
+        # Every sweep step, lane and V-loop lane its own element.
+        ("roffset + lane * 4 + cutlass.Int32(vl)", True),
+        # The same elements at every sweep step: a reload reads the last
+        # step's values.
+        ("lane * 4 + cutlass.Int32(vl)", False),
+        # Lane 1's first element is lane 0's second.
+        ("roffset + lane + cutlass.Int32(vl)", False),
+        # Of two threads one element apart, thread 1's first element is
+        # thread 0's second, a packet lane's.  Two apart, thread 1's
+        # elements fill thread 0's gaps.
+        (
+            "roffset + lane * 4 + cutlass.Int32(vl) + cute.arch.thread_idx()[0]",
+            False,
+        ),
+        (
+            "roffset + lane * 4 + cutlass.Int32(vl) + 2 * cute.arch.thread_idx()[0]",
+            True,
+        ),
+    ],
+)
+def test_a_packet_store_writes_distinct_elements(element: str, distinct: bool) -> None:
+    # Eight sweep steps of two lanes, each flushing a packet of two, on two
+    # threads.
+    first_loop = ast.parse(
+        f"""
+for roffset in range(0, 64, 8):
+    for lane in range(2):
+        vals = []
+        for vl in cutlass.range_constexpr(2):
+            rindex = {element}
+            vals.append(cutlass.Float32(v).bitcast(cutlass.Uint32))
+"""
+    ).body[0]
+    assert isinstance(first_loop, ast.For)
+    fuser = _CuteFuseTwoPassLoads(
+        thread_block_dims=(2, 1, 1), tensor_dtypes={"ws": "cutlass.Float32"}
+    )
+    assert (
+        fuser._stores_distinct_elements(
+            f"load(ws.iterator + ({element}))",
+            first_loop,
+            ast.Constant(8),
+            8,
+            16,
+            vector_lane=("vl", 2),
+        )
+        is distinct
+    )
+
+
+@pytest.mark.parametrize(
+    ("between", "inner", "lane", "matched"),
+    [
+        ([], [], "vl2", True),
+        # After its loop ``vl`` holds the first sweep's last lane, one element
+        # for every lane, read directly or through a name bound in between.
+        ([], [], "vl", False),
+        (["saved = vl"], [], "saved", False),
+        # The loop rebinds its variable: its lanes run in another order.
+        ([], ["vl2 = 1 - vl2"], "vl2", False),
+    ],
+    ids=["own-lane", "first-lane", "first-lane-through-a-name", "rebound-lane"],
+)
+def test_a_later_v_loop_reads_a_packet_only_at_its_own_lanes(
+    between: list[str], inner: list[str], lane: str, matched: bool
+) -> None:
+    first = ast.parse(
+        "\n".join(
+            [
+                "vals = []",
+                "for vl in cutlass.range_constexpr(2):",
+                f"    {_LANE_INDEX}",
+                f"    {_APPEND}",
+                "_cute_store_u32_vec(ws.iterator + cutlass.Int32(base), vals)",
+            ]
+        )
+    ).body
+    later = ast.parse(
+        "\n".join(
+            [
+                *between,
+                "for vl2 in cutlass.range_constexpr(2):",
+                *(f"    {line}" for line in inner),
+                f"    rindex2 = base + cutlass.Int32({lane})",
+                "    w = (ws.iterator + cutlass.Int32(rindex2)).load()",
+            ]
+        )
+    ).body
+    fuser = _CuteFuseTwoPassLoads(
+        tensor_dtypes={"ws": "cutlass.Float32"}, forwardable_tensors={"ws"}
+    )
+    packet = fuser._forwardable_packet_store(first, len(first) - 1)
+    assert packet is not None
+    # The packet's key as the fusion spells it: the element of lane ``vl``.
+    lane_index = cast("ast.Assign", ast.parse(_LANE_INDEX).body[0])
+    key = _canonical_load_text(
+        packet.load,
+        {},
+        {"rindex": lane_index.value},
+        tensor_dtypes={"ws": "cutlass.Float32"},
+    )
+    matches = fuser._packet_lane_matches(
+        later, {key: packet}, {}, {}, analysis=_AnalysisCache(fuser._canonical)
+    )
+    assert bool(matches) is matched
 
 
 def test_the_knob_off_keeps_the_reload() -> None:
