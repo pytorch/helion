@@ -301,12 +301,13 @@ def cpu_target(*, forbid_native: bool = True) -> Generator[None, None, None]:
 
 
 def cuda_fake(backend: object, tensor: torch.Tensor) -> torch.Tensor:
-    """Stand-in for ``CuteBackend.normalize_input_fake_tensor`` on a CPU process.
+    """Stand-in for a backend's ``normalize_input_fake_tensor`` on a CPU process.
 
-    Re-homes a CPU fake tensor on ``cuda:0`` so CuTe code generation sees device
-    inputs without a CUDA context (the device-type gates of the tcgen05
-    planners, the recurrence planners and the TMA routes then see a CUDA
-    target).
+    Re-homes a CPU fake tensor on ``cuda:0`` so code generation sees device
+    inputs without a CUDA context: CuTe's device-type gates (the tcgen05
+    planners, the recurrence planners and the TMA routes) then see a CUDA
+    target, and so do the Inductor lowerings that differ by device
+    (addcdiv's ``div_rn``), which a Triton test patches it in for.
     """
     assert isinstance(tensor, FakeTensor)
     with torch._C._DisableTorchDispatch():
