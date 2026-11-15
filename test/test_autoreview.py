@@ -295,6 +295,26 @@ def test_neither_reviewer_fails(review):
     assert code == 2 and "--no-codex was given" in err
 
 
+def test_python_without_pytest_is_warned_about(monkeypatch):
+    assert autoreview.missing_pytest_warning() is None
+    monkeypatch.setattr(
+        autoreview, "PYTEST_MODULES", ("pytest", "helion_no_such_module")
+    )
+    assert autoreview.missing_pytest_warning() == (
+        f"WARNING: {sys.executable} cannot import helion_no_such_module, and the "
+        "reviewers run tests with it: run this script with the Python of the "
+        "environment Helion is installed in."
+    )
+
+
+@pytest.mark.slow
+def test_python_without_pytest_warns_before_and_after_the_review(review, monkeypatch):
+    monkeypatch.setattr(autoreview, "PYTEST_MODULES", ("helion_no_such_module",))
+    code, out, err = review("claude", "codex")
+    assert code == 0 and "claude says LGTM" in out
+    assert err.count("cannot import helion_no_such_module") == 2
+
+
 def test_fix_needs_claude(review):
     with pytest.raises(SystemExit) as info:
         review("codex", args=("--fix",))
@@ -371,18 +391,20 @@ def test_main_selection_and_review_record_without_processes(
 
 
 @pytest.mark.parametrize(
-    "meta,no_sandbox,sandbox,launcher_flags,expected_sandbox",
+    "platform,meta,no_sandbox,sandbox,launcher_flags,expected_sandbox",
     [
-        (False, False, "read-only", [], "read-only"),
+        ("linux", False, False, "read-only", [], "read-only"),
         (
+            "linux",
             True,
             False,
             "workspace-write",
             ["--dangerously-enable-internet-mode"],
             "workspace-write",
         ),
-        (False, True, "read-only", [], "danger-full-access"),
+        ("linux", False, True, "read-only", [], "danger-full-access"),
         (
+            "linux",
             True,
             True,
             "workspace-write",
@@ -392,10 +414,29 @@ def test_main_selection_and_review_record_without_processes(
             ],
             "danger-full-access",
         ),
+        (
+            "darwin",
+            True,
+            True,
+            "workspace-write",
+            [
+                "--dangerously-enable-internet-mode",
+                "--dangerously-disable-osx-sandbox",
+            ],
+            "danger-full-access",
+        ),
+        ("darwin", False, True, "read-only", [], "danger-full-access"),
     ],
 )
 def test_codex_command_without_processes(
-    tmp_path, monkeypatch, meta, no_sandbox, sandbox, launcher_flags, expected_sandbox
+    tmp_path,
+    monkeypatch,
+    platform,
+    meta,
+    no_sandbox,
+    sandbox,
+    launcher_flags,
+    expected_sandbox,
 ):
     prompt = "Review the requested source."
     log_path = tmp_path / "codex.log"
@@ -413,6 +454,7 @@ def test_codex_command_without_processes(
 
     monkeypatch.setattr(autoreview, "run_subprocess", run)
     monkeypatch.setattr(autoreview.subprocess, "Popen", forbidden_process)
+    monkeypatch.setattr(autoreview.sys, "platform", platform)
     assert (
         autoreview.run_codex_review(
             prompt,
@@ -544,10 +586,16 @@ def test_codex_no_sandbox_uses_meta_launcher_flags_only_with_meta(review, tmp_pa
     assert argv[argv.index("-s") + 1] == "danger-full-access"
     # Upstream Codex rejects the flags of Meta's launcher.
     assert "--dangerously-disable-linux-sandbox" not in argv
+    assert "--dangerously-disable-osx-sandbox" not in argv
     assert "--dangerously-enable-internet-mode" not in argv
     review("codex", args=("--meta", "--codex-no-sandbox"))
     argv = json.loads(argv_file.read_text())
-    assert "--dangerously-disable-linux-sandbox" in argv
+    launcher_flag = (
+        "--dangerously-disable-osx-sandbox"
+        if sys.platform == "darwin"
+        else "--dangerously-disable-linux-sandbox"
+    )
+    assert launcher_flag in argv
     assert "--dangerously-enable-internet-mode" in argv
     review("codex")
     argv = json.loads(argv_file.read_text())
