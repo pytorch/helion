@@ -165,4 +165,5 @@ class TestPrefetchCodeBackends(RefEagerTestBase, TestCase):
         code, out = code_and_output(prefetch_code_add, (x,), block_sizes=[64])
         torch.testing.assert_close(out, x + 1)
         if _get_backend() not in ("triton", "gluon"):
-            self.assertNotIn("prefetch_code()", code)
+            # The source comments quote hl.prefetch_code(); check the emitted call.
+            self.assertNotIn("helion_prefetch_code.prefetch_code()", code)
