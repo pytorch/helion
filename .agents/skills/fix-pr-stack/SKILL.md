@@ -142,6 +142,20 @@ The stack-history skill has the recipe and the checks (every unmerged pull
 request once, in order, trailer intact; the only commits you may `--skip` are
 ones whose pull request is `MERGED`).
 
+`main` can also move into conflict with the stack between two submits, and
+that has to be caught before the next one: `stack-pr submit` points every pull
+request at `main` while it pushes, and GitHub starts no test workflows for a
+push to a pull request that conflicts with its base. Such a pull request ends
+up with a handful of passing checks and no test job. So fetch before every
+resubmit, and rebase if any commit of the stack no longer merges:
+
+```
+git fetch origin
+for c in $(git rev-list --reverse <base>..<submit head sha>); do
+  git merge-tree --write-tree origin/main $c >/dev/null || echo "conflicts with main: $c"
+done
+```
+
 ## 4. Verify locally, then resubmit
 
 Lint, and run the lanes for the files the fixes touched (verify skill). Fixes
@@ -171,7 +185,10 @@ on a devserver), and use the wait for other work, committed before the next
 fix round and not in this checkout while a local run still reads it. When the
 checks have finished:
 
-- every required check green on every pull request: done, go to step 6;
+- every required check green on every pull request: done, go to step 6. A
+  pull request showing only a few checks, none of them a test, lint or docs
+  job, was not tested (its push conflicted with `main`, step 3): that is a
+  rebase and another submit, not green;
 - an infrastructure failure: `gh run rerun <run-id> --repo pytorch/helion --failed`
   once; a second infrastructure failure of the same job goes in the report;
 - a real failure: back to step 2 for the lowest pull request it appears on.

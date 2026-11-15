@@ -41,6 +41,9 @@ You own your work end to end. Without asking, you may:
 - commit; amend, squash, reorder and reword your own unsubmitted commits; rebase
   the local stack onto `origin/main`;
 - take GPUs through the board and run tests, benchmarks and autotuning on them;
+- delete the scratch worktrees and local branches this session created
+  (backups, bisects, experiments) once they are no longer needed, leaving
+  other sessions' alone;
 - fix bugs you come across, pre-existing ones included (see Fix What You Find);
 - inside the fix-pr-stack skill, run `stack-pr submit` again to update pull
   requests that already exist.
@@ -129,9 +132,9 @@ runtime uses Triton's launcher. The paths you changed say which lanes matter:
 | --- | --- |
 | one `test/test_*.py` | that module, on the backends it targets |
 | `helion/_compiler/cute/**`, `helion/runtime/cute/**` | the CuTe CPU lane first (no GPU; catches most codegen regressions), then the CuTe GPU lane |
-| `helion/_compiler/triton/**`, `helion/runtime/triton/**` | the Triton and CuTe lanes (CuTe builds on them); affected Pallas interpreter and Metal CPU-only checks can also run locally |
+| `helion/_compiler/triton/**`, `helion/runtime/triton/**` | the Triton and CuTe lanes (CuTe builds on them), plus, for printer changes (the Pallas printer builds on Triton's), `test/test_pallas.py` under `pallas-interpret`; the Metal CPU-only checks can also run locally |
 | `helion/_compiler/{pallas,metal,flydsl}/**`, `helion/runtime/pallas/**` | that backend's suite (`pallas-interpret` and Metal CPU-only checks locally; native Metal/MPS and FlyDSL in CI) |
-| core: `helion/_compiler/*.py`, `helion/language/**`, `helion/autotuner/**`, `helion/runtime/*.py`, `helion/_testing/**`, `test/conftest.py` | the Triton and CuTe lanes |
+| core: `helion/_compiler/*.py`, `helion/language/**`, `helion/autotuner/**`, `helion/runtime/*.py`, `helion/_testing/**`, `test/conftest.py` | the Triton and CuTe lanes; for lowering code every backend shares, `test/test_pallas.py` under `pallas-interpret` too (below) |
 | `examples/**` | `test/test_examples.py` under the affected backends |
 | `scripts/*.py` | the test modules that name the script (`--changed` finds them) |
 | `docs/`, `benchmarks/`, `.github/` | their own checks; no suite |
@@ -178,6 +181,15 @@ runtime uses Triton's launcher. The paths you changed say which lanes matter:
   `scripts/run_tests.py --backend metal <test paths> -- -m "cpu_only and not cuda" -n 0`.
   Metal runs serially, so do not pass `--lane`. Native Metal/MPS, TileIR, TPU,
   ROCm and XPU run only in CI; read their job logs rather than guessing.
+- Pallas needs a TPU for most of what it does, so CI is where it is tested.
+  `pallas-interpret` is a partial local check: `scripts/run_tests.py --backend
+  pallas-interpret test/test_pallas.py` takes about two minutes without a GPU
+  and catches a lowering that no longer compiles. Run it after changing the
+  Triton printer or code every backend shares (`helion/language/**`,
+  lowerings registered as `"common"`, `helion/_compiler/tile_dispatch.py`),
+  which the Triton and CuTe lanes cannot vouch for, and read the Pallas job
+  once the pull request is up. The Metal CPU-only checks are opt-in: run them
+  when you change the Metal backend, or want a local read on it before CI.
 - Never run two suites on one GPU (each sizes itself to fill it), and never edit
   source or rewrite history in a checkout while a run reads it: Helion reads
   kernel source from disk by line number. Long runs belong in a worktree.
@@ -323,7 +335,8 @@ the pull request description.
 - Last line: the review record, `autoreview passed: claude, codex`, naming the
   reviewers that ran in the passing review (Code Review). It sits above the
   `stack-info:` trailer once stack-pr has added one. A commit without it is not
-  ready to submit.
+  ready to submit. Review findings you classified as invalid go in a
+  `Review notes:` paragraph above it (Answering the findings).
 
 ### Commit when a step is complete
 
@@ -335,12 +348,14 @@ squashed away before you hand the work back.
 ### Shaping the stack before it is submitted
 
 Until a stack is submitted its history is yours: squash, reorder, split and
-reword freely (recipes in the stack-history skill). Whether it is submitted is
-what its commits say now, not what you remember: a commit with a `stack-info:`
-line has a pull request, and the user may have submitted since you last
-looked. Check before every rewrite, and check after it that no `stack-info:`
-line was lost (a commit without one gets a duplicate pull request on the next
-submit). Aim for a stack where
+reword freely (recipes in the stack-history skill). Do it as you go, not only
+at the end: a history that grows into dozens of commits (or hundreds, with
+`fixup!` commits) is slow to rebase, and tells the user the work is not
+converging. Whether it is submitted is what its commits say now, not what you
+remember: a commit with a `stack-info:` line has a pull request, and the user
+may have submitted since you last looked. Check before every rewrite, and
+check after it that no `stack-info:` line was lost (a commit without one gets
+a duplicate pull request on the next submit). Aim for a stack where
 
 - each commit is one reviewable change with its own tests, landable in order;
 - commits touching the same code are squashed (reviewing the same lines twice
@@ -349,9 +364,13 @@ submit). Aim for a stack where
 - separate areas stay separate commits; one to five pull requests per stack is
   typical, and a very large commit is split by concern where a natural seam
   exists;
+- the stack stays small however much work it holds: past about ten commits,
+  squash by area (test infrastructure, autotuner, core compiler, each backend)
+  rather than keep one commit per fix, and hand back a long project as at most
+  about 15 commits;
 - no `fixup!` or `WIP` commits remain and every message follows the conventions;
 - every commit ends with its `autoreview passed:` line from a review of its
-  current content.
+  current content, or of each of the commits squashed into it.
 
 ### After the stack is submitted
 
@@ -389,6 +408,8 @@ rebase re-runs CI for the whole stack.
   pre-existing ones in code you did not write. A fix in code your current
   commit already changes goes into that commit; any other fix gets its own
   commit at the bottom of the stack, so it can land and be reverted alone.
+  When such fixes pile up, fold them into one commit per area (Shaping the
+  stack before it is submitted): a few dozen single-fix commits are too many.
 - CI failures on `main`: check whether a fix is already landing (`git log
   origin/main`, `gh pr list --search`), reproduce locally, and fix at the bottom
   of the stack. In a submitted stack a new bottom commit means a new pull
@@ -407,21 +428,72 @@ no arguments the uncommitted tree, and `origin/main..HEAD` the whole stack. A
 run costs minutes and compute, so use it with judgment: review a logical
 commit when it is complete rather than every intermediate step, and review the
 finished stack once more before handing back a larger project, while the work
-is still in your context. Fix every finding or explain in your reply why it
-does not apply; folding small, mechanical review fixes into the reviewed commit
-needs no second review, while bigger fixes get another run. The reviewers run Claude `opus` and your configured Codex model, both
-at effort `xhigh`; `--claude-model`, `--claude-effort`, `--codex-model` and
+is still in your context. Every finding gets an answer: it is fixed, or it
+is classified as invalid with an explanation (Answering the findings). The
+reviewers run Claude `opus` and your configured Codex model, both at effort
+`xhigh`; `--claude-model`, `--claude-effort`, `--codex-model` and
 `--codex-effort` (or `HELION_AUTOREVIEW_*` variables) change that, e.g.
 `--claude-model fable --claude-effort max` for a deeper pass on risky work.
 A run that fails (a non-zero exit, a reviewer's `ERROR:` line, a timeout) is a
 broken tool: report it rather than skipping the review or reviewing it
 yourself instead.
+One failure is avoidable. Codex reviews in a read-only sandbox, which has no
+temporary directory, and importing torch needs one: when the reviewers have
+to run Helion to check a change, Codex ends in an `ERROR:` about that
+directory. Pass `--codex-sandbox workspace-write` for such a change (most
+compiler and runtime changes), and run a review that ended in that `ERROR:`
+again with it. The option lets Codex write under the checkout and `/tmp`; it
+is still told to report findings and edit nothing.
 A recognized Codex sandbox startup failure is retried once with the same
 settings. `HELION_AUTOREVIEW_TIMEOUT` applies per attempt, so a retry can take
 twice that timeout plus bounded cleanup.
 Either reviewer is enough: when only one of the `claude` and `codex` CLIs is
 installed, the script runs that one and prints a `WARNING` saying so. Tell the
 user in your reply that the review ran with one reviewer.
+
+### Answering the findings
+
+The reviewers are often right and sometimes wrong: they see one commit, not
+the rest of the stack or what the user asked for, and a confident finding can
+rest on a misreading. Check each finding before you act on it, then give it
+one of two answers. Do not leave a finding unanswered, and do not make a
+change you believe is wrong to get a pass.
+
+- Fixed. Defects are fixed: a wrong result, a crash, a regression, a
+  contradiction between code, tests, docs and message, a broken rule of this
+  file. That includes defects that predate your change (Fix What You Find).
+  Small, mechanical fixes folded into the reviewed commit need no second
+  review; bigger ones get another run.
+- Invalid, with an explanation. A finding is invalid when it is wrong (say
+  what you checked), when it does not apply (a later commit of the stack
+  uses what it calls unused; the behavior is what the user asked for), or
+  when it asks for more than this commit should do. A larger fix for a
+  defect that predates the change, in code the change leaves alone, gets a
+  commit of its own (Fix What You Find says where). New scope, or a new
+  rule, policy or public behavior, is the user's decision: tell them
+  instead of adopting it. That a fix is optional or a lot of work does not
+  make a finding invalid.
+
+Record each invalid finding in the commit message, in a `Review notes:`
+paragraph above the review line, one item per finding: the finding in a few
+words, then why it is invalid.
+
+```
+Review notes:
+- Not valid: "make division_dtype private". The CuTe backend imports it
+  in the division commit of this stack.
+- Not valid: "require the Metal checks for printer changes". A new rule
+  for contributors; raised with the user instead.
+```
+
+The reviewers read the paragraph on the next run and are told to check each
+explanation, dropping the finding when the explanation holds and raising it
+again, with what it gets wrong, when it does not. So pushing back on a
+claimed defect takes another run, which has to accept the explanation; a
+note on a suggestion needs none. When the reviewers reject an explanation
+twice, stop and ask the user. The paragraph stays in the message: the pull
+request's reader sees what the review raised and why the code did not
+change, and later runs do not raise it again.
 
 ### Recording the review
 
@@ -437,12 +509,22 @@ autoreview passed: claude, codex
   was installed). Copy it. Never write the line without a run behind it.
 - Add it to every commit the passing run covered: `--head` covers the last
   commit, a range such as `origin/main..HEAD` covers each commit in it.
-- A run with findings also counts once every finding is fixed (small,
-  mechanical fixes folded in; anything bigger needs another run) or explained
-  as not applying in your reply. Use the reviewers that ran in it.
+- A run with findings also counts once every finding is answered (Answering
+  the findings): fixed, with small, mechanical fixes folded in and anything
+  bigger reviewed again, or recorded as invalid under `Review notes:`, with
+  another run behind every claimed defect answered that way. Use the
+  reviewers that ran in it.
 - The line goes stale when its commit changes after the review other than by
-  folding in fixes for that review: new work, a squash or split, a conflict
-  resolution in a rebase, a fix for a CI failure. Remove it and review again.
+  folding in fixes for that review or by a squash that keeps it (next item):
+  new work, a split, a conflict resolution in a rebase, a fix for a CI
+  failure. Remove it and review again.
+- A squash of commits that each carry the line keeps it, naming only the
+  reviewers named in every one of them. When no reviewer is named in all of
+  them, or the squash takes in a commit without the line (unless that commit
+  only holds fixes for the review of the commit it is folded into), the line
+  is removed and the commit is reviewed again. Either way the squashed
+  commit's `Review notes:` paragraph holds the items of every commit folded
+  into it.
 
 Do not run it when `HELION_AUTOREVIEW_SESSION` is set: you are then the
 reviewer or fixer it launched. Review only the checkout you work in (`--head`,
@@ -460,7 +542,10 @@ the tree on `PYTHONPATH`, so the interpreters tests start (`python <script>`,
 other working directories) do not fall back to the editable install's
 checkout. Plain pytest gives no such guarantee for those subprocesses. `python
 -c "import helion; print(helion.__file__)"` from the worktree shows which tree
-the interpreter imports. Remove a worktree with `git worktree remove` when done.
+the interpreter imports. Remove a worktree with `git worktree remove` when
+done, and delete the scratch branches made along the way: the worktrees and
+backup branches this session created are yours to clean up, without asking.
+Other sessions of your account share the repository; leave theirs alone.
 
 ## Agent-Specific Instructions
 
