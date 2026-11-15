@@ -4595,6 +4595,11 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 device_ir.tile_dependency_graph,
                 source_phase_starts,
             )
+            # Dropped hint edges were the kernel's only dependencies.
+            config_spec.cross_loop_pipeline_retired = (
+                bool(device_ir.tile_dependency_graph.unordered_hint_reads)
+                and not device_ir.implicit_dependency_starts
+            )
             if device_ir.implicit_dependency_starts and not (
                 env.backend.lower_dependency_phases_as_ordered_launches(func, device_ir)
             ):

@@ -398,6 +398,37 @@ def scale_idprefetch_mm(
     return y, out
 
 
+@helion.kernel(static_shapes=True, backend="gluon")
+def scale_hintprefetch_mm(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    wp: torch.Tensor,
+    ids: torch.Tensor,
+    routes: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``scale_idprefetch_mm`` reading the whole list in each task, which a last
+    root rewrites (the next launch's hint list)."""
+    m, k = x.size()
+    _, n = w.size()
+    y = torch.empty_like(x)
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tile_r, tile_c in hl.tile([m, k]):
+        y[tile_r, tile_c] = x[tile_r, tile_c] * 2
+    for tile_p in hl.tile(ids.size(0), block_size=1):
+        hot = ids[:]
+        block = torch.sum(torch.where(hl.arange(ids.size(0)) == tile_p.begin, hot, 0))
+        if block >= 0:
+            hl.prefetch(wp, [block, slice(None), slice(None)])
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(y[tile_m, tile_k], w[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = acc
+    for tile_s in hl.tile(ids.size(0), block_size=16):
+        ids[tile_s] = routes[tile_s]
+    return y, out
+
+
 # The config every tensor-form prefetch test runs (``scale_then_mm`` shapes).
 PREFETCH_CONFIG = {
     "block_sizes": [128, 64, 128, 64, 64],
@@ -1353,6 +1384,25 @@ class TestGluonRing(TestCase):
         self.assertIn("cp.async.bulk.prefetch.tensor.3d.L2.global.tile", code)
         self.assertNotIn("_RDIM_SIZE", code)
         self._assert_prefetch_in_body(code, "scale_idprefetch_mm")
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_hint_list_rewrite_waits_for_no_read(self) -> None:
+        """A prefetch-only root's read of a list a later root rewrites is a hint:
+        the rewrite need not wait for it (the read may see either list)."""
+        x, w, _, _ = _prefetch_reference()
+        ids = torch.tensor([3, -1, 7, 0] * 4, device=DEVICE, dtype=torch.int32)
+        routes = torch.arange(16, device=DEVICE, dtype=torch.int32)
+        args = (w.view(16, 64, 256), ids, routes)
+        bound = scale_hintprefetch_mm.bind((x, w, *args))
+        graph = bound.host_function.device_ir.tile_dependency_graph
+        # Roots: the scale, the prefetches, the matmul, the rewrite.
+        self.assertFalse(
+            [e for e in graph.edges if 1 in (e.producer_root, e.consumer_root)]
+        )
+        code = self._prefetch_case(scale_hintprefetch_mm, args)
+        torch.testing.assert_close(ids, routes, atol=0, rtol=0)
+        self._assert_prefetch_in_body(code, "scale_hintprefetch_mm")
 
     @skipIfRefEager("checks generated code")
     @skipUnlessGluon()

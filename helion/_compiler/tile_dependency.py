@@ -4609,6 +4609,9 @@ class TileAccess:
     # writes; None is this rank's own copy.
     owner_rank: int | None = None
     dtype: torch.dtype | None = None
+    # A prefetch-only root's load (its values only steer prefetches): it waits
+    # for earlier writes, but no later write waits for it.
+    hint: bool = False
 
     def __post_init__(self) -> None:
         """Canonicalize layout values once at the dependency-analysis boundary."""
@@ -4739,6 +4742,9 @@ class TileDependencyGraph:
     # The cluster candidates this config carries in launch clusters
     # (``cross_loop_cluster``): their dependency is "cluster".
     cluster_allocation_ids: frozenset[int] = frozenset()
+    # (root, allocation id) of each hint load (``TileAccess.hint``) that a
+    # later write in its phase overlaps: without hints that write would wait.
+    unordered_hint_reads: frozenset[tuple[int, int]] = frozenset()
 
     def __post_init__(self) -> None:
         if tuple(site.site_id for site in self.execution_sites) != tuple(
@@ -7016,6 +7022,8 @@ def build_tile_dependency_graph(
     dependencies_by_edge: dict[tuple[int, int, int], set[AccessDependency]] = {}
     reaching_writes: dict[int, list[_ReachingAccess]] = {}
     reaching_reads: dict[int, list[_ReachingAccess]] = {}
+    hint_reads: dict[int, list[_ReachingAccess]] = {}
+    unordered_hint_reads: set[tuple[int, int]] = set()
 
     def record(
         producer: _ReachingAccess,
@@ -7042,7 +7050,7 @@ def build_tile_dependency_graph(
         phase = root_phases[consumer_root]
         if phase != current_phase:
             # A phase barrier orders this rank's roots, not other ranks'.
-            for reaching in (reaching_writes, reaching_reads):
+            for reaching in (reaching_writes, reaching_reads, hint_reads):
                 for allocation_id in reaching.keys() - symmetric_allocation_ids:
                     del reaching[allocation_id]
             current_phase = phase
@@ -7098,6 +7106,11 @@ def build_tile_dependency_graph(
                             consumer,
                             TileDependencyKind.WRITE_AFTER_READ,
                         )
+                unordered_hint_reads.update(
+                    (hint.root, allocation_id)
+                    for hint in hint_reads.get(allocation_id, ())
+                    if allocation_regions_may_overlap(hint.region, consumer.region)
+                )
 
         for allocation_id in reads.keys() | writes.keys():
             consumer_writes = writes.get(allocation_id, ())
@@ -7111,7 +7124,11 @@ def build_tile_dependency_graph(
                 reaching_reads[allocation_id] = _subtract_reaching_accesses(
                     reaching_reads.get(allocation_id, []), consumer_writes
                 )
-            consumer_reads = reads.get(allocation_id, ())
+            consumer_reads = [
+                c for c in reads.get(allocation_id, ()) if not c.access.hint
+            ]
+            if hints := [c for c in reads.get(allocation_id, ()) if c.access.hint]:
+                hint_reads.setdefault(allocation_id, []).extend(hints)
             if consumer_reads:
                 reaching_reads.setdefault(allocation_id, []).extend(
                     _ReachingAccess(consumer.root, consumer.access, residual)
@@ -7286,6 +7303,7 @@ def build_tile_dependency_graph(
             for allocation_id, failure in tagged_failures.items()
             if failure is None
         ),
+        unordered_hint_reads=frozenset(unordered_hint_reads),
     )
 
 

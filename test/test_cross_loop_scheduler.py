@@ -512,6 +512,7 @@ def _access(
 def _dependency_graph(
     root_axes: list[list[int]],
     *accesses: TileAccess,
+    root_phases: tuple[int, ...] | None = None,
 ) -> TileDependencyGraph:
     return build_tile_dependency_graph(
         tuple(
@@ -519,6 +520,7 @@ def _dependency_graph(
             for index, access in enumerate(accesses)
         ),
         root_axes,
+        root_phases=root_phases,
     )
 
 
@@ -1538,6 +1540,40 @@ class TestCrossLoopScheduler(TestCase):
         assert frontier is not None
         self.assertEqual(frontier.target_domain, plan.wave_domain)
         self.assertEqual(frontier.prefix_before(3), 1)
+
+    def test_hint_load_orders_no_later_write(self) -> None:
+        def edges(*accesses: TileAccess) -> set[tuple[int, int, str]]:
+            graph = _dependency_graph([[10], [20]], *accesses)
+            return {
+                (edge.producer_root, edge.consumer_root, dependency.kind.value)
+                for edge in graph.edges
+                for dependency in edge.access_dependencies
+            }
+
+        load = _access(root=0, kind="load", block_id=10)
+        store = _access(root=1, kind="store", block_id=20)
+        self.assertEqual(edges(load, store), {(0, 1, "write_after_read")})
+        # A prefetch-only root's load: the later store need not wait for it ...
+        hint = dataclasses.replace(load, hint=True)
+        self.assertEqual(edges(hint, store), set())
+        # ... but it still waits for an earlier store.
+        self.assertEqual(
+            edges(
+                _access(root=0, kind="store", block_id=10),
+                dataclasses.replace(
+                    _access(root=1, kind="load", block_id=20), hint=True
+                ),
+            ),
+            {(0, 1, "read_after_write")},
+        )
+        # A phase boundary orders the two anyway: no hint dependency is lost.
+        graph = _dependency_graph([[10], [20]], hint, store, root_phases=(0, 1))
+        self.assertEqual(graph.edges, ())
+        self.assertEqual(graph.unordered_hint_reads, frozenset())
+        self.assertEqual(
+            _dependency_graph([[10], [20]], hint, store).unordered_hint_reads,
+            {(0, 0)},
+        )
 
     def test_exact_dependency_builds_one_counter_event(self) -> None:
         graph = _dependency_graph(

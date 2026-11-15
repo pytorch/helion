@@ -3433,6 +3433,12 @@ def emit_cross_loop_schedule(
                 for edge in dependency_graph.edges
                 if edge.producer_root == root
             }
+            # (A hint load's later writers no longer wait for it: no edge.)
+            | {
+                allocation_id
+                for hint_root, allocation_id in dependency_graph.unordered_hint_reads
+                if hint_root == root
+            }
             | {
                 edge.allocation_id
                 for edge in dependency_graph.edges

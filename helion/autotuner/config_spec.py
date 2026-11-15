@@ -1197,6 +1197,11 @@ class ConfigSpec:
         # Whether a cross-rank dependency transports a scatter in band: its
         # guard-skipped tasks need static or claimed (gluon ring) roots.
         self.inband_scatter: bool = False
+        # Set when a later write overlaps a load of a prefetch-only root that
+        # it no longer waits for: if that leaves no dependency (no
+        # cross_loop_pipeline), a config saved before still loads (normalize
+        # ignores the key).
+        self.cross_loop_pipeline_retired: bool = False
         # Whether the kernel runs several phases in one persistent launch
         # (``hl.barrier()`` or an implicit cross-root dependency).
         self.multi_phase: bool = False
@@ -2178,6 +2183,14 @@ class ConfigSpec:
         ):
             if _fix_invalid:
                 config.pop("cross_loop_pipeline", None)
+            elif self.cross_loop_pipeline_retired:
+                pipeline = config.pop("cross_loop_pipeline")
+                log.warning(
+                    "Ignoring cross_loop_pipeline=%r: this kernel no longer has "
+                    "cross-loop dependencies (its prefetch-only roots' loads "
+                    "order no later write)",
+                    pipeline,
+                )
             else:
                 raise InvalidConfig(
                     "cross_loop_pipeline is available only for kernels "

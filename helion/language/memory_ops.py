@@ -444,6 +444,12 @@ def prefetch(
     :func:`load` it takes no ``indexing``, eviction-policy or cache-modifier
     config slot, so adding one leaves every load's tunables where they were.
 
+    In a top-level loop whose only effects are prefetches, later loops' stores
+    need not wait for its loads, so the values that compute a prefetch's index
+    or guard may come from such a store, and from different stores for
+    different loads (or elements): keep every value those loads can see a
+    valid index, or take the index and its guard from one element of one load.
+
     On NVIDIA GPUs (Triton backend), when the last index is a full slice or a
     tile of a stride-1 dim and there is no ``extra_mask``, each element of the
     leading indices issues one ``cp.async.bulk.prefetch.L2`` covering its row
