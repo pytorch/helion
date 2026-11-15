@@ -4677,6 +4677,11 @@ class TestFragmentPredicatePreprocessingCPU(unittest.TestCase):
             ast.dump(ast.parse("a and b and c", mode="eval")),
         )
 
+    # Starts an interpreter that imports torch and the CuTe DSL, which the
+    # Test Budget Rules put in the slow tier; the in-process
+    # test_private_actual_sdk_preprocessor_and_legacy_scope runs the
+    # preprocessor on pull requests.
+    @pytest.mark.slow
     def test_actual_sdk_preprocesses_reservation_masks(self):
         import importlib.util
         from pathlib import Path

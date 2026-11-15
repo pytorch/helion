@@ -328,6 +328,7 @@ def _scale_into(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@pytest.mark.cuda
 @skipIfNotCUDA()
 @skipIfCudaCapabilityLessThan((10, 0), reason="ld.global.nc.v8 needs SM100+")
 @pytest.mark.parametrize("pdl", [False, True])
@@ -366,6 +367,7 @@ def test_readonly_packets_load_every_bit(
     torch.testing.assert_close(out, x * 2, atol=0, rtol=0)
 
 
+@pytest.mark.cuda
 @skipIfNotCUDA()
 @pytest.mark.parametrize(
     "out_dtype,width",

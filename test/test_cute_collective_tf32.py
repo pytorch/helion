@@ -1,85 +1,24 @@
 from __future__ import annotations
 
 import ast
-from typing import TYPE_CHECKING
 
 import pytest
 import torch
 
 import helion
 from helion._compiler.cute.autotune.heuristics.cute import CuteCollectiveMatmulHeuristic
-from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_collective import collective_config as _config
+from helion._testing.cute_collective import collective_kernel as _kernel
+from helion._testing.cute_collective import jagged_inputs as _jagged_inputs
+from helion._testing.cute_collective import round_tf32 as _round_tf32
 from helion._testing.cute_flash import seeds_per_codegen_branch
 from helion.autotuner.benchmarking import _make_cudagraph_replay
-import helion.language as hl
-
-jagged_dense_bmm = import_example("jagged_dense_bmm").jagged_dense_bmm
 
 pytestmark = skipUnlessBackends(["cute"])
 
 CUDA_DEVICE = "cuda"
-
-if TYPE_CHECKING:
-    from helion.runtime.kernel import Kernel
-
-
-def _computed_batched_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    batches, rows, reduction = a.shape
-    columns = b.size(2)
-    out = torch.empty((batches, rows, columns), dtype=a.dtype, device=a.device)
-    for batch, row, column in hl.tile([batches, rows, columns]):
-        acc = hl.zeros([batch, row, column], dtype=torch.float32)
-        for contraction in hl.tile(reduction):
-            left = a[batch, row, contraction] * 0.75
-            acc = torch.baddbmm(acc, left, b[batch, contraction, column])
-        out[batch, row, column] = acc + 0.25
-    return out
-
-
-def _kernel(
-    *, precision: str = "tf32", batched: bool = False, static_shapes: bool = True
-) -> Kernel[torch.Tensor]:
-    return helion.kernel(
-        _computed_batched_matmul if batched else jagged_dense_bmm.fn,
-        backend="cute",
-        static_shapes=static_shapes,
-        autotune_effort="none",
-        dot_precision=precision,
-    )
-
-
-def _config(
-    bm: int = 64,
-    bn: int = 32,
-    bk: int = 64,
-    *,
-    compute: str = "tcgen05",
-    copy: str = "scalar",
-) -> helion.Config:
-    return helion.Config(
-        block_sizes=[1, bm, bn, bk],
-        num_threads=[0, 128 // bn, bn, 1],
-        cute_vector_widths=[1] * 4,
-        cute_lane_layouts=["blocked"] * 4,
-        cute_collective_mma=True,
-        cute_collective_compute=compute,
-        cute_collective_copy=copy,
-    )
-
-
-def _jagged_inputs(
-    *, batch: int, rows: int, k: int, n: int, device: str = "cpu"
-) -> tuple[torch.Tensor, ...]:
-    offsets = torch.zeros(batch + 1, dtype=torch.int64, device=device)
-    offsets[-1] = rows
-    return (
-        offsets,
-        torch.empty((rows, k), device=device),
-        torch.empty((batch, k, n), device=device),
-        torch.empty((batch, n), device=device),
-    )
 
 
 @pytest.mark.parametrize(
@@ -187,13 +126,6 @@ def test_multiple_batch_elements_cannot_share_one_collective_tile() -> None:
     source = bound.to_code(config)
     assert "cute.gemm(" not in source
     assert "TmemAllocator" not in source
-
-
-def _round_tf32(value: torch.Tensor) -> torch.Tensor:
-    # Independent finite-input oracle for cvt.rna.tf32.f32: add half a TF32
-    # ULP to the IEEE magnitude then discard 13 significand bits.
-    bits = value.contiguous().view(torch.int32)
-    return ((bits + 0x1000) & -0x2000).view(torch.float32)
 
 
 def _require_sm100() -> None:

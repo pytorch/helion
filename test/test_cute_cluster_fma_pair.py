@@ -205,6 +205,7 @@ def _check_cluster_rows(actual: torch.Tensor, x: torch.Tensor) -> None:
     assert torch.equal(actual[1:3][empty], torch.zeros_like(actual[1:3][empty]))
 
 
+@pytest.mark.cuda
 @skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("fast_math", [False, True])

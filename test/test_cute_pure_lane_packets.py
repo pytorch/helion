@@ -26,6 +26,7 @@ from helion._compiler.cute.pure_lane_packets import is_pure_inline_asm_call
 from helion._compiler.cute.pure_lane_packets import is_pure_scalar_assembly
 from helion._compiler.rng_utils import philox_rand_ref
 from helion._testing import import_example
+from helion._testing import pairwise
 import helion.language as hl
 
 _examples_low_mem_dropout = import_example("low_mem_dropout")
@@ -521,12 +522,16 @@ def _mutating_graph(
         _assert_exact(actual, expected)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("width", (4, 8))
 @pytest.mark.parametrize(
-    "dtype", (torch.float32, torch.float16, torch.bfloat16), ids=("f32", "f16", "bf16")
+    ("width", "dtype", "backward"),
+    pairwise(
+        width=(4, 8),
+        dtype=(torch.float32, torch.float16, torch.bfloat16),
+        backward=(False, True),
+    ),
 )
-@pytest.mark.parametrize("backward", (False, True))
 def test_dropout_packets_exact(width: int, dtype: torch.dtype, backward: bool) -> None:
     function = low_mem_dropout_bwd if backward else low_mem_dropout
     kernel = helion.kernel(
@@ -581,10 +586,16 @@ def _dropout_case(
     _mutating_graph(lambda: bound(0.25, data, 123), mutate, lambda: expected(123, 0.25))
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("policy", (None, "philox4"), ids=("default", "philox4"))
-@pytest.mark.parametrize("backward", (False, True))
-@pytest.mark.parametrize("dtype", (torch.float32, torch.float16, torch.bfloat16))
+@pytest.mark.parametrize(
+    ("policy", "backward", "dtype"),
+    pairwise(
+        policy=(None, "philox4"),
+        backward=(False, True),
+        dtype=(torch.float32, torch.float16, torch.bfloat16),
+    ),
+)
 def test_philox4_masks_config_independent_and_poisoned_replay(
     policy: str | None, backward: bool, dtype: torch.dtype
 ) -> None:
@@ -689,6 +700,7 @@ def _twice_assembly(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("width", (4, 8))
 @pytest.mark.parametrize("layout", ("blocked", "strided"))
@@ -735,6 +747,7 @@ def _arbitrary_offset_uniform(offsets: torch.Tensor, seed: int) -> torch.Tensor:
     return out
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("width,layout", ((4, "blocked"), (8, "strided")))
 def test_default_philox4_arbitrary_offsets(width: int, layout: str) -> None:

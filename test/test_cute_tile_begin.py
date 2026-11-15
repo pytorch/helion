@@ -13,6 +13,7 @@ from .test_cute_grid_launch_extents import _launch_block
 from .test_cute_grid_launch_extents import _tile_coordinates
 import helion
 from helion import exc
+from helion._compiler.backend_registry import repair_backend_codegen
 from helion._compiler.cute import target_facts
 from helion._compiler.cute import tile_ops
 from helion._compiler.cute.backend import CuteBackend
@@ -119,6 +120,9 @@ def test_begin_selects_innermost_index_owner(broadcast: bool) -> None:
     if broadcast:
         assert _cute_block_tile_begin_expr(state, 7) == "inner_offset"
     else:
+        # A process's first CuTe dispatch reloads the codegen modules, which
+        # would rebind the function patched below.
+        repair_backend_codegen("cute")
         with patch.object(tile_ops, "_disable_flatten_get_tile", return_value=7):
             assert is_api_func(tile_ops.tile_begin)
             result = tile_ops.tile_begin._codegen["cute"](state)

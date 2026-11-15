@@ -127,6 +127,7 @@ def test_relative_bounds_require_proven_packet_alignment(
                 assert len(results) == 1
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("limit", [127, 128])

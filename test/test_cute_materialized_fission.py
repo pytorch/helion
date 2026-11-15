@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import dataclasses
 import hashlib
 import inspect
 import operator
@@ -19,7 +18,6 @@ from test.cute_population_contracts import _cpu_target
 from test.cute_population_contracts import with_flat_min_blocks_default
 
 import helion
-from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.mma_support import CuteMmaSupport
 from helion._compiler.cute.promote_output_axis import _access_tensor
@@ -28,6 +26,9 @@ from helion._compiler.cute.target_facts import TargetFacts
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._testing import cpu_render_target
 from helion._testing import import_example
+from helion._testing.cute_codegen import compile_reference
+from helion._testing.cute_codegen import reference_host_function
+from helion._testing.cute_codegen import run_cpu_reference
 from helion._testing.cute_structural_kernels import _se_args
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.precompile_future import SerializedCompiledFunction
@@ -37,8 +38,6 @@ from helion.autotuner.precompile_future import _unload_compiled_fn
 import helion.language as hl
 from helion.language import memory_ops
 from helion.runtime.ref_mode import RefMode
-from helion.runtime.ref_mode import RefModeContext
-from helion.runtime.ref_mode import RefModeTorchFunctionMode
 from helion.runtime.settings import Settings
 
 pytestmark = pytest.mark.cpu_only
@@ -505,38 +504,11 @@ class _HostModules:
         return SimpleNamespace(**namespace)
 
 
-class _CpuRefMode(RefModeTorchFunctionMode):
-    def _handle_mm_with_bias(
-        self,
-        args: tuple[object, ...],
-        kwargs: dict[str, object],
-        mm_func: object,
-        op_name: str,
-    ) -> torch.Tensor:
-        # CPU torch.mm does not implement out_dtype; preserve the FP32
-        # accumulator explicitly for the reference path only.
-        assert op_name == "addmm"
-        bias, lhs, rhs = (cast("torch.Tensor", value) for value in args[:3])
-        assert bias.dtype is torch.float32
-        assert bias.device.type == lhs.device.type == rhs.device.type == "cpu"
-        return (
-            cast("float", kwargs.get("alpha", 1)) * (lhs.float() @ rhs.float())
-            + cast("float", kwargs.get("beta", 1)) * bias
-        )
-
-
 def _run_reference(
     bound: BoundKernel[Any], args: tuple[object, ...], transformed: bool
 ) -> object:
     if transformed:
-        with bound.env, bound.host_function:
-            definition = bound.host_function.codegen_function_def(
-                bound.host_function.body
-            )
-        definition = cast(
-            "ast.FunctionDef",
-            ast.parse(ast.unparse(ast.fix_missing_locations(definition))).body[0],
-        )
+        definition = reference_host_function(bound)
         # Use different row and column tile sizes in the two launch domains.
         roots = [stmt for stmt in definition.body if isinstance(stmt, ast.For)]
         for root, blocks in zip(roots, ((8, 8), (16, 16)), strict=True):
@@ -550,30 +522,10 @@ def _run_reference(
                     ),
                 )
             )
-        namespace = dict(bound.kernel.fn.__globals__)
-        namespace["_default_cute_launcher"] = None
-        exec(
-            compile(
-                ast.fix_missing_locations(
-                    ast.Module(body=[definition], type_ignores=[])
-                ),
-                "<fission-reference>",
-                "exec",
-            ),
-            namespace,
-        )
-        fn = namespace[definition.name]
+        fn = compile_reference(bound, definition, "<fission-reference>")
     else:
         fn = bound.kernel.fn
-    with _cpu_target():
-        env = CompileEnvironment(
-            torch.device("cpu"),
-            dataclasses.replace(bound.settings, ref_mode=RefMode.EAGER),
-        )
-    context = RefModeContext(env, None)
-    context.func_mode = _CpuRefMode()
-    with context:
-        return fn(*args)
+    return run_cpu_reference(bound, fn, args)
 
 
 @pytest.mark.parametrize("static_shapes", [False, True])
