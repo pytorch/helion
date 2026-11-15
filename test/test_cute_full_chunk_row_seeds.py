@@ -73,6 +73,21 @@ def normalize_row_bias(
     return out
 
 
+def normalize_rows_with_stats(
+    x: torch.Tensor, mean: torch.Tensor, rstd: torch.Tensor
+) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for row in hl.tile(x.size(0)):
+        value = x[row, :]
+        row_mean = value.mean(-1)
+        mean[row] = row_mean
+        centered = value - row_mean[:, None]
+        row_rstd = torch.rsqrt((centered * centered).mean(-1) + 1e-5)
+        rstd[row] = row_rstd
+        out[row, :] = centered * row_rstd[:, None]
+    return out
+
+
 @pytest.fixture(autouse=True)
 def cpu_only() -> Iterator[None]:
     initialized = torch.cuda.is_initialized()
@@ -435,6 +450,40 @@ def test_block_id_mapping_and_policy_indices_are_not_positions() -> None:
     # Reverse fact traversal without changing their owned config slots.
     with patch.object(spec, "memory_op_facts", list(reversed(facts))):
         assert seeds_for(bound) == reordered
+
+
+def test_retention_seeds_cover_the_loads_their_rolled_code_lowers() -> None:
+    # The rolled code reads x in both loops and the weight in the second:
+    # three load slots, which all retain their lines; the facts' two other
+    # slots, the roller's own loop graphs, stay unused.
+    bound = bind(16, 7168, torch.bfloat16)
+    seed = next(
+        seed
+        for seed in seeds_for(bound)
+        if any(seed.config.get("load_eviction_policies") or ())
+    )
+    assert seed.config["load_eviction_policies"] == ["l2_last"] * 3 + [""] * 2
+    source = bound.to_code(seed)
+    loads = [
+        line
+        for line in source.splitlines()
+        if "(x.iterator" in line or "(weight.iterator" in line
+    ]
+    assert len(loads) == 2, loads
+    assert all("_cute_load_l2_evict_last(" in line for line in loads), loads
+
+
+def test_a_seed_rolls_past_a_store_to_another_argument_while_binding() -> None:
+    # The sweep after each store reloads the row, which is right only while
+    # ``mean`` and ``rstd`` are disjoint from ``x``: a fact of the bound
+    # inputs, which the seed's rolled config asks for while the kernel still
+    # binds, ahead of the runtime's storage snapshot.
+    kernel = helion.kernel(
+        normalize_rows_with_stats, backend="cute", static_shapes=True
+    )
+    bound = kernel._bind_isolated((torch.empty(4, 64), torch.empty(4), torch.empty(4)))
+    slots = bound.config_spec.reduction_loops
+    assert [slot.persistent_reason for slot in slots] == [None]
 
 
 @pytest.mark.parametrize("target", [None, (8, 0), (9, 0), (10, 3)])

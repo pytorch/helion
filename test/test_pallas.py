@@ -7681,6 +7681,55 @@ class TestPallas(TestCase):
         ref = torch.bmm(y[:, s:e, :].transpose(0, 1), y[:, s:e, :].permute(1, 2, 0))
         torch.testing.assert_close(out.cpu(), ref.cpu(), rtol=2e-2, atol=2e-2)
 
+    def test_loop_carry_update_from_partial_tile_loads(self) -> None:
+        """A carry with a dim on its loop's own block keeps its value in the
+        padded lanes of a partial tile, which would each add exp(0), also in
+        the branch of a runtime ``if`` that adds exp(x): the other branch's
+        constant reaches them."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def exp_sum(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            block_n = hl.register_block_size(n)
+            out = torch.empty([m], device=x.device, dtype=torch.float32)
+            for tile_m in hl.tile(m):
+                acc = hl.zeros([tile_m, block_n], dtype=torch.float32)
+                for tile_n in hl.tile(n, block_size=block_n):
+                    acc = acc + torch.exp(x[tile_m, tile_n])
+                out[tile_m] = acc.sum(dim=1)
+            return out
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def exp_or_one(x: torch.Tensor, beta: float) -> torch.Tensor:
+            m, n = x.shape
+            block_n = hl.register_block_size(n)
+            out = torch.empty([m], device=x.device, dtype=torch.float32)
+            for tile_m in hl.tile(m):
+                acc = hl.zeros([tile_m, block_n], dtype=torch.float32)
+                for tile_n in hl.tile(n, block_size=block_n):
+                    if beta > 0:
+                        acc = acc + torch.exp(x[tile_m, tile_n])
+                    else:
+                        acc = acc + 1.0
+                out[tile_m] = acc.sum(dim=1)
+            return out
+
+        # 200 columns end in a tile of 72 of 128.
+        x = -torch.randint(2, 10, [16, 200], device=DEVICE).float()
+        code, result = code_and_output(exp_sum, (x,), block_sizes=[128, 8])
+        self.assertRegex(
+            code,
+            r"_mask_select\w* = jnp\.where\(.*, jnp\.full\(\[\], 0, jnp\.float32\)\)",
+        )
+        torch.testing.assert_close(
+            result, torch.exp(x).sum(dim=1), rtol=1e-5, atol=1e-5
+        )
+        for beta, expected in ((1.0, torch.exp(x).sum(dim=1)), (-1.0, 256.0)):
+            _, result = code_and_output(exp_or_one, (x, beta), block_sizes=[128, 8])
+            torch.testing.assert_close(
+                result, torch.zeros_like(result) + expected, rtol=1e-5, atol=1e-5
+            )
+
     def test_if_branch_intermediate_outputs(self) -> None:
         """Branch intermediates must survive in _if output list."""
 

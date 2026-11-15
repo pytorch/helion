@@ -8,10 +8,11 @@ threads (a lane loop, or vector lanes), a carry with a dim on that block,
 block_size=bn)``, folds every lane of a thread into that one scalar.
 
 Only an additive fold is still exact: from zero, ``acc = acc + x`` per lane
-(or ``- x``, also in the branches of a runtime ``if``) leaves the sum of the
-thread's lanes, and a sum over the block's dim after the loop
-(``acc.sum(-1)``, the manual looped reduction) adds those partial sums
-across the threads.  Any other update (``torch.maximum``, a rescale),
+(or ``- x``, also in the branches of a runtime ``if``, or kept out of a
+partial tile's padded lanes by ``mask_loop_carries``'s ``_mask_select``)
+leaves the sum of the thread's lanes, and a sum over the block's dim after
+the loop (``acc.sum(-1)``, the manual looped reduction) adds those partial
+sums across the threads.  Any other update (``torch.maximum``, a rescale),
 nonzero initial value, read of the carry inside the loop, or consumer after
 the loop other than such a sum (``amax``, ``acc * acc``, a store) would see
 the folded lanes, so ``check_lane_merged_carries`` refuses it.
@@ -28,10 +29,13 @@ from torch.fx.node import Node
 
 from ... import exc
 from ...language._tracing_ops import _if
+from ...language._tracing_ops import _mask_select
 from ...language._tracing_ops import _new_var
 from ...language._tracing_ops import _phi
 from ...language.creation_ops import full
 from ..compile_environment import CompileEnvironment
+from ..node_masking import block_dims
+from ..node_masking import loop_carries
 
 if TYPE_CHECKING:
     from ..device_ir import ForLoopGraphInfo
@@ -61,46 +65,24 @@ def check_lane_merged_carries(state: CodegenState, info: ForLoopGraphInfo) -> No
             lane_looped.add(env.canonical_block_id(block_id))
     if not lane_looped:
         return
-    inits = loop.args[3]
-    assert isinstance(inits, (list, tuple))
-    placeholders = info.graph.find_nodes(op="placeholder")
-    (output,) = info.graph.find_nodes(op="output")
-    outputs = output.args[0]
-    assert isinstance(outputs, (list, tuple))
-    for result in loop.users:
-        if result.target is not operator.getitem:
+    for carry in loop_carries(loop, info.graph):
+        value = carry.placeholder.meta.get("val")
+        dims = block_dims(value, lane_looped)
+        if not dims:
             continue
-        index = cast("int", result.args[1])
-        for phi in result.users:
-            if phi.target is not _phi or phi.args[1] is not result:
-                continue
-            init = phi.args[0]
-            if init not in inits:
-                continue
-            placeholder = placeholders[inits.index(init)]
-            value = placeholder.meta.get("val")
-            if not isinstance(value, torch.Tensor):
-                continue
-            dims = [
-                dim
-                for dim, size in enumerate(value.shape)
-                if (block_id := env.get_block_id(size)) is not None
-                and env.canonical_block_id(block_id) in lane_looped
-            ]
-            if not dims:
-                continue
-            reason = _unfolded_use(
-                state, init, placeholder, outputs[index], result, dims
+        assert isinstance(value, torch.Tensor)
+        reason = _unfolded_use(
+            state, carry.init, carry.placeholder, carry.update, carry.result, dims
+        )
+        if reason is not None:
+            raise exc.BackendUnsupported(
+                "cute",
+                f"loop carry {carry.phi.name} (shape {list(value.shape)}) has dim "
+                f"{dims[0]} on its own loop's block, whose threads each "
+                "hold several of its elements in one carried scalar; only "
+                "a zero-initialized sum (acc = acc + x, then acc.sum over "
+                f"that dim) survives that, but {reason}",
             )
-            if reason is not None:
-                raise exc.BackendUnsupported(
-                    "cute",
-                    f"loop carry {phi.name} (shape {list(value.shape)}) has dim "
-                    f"{dims[0]} on its own loop's block, whose threads each "
-                    "hold several of its elements in one carried scalar; only "
-                    "a zero-initialized sum (acc = acc + x, then acc.sum over "
-                    f"that dim) survives that, but {reason}",
-                )
 
 
 def _unfolded_use(
@@ -135,8 +117,9 @@ def _additive(state: CodegenState, update: Node, carry: Node) -> str | None:
     the carry read nowhere else in its graph, or None.
 
     The update adds or subtracts other values along a chain down to the
-    carry, through copies and through runtime ``if``s whose branches each
-    update it that way (or leave it).
+    carry, through copies, through runtime ``if``s whose branches each
+    update it that way (or leave it) and through the ``_mask_select`` that
+    leaves it in a partial tile's padded lanes.
     """
     chain: set[Node] = set()
     pending: list[Node] = [update]
@@ -145,7 +128,7 @@ def _additive(state: CodegenState, update: Node, carry: Node) -> str | None:
         if node is carry or node in chain:
             continue
         chain.add(node)
-        if node.target is _new_var or node.target is _phi:
+        if node.target in (_new_var, _phi, _mask_select):
             operands = [arg for arg in node.args[:2] if isinstance(arg, Node)]
             if node.target is _new_var:
                 operands = operands[:1]
@@ -190,31 +173,14 @@ def _branch_input(state: CodegenState, item: Node, carry: Node) -> Node | str:
     from ..device_ir import IfGraphInfo
 
     if_node = cast("Node", item.args[0])
-    index = cast("int", item.args[1])
     if_info = state.get_graph(if_node.args[1])
     assert isinstance(if_info, IfGraphInfo)
-    entries = if_info.branches_outputs or []
-    common = sum(1 for entry in entries if all(isinstance(e, int) for e in entry))
-    if_only = sum(1 for entry in entries if isinstance(entry[1], str))
-    else_only = len(entries) - common - if_only
-    # The ``_if`` results: the if branch's common and if-only outputs, the
-    # outer values the else branch replaces, then the else branch's common
-    # outputs, the outer values the if branch replaces and its else-only
-    # outputs (``WalkDeviceAST.visit_If``).
-    if index < common + if_only:
-        branch, entry = 0, entries[index]
-    elif common + if_only + else_only <= index < 2 * common + if_only + else_only:
-        branch, entry = 1, entries[index - (common + if_only + else_only)]
-    elif index >= 2 * common + 2 * if_only + else_only:
-        branch = 1
-        entry = entries[
-            common + if_only + index - (2 * common + 2 * if_only + else_only)
-        ]
-    else:
+    source = if_info.result_source(if_node, cast("int", item.args[1]))
+    if not isinstance(source, tuple):
         return "an if passes it through unexpectedly"
-    output_index = entry[branch]
-    assert isinstance(output_index, int)
-    graph = state.get_graph(if_node.args[1 + branch]).graph
+    graph_id, output_index = source
+    branch = 0 if graph_id == if_node.args[1] else 1
+    graph = state.get_graph(graph_id).graph
     (output,) = graph.find_nodes(op="output")
     outputs = output.args[0]
     assert isinstance(outputs, (list, tuple))

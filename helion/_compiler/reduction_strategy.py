@@ -997,7 +997,9 @@ class PersistentReductionStrategy(ReductionStrategy):
                     )
                 else:
                     # No dependencies - issue statement immediately
-                    expr_str = HostFunction.current().sympy_expr(numel)
+                    expr_str = HostFunction.current().sympy_expr(
+                        numel, state.device_function.config
+                    )
                     stmt = statement_from_string(
                         f"{block_size_var} = {backend.dynamic_rdim_size_expr(expr_str)}"
                     )

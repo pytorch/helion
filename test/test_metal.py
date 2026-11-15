@@ -178,6 +178,21 @@ def masked_copy(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="metal", static_shapes=True)
+def carry_exp_sum(x: torch.Tensor) -> torch.Tensor:
+    """A per-lane accumulator updated from each tile's loads, summed after
+    the loop (``mask_loop_carries``)."""
+    m, n = x.shape
+    bn = hl.register_block_size(n)
+    out = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m, bn], dtype=x.dtype)
+        for tile_n in hl.tile(n, block_size=bn):
+            acc = acc + torch.exp(x[tile_m, tile_n])
+        out[tile_m] = acc.sum(-1)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Kernel definitions – arithmetic
 # ---------------------------------------------------------------------------
@@ -603,6 +618,21 @@ class TestMetalBoundsMasking(unittest.TestCase):
                 self.assertRaisesRegex(exc.BackendUnsupported, "not known until"),
             ):
                 kernel(x[:, 0] if kernel is flat else x)
+
+    def test_loop_carry_keeps_a_partial_tiles_fill_values_out(self) -> None:
+        """500 columns end in a 4-column tile of a 16-lane carry: the
+        update's ``torch.exp`` takes 0 in the 12 padded lanes
+        (``_mask_select``), each of which would otherwise add ``exp(0)``."""
+        x = torch.randn(64, 500, device=DEVICE)
+        result, _, msl = _run_with_msl(
+            carry_exp_sum, (x,), helion.Config(block_sizes=[16, 4])
+        )
+        torch.testing.assert_close(result, torch.exp(x).sum(-1), rtol=1e-4, atol=1e-4)
+        self.assertRegex(
+            msl,
+            r"_mask_select\w* = \(mask_\d+ \? \w+ : static_cast<float>\(0\)\);",
+            "the operand select not found in generated MSL",
+        )
 
 
 # ---------------------------------------------------------------------------

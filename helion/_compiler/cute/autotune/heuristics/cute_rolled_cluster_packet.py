@@ -188,9 +188,14 @@ class CuteRolledClusterPacketHeuristic(AutotunerHeuristic):
         if not isinstance(cluster_domain, EnumFragment):
             return []
         policy_domain = spec.load_eviction_policies.inner.search_values() or ()
+        # The load slots of the seeds' code, which rolls the reduction: rolling
+        # numbers them its own way, whatever the chunk
+        # (``DeviceIR.config_memory_op_facts``).
         policy_indices = {
             fact.eviction_index
-            for fact in spec.memory_op_facts
+            for fact in device_ir.config_memory_op_facts(
+                Config.from_dict({"reduction_loops": [size]})
+            )
             if fact.kind == "load"
             and fact.eviction_index is not None
             and fact.dtype == dtype
@@ -401,7 +406,7 @@ class CuteRolledClusterPacketHeuristic(AutotunerHeuristic):
         policies = spec.load_eviction_policies.default()
         policy_indices = {
             fact.eviction_index
-            for fact in spec.memory_op_facts
+            for fact in device_ir.config_memory_op_facts(Config.from_dict(values))
             if fact.kind == "load"
             and fact.eviction_index is not None
             and fact.dtype == dtype

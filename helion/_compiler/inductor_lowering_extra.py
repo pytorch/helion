@@ -236,7 +236,6 @@ def var_mean_helper_(
     return_mean: bool,
     # pyrefly: ignore [implicit-import]
 ) -> torch._inductor.ir.TensorBox:
-    from torch._inductor.lowering import var_mean_sum_
     from torch._prims_common import get_computation_dtype
 
     out_dtype = x.get_dtype()
@@ -252,10 +251,115 @@ def var_mean_helper_(
         "return_mean": return_mean,
     }
     # TODO(yf225): support Welford reduction in Helion, then switch back to use Inductor `var_mean_helper_()`.
-    output = var_mean_sum_(**kwargs)
+    output = _var_mean_sum(**kwargs)
     output = tuple(to_dtype(o, out_dtype, copy=False) for o in output)
     # pyrefly: ignore [bad-return]
     return output[0] if not return_mean else output
+
+
+def _var_mean_sum(
+    x: TensorBox,
+    axis: list[int] | None,
+    correction: float | None,
+    keepdim: bool,
+    return_mean: bool,
+) -> tuple[TensorBox, ...]:
+    """Inductor's ``var_mean_sum_``, counting the elements of each reduced
+    dim as the mean lowering does (``_reduced_dim_extent``): a padded
+    ``hl.arange``'s lanes by the range's length (``_padded_range_lengths``),
+    a tile dim by the tile's extent, and a jagged tile dim refused."""
+    from torch._inductor.lowering import _validate_reduction_axis
+    from torch._inductor.lowering import div
+    from torch._inductor.lowering import square
+    from torch._inductor.lowering import sub
+    from torch._inductor.lowering import sum_
+    from torch._inductor.utils import sympy_product
+    from torch.utils._sympy.functions import Max
+
+    if correction is None:
+        correction = 1
+    size = x.get_size()
+    axis = _validate_reduction_axis(x, axis)
+    lengths = _padded_range_lengths(len(size))
+    try:
+        count = sympy_product(_reduced_dim_extent(size[i], lengths[i]) for i in axis)
+    except exc.InvalidJaggedTileUsage:
+        raise exc.InvalidJaggedTileUsage(
+            "a variance over the jagged tile dim (torch.var, torch.std, "
+            "torch.var_mean) is not supported: each row of the parent tile "
+            "holds its own number of elements, so there is no one count to "
+            "divide by"
+        ) from None
+
+    def divide(total: TensorBox, divisor: sympy.Basic) -> TensorBox:
+        device = x.get_device()
+        assert device is not None
+        constant = ir.IndexingConstant(
+            index=divisor, dtype=x.get_dtype(), device=device
+        )
+        return div(total, ir.ExpandView.create(constant, list(total.get_size())))
+
+    # ``mean``'s lowering, as x is in the computation dtype already.
+    x_mean = mean(x, axis, keepdim=True)
+    if return_mean:
+        x_mean.realize()
+    # The squared deviations get a buffer of their own, so the sum masks them
+    # as its input: fused into the sum, a lane past a partial tile or past
+    # the row's length would add (0 - mean) ** 2 to it.
+    deviations = square(sub(x, x_mean))
+    deviations.realize()
+    sum_result = sum_(deviations, axis, keepdim)
+    if correction:
+        count = Max(sympy.Add(count, -correction), sympy.Integer(0))
+    x_var = divide(sum_result, count)
+    if not return_mean:
+        return (x_var,)
+    # Without keepdim the mean returned is a reduction of its own: the
+    # realized mean squeezed is a view, no buffer as the lowering of a node's
+    # result needs, and a copy of it would read the value with its kept dim.
+    return x_var, x_mean if keepdim else mean(x, axis, keepdim=False)
+
+
+_REDUCES_FIRST_ARGUMENT = (
+    torch.ops.aten.mean.dim,
+    torch.ops.aten.mean.default,
+    torch.ops.aten.var.correction,
+    torch.ops.aten.var_mean.correction,
+)
+
+
+def padded_range_lengths(value: object, ndim: int) -> tuple[int | None, ...]:
+    """For each of the ``ndim`` dims of ``value``, the length of the padded
+    ``hl.arange`` whose lanes it holds, or None.
+
+    ``hl.arange(200)`` runs over 256 lanes, and a load over it,
+    ``hl.load(x, [i, hl.arange(200)])``, has the padded size 256
+    (``_padded_iota_dims``); the lanes past 200 hold no elements.  A
+    reduction's masked input (``_mask_to``) holds the lanes of what it masks.
+    """
+    from ..language import _tracing_ops
+    from .indexing_strategy import _padded_iota_dims
+
+    none = (None,) * ndim
+    while isinstance(value, torch.fx.Node) and value.target is _tracing_ops._mask_to:
+        value = value.args[0]
+    val = value.meta.get("val") if isinstance(value, torch.fx.Node) else None
+    if not isinstance(val, torch.Tensor) or val.ndim != ndim:
+        return none
+    dims = _padded_iota_dims(value, through_loads=True)
+    if dims is None or len(dims) != ndim:
+        return none
+    return dims
+
+
+def _padded_range_lengths(ndim: int) -> tuple[int | None, ...]:
+    """``padded_range_lengths`` of the reduced value, the first argument of
+    the ``mean``, ``var`` or ``var_mean`` being lowered, whose lowering reads
+    it here once."""
+    node = V.graph.current_node
+    if node is None or node.target not in _REDUCES_FIRST_ARGUMENT:
+        return (None,) * ndim
+    return padded_range_lengths(node.args[0], ndim)
 
 
 _JAGGED_MEAN_UNSUPPORTED = (
@@ -265,7 +369,7 @@ _JAGGED_MEAN_UNSUPPORTED = (
 )
 
 
-def _reduced_dim_extent(size: sympy.Expr) -> sympy.Expr:
+def _reduced_dim_extent(size: sympy.Expr, padded_length: int | None) -> sympy.Expr:
     """The elements a mean over a dim of ``size`` divides by.
 
     A dim sized by the block of an ``hl.tile`` loop may hold fewer elements
@@ -274,7 +378,9 @@ def _reduced_dim_extent(size: sympy.Expr) -> sympy.Expr:
     sum, so the mean divides by the tile's extent (``tile.end -
     tile.begin``, rendered as the block size where no mask is needed; see
     :class:`~helion._compiler.variable_origin.TileExtentOrigin`) instead of
-    the block.  A reduction dim is its full size and is not changed here.
+    the block.  A reduction dim is its full size, except the padded size of
+    an ``hl.arange``'s lanes, which hold the range's ``padded_length``
+    (``_padded_range_lengths``).
     A jagged tile dim has a per-row extent (each row of the parent tile
     holds its own number of elements) that no scalar divisor expresses, so
     a mean over it is rejected rather than divided by the block, whether the
@@ -288,6 +394,8 @@ def _reduced_dim_extent(size: sympy.Expr) -> sympy.Expr:
     from .host_function import SymbolOrigin
     from .variable_origin import TileExtentOrigin
 
+    if padded_length is not None:
+        return sympy.Integer(padded_length)
     env = CompileEnvironment.current()
     if not isinstance(size, sympy.Symbol):
         if any(
@@ -341,7 +449,8 @@ def mean(
     if output_dtype in (torch.float16, torch.bfloat16):
         x = to_dtype(x, torch.float)
     sum_result = sum_(x, axis, keepdim)
-    denom = sympy.Mul(*[_reduced_dim_extent(size[i]) for i in axis])
+    lengths = _padded_range_lengths(len(size))
+    denom = sympy.Mul(*[_reduced_dim_extent(size[i], lengths[i]) for i in axis])
     device = x.get_device()
     assert device is not None
     denom_box = ir.IndexingConstant(index=denom, dtype=x.get_dtype(), device=device)
