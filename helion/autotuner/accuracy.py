@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import math
 import types
 from typing import TYPE_CHECKING
@@ -151,6 +152,12 @@ def effective_fp8_accuracy(settings: Settings) -> str:
     return settings.autotune_fp8_accuracy
 
 
+# Every closeness comparison counts a NaN that matches a NaN at the same
+# position as accurate (see ``assert_close``).
+_assert_close_equal_nan = functools.partial(torch.testing.assert_close, equal_nan=True)
+_allclose_equal_nan = functools.partial(torch.allclose, equal_nan=True)
+
+
 def relative_l2_disagreement(
     actual: object, expected: object, max_relative_l2: float
 ) -> str | None:
@@ -222,7 +229,7 @@ def _relative_l2_disagreement(
         if a.numel() == 0:
             continue
         if a.dtype == torch.float4_e2m1fn_x2:
-            # Packed FP4 has no numeric cast (see ``_assert_close_large``):
+            # Packed FP4 has no numeric cast (see ``_chunked_assert_close``):
             # the two runs must agree byte for byte.
             if not torch.equal(a.view(torch.uint8), b.view(torch.uint8)):
                 return f"leaf {index} ({a.dtype}) differs"
@@ -231,12 +238,20 @@ def _relative_l2_disagreement(
             if not torch.equal(a, b):
                 return f"leaf {index} ({a.dtype}) differs"
             continue
-        # float64 leaves keep their range: in float32 two different large
-        # values would both overflow to inf and agree.
-        compute_dtype = torch.float64 if a.dtype == torch.float64 else torch.float32
-        af = a.detach().to(compute_dtype)
-        bf = b.detach().to(compute_dtype)
+        # A complex leaf's real and imaginary parts count as elements of their
+        # own.  Float64 keeps its range (float32 would turn a large finite
+        # value into an infinity); every other float dtype widens exactly.
+        af, bf = (
+            torch.view_as_real(t.detach().resolve_conj())
+            if t.is_complex()
+            else t.detach()
+            for t in (a, b)
+        )
+        if af.dtype != torch.float64:
+            af, bf = af.to(torch.float32), bf.to(torch.float32)
         finite = torch.isfinite(bf)
+        # An infinity must also keep its sign: the masks alone would let -inf
+        # stand for +inf, which is zeroed with the other non-finite elements.
         if (
             not torch.equal(torch.isfinite(af), finite)
             or not torch.equal(torch.isnan(af), torch.isnan(bf))
@@ -245,11 +260,20 @@ def _relative_l2_disagreement(
             return f"leaf {index}: the non-finite elements differ"
         af = torch.where(finite, af, torch.zeros((), dtype=af.dtype, device=af.device))
         bf = torch.where(finite, bf, torch.zeros((), dtype=bf.dtype, device=bf.device))
+        # The norms of the finite elements over their largest magnitude, in
+        # float32 (float64 is not available everywhere): squares of values
+        # near either end of the range would overflow or underflow.  The peak
+        # stays a tensor: CUDA divides by a Python number through its
+        # reciprocal in the tensor's dtype, which is infinite for a subnormal
+        # peak.
+        peak = torch.maximum(af.abs().amax(), bf.abs().amax())
+        if not peak.item():
+            continue
+        af = (af / peak).to(torch.float32)
+        bf = (bf / peak).to(torch.float32)
         scale = max(
             torch.linalg.vector_norm(af).item(), torch.linalg.vector_norm(bf).item()
         )
-        if scale == 0.0:
-            continue
         relative_l2 = torch.linalg.vector_norm(af - bf).item() / scale
         if not relative_l2 <= max_relative_l2:
             return (
@@ -257,6 +281,55 @@ def _relative_l2_disagreement(
                 f"{max_relative_l2:.0e}"
             )
     return None
+
+
+def entirely_nan(t: torch.Tensor, chunk_size: int = 2**22) -> bool:
+    """Whether ``t`` is a non-empty floating-point tensor of NaNs only.
+
+    A tensor whose first element is a number returns at once.  Otherwise
+    this checks chunks of ``chunk_size`` elements of the flattened tensor (a
+    copy of a non-contiguous one, as in ``_chunked_rms``: an expanded row
+    costs its logical size) and stops at the first one holding a number.
+    """
+    if not (t.is_floating_point() or t.is_complex()) or t.numel() == 0:
+        return False
+    if not bool(torch.isnan(t[(0,) * t.dim()])):
+        return False
+    flat = t.reshape(-1)
+    return all(
+        bool(torch.isnan(flat[start : start + chunk_size]).all())
+        for start in range(0, flat.numel(), chunk_size)
+    )
+
+
+def fp4_bytes(t: torch.Tensor) -> torch.Tensor:
+    """Packed fp4 as its bytes, which ``torch.equal`` compares (it has no
+    fp4 kernel); any other tensor as it is."""
+    return t.view(torch.uint8) if t.dtype == torch.float4_e2m1fn_x2 else t
+
+
+def same_values(new: torch.Tensor, old: torch.Tensor) -> bool:
+    """Whether ``new`` holds exactly ``old``'s values, a NaN matching a NaN at
+    the same position: ``torch.equal`` counts a NaN unequal to itself, so a
+    floating-point tensor it finds different must hold the same bytes (a
+    NaN of another payload, or -0.0 against 0.0, then differs), as packed
+    fp4 always must (``fp4_bytes``).  A conjugate or negative view compares
+    its resolved values (the clones the baseline runs on are resolved)."""
+    if torch.equal(fp4_bytes(new), fp4_bytes(old)):
+        return True
+    if (
+        new.dtype != old.dtype
+        or new.shape != old.shape
+        or not (new.is_floating_point() or new.is_complex())
+    ):
+        return False
+    new, old = (t.resolve_conj().resolve_neg() for t in (new, old))
+    if new.is_complex():
+        new, old = torch.view_as_real(new), torch.view_as_real(old)
+    bits = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+    return torch.equal(
+        new.view(bits[new.element_size()]), old.view(bits[old.element_size()])
+    )
 
 
 def assert_close(
@@ -270,6 +343,14 @@ def assert_close(
     fp8_accuracy: str = "bitwise",
 ) -> None:
     """Like torch.testing.assert_close, with packed floats and large tensor handling.
+
+    A NaN matches a NaN at the same position (as in the fp8 ulp comparison):
+    kernels whose correct output contains NaNs (a sqrt or log of negative
+    inputs) must still autotune; a NaN on one side only is a mismatch.  Where
+    a complex value holds a NaN on either side, its real and imaginary parts
+    compare as numbers of their own (``torch.testing`` matches two complex
+    values whenever either part of each is a NaN); elsewhere complex values
+    compare as ``torch.testing`` compares them.
 
     With ``atol_scale="rms"`` (``scale_atol_by_expected_rms`` for short; used
     when the caller did not specify an explicit atol), the absolute-tolerance
@@ -420,6 +501,15 @@ def _assert_close_records(
                     atol_scale=atol_scale,
                 )
                 continue
+            if (
+                actual_leaf.is_complex()
+                and actual_leaf.dtype == expected_leaf.dtype
+                and actual_leaf.shape == expected_leaf.shape
+                and actual_leaf.device == expected_leaf.device
+            ):
+                _assert_complex_nan_parts_close(
+                    actual_leaf, expected_leaf, atol=atol, rtol=rtol
+                )
             _chunked_assert_close(
                 actual_leaf,
                 expected_leaf,
@@ -433,7 +523,18 @@ def _assert_close_records(
                     f"string mismatch {actual_leaf} vs {expected_leaf}"
                 )
         elif _is_number(actual_leaf) and _is_number(expected_leaf):
-            torch.testing.assert_close(actual_leaf, expected_leaf, atol=atol, rtol=rtol)
+            if (
+                isinstance(actual_leaf, complex)
+                and isinstance(expected_leaf, complex)
+                and any(
+                    math.isnan(part)
+                    for value in (actual_leaf, expected_leaf)
+                    for part in (value.real, value.imag)
+                )
+            ):
+                actual_leaf = (actual_leaf.real, actual_leaf.imag)
+                expected_leaf = (expected_leaf.real, expected_leaf.imag)
+            _assert_close_equal_nan(actual_leaf, expected_leaf, atol=atol, rtol=rtol)
         elif actual_leaf != expected_leaf:
             # Leaves torch.testing has no comparison for (a torch.dtype, None)
             # must be equal.
@@ -475,6 +576,45 @@ def _assert_non_finite_bytes_match(
             raise AssertionError(
                 "fp8 tensors differ at an inf or NaN element during autotuner "
                 f"accuracy check (dtype={expected.dtype})"
+            )
+
+
+def _assert_complex_nan_parts_close(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    atol: float,
+    rtol: float,
+    chunk_size: int = 2**22,
+) -> None:
+    """Compare, part by part, the complex values of ``actual`` and
+    ``expected`` (same dtype and shape) that hold a NaN on either side: a NaN
+    must face a NaN in the same part, and the other part must be close.
+    ``torch.testing`` counts two complex values equal under ``equal_nan``
+    whenever either part of each is a NaN, so ``NaN+1j`` would match
+    ``NaN+999j``; the other values are left to it.  Chunked as
+    ``_chunked_assert_close`` is."""
+    actual_parts = torch.view_as_real(actual.resolve_conj()).reshape(-1, 2)
+    expected_parts = torch.view_as_real(expected.resolve_conj()).reshape(-1, 2)
+    for start in range(0, actual_parts.shape[0], chunk_size):
+        actual_chunk = actual_parts[start : start + chunk_size]
+        expected_chunk = expected_parts[start : start + chunk_size]
+        nan = actual_chunk.isnan().any(-1) | expected_chunk.isnan().any(-1)
+        if not nan.any():
+            continue
+        close = torch.isclose(
+            actual_chunk[nan],
+            expected_chunk[nan],
+            rtol=rtol,
+            atol=atol,
+            equal_nan=True,
+        ).all(-1)
+        if not bool(close.all()):
+            index = int(nan.nonzero()[int((~close).nonzero()[0, 0]), 0])
+            raise AssertionError(
+                "Complex values holding a NaN differ in a part during autotuner "
+                f"accuracy check, first at flat index {start + index}: actual "
+                f"{complex(*actual_chunk[index].tolist())}, expected "
+                f"{complex(*expected_chunk[index].tolist())}"
             )
 
 
@@ -575,9 +715,10 @@ class AccuracyCheck:
       must match exactly (an fp8 one under ``"ulp"`` still gets one ulp).
 
     Scaling applies to floating-point tensors and ignores non-finite baseline
-    elements, which must match exactly.  Integer and bool tensors get the
-    unscaled tolerances, as in the default check (exact when ``rtol=0`` and
-    ``atol < 1``); packed fp4 tensors must match byte for byte.
+    elements, which must match exactly (a NaN matches a NaN).  Integer and
+    bool tensors get the unscaled tolerances, as in the default check (exact
+    when ``rtol=0`` and ``atol < 1``); packed fp4 tensors must match byte for
+    byte.
     ``fp8_accuracy`` selects how fp8 tensors are compared (see
     :func:`assert_close`) in place of the ``autotune_fp8_accuracy`` setting
     (``HELION_AUTOTUNE_FP8_ACCURACY``), which this check ignores like the
@@ -598,7 +739,7 @@ class AccuracyCheck:
     # Bump whenever a behavior reachable from ``assert_close`` changes: cached
     # autotune results are keyed by it, and the loose cache key holds no hash
     # of Helion's source.
-    VERSION: ClassVar[int] = 3
+    VERSION: ClassVar[int] = 4
 
     def __post_init__(self) -> None:
         for name in ("atol", "rtol"):
@@ -816,8 +957,11 @@ def _assert_close_fp8_ulp(
     with ``atol`` scaled by ``max(1, rms(b))`` or ``max(|b|)`` when requested: one ulp admits
     the single-bucket flips, the tolerances cover near-zero elements of a
     large reduction whose few-ulp distance is small against the output scale.
-    NaNs must match NaNs.  ``float8_e8m0fnu`` has no mantissa, so its one ulp
-    is one exponent step (a byte distance of one).
+    The bound applies between finite values: a NaN must match a NaN and an
+    infinity the same infinity.  ``float8_e8m0fnu`` has no mantissa, so its
+    one ulp is one exponent step (a byte distance of one), and it takes no
+    tolerance: the RMS-scaled default atol would let multi-step exponent
+    errors of a scale-factor output through.
 
     The differing elements must additionally not be systematically
     one-directional: reordering noise flips values up and down in equal
@@ -844,10 +988,12 @@ def _assert_close_fp8_ulp(
     expected_flat = expected.reshape(-1)
     total = expected_flat.numel()
     mismatches = 0
+    non_finite_mismatches = 0
     up = 0
     down = 0
-    worst_diff = -1.0
+    worst_rank = -1.0
     worst_index = 0
+    worst_diff = worst_actual = worst_expected = 0.0
     for start in range(0, total, chunk_size):
         a8 = actual_flat[start : start + chunk_size]
         b8 = expected_flat[start : start + chunk_size]
@@ -861,40 +1007,59 @@ def _assert_close_fp8_ulp(
                 a8.view(torch.uint8).to(torch.int16)
                 - b8.view(torch.uint8).to(torch.int16)
             ).abs()
-            # NaN (byte 0xFF) is one byte from the largest finite value.
-            within = (distance <= 1) & ~torch.isnan(a) & ~torch.isnan(b)
+            within = distance <= 1
         else:
             tolerance = _fp8_ulp(torch.maximum(a.abs(), b.abs()), dtype) + atol
             if rtol:
                 tolerance = tolerance + rtol * b.abs()
-            # An infinite element (whose tolerance is infinite too) must match
-            # exactly: ``equal`` covers that.
-            within = (diff <= tolerance) & torch.isfinite(a) & torch.isfinite(b)
-        bad = ~(equal | both_nan | within)
+            within = diff <= tolerance
+        # The bound relates finite values only: against an infinite baseline
+        # element ``rtol * |b|`` is infinite, and the e8m0 NaN (byte 255) is
+        # one byte from 2**127.  A matching infinity passes as ``equal``.
+        finite = torch.isfinite(a) & torch.isfinite(b)
+        bad = ~(equal | both_nan | (finite & within))
         n_bad = int(bad.sum())
         if n_bad:
             mismatches += n_bad
-            # A NaN against a number has a NaN difference; rank it above every
-            # finite excess so the report names it.
+            non_finite_mismatches += int((bad & ~finite).sum())
+            # A NaN against a number has a NaN difference; rank it with the
+            # infinite ones above every finite excess so the report names it.
             excess = torch.where(bad, diff, torch.zeros_like(diff)).nan_to_num(
-                nan=math.inf
+                nan=math.inf, posinf=math.inf
             )
             local = int(excess.argmax())
-            value = float(excess[local])
-            if value > worst_diff:
-                worst_diff = value
+            rank = float(excess[local])
+            if rank > worst_rank:
+                worst_rank = rank
                 worst_index = start + local
+                worst_diff = float(diff[local])
+                worst_actual, worst_expected = float(a[local]), float(b[local])
         differs = ~(equal | both_nan)
         up += int((differs & (a > b)).sum())
         down += int((differs & (a < b)).sum())
     if mismatches:
+        reasons = []
+        if mismatches > non_finite_mismatches:
+            reasons.append(
+                "by more than one ulp (one exponent step: no tolerance applies)"
+                if dtype is torch.float8_e8m0fnu
+                else "by more than one ulp plus the tolerance "
+                f"(atol={atol:.3g}, rtol={rtol:.3g})"
+            )
+        if non_finite_mismatches:
+            reasons.append("in NaN or infinite elements, which must match exactly")
+        non_finite = (
+            f", {non_finite_mismatches} of them NaN or infinite"
+            if non_finite_mismatches
+            else ""
+        )
         raise AssertionError(
-            "fp8 tensors differ by more than one ulp plus the tolerance "
-            f"(atol={atol:.3g}, rtol={rtol:.3g}, dtype={dtype})!\n\n"
+            f"fp8 tensors of dtype {dtype} differ {' and '.join(reasons)}!\n\n"
             f"Mismatched elements: {mismatches} / {total} "
-            f"({100.0 * mismatches / max(total, 1):.1f}%)\n"
+            f"({100.0 * mismatches / max(total, 1):.1f}%){non_finite}\n"
             f"Greatest absolute difference: {worst_diff} at index "
-            f"{_unravel_index(worst_index, expected.shape)}"
+            f"{_unravel_index(worst_index, expected.shape)} "
+            f"(actual {worst_actual}, expected {worst_expected})"
         )
     flips = up + down
     if abs(up - down) > 0.5 * flips + 4.0 * math.sqrt(flips) + 1.0:
@@ -940,17 +1105,17 @@ def _chunked_assert_close(
         and actual.dtype == expected.dtype
         and actual.device == expected.device
         and (
-            torch.allclose(actual, expected, atol=atol, rtol=rtol)
+            _allclose_equal_nan(actual, expected, atol=atol, rtol=rtol)
             if actual.dtype.is_floating_point or actual.dtype.is_complex
             else torch.equal(actual, expected)
         )
     ):
         return
     if actual.numel() <= chunk_size:
-        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+        _assert_close_equal_nan(actual, expected, atol=atol, rtol=rtol)
         return
     if actual.dtype != expected.dtype or actual.device != expected.device:
-        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+        _assert_close_equal_nan(actual, expected, atol=atol, rtol=rtol)
         return
     if actual.device.type == "tpu":
         # ``torch.testing.assert_close`` copies each TPU chunk to the host to
@@ -965,8 +1130,10 @@ def _chunked_assert_close(
         expected_chunk = expected_flat[start : start + chunk_size]
         if actual.device.type == "tpu":
             if actual.dtype.is_floating_point or actual.dtype.is_complex:
-                if torch.allclose(actual_chunk, expected_chunk, atol=atol, rtol=rtol):
+                if _allclose_equal_nan(
+                    actual_chunk, expected_chunk, atol=atol, rtol=rtol
+                ):
                     continue
             elif torch.equal(actual_chunk, expected_chunk):
                 continue
-        torch.testing.assert_close(actual_chunk, expected_chunk, atol=atol, rtol=rtol)
+        _assert_close_equal_nan(actual_chunk, expected_chunk, atol=atol, rtol=rtol)

@@ -6,11 +6,13 @@ import dataclasses
 import linecache
 import math
 import multiprocessing as mp
+from multiprocessing import connection as mp_connection
 from multiprocessing.connection import Connection
 import os
 from pathlib import Path
 import pickle
 import random
+import select
 import signal
 import statistics
 import subprocess
@@ -40,6 +42,7 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner import PatternSearch
+from helion.autotuner import benchmark_worker as benchmark_worker_module
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.benchmark_job import AccuracyCheckJob
@@ -78,6 +81,8 @@ from helion.runtime.cute.launcher import _create_cute_wrapper
 from helion.runtime.settings import Settings
 
 if TYPE_CHECKING:
+    import contextlib
+
     from helion.runtime.kernel import CompiledConfig
 
 
@@ -189,6 +194,22 @@ class _OutOfMemoryInProcess:
 
 
 @dataclasses.dataclass
+class _OutOfMemoryWhileAlive:
+    """Runs out of device memory while process ``pid`` exists, as beside a
+    killed worker whose CUDA teardown holds the device; returns its own pid
+    once ``pid`` is gone."""
+
+    pid: int
+
+    def __call__(self) -> int:
+        try:
+            os.kill(self.pid, 0)
+        except ProcessLookupError:
+            return os.getpid()
+        raise RuntimeError("CUDA out of memory")
+
+
+@dataclasses.dataclass
 class _SpawnChildAndSleep:
     pid_path: str
 
@@ -196,6 +217,58 @@ class _SpawnChildAndSleep:
         child = subprocess.Popen(["sleep", "60"])
         Path(self.pid_path).write_text(str(child.pid))
         time.sleep(60)
+
+
+def _close_descriptors_and_sleep(
+    connection: Connection, seconds: float, release: int | None
+) -> None:
+    """A benchmark worker partway through an exit that its CUDA teardown
+    holds up: its descriptors are closed, so the parent's sentinel reads EOF,
+    but the process remains for ``seconds``, or until the parent closes the
+    write end of the ``release`` pipe. The job pipe stays open, so
+    ``shutdown``'s stop message still goes through."""
+    start_isolated_process_group()
+    kept = [connection.fileno()] if release is None else [connection.fileno(), release]
+    low = 3
+    for fd in sorted(kept):
+        os.closerange(low, fd)
+        low = fd + 1
+    os.closerange(low, os.sysconf("SC_OPEN_MAX"))
+    if release is None:
+        time.sleep(seconds)
+    else:
+        select.select([release], [], [], seconds)
+
+
+def _exit_leaving_the_sentinel_open(release: int, release_writer: int) -> None:
+    """Exit once a descendant has left the process group (which a worker's
+    kill then misses), holding the sentinel's write end until the parent
+    closes ``release_writer``, the write end of the ``release`` pipe."""
+    os.close(release_writer)
+    start_isolated_process_group()
+    ready, ready_writer = os.pipe()
+    if os.fork() == 0:
+        os.close(ready)
+        os.setsid()
+        os.close(ready_writer)
+        select.select([release], [], [], 600.0)
+        os._exit(0)
+    os.close(ready_writer)
+    # EOF once the descendant has its own session: a kill of this process
+    # group before that would take the descendant along, and the sentinel
+    # with it.
+    os.read(ready, 1)
+    os.close(ready)
+
+
+def _sleep_leaving_the_sentinel_open(
+    connection: Connection, release: int, release_writer: int
+) -> None:
+    """``_exit_leaving_the_sentinel_open``'s descendant, then report it and
+    sleep until killed."""
+    _exit_leaving_the_sentinel_open(release, release_writer)
+    connection.send("forked")
+    time.sleep(600.0)
 
 
 @dataclasses.dataclass
@@ -1717,6 +1790,9 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             patch(
                 "helion.autotuner.benchmark_worker.signal_process_tree"
             ) as signal_tree,
+            patch(
+                "helion.autotuner.benchmark_worker._wait_for_exit", return_value=False
+            ) as wait_for_exit,
             self.assertRaisesRegex(
                 BenchmarkWorkerUnkillable,
                 "refusing to launch another worker",
@@ -1741,7 +1817,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         timer.return_value.start.assert_called_once_with()
         timer.return_value.cancel.assert_called_once_with()
         signal_tree.assert_called_once_with(process, signal.SIGKILL)
-        process.join.assert_called_once_with(timeout=_REAP_TIMEOUT_SECONDS)
+        wait_for_exit.assert_called_once_with(process, _REAP_TIMEOUT_SECONDS)
         connection.close.assert_called_once_with()
         self.assertIs(worker._process, process)
         self.assertIs(worker._parent_connection, connection)
@@ -1756,7 +1832,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
     def test_watchdog_claim_cannot_race_successful_completion(self) -> None:
         worker = BenchmarkWorker()
         process = Mock(pid=123)
-        process.is_alive.side_effect = (True, False)
+        process.is_alive.side_effect = (True,)
         connection = Mock()
         event_type = threading.Event
         watchdog_checked_done = event_type()
@@ -1817,6 +1893,9 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
                 side_effect=event_factory,
             ),
             patch("helion.autotuner.benchmark_worker.signal_process_tree"),
+            patch(
+                "helion.autotuner.benchmark_worker._wait_for_exit", return_value=True
+            ),
         ):
             runner.start()
             self.assertTrue(watchdog_checked_done.wait(timeout=2.0))
@@ -1832,13 +1911,16 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
     def test_shutdown_surfaces_unkillable_worker(self) -> None:
         worker = BenchmarkWorker()
         process = Mock(pid=123)
-        process.is_alive.side_effect = (True, True)
+        process.is_alive.return_value = True
         connection = Mock()
         worker._process = process
         worker._parent_connection = connection
 
         with (
             patch("helion.autotuner.benchmark_worker.signal_process_tree"),
+            patch(
+                "helion.autotuner.benchmark_worker._wait_for_exit", return_value=False
+            ),
             self.assertRaisesRegex(
                 BenchmarkWorkerUnkillable,
                 "refusing to launch another worker",
@@ -1848,6 +1930,300 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
 
         self.assertIs(worker._process, process)
         self.assertIs(worker._parent_connection, connection)
+
+    def _exiting_worker(
+        self, release: int | None = None
+    ) -> tuple[BenchmarkWorker, mp.process.BaseProcess]:
+        """A worker whose process has closed its descriptors and sleeps on
+        (``_close_descriptors_and_sleep``), once its sentinel reads EOF."""
+        context = mp.get_context("fork")
+        connection, child_connection = context.Pipe(duplex=True)
+        # Ten minutes outlast the slow tests' worker starts on a loaded host;
+        # the cleanups below end it.
+        process = context.Process(
+            target=_close_descriptors_and_sleep,
+            args=(child_connection, 600.0, release),
+            daemon=True,
+        )
+        process.start()
+        child_connection.close()
+        self.addCleanup(self._forget_exiting, process)
+        self.addCleanup(process.join, 5)
+        self.addCleanup(process.kill)
+        self.assertTrue(mp_connection.wait([process.sentinel], 30))
+        self.assertTrue(process.is_alive())
+        worker = BenchmarkWorker()
+        worker._process = process
+        worker._parent_connection = connection
+        return worker, process
+
+    @staticmethod
+    def _forget_exiting(process: mp.process.BaseProcess) -> None:
+        """Take ``process`` out of the module's exiting workers, which every
+        ``BenchmarkWorker`` of the test process shares."""
+        with benchmark_worker_module._exiting_lock:
+            if process in benchmark_worker_module._exiting:
+                benchmark_worker_module._exiting.remove(process)
+
+    def test_shutdown_is_bounded_while_the_worker_finishes_exiting(self) -> None:
+        # process.join(timeout) waits for the sentinel only, then reaps with a
+        # blocking waitpid: here it would wait out the minute-long sleep, as
+        # it waited out a CUDA teardown on a loaded GPU.
+        worker, process = self._exiting_worker()
+        started = time.monotonic()
+        with patch("helion.autotuner.benchmark_worker._SHUTDOWN_TIMEOUT_SECONDS", 0.5):
+            worker.shutdown()
+        self.assertLess(time.monotonic() - started, 30.0)
+        self.assertEqual(process.exitcode, -signal.SIGKILL)
+        self.assertIsNone(worker._process)
+
+    def test_a_worker_past_closing_its_descriptors_is_not_unkillable(self) -> None:
+        # SIGKILL cannot cut a CUDA teardown short (modeled by a SIGKILL that
+        # does not arrive). A worker whose sentinel closed runs no more code
+        # and the next one may start, as when join() eventually reaped it.
+        worker, process = self._exiting_worker()
+        with (
+            patch("helion.autotuner.benchmark_worker.signal_process_tree"),
+            patch("helion.autotuner.benchmark_worker._REAP_TIMEOUT_SECONDS", 0.5),
+        ):
+            worker._kill()
+        self.assertTrue(process.is_alive())
+        self.assertIsNone(worker._fatal_error)
+        self.assertIsNone(worker._process)
+        self.assertIn(process, benchmark_worker_module._exiting)
+
+    def test_a_reaped_worker_is_not_waited_for(self) -> None:
+        # Its sentinel can stay open past the exit, here held by a descendant
+        # outside the killed process group: shutdown must not wait on it.
+        release, release_writer = os.pipe()
+        context = mp.get_context("fork")
+        process = context.Process(
+            target=_exit_leaving_the_sentinel_open,
+            args=(release, release_writer),
+            daemon=True,
+        )
+        process.start()
+        os.close(release)
+        self.addCleanup(os.close, release_writer)
+        benchmark_worker_module._poll_until_reaped(process, time.monotonic() + 30.0)
+        self.assertEqual(process.exitcode, 0)
+        self.assertFalse(mp_connection.wait([process.sentinel], 0))
+        worker = BenchmarkWorker()
+        worker._process = process
+        worker._parent_connection, child_connection = context.Pipe(duplex=True)
+        child_connection.close()
+        started = time.monotonic()
+        with patch("helion.autotuner.benchmark_worker._REAP_TIMEOUT_SECONDS", 30.0):
+            worker.shutdown()
+        self.assertLess(time.monotonic() - started, 10.0)
+        self.assertIsNone(worker._process)
+
+    def test_a_killed_worker_is_not_waited_for_once_reaped(self) -> None:
+        # Alive when killed, its sentinel held open by a descendant outside
+        # its process group: it is reaped as soon as it dies, so the kill
+        # does not wait the deadline out on the sentinel.
+        release, release_writer = os.pipe()
+        context = mp.get_context("fork")
+        connection, child_connection = context.Pipe(duplex=True)
+        process = context.Process(
+            target=_sleep_leaving_the_sentinel_open,
+            args=(child_connection, release, release_writer),
+            daemon=True,
+        )
+        process.start()
+        os.close(release)
+        child_connection.close()
+        self.addCleanup(os.close, release_writer)
+        self.addCleanup(process.join, 5)
+        self.addCleanup(process.kill)
+        self.assertTrue(connection.poll(30))
+        self.assertEqual(connection.recv(), "forked")
+        worker = BenchmarkWorker()
+        worker._process = process
+        worker._parent_connection = connection
+        started = time.monotonic()
+        with patch("helion.autotuner.benchmark_worker._REAP_TIMEOUT_SECONDS", 30.0):
+            worker._kill()
+        self.assertLess(time.monotonic() - started, 10.0)
+        self.assertEqual(process.exitcode, -signal.SIGKILL)
+        self.assertIsNone(worker._process)
+
+    def test_a_worker_that_has_not_begun_to_exit_is_unkillable(self) -> None:
+        # Past the deadline with its sentinel still open (a SIGKILL that does
+        # not arrive, here) the worker may still run code: it is reported
+        # unkillable, kept and not remembered as exiting.
+        context = mp.get_context("fork")
+        connection, child_connection = context.Pipe(duplex=True)
+        process = context.Process(target=time.sleep, args=(60,), daemon=True)
+        process.start()
+        child_connection.close()
+        self.addCleanup(process.join, 5)
+        self.addCleanup(process.kill)
+        worker = BenchmarkWorker()
+        worker._process = process
+        worker._parent_connection = connection
+        with (
+            patch("helion.autotuner.benchmark_worker.signal_process_tree"),
+            patch("helion.autotuner.benchmark_worker._REAP_TIMEOUT_SECONDS", 0.5),
+        ):
+            worker._kill()
+        self.assertTrue(process.is_alive())
+        self.assertIs(worker._process, process)
+        self.assertNotIn(process, benchmark_worker_module._exiting)
+        with self.assertRaisesRegex(
+            BenchmarkWorkerUnkillable, "refusing to launch another worker"
+        ):
+            worker._raise_if_unusable()
+
+    def _brief_reap_of(
+        self, process: mp.process.BaseProcess
+    ) -> contextlib.AbstractContextManager[object]:
+        """Cut to 2 s a worker start's wait for the killed workers while
+        ``process`` is one of them (``_reap_exiting``); a real worker's kill,
+        and a start's wait for that worker alone, keep their deadline, which
+        its CUDA teardown may need on a loaded host."""
+        reap_exiting = benchmark_worker_module._reap_exiting
+
+        def reap() -> bool:
+            if process not in benchmark_worker_module._exiting:
+                return reap_exiting()
+            with patch("helion.autotuner.benchmark_worker._REAP_TIMEOUT_SECONDS", 2.0):
+                return reap_exiting()
+
+        return patch(
+            "helion.autotuner.benchmark_worker._reap_exiting", side_effect=reap
+        )
+
+    def _killed_while_exiting(
+        self, release: int | None = None
+    ) -> mp.process.BaseProcess:
+        """The process of an ``_exiting_worker``, killed by a SIGKILL that
+        does not arrive (as a CUDA teardown outlasts it) and remembered as
+        exiting."""
+        worker, process = self._exiting_worker(release)
+        with (
+            patch("helion.autotuner.benchmark_worker.signal_process_tree"),
+            patch("helion.autotuner.benchmark_worker._REAP_TIMEOUT_SECONDS", 0.5),
+        ):
+            worker._kill()
+        self.assertIn(process, benchmark_worker_module._exiting)
+        return process
+
+    @pytest.mark.slow
+    def test_a_new_worker_starts_once_a_killed_one_has_been_reaped(self) -> None:
+        # A killed worker counts as exited once its descriptors close, though
+        # its CUDA teardown may still run the kernel it was killed in: a
+        # worker timing candidates beside it would measure them slow.  The
+        # next worker, also in a new BenchmarkWorker as the provider makes
+        # one after a shutdown, starts once the killed one is reaped: its
+        # first job finds it gone and runs out of no memory.
+        release, release_writer = os.pipe()
+        process = self._killed_while_exiting(release)
+        os.close(release)
+        writers = [release_writer]
+        reap_exiting = benchmark_worker_module._reap_exiting
+
+        def finish_exit_while_waited_for() -> bool:
+            # The teardown ends while the parent waits for it.
+            if writers:
+                os.close(writers.pop())
+            return reap_exiting()
+
+        self.addCleanup(finish_exit_while_waited_for)
+        warnings: list[str] = []
+        fresh = BenchmarkWorker(log_warning=warnings.append)
+        try:
+            with patch(
+                "helion.autotuner.benchmark_worker._reap_exiting",
+                side_effect=finish_exit_while_waited_for,
+            ):
+                pid = fresh.run(_OutOfMemoryWhileAlive(process.pid), timeout=30.0)
+            self.assertNotEqual(pid, process.pid)
+            self.assertIsNotNone(process.exitcode)
+            self.assertNotIn(process, benchmark_worker_module._exiting)
+            self.assertEqual(warnings, [])
+        finally:
+            fresh.shutdown()
+
+    @pytest.mark.slow
+    def test_out_of_memory_beside_a_worker_still_exiting_is_retried(self) -> None:
+        # A worker that completed a job runs out of memory while a killed
+        # one, here of another BenchmarkWorker, is still exiting and may hold
+        # that memory: the job reruns once the killed one has been reaped,
+        # whatever the worker's back-off, which the rerun leaves alone.
+        warnings: list[str] = []
+        writers: list[int] = []
+
+        def finish_exit(message: str | None = None) -> None:
+            if message is not None:
+                warnings.append(message)
+            if writers:
+                os.close(writers.pop())
+
+        self.addCleanup(finish_exit)
+        fresh = BenchmarkWorker(log_warning=finish_exit)
+        # back-off from jobs that ran out of memory on their own
+        fresh._retry_after_jobs = 4
+        try:
+            first = fresh.run(_ReturnPid(), timeout=30.0)
+            release, release_writer = os.pipe()
+            writers.append(release_writer)
+            process = self._killed_while_exiting(release)
+            os.close(release)
+            pid = fresh.run(_OutOfMemoryWhileAlive(process.pid), timeout=30.0)
+            self.assertNotIn(pid, (first, process.pid))
+            self.assertIsNotNone(process.exitcode)
+            self.assertNotIn(process, benchmark_worker_module._exiting)
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("while a killed worker was still exiting", warnings[0])
+            self.assertEqual(fresh._retry_after_jobs, 4)
+        finally:
+            fresh.shutdown()
+
+    @pytest.mark.slow
+    def test_a_worker_exiting_past_the_reap_deadline_is_forgotten(self) -> None:
+        # The next worker's start waits for the killed worker only up to the
+        # deadline, says so, and forgets it: the job's out-of-memory error is
+        # raised without a rerun, and the worker started to replace it waits
+        # for the killed one no more.  The back-off stays as it was.
+        process = self._killed_while_exiting()
+        warnings: list[str] = []
+        fresh = BenchmarkWorker(log_warning=warnings.append)
+        try:
+            with (
+                self._brief_reap_of(process),
+                self.assertRaisesRegex(RuntimeError, "CUDA out of memory"),
+            ):
+                fresh.run(_OutOfMemoryWhileAlive(process.pid), timeout=30.0)
+            self.assertTrue(process.is_alive())
+            self.assertNotIn(process, benchmark_worker_module._exiting)
+            self.assertEqual(fresh._retry_after_jobs, 1)
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("may measure slow", warnings[0])
+        finally:
+            fresh.shutdown()
+
+    @pytest.mark.slow
+    def test_a_rerun_beside_a_worker_exiting_past_the_reap_deadline_says_so(
+        self,
+    ) -> None:
+        # A job runs out of memory beside a killed worker that is still
+        # exiting: the rerun's worker starts once the wait for it runs out,
+        # forgets it and says the candidates it times may measure slow.
+        warnings: list[str] = []
+        fresh = BenchmarkWorker(log_warning=warnings.append)
+        try:
+            first = fresh.run(_ReturnPid(), timeout=30.0)
+            process = self._killed_while_exiting()
+            with self._brief_reap_of(process):
+                pid = fresh.run(_OutOfMemoryInProcess(first), timeout=30.0)
+            self.assertNotEqual(pid, first)
+            self.assertNotIn(process, benchmark_worker_module._exiting)
+            self.assertEqual(len(warnings), 2)
+            self.assertIn("while a killed worker was still exiting", warnings[0])
+            self.assertIn("may measure slow", warnings[1])
+        finally:
+            fresh.shutdown()
 
     def test_provider_cleanup_retains_unkillable_worker(self) -> None:
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
@@ -1895,7 +2271,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
                 while time.monotonic() < deadline:
                     try:
                         state = Path(f"/proc/{child_pid}/stat").read_text().split()[2]
-                    except FileNotFoundError:
+                    except (FileNotFoundError, ProcessLookupError):
                         state = "gone"
                     if state in {"gone", "Z"}:
                         break
@@ -1933,7 +2309,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         worker = BenchmarkWorker()
         connection, child_connection = mp.Pipe()
         process = Mock(pid=123)
-        process.is_alive.side_effect = (True, False)
+        process.is_alive.side_effect = (True,)
         worker._process = process
         worker._parent_connection = connection
         watchdog_finished = threading.Event()
@@ -1959,6 +2335,10 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
                 patch(
                     "helion.autotuner.benchmark_worker.signal_process_tree",
                     side_effect=lambda *_args: child_connection.close(),
+                ),
+                patch(
+                    "helion.autotuner.benchmark_worker._wait_for_exit",
+                    return_value=True,
                 ),
                 patch.object(worker, "_kill_if_current", kill_then_notify),
                 patch.object(connection, "poll", poll_after_watchdog),
