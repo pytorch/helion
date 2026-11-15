@@ -1,7 +1,7 @@
-"""The in-place snapshot proof of ``fuse_two_pass_loads`` and the packet prefetch
-of ``prefetch_reduction_packets`` compare names through the final rename's
-groups: the rename merges a loop's output name into the carried name, so
-``idx_next = idx + 1`` writes ``idx``."""
+"""The load matching and in-place snapshot proof of ``fuse_two_pass_loads`` and
+the packet prefetch of ``prefetch_reduction_packets`` compare names through the
+final rename's groups: the rename merges a loop's output name into the carried
+name, so ``idx_next = idx + 1`` writes ``idx``."""
 
 from __future__ import annotations
 
@@ -26,8 +26,9 @@ pytestmark = pytest.mark.cpu_only
 def _fuses(source: str, rename_groups: dict[str, str]) -> bool:
     result = fuse_two_pass_loads(
         ast.parse(source).body,
-        tensor_dtypes={"x": "cutlass.Float32"},
+        tensor_dtypes={"x": "cutlass.Float32", "out": "cutlass.Float32"},
         reload_modes={7: "register"},
+        proven_disjoint_tensor_pairs={frozenset(("x", "out"))},
         rename_groups=rename_groups,
     )
     return "_fuse_cache_" in ast.unparse(ast.Module(body=result, type_ignores=[]))
@@ -66,10 +67,10 @@ def test_in_place_snapshot_proof_compares_names_through_rename_groups(
     assert _fuses(_snapshot_kernel(step), rename_groups) is fuses
 
 
-def test_in_place_snapshot_serves_only_the_element_the_first_sweep_cached() -> None:
-    # After the rename, the consume sweep loads and stores x[lane + 1]: as
-    # written, its load is the first sweep's x[lane], and its store another
-    # element.
+def test_a_load_through_a_merged_index_is_not_matched_to_another_element() -> None:
+    # After the rename, the consume sweep loads and stores x[lane + 1]: the
+    # write of idx_next rebinds idx before the load, so load matching does not
+    # serve it the first sweep's x[lane].
     source = """
 for synthetic_lane_7 in range(9):
     a = (x.iterator + synthetic_lane_7).load()
@@ -81,6 +82,163 @@ for synthetic_lane_7 in range(9):
     (x.iterator + idx_next).store(b + 1)
 """
     assert not _fuses(source, {"idx_next": "idx"})
+
+
+_CARRIED_INDEX = """
+idx = 0
+for synthetic_lane_7 in range(8):
+    b = (x.iterator + idx).load()
+    a = (x.iterator + 0).load()
+    acc = acc + a + b
+    idx_next = idx + 1
+idx = 0
+for synthetic_lane_7 in range(8):
+    c = (x.iterator + idx).load()
+    (out.iterator + synthetic_lane_7).store(c)
+    idx_next = idx + 1
+"""
+_MOVED_START = """
+start = 0
+for synthetic_lane_7 in range(start, start + 8):
+    before = (x.iterator + synthetic_lane_7).load()
+    acc = acc + before
+start_next = start + 8
+for synthetic_lane_7 in range(start, start + 8):
+    after = (x.iterator + synthetic_lane_7).load()
+    (out.iterator + synthetic_lane_7).store(after)
+"""
+_REBOUND_BEFORE_LOAD = """
+for synthetic_lane_7 in range(8):
+    idx = 0
+    idx_next = idx + synthetic_lane_7
+    v = (x.iterator + idx).load()
+    acc = acc + v
+for synthetic_lane_7 in range(8):
+    idx = 0
+    idx_next = idx + synthetic_lane_7 * 2
+    v = (x.iterator + idx).load()
+    (out.iterator + synthetic_lane_7).store(v)
+"""
+_ADVANCED_IN_CONSUME_LOOP = """
+for synthetic_lane_7 in range(9):
+    a = (x.iterator + synthetic_lane_7).load()
+    acc = acc + a
+for synthetic_lane_7 in range(9):
+    idx = synthetic_lane_7
+    idx_next = synthetic_lane_7 + 1
+    b = (x.iterator + idx).load()
+    (out.iterator + synthetic_lane_7).store(b + acc)
+"""
+_PLAIN_SWEEPS = """
+for synthetic_lane_7 in range(8):
+    a = (x.iterator + synthetic_lane_7).load()
+    acc = acc + a
+for synthetic_lane_7 in range(8):
+    b = (x.iterator + synthetic_lane_7).load()
+    (out.iterator + synthetic_lane_7).store(b)
+"""
+_REBOUND_SWEEP_INDEX = """
+for synthetic_lane_7 in range(8):
+    lane_next = synthetic_lane_7
+    a = (x.iterator + lane_next).load()
+    acc = acc + a
+for synthetic_lane_7 in range(8):
+    lane_next = synthetic_lane_7 + 1
+    b = (x.iterator + lane_next).load()
+    (out.iterator + synthetic_lane_7).store(b)
+"""
+
+
+@pytest.mark.parametrize(
+    ("source", "rename_groups", "fuses"),
+    [
+        # After the rename, idx_next is idx: x[idx] reads another element in
+        # every iteration, not the x[0] the first sweep also loads.
+        (_CARRIED_INDEX, {"idx_next": "idx"}, False),
+        (_CARRIED_INDEX, {}, True),
+        # After the rename, start_next moves start between the sweeps.
+        (_MOVED_START, {"start_next": "start"}, False),
+        (_MOVED_START, {}, True),
+        # After the rename, idx_next = idx + lane rebinds idx before the load:
+        # x[idx] is x[lane] in both sweeps, not x[0], and not known equal.
+        (_REBOUND_BEFORE_LOAD, {"idx_next": "idx"}, False),
+        (_REBOUND_BEFORE_LOAD, {}, True),
+        # After the rename, idx_next = lane + 1 rebinds idx before the load of
+        # a consume loop that stores no element of x: x[idx] is x[lane + 1].
+        (_ADVANCED_IN_CONSUME_LOOP, {"idx_next": "idx"}, False),
+        (_ADVANCED_IN_CONSUME_LOOP, {}, True),
+        # After the rename, lane_next = lane + 1 rebinds the sweep index
+        # before the load: the slot the index then names is the next one.
+        (_REBOUND_SWEEP_INDEX, {"lane_next": "synthetic_lane_7"}, False),
+        # A sweep index in a group still holds equal values at equal
+        # iterations of both sweeps.
+        (_PLAIN_SWEEPS, {"synthetic_lane_7": "lane"}, True),
+    ],
+    ids=[
+        "carried-merged",
+        "carried-unmerged",
+        "start-merged",
+        "start-unmerged",
+        "rebound-merged",
+        "rebound-unmerged",
+        "consume-merged",
+        "consume-unmerged",
+        "sweep-index-merged",
+        "sweep-index-in-a-group",
+    ],
+)
+def test_load_matching_compares_names_through_rename_groups(
+    source: str, rename_groups: dict[str, str], fuses: bool
+) -> None:
+    assert _fuses(source, rename_groups) is fuses
+
+
+def _vector_lane_kernel(between: str, first: str, later: str) -> str:
+    # Load matching aligns the sweeps' vector lanes by spelling vec_lane_2 as
+    # vec_lane_1 in the later sweep's keys.
+    return f"""
+for roffset_7 in range(0, 64, 32):
+    for vec_lane_1 in range(8):
+        v = (x.iterator + roffset_7 + {first}).load()
+        acc = acc + v
+{between}
+for roffset_7 in range(0, 64, 32):
+    for vec_lane_2 in range(8):
+        w = (x.iterator + roffset_7 + {later}).load()
+        (out.iterator + roffset_7 + vec_lane_2).store(w)
+"""
+
+
+@pytest.mark.parametrize(
+    ("between", "later", "rename_groups", "fuses"),
+    [
+        # After the rename, idx is the first sweep's lane variable: x[idx] is
+        # x[lane] in the first sweep but x[7], its last lane, in the later one.
+        ("", "idx", {"idx": "vec_lane_1"}, False),
+        ("", "idx", {}, True),
+        # The same through a definition between the sweeps that the later
+        # sweep's key inlines, and with idx rebound between them.
+        ("saved = idx", "saved", {"idx": "vec_lane_1"}, False),
+        ("saved = idx", "saved", {}, True),
+        ("idx = indices[0]", "idx", {"idx": "vec_lane_1"}, False),
+        # After the rename, idx is the later sweep's lane variable, which the
+        # alignment does not spell as the first sweep's.
+        ("", "idx", {"idx": "vec_lane_2"}, False),
+    ],
+    ids=[
+        "first-lane-merged",
+        "unmerged",
+        "definition-merged",
+        "definition-unmerged",
+        "rebound-merged",
+        "later-lane-merged",
+    ],
+)
+def test_vector_lane_alignment_compares_names_through_rename_groups(
+    between: str, later: str, rename_groups: dict[str, str], fuses: bool
+) -> None:
+    source = _vector_lane_kernel(between, "idx", later)
+    assert _fuses(source, rename_groups) is fuses
 
 
 def _prefetch_kernel(

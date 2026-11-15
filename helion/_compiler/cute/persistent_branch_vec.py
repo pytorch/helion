@@ -13,6 +13,7 @@ from __future__ import annotations
 import ast
 from collections import Counter
 import dataclasses
+from functools import cache
 from functools import partial
 import math
 import re
@@ -47,12 +48,15 @@ _DTYPE_INFO = {
     "cutlass.Int32": ("cutlass.Uint32", 4, "_cute_store_u32_vec"),
     "cutlass.Uint32": ("cutlass.Uint32", 4, "_cute_store_u32_vec"),
 }
-# FP8 stores collect unconverted lanes; their flush helper converts the whole
-# packet at once.  FP8 loads keep their scalar path.
+# FP8 stores collect unconverted lanes, which their flush helper converts as
+# one packet; bool stores collect converted ``cutlass.Uint8`` lanes, which
+# ``_cute_store_u8_vec`` only packs.  Loads of these dtypes keep their scalar
+# path.
 _STORE_DTYPE_INFO = {
     **_DTYPE_INFO,
     "cutlass.Float8E4M3FN": ("cutlass.Uint8", 1, "_cute_store_fp8e4m3fn_vec"),
     "cutlass.Float8E5M2": ("cutlass.Uint8", 1, "_cute_store_fp8e5m2_vec"),
+    "cutlass.Boolean": ("cutlass.Uint8", 1, "_cute_store_u8_vec"),
 }
 # Element bytes of each generated ``NAME(pointer, values)`` packet flush; the
 # lane passes treat exactly these helpers as one store of ``values``.
@@ -380,12 +384,19 @@ def _is_affine_in_lane(node: ast.AST, lane_var: str) -> tuple[bool, bool]:
             return True, True
         return True, False
     if isinstance(node, ast.Call):
-        dependencies = [_is_affine_in_lane(arg, lane_var) for arg in node.args]
-        depends = any(item[0] for item in dependencies)
+        # The callee counts too: ``cutlass.Int32(v[lane]).bitcast(...)``
+        # depends on the lane through its receiver.
+        func_depends, func_valid = _is_affine_in_lane(node.func, lane_var)
+        dependencies = [
+            _is_affine_in_lane(arg, lane_var)
+            for arg in [*node.args, *(keyword.value for keyword in node.keywords)]
+        ]
+        depends = func_depends or any(item[0] for item in dependencies)
         if not depends:
-            return False, all(item[1] for item in dependencies)
+            return False, func_valid and all(item[1] for item in dependencies)
         is_cutlass_cast = (
-            len(node.args) == 1
+            not func_depends
+            and len(node.args) == 1
             and not node.keywords
             and ast.unparse(node.func).startswith("cutlass.")
         )
@@ -1454,15 +1465,22 @@ class _BranchLocalPersistentVectorizer:
         )
 
     @classmethod
-    def _load_pointer(cls, node: ast.Call) -> ast.AST | None:
+    def _load_roots(cls, node: ast.Call) -> tuple[bool, frozenset[str] | None]:
+        """Whether ``node`` loads, and the tensors it may read (None: any)."""
         marker = _marker_call(node, _LOAD_MARKER, 6)
         if marker is not None:
-            return marker.args[4]
+            return True, cls._pointer_roots(marker.args[4])
+        if isinstance(node.func, ast.Name) and node.func.id in _VECTOR_LOAD_HELPERS:
+            # ``<L2 helper>(PTR, ir.VectorType.get(...))``: a packet load the
+            # loop's aliasing checks must see like any other load.  One of a
+            # form the parser does not know may read anything.
+            access = match_packet_access(node)
+            return True, None if access is None else cls._pointer_roots(access.pointer)
         if not (isinstance(node.func, ast.Attribute) and node.func.attr == "load"):
-            return None
+            return False, None
         if node.args and cls._contains_arch_attribute(node.func.value):
-            return node.args[0]
-        return node.func.value
+            return True, cls._pointer_roots(node.args[0])
+        return True, cls._pointer_roots(node.func.value)
 
     def _has_aliasing_write_in_loop(
         self,
@@ -1471,6 +1489,7 @@ class _BranchLocalPersistentVectorizer:
         load_index: int,
         lane_var: str,
         lane_extent: int,
+        definition_snapshots: list[dict[str, ast.expr]] | None,
     ) -> bool:
         """Whether any loop iteration can write storage read by this load.
 
@@ -1478,11 +1497,11 @@ class _BranchLocalPersistentVectorizer:
         next constexpr-lane iteration.  Hoisting the vector load above the
         loop would observe the pre-write value for every lane. Such a write is
         a barrier unless its tensor is disjoint or both exact accesses have the
-        same injective lane mapping.
+        same injective lane mapping.  ``definition_snapshots`` are ``body``'s
+        ``_memory_address_definition_snapshots`` (``None``, a definition
+        reaching an address too large to freeze, declines).
         """
-        load_pointer = load_marker.args[4]
-        load_roots = self._pointer_roots(load_pointer)
-        definition_snapshots = _definition_snapshots(body)
+        load_roots = self._pointer_roots(load_marker.args[4])
         if definition_snapshots is None:
             return True
         for store_index, stmt in enumerate(body):
@@ -1524,6 +1543,7 @@ class _BranchLocalPersistentVectorizer:
         store_index: int,
         lane_var: str,
         lane_extent: int,
+        definition_snapshots: list[dict[str, ast.expr]] | None,
     ) -> bool:
         """Whether sinking a store can cross an aliasing memory access.
 
@@ -1532,18 +1552,19 @@ class _BranchLocalPersistentVectorizer:
         the sunk vector transaction across iterations.  Exclude only the
         candidate marker itself; every other load/store/atomic in the repeated
         loop must be proven disjoint, except a preceding exact load with the
-        same injective lane mapping.
+        same injective lane mapping and another store marker with it
+        (``_store_accesses_are_iteration_independent``).  A later such store
+        must be sunk as well, or this one is put back
+        (``_unsink_overwritten_stores``).  ``definition_snapshots`` are as for
+        ``_has_aliasing_write_in_loop``.
         """
         store_roots = self._pointer_roots(store_marker.args[3])
-        definition_snapshots = _definition_snapshots(body)
         if definition_snapshots is None:
             return True
         for access_index, stmt in enumerate(body):
             for node in _memory_load_calls(stmt):
-                pointer = self._load_pointer(node)
-                if pointer is not None and self._may_alias(
-                    store_roots, self._pointer_roots(pointer)
-                ):
+                loads, roots = self._load_roots(node)
+                if loads and self._may_alias(store_roots, roots):
                     # Sinking the store retains a preceding load's within-lane
                     # order. Matching exact lane mappings rule out only the
                     # cross-iteration dependence introduced by the sink.
@@ -1634,8 +1655,20 @@ class _BranchLocalPersistentVectorizer:
         before: list[ast.stmt] = []
         after: list[ast.stmt] = []
         rewritten_body: list[ast.stmt] = []
+        # Each sunk store's collector setup and flushes, by statement index
+        # (``_unsink_overwritten_stores``).
+        sunk: dict[int, tuple[ast.stmt, list[ast.stmt]]] = {}
+        # The aliasing checks compare the addresses of this loop's markers as
+        # the body reads before any rewrite: hoisting a load edits its
+        # statement in place, but every rewrite below runs a check first, so
+        # the first call, which the cache keeps, comes before all of them.
+        address_definitions = cache(
+            partial(_memory_address_definition_snapshots, loop.body)
+        )
 
         for stmt_index, stmt in enumerate(loop.body):
+            collector: ast.stmt | None = None
+            flushes_from = len(after)
             load_markers: list[ast.Call] = []
             for node in ast.walk(stmt):
                 marker_call = _marker_call(node, _LOAD_MARKER, 6)
@@ -1666,6 +1699,7 @@ class _BranchLocalPersistentVectorizer:
                         stmt_index,
                         lane_var,
                         width,
+                        address_definitions(),
                     )
                 ):
                     scalar_load, mask = load_info
@@ -1801,11 +1835,18 @@ class _BranchLocalPersistentVectorizer:
                         stmt_index,
                         lane_var,
                         width,
+                        address_definitions(),
                     )
                 ):
                     carrier, _itemsize, store_helper = dtype_info
                     lane_value = _clone_expr(store_marker.args[4])
-                    if carrier == "cutlass.Uint8":
+                    if dtype == "cutlass.Boolean":
+                        lane_value = ast.Call(
+                            func=ast.parse(carrier, mode="eval").body,
+                            args=[lane_value],
+                            keywords=[],
+                        )
+                    elif carrier == "cutlass.Uint8":
                         assert isinstance(dtype, str)
                         fp8_source = self._fp8_lane_value(
                             lane_value, dtype, rewritten_body
@@ -1823,12 +1864,11 @@ class _BranchLocalPersistentVectorizer:
                             keywords=[],
                         )
                     values_name = self._fresh("_persistent_branch_store_values")
-                    before.append(
-                        ast.Assign(
-                            targets=[ast.Name(id=values_name, ctx=ast.Store())],
-                            value=ast.List(elts=[], ctx=ast.Load()),
-                        )
+                    collector = ast.Assign(
+                        targets=[ast.Name(id=values_name, ctx=ast.Store())],
+                        value=ast.List(elts=[], ctx=ast.Load()),
                     )
+                    before.append(collector)
                     append = ast.Expr(
                         value=ast.Call(
                             func=ast.Attribute(
@@ -1862,9 +1902,60 @@ class _BranchLocalPersistentVectorizer:
 
             rewritten_body.append(stmt)
             definitions.update(_single_name_definitions([stmt]))
+            if collector is not None:
+                sunk[stmt_index] = (collector, after[flushes_from:])
 
+        self._unsink_overwritten_stores(loop.body, rewritten_body, before, after, sunk)
         loop.body = self.transform_body(rewritten_body)
         return before, loop, after
+
+    def _unsink_overwritten_stores(
+        self,
+        body: list[ast.stmt],
+        rewritten_body: list[ast.stmt],
+        before: list[ast.stmt],
+        after: list[ast.stmt],
+        sunk: dict[int, tuple[ast.stmt, list[ast.stmt]]],
+    ) -> None:
+        """Put back in the loop each sunk store that a later write of the
+        loop may overwrite there.
+
+        ``_has_other_aliasing_access_in_loop`` lets a store sink past a later
+        store marker with the same lane addresses, or with lane addresses
+        only proven apart across lanes (modular lane-disjointness: in the same
+        lane the two may still meet).  That store runs after the sunk one in
+        every lane, so it must flush after it, as a packet of its own; one
+        that stays in the loop (its guard varies across the lanes, or it is
+        nested) would be overwritten by the earlier flush.  The sunk store
+        then keeps its scalar form, and counts as a write of the loop for the
+        stores before it.  ``body`` holds the loop's marked statements,
+        ``rewritten_body`` their rewrites, one each; ``sunk`` maps the index
+        of each sunk store to its collector setup in ``before`` and its
+        flushes in ``after``.
+        """
+        assert len(body) == len(rewritten_body)
+        if not sunk:
+            # Nothing to put back: the walk below would read every call.
+            return
+        later_writes: list[frozenset[str] | None] = []
+        for index in reversed(range(len(body))):
+            if index in sunk:
+                marker = self._store_marker(body[index])
+                assert marker is not None
+                roots = self._pointer_roots(marker.args[3])
+                if not any(self._may_alias(roots, other) for other in later_writes):
+                    continue
+                collector, flushes = sunk[index]
+                rewritten_body[index : index + 1] = self._restore_store(marker)
+                before[:] = [stmt for stmt in before if stmt is not collector]
+                after[:] = [
+                    stmt for stmt in after if not any(stmt is f for f in flushes)
+                ]
+            for node in ast.walk(body[index]):
+                if isinstance(node, ast.Call):
+                    written = call_write_roots(node, self._pointer_roots)
+                    if written != frozenset():
+                        later_writes.append(written)
 
     def _fp8_lane_value(
         self, value: ast.expr, dtype: str, loop_body: list[ast.stmt]

@@ -21,6 +21,7 @@ PACKET_FLUSH_L2_EVICT_LAST = {
     "_cute_store_u32_vec": "_cute_store_u32x4_l2_evict_last",
     "_cute_store_fp8e4m3fn_vec": "_cute_store_fp8e4m3fn_vec_l2_evict_last",
     "_cute_store_fp8e5m2_vec": "_cute_store_fp8e5m2_vec_l2_evict_last",
+    "_cute_store_u8_vec": "_cute_store_u8_vec_l2_evict_last",
 }
 # Plain packet flush -> its streaming (evict-first) form.
 PACKET_FLUSH_STREAMING = {
@@ -28,6 +29,7 @@ PACKET_FLUSH_STREAMING = {
     "_cute_store_u32_vec": "_cute_store_u32x4_streaming",
     "_cute_store_fp8e4m3fn_vec": "_cute_store_fp8e4m3fn_vec_streaming",
     "_cute_store_fp8e5m2_vec": "_cute_store_fp8e5m2_vec_streaming",
+    "_cute_store_u8_vec": "_cute_store_u8_vec_streaming",
 }
 # ``cute_store_policy`` value -> its flush table.
 PACKET_FLUSH_BY_POLICY = {

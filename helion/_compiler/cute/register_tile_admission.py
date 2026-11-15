@@ -53,23 +53,40 @@ class RegisterTileOptions:
     """Autotuner knobs of the register-tile schedule
     (``register_tile_reductions.lower_register_tile_lane_loop``).
 
-    * ``warp_fold`` (``cute_register_tile_warp_fold``): the shared-memory
-      column reduce of a multi-warp group whose threads are laid out along the
-      vector axis first (``pre > 1``) folds each warp's reduction coordinates
-      with a strided shuffle butterfly before the shared-memory exchange
-      (``_cute_grouped_reduce_shared_columns(..., fold='warp')``) instead of
-      every thread summing ``group_span // pre`` staged partials per column.
+    The shared-memory column reduce of a group whose threads are laid out
+    along the vector axis first (``pre > 1``) has every thread sum the
+    ``group_span // pre`` staged partials of each of its columns
+    (``_cute_grouped_reduce_shared_columns``).  Two knobs read fewer; both
+    change the order of the sums, so neither is a default:
+
+    * ``warp_fold`` (``cute_register_tile_warp_fold``): a multi-warp group
+      whose sibling count divides a warp folds each warp's reduction
+      coordinates with a strided shuffle butterfly before the shared-memory
+      exchange (``fold='warp'``); every thread then sums ``group_span // 32``
+      warp partials per column.
+    * ``cooperative_fold`` (``cute_register_tile_cooperative_fold``): a
+      warp-aligned group spreads its outputs over its lanes
+      (``fold='cooperative'``): a few lanes per output sum its staged
+      partials and fold them with a shuffle butterfly, and every thread reads
+      its outputs back, for one more barrier.  Requested with ``warp_fold``,
+      it wins (normalization drops the warp fold beside it).  On wide groups
+      it reads fewer shared values than the warp fold, whose reads
+      (``group_span // 32`` per column) still grow with the group;
+      ``_cute_cooperative_column_sums`` works an example.  No seed sets it,
+      so the search does not offer it.
     * ``store_first`` (``cute_register_tile_store_first``): the per-lane
       consume nest (the lane-varying stores) is emitted before the reductions'
       cross-thread combines when no store reads a reduction result, so a
       warp's stores do not wait behind the combines' CTA barriers.
 
-    Both default off, and a knob the tile cannot honour (a one-warp group, a
-    store that needs a reduction result) is ignored: the schedule then renders
-    byte-identically to the one before the knobs existed.
+    All default off, and a knob the tile cannot honour (a ``pre == 1`` group,
+    a fold whose group shape does not fit it, a store that needs a reduction
+    result) is ignored: the schedule then renders byte-identically to the one
+    before the knobs existed.
     """
 
     warp_fold: bool = False
+    cooperative_fold: bool = False
     store_first: bool = False
 
 

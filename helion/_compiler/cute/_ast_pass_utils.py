@@ -32,6 +32,8 @@ pinned by ``test/test_cute_ast_pass_utils.py`` against the legacy copies:
   node.
 * dataflow -- ``exposed_reads`` (forward, with explicit branch/loop/define
   policies) and ``live_in`` (backward, zero-trip loops).
+* device body -- ``body_end_follows_all_tiles``: whether a statement appended
+  to a device body runs once per CTA, after all of its tiles.
 
 Do not import this module from device-helper modules that generated code
 imports (``reduce_helpers``, ``vec_utils``, ``*_runtime``): they are part of
@@ -65,6 +67,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
     from collections.abc import Mapping
     from collections.abc import Sequence
+
+    from ..device_ir import DeviceIR
 
 _A = TypeVar("_A", bound=ast.AST)
 
@@ -366,6 +370,26 @@ def constexpr_v_loop(node: ast.AST) -> tuple[ast.For, int] | None:
     if not (isinstance(extent, ast.Constant) and isinstance(extent.value, int)):
         return None
     return node, extent.value
+
+
+# --------------------------------------------------------------------------
+# Device body
+# --------------------------------------------------------------------------
+
+
+def body_end_follows_all_tiles(body: Sequence[ast.AST], device_ir: DeviceIR) -> bool:
+    """Whether every thread of every CTA reaches the end of the device
+    ``body`` once, after all of the CTA's tiles: the body has no early
+    ``return`` and the launch no grid barrier (``hl.barrier()`` phases; a
+    stage of the ordered-phase lowering is a launch of its own, with one
+    phase).  The device remainder fills (``host_remainder_fills.py``) and
+    the flush of privatized atomics (``atomic_privatization.py``) are
+    appended there."""
+    return len(device_ir.phases) <= 1 and not any(
+        isinstance(node, ast.Return)
+        for statement in body
+        for node in ast.walk(statement)
+    )
 
 
 # --------------------------------------------------------------------------
@@ -718,8 +742,11 @@ def live_in(
 
     A plain assignment (``assigned``) kills its target before adding its
     reads; an ``if`` is live-in for either arm plus its test; a ``for`` with a
-    ``Name`` target iterates its body to a fixed point (a zero-trip loop keeps
-    ``live_out`` live) and then reads its iterator; anything else only reads.
+    ``Name`` target runs its ``else`` after the last iteration (a ``break``
+    that skips it keeps what is live after the loop live at the end of its
+    body, ``_breaks_out``), iterates its body to a fixed point (a zero-trip
+    loop keeps what is live after it live) and then reads its iterator;
+    anything else only reads.
     """
     live = set(live_out)
     for statement in reversed(statements):
@@ -734,20 +761,50 @@ def live_in(
                 | set(reads(statement.test))
             )
         elif isinstance(statement, ast.For) and isinstance(statement.target, ast.Name):
-            carried = set(live)
-            while True:
-                needed = live_in(
-                    statement.body, carried, reads=reads, assigned=assigned
-                ) - {statement.target.id}
-                updated = carried | needed
-                if updated == carried:
-                    break
-                carried = updated
-            live |= carried | set(reads(statement.iter))
-            live = live_in(statement.orelse, live, reads=reads, assigned=assigned)
+            after_else = live_in(statement.orelse, live, reads=reads, assigned=assigned)
+            live = live | after_else if _breaks_out(statement) else after_else
+            live = loop_live_end(statement, live, reads=reads, assigned=assigned)
+            live |= set(reads(statement.iter))
         else:
             live.update(reads(statement))
     return live
+
+
+def _breaks_out(loop: ast.For) -> bool:
+    """Whether a ``break`` of ``loop`` may skip its ``else``: one in its body
+    outside the bodies of nested loops (a nested loop's ``else`` runs in
+    ``loop``) and of nested functions."""
+
+    def breaks(node: ast.AST) -> bool:
+        if isinstance(node, ast.Break):
+            return True
+        if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+            return any(breaks(child) for child in node.orelse)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            return False
+        return any(breaks(child) for child in ast.iter_child_nodes(node))
+
+    return any(breaks(statement) for statement in loop.body)
+
+
+def loop_live_end(
+    loop: ast.For,
+    live_after: Collection[str],
+    *,
+    reads: Callable[[ast.AST], Collection[str]] = _rw_reads,
+    assigned: Callable[[ast.AST], str | None] = assigned_name,
+) -> set[str]:
+    """Names live at the end of ``loop``'s body: live after the loop (a
+    zero-trip loop keeps them) or read by a later iteration before it writes
+    them, the fixed point over the back edge (``live_in``)."""
+    assert isinstance(loop.target, ast.Name)
+    end = set(live_after)
+    while True:
+        head = live_in(loop.body, end, reads=reads, assigned=assigned)
+        grown = end | (head - {loop.target.id})
+        if grown == end:
+            return end
+        end = grown
 
 
 # ---------------------------------------------------------------------------
@@ -848,6 +905,18 @@ _PURE_OPERATOR_CALLS = frozenset(
 _CHUNK_REDUCTION_HELPERS = CTA_REDUCES
 
 
+def is_cta_reduce_call(call: ast.Call) -> bool:
+    """Whether ``call`` combines a value across the threads of one CTA: a
+    scalar reduce helper (``reduce_call.CTA_REDUCES``) or the DSL's warp
+    reduction (``cute.arch.warp_reduction*``, emitted for a row reduced by
+    at most 32 threads).  These are the reduces the relocation proofs accept
+    with ``allow_reduction``."""
+    name = call_path_str(call.func)
+    return name is not None and (
+        name in CTA_REDUCES or name.startswith("cute.arch.warp_reduction")
+    )
+
+
 def _is_proven_relocatable_call(
     call: ast.Call,
     *,
@@ -929,9 +998,7 @@ def _is_proven_relocatable_call(
         # Another backend's pure device calls (Metal's casts); the AST passes
         # also run outside a compile, in their unit tests.
         return True
-    return allow_reduction and (
-        name in _CHUNK_REDUCTION_HELPERS or name.startswith("cute.arch.warp_reduction")
-    )
+    return allow_reduction and is_cta_reduce_call(call)
 
 
 def _is_proven_relocatable_assignment(
@@ -969,6 +1036,24 @@ def _self_addend(stmt: ast.AST, target: str) -> ast.AST | None:
 
 def _canonical_name(name: str, rename_groups: dict[str, str]) -> str:
     return rename_groups.get(name, name)
+
+
+def merged_names(rename_groups: Mapping[str, str]) -> dict[str, frozenset[str]]:
+    """Each name ``rename_groups`` (``ast_rename``'s map to a shared name)
+    merges with others, with all of them: once renamed they are one
+    variable, so a write to any is a write to all."""
+    groups: dict[str, set[str]] = {}
+    for name, canonical in rename_groups.items():
+        groups.setdefault(canonical, {canonical}).add(name)
+    return {name: frozenset(group) for group in groups.values() for name in group}
+
+
+def with_merged_names(
+    names: Iterable[str], merged: Mapping[str, frozenset[str]]
+) -> set[str]:
+    """``names`` and every name ``merged`` (from ``merged_names``) merges
+    with one of them."""
+    return {alias for name in names for alias in merged.get(name, (name,))}
 
 
 def _dependency_names(body: list[ast.AST], roots: set[str]) -> set[str]:

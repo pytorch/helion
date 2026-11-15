@@ -1174,6 +1174,8 @@ class RolledReductionInfo(NamedTuple):
 
 # Why a dim older versions rolled, and no loop computes, keeps its saved slot.
 _RETIRED_LOOP_REASON = "no loop over this reduction computes it correctly"
+# Why a dim whose reductions read a range it pads keeps its slot unrolled.
+_PADDED_RANGE_REASON = "its reductions read a range padded past its extent"
 
 
 def _rolled_reduction_info(
@@ -1187,6 +1189,21 @@ def _rolled_reduction_info(
         can_be_rolled_by_caller=roller.outer_count == 0
         and len(roller.graphs_added) == 1,
     )
+
+
+class _RdimRollAnalysis(NamedTuple):
+    """What ``register_rollable_reductions``'s first pass found for a dim."""
+
+    rdim: BlockSizeInfo
+    # A config may roll the dim: some original graph reduces over it.
+    allow_loop: bool
+    # The original graphs whose reductions over the dim roll.
+    used_graphs: set[int]
+    # Some graph reduces over the dim twice (``reduction_fusion``).
+    fusible: bool
+    # Why the dim stays persistent in a slot of its own
+    # (``ReductionLoopSpec.persistent_reason``), else None.
+    persistent_reason: str | None
 
 
 def _reduction_loop_spec(
@@ -1402,7 +1419,7 @@ class DeviceIR:
 
         # First pass: run roller analysis for all reduction dims and
         # record which original graphs use each rdim.
-        rdim_results: list[tuple[BlockSizeInfo, bool, set[int], bool, str | None]] = []
+        rdim_results: list[_RdimRollAnalysis] = []
         # The dims older versions rolled that the roller now refuses for a
         # free range or a tie (``_legacy_loop_graphs``), with the original
         # graphs of their loops.
@@ -1435,7 +1452,7 @@ class DeviceIR:
                 can_roll_graphs = False
 
             if not can_roll_graphs:
-                rdim_results.append((rdim, False, set(), False, None))
+                rdim_results.append(_RdimRollAnalysis(rdim, False, set(), False, None))
                 if env.backend_name != "pallas" and (
                     graphs := self._legacy_loop_graphs(
                         rdim.block_id, num_original_graphs
@@ -1443,6 +1460,13 @@ class DeviceIR:
                 ):
                     retired[rdim.block_id] = graphs
                 continue
+
+            # A dim whose reductions read a range it pads stays persistent;
+            # its slot stays, pinned, for the configs older versions saved.
+            pinned = any(
+                roller.reads_padded_range(graph_info.graph)
+                for graph_info in self.graphs[:num_original_graphs]
+            )
 
             used_graphs: set[int] = set()
             all_graphs_processed = True
@@ -1510,8 +1534,12 @@ class DeviceIR:
                     # its analysis graphs, and with them its slots.)
                     del self.graphs[num_graphs:]
                     del self.rolled_reductions[num_rolled:]
+            elif pinned and allow_loop:
+                persistent_reason = _PADDED_RANGE_REASON
             rdim_results.append(
-                (rdim, allow_loop, used_graphs, fusible, persistent_reason)
+                _RdimRollAnalysis(
+                    rdim, allow_loop, used_graphs, fusible, persistent_reason
+                )
             )
 
         env.backend.rewrite_device_ir(
@@ -1538,8 +1566,9 @@ class DeviceIR:
                     env.backend.register_reduction_loop_config_slots(
                         env, rdim.block_id, rdim.size_hint()
                     )
-                    # Only a dim whose loops a config can emit fuses them.
-                    if fusible:
+                    # Only a dim whose loops a config can emit fuses them:
+                    # not one that stays persistent.
+                    if fusible and persistent_reason is None:
                         env.config_spec.reduction_fusion_available = True
             graphs_with_rolled_rdim |= used_graphs
         if env.backend_name != "pallas":

@@ -79,7 +79,8 @@ the launcher runs the module.  The CuTe backend plugs in at these points:
    `thread_axis_limit`, `loop_var_prefixes`, `packed_grid_block`
    (`tile_packing.py`) and the other layout predicates;
    `record_launch_thread_extent` / `record_grid_thread_extent` /
-   `record_vloop_wrapper` (the launch facts on `cute_state.lanes`);
+   `record_vloop_wrapper` / `record_flattened_vloop_wrapper` (the launch
+   facts on `cute_state.lanes`);
    `apply_lane_cluster_split` -> `lane_cluster_split.apply_cluster_split`;
    `check_lane_loop_nest` and `add_lane_nest_barriers` ->
    `lane_loops/nest_check.py` (the nest exactness check and redistribution
@@ -87,8 +88,8 @@ the launcher runs the module.  The CuTe backend plugs in at these points:
    `demote_grid_tile_vec_stores` / `demote_loop_tile_vec_stores` ->
    `memory_ops.demote_reordered_tile_vec_stores`.
 4. **generate_ast** (`generate_ast.py`, core) -- `retry_policy()` wraps every
-   pass (`CuteRegeneration`: five signals, each fires at most once, so a call
-   generates a kernel at most three times); `kernel_generators()` is tried
+   pass (`CuteRegeneration`: six signals, each fires at most once per call,
+   section 3.3); `kernel_generators()` is tried
    first (the `KernelGenerator`s, first match wins); otherwise `pre_codegen`
    runs the planner cascade (section 3.2), `GenerateAST.visit_For` tries
    `root_emitters()` for each root (in the order `test/test_cute_root_emitters.py`
@@ -226,7 +227,11 @@ saying which specializing arguments of `generate_ast` it cannot honor, and
 re-enters `generate_ast` for the kernels it composes.  `CuteRegeneration`
 regenerates after `RegisterTileUnsupported`, `VloopSinkNotApplied`,
 `FragmentMmaNotApplied`, `RingMmaNotApplied` or `LaneUnrollNotApplied`, with
-the knob that raised switched off.
+the knob that raised switched off, and after `VloopSinkLayoutRefused` (codegen
+refused the tile-first reduction layout `cute_vloop_sink` planned) with the
+knob still on and the default layout.  `materialized_fission` (and
+`ordered_phases` through it) regenerates a stage after the two vector-loop
+signals itself, from graphs it rebuilds.
 
 ### 3.4 Where composition is not yet complete
 

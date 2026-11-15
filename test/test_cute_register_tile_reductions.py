@@ -30,6 +30,7 @@ from typing import Any
 from typing import Callable
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -763,9 +764,9 @@ def test_vector_loop_sinking_leaves_the_register_tile_alone() -> None:
 def test_the_looped_retry_keeps_the_sink_knob() -> None:
     # The retry after a rejected register tile re-normalizes the config with
     # register tiles withheld and nothing else: ``cute_vloop_sink`` survives
-    # into the looped pass, where the sink hook runs on the rolled body (this
-    # grid records no V-loop wrapper, so it leaves the body untouched).  The
-    # knob-on code is the knob-off looped code.
+    # into the looped pass, where the sink hook sinks the one-block tile's
+    # V-loop into the rolled body (one packet per row), unlike the knob-off
+    # looped code.
     arguments = (_f32(1024, 1024), 1)
     bound = cpu_bind(col_sum_guarded, arguments)
     config = column_config(bound, block=32, tile_threads=8, reduction_threads=64)
@@ -773,8 +774,8 @@ def test_the_looped_retry_keeps_the_sink_knob() -> None:
     assert [attempt.reduction_loops for attempt in passes] == [[None], [128]]
     assert all(attempt.config["cute_vloop_sink"] is True for attempt in passes)
     assert "_REDUCTION_BLOCK_1" in code
-    assert "_vsink_" not in code
-    assert code == bound.to_code(config)
+    assert "_vsink_" in code
+    assert "_vsink_" not in bound.to_code(config)
 
 
 @helion.kernel(backend="triton", static_shapes=True, autotune_effort="none")
@@ -966,8 +967,8 @@ def test_control_flow_names_are_tracing_ops() -> None:
 
 
 def test_column_reduce_returns_behind_a_barrier() -> None:
-    # Both branches of the column reduce read other threads' slots after one
-    # barrier and must not return before a second one: a persistent CTA calls
+    # Every branch of the column reduce reads other threads' slots after a
+    # barrier and must not return before another one: a persistent CTA calls
     # the helper once per tile with no other barrier per trip, and the GPU
     # test of that shape cannot catch a missing barrier reliably.
     path = pathlib.Path(helion.__file__).parent / "_compiler/cute/reduce_helpers.py"
@@ -988,9 +989,158 @@ def test_column_reduce_returns_behind_a_barrier() -> None:
                 if isinstance(statement, ast.Return):
                     returns += 1
                     assert ast.unparse(previous) == "cute.arch.sync_threads()"
-    # The warp-fold branch (``fold='warp'``), the one-warp-per-slot branch
-    # (``pre == 1``) and the serial ``pre > 1`` branch.
-    assert returns == 3
+    # The cooperative branch (``fold='cooperative'``), the warp-fold branch
+    # (``fold='warp'``), the one-warp-per-slot branch (``pre == 1``) and the
+    # serial ``pre > 1`` branch.
+    assert returns == 4
+
+
+class _LaneSmem:
+    """A shared-memory buffer of the column reduce traced over numpy lanes
+    (one value per thread of the CTA), failing on a race between two
+    barriers: a slot one thread stores and another thread stores or loads.
+    The one exception is a single store (one instruction) in which lanes of
+    one warp store the same value to a slot, as the folds' unpredicated
+    stores do; lanes of different warps storing to one slot race under the
+    PTX memory model even with equal values."""
+
+    def __init__(self, size: int, threads: np.ndarray) -> None:
+        self.data = np.zeros(size)
+        self.threads = threads
+        self.barrier()
+
+    def barrier(self) -> None:
+        # Per slot, the thread that stored (loaded) it since the last
+        # barrier: -1 for none, -2 for several.
+        self.stored_by = np.full(self.data.shape, -1)
+        self.loaded_by = np.full(self.data.shape, -1)
+
+    def _check(self, index: np.ndarray, others: np.ndarray) -> np.ndarray:
+        """``index`` over every thread, failing when another thread made a
+        conflicting access (``others``) to one of its slots."""
+        index = np.broadcast_to(index, self.threads.shape)
+        assert (index >= 0).all()
+        prior = others[index]
+        assert ((prior == -1) | (prior == self.threads)).all(), "race"
+        return index
+
+    def _record(self, owners: np.ndarray, index: np.ndarray) -> None:
+        prior = owners[index]
+        alone = (prior == -1) | (prior == self.threads)
+        owners[index] = np.where(alone, self.threads, -2)
+        slots, counts = np.unique(index, return_counts=True)
+        owners[slots[counts > 1]] = -2
+
+    def __setitem__(self, index: np.ndarray, value: np.ndarray) -> None:
+        index = self._check(index, self.loaded_by)
+        index = self._check(index, self.stored_by)
+        value = np.broadcast_to(value, index.shape)
+        warps = self.threads // 32
+        slots, inverse, counts = np.unique(
+            index, return_inverse=True, return_counts=True
+        )
+        for shared in np.flatnonzero(counts > 1):
+            lanes = inverse == shared
+            assert np.unique(warps[lanes]).size == 1, "race between warps"
+            assert np.unique(value[lanes]).size == 1, "two values"
+        self._record(self.stored_by, index)
+        self.data[index] = value
+
+    def __getitem__(self, index: np.ndarray) -> np.ndarray:
+        index = self._check(index, self.stored_by)
+        self._record(self.loaded_by, index)
+        return self.data[index]
+
+
+def _lane_column_reduce(
+    values: list[np.ndarray], *, pre: int, group_span: int, group_count: int, fold: str
+) -> list[np.ndarray]:
+    """``_cute_grouped_reduce_shared_columns`` over numpy lanes: the helper
+    is plain Python during tracing, so only the DSL calls are replaced."""
+    from helion._compiler.cute import reduce_helpers
+
+    threads = np.arange(group_count * group_span)
+    buffers: list[_LaneSmem] = []
+
+    def make_tensor(size: int, shape: tuple[int]) -> _LaneSmem:
+        assert shape == (size,)
+        buffers.append(_LaneSmem(size, threads))
+        return buffers[-1]
+
+    def shuffle_sync_bfly(
+        value: np.ndarray, *, offset: int, mask: int, mask_and_clamp: int
+    ) -> np.ndarray:
+        assert (mask, mask_and_clamp) == (-1, 31) and offset < 32
+        return value[threads ^ offset]
+
+    lanes = types.SimpleNamespace(
+        arch=types.SimpleNamespace(
+            alloc_smem=lambda dtype, size: size,
+            sync_threads=lambda: [buffer.barrier() for buffer in buffers],
+            shuffle_sync_bfly=shuffle_sync_bfly,
+        ),
+        make_tensor=make_tensor,
+    )
+    with patch.object(reduce_helpers, "cute", lanes):
+        return reduce_helpers._cute_grouped_reduce_shared_columns(
+            values,
+            "sum",
+            np.float64(0),
+            threads,
+            threads % group_span,
+            pre=pre,
+            group_span=group_span,
+            group_count=group_count,
+            fold=fold,
+        )
+
+
+def test_column_reduce_folds_sum_each_sibling_class_without_races() -> None:
+    # Integer partials sum exactly in any order, so every fold matches.  The
+    # cooperative shapes: one lane block per output (``pre=4``,
+    # ``group_span=128``), 16 blocks of 32 lanes (a five-level butterfly)
+    # wrapping onto eight outputs, where warps 0 and 8 compute the same
+    # output and must store it to different slots, the BatchNorm tile
+    # (``pre=16``, ``group_span=1024``, eight columns), one lane per output
+    # over four passes in two one-warp groups, three columns over two groups
+    # with blocks wrapping, and a reduction extent of 48, which blocks of 32
+    # lanes would not divide.
+    pytest.importorskip("cutlass")
+    rng = np.random.default_rng(0)
+    for pre, width, group_span, group_count in (
+        (4, 4, 128, 1),
+        (2, 4, 512, 1),
+        (16, 8, 1024, 1),
+        (16, 8, 32, 2),
+        (8, 3, 64, 2),
+        (2, 1, 96, 1),
+    ):
+        lanes = np.arange(group_count * group_span)
+        values = [
+            rng.integers(-1000, 1000, lanes.size).astype(np.float64)
+            for _ in range(width)
+        ]
+        expected = [
+            column.reshape(group_count, -1, pre).sum(1)[
+                lanes // group_span, lanes % pre
+            ]
+            for column in values
+        ]
+        folds = ["serial", "cooperative"]
+        if group_span > 32 and 32 % pre == 0:
+            folds.append("warp")
+        for fold in folds:
+            results = _lane_column_reduce(
+                values,
+                pre=pre,
+                group_span=group_span,
+                group_count=group_count,
+                fold=fold,
+            )
+            shape = f"{fold}: {pre=} {width=} {group_span=} {group_count=}"
+            assert len(results) == width, shape
+            for result, want in zip(results, expected, strict=True):
+                np.testing.assert_array_equal(result, want, err_msg=shape)
 
 
 def test_register_tile_blocks_follow_the_body_and_the_extent() -> None:
@@ -1402,6 +1552,71 @@ def test_column_register_tiles_match_reference(
         x.uniform_(-1, 1)
 
 
+def _col_var_reference(x: torch.Tensor) -> torch.Tensor:
+    return x.var(0, unbiased=False)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    ("kernel", "reference", "rows", "tile_threads", "reduction_threads", "extra"),
+    (
+        # Two sibling threads under 256 reduction threads, four columns each:
+        # 16 lane blocks of 32 (a five-level butterfly) for eight outputs, so
+        # two blocks compute and store each output.
+        pytest.param(
+            col_sum, _col_sum_reference, 512, 2, 256, {}, id="col-sum-wrapped-blocks"
+        ),
+        # A one-warp group: 16 sibling threads over two reduction threads,
+        # four columns each, so one lane per output (no shuffle) in two passes
+        # over the 64 outputs.
+        pytest.param(
+            col_sum, _col_sum_reference, 8, 16, 2, {}, id="col-sum-one-warp-two-passes"
+        ),
+        # The variance's second reduction reads the first one's mean, in a
+        # persistent CTA loop (no other barrier between trips); eight lanes
+        # per output.
+        pytest.param(
+            col_var,
+            _col_var_reference,
+            128,
+            4,
+            32,
+            {"pid_type": "persistent_blocked"},
+            id="col-var-persistent",
+        ),
+    ),
+)
+def test_cooperative_column_fold_matches_reference(
+    kernel: helion.Kernel,
+    reference: Callable[[torch.Tensor], torch.Tensor],
+    rows: int,
+    tile_threads: int,
+    reduction_threads: int,
+    extra: dict[str, Any],
+) -> None:
+    torch.manual_seed(0)
+    x = torch.randn(rows, 16384, device=DEVICE)
+    bound = kernel.bind((x,))
+    config = column_config(
+        bound,
+        block=4 * tile_threads,
+        tile_threads=tile_threads,
+        reduction_threads=reduction_threads,
+        cute_register_tile_cooperative_fold=True,
+        **extra,
+    )
+    code = bound.to_code(config)
+    group = f"pre={tile_threads}, group_span={tile_threads * reduction_threads}"
+    assert f"{group}, group_count=1, fold='cooperative')" in code
+    compiled = bound.compile_config(config)
+    for _ in range(2):
+        out = compiled(x)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, reference(x), rtol=1e-4, atol=1e-3)
+        x.uniform_(-1, 1)
+
+
 def _col_sum_f32_reference(x: torch.Tensor) -> torch.Tensor:
     return x.float().sum(0)
 
@@ -1517,25 +1732,32 @@ def _col_sum_guarded_reference(x: torch.Tensor, flag: int) -> torch.Tensor:
         ),
     ),
 )
+@pytest.mark.parametrize("sink", (False, True), ids=("plain", "sink"))
 def test_looped_retry_matches_reference(
     kernel: helion.Kernel,
     reference: Callable[..., torch.Tensor],
     inputs: int,
     extra: tuple[int, ...],
+    sink: bool,
 ) -> None:
     # Over 1024 rows with threads [8, 64] the register tile is the only reason
     # the config keeps the reduction persistent.  When the split rejects the
     # body, the retry compiles the looped reduction (reduction_loops=[128],
-    # 64 reduction threads) the geometry meant before register tiles existed.
+    # 64 reduction threads) the geometry meant before register tiles existed;
+    # with ``cute_vloop_sink`` the guarded column sum sinks its V-loop there.
     torch.manual_seed(0)
     tensors = tuple(torch.randn(1024, 4096, device=DEVICE) for _ in range(inputs))
     bound = kernel.bind((*tensors, *extra))
     config = column_config(bound, block=32, tile_threads=8, reduction_threads=64)
     assert config.reduction_loops == [None]
+    if sink:
+        config = _sinking(bound, config)
     code = bound.to_code(config)
     assert "synthetic_lane_1" not in code
     assert "_REDUCTION_BLOCK_1" in code
     assert "block=(64, 8, 1)" in code
+    if sink and kernel is col_sum_guarded:
+        assert "_vsink_" in code
     compiled = bound.compile_config(config)
     for _ in range(2):
         out = compiled(*tensors, *extra)

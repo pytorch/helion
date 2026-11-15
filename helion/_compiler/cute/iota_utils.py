@@ -18,12 +18,16 @@ import torch
 from torch.fx.node import Node
 
 from ... import exc
+from ..._utils import next_power_of_2
 from ...language import _tracing_ops
 from ...language import memory_ops
 from ...language import view_ops
+from ...language.atomic_ops import ATOMIC_OPS
 from ..compile_environment import CompileEnvironment
 from ..compile_environment import _symint_expr
 from ..host_function import HostFunction
+from ..indexing_strategy import LANE_PRESERVING_OPS
+from ..indexing_strategy import load_index_axes
 from ..variable_origin import BlockSizeOrigin
 from .state import cute_codegen_state
 
@@ -808,3 +812,291 @@ def cute_free_arange_lanes(cg: GenerateAST) -> FreeArangeLanes:
     if state.free_arange_lanes is None:
         state.free_arange_lanes = FreeArangeLanes(cg.codegen_graphs)
     return state.free_arange_lanes
+
+
+def cute_arange_index_source(
+    node: object, memo: dict[Node, Node | None] | None = None
+) -> Node | None:
+    """The ``hl.arange`` iota that index ``node`` is computed lane-wise from.
+
+    Pointwise ops on a range (``cols * 2 + 1``) keep its lanes, and so does a
+    view of it in its own shape (``LANE_PRESERVING_OPS``), as
+    ``_padded_iota_dims`` follows them for Triton and the roller.  ``memo``
+    holds the sources of the nodes one walk has met, which it would otherwise
+    walk once per path (``_arange_index_source_once``).
+    """
+    if not isinstance(node, Node):
+        return None
+    if node.target is torch.ops.prims.iota.default:
+        return node
+    if memo is None:
+        memo = {}
+    value = node.meta.get("val")
+    if (
+        not isinstance(value, torch.Tensor)
+        or value.ndim != 1
+        or not isinstance(node.target, torch._ops.OpOverload)
+        or (
+            torch.Tag.pointwise not in node.target.tags
+            and node.target not in LANE_PRESERVING_OPS
+        )
+    ):
+        return None
+    sources = {
+        _arange_index_source_once(arg, memo)
+        for arg in node.all_input_nodes
+        if isinstance(arg_value := arg.meta.get("val"), torch.Tensor) and arg_value.ndim
+    }
+    if len(sources) != 1 or (source := sources.pop()) is None:
+        return None
+    source_value = source.meta.get("val")
+    if not isinstance(
+        source_value, torch.Tensor
+    ) or not CompileEnvironment.current().known_equal(
+        source_value.size(0), value.size(0)
+    ):
+        return None
+    return source
+
+
+def _arange_index_source_once(node: Node, memo: dict[Node, Node | None]) -> Node | None:
+    """``cute_arange_index_source`` of a node one walk reaches, computed once:
+    a value read along several paths (``row + row * 0.5``) would otherwise be
+    walked once per path."""
+    if node not in memo:
+        memo[node] = cute_arange_index_source(node, memo)
+    return memo[node]
+
+
+# Memory ops whose ``args[1]`` subscript ``_cute_combined_mask`` bounds.
+_INDEXED_MEMORY_OPS = frozenset({memory_ops.load, memory_ops.store, *ATOMIC_OPS})
+
+
+def _padded_range_uses(node: Node, length: int) -> tuple[bool, bool, bool]:
+    """``(escapes, reduced, untraced)`` for the padded range ``node`` of
+    ``length``.
+
+    The walk follows the values that carry the range's lanes (a dim of the
+    range's length or of its padded size) from the range: ``escapes`` when one
+    reaches a loop or branch body, which reads it through a placeholder past
+    which neither the masks of ``padded_range_blocks`` nor
+    ``cute_padded_range_length`` trace it back to the range, or the graph's
+    output; ``reduced`` when one feeds a value without those lanes, a
+    reduction over them.  The walk stops there: a reduced scalar needs no mask
+    wherever it goes (a loop-carried accumulator, an inner loop's operand).
+    ``untraced`` when a load, store or atomic indexes by one that
+    ``cute_arange_index_source`` does not trace back to the range, so its
+    address mask would lack the range's length.
+    """
+    padded = next_power_of_2(length)
+    env = CompileEnvironment.current()
+
+    def carries_lanes(value: torch.Tensor) -> bool:
+        return any(
+            env.known_equal(size, length) or env.known_equal(size, padded)
+            for size in value.size()
+        )
+
+    escapes = reduced = False
+    seen: set[Node] = set()
+    stack = list(node.users)
+    while stack:
+        user = stack.pop()
+        if user in seen:
+            continue
+        seen.add(user)
+        if (
+            user.op == "output"
+            or _tracing_ops.is_for_loop_target(user.target)
+            or user.target
+            in (_tracing_ops._if, _tracing_ops._while_loop, _tracing_ops._phi)
+        ):
+            escapes = True
+            continue
+        value = user.meta.get("val")
+        tensors = [
+            item
+            for item in (value if isinstance(value, (list, tuple)) else (value,))
+            if isinstance(item, torch.Tensor)
+        ]
+        if tensors and not any(carries_lanes(tensor) for tensor in tensors):
+            reduced = True
+            continue
+        stack.extend(user.users)
+    sources: dict[Node, Node | None] = {}
+    untraced = any(
+        isinstance(index := user.args[1], (list, tuple))
+        and any(
+            isinstance(item, Node)
+            and (item is node or item in seen)
+            and cute_arange_index_source(item, sources) is not node
+            for item in index
+        )
+        for user in seen
+        if user.target in _INDEXED_MEMORY_OPS
+    )
+    return escapes, reduced, untraced
+
+
+def cute_padded_range_reduction_block(
+    cg: GenerateAST, source_node: Node, length: int | None
+) -> int | None:
+    """The persistent reduction dim whose lanes the range ``source_node`` of
+    ``length`` takes.
+
+    ``hl.arange(200)`` of a static extent that is not a power of two runs over
+    256 lanes, and a load over it, ``hl.load(x, [i, hl.arange(200)])`` in a
+    grid kernel, has the padded size 256, so a reduction over the load runs on
+    the lanes of a reduction dim of 256 that the range does not name.  The
+    range takes that dim's lanes, as Triton's ``tl.arange(0, 256)`` shares the
+    reduction's: a synthetic lane loop of its own would wrap the reduction,
+    which would then reduce 256 copies of one element each iteration.  The
+    loads and stores over the range mask the lanes past its length
+    (``CuteCodegenState.padded_range_blocks``), and so do the reductions of
+    values computed from them (``cute_padded_range_length``).  The roller
+    keeps such a dim persistent (``ReductionRoller.reads_padded_range``); a
+    rolled one has no lanes outside its loop for a range that only meets it in
+    a store.  A range whose lanes reach a loop or branch body
+    (``_padded_range_uses``) is refused, as is a reduction of its lanes over a
+    rolled dim: the lowering without the reduction's lanes would run the range
+    on a lane loop of its own around the reduction.  So is one that a load or
+    store indexes by in a form the masks cannot trace back to it, which keeps
+    the lowering without the reduction's lanes when nothing reduces it.
+    """
+    if not isinstance(length, int) or length <= 1 or length == next_power_of_2(length):
+        return None
+    # A static extent resolves to the reduction dim of that size, if any.
+    block_id = CompileEnvironment.current().resolve_block_id(next_power_of_2(length))
+    if block_id is None:
+        return None
+    from ..reduction_strategy import PersistentReductionStrategy
+
+    strategy = cg.device_function.tile_strategy.block_id_to_strategy.get((block_id,))
+    if strategy is None:
+        # No reduction over the dim is lowered in this function (it is the
+        # dim of another root's reduction of that size): nothing here runs on
+        # its lanes.
+        return None
+    escapes, reduced, untraced = _padded_range_uses(source_node, length)
+    if (
+        not escapes
+        and not untraced
+        and isinstance(strategy, PersistentReductionStrategy)
+    ):
+        return block_id
+    # The lowering without the reduction's lanes runs the range on a synthetic
+    # lane loop around the whole body, and a reduction over its padded size
+    # inside that loop reduces one element per lane pass: whether the lanes
+    # that reach a loop or branch body (or come out of one) feed it cannot be
+    # traced past the placeholder.
+    if escapes:
+        cause = "its padded lanes reach a loop or branch body"
+    elif reduced and untraced:
+        cause = (
+            "a load or store indexes by it in a form the length mask cannot "
+            "trace back to it (an offset of a loaded index could leave the row)"
+        )
+    elif reduced:
+        cause = "its lanes are reduced over a rolled dim of its padded size"
+    else:
+        return None
+    raise exc.BackendUnsupported(
+        "cute",
+        f"an hl.arange of {length} in a kernel that reduces over its padded "
+        f"size {next_power_of_2(length)}: {cause}",
+    )
+
+
+def _pads_to(iota: Node, size: object) -> bool:
+    """Whether the range ``iota`` has a static length ``size`` pads."""
+    length = iota.meta["val"].size(0)
+    return (
+        isinstance(length, int)
+        and isinstance(size, int)
+        and length != size
+        and next_power_of_2(length) == size
+    )
+
+
+def cute_padded_range_length(
+    cg: GenerateAST,
+    reduction: Node,
+    block_id: int,
+    inputs: list[Node] | None = None,
+) -> int | None:
+    """The length of the padded range on the lanes of ``block_id``
+    (``cute_padded_range_reduction_block``) whose values ``reduction`` reads
+    (only through ``inputs``, when given), or None.
+
+    The reduction runs over all of the dim's lanes, and an op between the
+    masked load and the reduction can make the lanes past the range's length
+    nonzero (``(v * 2 + 1).sum()``, an ``amax`` of negative values), so
+    ``CutePersistentReductionEmitter`` masks them.  The walk follows the
+    values on the dim's lanes back from the reduction to a load or store over
+    the range: a range reduced away before (``hl.arange(200).sum()`` scaling
+    a row) does not reach the lanes, nor does one indexing a load along
+    another dim (``x[tile, rows, :].amax(-1)``, ``load_index_axes``).  A range
+    of the dim's padded size that runs on other lanes, those of a reduction
+    dim of its own length (``cols.sum()`` beside
+    ``hl.load(x, [i, cols]).sum(-1)``) or a synthetic axis, is refused: the
+    dim's lanes would reduce copies of one element.
+    """
+    bound = cute_codegen_state(cg).padded_range_blocks
+    env = CompileEnvironment.current()
+    size = env.block_sizes[block_id].size
+
+    def on_lanes(value: Node) -> bool:
+        val = value.meta.get("val")
+        return isinstance(val, torch.Tensor) and any(
+            env.resolve_block_id(size) == block_id for size in val.size()
+        )
+
+    def indexes_lanes(load: Node, axes: dict[int, list[int | None]], arg: Node) -> bool:
+        # Whether ``arg`` indexes ``load`` along a dim on the lanes.
+        val = load.meta["val"]
+        index = load.args[1]
+        assert isinstance(index, (list, tuple))
+        return any(
+            axis is not None and env.resolve_block_id(val.size(axis)) == block_id
+            for position, item in enumerate(index)
+            if item is arg
+            for axis in axes.get(position, [None])
+        )
+
+    lengths: set[int] = set()
+    seen: set[Node] = set()
+    sources: dict[Node, Node | None] = {}
+    stack = [
+        arg
+        for arg in (reduction.all_input_nodes if inputs is None else inputs)
+        if on_lanes(arg)
+    ]
+    while stack:
+        value = stack.pop()
+        if value in seen:
+            continue
+        seen.add(value)
+        axes = load_index_axes(value) if value.target is memory_ops.load else None
+        for arg in value.all_input_nodes:
+            iota = _arange_index_source_once(arg, sources)
+            if (
+                iota is not None
+                and axes is not None
+                and not indexes_lanes(value, axes, arg)
+            ):
+                continue
+            if iota is not None and bound.get(iota) == block_id:
+                lengths.add(iota.meta["val"].size(0))
+            elif iota is not None and _pads_to(iota, size):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "a reduction over the padded lanes of an hl.arange that does "
+                    "not run on the reduction's lanes",
+                )
+            elif on_lanes(arg):
+                stack.append(arg)
+    if len(lengths) > 1:
+        raise exc.BackendUnsupported(
+            "cute", "a reduction of the lanes of padded ranges of different lengths"
+        )
+    return lengths.pop() if lengths else None

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 import unittest
 from unittest.mock import patch
@@ -18,6 +19,7 @@ from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import output_only
+from helion._testing import padded_range_kernels
 from helion._testing import skipIfCute
 from helion._testing import skipIfMetal
 from helion._testing import skipIfNotCUDA
@@ -28,6 +30,7 @@ from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessCuteAvailable
 from helion._testing import skipUnlessTensorDescriptor
+from helion._testing import xfailIfFn
 from helion._testing import xfailIfPallasTpu
 from helion._testing.reduction_inputs import exact_fp32_sum_input
 from helion._testing.row_iota_kernels import half_row_fill
@@ -100,6 +103,31 @@ def tile_row_sums(x: torch.Tensor, buf: torch.Tensor) -> torch.Tensor:
     for tile in hl.tile(x.size(0), block_size=64):
         out[tile] = buf[:, :].sum(-1)
     return out
+
+
+grid_padded_range_sum = helion.kernel(
+    padded_range_kernels.grid_padded_range_sum, static_shapes=True
+)
+
+
+grid_offset_range_sum = helion.kernel(
+    padded_range_kernels.grid_offset_range_sum, static_shapes=True
+)
+
+
+grid_padded_range_sum_and_max = helion.kernel(
+    padded_range_kernels.grid_padded_range_sum_and_max, static_shapes=True
+)
+
+
+grid_padded_range_sums_accumulated = helion.kernel(
+    padded_range_kernels.grid_padded_range_sums_accumulated, static_shapes=True
+)
+
+
+grid_padded_range_sum_scales_a_row = helion.kernel(
+    padded_range_kernels.grid_padded_range_sum_scales_a_row, static_shapes=True
+)
 
 
 @helion.kernel(static_shapes=True)
@@ -1715,12 +1743,11 @@ class TestReductions(RefEagerTestBase, TestCase):
 
     @skipIfPallas("Pallas does not pad hl.arange to a power of two")
     @skipIfMetal("not verified on Metal")
-    @skipIfCute("CuTe sums a grid load over a padded hl.arange wrong")
     def test_mean_over_a_padded_range_divides_by_its_length(self):
         """A grid kernel's load over ``hl.arange(n)``, for an ``n`` that is not a
         power of two, has the range's padded size; the lanes past ``n`` hold no
         elements, and the mean divides by ``n``, as do var_mean's mean and
-        variance (they divided by 256 at n=200).  Triton leaves those
+        variance (they divided by 256 at n=200).  Both backends leave those
         lanes, where the squared deviation is ``(0 - mean) ** 2``, out of
         var_mean's sum."""
 
@@ -3201,6 +3228,91 @@ class TestReductions(RefEagerTestBase, TestCase):
         _, out = code_and_output(centered_square_sum, (x,), block_sizes=[16])
         expected = ((x - x.mean(-1, keepdim=True)) ** 2).sum(-1)
         torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-3)
+
+    @skipIfRefEager("reduction_loops only exists in compiled mode")
+    @skipIfPallas("Pallas does not pad hl.arange to a power of two")
+    @skipIfMetal("not verified on Metal")
+    def test_grid_sum_of_a_load_over_a_padded_range(self) -> None:
+        """``hl.load(x, [i, hl.arange(n)]).sum(-1)`` in a grid kernel, for an
+        ``n`` that is not a power of two: the load has the padded size, and so
+        has the sum's reduction dim.  CuTe ran the range on a lane loop of its
+        own around the sum, which reduced 256 copies of one element a pass and
+        stored the last pass; a chunked loop over the dim read the load from
+        outside it (Triton failed to compile, CuTe folded one chunk).  The range
+        runs on the reduction's lanes, masked past its length also where the
+        row goes on, and the dim stays persistent, for a saved chunk size too
+        and for the 4096 lanes of 3000 columns, which defaulted to a loop on
+        CuTe."""
+        cases = [
+            (grid_padded_range_sum, width, slice(None)) for width in (5, 200, 3000)
+        ]
+        cases.append((grid_offset_range_sum, 210, slice(3, 203)))
+        for kernel, width, columns in cases:
+            x = torch.randn(16, width, device=DEVICE)
+            for chunk in (None, 32):
+                with self.subTest(kernel=kernel.name, width=width, chunk=chunk):
+                    _, out = code_and_output(kernel, (x,), reduction_loops=[chunk])
+                    torch.testing.assert_close(
+                        out, x[:, columns].sum(-1), rtol=1e-4, atol=1e-4
+                    )
+
+    @skipIfPallas("Pallas does not pad hl.arange to a power of two")
+    @skipIfMetal("not verified on Metal")
+    def test_grid_sum_of_a_padded_range_reaching_an_inner_loop(self) -> None:
+        """The sum of a padded range's lanes is a scalar, which needs no mask
+        when an inner loop carries it in an accumulator or reads it in its
+        body.  CuTe took either for the range reaching the loop and ran it on
+        a lane loop of its own around the whole body, which summed 256 copies
+        of one element a pass (512, not 400, for two all-ones rows of 200)."""
+        for width in (5, 200):
+            with self.subTest(width=width):
+                x = torch.randn(16, 2, width, device=DEVICE)
+                _, out = code_and_output(grid_padded_range_sums_accumulated, (x,))
+                torch.testing.assert_close(out, x.sum(-1).sum(-1), rtol=1e-4, atol=1e-4)
+                rows = torch.randn(16, width, device=DEVICE)
+                y = torch.randn(16, 4, device=DEVICE)
+                _, out = code_and_output(grid_padded_range_sum_scales_a_row, (rows, y))
+                torch.testing.assert_close(
+                    out, rows.sum(-1, keepdim=True) * y, rtol=1e-4, atol=1e-4
+                )
+
+    @onlyBackends(["triton", "cute"])
+    def test_grid_reductions_mask_the_lanes_past_a_padded_range(self) -> None:
+        """The reductions over a padded range's lanes take their identity past
+        the range: ``2 * x + 1`` is one in the padding lanes, which made the
+        sums too large and the max of a negative row one."""
+        for width in (5, 200, 3000):
+            with self.subTest(width=width):
+                x = torch.randn(16, width, device=DEVICE) - 3.0
+                _, out = code_and_output(grid_padded_range_sum_and_max, (x,))
+                v = x * 2.0 + 1.0
+                torch.testing.assert_close(
+                    out, v.sum(-1) + v.amax(-1), rtol=1e-4, atol=1e-3
+                )
+
+    @onlyBackends(["triton", "cute"])
+    @xfailIfFn(
+        lambda: (
+            _get_backend() in ("triton", "tileir")
+            and os.environ.get("HELION_INTERPRET") != "1"
+        ),
+        "Triton lowers the view as a tl.reshape of the range's 8 padded lanes "
+        "to its length, 5, which does not compile",
+    )
+    def test_grid_store_through_a_view_of_a_padded_range(self) -> None:
+        """A view of a padded range in its own shape, beside the sum of the
+        row that gives it the row's 8 lanes, loads and stores only the range's
+        5 columns (lanes 5 and 6 wrote columns 6 and 7)."""
+
+        kernel = helion.kernel(
+            padded_range_kernels.grid_store_through_a_view_of_the_range,
+            static_shapes=True,
+        )
+        x = torch.randn(16, 8, device=DEVICE)
+        _, out = code_and_output(kernel, (x,))
+        expected = torch.zeros_like(x)
+        expected[:, 1:6] = x[:, 1:6] + x.sum(-1, keepdim=True)
+        torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
 
     @skipIfRefEager("inspects the reduction_loops config surface")
     @skipIfPallas("Pallas lowers full slices without reduction loops")

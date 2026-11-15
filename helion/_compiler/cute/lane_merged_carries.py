@@ -12,10 +12,30 @@ Only an additive fold is still exact: from zero, ``acc = acc + x`` per lane
 partial tile's padded lanes by ``mask_loop_carries``'s ``_mask_select``)
 leaves the sum of the thread's lanes, and a sum over the block's dim after
 the loop (``acc.sum(-1)``, the manual looped reduction) adds those partial
-sums across the threads.  Any other update (``torch.maximum``, a rescale),
-nonzero initial value, read of the carry inside the loop, or consumer after
-the loop other than such a sum (``amax``, ``acc * acc``, a store) would see
-the folded lanes, so ``check_lane_merged_carries`` refuses it.
+sums across the threads, if it adds them in the carry's dtype: a sum that
+widens it (an ``int32`` carry's ``int64`` sum, a half-precision one's
+``float32`` accumulation) would leave the fold's additions narrower, and one
+that narrows it would cast the folded totals.  Any other update
+(``torch.maximum``, a rescale), nonzero initial value, read of the carry
+inside the loop, or consumer after the loop other than such a sum
+(``amax``, ``acc * acc``, a store) would see the folded lanes, so
+``check_lane_merged_carries`` refuses it.  The sum may read the carry
+through the ``_mask_to`` the compiler puts before it when the padded lanes
+of a partial tile would not add zero (``acc + torch.exp(x)``), if the
+carry's update reads the tile's lanes along every block it folds, in all of
+it or in a branch of a runtime ``if`` (``CARRIES_READING_TILE_LANES_META``):
+``mask_loop_carries`` keeps the padded lanes out of such an update with a
+``_mask_select``, so after the loop that mask is a copy, and the loads the
+update reads make the lane loop over each such block run every update of
+the loop body per lane, the other branch's too.  An update that reads none
+of the tile's lanes along a folded block (``acc + 1.0``, or
+``torch.exp(x[tile_m, tile_n])[:, :, None]`` in a loop over ``tile_n`` and
+``tile_k`` that folds ``bk``) gets no lane loop over it, so a thread would
+add it once for all its lanes there; its mask after the loop refuses it.  So
+does an update ``mask_loop_carries`` leaves unmasked
+(``CARRIES_LEFT_UNMASKED_META``: a branch of a runtime ``if`` that reads none
+of the tile's lanes, then another change of the carry after the ``if``),
+whose padded lanes keep their loads' fill values.
 """
 
 from __future__ import annotations
@@ -25,25 +45,29 @@ from typing import TYPE_CHECKING
 from typing import cast
 
 import torch
-from torch._prims_common import get_computation_dtype
 from torch.fx.node import Node
 
 from ... import exc
 from ...language._tracing_ops import _if
 from ...language._tracing_ops import _mask_select
+from ...language._tracing_ops import _mask_to
 from ...language._tracing_ops import _new_var
 from ...language._tracing_ops import _phi
 from ...language.creation_ops import full
 from ..compile_environment import CompileEnvironment
-from ..node_masking import block_dims
+from ..node_masking import CARRIES_LEFT_UNMASKED_META
+from ..node_masking import CARRIES_READING_TILE_LANES_META
+from ..node_masking import METADATA_TARGETS
+from ..node_masking import _dim_blocks
 from ..node_masking import loop_carries
+from ..node_masking import skip_copies
+from ..reduction_strategy import reduction_acc_dtype
 
 if TYPE_CHECKING:
     from ..device_ir import ForLoopGraphInfo
     from ..inductor_lowering import CodegenState
+    from ..node_masking import LoopCarry
 
-# Reads of a value's metadata, not of its elements.
-_METADATA_TARGETS = (torch.ops.aten.sym_size.int, torch.ops.aten.sym_stride.int)
 _ADDITIVE_TARGETS = (torch.ops.aten.add.Tensor, torch.ops.aten.sub.Tensor)
 _SUM_TARGETS = (torch.ops.aten.sum.dim_IntList,)
 
@@ -51,7 +75,8 @@ _SUM_TARGETS = (torch.ops.aten.sum.dim_IntList,)
 def check_lane_merged_carries(state: CodegenState, info: ForLoopGraphInfo) -> None:
     """Refuse a carry of ``info``'s loop that folds the lanes of the loop's
     own block, unless it is a zero-initialized additive update consumed only
-    by sums over that block's dim (see the module docstring)."""
+    by sums over that block's dim in the carry's dtype (see the module
+    docstring)."""
     loop = state.fx_node
     if loop is None:
         return
@@ -68,13 +93,12 @@ def check_lane_merged_carries(state: CodegenState, info: ForLoopGraphInfo) -> No
         return
     for carry in loop_carries(loop, info.graph):
         value = carry.placeholder.meta.get("val")
-        dims = block_dims(value, lane_looped)
-        if not dims:
+        dim_blocks = _dim_blocks(value, lane_looped)
+        if not dim_blocks:
             continue
         assert isinstance(value, torch.Tensor)
-        reason = _unfolded_use(
-            state, carry.init, carry.placeholder, carry.update, carry.result, dims
-        )
+        dims = list(dim_blocks)
+        reason = _unfolded_use(state, loop, carry, dims, set(dim_blocks.values()))
         if reason is not None:
             raise exc.BackendUnsupported(
                 "cute",
@@ -82,20 +106,22 @@ def check_lane_merged_carries(state: CodegenState, info: ForLoopGraphInfo) -> No
                 f"{dims[0]} on its own loop's block, whose threads each "
                 "hold several of its elements in one carried scalar; only "
                 "a zero-initialized sum (acc = acc + x, then acc.sum over "
-                f"that dim) survives that, but {reason}",
+                f"that dim in the carry's dtype) survives that, but {reason}",
             )
 
 
 def _unfolded_use(
     state: CodegenState,
-    init: object,
-    placeholder: Node,
-    update: object,
-    result: Node,
+    loop: Node,
+    carry: LoopCarry,
     dims: list[int],
+    folded: set[int],
 ) -> str | None:
-    """Why the folded lanes of the carry would be observed, or None."""
-    if not _is_zero(_skip_copies(init)):
+    """Why the folded lanes of ``carry``, a carry of ``loop`` whose dims
+    ``dims`` are on the lane-looped blocks ``folded``, would be observed, or
+    None."""
+    placeholder, update = carry.placeholder, carry.update
+    if not _is_zero(skip_copies(carry.init)):
         return "its initial value is not zero"
     if not isinstance(update, Node) or any(
         user.op != "output" for user in _element_users(update)
@@ -104,12 +130,36 @@ def _unfolded_use(
     reason = _additive(state, update, placeholder)
     if reason is not None:
         return reason
-    for phi in result.users:
+    masked = False
+    for phi in carry.result.users:
         if phi.target is not _phi:
-            return f"{phi.target} reads the loop's result"
-        for user in _element_users(phi):
-            if user.target not in _SUM_TARGETS or not _sums_dims(user, dims):
-                return f"{user.target} reads it after the loop"
+            return f"{phi.name} reads the loop's result"
+        users = _element_users(phi)
+        while users:
+            user = users.pop()
+            if user.target is _mask_to:
+                masked = True
+                users.extend(_element_users(user))
+            elif user.target not in _SUM_TARGETS:
+                return f"{user.name} reads it after the loop"
+            elif change := _sum_dtype_change(user):
+                return change
+            elif not _sums_dims(user, dims):
+                return f"{user.name} reads it after the loop"
+    if masked and carry.index in loop.meta.get(CARRIES_LEFT_UNMASKED_META, ()):
+        return (
+            "the sum after the loop reads it through a mask, and its update "
+            "changes it after a runtime if one of whose branches reads none of "
+            "the tile's lanes, so the padded lanes of a partial tile are not "
+            "masked out of it"
+        )
+    lane_reads = loop.meta.get(CARRIES_READING_TILE_LANES_META, {})
+    if masked and not folded <= lane_reads.get(carry.index, frozenset()):
+        return (
+            "the sum after the loop reads it through a mask, and the loop adds "
+            "a value that is the same in every lane of a block it folds, which "
+            "a thread would add once for all its lanes there"
+        )
     return None
 
 
@@ -144,7 +194,7 @@ def _additive(state: CodegenState, update: Node, carry: Node) -> str | None:
                 or (positions[0] == 1 and node.target is not torch.ops.aten.add.Tensor)
                 or (positions[0] == 1 and node.kwargs.get("alpha", 1) != 1)
             ):
-                return f"the loop updates it with {node.target}"
+                return f"the loop updates it with {node.name}"
             operands = [cast("Node", node.args[positions[0]])]
         elif node.target is operator.getitem and _is_if(node.args[0]):
             branch_input = _branch_input(state, node, carry)
@@ -154,7 +204,7 @@ def _additive(state: CodegenState, update: Node, carry: Node) -> str | None:
             chain.add(if_node)
             operands = [branch_input]
         else:
-            return f"the loop updates it with {node.target}"
+            return f"the loop updates it with {node.name}"
         if not operands or not all(_reads(arg, carry) for arg in operands):
             return "the loop does not update it by adding"
         pending.extend(operands)
@@ -223,14 +273,8 @@ def _is_zero(node: object) -> bool:
     )
 
 
-def _skip_copies(node: object) -> object:
-    while isinstance(node, Node) and node.target is _new_var:
-        node = node.args[0]
-    return node
-
-
 def _element_users(node: Node) -> list[Node]:
-    return [user for user in node.users if user.target not in _METADATA_TARGETS]
+    return [user for user in node.users if user.target not in METADATA_TARGETS]
 
 
 def _reads(arg: object, placeholder: Node) -> bool:
@@ -244,7 +288,7 @@ def _reads(arg: object, placeholder: Node) -> bool:
         node = pending.pop()
         if node is placeholder:
             return True
-        if node in seen or node.target in _METADATA_TARGETS:
+        if node in seen or node.target in METADATA_TARGETS:
             continue
         seen.add(node)
         pending.extend(node.all_input_nodes)
@@ -252,16 +296,14 @@ def _reads(arg: object, placeholder: Node) -> bool:
 
 
 def _sums_dims(node: Node, dims: list[int]) -> bool:
-    """Whether the sum ``node`` reduces every dim in ``dims`` of its input,
-    adding its elements in their own dtype (``_sum_dtype_change``)."""
+    """Whether the sum ``node`` reduces every dim in ``dims`` of its input."""
     source = node.args[0]
     reduced = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim")
-    if not isinstance(source, Node) or not isinstance(reduced, (list, tuple)):
+    if not isinstance(reduced, (list, tuple)):
         return False
+    assert isinstance(source, Node)
     value = source.meta.get("val")
     assert isinstance(value, torch.Tensor)
-    if _sum_dtype_change(node) is not None:
-        return False
     normalized = {cast("int", dim) % value.ndim for dim in reduced}
     return all(dim in normalized for dim in dims)
 
@@ -279,8 +321,7 @@ def _sum_dtype_change(node: Node) -> str | None:
     value = source.meta.get("val")
     result = node.meta.get("val")
     assert isinstance(value, torch.Tensor) and isinstance(result, torch.Tensor)
-    # The dtype the sum accumulates in (``reduction_acc_dtype``).
-    accumulated = get_computation_dtype(result.dtype)
+    accumulated = reduction_acc_dtype("sum", value, result)
     if accumulated != value.dtype:
         return f"{node.name} adds it in {accumulated}, not in the carry's {value.dtype}"
     if result.dtype != value.dtype:

@@ -90,6 +90,7 @@ from ._ast_pass_utils import callee_name
 from ._ast_pass_utils import is_staged_loop
 from ._ast_pass_utils import is_trace_time_test
 from .reduce_call import ReduceScope
+from .reduce_call import shared_columns_elements
 from .reduce_call import use_interleaved_shared_reduce
 from .reduce_call import use_serial_block_reduce
 
@@ -1100,14 +1101,11 @@ class _Walk:
                 if isinstance(fold_value, ast.Constant)
                 else None
             )
-            if width is None or fold not in ("serial", "warp"):
+            if width is None or fold not in ("serial", "warp", "cooperative"):
                 return _UNKNOWN
-            if pre > 1 and fold == "warp":
-                elements = group_count * (group_span // 32) * pre * width
-            elif pre == 1:
-                elements = group_count * (group_span // 32) * width
-            else:
-                elements = group_count * group_span * width
+            elements = shared_columns_elements(
+                pre, width, group_span, group_count, fold
+            )
         else:
             assert scope is ReduceScope.SHARED_TWO_STAGE_FRAGMENT
             element_type = identity_type(3)

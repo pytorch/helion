@@ -17,6 +17,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 from typing import TYPE_CHECKING
+from typing import cast
 
 from .... import exc
 from ...ast_extension import create
@@ -67,6 +68,28 @@ def _int_literal(node: ast.AST) -> int | None:
     return None
 
 
+def _literal_range_bounds(loop: ast.For) -> tuple[int, ...] | None:
+    """The one to three ``int`` literal arguments (:func:`_int_literal`) of a
+    ``for`` over ``range`` or ``cutlass.range_constexpr`` with a nonzero step,
+    else ``None``."""
+    iterator = loop.iter
+    if not isinstance(iterator, ast.Call) or iterator.keywords:
+        return None
+    if ast.unparse(iterator.func) not in ("range", "cutlass.range_constexpr"):
+        return None
+    values = [_int_literal(arg) for arg in iterator.args]
+    if not 1 <= len(values) <= 3 or None in values or values[2:] == [0]:
+        return None
+    return tuple(cast("list[int]", values))
+
+
+def _literal_range_trips(loop: ast.For) -> int | None:
+    """Trip count of a ``for`` over ``range`` or ``cutlass.range_constexpr``
+    with literal bounds (:func:`_literal_range_bounds`), else ``None``."""
+    bounds = _literal_range_bounds(loop)
+    return None if bounds is None else len(range(*bounds))
+
+
 def _literal_lane_loop_extent(loop: ast.For) -> int | None:
     """Trip count of a lane loop with literal bounds (:func:`_int_literal`,
     which also reads integer casts, ``+N`` and bools, none of which a lane
@@ -77,17 +100,13 @@ def _literal_lane_loop_extent(loop: ast.For) -> int | None:
     for reverse scans (both also as ``cutlass.range_constexpr``); both visit
     the same ``N`` lanes, one included (``range(0, -1, -1)``).
     """
-    iterator = loop.iter
-    if not isinstance(iterator, ast.Call) or iterator.keywords:
+    bounds = _literal_range_bounds(loop)
+    if bounds is None:
         return None
-    function = ast.unparse(iterator.func)
-    if function not in ("range", "cutlass.range_constexpr"):
-        return None
-    values = [_int_literal(arg) for arg in iterator.args]
-    if len(values) == 1 and values[0] is not None:
-        return values[0]
-    if len(values) == 3 and values[0] is not None and values[1] == values[2] == -1:
-        return values[0] + 1
+    if len(bounds) == 1:
+        return bounds[0]
+    if len(bounds) == 3 and bounds[1] == bounds[2] == -1:
+        return bounds[0] + 1
     return None
 
 

@@ -39,6 +39,8 @@ from ..compile_environment import _symint_expr
 from ..host_function import HostFunction
 from ..variable_origin import GridOrigin
 from ..variable_origin import NameOrigin
+from .atomic_pointer import cute_coord_pointer_expr
+from .atomic_privatization import privatizes
 from .cute_reshape import cute_lane_loops_active
 from .cute_reshape import describe_rebound_block_dims
 from .cute_reshape import subscript_rebound_block_dims
@@ -66,15 +68,6 @@ _CUTE_VECTOR_ATOMIC_HELPERS = {
 }
 # ``red.global.add.v{2,4}.f32`` is an sm_90+ PTX form.
 _CUTE_VECTOR_ATOMIC_MIN_CAPABILITY = (9, 0)
-
-
-def _cute_coord_pointer_expr(name: str, index_exprs: list[str]) -> str:
-    coord = (
-        f"({index_exprs[0]},)"
-        if len(index_exprs) == 1
-        else f"({', '.join(index_exprs)})"
-    )
-    return f"({name}.iterator + cute.crd2idx({coord}, {name}.layout)).llvm_ptr"
 
 
 def _resolve_cute_atomic_kwargs(cute_func: str, requested: list[str]) -> list[str]:
@@ -295,9 +288,13 @@ def _codegen_cute_atomic_rmw(
     backend = CompileEnvironment.current().backend
     target_dtype = backend.dtype_str(target.dtype)
     callee = _cute_atomic_callee(cute_func, target.dtype)
-    if state.config.get(
-        "cute_warp_aggregated_atomics", False
-    ) and warp_atomic_candidate(state.fx_node):
+    if (
+        state.config.get("cute_warp_aggregated_atomics", False)
+        and warp_atomic_candidate(state.fx_node)
+        # A privatized target's adds go to a shared-memory copy, which the
+        # rewrite redirects only scalar atomics to (``atomic_privatization``).
+        and not privatizes(state.device_function, target)
+    ):
         callee = _CUTE_WARP_FETCH_ADD_HELPER
     cast_value_exprs = [
         expr_from_string(
@@ -350,7 +347,7 @@ def _codegen_cute_atomic_rmw(
         state, index, ast_index, tensor=target, for_store=True
     )
     tensor_name = state.device_function.tensor_arg(target).name
-    pointer = _cute_coord_pointer_expr(tensor_name, index_exprs)
+    pointer = cute_coord_pointer_expr(tensor_name, index_exprs)
     resolved_kwargs = _resolve_cute_atomic_kwargs(cute_func, keyword_names)
     values_section = ", ".join(
         f"{actual}={{{intent}}}"
@@ -670,6 +667,10 @@ def _cute_vector_atomic_site(
     capability = env.config_spec.target_device_capability
     if capability is None or capability < _CUTE_VECTOR_ATOMIC_MIN_CAPABILITY:
         return False
+    # A privatized target's adds go to a shared-memory copy, which the
+    # rewrite redirects only scalar atomics to (``atomic_privatization.py``).
+    if privatizes(state.device_function, target):
+        return False
     # An atomic that is uniform along a live lane loop must stay a scalar
     # atomic: the lane-loop placement pass pins that form to the loop's
     # first lane (or rejects it), whereas the flush protocol below would
@@ -746,7 +747,7 @@ def _cute_vector_atomic_site(
     tensor_name = state.device_function.tensor_arg(target).name
     base_exprs = list(index_exprs)
     base_exprs[pos] = base_index_var
-    base_pointer = _cute_coord_pointer_expr(tensor_name, base_exprs)
+    base_pointer = cute_coord_pointer_expr(tensor_name, base_exprs)
     guard = " and ".join(predicates)
     body = stack[-1]
 
@@ -1296,11 +1297,13 @@ def _cute_unindexed_leader_axes(
     the rest once codegen is done.
     """
     from ..compile_environment import CompileEnvironment
+    from ..reduction_strategy import PersistentReductionStrategy
 
     env = CompileEnvironment.current()
     fx_graph = state.fx_node.graph if state.fx_node is not None else None
     leader_axes: set[int] = set()
     active_thread_axes: set[int] = set()
+    indexed_thread_axes: set[int] = set()
     loop_states = _cute_loop_states(state)
 
     def collect(thread_axes: dict[int, int]) -> None:
@@ -1328,11 +1331,27 @@ def _cute_unindexed_leader_axes(
                 candidate_block_id, state.codegen, fx_graph
             )
             if resolved in indexed_block_ids:
+                indexed_thread_axes.add(thread_axis)
                 continue
             leader_axes.add(thread_axis)
 
     for loop_state in loop_states:
         collect(loop_state.block_thread_axes)
+    # A full slice indexing a sibling's axis
+    # (``CutePersistentReductionEmitter.plan_axis_partner``) spreads its
+    # elements over the threads of it (one per thread, or one per synthetic
+    # lane of each) beside the sibling's own, the two never meeting in a
+    # value: an atomic indexing either block varies along the axis, whatever
+    # it does with the other.
+    for loop_state in loop_states:
+        strategy = loop_state.strategy
+        if (
+            isinstance(strategy, PersistentReductionStrategy)
+            and strategy._cute_axis_partner is not None
+            and loop_state.block_thread_axes.get(strategy.block_index)
+            in indexed_thread_axes
+        ):
+            leader_axes.discard(loop_state.block_thread_axes[strategy.block_index])
 
     # Ghost-axis leaders: any CTA-resident thread axis (size > 1) that
     # no active loop currently owns: one whose loop has finished, one whose
@@ -1859,13 +1878,11 @@ def _codegen_tensor_index_common_cute(
         for intent, actual in zip(keyword_names, resolved_kwargs, strict=True)
     )
     placeholders = dict(zip(keyword_names, value_exprs, strict=True))
+    pointer = cute_coord_pointer_expr(
+        tensor_name, [f"cutlass.Int32({iota_start}) + {index_var}"]
+    )
     atomic_expr = expr_from_string(
-        callee
-        + "("
-        + f"({tensor_name}.iterator + "
-        + f"cute.crd2idx((cutlass.Int32({iota_start}) + {index_var},), {tensor_name}.layout)).llvm_ptr, "
-        + values_section
-        + ", sem={sem})",
+        f"{callee}({pointer}, {values_section}, sem={{sem}})",
         sem=sem,
         **placeholders,
     )
@@ -2003,13 +2020,10 @@ def _codegen_tensor_index_loop_common_cute(
         for intent, actual in zip(keyword_names, resolved_kwargs, strict=True)
     )
     placeholders = dict(zip(keyword_names, indexed_values, strict=True))
+    # ``{index}``, the placeholder below, is the coordinate.
+    pointer = cute_coord_pointer_expr(tensor_name, ["{index}"])
     atomic_expr = expr_from_string(
-        callee
-        + "("
-        + f"({tensor_name}.iterator + "
-        + f"cute.crd2idx(({{index}},), {tensor_name}.layout)).llvm_ptr, "
-        + values_section
-        + ", sem={sem})",
+        f"{callee}({pointer}, {values_section}, sem={{sem}})",
         index=index_expr,
         sem=sem,
         **placeholders,

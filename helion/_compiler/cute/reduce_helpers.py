@@ -8,6 +8,8 @@ import cutlass.cute as cute
 
 from .device.sync import store_shared_remote_f32
 from .device.sync import store_shared_remote_f32x2
+from .reduce_call import cooperative_column_share
+from .reduce_call import cooperative_column_slots
 from .reduce_call import use_interleaved_shared_reduce
 from .reduce_call import use_serial_block_reduce
 
@@ -359,9 +361,21 @@ def _cute_grouped_reduce_shared_columns(
       ``log2(32 // pre)`` shuffles plus ``group_span // 32`` reads; the sum
       order differs (a tree within the warp, then over the warps), so the
       register-tile emitter only requests it through an autotuner knob.
+    * ``pre > 1``, ``fold="cooperative"`` (``group_span`` a multiple of 32):
+      every thread writes its partials; after one barrier the group's
+      ``pre * len(values)`` outputs are spread over its lanes, a few lanes
+      per output summing strided subsets of its partials and folding them
+      with a shuffle butterfly into a shared output slot, and after a second
+      barrier every thread reads its sibling class's outputs
+      (``_cute_cooperative_column_sums``).  A thread reads a handful of
+      staged partials instead of ``group_span // pre`` per column, for one
+      more barrier; the sum order differs (strided partial sums, then a
+      tree), so the register-tile emitter also requests it only through an
+      autotuner knob.
 
-    Either way the whole tile costs two barriers, against one two-stage reduce
-    (two barriers, and ``pre`` masked shuffles per stage) per column.  The
+    The serial and warp forms cost the whole tile two barriers (the
+    cooperative form three), against one two-stage reduce (two barriers, and
+    ``pre`` masked shuffles per stage) per column.  The
     trailing barrier matters at a multi-trip call site (a persistent
     ``pid_type`` loop has no other barrier per trip): without it a fast warp's
     next-trip writes could overwrite partials a slower warp has not read yet.
@@ -370,13 +384,31 @@ def _cute_grouped_reduce_shared_columns(
     """
     if reduction_type not in ("sum", "prod"):
         raise ValueError(f"unsupported CuTe column reduction type: {reduction_type!r}")
-    if fold not in ("serial", "warp"):
+    if fold not in ("serial", "warp", "cooperative"):
         raise ValueError(f"unsupported CuTe column reduction fold: {fold!r}")
     warp_fold, combine = _resolve_ops(reduction_type)
     width = len(values)
     dtype = type(identity)
     group_id = lane_var // group_span
     results = []
+    if pre > 1 and fold == "cooperative":
+        if group_span % 32:
+            raise ValueError(
+                "the cooperative fold of a CuTe column reduction needs a "
+                f"warp-aligned group (group_span={group_span})"
+            )
+        results = _cute_cooperative_column_sums(
+            values,
+            combine,
+            identity,
+            group_id,
+            lane_in_group_var,
+            pre=pre,
+            group_span=group_span,
+            group_count=group_count,
+        )
+        cute.arch.sync_threads()
+        return results
     if pre > 1 and fold == "warp":
         if group_span % 32 or 32 % pre:
             raise ValueError(
@@ -439,6 +471,99 @@ def _cute_grouped_reduce_shared_columns(
         results.append(total)
     cute.arch.sync_threads()
     return results
+
+
+def _cute_cooperative_column_sums(
+    values: list,
+    combine: object,
+    identity: cute.Numeric,
+    group_id: cutlass.Int32,
+    lane_in_group_var: cutlass.Int32,
+    *,
+    pre: int,
+    group_span: int,
+    group_count: int,
+) -> list:
+    """``_cute_grouped_reduce_shared_columns(..., fold="cooperative")``.
+
+    The serial fold has every thread sum all ``group_span // pre`` staged
+    partials of each of its columns, redundantly across the group: a
+    1024-thread group with ``pre = 16`` reads 512 values per thread for eight
+    columns.  Here the group's ``pre * width`` outputs are spread over its
+    threads: ``share`` consecutive lanes (``cooperative_column_share``) each
+    sum every ``share``-th partial of one output and fold their sums with a
+    shuffle butterfly, after which each of them holds the output and stores
+    it to the block's slot (same value, same address, one instruction of one
+    warp, no lane predicate); after a second barrier every thread reads the
+    ``width`` outputs of its sibling class.  The lane blocks take the
+    outputs in turn (several each when they are fewer than the outputs), and
+    a lane reads ``group_span // pre // share`` staged partials per output
+    it takes: in the example eight (then three shuffles and eight output
+    reads) instead of 512.  The group reads every staged partial once when
+    the blocks match the outputs one to one (``share * pre * width ==
+    group_span``); when ``share`` is capped by a warp or by the reduction
+    extent, the blocks outnumber the outputs and the extra ones recompute an
+    output another block also computes, reading its partials again.  Every
+    block of a pass stores to a slot of its own (``cooperative_column_slots``),
+    so blocks of different warps never store to one slot, not even the same
+    value.  The lanes of a block read partials ``pre * width`` words apart,
+    a ``share``-way bank conflict when that stride is a multiple of 32
+    words (8-way in the example, on eight reads instead of 512).  One more
+    barrier than the serial fold; the sum order (strided partial sums,
+    then a tree) differs from the serial fold's.  Shared memory: the staged
+    partials plus ``cooperative_column_slots`` output slots per group.  Like
+    ``_cute_warp_fold_column_sums`` it stops before the trailing barrier,
+    which the caller emits.
+    """
+    width = len(values)
+    dtype = type(identity)
+    reduce_extent = group_span // pre
+    outputs = pre * width
+    slots = cooperative_column_slots(pre, width, group_span)
+    staged = group_count * group_span * width
+    smem_ptr = cute.arch.alloc_smem(dtype, staged + group_count * slots)
+    smem = cute.make_tensor(smem_ptr, (staged + group_count * slots,))
+    stage_base = group_id * (group_span * width)
+    result_base = staged + group_id * slots
+    slot_base = stage_base + lane_in_group_var * width
+    for column, value in enumerate(values):
+        smem[slot_base + column] = value
+    cute.arch.sync_threads()
+    share = cooperative_column_share(pre, width, group_span)
+    owners = group_span // share
+    part = lane_in_group_var % share
+    block = lane_in_group_var // share
+    for first in range(0, outputs, owners):
+        # Plain Python during tracing, so no branch on the lane: block ``k``
+        # of the pass takes output ``first + k`` and stores it to slot
+        # ``first + k``, the slot its readers read; a block past the last
+        # output wraps onto an earlier one, recomputes it identically and
+        # stores the copy to a slot of its own that nothing reads.
+        output = (first + block) % outputs
+        sibling = output // width
+        column = output % width
+        total = identity
+        for step in range(reduce_extent // share):
+            partial = part + step * share
+            total = combine(
+                total,
+                _smem_read(
+                    smem, stage_base + (partial * pre + sibling) * width + column, dtype
+                ),
+            )
+        for shift in range(share.bit_length() - 2, -1, -1):
+            total = combine(
+                total,
+                dtype(
+                    cute.arch.shuffle_sync_bfly(
+                        total, offset=1 << shift, mask=-1, mask_and_clamp=31
+                    )
+                ),
+            )
+        smem[result_base + first + block] = total
+    cute.arch.sync_threads()
+    sibling_base = result_base + (lane_in_group_var % pre) * width
+    return [_smem_read(smem, sibling_base + column, dtype) for column in range(width)]
 
 
 def _cute_warp_fold_column_sums(

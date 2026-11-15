@@ -37,10 +37,12 @@ first entry issues each atomic on the leader thread of the launch axes
 claimed after it (``guard_atomics_on_later_thread_axes``), and its other
 entries lower the collective matmuls and decide the launch shape (the
 gathered-MMA extension of the signature, the owned block dims, the bounded
-cache plan's block).  ``freeze_pass_context`` then seals the launch shape and
-the final signature into the context every ``DEVICE_BODY_PASSES`` entry
-reads; ``KERNEL_DEF_PASSES`` reads the same context after ``ast_rename``
-(``DeviceBodyContext.pass_context`` carries it across).
+cache plan's block).  ``freeze_pass_context`` then seals the launch shape, the
+block grid (after the collective lowering, which may hand the launch to a host
+wrapper with its own grid) and the final signature into the context every
+``DEVICE_BODY_PASSES`` entry reads; ``KERNEL_DEF_PASSES`` reads the same
+context after ``ast_rename`` (``DeviceBodyContext.pass_context`` carries it
+across).
 
 Every entry is ``(name, gate, run, requires, provides)``: ``gate`` reads the
 per-render state and decides whether ``run`` executes; ``run`` rewrites the
@@ -97,9 +99,10 @@ class PassContext:
     One context per render, compared by identity (``eq=False``).
 
     Built once by ``build_pass_context``; ``with_launch_shape`` seals the
-    launch shape the prologue decided.  The containers are the objects the
-    inline code built (``constexpr_values`` is ``DeviceBodyContext``'s dict,
-    filled here and read by the post-rename stage); no pass writes to them.
+    launch shape and block grid the prologue decided.  The containers are the
+    objects the inline code built (``constexpr_values`` is
+    ``DeviceBodyContext``'s dict, filled here and read by the post-rename
+    stage); no pass writes to them.
     """
 
     fn: DeviceFunction
@@ -141,22 +144,29 @@ class PassContext:
     reload_modes: dict[int, str]
     dynamic_trip_counts: dict[str, tuple[int, str]]
     new_var: Callable[[str], str]
-    # Launch shape (final after ``freeze_pass_context``).
+    # Launch shape and block grid (final after ``freeze_pass_context``).
     exact_thread_block_dims: tuple[int, int, int] | None
-    # ``xyz`` program ids without a cluster: the per-axis block-grid extents
-    # proven from exact runtime sizes (``None`` where unproven).
-    xyz_grid: bool
+    # Whether ``block_grid_dims`` is the launch's block grid (``xyz`` program
+    # ids without a cluster, or a static flat launch, and no host wrapper plan
+    # launching a grid of its own), with its per-axis extents proven from
+    # exact runtime sizes (``None`` where unproven; unproven everywhere until
+    # the prologue is done).
+    exact_grid: bool
     block_grid_dims: tuple[int | None, int | None, int | None]
 
     def with_launch_shape(
         self,
         exact_thread_block_dims: tuple[int, int, int] | None,
         signature_names: frozenset[str],
+        exact_grid: bool,
+        block_grid_dims: tuple[int | None, int | None, int | None],
     ) -> PassContext:
         return dataclasses.replace(
             self,
             exact_thread_block_dims=exact_thread_block_dims,
             signature_names=signature_names,
+            exact_grid=exact_grid,
+            block_grid_dims=block_grid_dims,
         )
 
 
@@ -243,16 +253,23 @@ def _block_grid_dims(
     # (``CompileEnvironment.keyed_hint``).
     from ...program_id import XYZProgramIDs
 
+    flat_grid = _exact_flat_grid(fn)
+    if flat_grid is not None:
+        return True, (flat_grid, 1, 1)
     xyz_pid = (
         fn.pid
         if isinstance(fn.pid, XYZProgramIDs)
         and fn.cute_state.lanes.simt_cluster_n == 1
         and len(fn.pid.pid_info) <= 3
+        # A host wrapper plan may launch a grid of its own.
+        and not cute_codegen_state(fn.codegen).wrapper_plans
         else None
     )
-    xyz_grid = xyz_pid is not None
     exact_grid_extent_values: dict[sympy.Expr, int] = {}
-    if xyz_grid and "input_tensor_metadata" in env.compiler_fact_specialization_facts:
+    if (
+        xyz_pid is not None
+        and "input_tensor_metadata" in env.compiler_fact_specialization_facts
+    ):
         for argument in fn.arguments:
             if not isinstance(argument, TensorArg) or isinstance(
                 argument, TensorDescriptorArg
@@ -292,7 +309,31 @@ def _block_grid_dims(
                 block_grid_dims[axis] = (extent + block_size - 1) // block_size
         for axis in range(len(xyz_pid.pid_info), 3):
             block_grid_dims[axis] = 1
-    return xyz_grid, (block_grid_dims[0], block_grid_dims[1], block_grid_dims[2])
+    return xyz_pid is not None, (
+        block_grid_dims[0],
+        block_grid_dims[1],
+        block_grid_dims[2],
+    )
+
+
+def _exact_flat_grid(fn: DeviceFunction) -> int | None:
+    """The CTA count of a flat launch whose extents are all static: the grid
+    is ``(count, 1, 1)`` and ``block_idx[0]`` is the virtual pid itself (no
+    XCD remap, no shared pid), so the per-axis pids it decomposes into are
+    the ``//`` / ``%`` arithmetic the proven-bounds pass evaluates.  A host
+    wrapper plan launches its own grid (``grid_x``), so none is proven."""
+    from ...program_id import FlatProgramIDs
+
+    pid = fn.pid
+    if (
+        type(pid) is not FlatProgramIDs
+        or fn.cute_state.lanes.simt_cluster_n != 1
+        or pid.shared_pid_var is not None
+        or fn.config.get("xcd_remap", False)
+        or cute_codegen_state(fn.codegen).wrapper_plans
+    ):
+        return None
+    return pid.static_grid_size()
 
 
 def build_pass_context(ctx: DeviceBodyContext) -> PassContext:
@@ -307,7 +348,6 @@ def build_pass_context(ctx: DeviceBodyContext) -> PassContext:
     fn = ctx.device_function
     env = CompileEnvironment.current()
     constexpr_values = _collect_constexpr_values(ctx)
-    xyz_grid, block_grid_dims = _block_grid_dims(fn, env, constexpr_values)
     return PassContext(
         fn=fn,
         env=env,
@@ -338,8 +378,10 @@ def build_pass_context(ctx: DeviceBodyContext) -> PassContext:
         dynamic_trip_counts=fn.cute_state.lanes.dynamic_reduction_trips,
         new_var=lambda name: fn.new_var(name, dce=False),
         exact_thread_block_dims=_exact_thread_block_dims(fn.tile_strategy),
-        xyz_grid=xyz_grid,
-        block_grid_dims=block_grid_dims,
+        # Sealed by ``freeze_pass_context``: the prologue's collective
+        # lowering may hand the launch to a host wrapper.
+        exact_grid=False,
+        block_grid_dims=(None, None, None),
     )
 
 
@@ -517,9 +559,17 @@ def _bounded_cache_prepare(s: _DeviceBodyState) -> None:
 
 
 def freeze_pass_context(s: _DeviceBodyState) -> None:
-    """Seal the launch shape and the final signature into the context."""
-    s.ctx = s.ctx.with_launch_shape(
-        s.launch_shape, frozenset(arg.arg for arg in s.args)
+    """Seal the launch shape, the block grid and the final signature into the
+    context."""
+    ctx = s.ctx
+    exact_grid, block_grid_dims = _block_grid_dims(
+        ctx.fn, ctx.env, ctx.constexpr_values
+    )
+    s.ctx = ctx.with_launch_shape(
+        s.launch_shape,
+        frozenset(arg.arg for arg in s.args),
+        exact_grid,
+        block_grid_dims,
     )
 
 
@@ -563,6 +613,7 @@ def _fuse_two_pass_loads(s: _DeviceBodyState) -> None:
         proven_disjoint_tensor_pairs=ctx.proven_disjoint_tensor_pairs,
         proven_tensor_stride_values=ctx.proven_tensor_stride_values,
         dynamic_trip_counts=ctx.dynamic_trip_counts,
+        binding_dtypes=s.fn.cute_state.uniform_cutoff_dtypes,
         rename_groups=ctx.rename_groups,
     )
 
@@ -881,6 +932,7 @@ def _unroll_lane_loads(s: _DeviceBodyState) -> None:
         s.knob_unroll,
         s.ctx.new_var,
         forced_full=s.folded_lanes,
+        constexpr_values=s.ctx.constexpr_values,
     )
     # With sinking the knob belongs to the sunk nest's lane loops
     # (``_normalize_cute_vloop_sink``); a nest that offers none
@@ -906,7 +958,7 @@ def _fold_lane_reductions(s: _DeviceBodyState) -> None:
 def _split_lane_loads(s: _DeviceBodyState) -> None:
     from ..split_lane_loads import split_lane_loads
 
-    s.kernel_body = split_lane_loads(s.kernel_body)
+    s.kernel_body = split_lane_loads(s.kernel_body, s.ctx.constexpr_values)
 
 
 def _prefetch_reduction_packets(s: _DeviceBodyState) -> None:
@@ -1063,20 +1115,35 @@ def _simplify_proven_loop_bounds(s: _DeviceBodyState) -> None:
     # Ordinary collective launches use the PID strategy's grid
     # unchanged. Other launch schedulers retain architectural bounds.
     collective_grid = None
-    if (
-        fn.pid is not None
-        and type(fn.pid) in (FlatProgramIDs, XYZProgramIDs)
-        and fn.cute_state.lanes.simt_cluster_n == 1
-        and fn.cute_state.lanes.collective_mma_sites
-        and not cute_codegen_state(fn.codegen).wrapper_plans
-    ):
-        collective_grid = exact_static_grid(fn.pid.codegen_grid(), ctx.constexpr_values)
+    if fn.cute_state.lanes.collective_mma_sites:
+        if type(fn.pid) is FlatProgramIDs:
+            # The grid ``_exact_flat_grid`` proved, if any.
+            if ctx.exact_grid:
+                collective_grid = cast("tuple[int, int, int]", ctx.block_grid_dims)
+        elif (
+            type(fn.pid) is XYZProgramIDs
+            and fn.cute_state.lanes.simt_cluster_n == 1
+            and not cute_codegen_state(fn.codegen).wrapper_plans
+        ):
+            collective_grid = exact_static_grid(
+                fn.pid.codegen_grid(), ctx.constexpr_values
+            )
     s.kernel_body = simplify_proven_loop_bounds(
         s.kernel_body,
         enabled=bool(ctx.config.config.get("cute_proven_bounds", False)),
         thread_block_dims=ctx.exact_thread_block_dims,
         constexpr_values=ctx.constexpr_values,
         block_grid_dims=collective_grid,
+    )
+
+
+def _divide_vector_bases(s: _DeviceBodyState) -> None:
+    from ..lane_invariant_division import divide_vector_bases
+
+    s.kernel_body = divide_vector_bases(
+        s.kernel_body,
+        constexpr_values=s.ctx.constexpr_values,
+        rename_groups=s.ctx.rename_groups,
     )
 
 
@@ -1087,11 +1154,12 @@ def _simplify_proven_bounds(s: _DeviceBodyState) -> None:
     s.kernel_body = simplify_proven_bounds(
         s.kernel_body,
         enabled=cast("bool", ctx.config.config.get("cute_proven_bounds", False)),
-        xyz_grid=ctx.xyz_grid,
+        exact_grid=ctx.exact_grid,
         thread_block_dims=ctx.exact_thread_block_dims,
         block_grid_dims=ctx.block_grid_dims,
         constexpr_values=ctx.constexpr_values,
         proven_tensor_size_values=ctx.proven_tensor_size_values,
+        rename_groups=ctx.rename_groups,
     )
 
 
@@ -1547,6 +1615,7 @@ DEVICE_BODY_PASSES: tuple[DeviceBodyPass, ...] = (
         # Needs the proved private recurrence and the generic fp32 pairs.
         requires=(LAUNCH_SHAPE, "state_loads_pipelined", "fp32_loops_packed"),
     ),
+    DeviceBodyPass("divide_vector_bases", _always, _divide_vector_bases),
     DeviceBodyPass(
         "simplify_proven_loop_bounds",
         _always,

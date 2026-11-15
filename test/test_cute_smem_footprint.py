@@ -447,8 +447,13 @@ def _helper_buffer(function: str, index: int = 0, **values: int) -> int:
     """The elements of the ``index``-th ``alloc_smem`` (in source order) of
     ``reduce_helpers.<function>``: its size expression evaluated over
     ``values`` and the integer assignments ahead of it (the helper's own
-    arithmetic, read as text so the DSL is not imported)."""
-    namespace: dict[str, object] = {"__builtins__": {}, **values}
+    arithmetic, read as text so the DSL is not imported, with the
+    ``reduce_call`` sizes it calls)."""
+    namespace: dict[str, object] = {
+        "__builtins__": {},
+        "cooperative_column_slots": reduce_call.cooperative_column_slots,
+        **values,
+    }
     pending: list[ast.stmt] = list(_HELPERS[function].body)
     seen = 0
     while pending:
@@ -520,6 +525,13 @@ _REDUCE_BUFFERS = {
     "pre=4, group_span=128, group_count=1, fold='warp')": 4
     * _helper_buffer(
         "_cute_warp_fold_column_sums", width=3, pre=4, group_span=128, group_count=1
+    ),
+    # The cooperative fold: the staged partials plus an output slot per lane
+    # block and pass of every group.
+    f"{COLUMNS}(acc, 'sum', cutlass.Float32(0), l, g, "
+    "pre=4, group_span=128, group_count=2, fold='cooperative')": 4
+    * _helper_buffer(
+        "_cute_cooperative_column_sums", width=3, pre=4, group_span=128, group_count=2
     ),
     f"{COLUMNS}(acc, 'sum', cutlass.Float32(0), l, g, "
     "pre=4, group_span=128, group_count=1)": 4

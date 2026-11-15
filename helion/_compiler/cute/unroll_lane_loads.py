@@ -58,10 +58,16 @@ moves only when every name it reads is defined outside the loop, is a lane
 variable, or is defined exactly once in the loop by a statement that moved
 before it: a loop-carried value or a name defined twice pins its readers.
 Bodies still holding ``_helion_*`` compiler markers, reversed lane loops and
-already-constexpr lane loops are left alone.  The pass reports whether it
-fired so the caller can regenerate with the knob off when it did not
-(``LaneUnrollNotApplied`` in ``generate_ast``): the knob alone never changes
-the code.
+already-constexpr lane loops are left alone, and so is a body holding any loop
+the trace keeps rolled other than a lane loop and a loop of one trip (a looped
+reduction's sweep, a serial scan's fallback loop, an inner ``hl.tile`` loop
+of several tiles), which every copy would repeat; the copies the knob asks
+for trace at most ``_MAX_UNROLLED_STATEMENTS`` statements (``_trace_size``).
+A lane loop that a vectorized reduction's cross-lane fold must fully unroll
+skips both checks: it is unrolled in place otherwise (``_force_constexpr``).
+The pass reports whether it fired so the caller can regenerate with the knob
+off when it did not (``LaneUnrollNotApplied`` in ``generate_ast``): the knob
+alone never changes the code.
 """
 
 from __future__ import annotations
@@ -78,8 +84,12 @@ from ..ast_extension import statement_from_string
 from ..ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from ..ast_read_writes import ReadWrites
 from ._ast_pass_utils import _is_proven_relocatable_call
+from ._ast_pass_utils import call_path
 from ._ast_pass_utils import loop_extent
 from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
+from .fuse_two_pass_loads import _range_bounds
+from .fuse_two_pass_loads import _trip_count_for
+from .lane_loops.markers import _literal_range_trips
 from .lane_loops.statements import contains_compiler_marker
 from .packet_access import match_packet_access
 
@@ -87,6 +97,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Collection
     from collections.abc import Iterable
+    from collections.abc import Mapping
 
 _LIST_PREFIX = "_lane_unroll_loads_"
 
@@ -119,6 +130,93 @@ _MAX_UNROLLED_LANES = 64
 # Larger knob values saturate here instead of spilling; scalar loads (a
 # gathered row index) do not count.
 _MAX_LIVE_PACKETS = 16
+# Statements the trace-time copies of a lane body emit (the copies times the
+# ``_trace_size`` of one); the loads-first split shares the bound.  What an
+# element costs varies far more than the element count: the split of a
+# 15-input BatchNorm-inference body (12 gathered per-channel loads and 3 rsqrt
+# per element, 429 statements per 8-element lane) compiled for 7 s at 16
+# lanes, 38 s at 32 and 253 s (8 GB) at 64, a 1-input scale at 64 lanes (2752
+# statements) for 0.3 s.  The split measures a lane body without its lane base
+# and hoisted ``_tile_unroll_vec_*`` loads, which its two phases trace again
+# (``split_lane_loads``); the knob measures the whole body, so a body near the
+# bound can pass the split's count and fail the knob's.
+_MAX_UNROLLED_STATEMENTS = 8192
+
+
+def _trace_size(
+    statements: Iterable[ast.AST], constexpr_values: Mapping[str, int] | None = None
+) -> int | None:
+    """The statements one trace of ``statements`` emits, each once per trip
+    of the ``cutlass.range_constexpr`` loops around it.  A lane loop counts
+    its trips too, whether the trace unrolls it or not: one left rolled is
+    counted as unrolled, an overcount on the safe side, and its body is the
+    per-element work of another tile axis, not a loop with traffic of its own.
+    So does a rolled loop of one trip (or none), its static bounds resolved
+    through ``constexpr_values``: an inner ``hl.tile`` loop whose block covers
+    its extent runs once, as straight-line code would.  A ``range_constexpr``
+    whose bound the trace reads (``cute.size(frag)``) counts once, an
+    undercount: the trace unrolls it, but its trips are not known here.
+
+    ``None`` when any other loop sits among them: a ``while`` or a ``for`` the
+    trace keeps rolled (a looped reduction's sweep, a serial scan's fallback
+    loop, an inner ``hl.tile`` loop of several tiles).  Every copy of a lane
+    body repeats such a loop as an ``scf.for`` of its own at a cost its
+    statements do not show (two sweeps per row over 8-wide chunks with
+    register-prefetched reloads compiled for 15 s at 64 copies and 106 s at
+    256), while the loads a copy issues first are a few per-lane operands next
+    to the loop's own traffic, so neither pass copies it.  Declining a loop
+    of a few trips the same way is a compile-time safeguard; its speed was
+    not measured.  A loop's trips are counted one way for every kind
+    (``_loop_trips``).
+    """
+    size = 0
+    for statement in statements:
+        trips = 1
+        if isinstance(statement, ast.While):
+            return None
+        if isinstance(statement, ast.For):
+            loop_trips = _loop_trips(statement, constexpr_values)
+            if isinstance(statement.iter, ast.Call) and call_path(
+                statement.iter.func
+            ) == ("cutlass", "range_constexpr"):
+                # A bound read at trace time (``cute.size(...)``) counts once.
+                trips = 1 if loop_trips is None else loop_trips
+            elif _is_lane_loop(statement) and loop_trips is not None:
+                trips = loop_trips
+            elif not _runs_once(statement, loop_trips):
+                return None
+        nested = [
+            node
+            for node in ast.iter_child_nodes(statement)
+            if isinstance(node, ast.stmt)
+        ]
+        inner = _trace_size(nested, constexpr_values)
+        if inner is None:
+            return None
+        size += 1 + trips * inner
+    return size
+
+
+def _loop_trips(
+    loop: ast.For, constexpr_values: Mapping[str, int] | None
+) -> int | None:
+    """The trips of a ``for`` over ``range`` or ``cutlass.range_constexpr``:
+    by its literal bounds, any step (``range(N - 1, -1, -1)`` included), else
+    by bounds resolved through ``constexpr_values`` (names, through
+    ``cutlass.Int32`` casts, and a positive step); ``None`` otherwise."""
+    literal = _literal_range_trips(loop)
+    if literal is not None:
+        return literal
+    bounds = _range_bounds(loop.iter)
+    if bounds is None:
+        return None
+    return _trip_count_for(*bounds, dict(constexpr_values or {}))
+
+
+def _runs_once(loop: ast.For, trips: int | None) -> bool:
+    """Whether a ``for`` of ``trips`` trips (``_loop_trips``) runs at most
+    once: an ``else`` clause or an unknown count says no."""
+    return not loop.orelse and trips is not None and trips <= 1
 
 
 def _ascending_range_extent(loop: ast.AST) -> int | None:
@@ -455,7 +553,11 @@ def _rewrite_compute_phase(
 
 
 def _unroll_factor(
-    extent: int, unroll: int, nested_product: int, packet_count: int = 0
+    extent: int,
+    unroll: int,
+    nested_product: int,
+    packet_count: int,
+    statements: int,
 ) -> int:
     factor = 1
     for choice in _CUTE_LANE_UNROLL_CHOICES:
@@ -464,6 +566,7 @@ def _unroll_factor(
             and extent % choice == 0
             and choice * nested_product <= _MAX_UNROLLED_LANES
             and choice * packet_count <= _MAX_LIVE_PACKETS
+            and choice * statements <= _MAX_UNROLLED_STATEMENTS
         ):
             factor = choice
     return factor
@@ -475,6 +578,7 @@ def _unroll_one(
     new_var: Callable[[str], str],
     *,
     require_full: bool = False,
+    constexpr_values: Mapping[str, int] | None = None,
 ) -> list[ast.stmt] | None:
     extent = _ascending_range_extent(loop)
     if (
@@ -488,7 +592,13 @@ def _unroll_one(
     plan, _deps = planner.plan(loop, extent, set(), [])
     if not plan.load_count():
         return None
-    factor = _unroll_factor(extent, unroll, plan.nested_product(), plan.packet_count())
+    # A forced unroll copies the body in place otherwise (``_force_constexpr``).
+    statements = 0 if require_full else _trace_size(loop.body, constexpr_values)
+    if statements is None:
+        return None
+    factor = _unroll_factor(
+        extent, unroll, plan.nested_product(), plan.packet_count(), statements
+    )
     if factor < 2 or (require_full and factor != extent):
         return None
     lists = [new_var(f"{_LIST_PREFIX}{i}") for i in range(planner.next_list)]
@@ -569,9 +679,11 @@ def unroll_lane_loads(
     new_var: Callable[[str], str],
     *,
     forced_full: Collection[str] = (),
+    constexpr_values: Mapping[str, int] | None = None,
 ) -> tuple[list[ast.stmt], bool]:
     """Apply the loads-first lane unroll to every lane loop reachable from
     ``body``; returns the new body and whether the knob transformed any loop.
+    ``constexpr_values`` resolves the bounds of rolled loops (``_trace_size``).
 
     ``forced_full`` names lane variables whose loops are unrolled completely
     whatever the knob says (the vectorized lane loops of a reduced block,
@@ -601,7 +713,12 @@ def unroll_lane_loads(
                     result.extend(replacement)
                     continue
                 if knob > 1:
-                    replacement = _unroll_one(stmt, knob, new_var)  # type: ignore[arg-type]
+                    replacement = _unroll_one(
+                        stmt,  # type: ignore[arg-type]
+                        knob,
+                        new_var,
+                        constexpr_values=constexpr_values,
+                    )
                     if replacement is not None:
                         fired = True
                         result.extend(replacement)

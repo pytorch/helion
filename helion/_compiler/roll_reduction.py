@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import torch
 from torch.fx import map_arg
 
+from .._utils import next_power_of_2
 from ..language import _MEMORY_OPS
 from ..language import _tracing_ops
 from ..language import atomic_add
@@ -35,6 +36,9 @@ from .aten_lowering import aten_lowering_dispatch
 from .compile_environment import CompileEnvironment
 from .fx_side_effects import is_impure_node
 from .host_function import HostFunction
+from .indexing_strategy import _padded_iota_dims_once
+from .indexing_strategy import load_index_axes
+from .indexing_strategy import padded_index_dims
 from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import ReductionLowering
 from .loop_dependency_checker import reaches_through_pointers
@@ -947,6 +951,116 @@ class ReductionRoller:
             )
             for node in graph.nodes
         )
+
+    def reads_padded_range(self, graph: torch.fx.Graph) -> bool:
+        """Check if a reduction over the rdim reads a padded ``iota`` on the
+        rdim's lanes.
+
+        ``hl.arange(200)`` of a static extent that is not a power of two runs
+        over 256 lanes, and a load over it, ``hl.load(x, [i, hl.arange(200)])``
+        in a grid kernel, has the padded size 256: a reduction over the load
+        gets a reduction dim of 256 that names neither the range nor the load.
+        The roller leaves both outside a loop over that dim, at their full
+        extent, so every chunk would fold the same values (a shape mismatch on
+        Triton).  Such a dim stays persistent, as it does when the range is
+        256 long (``has_unrollable_rdim_use``), but keeps its reduction_loops
+        slot, pinned (``ReductionLoopSpec.pinned``): older versions offered it.
+
+        The walk follows the values on the rdim's lanes back from each
+        reduction over it, to one computed from a padded range
+        (``_padded_iota_dims``) or a load indexed by one.  A range reduced away
+        before does not reach the lanes: ``hl.arange(200).sum()`` scaling a
+        row, or a 3000-column load summed beside a 4096-column row.
+        """
+        size = self.rdim.size
+        if not isinstance(size, int):
+            return False
+        env = CompileEnvironment.current()
+
+        def on_rdim(node: torch.fx.Node) -> bool:
+            val = node.meta.get("val")
+            return isinstance(val, torch.Tensor) and any(
+                env.resolve_block_id(dim) == self.rdim.block_id for dim in val.size()
+            )
+
+        # One walk over the graph, which meets a value on several paths.
+        memo: dict[tuple[torch.fx.Node, bool], tuple[int | None, ...] | None] = {}
+
+        def same_shape(node: torch.fx.Node, other: torch.fx.Node) -> bool:
+            # ``known_equal``: comparing the symbolic sizes would add guards.
+            val = node.meta.get("val")
+            other_val = other.meta.get("val")
+            return (
+                isinstance(val, torch.Tensor)
+                and isinstance(other_val, torch.Tensor)
+                and val.ndim == other_val.ndim
+                and all(map(env.known_equal, val.shape, other_val.shape))
+            )
+
+        def padded_to_rdim(node: torch.fx.Node, *, any_axis: bool) -> bool | None:
+            """Whether a padded range's lanes are on an axis of ``node`` on the
+            rdim's lanes, or with ``any_axis`` on any axis; None where no walk
+            gives ``node`` padded dims (a reduction).  A load's dims are its
+            indices' (``load_index_axes``): ``x[tile, rows, :]`` puts the
+            range on its second dim, beside the 256 columns."""
+            dims = _padded_iota_dims_once(node, False, memo)
+            if (
+                dims is None
+                and node.target is load
+                and (axes := load_index_axes(node)) is not None
+            ):
+                index = node.args[1]
+                assert isinstance(index, (list, tuple))
+                dims = padded_index_dims(
+                    node,
+                    axes,
+                    lambda position: _padded_iota_dims_once(
+                        index[position], False, memo
+                    ),
+                )
+            if dims is None:
+                return None
+            val = node.meta.get("val")
+            return any(
+                length is not None
+                and next_power_of_2(length) == size
+                and (
+                    any_axis
+                    or not isinstance(val, torch.Tensor)
+                    or val.ndim != len(dims)
+                    or env.resolve_block_id(val.size(axis)) == self.rdim.block_id
+                )
+                for axis, length in enumerate(dims)
+            )
+
+        for node in graph.nodes:
+            if not self.is_reduction(node):
+                continue
+            seen: set[torch.fx.Node] = set()
+            stack = [arg for arg in node.all_input_nodes if on_rdim(arg)]
+            while stack:
+                value = stack.pop()
+                if value in seen:
+                    continue
+                seen.add(value)
+                # A value's padded dims follow its inputs' onto its own axes:
+                # in ``hl.arange(200)[:, None] * row[None, :]`` the range pads
+                # the first axis, which has a reduction dim of its own, not the
+                # row's columns.  Where the walk does not follow a value, an
+                # input of its shape is padded on the same axes, and one of
+                # another shape (the range a load's padded size comes from)
+                # wherever it is padded.
+                found = padded_to_rdim(value, any_axis=False)
+                if found or (
+                    found is None
+                    and any(
+                        padded_to_rdim(arg, any_axis=not same_shape(arg, value))
+                        for arg in value.all_input_nodes
+                    )
+                ):
+                    return True
+                stack.extend(arg for arg in value.all_input_nodes if on_rdim(arg))
+        return False
 
     def has_stack_tensor_with_rdim(self, graph: torch.fx.Graph) -> bool:
         """Check if a graph contains stack tensors with rdim inputs."""
