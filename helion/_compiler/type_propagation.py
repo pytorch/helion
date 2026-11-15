@@ -1352,6 +1352,10 @@ class TypePropagation(ast.NodeVisitor):
                 if len(ExtendedAST.current()) != 1:
                     raise exc.NestedGridLoop
 
+        env = CompileEnvironment.current()
+        outer_root_id = env.typing_root_id
+        if device_loop and self.device_loop_depth == 0:
+            env.typing_root_id = node._root_id
         self.device_loop_depth += device_loop
         _maybe_patch_tensor_factories = (
             patch_tensor_factories
@@ -1369,6 +1373,7 @@ class TypePropagation(ast.NodeVisitor):
             orelse = self._body(node.orelse)
             self.scope.merge_if_else(body, orelse)
         self.device_loop_depth -= device_loop
+        env.typing_root_id = outer_root_id
         return NoType(origin=self.origin())
 
     def visit_While(self, node: ast.While) -> TypeInfo:

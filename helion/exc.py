@@ -279,6 +279,16 @@ class TunableTypeNotSupported(BaseError):
     message = "hl.register_tunable() only supports integer, float, and boolean types, got {0!s}."
 
 
+class TunableSpecialized(BaseError):
+    message = (
+        "hl.register_tunable({0!r}) is evaluated at its hint {1} here{2}, so "
+        "every config would compute with {1}: use the tunable in arithmetic and "
+        "in helion helpers (helion.next_power_of_2, helion.cdiv) over config "
+        "values only, called in the kernel with positional arguments, or size "
+        "the dim with hl.register_block_size."
+    )
+
+
 class TunableNameConflict(BaseError):
     message = (
         "Tunable parameter with name {0!s} already exists. Please use a different name."

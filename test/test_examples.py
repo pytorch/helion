@@ -2422,6 +2422,38 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfXPU("Timeout on XPU")
     def test_fused_linear_jsd(self):
+        args, expected = self._fused_linear_jsd_case()
+        check_example(
+            "fused_linear_jsd",
+            args,
+            expected,
+            fn_name="fused_linear_jsd_kernel",
+            block_sizes=[64],
+        )
+
+    @skipIfXPU("Timeout on XPU")
+    # Pallas has no reduction_loops: it would rerun the persistent config.
+    @onlyBackends(["triton", "cute"])
+    def test_fused_linear_jsd_rolled(self):
+        """Both softmaxes rolled: reduction_loops=[64] splits the max, sum and
+        consumer passes over each 256-wide row into sweeps of 64 columns."""
+        args, expected = self._fused_linear_jsd_case()
+        check_example(
+            "fused_linear_jsd",
+            args,
+            expected,
+            fn_name="fused_linear_jsd_kernel",
+            emit_code=False,
+            block_sizes=[64],
+            reduction_loops=[64],
+        )
+
+    @staticmethod
+    def _fused_linear_jsd_case() -> tuple[
+        tuple[float, int, float, torch.Tensor, torch.Tensor], torch.Tensor
+    ]:
+        """fused_linear_jsd_kernel's arguments for 64 rows of 256 logits, and
+        the loss of the PyTorch reference."""
         beta = 0.5
         ignore_index = -100
         temperature = 1.0
@@ -2455,14 +2487,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             student_input,
             teacher_input,
         )
-
-        check_example(
-            "fused_linear_jsd",
-            args,
-            expected,
-            fn_name="fused_linear_jsd_kernel",
-            block_sizes=[64],
-        )
+        return args, expected
 
     def test_fused_linear_jsd_flushed_probabilities(self):
         """Rows whose softmax probabilities are fp32 subnormals.

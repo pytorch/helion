@@ -13,8 +13,6 @@ import operator
 from typing import TYPE_CHECKING
 from typing import cast
 
-import torch
-
 from ...language import _decorators
 from ...language.scan_ops import _associative_scan
 from ..ast_extension import create
@@ -55,7 +53,12 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
             state, input_tensor, valid, helper_func_name, bool(is_tuple_input)
         )
     scan_expr = _create_scan_expression(
-        input_tensor, cast("int", dim), helper_func_name, bool(reverse)
+        input_tensor,
+        state.tile_strategy.physical_dim(
+            [*state.proxy_tensor_arg(1).size()], cast("int", dim)
+        ),
+        helper_func_name,
+        bool(reverse),
     )
 
     if is_tuple_input:
@@ -69,14 +72,14 @@ def _scanned_lanes_valid(state: CodegenState, dim: int) -> str | None:
     """The lanes along ``dim`` that hold elements, broadcast to the input's
     shape, or None when every lane does: those inside the mask of the dim's
     block (a reduction dim padded to a power of two, a partial last tile)."""
-    value = state.proxy_arg(1)
-    tensor = value[0] if isinstance(value, (tuple, list)) else value
-    assert isinstance(tensor, torch.Tensor)
+    tensor = state.proxy_tensor_arg(1)
     env = CompileEnvironment.current()
     block = env.resolve_block_id(tensor.size(dim))
     if block is None:
         return None
-    return _tile_mask_expr(state, tensor, (env.canonical_block_id(block),))
+    return _tile_mask_expr(
+        state.device_function, tensor.size(), (env.canonical_block_id(block),)
+    )
 
 
 def _with_validity(

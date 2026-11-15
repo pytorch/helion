@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import collections
 import dataclasses
 import functools
 import itertools
@@ -63,6 +62,7 @@ if TYPE_CHECKING:
     from .cute.lane_loops.statements import LanePlacement
     from .cute.lane_loops.statements import LaneScope
     from .cute.memory_ops import CuteLaneRelocation
+    from .device_ir import DeviceIR
     from .inductor_lowering import CodegenState
     from .lane_loop_context import LaneLoopContext
     from .pallas.dma import DmaResources
@@ -1405,8 +1405,10 @@ class TileStrategy:
     def codegen_preamble(self, state: CodegenState) -> None:
         """Called after a *different* strategy has been used to generate the grid."""
 
-    def compact_shape(self, shapes: list[CompactedShape]) -> list[CompactedShape]:
-        raise NotImplementedError
+    def compacted_block_ids(self) -> list[int]:
+        """The block ids, in order, whose dims a value holds in one dimension
+        (``compacted_dim_groups``); empty where every dim keeps its own."""
+        return []
 
     def _create_block_id_info_dict(
         self,
@@ -2474,15 +2476,21 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
                     if all(c.block_ids != block_ids for c in cands):
                         cands.append(spec)
 
-    def compact_shape(self, shapes: list[CompactedShape]) -> list[CompactedShape]:
-        # Keep axis structure intact for multi-phase kernels (e.g., barrier) to
-        # avoid mismatched ranks in downstream reductions.
-        if len(HostFunction.current().device_ir.root_ids) > 1:
-            return shapes
+    @staticmethod
+    def compacts_tiles(device_ir: DeviceIR) -> bool:
+        """Whether a flattened tile holds its dims in one dimension of a value
+        (``compacted_block_ids``): not in a kernel of more than one root,
+        whose multi-phase structure (e.g., barrier) keeps each dim so that
+        downstream reductions see matching ranks."""
+        return len(device_ir.root_ids) <= 1
+
+    def compacted_block_ids(self) -> list[int]:
+        if not self.compacts_tiles(HostFunction.current().device_ir):
+            return []
 
         env = CompileEnvironment.current()
         # Filter out unit-sized blocks that don't need compacting
-        compact_block_ids = [
+        return [
             block_id
             for block_id in self.block_ids
             if not (
@@ -2490,40 +2498,6 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
                 and env.block_sizes[block_id].size == 1
             )
         ]
-        if not compact_block_ids:
-            return shapes
-
-        output = []
-        shape_queue = collections.deque(shapes)
-        while shape_queue:
-            shape = shape_queue.popleft()
-            # Check if this starts our flattened sequence
-            if len(shape.block_ids) != 1 or shape.block_ids[0] != compact_block_ids[0]:
-                output.append(shape)
-                continue
-
-            # Try to collect the full sequence
-            group_shapes = [shape]
-            found_complete_sequence = True
-            for expected in compact_block_ids[1:]:
-                if (
-                    shape_queue
-                    and len(shape_queue[0].block_ids) == 1
-                    and shape_queue[0].block_ids[0] == expected
-                ):
-                    group_shapes.append(shape_queue.popleft())
-                else:
-                    # Partial match - don't combine
-                    found_complete_sequence = False
-                    output.extend(group_shapes)
-                    break
-
-            if found_complete_sequence:
-                # Full match - combine into one
-                for s in group_shapes[1:]:
-                    shape = shape.combine(s)
-                output.append(shape)
-        return output
 
 
 class _BaseNDTileStrategy(BlockSizeTileStrategy):
@@ -2961,10 +2935,6 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             thread_axis_sizes=tracker.sizes,
             block_thread_axes=tracker.block_axes,
         )
-
-    def compact_shape(self, shapes: list[CompactedShape]) -> list[CompactedShape]:
-        # TODO(jansel): we should combine size==1 dimensions here
-        return shapes
 
 
 class NDTileStrategy(_BaseNDTileStrategy):
@@ -4725,3 +4695,27 @@ class CompactedShape(NamedTuple):
             user_indices=[*self.user_indices, *other.user_indices],
             block_ids=[*self.block_ids, *other.block_ids],
         )
+
+
+def compacted_dim_groups(
+    dim_block_ids: Sequence[Sequence[int]], runs: Iterable[Sequence[int]]
+) -> list[list[int]]:
+    """Group the positions of dims, given each one's block ids, into the
+    dimensions of a value: a complete run of a flattened loop's block ids
+    (``TileStrategy.compacted_block_ids``), in order with one block per dim,
+    is one dimension; every other dim is its own."""
+    # A run of one block groups nothing, and must not shadow a longer run
+    # that starts with the same block.
+    patterns = [[[block_id] for block_id in run] for run in runs if len(run) > 1]
+    groups: list[list[int]] = []
+    start = 0
+    while start < len(dim_block_ids):
+        end = start + 1
+        for pattern in patterns:
+            window = dim_block_ids[start : start + len(pattern)]
+            if [[*block_ids] for block_ids in window] == pattern:
+                end = start + len(pattern)
+                break
+        groups.append([*range(start, end)])
+        start = end
+    return groups

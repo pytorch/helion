@@ -7851,7 +7851,12 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
         # Power-of-two vector widths must divide the actual extent.
         vec = math.gcd(full_vec, extent)
         flatten_group = next(
-            (f for f in spec.flatten_loops if f.block_ids[-1] == vec_block), None
+            (
+                f
+                for f in spec.flatten_loops
+                if f.block_ids[-1] == vec_block and not f.pinned
+            ),
+            None,
         )
         fragments = {s.block_id: s._fragment(spec) for s in spec.block_sizes}
         # Flatten when one axis cannot supply a full CTA of vector packets.

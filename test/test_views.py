@@ -1469,10 +1469,7 @@ def _execute_triton_stack_lowering(values, dim):
             device_function=SimpleNamespace(
                 new_var=lambda name: f"{name}_{next(sequence)}",
                 tile_strategy=SimpleNamespace(
-                    compact_shape=lambda shape: [
-                        SimpleNamespace(user_indices=[axis])
-                        for axis in range(len(shape))
-                    ]
+                    physical_dims=lambda shape: [[axis] for axis in range(len(shape))]
                 ),
             ),
         ),

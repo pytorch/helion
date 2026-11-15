@@ -32,12 +32,15 @@ from torch.fx import map_arg
 from ..autotuner.config_fragment import integer_power_of_two
 from ..language.view_ops import split as hl_split
 from .compile_environment import CompileEnvironment
+from .compile_environment import FixedBlockSizeSource
+from .compile_environment import LoopSpecBlockSizeSource
 from .fx_side_effects import is_impure_node
 from .indexing_strategy import subscript_tile_info
 from .inductor_lowering import APIFuncLowering
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterable
     from collections.abc import Iterator
 
 CUTE_DIM_LOCAL_COORD_META = "cute_dim_local_coords"
@@ -67,22 +70,27 @@ class EpilogueSubtilingCandidate(NamedTuple):
 
 def apply_epilogue_subtiling(
     graph: torch.fx.Graph,
-    split_factor: int = 2,
-    configured_block_sizes: dict[int, int | torch.SymInt] | None = None,
-    descriptor_output_nodes: set[torch.fx.Node] | None = None,
+    split_factor: int,
+    configured_block_sizes: dict[int, int | torch.SymInt],
+    descriptor_output_nodes: set[torch.fx.Node],
+    configured_extents: dict[int, int | None],
 ) -> bool:
-    """Apply epilogue subtiling to the graph in-place."""
+    """Apply epilogue subtiling to the graph in-place.
+
+    ``configured_extents`` gives each configured tile's extent under the
+    config, or None where it stays dynamic
+    (``CompileEnvironment.config_value``): it settles which tiles the split
+    may take (``_find_split_candidate``).
+    """
     if split_factor < 2 or not integer_power_of_two(split_factor):
         raise ValueError(
             f"epilogue_subtile expects a power-of-two >= 2, got {split_factor}"
         )
     env = CompileEnvironment.current()
-    configured_block_sizes = configured_block_sizes or {}
-    descriptor_output_nodes = descriptor_output_nodes or set()
     changed = False
 
     for candidate in _iter_eligible_epilogue_chains(
-        graph, env, split_factor, descriptor_output_nodes
+        graph, env, split_factor, descriptor_output_nodes, configured_extents
     ):
         _rewrite_chain(
             graph,
@@ -99,13 +107,54 @@ def apply_epilogue_subtiling(
 
 
 def has_epilogue_subtiling_candidate(
-    graph: torch.fx.Graph, split_factor: int = 2
+    graphs: Iterable[torch.fx.Graph], split_factor: int = 2
 ) -> bool:
-    """Return whether the graph has at least one eligible epilogue chain."""
+    """Return whether any of ``graphs`` has an eligible epilogue chain.
+
+    Without a config, the extent a tile has under every config decides where
+    there is one: a literal block size, 1 for a dim of size 1
+    (``LoopSpecBlockSizeSource``), or None for a tile no config fixes
+    (``block_size=k`` over a dynamic ``k``), which is never split
+    (``_find_split_candidate``).  The tracing hint decides a tile some config
+    may resize.  Under a config that subtiles, the stores take tensor
+    descriptors (``ConfigSpec.fix_epilogue_subtile_store_indexing``), which
+    also split along a full slice the factor divides; the hint of its extent
+    decides, since a guard on an input's size would specialize the kernel to
+    it.
+    """
+    from ..language.memory_ops import store
+
     if not (integer_power_of_two(split_factor) and split_factor >= 2):
         return False
     env = CompileEnvironment.current()
-    return any(True for _ in _iter_eligible_epilogue_chains(graph, env, split_factor))
+    known_extents: dict[int, int | None] = {}
+    for info in env.block_sizes:
+        if not info.is_tile:
+            continue
+        source = info.block_size_source
+        if isinstance(source, FixedBlockSizeSource):
+            if isinstance(source.value, int):
+                known_extents[info.block_id] = source.value
+            elif not env.config_may_fix(source.value):
+                known_extents[info.block_id] = None
+        elif (
+            isinstance(source, LoopSpecBlockSizeSource)
+            and isinstance(info.size, (int, torch.SymInt))
+            and env.known_equal(info.size, 1)
+        ):
+            known_extents[info.block_id] = 1
+    return any(
+        True
+        for graph in graphs
+        for _ in _iter_eligible_epilogue_chains(
+            graph,
+            env,
+            split_factor,
+            {node for node in graph.nodes if node.target is store},
+            known_extents,
+            slice_divides=lambda size: env.size_hint(size) % split_factor == 0,
+        )
+    )
 
 
 def _iter_eligible_epilogue_chains(
@@ -113,12 +162,19 @@ def _iter_eligible_epilogue_chains(
     env: CompileEnvironment,
     split_factor: int,
     descriptor_output_nodes: set[torch.fx.Node] | None = None,
+    configured_extents: dict[int, int | None] | None = None,
+    slice_divides: Callable[[int | torch.SymInt], bool] | None = None,
 ) -> Iterator[EpilogueSubtilingCandidate]:
-    """Yield eligible store/atomic + pointwise chains that can be split."""
+    """Yield eligible store/atomic + pointwise chains that can be split.
+
+    ``slice_divides`` tests whether the factor divides a full slice's extent
+    (by default exactly, which guards a symbolic extent).
+    """
     from ..language.atomic_ops import atomic_add
     from ..language.memory_ops import store
 
     descriptor_output_nodes = descriptor_output_nodes or set()
+    configured_extents = configured_extents or {}
     for output_node in list(graph.nodes):
         if output_node.op != "call_function" or output_node.target not in (
             store,
@@ -150,7 +206,7 @@ def _iter_eligible_epilogue_chains(
             _find_static_slice_split_candidate(
                 boundary_val,
                 output_node,
-                split_factor,
+                slice_divides or (lambda size: bool(size % split_factor == 0)),
             )
             if output_node in descriptor_output_nodes
             else None
@@ -163,6 +219,7 @@ def _iter_eligible_epilogue_chains(
                 boundary_val,
                 env,
                 split_factor,
+                configured_extents,
             )
             if split_candidate is None:
                 continue
@@ -190,7 +247,11 @@ def _find_output_split_dim(
 
     Returns None if the tile is not indexed directly at exactly one position, or
     if it also feeds a tensor indexer (e.g. ``idx[tile_m]``), which would not be
-    split along with the stored value.
+    split along with the stored value.  Also None when the store reads the
+    tile's index off the size of a value from outside its loop (``sym_size``
+    of a loop input, such as a row total carried into an inner loop): that
+    index lowers to the size itself, not an expression the pieces' indices
+    (``_new_subtile_index_node``) can offset.
     """
     subscript_arg = output_node.args[1]
     if not isinstance(subscript_arg, (list, tuple)):
@@ -208,7 +269,13 @@ def _find_output_split_dim(
             env.get_block_id(size) == block_id for size in val.shape
         ):
             return None
-    return positions[0] if len(positions) == 1 else None
+    if len(positions) != 1:
+        return None
+    (position,) = positions
+    index = cast("torch.fx.Node", subscript_arg[position])
+    if index.target is torch.ops.aten.sym_size.int:
+        return None
+    return position
 
 
 def _rewrite_chain(
@@ -691,27 +758,46 @@ def _find_split_candidate(
     value: torch.Tensor,
     env: CompileEnvironment,
     split_factor: int,
+    configured_extents: dict[int, int | None],
 ) -> tuple[int, int, int | torch.SymInt] | None:
-    """Find a non-reduction, non-jagged tile dim to split."""
+    """Find the tile dim to split: the innermost dim of ``value`` that is a
+    tile, not a reduction dim or a jagged tile, or None.
+
+    The factor must divide the extent the config gives that tile
+    (``configured_extents``, from ``config_value``), whatever its tracing
+    hint: a tile narrower than the factor would split into zero-width pieces
+    that store nothing, and an extent the config leaves dynamic is never
+    split; either keeps the store whole rather than splitting an outer tile
+    dim.  The tracing hint decides a tile without an entry
+    (``has_epilogue_subtiling_candidate``, for a tile some config may
+    resize).
+    """
     for dim in range(value.dim() - 1, -1, -1):
         size = value.size(dim)
         block_id = env.get_block_id(size)
         if (
-            block_id is not None
-            and env.block_sizes[block_id].is_tile
-            and not env.is_jagged_tile(block_id)
-            and size % split_factor == 0
+            block_id is None
+            or not env.block_sizes[block_id].is_tile
+            or env.is_jagged_tile(block_id)
         ):
-            return dim, block_id, size
+            continue
+        if block_id in configured_extents:
+            extent = configured_extents[block_id]
+            if extent is None or extent % split_factor != 0:
+                return None
+        elif size % split_factor != 0:
+            continue
+        return dim, block_id, size
     return None
 
 
 def _find_static_slice_split_candidate(
     value: torch.Tensor,
     output_node: torch.fx.Node,
-    split_factor: int,
+    divides: Callable[[int | torch.SymInt], bool],
 ) -> tuple[int, int, int | torch.SymInt] | None:
-    """Return value dim, subscript position, and size of a full-slice split."""
+    """Return value dim, subscript position, and size of a full-slice split
+    whose extents ``divides`` accepts."""
     subscript_arg = output_node.args[1]
     if not isinstance(subscript_arg, (list, tuple)):
         return None
@@ -747,8 +833,8 @@ def _find_static_slice_split_candidate(
             and subscript.start is None
             and subscript.stop is None
             and subscript.step in (None, 1)
-            and value.size(value_dim) % split_factor == 0
-            and split_size % split_factor == 0
+            and divides(value.size(value_dim))
+            and divides(split_size)
         ):
             candidate = (value_dim, output_dim, split_size)
         tensor_dim += 1

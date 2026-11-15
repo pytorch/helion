@@ -2560,11 +2560,11 @@ class TestIndexing(RefEagerTestBase, TestCase):
         _code, result = code_and_output(bounded_tiles, (x, 40))
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
-    @onlyBackends(["cute"])
     @skipIfRefEager(
         "the tiles kernel sorts and scans each 32-wide tile, so the result depends"
         " on block_sizes, which ref mode does not apply"
     )
+    @skipIfXPU("XPU returns wrong values for these slice sorts")
     def test_sort_and_scan_skip_the_padded_positions(self):
         """Positions past the end of a tile hold no element: a 24-long slice
         on 32 lanes (dynamic shapes) or the 16-element last tile of a 48-wide
@@ -2633,13 +2633,23 @@ class TestIndexing(RefEagerTestBase, TestCase):
             return out
 
         x = torch.randn([40, 64], device=DEVICE)
+        # A sort along a tile dim pins the loop unflattened; the refusal backs
+        # that up for a flattened tile that still reaches it.
+        (spec,) = sort_tiles.bind((x,)).config_spec.flatten_loops
+        self.assertTrue(spec.pinned)
+        flattened = helion.kernel(
+            sort_tiles.fn, autotune_effort="none", static_shapes=True
+        )
         for loop_order in ([1, 0], [0, 1]):
             with (
                 self.subTest(loop_order=loop_order),
+                patch(
+                    "helion._compiler.compile_environment.BlockSizeInfo.pin_unflattened"
+                ),
                 self.assertRaisesRegex(exc.BackendUnsupported, "flattened multi-dim"),
             ):
                 code_and_output(
-                    sort_tiles,
+                    flattened,
                     (x,),
                     block_sizes=[16, 4],
                     flatten_loops=[True],

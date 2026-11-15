@@ -461,6 +461,9 @@ def codegen_unsqueeze(ctx: LoweringContext, node: Node) -> object:
     assert 0 <= dim <= ndim, f"Invalid dim {dim} for tensor with {ndim} dims"
     args = [":"] * ndim
     args.insert(dim, "None")
+    args = ctx.cg.device_function.tile_strategy.physical_keys(
+        node.meta["val"].size(), args
+    )
     return expr_from_string(
         f"{{tensor}}[{', '.join(args)}]",
         tensor=tensor,

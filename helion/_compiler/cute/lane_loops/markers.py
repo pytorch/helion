@@ -541,6 +541,8 @@ def _combine_expr(
         return f"({acc}) + ({val})"
     if reduction_type == "prod":
         return f"({acc}) * ({val})"
+    if reduction_type == "any":
+        return f"({acc}) | ({val})"
     if reduction_type in ("max", "min"):
         from ..math_templates import nan_extremum_expr
 
@@ -741,6 +743,8 @@ def _warp_reduce_expr(reduction_type: str, acc: str, threads_in_group: int) -> s
         return f"cute.arch.warp_reduction(({acc}), _cute_nan_min{tg})"
     if reduction_type == "prod":
         return f"cute.arch.warp_reduction(({acc}), lambda a, b: (a * b){tg})"
+    if reduction_type == "any":
+        return f"cute.arch.warp_reduction(({acc}), lambda a, b: (a | b){tg})"
     raise NotImplementedError(f"lane warp reduce {reduction_type!r}")
 
 
