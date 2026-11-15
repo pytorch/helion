@@ -133,7 +133,11 @@ class TritonBackend(Backend):
         return True
 
     def fast_math_name(self, node: torch.fx.Node) -> str | None:
-        return _TRITON_FAST_MATH.get(node.target) or super().fast_math_name(node)
+        from ..inductor_lowering import functional_target
+
+        return _TRITON_FAST_MATH.get(functional_target(node)) or super().fast_math_name(
+            node
+        )
 
     @property
     def supports_autotune_multi(self) -> bool:

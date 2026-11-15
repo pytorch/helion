@@ -55,6 +55,8 @@ from helion._testing import skipIfNotCUDA
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_native_compile
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_codegen import with_exact_division
+from helion._testing.cute_codegen import without_ieee_division_launch
 from helion._testing.cute_sass import cute_launcher_sass
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import BackendUnsupported
@@ -234,57 +236,71 @@ def _chained_divisions(x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
     return out
 
 
-softmax = helion.kernel(backend="cute", static_shapes=True)(_softmax)
+softmax = helion.kernel(backend="cute", static_shapes=True, cute_exact_division=True)(
+    _softmax
+)
 softmax_plain = helion.kernel(
     backend="cute", static_shapes=True, cute_exact_division=False
 )(_softmax)
-softmax_fast_math = helion.kernel(backend="cute", static_shapes=True, fast_math=True)(
-    _softmax
-)
-jsd = helion.kernel(backend="cute", static_shapes=True)(_jsd)
+softmax_fast_math = helion.kernel(
+    backend="cute", static_shapes=True, fast_math=True, cute_exact_division=True
+)(_softmax)
+jsd = helion.kernel(backend="cute", static_shapes=True, cute_exact_division=True)(_jsd)
 jsd_plain = helion.kernel(
     backend="cute", static_shapes=True, cute_exact_division=False
 )(_jsd)
-rows_div = helion.kernel(backend="cute", static_shapes=True)(_rows_div)
+rows_div = helion.kernel(backend="cute", static_shapes=True, cute_exact_division=True)(
+    _rows_div
+)
 divide_by_scale = helion.kernel(
-    backend="cute", static_shapes=True, autotune_effort="none"
+    backend="cute", static_shapes=True, autotune_effort="none", cute_exact_division=True
 )(_divide_by_scale)
 divide_by_scale_fast_math = helion.kernel(
-    backend="cute", static_shapes=True, autotune_effort="none", fast_math=True
+    backend="cute",
+    static_shapes=True,
+    autotune_effort="none",
+    fast_math=True,
+    cute_exact_division=True,
 )(_divide_by_scale)
-divide_inside_loop = helion.kernel(backend="cute", static_shapes=True)(
-    _divide_inside_loop
-)
-int_divs = helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")(
-    _int_divs
-)
-sum_and_store = helion.kernel(backend="cute", static_shapes=True)(_sum_and_store)
+divide_inside_loop = helion.kernel(
+    backend="cute", static_shapes=True, cute_exact_division=True
+)(_divide_inside_loop)
+int_divs = helion.kernel(
+    backend="cute", static_shapes=True, autotune_effort="none", cute_exact_division=True
+)(_int_divs)
+sum_and_store = helion.kernel(
+    backend="cute", static_shapes=True, cute_exact_division=True
+)(_sum_and_store)
 sum_and_store_plain = helion.kernel(
     backend="cute", static_shapes=True, cute_exact_division=False
 )(_sum_and_store)
-normalize_and_sum = helion.kernel(backend="cute", static_shapes=True)(
-    _normalize_and_sum
-)
+normalize_and_sum = helion.kernel(
+    backend="cute", static_shapes=True, cute_exact_division=True
+)(_normalize_and_sum)
 normalize_and_sum_plain = helion.kernel(
     backend="cute", static_shapes=True, cute_exact_division=False
 )(_normalize_and_sum)
-carried_alias = helion.kernel(backend="cute", static_shapes=True)(_carried_alias)
+carried_alias = helion.kernel(
+    backend="cute", static_shapes=True, cute_exact_division=True
+)(_carried_alias)
 carried_alias_plain = helion.kernel(
     backend="cute", static_shapes=True, cute_exact_division=False
 )(_carried_alias)
-carried_acc = helion.kernel(backend="cute", static_shapes=True)(_carried_acc)
+carried_acc = helion.kernel(
+    backend="cute", static_shapes=True, cute_exact_division=True
+)(_carried_acc)
 carried_acc_plain = helion.kernel(
     backend="cute", static_shapes=True, cute_exact_division=False
 )(_carried_acc)
-rolled_rows_two_sums = helion.kernel(backend="cute", static_shapes=True)(
-    _rolled_rows_two_sums
-)
+rolled_rows_two_sums = helion.kernel(
+    backend="cute", static_shapes=True, cute_exact_division=True
+)(_rolled_rows_two_sums)
 rolled_rows_two_sums_plain = helion.kernel(
     backend="cute", static_shapes=True, cute_exact_division=False
 )(_rolled_rows_two_sums)
-chained_divisions = helion.kernel(backend="cute", static_shapes=True)(
-    _chained_divisions
-)
+chained_divisions = helion.kernel(
+    backend="cute", static_shapes=True, cute_exact_division=True
+)(_chained_divisions)
 chained_divisions_plain = helion.kernel(
     backend="cute", static_shapes=True, cute_exact_division=False
 )(_chained_divisions)
@@ -550,9 +566,11 @@ def _softmax_render(plain: bool = False) -> str:
 
 def _kernel_body(code: str) -> str:
     """The device function text: no module header (imports of helpers used
-    by other kernels rendered in this process can appear there) and no
-    ``# src[...]`` comments (which quote the kernel's own ``/``)."""
-    body = code.split("@cute.kernel", 1)[1]
+    by other kernels rendered in this process can appear there), no
+    ``# src[...]`` comments (which quote the kernel's own ``/``) and no IEEE
+    division compile option on the launch (the kernels here set
+    ``cute_exact_division``; the plain ones they are compared with do not)."""
+    body = without_ieee_division_launch(code.split("@cute.kernel", 1)[1])
     return "\n".join(line for line in body.splitlines() if "# src[" not in line)
 
 
@@ -711,7 +729,9 @@ def test_the_setting_and_the_pass_switch_keep_the_plain_divide(
     assert tuple(fragment.choices) == ("redo", "plain")  # pyrefly: ignore
     monkeypatch.setenv("HELION_DISABLE_HOIST_RECIP", "1")
     code = _render(
-        helion.kernel(backend="cute", static_shapes=True)(_softmax),
+        helion.kernel(backend="cute", static_shapes=True, cute_exact_division=True)(
+            _softmax
+        ),
         (x,),
         **SOFTMAX_CONFIG,
     )
@@ -1847,6 +1867,22 @@ def _sass_loads_and_exponentials(
     )
 
 
+@functools.cache
+def _ieee_kernel(plain: helion.Kernel) -> helion.Kernel:
+    return with_exact_division(plain)
+
+
+def _ieee_plain(plain: helion.Kernel, args: tuple[object, ...], **config: Any) -> Any:
+    """``plain``'s statements with one IEEE ``div.rn`` per element: the
+    kernel under ``cute_exact_division`` at the knob's plain form.  That is
+    the result the redo form must equal bit for bit; without the setting the
+    same ``/`` compiles to ``div.full``, as it does for the kernels of
+    ``test_cute_division_cuda.py``."""
+    return code_and_output(
+        _ieee_kernel(plain), args, **{**config, "cute_exact_div_form": "plain"}
+    )
+
+
 @pytest.mark.cuda
 @skipIfNotCUDA()
 @onlyBackends(["cute"])
@@ -1999,7 +2035,7 @@ class TestExactDivisionCuda(TestCase):
             xh = case.to(torch.float16).to(DEVICE)
             code, out = code_and_output(softmax, (xh,), **SOFTMAX_CONFIG)
             assert REDO in code
-            code0, out0 = code_and_output(softmax_plain, (xh,), **SOFTMAX_CONFIG)
+            code0, out0 = _ieee_plain(softmax_plain, (xh,), **SOFTMAX_CONFIG)
             assert ANY_EXACT not in _kernel_body(code0)
             with self.subTest(case=name):
                 self.assertTrue(
@@ -2029,7 +2065,7 @@ class TestExactDivisionCuda(TestCase):
             args = (0.3, 2.0, student.to(DEVICE), teacher.to(DEVICE))
             code, out = code_and_output(jsd, args, **JSD_CONFIG)
             assert REDO in code and "_helion_exdiv_save_" in code
-            code0, out0 = code_and_output(jsd_plain, args, **JSD_CONFIG)
+            code0, out0 = _ieee_plain(jsd_plain, args, **JSD_CONFIG)
             assert ANY_EXACT not in _kernel_body(code0)
             with self.subTest(case=name):
                 self.assertTrue(
@@ -2088,15 +2124,15 @@ class TestExactDivisionCuda(TestCase):
                 x[tile_m, :] = x[tile_m, :] / s[tile_m][:, None]
             return x
 
-        hoisted = helion.kernel(backend="cute", static_shapes=True)(
-            _normalize_rows_in_place
-        )
+        hoisted = helion.kernel(
+            backend="cute", static_shapes=True, cute_exact_division=True
+        )(_normalize_rows_in_place)
         plain = helion.kernel(
             backend="cute", static_shapes=True, cute_exact_division=False
         )(_normalize_rows_in_place)
         x, s = _hard_rows(DEVICE, RAGGED_ROWS, 1000)
         code, out = code_and_output(hoisted, (x.clone(), s), **ROWS_CONFIG)
-        code0, out0 = code_and_output(plain, (x.clone(), s), **ROWS_CONFIG)
+        code0, out0 = _ieee_plain(plain, (x.clone(), s), **ROWS_CONFIG)
         body = _kernel_body(code)
         assert ANY_EXACT not in body and HOISTED not in body, body
         assert body == _kernel_body(code0)
@@ -2121,11 +2157,11 @@ class TestExactDivisionCuda(TestCase):
         expected[:, :block] = x[:, :block] / s[:, None]
         expected[:, block:] = x[:, block:] / t[:, None]
         self.assertTrue(torch.equal(out.view(torch.int32), expected.view(torch.int32)))
-        _code, out0 = code_and_output(carried_alias_plain, (x, s, t), **NESTED_CONFIG)
+        _code, out0 = _ieee_plain(carried_alias_plain, (x, s, t), **NESTED_CONFIG)
         self.assertTrue(torch.equal(out.view(torch.int32), out0.view(torch.int32)))
         code, out = code_and_output(carried_acc, (x, s), **NESTED_CONFIG)
         assert ANY_EXACT in _kernel_body(code)
-        _code, out0 = code_and_output(carried_acc_plain, (x, s), **NESTED_CONFIG)
+        _code, out0 = _ieee_plain(carried_acc_plain, (x, s), **NESTED_CONFIG)
         self.assertTrue(torch.equal(out.view(torch.int32), out0.view(torch.int32)))
 
     def test_cached_dividends_compile_and_match_for_the_redo_form(
@@ -2136,9 +2172,7 @@ class TestExactDivisionCuda(TestCase):
         registers.  The redo render compiles and matches the plain render
         bit for bit, hard dividends included."""
         x, s = _hard_rows(DEVICE, 64, 2048)
-        code0, (out0, res0) = code_and_output(
-            sum_and_store_plain, (x, s), **NESTED_CONFIG
-        )
+        code0, (out0, res0) = _ieee_plain(sum_and_store_plain, (x, s), **NESTED_CONFIG)
         assert ANY_EXACT not in _kernel_body(code0)
         self.assertTrue(
             torch.equal(out0.view(torch.int32), (x / s[:, None]).view(torch.int32))
@@ -2192,7 +2226,7 @@ class TestExactDivisionCuda(TestCase):
                 k: v for k, v in config.items() if k != "cute_exact_div_form"
             }
             try:
-                code0, out0 = code_and_output(plain, args, **plain_config)
+                code0, out0 = _ieee_plain(plain, args, **plain_config)
             except BackendUnsupported as rejection:
                 with (
                     self.subTest(config=plain_config, rejected=str(rejection)),

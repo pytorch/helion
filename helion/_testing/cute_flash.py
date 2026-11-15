@@ -21,6 +21,7 @@ import dataclasses
 import functools
 import os
 from pathlib import Path
+import re
 import sys
 from typing import TYPE_CHECKING
 from typing import Any
@@ -54,6 +55,8 @@ if TYPE_CHECKING:
     from ..runtime.kernel import Kernel
 
 __all__ = [
+    "APPROX_GATE_DIVISION",
+    "PLAIN_GATE_DIVISION",
     "bind_flash_kernel",
     "compile_and_run",
     "compile_and_source",
@@ -66,6 +69,17 @@ __all__ = [
     "seeds_per_codegen_branch",
     "shared_flash_generation",
 ]
+
+# A fused gated-attention body's gate division: the ``/`` of the plain path
+# (``div.full.f32``, or the IEEE divide under ``cute_exact_division``), and
+# the approximate reciprocal multiply the ``fast_math`` setting selects (with
+# the exp, the lines of the gate program that differ between the two modes).
+PLAIN_GATE_DIVISION = re.compile(r"flash_g\d+ = flash_g\d+ / flash_g\d+$", re.MULTILINE)
+APPROX_GATE_DIVISION = re.compile(
+    r"flash_g\d+ = _helion_flash_rt\.gated_mul_ftz_vec\(flash_g\d+, "
+    r"cute\.math\.rcp\(flash_g\d+, approx=True, ftz=True\)\)$",
+    re.MULTILINE,
+)
 
 _FRAGMENT_CACHE: dict[object, dict[str, Any]] = {}
 _FRAGMENT_VERIFIED: set[object] = set()

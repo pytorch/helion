@@ -1463,6 +1463,13 @@ _MODE_DIVISION_TARGETS: frozenset[object] = frozenset(
 )
 
 
+def functional_target(node: torch.fx.Node) -> object:
+    """``node``'s target, or for an in-place aten op the functional overload
+    it lowers as (``_functional_twins``): ``x.div_(y)`` is ``aten.div.Tensor``
+    to a table keyed by target."""
+    return _functional_twins().get(node.target, node.target)  # pyrefly: ignore [no-matching-overload]
+
+
 def _is_plain_true_division(node: torch.fx.Node) -> bool:
     """Whether ``node`` is a true division whose quotient is the node's result.
 
@@ -1470,7 +1477,7 @@ def _is_plain_true_division(node: torch.fx.Node) -> bool:
     division and remainder lower their quotient into a rounding step inside the
     same node, so an approximate quotient would change the integer result.
     """
-    target = node.target
+    target = functional_target(node)
     if target in _PLAIN_TRUE_DIVISION_TARGETS:
         return True
     if target in _MODE_DIVISION_TARGETS:
@@ -1485,7 +1492,7 @@ def _is_plain_true_division(node: torch.fx.Node) -> bool:
 _FP32_DIVIDED_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
 
-def _rounds_its_quotient(node: torch.fx.Node) -> bool:
+def rounds_its_quotient(node: torch.fx.Node) -> bool:
     """Whether ``node`` divides and then truncates or floors the quotient:
     ``div`` with a rounding mode, which ``//`` and ``floor_divide`` decompose
     to.  One wrong last bit in such a quotient is a whole unit in the result
@@ -1701,7 +1708,7 @@ class GenerateASTFromInductor(DefaultHandler):
         if (
             CompileEnvironment.current().settings.fast_math
             and node is not None
-            and not _rounds_its_quotient(node)
+            and not rounds_its_quotient(node)
         ):
             return self._default("div_rn", (a, b), {})
         exact = self._div_rn(a, b, self._division_dtype())
@@ -1711,17 +1718,16 @@ class GenerateASTFromInductor(DefaultHandler):
         """Divide; under ``fast_math`` the Triton backend takes the approximate divide.
 
         Triton's ``/`` on fp32 is ``div.full.f32`` (2 ulp over the full range,
-        a reciprocal and a multiply).  ``fast_dividef`` is
+        a reciprocal and a multiply), and so is the CuTe backend's
+        (``HelionCuteDSLOpOverrides.truediv``).  ``fast_dividef`` is
         ``div.approx.ftz.f32``: cheaper at the same 2 ulp, but a subnormal
         divisor gives +-inf, a subnormal quotient flushes to zero and a
         divisor above 2**126 gives 0, so it is only emitted when the
-        ``fast_math`` setting opts the kernel into approximations -- the CuTe
-        backend's contract too: IEEE by default, and under the setting
-        ``div.approx.ftz`` for an fp32 quotient (its 16-bit quotients stay
-        exact).  Like Triton's ``/``, the result stays fp32 (half-precision
-        and integer operands are promoted to fp32 first); the consumer casts.
-        TileIR shares the Triton codegen but has no libdevice
-        ``fast_dividef``, so it keeps ``/`` under the setting.
+        ``fast_math`` setting opts the kernel into approximations.  Like
+        Triton's ``/``, the result stays fp32 (half-precision and integer
+        operands are promoted to fp32 first); the consumer casts.  TileIR
+        shares the Triton codegen but has no libdevice ``fast_dividef``, so
+        it keeps ``/`` under the setting.
 
         A quotient its node truncates (``div`` with ``rounding_mode="trunc"``;
         the floor mode's comes through ``div_rn``) is the correctly rounded
@@ -1735,7 +1741,7 @@ class GenerateASTFromInductor(DefaultHandler):
         """
         env = CompileEnvironment.current()
         node = V.current_node
-        if node is not None and _rounds_its_quotient(node):
+        if node is not None and rounds_its_quotient(node):
             dtype = division_dtype(node)
             exact = self._div_rn(a, b, dtype)
             if exact is None:

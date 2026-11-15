@@ -340,7 +340,9 @@ plan-derived constants computed once per plan list), `launch_caches.py`
 `fast_relaunch.py` (`CuteFastRelaunch`), `arg_signature.py`, `tensor_maps.py`,
 `occupancy.py`, `sass_check.py`, `plan_facts.py`.  `standalone_launcher.py`
 runs kernels exported by `helion/_compiler/cute/standalone.py`
-(`Backend.build_standalone_code`) without Helion.
+(`Backend.build_standalone_code`) without Helion; its `_standalone_compile`
+is also how Helion's launcher compiles (`compile_cache.compile_with_options`),
+so the two parse compile options alike.
 
 ## 8. Device helpers and byte-pinned paths
 

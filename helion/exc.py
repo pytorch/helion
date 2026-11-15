@@ -563,12 +563,14 @@ class BlockSizeIgnoredInInterpretMode(BaseWarning):
 class FastMathUnused(BaseWarning):
     message = (
         "This kernel computes {0}, which the fast_math setting lowers to faster "
-        "approximate forms (approximate fp32 division and reciprocal, ex2.approx "
-        "exponentials, approximate erf/rsqrt, and on Triton approximate sigmoid and "
-        "max/min without NaN propagation) that typically change results by a few ulp, "
-        "flush denormals or drop NaNs; without it the exact forms are used. If the "
-        "kernel's consumers tolerate that, set @helion.kernel(fast_math=True) or "
-        "HELION_FAST_MATH=1. Silence with ignore_warnings=[helion.exc.FastMathUnused]."
+        "approximate forms (div.approx fp32 division and reciprocal, ex2.approx "
+        "exponentials, approximate erf/rsqrt, on CuTe also approximate sqrt, log, "
+        "log2, sin, cos and tanh, and on Triton approximate sigmoid and max/min "
+        "without NaN propagation) that typically change results by a few ulp, flush "
+        "denormals or drop NaNs; without it the more accurate forms are used "
+        "(fp32 division is then within 2 ulp). If the kernel's consumers "
+        "tolerate that, set @helion.kernel(fast_math=True) or HELION_FAST_MATH=1. "
+        "Silence with ignore_warnings=[helion.exc.FastMathUnused]."
     )
 
 

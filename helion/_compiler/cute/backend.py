@@ -149,6 +149,24 @@ if TYPE_CHECKING:
 # Integer dtypes narrower than the Int32 the DSL gives a Python int.
 _NARROW_INTEGER_DTYPES = (torch.int8, torch.int16, torch.uint8)
 
+# Operations the ``fast_math`` setting lowers to an approximate fp32
+# instruction on this backend only (``sqrt.approx.ftz`` for the IEEE
+# ``sqrt.rn``; ``lg2.approx.ftz``, ``sin.approx``, ``cos.approx`` and
+# ``tanh.approx`` for libdevice's routines), by the name
+# ``exc.FastMathUnused`` reports them under.  Each is 4% to 9% of a
+# streaming pointwise kernel's time on a B200 (the Triton backend lowers
+# them the same way with or without the setting).  ``softmax``,
+# ``log_softmax``, ``silu`` and the norms reach the warning through the
+# ``exp``, ``log``, ``sqrt`` and division nodes they decompose into.
+_CUTE_FAST_MATH_SENSITIVE_TARGETS: dict[object, str] = {
+    torch.ops.aten.sqrt.default: "sqrt",
+    torch.ops.aten.log.default: "log",
+    torch.ops.aten.log2.default: "log2",
+    torch.ops.aten.sin.default: "sin",
+    torch.ops.aten.cos.default: "cos",
+    torch.ops.aten.tanh.default: "tanh",
+}
+
 
 def _is_negative_zero(value: float | bool) -> bool:
     return type(value) is float and value == 0.0 and math.copysign(1.0, value) < 0
@@ -1693,14 +1711,26 @@ class CuteBackend(Backend):
         # There is no float64 ex2.approx: a float64 exp is cute.math.exp under
         # fast_math too, and a float64 exp2 compiles to the same float64
         # polynomial with or without ``fastmath=True``
-        # (``HelionCuteDSLOpOverrides.exp`` / ``exp2``).  The approximate
-        # division is fp32's alone: a true division of another result dtype
-        # stays IEEE (``HelionCuteDSLOpOverrides.truediv``).
-        name = super().fast_math_name(node)
+        # (``HelionCuteDSLOpOverrides.exp`` / ``exp2``).  ``div.approx.ftz``
+        # is fp32's alone: a true division computed in another dtype keeps
+        # its ``/`` (``HelionCuteDSLOpOverrides.truediv``, which reads
+        # ``division_dtype`` too: ``x.div_(y)`` divides in the dtype its
+        # operands promote to, not the dtype of ``x``).  The operations this
+        # backend alone lowers to an approximate fp32 instruction under the
+        # setting (``_CUTE_FAST_MATH_SENSITIVE_TARGETS``) count for the
+        # 32-bit and 16-bit dtypes computed in fp32.
+        from ..inductor_lowering import division_dtype
+        from ..inductor_lowering import functional_target
+
         val = node.meta.get("val")
-        if isinstance(val, torch.Tensor) and (
-            (name in ("exp", "exp2") and val.dtype == torch.float64)
-            or (name == "fp32 division" and val.dtype != torch.float32)
+        dtype = val.dtype if isinstance(val, torch.Tensor) else None
+        name = super().fast_math_name(node)
+        if name is None:
+            if dtype == torch.float64:
+                return None
+            return _CUTE_FAST_MATH_SENSITIVE_TARGETS.get(functional_target(node))
+        if (name in ("exp", "exp2") and dtype == torch.float64) or (
+            name == "fp32 division" and division_dtype(node) != torch.float32
         ):
             return None
         return name
@@ -3544,9 +3574,10 @@ class CuteBackend(Backend):
                     )
                 # RCP.APPROX + EX2.APPROX, the same sequence triton's default
                 # tl.sigmoid compiles to (one MUFU.EX2 + one MUFU.RCP).  The
-                # base lowering's accurate IEEE div is a ~20-instruction
-                # BRANCHY SASS expansion (BSSY/BSYNC reconvergence per
-                # element) that buys no accuracy here: sigmoid's error is
+                # base lowering's division (``div.full.f32``, or under
+                # ``cute_exact_division`` the IEEE one, a ~20-instruction
+                # BRANCHY SASS expansion with a BSSY/BSYNC reconvergence per
+                # element) buys no accuracy here: sigmoid's error is
                 # dominated by the shared x*log2e argument rounding, and both
                 # forms measure max 64 ulp / mean 3.5 ulp vs an fp64
                 # reference on [-87, 87] (identical distributions), with
@@ -3581,19 +3612,73 @@ class CuteBackend(Backend):
 
             @staticmethod
             def truediv(a: CuteDSLArg, b: CuteDSLArg) -> CuteDSLArg:
-                # cute.math.div lowers to an NVVM intrinsic that only accepts
-                # fp32 scalars; 16/64-bit operands raise at DSL trace time, so
-                # keep the accurate IEEE path for every other dtype.
-                expected = CuteDSLOpOverrides._expected_tensor_val()
-                if (
-                    HelionCuteDSLOpOverrides._fastmath_on()
-                    and expected is not None
-                    and expected.dtype == torch.float32
-                ):
+                """Divide as the Triton backend does.
+
+                A 32-bit or 16-bit float ``/`` is ``div.full.f32``, what
+                Triton's ``/`` compiles to: within 2 ulp over the full range
+                and without a slow path (ptxas scales the operands, takes the
+                divisor's reciprocal and multiplies, and hoists the
+                reciprocal of a loop-invariant divisor itself).  The
+                generated code spells it ``/``: the launcher compiles every
+                CuTe kernel with libNVVM's ``-prec-div=0``
+                (``helion.runtime.cute.compile_cache``), so the divisions the
+                fused templates and the vector lanes emit round the same way.
+                ``Settings.cute_exact_division`` compiles the kernel with the
+                IEEE ``div.rn.f32`` instead, and float64 is IEEE under both.
+
+                Under ``fast_math`` an fp32 quotient is ``div.approx.ftz``
+                (Triton's ``fast_dividef``): an NVVM intrinsic that only
+                accepts fp32 scalars, so the other dtypes keep ``/``.
+
+                A quotient its node truncates or floors is the IEEE one in
+                every mode: one wrong last bit there is a whole unit in the
+                result (``div.full`` gives 33 / 33 just below 1, which
+                truncates to 0).  The shared lowering asks
+                ``CuteHandlerOpOverrides.div_rn`` for it, an intrinsic that
+                no division option and no ``fast_math`` rewrite changes, so
+                such a quotient arrives here only when it is computed in
+                float64 (``division_dtype``: the operands of ``x.div_(y)``
+                with a float64 ``y`` are float64 whatever the dtype of
+                ``x``).  A float64 division is IEEE as it is, but under
+                ``fast_math`` the reciprocal hoist turns a ``/`` by a
+                loop-invariant divisor into a multiply, and 49 * (1 / 49)
+                truncates to 0 in float64 too: this quotient is spelled as
+                the call ``cute.math.div``, the same division, which that
+                pass does not rewrite.
+
+                ``cute.math.div`` takes two operands of one type, and reads
+                a number literal as an fp32 or an int32 where ``/`` converts
+                it: both calls spell their operands in the dtype they divide
+                in (``x / 3`` under ``fast_math`` did not compile).
+                """
+                from torch._inductor.virtualized import V
+
+                from ..inductor_lowering import division_dtype
+                from ..inductor_lowering import rounds_its_quotient
+
+                node = V.current_node
+                dtype = (
+                    division_dtype(node) if isinstance(node, torch.fx.Node) else None
+                )
+                if dtype == torch.float64 and rounds_its_quotient(node):
                     return CuteDSLOpOverrides._apply_binary_op(
-                        a, b, "cute.math.div({a}, {b}, approx=True, ftz=True)"
+                        a,
+                        b,
+                        "cute.math.div(cutlass.Float64({a}), cutlass.Float64({b}))",
+                    )
+                if HelionCuteDSLOpOverrides._fastmath_on() and dtype == torch.float32:
+                    return CuteDSLOpOverrides._apply_binary_op(
+                        a,
+                        b,
+                        "cute.math.div(cutlass.Float32({a}), cutlass.Float32({b}), "
+                        "approx=True, ftz=True)",
                     )
                 return CuteDSLOpOverrides.truediv(a, b)
+
+            @staticmethod
+            # pyrefly: ignore [bad-override]
+            def isinf(x: CuteDSLArg) -> CuteDSLArg:
+                return CuteDSLOpOverrides._apply_unary_op(x, "cute.math.isinf({x})")
 
             @staticmethod
             # pyrefly: ignore [bad-override]

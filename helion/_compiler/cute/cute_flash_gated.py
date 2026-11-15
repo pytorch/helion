@@ -15,13 +15,15 @@ This generalizes the CuTe flash-attention family in three directions:
   and materialized once at the select that consumes them; they also bound the
   KV range of a query tile (columns every row masks are skipped).  Masked
   scores are replaced by 1.0 before the gate runs (their gate values are
-  discarded) so TMA zero fill never sends the IEEE division down its slow
-  path.  ``exp2`` feeding ``c + e`` uses the flush-to-zero ex2 (bit-identical
+  discarded) so TMA zero fill never sends the IEEE division of
+  ``cute_exact_division`` down its slow path.  ``exp2`` feeding ``c + e``
+  uses the flush-to-zero ex2 (bit-identical
   there); ``exp`` is the pointwise lowering's, as in the configs this body
   declines: the exactly reduced ``cute.math.exp``, or ``ex2.approx`` of
   ``x * log2(e)`` under the ``fast_math`` setting.  The division is the
-  pointwise lowering's too: IEEE, or ``div.approx.ftz`` for an fp32 quotient
-  under that setting.
+  pointwise lowering's too: the one the launch compiles ``/`` to
+  (``div.full.f32``, or the IEEE one under ``cute_exact_division``), or
+  ``div.approx.ftz`` for an fp32 quotient under that setting.
 * **Row loads.** Two forms.  *Root form*: Q/K/V/O rows are
   ``x[tile.index + offset, lane, :]`` on a rank-3 host tensor whose leading
   coordinate is a singleton root axis (the head), with a loop-invariant scalar
@@ -2665,7 +2667,7 @@ class _GatedEmitter:
         # Under the existing ``fast_math`` setting the gate uses the hardware
         # ex2 without the denormal fixup and divides fp32 as the pointwise
         # lowering does (``div.approx.ftz``); the default, and the division of
-        # other dtypes, is IEEE.
+        # other dtypes, is the ``/`` the launch compiles.
         self.fast_math = bool(self.env.settings.fast_math)
 
     # -- helpers -----------------------------------------------------------
@@ -2697,7 +2699,8 @@ class _GatedEmitter:
         self.value_section[name] = section
         # Per-element values are ``GATED_CHUNK_COLS``-wide TensorSSA vectors:
         # one statement per node keeps the chunk a straight-line block of
-        # vector arithmetic (the IEEE division stays per element inside it).
+        # vector arithmetic (the IEEE division of ``cute_exact_division``
+        # stays per element inside it).
         self.sections[section].append(f"{name} = {value.expr}")
         return _Value(
             name,
@@ -3165,7 +3168,8 @@ class _GatedEmitter:
         program runs: their gate values are discarded by the select, so the
         result is unchanged, and the substitution keeps zero-filled rows (TMA
         fill past the tensor end gives S = 0, hence a zero dividend) off the
-        IEEE division's slow path, which otherwise serializes the whole warp.
+        slow path of the IEEE division (``cute_exact_division``), which
+        otherwise serializes the whole warp.
         The bitmask statements the select needs are hoisted ahead of the
         first use of the scores; they depend on scalars only.
         """
@@ -3338,13 +3342,18 @@ class _GatedEmitter:
         else:
             assert op == "reciprocal"
             # The pointwise lowering's ``1 / x``: under fast_math, an fp32
-            # div.approx.ftz, which is one rcp.approx.ftz.
-            flags = (
-                ", approx=True, ftz=True"
-                if self.fast_math and dtype == torch.float32
-                else ""
-            )
-            expr = _Value(f"cute.math.rcp({x.expr}{flags})", "f", vec)
+            # div.approx.ftz, which is one rcp.approx.ftz.  Otherwise the
+            # division the launch compiles ``/`` to: the DSL's ``rcp`` of a
+            # vector is that ``1 / x``, and of a scalar the ``rcp.rn``
+            # intrinsic, which the launch's division option does not reach.
+            if self.fast_math and dtype == torch.float32:
+                expr = _Value(
+                    f"cute.math.rcp({x.expr}, approx=True, ftz=True)", "f", vec
+                )
+            elif vec:
+                expr = _Value(f"cute.math.rcp({x.expr})", "f", vec)
+            else:
+                expr = _Value(f"(cutlass.Float32(1.0) / {x.expr})", "f")
         return self._bind(section, _round_to_dtype(expr, dtype))
 
     def store_row_terms(self) -> list[str]:

@@ -48,9 +48,12 @@ def _code(
     *,
     forwarding: bool = True,
     rows: torch.Tensor | None = None,
+    exact_division: bool = False,
     **knobs: object,
 ) -> str:
-    kernel = helion.kernel(fn, backend="cute", static_shapes=True)
+    kernel = helion.kernel(
+        fn, backend="cute", static_shapes=True, cute_exact_division=exact_division
+    )
     with cpu_render_target(reduction_smem_budget_bytes=232448):
         if rows is None:
             rows = torch.empty(64, 1024, dtype=torch.bfloat16)
@@ -115,21 +118,30 @@ def test_a_packet_store_is_forwarded_lane_by_lane(
     # Each thread's eight elements in packets of ``width``: the first sweep
     # flushes the workspace in packets of the values its V-loop's lanes
     # gather, the second loads it one lane at a time in its own V-loop.
-    # Each lane caches its value next to its append (in the first sweep and
-    # in the exact division's copy of it) and reads it back; the unread
-    # flush goes.
-    code = _code(row_softmax_bwd, "register", dtype, cute_vector_widths=[width, 1])
-    assert _workspace_loads(code) == 0
-    assert "probs_ws.iterator" not in code
-    assert code.count(f"asm='{move} $0, $1;'") == 1
-    cache_writes = [
-        line.strip()
-        for line in code.splitlines()
-        if line.strip().startswith("_fuse_cache_")
-        and f"] = cutlass.{element}(v_" in line
-    ]
-    assert len(cache_writes) == 2
-    assert all(f"* {width} + reduction_vec_lane_1]" in line for line in cache_writes)
+    # Each lane caches its value next to its append and reads it back; the
+    # unread flush goes.  Under ``cute_exact_division`` the exact division's
+    # copy of the first sweep caches it too.
+    for exact_division in (False, True):
+        code = _code(
+            row_softmax_bwd,
+            "register",
+            dtype,
+            exact_division=exact_division,
+            cute_vector_widths=[width, 1],
+        )
+        assert _workspace_loads(code) == 0
+        assert "probs_ws.iterator" not in code
+        assert code.count(f"asm='{move} $0, $1;'") == 1
+        cache_writes = [
+            line.strip()
+            for line in code.splitlines()
+            if line.strip().startswith("_fuse_cache_")
+            and f"] = cutlass.{element}(v_" in line
+        ]
+        assert len(cache_writes) == 1 + exact_division
+        assert all(
+            f"* {width} + reduction_vec_lane_1]" in line for line in cache_writes
+        )
 
 
 @pytest.mark.skip(

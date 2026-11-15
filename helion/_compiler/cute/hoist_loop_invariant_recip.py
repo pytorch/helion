@@ -59,10 +59,11 @@ single reciprocal computation.
        v_12 = v_11 / v_9
        v_13 = v_12 / v_9
 
-   and the scalar ``truediv`` lowering emits the full IEEE divide
-   sequence (~20 SASS instructions with a BSSY/BSYNC branch) for every
-   quotient.  The block-local pass rewrites this to one IEEE reciprocal
-   plus one FMUL per quotient::
+   and the scalar ``truediv`` lowering emits one division per quotient:
+   ``div.full.f32`` (an operand scaling, a reciprocal and a multiply), or
+   under ``Settings.cute_exact_division`` the full IEEE divide sequence
+   (~20 SASS instructions with a BSSY/BSYNC branch).  The block-local pass
+   rewrites this to one reciprocal plus one FMUL per quotient::
 
        v_9 = v_7 + v_8
        _helion_inv_div_0 = 1.0 / v_9
@@ -86,7 +87,9 @@ neighbours (at most 1 ulp away from the IEEE division result).  The bound
 assumes ``1 / d`` is a normal fp32 value (roughly ``2**-128 < |d| <=
 2**126``); outside that range the reciprocal can overflow or lose bits
 where the division would not, exactly as for the loop-invariant hoist.
-Both rewrites use only IEEE-rounded ``/`` and ``*``, but they still change
+(The bounds are for the IEEE ``/`` of ``Settings.cute_exact_division``;
+by default ``/`` and the reciprocal are ``div.full.f32``, within 2 ulp
+each.)  Both rewrites use only ``/`` and ``*``, but they still change
 results, and only where they fire: inside a loop for the hoist, and where
 a block repeats a divisor for the sharing.  Which loops and blocks exist
 depends on the config (a lane loop when ``num_threads`` is below the block

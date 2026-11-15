@@ -1056,9 +1056,10 @@ class ConfigSpec:
         # kernel with a matmul; ``cute_tail_peel`` is tunable when there are
         # any (``tail_peel_blocks``).
         self.cute_tail_peel_blocks: frozenset[int] = frozenset()
-        # Set by DeviceIR analysis: an fp32 quotient whose divisor is a
-        # scalar or a broadcast row value (``hoist_loop_invariant_recip``'s
-        # exact hoist can apply), so ``cute_exact_div_form`` is tunable.
+        # Set by DeviceIR analysis under ``Settings.cute_exact_division``: an
+        # fp32 quotient whose divisor is a scalar or a broadcast row value
+        # (``hoist_loop_invariant_recip``'s exact hoist can apply), so
+        # ``cute_exact_div_form`` is tunable.
         self.cute_exact_division_sites = False
         self.cute_pair_lane_math_sites = False
         self.cute_scaled_mma_available = False

@@ -72,12 +72,18 @@ def _bind(
     heads_innermost: bool = True,
     static_shapes: bool = True,
     bias_dtype: torch.dtype = torch.bfloat16,
+    exact_division: bool = False,
 ) -> helion.runtime.kernel.BoundKernel:
     """``bias_softmax`` bound on CPU, in the caller's ``cpu_render_target``,
     to ``[2, heads, queries, keys]`` bf16 scores and a ``bias_dtype`` bias
     laid out heads-innermost (keys-innermost when ``heads_innermost`` is
     false)."""
-    kernel = helion.kernel(bias_softmax, backend="cute", static_shapes=static_shapes)
+    kernel = helion.kernel(
+        bias_softmax,
+        backend="cute",
+        static_shapes=static_shapes,
+        cute_exact_division=exact_division,
+    )
     scores = torch.empty(2, heads, queries, keys, dtype=torch.bfloat16)
     bias = (
         torch.empty(2, queries, keys, heads, dtype=bias_dtype).permute(0, 3, 1, 2)
@@ -104,9 +110,11 @@ def _bias_softmax_seeds(
         return list(bound.config_spec.compiler_seed_configs)
 
 
-def _bias_softmax_code(keys: int = 256, **knobs: object) -> str:
+def _bias_softmax_code(
+    keys: int = 256, *, exact_division: bool = False, **knobs: object
+) -> str:
     with cpu_render_target(reduction_smem_budget_bytes=232448):
-        bound = _bind(keys)
+        bound = _bind(keys, exact_division=exact_division)
         return bound.to_code(
             bound.config_spec.normalized_config(
                 helion.Config(**heads_config(2, keys), **knobs)
@@ -279,7 +287,9 @@ def test_knob_off_keeps_the_rolled_head_loop() -> None:
 
 
 def test_each_lane_keeps_its_own_division_redo() -> None:
-    code = _bias_softmax_code(cute_exact_div_form="redo", cute_grid_lane_jam=True)
+    code = _bias_softmax_code(
+        exact_division=True, cute_exact_div_form="redo", cute_grid_lane_jam=True
+    )
     tree = ast.parse(code)
     redos = [
         node
