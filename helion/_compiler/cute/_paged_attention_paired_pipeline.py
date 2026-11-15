@@ -9,11 +9,18 @@ compute groups. Register quotas stay inside disjoint role branches: 144 for
 compute, 72 for conversion and 48 for all four control warps (61,440 total).
 Optional barrier 5 retires the allocation before output stores: both 128-thread
 compute groups arrive after their final reads and the 32-thread QK role frees it.
+Every role then returns when its own work ends; without that retirement, or
+when the caller needs one common end, all 640 threads join before the release.
+Barrier 6 is the setup rendezvous. The loader warp initializes the pipeline
+barriers and only arrives, so its page stream starts while the other roles
+finish their setup; the QK role owns the query barrier and copies.
 """
 
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
+from typing import NamedTuple
 
 import cutlass
 import cutlass.cute as cute
@@ -208,10 +215,9 @@ def _compute_head(
         if cutlass.const_expr(probability_schedule == "serial"):
             _wait_non_mma(pv_done, step & 1, sleep_waits)
             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-    if cutlass.const_expr(probability_schedule != "serial"):
-        if count > 0:
-            _wait_non_mma(pv_done, (count - 1) & 1, sleep_waits)
-            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+    # The loop leaves the final denominators. In the nonserial schedules its
+    # last PV may still be accumulating O: reduce the denominators inside that
+    # wait, since the reduction reads neither shared P nor O.
     if cutlass.const_expr(probability_schedule == "early_tmem"):
         partials = load_query_panel(denominator_address, query_columns)
     # Transpose row ownership while retaining the exact ascending-XOR sum tree.
@@ -242,6 +248,11 @@ def _compute_head(
                 safe_total, output_reciprocal, output_scale_log2=output_scale_log2
             )
     cute.arch.barrier(barrier_id=1 + pair_head * 2, number_of_threads=128)
+    if cutlass.const_expr(probability_schedule != "serial"):
+        if count > 0:
+            _wait_non_mma(pv_done, (count - 1) & 1, sleep_waits)
+            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+    # O is final once the last PV completed (or was zeroed for an empty range).
     result = load_query_panel(output_address, query_columns)
     prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
     if cutlass.const_expr(early_tmem_retirement):
@@ -455,6 +466,136 @@ def _enqueue_operand_tile(
         )
 
 
+def _pipeline_barriers(value_metadata: bool) -> tuple[tuple[str, int, int], ...]:
+    """The pipeline barriers in block order, as ``(name, width, arrivals)``.
+
+    One barrier per raw ring slot (four) or per head (two), each initialized
+    to ``arrivals``; the value-metadata transport adds its four.
+    """
+    barriers = (
+        ("raw_k_ready", 4, 1),
+        ("raw_k_free", 4, 4),
+        ("raw_v_ready", 4, 1),
+        ("raw_v_free", 4, 128 if value_metadata else 4),
+        ("key_ready", 2, 4),
+        ("key_free", 2, 1),
+        ("value_ready", 2, 4),
+        ("value_free", 2, 1),
+        ("score_free", 2, 4),
+        ("score_ready", 2, 1),
+        ("probability_ready", 2, 4),
+        ("pv_done", 2, 1),
+    )
+    if value_metadata:
+        barriers += (("metadata_ready", 4, 32),)
+    return barriers
+
+
+def _pipeline_barrier_plan(
+    value_metadata: bool,
+) -> tuple[dict[str, int], int, tuple[tuple[tuple[int, int], ...], ...]]:
+    """Where each pipeline barrier lies and how the block is initialized.
+
+    Returns the first slot of every entry of ``_pipeline_barriers``, the
+    block's slot count and its initialization rounds. The block is padded to
+    whole rounds of 32 so that every lane of the initializing warp executes
+    each round's instruction and the rounds never diverge. A round holds the
+    arrival counts of its 32 slots as ``(count - 1, signed lane mask)`` terms.
+    """
+    offsets: dict[str, int] = {}
+    counts: list[int] = []
+    for name, width, arrivals in _pipeline_barriers(value_metadata):
+        offsets[name] = len(counts)
+        counts += [arrivals] * width
+    counts += [1] * (-len(counts) % 32)
+    rounds = []
+    for start in range(0, len(counts), 32):
+        terms = []
+        for value in sorted(set(counts[start : start + 32]) - {1}):
+            mask = sum(1 << lane for lane in range(32) if counts[start + lane] == value)
+            terms.append((value - 1, mask - (1 << 32) if mask >= 1 << 31 else mask))
+        rounds.append(tuple(terms))
+    return offsets, len(counts), tuple(rounds)
+
+
+class _SharedArray(NamedTuple):
+    """One shared-memory array of the paired body: its name there, element
+    type, element count and byte alignment, and the optional part of the
+    body it belongs to (``None``: every body allocates it)."""
+
+    name: str
+    dtype: type[cutlass.Numeric]
+    count: int
+    alignment: int
+    guard: str | None = None
+
+
+def _pipeline_shared_memory(
+    query_columns: int, value_metadata: bool
+) -> tuple[_SharedArray, ...]:
+    """The paired body's shared memory, one entry per array in allocation
+    order.
+
+    Four raw K and four raw V pages of 16 KiB with their scales, the query
+    and probability panels and the per-head state and scratch rows of both
+    heads, the role slot and one block for every pipeline barrier
+    (``_pipeline_barrier_plan``). A query map adds its barrier and the
+    value-metadata transport its flags. The body takes every array from
+    here (``_allocate_pipeline_shared_memory``), so a new array is a new
+    entry, and replaying the entries gives what the body occupies.
+    """
+    panel = 2 * (query_columns * 128)
+    state = 2 * (4 * query_columns)
+    return (
+        _SharedArray("raw_k", cutlass.Int8, 4 * 16384, 1024),
+        _SharedArray("raw_v", cutlass.Int8, 4 * 16384, 1024),
+        _SharedArray("scale_k", cutlass.Uint8, 4 * 512, 128),
+        _SharedArray("scale_v", cutlass.Uint8, 4 * 512, 128),
+        _SharedArray("shared_q_raw", cutlass.BFloat16, panel, 1024),
+        _SharedArray("probability_raw", cutlass.BFloat16, panel, 1024),
+        _SharedArray("state_raw", cutlass.Float32, state, 16),
+        _SharedArray("scratch_raw", cutlass.Float32, state, 16),
+        _SharedArray("slot", cutlass.Int32, 1, 4),
+        _SharedArray(
+            "barriers", cutlass.Int64, _pipeline_barrier_plan(value_metadata)[1], 8
+        ),
+        _SharedArray("query_ready", cutlass.Int64, 1, 8, guard="query_map"),
+        _SharedArray("metadata_flags", cutlass.Int32, 4, 16, guard="value_metadata"),
+    )
+
+
+def _allocate_pipeline_shared_memory(
+    smem: utils.SmemAllocator, arrays: tuple[_SharedArray, ...], parts: frozenset[str]
+) -> SimpleNamespace:
+    """Allocate ``arrays`` in table order for a body with the optional
+    ``parts``: one attribute per array, ``None`` for those of a part the
+    body lacks."""
+    return SimpleNamespace(
+        **{
+            array.name: (
+                smem.allocate_array(
+                    array.dtype, array.count, byte_alignment=array.alignment
+                )
+                if array.guard is None or array.guard in parts
+                else None
+            )
+            for array in arrays
+        }
+    )
+
+
+def _pipeline_parts(query_map: bool, value_metadata: bool) -> frozenset[str]:
+    """The optional parts of a body, as ``_SharedArray.guard`` names them."""
+    return frozenset(
+        name
+        for name, present in (
+            ("query_map", query_map),
+            ("value_metadata", value_metadata),
+        )
+        if present
+    )
+
+
 @cute.jit
 def paged_attention_paired_body(
     q: cute.Tensor,
@@ -504,6 +645,7 @@ def paged_attention_paired_body(
     rowwise_rescale_threshold: cutlass.Constexpr = None,
     early_tmem_retirement: cutlass.Constexpr = False,
     headwide_rescale: cutlass.Constexpr = False,
+    join_before_exit: cutlass.Constexpr = False,
 ) -> None:
     assert cutlass.const_expr(rowwise_rescale_threshold is None or reference_scores)
     assert cutlass.const_expr(v_lag in (0, 1, 2, 3))
@@ -555,74 +697,85 @@ def paged_attention_paired_body(
     if last_page > first_page:
         count = last_page - first_page
     # Dynamic shared allocations reduce address setup across the warp roles.
-    smem = utils.SmemAllocator()
-    raw_k = smem.allocate_array(cutlass.Int8, 4 * 16384, byte_alignment=1024)
-    raw_v = smem.allocate_array(cutlass.Int8, 4 * 16384, byte_alignment=1024)
-    scale_k = smem.allocate_array(cutlass.Uint8, 4 * 512, byte_alignment=128)
-    scale_v = smem.allocate_array(cutlass.Uint8, 4 * 512, byte_alignment=128)
+    # ``_pipeline_shared_memory`` lists them; the body allocates nothing else.
+    shared = _allocate_pipeline_shared_memory(
+        utils.SmemAllocator(),
+        _pipeline_shared_memory(query_columns, value_metadata_scales is not None),
+        _pipeline_parts(query_map is not None, value_metadata_scales is not None),
+    )
+    raw_k = shared.raw_k
+    raw_v = shared.raw_v
+    scale_k = shared.scale_k
+    scale_v = shared.scale_v
     raw_layout = cute.make_composed_layout(
         cute.make_swizzle(3, 4, 3), 0, cute.make_layout((128, 128), stride=(128, 1))
     )
     scale_layout = cute.make_layout((128, 4), stride=(4, 1))
-    shared_q_raw = smem.allocate_array(
-        cutlass.BFloat16, 2 * (query_columns * 128), byte_alignment=1024
+    shared_q_raw = shared.shared_q_raw
+    probability_raw = shared.probability_raw
+    state_raw = shared.state_raw
+    scratch_raw = shared.scratch_raw
+    slot = shared.slot
+    # One block holds every pipeline barrier so the loader warp can initialize
+    # it with one instruction per 32 barriers: lane L owns barrier 32 * r + L.
+    barrier_offsets, _barrier_count, barrier_rounds = _pipeline_barrier_plan(
+        value_metadata_scales is not None
     )
-    probability_raw = smem.allocate_array(
-        cutlass.BFloat16, 2 * (query_columns * 128), byte_alignment=1024
-    )
-    state_raw = smem.allocate_array(
-        cutlass.Float32, 2 * (4 * query_columns), byte_alignment=16
-    )
-    scratch_raw = smem.allocate_array(
-        cutlass.Float32, 2 * (4 * query_columns), byte_alignment=16
-    )
-    slot = smem.allocate_array(cutlass.Int32, 1, byte_alignment=4)
-    raw_k_ready = smem.allocate_array(cutlass.Int64, 4, byte_alignment=8)
-    raw_k_free = smem.allocate_array(cutlass.Int64, 4, byte_alignment=8)
-    raw_v_ready = smem.allocate_array(cutlass.Int64, 4, byte_alignment=8)
-    raw_v_free = smem.allocate_array(cutlass.Int64, 4, byte_alignment=8)
-    key_ready = smem.allocate_array(cutlass.Int64, 2, byte_alignment=8)
-    key_free = smem.allocate_array(cutlass.Int64, 2, byte_alignment=8)
-    value_ready = smem.allocate_array(cutlass.Int64, 2, byte_alignment=8)
-    value_free = smem.allocate_array(cutlass.Int64, 2, byte_alignment=8)
-    score_free = smem.allocate_array(cutlass.Int64, 2, byte_alignment=8)
-    score_ready = smem.allocate_array(cutlass.Int64, 2, byte_alignment=8)
-    probability_ready = smem.allocate_array(cutlass.Int64, 2, byte_alignment=8)
-    pv_done = smem.allocate_array(cutlass.Int64, 2, byte_alignment=8)
-    query_ready = None
-    if cutlass.const_expr(query_map is not None):
-        query_ready = smem.allocate_array(cutlass.Int64, 1, byte_alignment=8)
+    barriers = shared.barriers
+    raw_k_ready = barriers + barrier_offsets["raw_k_ready"]
+    raw_k_free = barriers + barrier_offsets["raw_k_free"]
+    raw_v_ready = barriers + barrier_offsets["raw_v_ready"]
+    raw_v_free = barriers + barrier_offsets["raw_v_free"]
+    key_ready = barriers + barrier_offsets["key_ready"]
+    key_free = barriers + barrier_offsets["key_free"]
+    value_ready = barriers + barrier_offsets["value_ready"]
+    value_free = barriers + barrier_offsets["value_free"]
+    score_free = barriers + barrier_offsets["score_free"]
+    score_ready = barriers + barrier_offsets["score_ready"]
+    probability_ready = barriers + barrier_offsets["probability_ready"]
+    pv_done = barriers + barrier_offsets["pv_done"]
+    # ``None`` without a query map.
+    query_ready = shared.query_ready
     metadata_flags = None
     metadata_ready = None
     if cutlass.const_expr(value_metadata_scales is not None):
-        metadata_flags = cute.make_tensor(
-            smem.allocate_array(cutlass.Int32, 4, byte_alignment=16),
-            cute.make_layout((4,)),
-        )
-        metadata_ready = smem.allocate_array(cutlass.Int64, 4, byte_alignment=8)
-    if thread == 0:
-        if cutlass.const_expr(query_map is not None):
-            prims.mbarrier_init(query_ready, 1)
-        for ring in cutlass.range_constexpr(4):
-            prims.mbarrier_init(raw_k_ready + ring, 1)
-            prims.mbarrier_init(raw_k_free + ring, 4)
-            prims.mbarrier_init(raw_v_ready + ring, 1)
-            if cutlass.const_expr(value_metadata_scales is not None):
-                prims.mbarrier_init(raw_v_free + ring, 128)
-                assert metadata_ready is not None
-                prims.mbarrier_init(metadata_ready + ring, 32)
-            else:
-                prims.mbarrier_init(raw_v_free + ring, 4)
-        for head in cutlass.range_constexpr(2):
-            prims.mbarrier_init(key_ready + head, 4)
-            prims.mbarrier_init(value_ready + head, 4)
-            prims.mbarrier_init(key_free + head, 1)
-            prims.mbarrier_init(value_free + head, 1)
-            prims.mbarrier_init(score_free + head, 4)
-            prims.mbarrier_init(score_ready + head, 1)
-            prims.mbarrier_init(probability_ready + head, 4)
-            prims.mbarrier_init(pv_done + head, 1)
+        metadata_flags = cute.make_tensor(shared.metadata_flags, cute.make_layout((4,)))
+        metadata_ready = barriers + barrier_offsets["metadata_ready"]
+    if warp == 17:
+        # The loader starts the page stream without waiting for the other
+        # roles, so it initializes the barriers that stream needs itself.
+        for init_round in cutlass.range_constexpr(len(barrier_rounds)):
+            expected = cutlass.Int32(1)
+            for term in cutlass.range_constexpr(len(barrier_rounds[init_round])):
+                extra, lanes = barrier_rounds[init_round][term]
+                expected = expected + extra * ((cutlass.Int32(lanes) >> lane) & 1)
+            prims.mbarrier_init(barriers + (32 * init_round + lane), expected)
         prims.fence_mbarrier_init()
+        # Lane zero alone issues the page stream, against barriers the other
+        # lanes initialized, and program order relates only one thread's own
+        # operations: join the warp behind every lane's fence first, as the
+        # conversion warps do before a lane-zero action.
+        cute.arch.sync_warp()
+    if warp == 16:
+        # The whole warp allocates before any of its lanes takes another path.
+        prims.tcgen05_alloc(slot, 512, group=prims.CTAGroup.CTA_1)
+        prims.tcgen05_relinquish_alloc_permit(group=prims.CTAGroup.CTA_1)
+        if cutlass.const_expr(query_map is not None):
+            # Only the QK issuer waits for shared Q, so its warp owns that
+            # barrier and the copies; the setup rendezvous below publishes
+            # the barrier to the warp's other lanes.
+            if lane == 0:
+                assert query_ready is not None
+                prims.mbarrier_init(query_ready, 1)
+                prims.fence_mbarrier_init()
+                enqueue_paged_query(
+                    query_map,
+                    shared_q_raw,
+                    query_ready,
+                    request,
+                    first_head,
+                    query_columns,
+                )
     if thread < 2 * query_columns:
         h = thread // query_columns
         query = thread % query_columns
@@ -663,23 +816,30 @@ def paged_attention_paired_body(
                         io_layouts,
                     )
                 shared_q[offset] = value
-    elif thread == 0:
-        enqueue_paged_query(
-            query_map, shared_q_raw, query_ready, request, first_head, query_columns
-        )
-    if warp == 16:
-        prims.tcgen05_alloc(slot, 512, group=prims.CTAGroup.CTA_1)
-        prims.tcgen05_relinquish_alloc_permit(group=prims.CTAGroup.CTA_1)
     cute.arch.fence_proxy(kind="async.shared", space="cta")
-    cute.arch.barrier()
+    # Setup rendezvous. The loader only arrives: each of its lanes initialized
+    # and fenced its barriers and the warp then synchronized above, so lane
+    # zero's stream follows every lane's initialization; it reads no state
+    # another role prepares (not the TMEM base, the row state or shared Q);
+    # and every consumer of what it loads waits on one of those barriers. The
+    # other 608 threads proceed only after all 640 arrivals, each of which
+    # follows its lane's fence, hence after the loader's initialization.
+    # The QK role's allocation writes the TMEM slot, so only a thread that
+    # waited here reads it: the loader, which has no use for the base, would
+    # race with that write.
+    base = cutlass.Int32(0)
+    if warp == 17:
+        prims.barrier_cta_arrive(6, thread_count=640)
+    else:
+        prims.barrier_cta_sync(6, thread_count=640)
+        base = cute.make_tensor(slot, cute.make_layout((1,)))[0]
     if cutlass.const_expr(query_map is not None):
-        # Only the QK issuer consumes shared Q. Other roles may start KV loads
-        # after the CTA initialization barrier. Empty KV loops still wait here
-        # before the final CTA join retires the outstanding query copies.
+        # Only the QK issuer consumes shared Q; the other roles start on KV
+        # without it. Empty KV loops still wait here, so the query copies
+        # have landed before this role frees TMEM and returns.
         if warp == 16:
             mbar_wait(query_ready, cutlass.Int32(0))
             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-    base = cute.make_tensor(slot, cute.make_layout((1,)))[0]
     if warp < 8:
         head = cute.arch.make_warp_uniform(warp // 4)
         probability = cute.make_tensor(
@@ -837,7 +997,8 @@ def paged_attention_paired_body(
                         )
             if cutlass.const_expr(early_tmem_retirement):
                 # One allocation-wide phase: two compute groups plus this warp.
-                # Keep zero-page tiles and the full final CTA join unchanged.
+                # Zero-page tiles take the same path: each compute group
+                # arrives after reading its zeroed panel.
                 prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
                 prims.barrier_cta_sync(5, thread_count=288)
                 prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
@@ -1013,7 +1174,14 @@ def paged_attention_paired_body(
                             sleep_waits,
                             read_overlap=value_metadata_read_overlap,
                         )
-    cute.arch.barrier()
+    # With the allocation retired above, nothing else needs a common end: the
+    # conversion warps consumed every raw tile, the issuers' MMAs completed
+    # before the last O read, and the QK role waited for the query copies and
+    # frees TMEM itself. Joining would only keep finished warps resident until
+    # the last store. A caller that releases dependents after the body
+    # (``join_before_exit``) still gets one common end.
+    if cutlass.const_expr(join_before_exit or not early_tmem_retirement):
+        cute.arch.barrier()
     if cutlass.const_expr(not early_tmem_retirement):
         if warp == 16:
             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)

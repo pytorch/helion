@@ -43,6 +43,7 @@ from .cute_mma_dag import MMA_DAG_V_LAG_KEY
 from .cute_mma_dag import MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY
 from .cute_mma_dag import MMA_DAG_VALUE_METADATA_SKIP_KEY
 from .cute_mma_dag import MMA_DAG_WARPS_KEY
+from .cute_mma_dag import paged_attention_early_retirement_default
 from .cute_mma_dag import paged_attention_pass_warps_reason
 from .cute_mma_dag import paged_attention_probability_choices
 from .cute_mma_dag import paged_attention_v_lag_choices
@@ -105,7 +106,10 @@ def paged_attention_config_reason(
         sleep_waits and pass_warps != MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
     ):
         return f"{MMA_DAG_SLEEP_WAITS_KEY} requires the paired schedule and a bool"
-    early_tmem_retirement = config.get(MMA_DAG_EARLY_TMEM_RETIREMENT_KEY, False)
+    early_tmem_retirement = config.get(
+        MMA_DAG_EARLY_TMEM_RETIREMENT_KEY,
+        paged_attention_early_retirement_default(pass_warps),
+    )
     if type(early_tmem_retirement) is not bool or (
         early_tmem_retirement and pass_warps != MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
     ):

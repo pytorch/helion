@@ -51,13 +51,22 @@ def paired_v_lag_config(lag: object) -> helion.Config:
 
 
 def without_retirement_seeds(seeds: list[helion.Config]) -> list[helion.Config]:
-    """Check the independent retirement suffix and return the prior seed prefix."""
+    """Check the independent retirement suffix and return the prior seed prefix.
+
+    Paired seeds spell out the schedule's default (early retirement), the
+    other schedules have no such knob; the suffix holds one paired counterpart
+    per V lag that keeps the final join instead.
+    """
     count = len(MMA_DAG_V_LAG_CHOICES)
     assert len(seeds) > count
     prefix, suffix = seeds[:-count], seeds[-count:]
     key = "cute_mma_dag_early_tmem_retirement"
-    assert not any(seed.get(key, False) for seed in prefix)
-    assert all(seed.get(key) is True for seed in suffix)
+    for seed in prefix:
+        if seed.get("cute_mma_dag_pass_warps") == "attention_paired":
+            assert seed.get(key) is True
+        else:
+            assert key not in seed.config
+    assert all(seed.get(key) is False for seed in suffix)
     assert (
         tuple(seed.get("cute_mma_dag_v_lag", 0) for seed in suffix)
         == MMA_DAG_V_LAG_CHOICES
@@ -99,8 +108,7 @@ def check_paired_v_lag_replay(
     )
     config = paired_v_lag_config(lag)
     config.config["block_sizes"] = [helion.next_power_of_2(query_len * 8)]
-    if early_tmem_retirement:
-        config.config["cute_mma_dag_early_tmem_retirement"] = True
+    config.config["cute_mma_dag_early_tmem_retirement"] = early_tmem_retirement
     source = bound.to_code(config)
     assert "paged_attention_paired_body(" in source
     assert ("early_tmem_retirement=True" in source) == early_tmem_retirement

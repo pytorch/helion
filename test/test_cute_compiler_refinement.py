@@ -224,7 +224,7 @@ def test_real_paired_surface_crosses_retirement_and_v_lag_only_on_paired_parents
             for pipeline in ("default", "opt2")
             for retire in (False, True)
             for lag in range(4)
-        } - {("default", False, 0)}
+        } - {("default", True, 0)}  # the parent: paired retirement defaults on
         selected = next(
             candidate
             for candidate in candidates

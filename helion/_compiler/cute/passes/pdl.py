@@ -129,17 +129,7 @@ def prepare_device_body(
             late_wait_names = _late_pdl_wait_names(fn)
             if late_wait_names:
                 dependent_launch = []
-            placement = (
-                "none"
-                if fn.cute_state.tcgen05.pdl_entry_wait
-                else fn.config.config.get("cute_pdl_release", CUTE_PDL_RELEASE_DEFAULT)
-            )
-            if placement == "loader_tail" and capture_mode is None:
-                # A later effect proof can decline the normalized capture
-                # route. Keep an ordinary entry wait and automatic release.
-                placement = "auto"
-            if placement == "auto":
-                placement = _implicit_pdl_release(fn, "entry")
+            placement = _pdl_release_placement(fn)
             release = statement_from_string(
                 "cute.arch.griddepcontrol_launch_dependents()"
             )
@@ -165,6 +155,44 @@ def prepare_device_body(
     if fn.cute_state.tcgen05.pdl_entry_wait:
         body = _tcgen05_early_pdl_release(fn, body)
     return body, late
+
+
+def _pdl_release_placement(fn: DeviceFunction) -> str:
+    """Where a kernel ``cute_pdl`` shapes releases its own dependents:
+    ``cute_pdl_release`` with ``auto`` resolved for this launch
+    (``_implicit_pdl_release``).  The tcgen05 entry-wait path places its
+    releases itself (``_tcgen05_early_pdl_release``): ``none`` here."""
+    placement = "none"
+    if not fn.cute_state.tcgen05.pdl_entry_wait:
+        placement = cast(
+            "str", fn.config.config.get("cute_pdl_release", CUTE_PDL_RELEASE_DEFAULT)
+        )
+    if placement == "loader_tail" and not fn.cute_state.lanes.pdl_loader_tail_release:
+        # Only the proved paired body places this release, and its codegen
+        # records where it does.  Everywhere else (a later effect proof can
+        # decline the normalized capture route) the kernel keeps an ordinary
+        # entry wait and the automatic release.
+        placement = "auto"
+    if placement == "auto":
+        placement = _implicit_pdl_release(fn, "entry")
+    return placement
+
+
+def exit_release_applies(fn: DeviceFunction) -> bool:
+    """Whether ``prepare_device_body`` puts this kernel's release behind the
+    body's last statement (``cute_pdl_release: exit`` on a kernel ``cute_pdl``
+    shapes).
+
+    Every thread runs that release, so the first one to finish triggers the
+    dependents.  A lowering whose threads finish at different times asks
+    while it renders its root and keeps one common end for it (the paired
+    attention body's final join).  What codegen adds after the question only
+    takes the generic release away (a tcgen05 entry wait, a native
+    ``use_pdl`` plan, a body that triggers its dependents itself) and never
+    moves it to the exit, so every kernel that gets the exit release was
+    answered True.
+    """
+    return pdl_applies(fn) and _pdl_release_placement(fn) == "exit"
 
 
 def place_late_wait(body: list[ast.stmt], late: LateWait) -> list[ast.stmt]:

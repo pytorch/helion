@@ -24,8 +24,10 @@ def _paired_config(key, value):
 
 @pytest.mark.parametrize(
     "key,value",
-    # Each lag is a distinct compiled drain; both Boolean endpoints cover
-    # omitted/default and enabled code generation independently for each knob.
+    # Each lag is a distinct compiled drain. Each Boolean knob is named with
+    # both values, so its off and its on code generation are covered whichever
+    # of them a config that omits it gets: off for the sleep waits and the
+    # query TMA, on for the early retirement of the paired schedule.
     [(LAG, lag) for lag in range(4)]
     + [(key, value) for key in (SLEEP, QUERY, RETIREMENT) for value in (False, True)],
 )

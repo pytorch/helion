@@ -52,8 +52,7 @@ def check_probability_schedule_replay(
             cute_pdl=True,
             cute_pdl_capture_overlap=True,
         )
-    if early_tmem_retirement:
-        config.config["cute_mma_dag_early_tmem_retirement"] = True
+    config.config["cute_mma_dag_early_tmem_retirement"] = early_tmem_retirement
     source = bound.to_code(config)
     assert "paged_attention_paired_body(" in source
     assert f"probability_schedule={schedule!r}" in source

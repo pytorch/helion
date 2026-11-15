@@ -261,6 +261,14 @@ def paged_attention_v_lag_choices(
     return (0,)
 
 
+def paged_attention_early_retirement_default(pass_warps: object) -> bool:
+    """Whether a config that leaves ``cute_mma_dag_early_tmem_retirement`` out
+    retires the allocation early: the paired schedule does, and no other body
+    has that phase. Normalization, a flattened config's default, the config
+    contract and the planner all take the default from here."""
+    return pass_warps == MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
+
+
 def paged_attention_probability_choices(
     facts: CuteMmaDagFacts, pass_warps: object
 ) -> tuple[str, ...]:

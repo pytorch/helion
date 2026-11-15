@@ -32,6 +32,7 @@ from .cute_mma_dag import MMA_DAG_V_LAG_CHOICES
 from .cute_mma_dag import MMA_DAG_V_LAG_KEY
 from .cute_mma_dag import MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY
 from .cute_mma_dag import MMA_DAG_VALUE_METADATA_SKIP_KEY
+from .cute_mma_dag import paged_attention_early_retirement_default
 from .memory_ops import cute_tensor_base_is_aligned
 from .native_s2f6_contract import NATIVE_S2F6_TARGETS
 
@@ -210,7 +211,10 @@ def plan_paged_attention_schedule(
     sleep_waits = config.get(MMA_DAG_SLEEP_WAITS_KEY, False)
     if type(sleep_waits) is not bool or (sleep_waits and not paired_items):
         return None
-    early_tmem_retirement = config.get(MMA_DAG_EARLY_TMEM_RETIREMENT_KEY, False)
+    early_tmem_retirement = config.get(
+        MMA_DAG_EARLY_TMEM_RETIREMENT_KEY,
+        paged_attention_early_retirement_default(pass_warps),
+    )
     if type(early_tmem_retirement) is not bool or (
         early_tmem_retirement and not paired_items
     ):
@@ -369,10 +373,11 @@ def _paged_attention_schedule_facts(
     ):
         # The native head vote must not include a padded register row.
         return None
-    # Two heads double the resident raw/Q/P/state panels. The 180 KiB
-    # conservative aligned budget includes the optional query barrier and
-    # 48 bytes of value metadata flags/barriers. The largest (40-query)
-    # panel uses less than 180,000 bytes including both optional allocations.
+    # Two heads double the resident raw/Q/P/state panels. Every layout of the
+    # paired body (each panel width, with and without the query barrier and
+    # the value metadata's barriers and flags) fits the 180 KiB required
+    # here: test_paired_shared_memory_stays_inside_its_budget replays the
+    # body's allocations and holds the byte counts.
     paired_items = (not capacity or capacity >= 184320) and (
         paired_attention_item_axis(env, transport) is not None
     )

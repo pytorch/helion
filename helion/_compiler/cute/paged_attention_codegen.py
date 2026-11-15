@@ -19,6 +19,7 @@ from .cute_mma_dag_emitter_base import _Evaluator
 from .fx_matcher import _is_call
 from .paged_attention_transport import paged_attention_launch_warps
 from .paged_attention_transport import paged_attention_tma_accesses
+from .passes.pdl import exit_release_applies
 from .pdl_release import CUTE_PDL_CAPTURE_RELEASE_CHOICES
 from .pdl_release import CUTE_PDL_RELEASE_DEFAULT
 from .state import cute_codegen_state
@@ -178,6 +179,7 @@ def codegen_paged_attention(cg: GenerateAST, schedule: PagedAttentionSchedule) -
         wrapper["capture_pdl_contract"] = "paired-output-stores-v1"
         mode_arg = f", capture_pdl_wait_mode={mode}"
         if df.config.config.get("cute_pdl_release") == "loader_tail":
+            df.cute_state.lanes.pdl_loader_tail_release = True
             mode_arg += ", capture_release_tail=True"
     coords = semantic.coordinates
     coordinate_dtype = "Int64" if coords.key_dtype == torch.int64 else "Int32"
@@ -194,6 +196,10 @@ def codegen_paged_attention(cg: GenerateAST, schedule: PagedAttentionSchedule) -
         panel_arg += ", sleep_waits=True"
     if schedule.paired_items and schedule.early_tmem_retirement:
         panel_arg += ", early_tmem_retirement=True"
+        if exit_release_applies(df):
+            # The generic exit release follows the body in every thread: keep
+            # one common end so no finished role releases the dependents early.
+            panel_arg += ", join_before_exit=True"
     if schedule.probability_schedule != MMA_DAG_PROBABILITY_SCHEDULE_SERIAL:
         assert schedule.paired_items and semantic.score_reference is not None
         panel_arg += f", probability_schedule={schedule.probability_schedule!r}"
