@@ -113,16 +113,13 @@ def _(state: CodegenState) -> ast.AST:
 
 @_decorators.codegen(load, "triton")
 def _(state: CodegenState) -> ast.AST:
-    # A store to this tensor earlier in the same loop body followed by this load
-    # is a cross-thread read-after-write on global memory; emit a barrier so the
-    # store is visible before the read (see mark_intra_loop_raw_barriers).
-    from ..loop_dependency_checker import INTRA_LOOP_RAW_BARRIER_META
+    # A store or an atomic to this tensor earlier in the same loop body followed
+    # by this load is a cross-thread read-after-write on global memory; emit a
+    # barrier so the write is visible before the read (see
+    # mark_intra_loop_raw_barriers).
+    from ..loop_dependency_checker import emit_intra_loop_raw_barrier
 
-    if state.fx_node is not None and state.fx_node.meta.get(
-        INTRA_LOOP_RAW_BARRIER_META
-    ):
-        for statement in state.device_function.cta_barrier():
-            state.add_statement(statement)
+    emit_intra_loop_raw_barrier(state)
 
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)

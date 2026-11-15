@@ -72,7 +72,8 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
         keywords=[],
     )
 
-    # Handle multiple outputs by creating getitem expressions
+    # Handle multiple outputs by creating getitem expressions of one call,
+    # which asm not declared pure keeps even when nothing reads them
     if has_multiple_outputs:
         assert isinstance(dtype, (tuple, list))  # Type guard for len()
         num_outputs = len(dtype)

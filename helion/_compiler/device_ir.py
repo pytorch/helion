@@ -61,6 +61,7 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .ast_read_writes import ReadWrites
 from .aten_lowering import resolve_reduction_sizes
+from .aten_lowering import restate_reduction_extents
 from .backend import DeviceIRStage
 from .compile_environment import CompileEnvironment
 from .compile_environment import warning
@@ -932,12 +933,11 @@ class WhileLoopGraphInfo(NodeArgsGraphInfo):
             state.codegen.divergent_control_flow(),
             state.codegen.set_statements(body_statements),
         ):
-            outputs = codegen_call_with_graph(
-                state.codegen,
-                self.graph,
-                args,
-                copy_named_args=False,
-            )
+            # The body reads copies of its inputs, as a for loop's body does:
+            # the merges after the loop give an input's name to its updated
+            # value, which the body may compute before its last read of the
+            # input.
+            outputs = codegen_call_with_graph(state.codegen, self.graph, args)
             loop_condition_update: list[ast.AST] = []
             cond_expr_loop = emit_condition(loop_condition_update)
         body_statements.extend(loop_condition_update)
@@ -2021,17 +2021,35 @@ class WalkDeviceAST(NodeVisitor):
         writes: dict[str, int],
         include_new: bool = False,
     ) -> LiftGraphArgs:
-        return LiftGraphArgs(
-            {
-                k: v
-                for k, v in subgraph_scope.items()
-                if k in writes
-                and (include_new or k in self.scope)
-                and self.scope.get(k) is not v
-                # Host tensors bound in the body (e.g. `for peer in peers`) stay static.
-                and not (isinstance(v, torch.Tensor) and not self.should_become_arg(v))
-            }
-        )
+        outputs = {
+            k: v
+            for k, v in subgraph_scope.items()
+            if k in writes
+            and (include_new or k in self.scope)
+            and self.scope.get(k) is not v
+            # Host tensors bound in the body (e.g. `for peer in peers`) stay static.
+            and not (isinstance(v, torch.Tensor) and not self.should_become_arg(v))
+        }
+        # Each output gets its own variable, or the ``_phi`` merges after the
+        # loop or branch would make the names one: an in-place method returns
+        # its receiver (``result = acc.add_(1)`` binds both names to one
+        # tensor), and a ``while`` body traces the tensors bound outside it,
+        # which the loop's outputs are then tracked onto.
+        claimed = [*self.scope.values()]
+        for k, v in outputs.items():
+            if isinstance(v, torch.Tensor) and not isinstance(v, Tile):
+                if any(v is w for w in claimed):
+                    outputs[k] = _new_var(v)
+                claimed.append(v)
+        return LiftGraphArgs(outputs)
+
+    @staticmethod
+    def _rebound(rw: ReadWrites) -> dict[str, int]:
+        """The names ``rw``'s statements rebind: assigned ones and the tensors
+        an in-place method mutates (``acc.add_(x)``), which ``make_fx`` rebinds
+        to the in-place node's output, so a loop or branch must carry them out
+        as it does an assigned value."""
+        return {**rw.method_writes, **rw.writes}
 
     @staticmethod
     def _rw_names(rw: ReadWrites) -> tuple[str, ...]:
@@ -2439,7 +2457,9 @@ class WalkDeviceAST(NodeVisitor):
             ) -> tuple[list[object], LiftGraphArgs]:
                 subgraph_walker._assign(node.target, inner_type.proxy())
                 subgraph_walker._body(node.body)
-                loop_outputs = self._collect_outputs(subgraph_walker.scope, rw.writes)
+                loop_outputs = self._collect_outputs(
+                    subgraph_walker.scope, self._rebound(rw)
+                )
                 return loop_outputs.get_graph_args(), loop_outputs
 
             block_ids: list[int] = []
@@ -2543,7 +2563,20 @@ class WalkDeviceAST(NodeVisitor):
             subgraph_walker: WalkDeviceAST,
         ) -> tuple[list[object], LiftGraphArgs]:
             subgraph_walker._body(node.body)
-            loop_outputs = self._collect_outputs(subgraph_walker.scope, body_rw.writes)
+            # The body traces the loop's own tensors, not copies, so a tensor an
+            # in-place method mutated (``acc.add_(x)``) is still the object
+            # bound outside the loop: give it a fresh variable to carry out.
+            for name in body_rw.method_writes:
+                value = subgraph_walker.scope.get(name)
+                if (
+                    isinstance(value, torch.Tensor)
+                    and value is self.scope.get(name)
+                    and self.should_become_arg(value)
+                ):
+                    subgraph_walker.scope[name] = _new_var(value)
+            loop_outputs = self._collect_outputs(
+                subgraph_walker.scope, self._rebound(body_rw)
+            )
             return loop_outputs.get_graph_args(), loop_outputs
 
         body_graph_id, outputs = self._trace_graph(
@@ -2643,7 +2676,7 @@ class WalkDeviceAST(NodeVisitor):
         ) -> tuple[list[object], LiftGraphArgs]:
             subgraph_walker._body(stmts)
             outputs_local = self._collect_outputs(
-                subgraph_walker.scope, rw.writes, include_new=True
+                subgraph_walker.scope, self._rebound(rw), include_new=True
             )
             return outputs_local.get_graph_args(), outputs_local
 
@@ -3851,8 +3884,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
 
         # Resolve source-level sizes before RNG lowering introduces internal
         # size queries that identify physical tile coordinates.
+        extents = restate_reduction_extents()
         for graph in device_ir.graphs:
-            resolve_reduction_sizes(graph.graph)
+            resolve_reduction_sizes(graph.graph, extents)
         merged_rdims = merge_reduction_dims(device_ir.graphs)
         backend = CompileEnvironment.current().backend
         backend.rewrite_device_ir(DeviceIRStage.BEFORE_RANDOM_OPS, func, device_ir)
@@ -3886,7 +3920,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             # warp-specialized (see intra_loop_raw_reread_block_ids); its
             # slot stays in the config space pinned to None.
             reread_block_ids = intra_loop_raw_reread_block_ids(
-                device_ir.graphs, device_ir.root_ids, device_ir.grid_block_ids
+                device_ir.graphs,
+                device_ir.root_ids,
+                device_ir.grid_block_ids,
+                atomics=backend.intra_loop_barriers_order_atomics,
             )
             for spec in warp_specialize_specs:
                 if reread_block_ids.intersection(spec.block_ids):

@@ -18,6 +18,7 @@ from .. import exc
 from .._compat import fp8_block_ptr_padding_broken
 from .._compat import get_tensor_descriptor_fn_name
 from .._compat import supports_block_ptr
+from .._compat import tensor_descriptor_supports_dtype
 from .._utils import next_power_of_2
 from .ast_extension import expr_from_string
 from .compile_environment import CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
@@ -1296,6 +1297,9 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         # Additional tensor descriptor requirements:
         # 1) ndim must be between 2 and 5
         if not (2 <= fake_tensor.ndim <= 5):
+            return False
+        # A bool tensor keeps pointer indexing: no descriptor takes ``*i1``.
+        if not tensor_descriptor_supports_dtype(fake_tensor.dtype):
             return False
 
         # 2) Exactly one dimension must be contiguous. Triton may permute the

@@ -1281,6 +1281,43 @@ class TestCrossLoopCodegenHelpers(TestCase):
             [argument.arg for argument in helper.args.args], ["weight_desc"]
         )
 
+    @pytest.mark.cpu_only
+    @skipIfNotTriton("outlined tile bodies are Triton helpers")
+    def test_outlined_tile_body_keeps_a_pass_where_its_dead_code_goes(self) -> None:
+        device_function = object.__new__(DeviceFunction)
+        device_function.arguments = []
+        device_function.wrapper_only_params = []
+        device_function.preamble = []
+        cast("Any", device_function).namespace = SimpleNamespace(
+            create_name=lambda name, _value: name
+        )
+        device_function.triton_outlined_helper_constexprs = {}
+        device_function._variable_renames = {}
+        device_function.dce_vars = ["unused"]
+        cast("Any", device_function).codegen = SimpleNamespace(module_statements=[])
+        cast("Any", device_function).helper_manager = SimpleNamespace(
+            codegen_helper_functions=list
+        )
+        environment = SimpleNamespace(backend_name="triton")
+        with mock.patch.object(CompileEnvironment, "current", return_value=environment):
+            for source, kept in (
+                # A loop whose only statement goes keeps a pass under it.
+                (
+                    "for k in range(4):\n    unused = k\ntl.store(output, 1)\n",
+                    "for k in range(4):\n    pass\ntl.store(output, 1)",
+                ),
+                # A body that goes entirely leaves a pass.
+                ("unused = 1\n", "pass"),
+            ):
+                with self.subTest(source=source):
+                    device_function.triton_outlined_helpers = []
+                    device_function.register_triton_outlined_helper(
+                        "dead_tile", ast.parse(source).body
+                    )
+                    helper = device_function.codegen_helper_functions()[0]
+                    assert isinstance(helper, ast.FunctionDef)
+                    self.assertEqual(ast.unparse(helper.body), kept)
+
 
 @helion.kernel(static_shapes=True, autotune_effort="none")
 def guarded_row_pair(

@@ -7,8 +7,10 @@ from operator import getitem
 from typing import TYPE_CHECKING
 from typing import cast
 
+import sympy
 import torch
 from torch._inductor.codegen.simd import constant_repr
+from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 from torch.fx.node import Argument
 from torch.fx.node import Node
 from torch.fx.node import map_arg
@@ -16,6 +18,7 @@ from torch.fx.node import map_arg
 from .. import exc
 from ..language._decorators import BackendDispatchTable
 from ..language._decorators import is_api_func
+from ..language._tracing_ops import EXTENT_VALUE
 from ..language._tracing_ops import _get_symnode
 from ..language.matmul_ops import MATMUL_DIM_BLOCK_IDS_META
 from ..language.matmul_ops import MATMUL_FACT_ID_META
@@ -23,6 +26,7 @@ from ..language.matmul_ops import enforce_dot_requirements
 from .ast_extension import expr_from_string
 from .compile_environment import CompileEnvironment
 from .compile_environment import _to_sympy
+from .compile_environment import shape_env_var_hints
 from .host_function import HostFunction
 from .node_masking import apply_masking
 from .node_masking import broadcasts_onto_masked_lanes
@@ -119,6 +123,36 @@ def register_lowering(
     return lowering
 
 
+_ARANGES = (
+    torch.ops.aten.arange.default,
+    torch.ops.aten.arange.start,
+    torch.ops.aten.arange.start_step,
+)
+
+
+def _shape_arguments(user: Node) -> list[tuple[int | str, Argument]]:
+    """``user``'s arguments that give a tensor's shape (a size, shape, length
+    or output size, or an arange's end), each with its position in
+    ``user.args`` or its name in ``user.kwargs``."""
+    if isinstance(user.target, torch._ops.OpOverload):
+        parameters = [argument.name for argument in user.target._schema.arguments]
+    elif is_api_func(user.target):
+        parameters = list(user.target._signature.parameters)
+    else:
+        return []
+    found: list[tuple[int | str, Argument]] = []
+    for position, name in enumerate(parameters):
+        if name not in {"size", "shape", "length", "output_size"} and not (
+            user.target in _ARANGES and name == "end"
+        ):
+            continue
+        if position < len(user.args):
+            found.append((position, user.args[position]))
+        elif name in user.kwargs:
+            found.append((name, user.kwargs[name]))
+    return found
+
+
 def _keep_shape_size_reads(node: Node) -> None:
     """Keep physical tile extents in shape parameters."""
     physical: Node | None = None
@@ -142,34 +176,105 @@ def _keep_shape_size_reads(node: Node) -> None:
         return physical
 
     for user in list(node.users):
-        if isinstance(user.target, torch._ops.OpOverload):
-            parameters = [argument.name for argument in user.target._schema.arguments]
-        elif is_api_func(user.target):
-            parameters = list(user.target._signature.parameters)
-        else:
-            continue
         args, kwargs = list(user.args), dict(user.kwargs)
-        for position, name in enumerate(parameters):
-            if name not in {"size", "shape", "length", "output_size"} and not (
-                user.target
-                in (
-                    torch.ops.aten.arange.default,
-                    torch.ops.aten.arange.start,
-                    torch.ops.aten.arange.start_step,
-                )
-                and name == "end"
-            ):
-                continue
-            if position < len(args):
-                args[position] = map_arg(args[position], physical_size)
-            elif name in kwargs:
-                kwargs[name] = map_arg(kwargs[name], physical_size)
+        for key, argument in _shape_arguments(user):
+            if isinstance(key, int):
+                args[key] = map_arg(argument, physical_size)
+            else:
+                kwargs[key] = map_arg(argument, physical_size)
         if tuple(args) != user.args or kwargs != user.kwargs:
             user.args, user.kwargs = tuple(args), kwargs
 
 
-def resolve_reduction_sizes(graph: torch.fx.Graph) -> None:
-    """Read a full slice's logical extent, independent of padding or chunk size."""
+def _restated(
+    value: torch.SymInt | torch.SymFloat | torch.SymBool, expr: sympy.Basic
+) -> int | float | bool | torch.SymInt | torch.SymFloat | torch.SymBool:
+    """``value`` with the expression ``expr``: a constant once ``expr`` is one."""
+    shape_env = CompileEnvironment.current().shape_env
+    if isinstance(value, torch.SymBool):
+        if expr in (sympy.true, sympy.false):
+            return bool(expr)
+        # A SymBool's expression is a sympy boolean rather than an Expr.
+        # pyrefly: ignore [bad-argument-type]
+        return shape_env.create_symboolnode(expr)
+    assert isinstance(expr, sympy.Expr)
+    # An int kernel argument is an unbacked symbol, which Helion still gives
+    # a hint (``var_to_val``); a value over one must not take a hint.
+    hint = (
+        None
+        if free_unbacked_symbols(expr)
+        else expr.xreplace(shape_env_var_hints(shape_env))
+    )
+    if hint is not None and not hint.is_number:
+        hint = None
+    if isinstance(value, torch.SymInt):
+        if isinstance(expr, sympy.Integer):
+            return int(expr)
+        return shape_env.create_symintnode(
+            expr, hint=None if hint is None else int(hint)
+        )
+    if isinstance(expr, sympy.Number):
+        return float(expr)
+    return shape_env.create_symfloatnode(
+        expr, hint=None if hint is None else float(hint)
+    )
+
+
+def restate_reduction_extents() -> dict[sympy.Symbol, sympy.Expr]:
+    """Each reduction dim's block size symbol -> the dim's extent, once the
+    sizes of the dims computed from another dim's size read that dim's
+    extent.
+
+    A read of a reduction dim's size (``row.size(1)`` for ``row =
+    x[tile, :]``) traces as the dim's block size symbol, which
+    ``resolve_reduction_sizes`` then reads as the extent.  A dim sized from
+    such a read (``x[tile, n:]`` for ``n = row.size(1) // 2``) was registered
+    over the symbol, so its mask and its block size read the block size where
+    the extent was meant.  A dim whose size is a block's own symbol (sized by
+    a shape read, ``_keep_shape_size_reads``) keeps it."""
+    env = CompileEnvironment.current()
+    extents: dict[sympy.Symbol, sympy.Expr] = {}
+    for info in env.block_sizes:
+        if not info.reduction or not isinstance(info.size, (int, torch.SymInt)):
+            continue
+        size = _to_sympy(info.size)
+        if env.get_block_id(size) is not None:
+            continue
+        # A dim's size reads only the dims registered before it.
+        extent = size.xreplace(extents)
+        if isinstance(info.size, torch.SymInt) and extent != size:
+            restated = _restated(info.size, extent)
+            assert isinstance(restated, (int, torch.SymInt))
+            info.size = restated
+        extents[info.symbol()] = extent
+    return extents
+
+
+def _shape_scalars(graph: torch.fx.Graph) -> set[Node]:
+    """The scalars a shape parameter of ``graph`` reads (``_shape_arguments``),
+    directly or through other scalars."""
+    pending: list[Node] = []
+    for user in graph.nodes:
+        for _key, argument in _shape_arguments(user):
+            map_arg(argument, pending.append)
+    scalars: set[Node] = set()
+    while pending:
+        node = pending.pop()
+        if node in scalars or not isinstance(
+            node.meta.get("val"), (torch.SymInt, torch.SymFloat, torch.SymBool)
+        ):
+            continue
+        scalars.add(node)
+        pending.extend(node.all_input_nodes)
+    return scalars
+
+
+def resolve_reduction_sizes(
+    graph: torch.fx.Graph, extents: dict[sympy.Symbol, sympy.Expr]
+) -> None:
+    """Read a full slice's logical extent, independent of padding or chunk
+    size, and so do the scalars computed from it (``extents``, from
+    ``restate_reduction_extents``), but for those a shape reads."""
     env = CompileEnvironment.current()
     for node in list(graph.nodes):
         if node.op != "call_function" or node.target not in (
@@ -204,6 +309,35 @@ def resolve_reduction_sizes(graph: torch.fx.Graph) -> None:
                         extent if arg is source else arg
                     ),
                 )
+    # The scalars computed from a size read, here or in an enclosing graph
+    # (a nested graph reads those through ``_get_symnode``), traced over the
+    # dim's block size symbol too.  Those a shape reads keep it, as does a
+    # value that is exactly a block's symbol: the shapes traced over the
+    # symbol (an ``hl.arange`` of such a value, and the dims later lowering
+    # registers for them) read it as the block size.  A capture a shape reads
+    # still prints the extent's value for its uses, as a root graph's own
+    # lowering of such a value does (``user_sympy_expr``).
+    shape_scalars = _shape_scalars(graph)
+    for node in graph.nodes:
+        value = node.meta.get("val")
+        if not isinstance(value, (torch.SymInt, torch.SymFloat, torch.SymBool)):
+            continue
+        expr = value.node.expr
+        if env.get_block_id(expr) is not None or not (
+            expr.free_symbols & extents.keys()
+        ):
+            continue
+        extent = expr.xreplace(extents)
+        if node in shape_scalars:
+            if node.target is _get_symnode:
+                node.meta[EXTENT_VALUE] = _restated(value, extent)
+            continue
+        node.meta["val"] = _restated(value, extent)
+        if node.target is _get_symnode:
+            node.args = (env.sympy_debug(extent),)
+            node.meta["helion_host_scalar"] = (
+                HostFunction.current().is_host_scalar_expr(extent)
+            )
 
 
 sym_size_lowering = register_lowering(torch.ops.aten.sym_size.int)

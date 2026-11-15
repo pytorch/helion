@@ -10,10 +10,23 @@ if TYPE_CHECKING:
     from torch.fx.node import Argument
 
     from .device_ir import GraphInfo
+    from .inductor_lowering import CodegenState
 
 
-# fx node meta key marking a load that must be preceded by ``tl.debug_barrier()``.
+# fx node meta key marking a read (a load, or an ``hl.inline_triton`` or
+# ``hl.triton_kernel`` snippet) that must be preceded by a CTA barrier.
 INTRA_LOOP_RAW_BARRIER_META = "_needs_debug_barrier_before"
+
+
+def emit_intra_loop_raw_barrier(state: CodegenState) -> None:
+    """The barrier ``mark_intra_loop_raw_barriers`` asks for before the node
+    ``state`` lowers: a read that may meet a write earlier in its loop body
+    (a load, or an ``hl.inline_triton`` or ``hl.triton_kernel`` snippet)."""
+    if state.fx_node is not None and state.fx_node.meta.get(
+        INTRA_LOOP_RAW_BARRIER_META
+    ):
+        for statement in state.device_function.cta_barrier():
+            state.add_statement(statement)
 
 
 # A root shared by every kernel argument: the caller may pass one tensor twice
@@ -217,10 +230,61 @@ def memory_write_target(node: Node) -> Argument | None:
     return None
 
 
+def opaque_access_target(node: Node) -> Argument | None:
+    """What an op with side effects that is no load, store, atomic or control
+    flow may read and write: every input it gets that may name the kernel's
+    memory (``hl.inline_triton`` and ``hl.triton_kernel`` may access any
+    pointer they are given, as may a distributed copy or barrier), or None
+    for any other node.  A value the device code computed names no memory:
+    an op given only such values reaches none (``hl.device_print`` of a
+    loaded element, a random op, an in-place op on a tile), and is None too.
+    ``_phi`` is impure only so that DCE keeps loop carries, and a prefetch
+    orders nothing."""
+    import torch
+
+    from ..language import memory_ops
+    from ..language._tracing_ops import _for_loop
+    from ..language._tracing_ops import _for_loop_step
+    from ..language._tracing_ops import _if
+    from ..language._tracing_ops import _phi
+    from ..language._tracing_ops import _while_loop
+    from .host_function import HostFunction
+
+    if (
+        node.op != "call_function"
+        or not node.is_impure()
+        or node.target
+        in (_phi, memory_ops.prefetch, _for_loop, _for_loop_step, _if, _while_loop)
+        or memory_write_target(node) is not None
+    ):
+        return None
+    memory = {
+        id(tensor.untyped_storage())
+        for tensor in HostFunction.current().tensor_to_origin
+    }
+
+    def names_memory(arg: Node) -> bool:
+        value = arg.meta.get("val")
+        if isinstance(value, torch.Tensor):
+            return id(value.untyped_storage()) in memory
+        # A scalar is no pointer; anything else (a stack tensor) may be one.
+        return not isinstance(
+            value, (torch.SymInt, torch.SymFloat, torch.SymBool, int, float, bool)
+        )
+
+    inputs = [arg for arg in node.all_input_nodes if names_memory(arg)]
+    return inputs or None
+
+
 def graph_memory_access_storage_ids(
     graphs: list[GraphInfo], graph_id: int
 ) -> tuple[set[int], set[int]]:
-    """Return storage identities read and written by a graph and its subgraphs."""
+    """Return storage identities read and written by a graph and its subgraphs.
+
+    Besides loads, stores, atomics and the graphs of control flow, any other op
+    with side effects reads and writes every tensor it is given
+    (``opaque_access_target``).
+    """
     from ..language import memory_ops
     from ..language._tracing_ops import _for_loop
     from ..language._tracing_ops import _for_loop_step
@@ -274,6 +338,11 @@ def graph_memory_access_storage_ids(
             assert isinstance(body_info, WhileLoopGraphInfo)
             update_from_subgraph(body_info.cond_graph_id)
             update_from_subgraph(subgraph_id)
+            continue
+        if (target := opaque_access_target(node)) is not None:
+            storage_ids = _storage_ids(graphs, graph_id, target)
+            reads.update(storage_ids)
+            writes.update(storage_ids)
     return reads, writes
 
 
@@ -282,6 +351,7 @@ def mark_intra_loop_raw_barriers(
     root_graph_ids: list[int],
     *,
     mark_in_divergent_control_flow: bool = True,
+    atomics: bool = False,
 ) -> None:
     """Mark loads that read storage written earlier in a device-loop body.
 
@@ -298,7 +368,7 @@ def mark_intra_loop_raw_barriers(
     ``tl.debug_barrier()`` before it (the CuTe codegen a
     ``cute.arch.sync_threads()``). The barrier flushes every prior write in the
     block, so once emitted the pending-write set is cleared and later loads need a
-    new store to re-arm. Storage identity comes from the fake tensor's underlying
+    new write to re-arm. Storage identity comes from the fake tensor's underlying
     storage, so distinct FX nodes for aliases and views compare equal. The walk
     follows Helion control-flow subgraphs and merges pending writes at joins.
 
@@ -306,9 +376,19 @@ def mark_intra_loop_raw_barriers(
     / while bodies: a CuTe SIMT branch condition can vary per thread, and a
     convergent CTA barrier inside a divergent branch deadlocks.  Loop bodies stay
     markable — Helion device-loop trip structure is uniform across the CTA.
+
+    With ``atomics`` (``Backend.intra_loop_barriers_order_atomics``), an
+    atomic writes its target, as a store does (``memory_write_target``).  Any
+    other op with side effects writes every input it gets that may name the
+    kernel's memory (``opaque_access_target``), and an ``hl.inline_triton``
+    or ``hl.triton_kernel`` snippet, which may read them too, is marked like a
+    load when one holds a pending write: its Triton codegen emits the barrier
+    before the snippet.
     """
     marker = _IntraLoopRawBarrierMarker(
-        graphs, mark_in_divergent_control_flow=mark_in_divergent_control_flow
+        graphs,
+        mark_in_divergent_control_flow=mark_in_divergent_control_flow,
+        atomics=atomics,
     )
     for graph_id in root_graph_ids:
         marker.run_graph(graph_id, set())
@@ -318,13 +398,16 @@ def intra_loop_raw_reread_block_ids(
     graphs: list[GraphInfo],
     root_graph_ids: list[int],
     grid_block_ids: list[list[int]],
+    *,
+    atomics: bool = False,
 ) -> set[int]:
     """Block ids of the device loops whose region re-reads storage it stores.
 
     A loop's region is its body with every loop nested in it.  The walk of
     ``mark_intra_loop_raw_barriers`` is run once per loop (grid loops
-    included) from an empty pending-write set, so only a store issued inside
-    the region arms a load inside it; a store before the loop does not count.
+    included) from an empty pending-write set, so only a write issued inside
+    the region (a store, or with ``atomics`` an atomic) arms a load inside
+    it; a write before the loop does not count.
 
     Such a loop cannot be warp-specialized: Triton's warp specialization
     distributes the body over partitions by data flow -- an epilogue that
@@ -346,7 +429,7 @@ def intra_loop_raw_reread_block_ids(
     )
     result: set[int] = set()
     for graph_id, block_ids in regions:
-        marker = _IntraLoopRawBarrierMarker(graphs, mark=False)
+        marker = _IntraLoopRawBarrierMarker(graphs, mark=False, atomics=atomics)
         marker.run_graph(graph_id, set())
         if marker.rereads:
             result.update(block_ids)
@@ -360,13 +443,35 @@ class _IntraLoopRawBarrierMarker:
         *,
         mark_in_divergent_control_flow: bool = True,
         mark: bool = True,
+        atomics: bool = False,
     ) -> None:
         self.graphs = graphs
         self.mark_in_divergent_control_flow = mark_in_divergent_control_flow
+        # Whether an atomic arms a later load like a store
+        # (``Backend.intra_loop_barriers_order_atomics``).
+        self.atomics = atomics
         # ``mark=False`` only counts the loads a marking walk would mark
         # (``rereads``), leaving the graphs and earlier marks untouched.
         self.mark = mark
         self.rereads = 0
+
+    def _read(
+        self, node: Node, storages: set[int], pending: set[int], *, divergent: bool
+    ) -> None:
+        """Mark ``node``, which reads ``storages``, for the barrier before it
+        when one of them holds a pending write, and clear the pending writes
+        the barrier flushes."""
+        if self.mark and node.meta.get(INTRA_LOOP_RAW_BARRIER_META):
+            pending.clear()
+        elif pending & storages:
+            if divergent and not self.mark_in_divergent_control_flow:
+                # Cannot place a convergent barrier here; leave the hazard
+                # pending so a later uniform read re-arms it.
+                return
+            if self.mark:
+                node.meta[INTRA_LOOP_RAW_BARRIER_META] = True
+            self.rereads += 1
+            pending.clear()
 
     def run_graph(
         self, graph_id: int, written: set[int], *, divergent: bool = False
@@ -376,6 +481,8 @@ class _IntraLoopRawBarrierMarker:
         from ..language._tracing_ops import _for_loop_step
         from ..language._tracing_ops import _if
         from ..language._tracing_ops import _while_loop
+        from ..language.inline_triton_ops import inline_triton
+        from ..language.inline_triton_ops import triton_kernel
         from .device_ir import ForLoopGraphInfo
         from .device_ir import IfGraphInfo
         from .device_ir import WhileLoopGraphInfo
@@ -384,21 +491,26 @@ class _IntraLoopRawBarrierMarker:
         for node in self.graphs[graph_id].graph.nodes:
             if node.op != "call_function":
                 continue
-            if node.target is memory_ops.store:
-                pending.update(_storage_ids(self.graphs, graph_id, node.args[0]))
+            if (target := memory_write_target(node)) is not None:
+                # A store, or an atomic where this barrier is the one that
+                # orders it: what it wrote may not be visible to the other
+                # warps yet.
+                if self.atomics or node.target is memory_ops.store:
+                    pending.update(_storage_ids(self.graphs, graph_id, target))
                 continue
             if node.target is memory_ops.load:
-                if self.mark and node.meta.get(INTRA_LOOP_RAW_BARRIER_META):
-                    pending.clear()
-                elif pending & _storage_ids(self.graphs, graph_id, node.args[0]):
-                    if divergent and not self.mark_in_divergent_control_flow:
-                        # Cannot place a convergent barrier here; leave the
-                        # hazard pending so a later uniform load re-arms it.
-                        continue
-                    if self.mark:
-                        node.meta[INTRA_LOOP_RAW_BARRIER_META] = True
-                    self.rereads += 1
-                    pending.clear()
+                self._read(
+                    node,
+                    _storage_ids(self.graphs, graph_id, node.args[0]),
+                    pending,
+                    divergent=divergent,
+                )
+                continue
+            if (target := opaque_access_target(node)) is not None:
+                storages = _storage_ids(self.graphs, graph_id, target)
+                if node.target in (inline_triton, triton_kernel):
+                    self._read(node, storages, pending, divergent=divergent)
+                pending.update(storages)
                 continue
             if node.target is _if:
                 if_graph_id = node.args[1]

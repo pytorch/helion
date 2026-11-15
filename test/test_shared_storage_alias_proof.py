@@ -96,3 +96,26 @@ def test_shared_reduction_proofs_use_all_storage_origins(consumer, relationship)
                 # Proving a candidate cannot publish a guard before the
                 # surrounding transform commits its successful rewrite.
                 assert env.runtime_input_specializations == before
+
+
+def _product_through_an_operator(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = torch.ops.aten.mul.Tensor(x[tile], y[tile])
+    return out
+
+
+def test_an_operator_lookup_keeps_the_storage_proofs():
+    # ``torch.ops.aten.mul.Tensor`` resolves a registered operator through
+    # torch's own namespace objects: no user protocol runs, so the wrapper's
+    # allocation stays provably disjoint from the inputs, as it is for the
+    # same kernel written with ``*``.
+    kernel = helion.kernel(_product_through_an_operator, static_shapes=True)
+    with cpu_render_target(fake_device_sm_count=148):
+        bound = cpu_bind(kernel, (torch.empty(8), torch.empty(8)))
+        env, host = bound.env, bound.host_function
+        with env, host:
+            out = host.local_types["out"].fake_value
+            x = host.local_types["x"].fake_value
+            assert env.tensor_storage_provenance(out) is not None
+            assert env.fresh_allocation_is_disjoint_from_input(out, x)

@@ -29,15 +29,13 @@ from torch.fx.experimental import proxy_tensor
 from .. import exc
 from ..language._decorators import args_to_proxies
 from ..language._tracing_ops import _host_tensor
-from ..language.distributed_ops import make_async_remote_copy
-from ..language.inline_triton_ops import inline_triton
-from ..language.inline_triton_ops import triton_kernel
 from ..language.memory_ops import load
 from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
 from .indexing_strategy import is_block_size_index
 from .loop_dependency_checker import _storage_ids
 from .loop_dependency_checker import memory_write_target
+from .loop_dependency_checker import opaque_access_target
 from .runtime_tensor_guards import _tensor_alias_sources
 from .runtime_tensor_guards import register_tensor_alias_specializations
 from .runtime_tensor_guards import runtime_tensors_have_disjoint_storage
@@ -239,12 +237,10 @@ def merge_reduction_dims(graphs: Sequence[GraphInfo]) -> set[int]:
                 for info in graphs:
                     for n in info.graph.nodes:
                         target = memory_write_target(n)
-                        if n.target is make_async_remote_copy:
-                            target = n.args[3]
-                        elif n.target in (inline_triton, triton_kernel):
-                            # Raw snippets can write any pointer passed in args.
-                            # all_input_nodes also handles mapping-style args.
-                            target = n.all_input_nodes
+                        if target is None:
+                            # A raw snippet or a distributed op may write any
+                            # tensor it is given.
+                            target = opaque_access_target(n)
                         if target is None:
                             continue
                         excluded_ids.update(_storage_ids(graphs, info.graph_id, target))
