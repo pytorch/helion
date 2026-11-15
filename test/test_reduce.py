@@ -343,11 +343,12 @@ class TestReduce(RefEagerTestBase, TestCase):
                 out_y[i] = hl.reduce(scaled_add_combine_fn, y[i, :], dim=1)
             return out_x, out_y
 
-        x = torch.randn([8, 64], device=DEVICE, dtype=torch.bfloat16)
+        # Small integers: every bf16 partial sum is exact in any order.
+        x = torch.randint(-4, 5, [8, 64], device=DEVICE).to(torch.bfloat16)
         y = 1 + torch.rand([8, 64], device=DEVICE) * 1e-3
         _, (out_x, out_y) = code_and_output(two_sums, (x, y))
         torch.testing.assert_close(out_y, y.sum(1), rtol=1e-5, atol=1e-5)
-        torch.testing.assert_close(out_x, x.sum(1), rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(out_x, x.sum(1), rtol=0, atol=0)
 
     def test_reduce_max(self):
         """Test reduce with maximum operation."""
