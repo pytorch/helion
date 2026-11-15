@@ -28,8 +28,10 @@ from ...language.atomic_ops import atomic_min
 from ...language.atomic_ops import atomic_or
 from ...language.atomic_ops import atomic_xchg
 from ...language.atomic_ops import atomic_xor
+from ..ast_extension import _STATEMENT_LIST_FIELDS
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
+from ..ast_read_writes import HELION_ATOMIC_THREAD_AXES_ATTR
 from ..ast_read_writes import HELION_ATOMIC_UNIFORM_LANES_ATTR
 from ..ast_read_writes import HELION_FENCE_BARRIER_ATTR
 from ..ast_read_writes import ReadWrites
@@ -46,7 +48,9 @@ from .warp_atomic import warp_atomic_candidate
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterable
+    from collections.abc import Iterator
 
+    from ..device_function import DeviceFunction
     from ..inductor_lowering import CodegenState
     from ..tile_strategy import DeviceLoopOrGridState
 
@@ -117,6 +121,8 @@ _CUTE_FLOAT_ATOMIC_HELPERS: dict[str, str] = {
     "atomic_max": "_cute_atomic_max_float32",
     "atomic_min": "_cute_atomic_min_float32",
 }
+# The warp-aggregated relaxed Int32 fetch-add (``warp_atomic_runtime``).
+_CUTE_WARP_FETCH_ADD_HELPER = "_cute_atomic_warp_fetch_add_int32"
 
 
 def _cute_atomic_callee(cute_func: str, target_dtype_torch: torch.dtype) -> str:
@@ -188,7 +194,15 @@ def _codegen_common_cute(
         statements.insert(start, statements.pop())
     if sem in ("acquire", "acq_rel"):
         if not (isinstance(result, ast.Constant) and result.value is None):
-            result = state.codegen.lift(result, prefix="atomic_old")
+            if state.fx_node is not None and not state.fx_node.users:
+                # Nothing reads the previous value: the atomic is a statement
+                # of its own, which the later-axis guard wraps like any unused
+                # atomic (``guard_atomics_on_later_thread_axes``).
+                assert isinstance(result, ast.expr)
+                state.add_statement(ast.fix_missing_locations(ast.Expr(value=result)))
+                result = ast.Constant(value=None)
+            else:
+                result = state.codegen.lift(result, prefix="atomic_old")
         # A broadcast of the leader's result already ends in a barrier.
         if ast.unparse(statements[-1]) != _CUTE_BLOCK_BARRIER:
             state.add_statement(_cute_fence_barrier("acquire"))
@@ -284,7 +298,7 @@ def _codegen_cute_atomic_rmw(
     if state.config.get(
         "cute_warp_aggregated_atomics", False
     ) and warp_atomic_candidate(state.fx_node):
-        callee = "_cute_warp_fetch_add_int32"
+        callee = _CUTE_WARP_FETCH_ADD_HELPER
     cast_value_exprs = [
         expr_from_string(
             backend.ast_to_dtype_expr("{value}", target_dtype),
@@ -388,7 +402,7 @@ def _cute_atomic_predicates(
     state: CodegenState,
     index: list[object],
     extra_predicates: list[str] | None,
-    atomic_expr: ast.AST | None = None,
+    atomic_expr: ast.AST,
     *,
     indexed_block_ids: set[int] | None,
 ) -> tuple[list[str], set[int]]:
@@ -398,18 +412,17 @@ def _cute_atomic_predicates(
     along on ``atomic_expr`` for the lane-loop placement.
     ``indexed_block_ids`` is the caller's ``_cute_atomic_indexed_blocks(state,
     index)`` (``None`` when the coverage is unknown)."""
-    leader_axes = _cute_unindexed_leader_axes(state, indexed_block_ids)
+    leader_axes = _cute_unindexed_leader_axes(state, indexed_block_ids, atomic_expr)
     if indexed_block_ids is None:
         # Without a known coverage, a tile attribute in the index
         # (``tile.begin``) still names the thread axis of its block as one
         # the atomic does not vary along.
         leader_axes |= _cute_leader_thread_axes(state, index)
-    if atomic_expr is not None:
-        setattr(
-            atomic_expr,
-            HELION_ATOMIC_UNIFORM_LANES_ATTR,
-            _cute_uniform_lane_vars(state, indexed_block_ids),
-        )
+    setattr(
+        atomic_expr,
+        HELION_ATOMIC_UNIFORM_LANES_ATTR,
+        _cute_uniform_lane_vars(state, indexed_block_ids),
+    )
     return [
         predicate
         for predicate in (
@@ -759,10 +772,19 @@ def _cute_vector_atomic_site(
         init_stmt = statement_from_string(f"{list_var} = []")
         lane_body.insert(context.vloop_position(), init_stmt)
         helper = _CUTE_VECTOR_ATOMIC_HELPERS[target.dtype]
-        flush = f"{helper}({base_pointer}, {list_var})"
+        flush_call = expr_from_string(f"{helper}({base_pointer}, {list_var})")
+        assert isinstance(flush_call, ast.expr)
+        setattr(
+            flush_call,
+            HELION_ATOMIC_THREAD_AXES_ATTR,
+            getattr(atomic_expr, HELION_ATOMIC_THREAD_AXES_ATTR),
+        )
+        flush_stmt: ast.stmt = ast.Expr(value=flush_call)
         if guard:
-            flush = f"if {guard}:\n    {flush}"
-        flush_stmt = statement_from_string(flush)
+            guard_expr = expr_from_string(guard)
+            assert isinstance(guard_expr, ast.expr)
+            flush_stmt = ast.If(test=guard_expr, body=[flush_stmt], orelse=[])
+        flush_stmt = ast.fix_missing_locations(flush_stmt)
         lane_body.insert(context.vloop_position() + 1 + site_index, flush_stmt)
         body_stmt = statement_from_string(
             f"{list_var}.append({{value}})", value=value_expr
@@ -1234,6 +1256,7 @@ def _cute_atomic_value_tile_blocks(state: CodegenState) -> set[int]:
 def _cute_unindexed_leader_axes(
     state: CodegenState,
     indexed_block_ids: set[int] | None,
+    atomic_expr: ast.AST,
 ) -> set[int]:
     """Return the thread axes whose leader alone issues the atomic.
 
@@ -1250,17 +1273,27 @@ def _cute_unindexed_leader_axes(
        ``thread_idx[axis] == 0``.
 
     2. **Ghost-axis leaders (any index form):** A CTA-resident thread
-       axis whose owning device loop has exited cannot be referenced by
-       any current expression — including gather (``idxs[tile]``) or
-       offset-constant (``[tile.begin]``) index forms whose index does
-       not flow through a ``BlockSizeOrigin``. Threads on a ghost axis
-       still exist (the CUDA ``blockDim`` is fixed for the kernel) and
-       would re-issue the atomic with whatever value the surviving
-       expression resolved to, multiplying the result by the ghost
-       axis's size. Predicate the ghost axis to leader unconditionally.
+       axis whose owning device loop has exited, or has not been entered
+       yet (a later loop of the body, another root loop of the kernel),
+       cannot be referenced by any current expression — including gather
+       (``idxs[tile]``) or offset-constant (``[tile.begin]``) index forms
+       whose index does not flow through a ``BlockSizeOrigin``.  Threads
+       on a ghost axis still exist (the CUDA ``blockDim`` is fixed for the
+       kernel) and would re-issue the atomic with whatever value the
+       surviving expression resolved to, multiplying the result by the
+       ghost axis's size. Predicate the ghost axis to leader unconditionally.
        The canonical case is ``examples.matmul_split_k`` under
        autotune-picked configs that pack the inner-K loop onto a CTA
        thread axis.
+
+    The ghost axes go by the launch as far as codegen has claimed it here
+    (``GenerateAST.launch_thread_axis_sizes``: every strategy's axes, entered
+    or not, and the free ``hl.arange`` dims' so far).  A free ``hl.arange``
+    dim emitted after the atomic claims its axis later
+    (``synthetic_axes.allocate_arange_coord``): the axes decided here are
+    recorded on ``atomic_expr`` (``HELION_ATOMIC_THREAD_AXES_ATTR``), and
+    ``guard_atomics_on_later_thread_axes`` runs the atomic on the leader of
+    the rest once codegen is done.
     """
     from ..compile_environment import CompileEnvironment
 
@@ -1302,11 +1335,12 @@ def _cute_unindexed_leader_axes(
         collect(loop_state.block_thread_axes)
 
     # Ghost-axis leaders: any CTA-resident thread axis (size > 1) that
-    # no active loop currently owns. ``max_thread_block_dims`` tracks the
-    # per-axis CTA size accumulated as device loops are entered and is
-    # never decremented on exit, so it correctly captures axes whose
-    # owning loop has finished but whose threads remain live.
-    for axis, size in enumerate(state.codegen.max_thread_block_dims):
+    # no active loop currently owns: one whose loop has finished, one whose
+    # loop is entered later in the body or belongs to another root loop
+    # sharing the launch, and a free ``hl.arange`` dim's.  An atomic ahead of
+    # a row reduction in its tile body otherwise ran on every thread of the
+    # reduction's axis.
+    for axis, size in state.codegen.launch_thread_axis_sizes().items():
         if size > 1 and axis not in active_thread_axes:
             leader_axes.add(axis)
     # A launch axis sized by a kernel argument has no size here (its block is
@@ -1318,6 +1352,11 @@ def _cute_unindexed_leader_axes(
     for axis in state.device_function.tile_strategy.symbolic_thread_axes():
         if axis not in active_thread_axes:
             leader_axes.add(axis)
+    setattr(
+        atomic_expr,
+        HELION_ATOMIC_THREAD_AXES_ATTR,
+        frozenset(active_thread_axes | leader_axes),
+    )
     return leader_axes
 
 
@@ -1360,6 +1399,117 @@ def _cute_leader_predicate(axes: set[int]) -> str | None:
     return " and ".join(
         f"(cute.arch.thread_idx()[{axis}] == 0)" for axis in sorted(axes)
     )
+
+
+_LATER_AXIS_ATOMIC_RESULT = (
+    "an atomic whose result is used, ahead of an hl.arange dim that claims its "
+    "thread axis after it, is not lowered: only the axis's first thread may "
+    "issue the atomic, and its result would not reach the others; move the "
+    "hl.arange ahead of the atomic"
+)
+
+
+def guard_atomics_on_later_thread_axes(
+    body: list[ast.stmt], fn: DeviceFunction
+) -> None:
+    """Issue each atomic on the leader of the launch axes claimed after it.
+
+    ``_cute_unindexed_leader_axes`` decides an atomic's leaders against the
+    launch as far as codegen has claimed it at the atomic, and records the
+    axes it decided on the call (``HELION_ATOMIC_THREAD_AXES_ATTR``).  A free
+    ``hl.arange`` dim claims its thread axis when codegen reaches it
+    (``synthetic_axes.allocate_arange_coord``), so an atomic emitted ahead of
+    one ran on every thread of its axis: ``hl.atomic_add(out, [tile],
+    x[tile])`` before ``res[tile, idx] = y[tile, idx] * 2`` with ``idx =
+    hl.arange(128)`` added each element 128 times.  The atomic does not vary
+    along such an axis: its index and value were generated before the axis
+    existed, and an atomic indexed by an ``hl.arange`` walks the entries on
+    one thread.  With the launch final, each atomic statement runs on the
+    leader of every launch axis it did not decide; an atomic whose result is
+    used declines, as the leader's result would not reach the other threads.
+    """
+    codegen = fn.codegen
+    launch = {
+        axis for axis, size in codegen.launch_thread_axis_sizes().items() if size > 1
+    }
+    for dims in (codegen.referenced_thread_block_dims, codegen.root_thread_block_dims):
+        launch.update(axis for axis, size in enumerate(dims) if size > 1)
+    if launch:
+        _guard_on_later_axes(body, frozenset(launch))
+
+
+def _later_axes(node: ast.AST, launch: frozenset[int]) -> frozenset[int]:
+    """The launch axes claimed after an atomic call, none for other nodes."""
+    decided = getattr(node, HELION_ATOMIC_THREAD_AXES_ATTR, None)
+    return frozenset() if decided is None else launch - decided
+
+
+def _guard_on_later_axes(statements: list[ast.stmt], launch: frozenset[int]) -> None:
+    for index, statement in enumerate(statements):
+        if (
+            isinstance(statement, ast.If)
+            and not statement.orelse
+            and len(statement.body) == 1
+            and isinstance(statement.body[0], ast.Expr)
+            and (later := _later_axes(statement.body[0].value, launch))
+        ):
+            # The atomic's own guard: its leaders join the guard's test.
+            statement.test = ast.BoolOp(
+                op=ast.And(),
+                values=[*_conjuncts(statement.test), *_conjuncts(_leader_test(later))],
+            )
+            ast.fix_missing_locations(statement)
+            continue
+        for nested in _nested_statement_lists(statement):
+            _guard_on_later_axes(nested, launch)
+        if isinstance(statement, ast.Expr) and (
+            later := _later_axes(statement.value, launch)
+        ):
+            statements[index] = ast.fix_missing_locations(
+                ast.copy_location(
+                    ast.If(test=_leader_test(later), body=[statement], orelse=[]),
+                    statement,
+                )
+            )
+            continue
+        if any(_later_axes(node, launch) for node in _own_nodes(statement)):
+            raise exc.BackendUnsupported("cute", _LATER_AXIS_ATOMIC_RESULT)
+
+
+def _leader_test(axes: frozenset[int]) -> ast.expr:
+    predicate = _cute_leader_predicate(set(axes))
+    assert predicate is not None
+    test = expr_from_string(predicate)
+    assert isinstance(test, ast.expr)
+    return test
+
+
+def _conjuncts(test: ast.expr) -> list[ast.expr]:
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+        return list(test.values)
+    return [test]
+
+
+def _nested_statement_lists(statement: ast.stmt) -> Iterator[list[ast.stmt]]:
+    for field in _STATEMENT_LIST_FIELDS:
+        nested = getattr(statement, field, None)
+        if not isinstance(nested, list):
+            continue
+        if field in ("handlers", "cases"):
+            for clause in nested:
+                yield clause.body
+        elif nested:
+            yield nested
+
+
+def _own_nodes(statement: ast.stmt) -> Iterator[ast.AST]:
+    """The nodes of ``statement`` outside the statement lists it holds."""
+    for field, value in ast.iter_fields(statement):
+        if field in _STATEMENT_LIST_FIELDS:
+            continue
+        for item in value if isinstance(value, list) else [value]:
+            if isinstance(item, ast.AST):
+                yield from ast.walk(item)
 
 
 def _cute_uniform_lane_vars(
@@ -1882,7 +2032,7 @@ def _codegen_tensor_index_loop_common_cute(
         for predicate in (
             _cute_active_mask_predicate(state, covered_block_ids),
             _cute_leader_predicate(
-                _cute_unindexed_leader_axes(state, covered_block_ids)
+                _cute_unindexed_leader_axes(state, covered_block_ids, atomic_expr)
             ),
         )
         if predicate is not None

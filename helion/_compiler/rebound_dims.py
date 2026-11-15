@@ -22,6 +22,7 @@ from ..language.matmul_ops import dot as hl_dot
 from ..language.reduce_ops import _reduce
 from ..language.scan_ops import _associative_scan
 from ..language.view_ops import join
+from .inductor_lowering import size1_reduction_positions
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -45,16 +46,23 @@ def operand_positions(
     consumer_sizes: Sequence[int | torch.SymInt],
     consumer_block_ids: Sequence[int | None],
     *,
-    lower_rank_by_block_id: bool,
+    pointwise_placement: bool,
 ) -> list[int]:
     """The consumer dim each dim of ``value`` meets (see ``rebound_block_dims``).
 
     Right-aligned, so a negative position is a dim the consumer does not have;
     a lower-rank pointwise operand is placed as
-    ``TileDispatch.broadcast_expand_dims`` places it.
+    ``TileDispatch.broadcast_expand_dims`` places it, and a higher-rank one
+    (the input of a reduction over extent-1 dims) as
+    ``size1_reduction_positions`` places it.  A higher-rank operand that is
+    no such input stays right-aligned.
     """
+    if pointwise_placement and value.ndim > len(consumer_block_ids):
+        positions = size1_reduction_positions(value.shape, consumer_sizes)
+        if positions is not None:
+            return positions
     offset = len(consumer_block_ids) - value.ndim
-    if not (lower_rank_by_block_id and 0 < value.ndim < len(consumer_block_ids)):
+    if not (pointwise_placement and 0 < value.ndim < len(consumer_block_ids)):
         return [dim + offset for dim in range(value.ndim)]
     consumer_canonical = [
         None if block_id is None else env.canonical_block_id(block_id)
@@ -153,11 +161,14 @@ def rebound_operands(node: Node) -> list[Node]:
 def rebound_consumer_dims(
     node: Node,
 ) -> tuple[list[int | torch.SymInt], bool] | None:
-    """The dims an operand of ``node`` is compared against, and whether a
-    lower-rank operand is placed by block id.
+    """The dims an operand of ``node`` is compared against, and whether the
+    operands are placed as a PointwiseLowering places them
+    (``operand_positions``).
 
     Only a PointwiseLowering expands a lower-rank operand by block id
-    (``TileDispatch.broadcast_expand_dims``).  ``tl.where``, the inline asm,
+    (``TileDispatch.broadcast_expand_dims``) and reads a higher-rank one, the
+    input of a reduction over extent-1 dims, without the reduced dims
+    (``size1_reduction_positions``).  ``tl.where``, the inline asm,
     ``hl.join``, the combine functions of a tuple reduce / scan and the
     matmul accumulator receive their operands unexpanded and so right-align
     them: a stack's or join's operands meet the result without the stacked

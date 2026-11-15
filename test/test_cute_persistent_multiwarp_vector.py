@@ -12,9 +12,11 @@ the full runtime thread id like the non-synthetic cross-warp path.
 from __future__ import annotations
 
 import ast
+import inspect
 from typing import Any
 from typing import Callable
 from typing import cast
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -496,6 +498,53 @@ def test_finalize_shared_reduce_groups_leaves_other_shapes_alone() -> None:
     assert "group_count=1)" in _finalize(exact, (1024, 1, 1))
     assert f"lane = {RUNTIME_LANE}" in _finalize(exact, (256, 2, 2))
     assert "group_count=1)" in _finalize(exact, (256, 2, 2))
+
+
+def test_finalize_shared_reduce_groups_resizes_the_vloop_sink_fragment() -> None:
+    # The V-loop sink's fragment combine keeps the emitted count of the
+    # per-lane reduces it replaces and is resized with them: the one launched
+    # group of four warps then folds its warp partials in the serial form's
+    # order, as the resized per-lane reduce does, where the emitted count
+    # would have taken the butterfly tree.
+    emitted = (
+        f"lane = {RUNTIME_LANE}\n"
+        "lane_in_group = lane % 128\n"
+        "lane_mod_pre = lane_in_group % 1\n"
+        "_cute_grouped_reduce_shared_two_stage_fragment(acc_frag, result_frag, "
+        "'sum', cutlass.Float32(0), lane, lane_in_group, lane_mod_pre, count=4, "
+        "pre=1, group_span=128, group_count=8)"
+    )
+    code = _finalize(emitted, (128, 1, 1))
+    assert f"lane = {X_LANE}" in code
+    assert "count=4, pre=1, group_span=128, group_count=1)" in code
+    pytest.importorskip("cutlass")  # reduce_helpers imports cutlass
+    from helion._compiler.cute import reduce_helpers
+
+    body_signature = inspect.signature(
+        reduce_helpers._cute_grouped_reduce_shared_two_stage_fragment_body
+    )
+    with patch.object(
+        reduce_helpers, "_cute_grouped_reduce_shared_two_stage_fragment_body"
+    ) as body:
+        for group_count in (1, 8):
+            reduce_helpers._cute_grouped_reduce_shared_two_stage_fragment(
+                None,
+                None,
+                "sum",
+                0.0,
+                0,
+                0,
+                0,
+                count=4,
+                pre=1,
+                group_span=128,
+                group_count=group_count,
+            )
+    # Bound by name, however the body's arguments are passed.
+    assert [
+        body_signature.bind(*call.args, **call.kwargs).arguments["serial"]
+        for call in body.call_args_list
+    ] == [True, False]
 
 
 @pytest.mark.parametrize(

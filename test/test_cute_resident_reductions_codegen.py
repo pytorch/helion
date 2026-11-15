@@ -17,6 +17,7 @@ from helion._compiler.cute.resident_reductions import proven_resident_tensor_ali
 from helion._compiler.device_function import DeviceFunction
 from helion._compiler.device_function import TensorArg
 from helion._testing import import_example
+from helion._testing.binding_state import with_binding_state
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
@@ -156,8 +157,10 @@ def test_fresh_allocation_view_alignment_accounts_for_storage_offset(
     function = cast(
         "DeviceFunction", SimpleNamespace(arguments=[TensorArg("view", tensor, None)])
     )
-    env = SimpleNamespace(
-        input_sources={}, compiler_fact_specialization_facts=frozenset()
+    env = with_binding_state(
+        SimpleNamespace(
+            input_sources={}, compiler_fact_specialization_facts=frozenset()
+        )
     )
     with patch.object(CompileEnvironment, "current", return_value=env):
         assert proven_resident_tensor_alignments(function) == {"view": alignment}

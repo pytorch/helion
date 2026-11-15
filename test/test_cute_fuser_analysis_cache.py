@@ -93,18 +93,14 @@ def test_loop_alias_summary_retains_first_breadth_first_match(capacity: int):
     first, second = ast.parse(
         """
 for offset in range(8):
-    reduction_lane_base_1 = offset
-    lane_base_1 = offset
     if predicate:
-        reduction_lane_base_deeper = offset
-        reduction_vec_lane_1 = offset
-    reduction_lane_base_later = offset
+        for vec_lane_deeper in range(4):
+            pass
     for vec_lane_1 in range(4):
         pass
+    for vec_lane_later in range(4):
+        pass
 for offset in range(8):
-    reduction_lane_base_2 = offset
-    lane_base_2 = offset
-    reduction_vec_lane_2 = offset
     for vec_lane_2 in range(4):
         pass
 """
@@ -116,11 +112,11 @@ for offset in range(8):
     expected = fuser._build_second_alias(first, second)
     for _ in range(3):
         assert fuser._build_second_alias(first, second, analysis=cache) == expected
-    assert expected["reduction_lane_base_2"] == "reduction_lane_base_1"
+    assert expected == {"vec_lane_2": "vec_lane_1"}
     assert len(cache._aliases) <= capacity
     target = second.body[0]
-    assert isinstance(target, ast.Assign)
-    target.targets[0] = ast.Name("reduction_lane_base_fresh", ctx=ast.Store())
+    assert isinstance(target, ast.For)
+    target.target = ast.Name("vec_lane_fresh", ctx=ast.Store())
     cache.clear()
     assert fuser._build_second_alias(first, second, analysis=cache) == (
         fuser._build_second_alias(first, second)

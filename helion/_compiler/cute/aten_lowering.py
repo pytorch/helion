@@ -32,13 +32,17 @@ from ..aten_lowering import argmax_lowering
 from ..aten_lowering import argmin_lowering
 from ..aten_lowering import baddbmm_lowering
 from ..aten_lowering import bmm_lowering
+from ..aten_lowering import codegen_full
+from ..aten_lowering import codegen_scalar_tensor
 from ..aten_lowering import expand_lowering
+from ..aten_lowering import full_lowering
 from ..aten_lowering import gather_lowering
 from ..aten_lowering import iota_lowering
 from ..aten_lowering import mm_lowering
 from ..aten_lowering import permute_lowering
 from ..aten_lowering import reshape_lowering
 from ..aten_lowering import rolled_reduction_iota_index
+from ..aten_lowering import scalar_tensor_lowering
 from ..aten_lowering import sort_lowering
 from ..aten_lowering import squeeze_lowering
 from ..aten_lowering import stack_lowering
@@ -143,6 +147,40 @@ def _serial_mm_from_load_views(
         if _requested_tcgen05_flat_role_coordinates(ctx):
             _reject_tcgen05_flat_role_coordinates_fallback()
     return result
+
+
+def _integer_fill_cute(ctx: LoweringContext, node: Node, value: object) -> object:
+    """One element per thread: the fill's ``value``, an integer or a bool
+    converted to the float dtype as in the pointwise lowering
+    (``integer_to_float_expr``), where MLIR could fold an 8-bit float
+    conversion into it; None for any other fill."""
+    from .handler_ops import integer_to_float_expr
+    from .handler_ops import scalar_value_dtype
+
+    dtype = node.kwargs.get("dtype", torch.get_default_dtype())
+    if not (isinstance(value, Node) and isinstance(dtype, torch.dtype)):
+        return None
+    value_ast = _env_arg(ctx, value)
+    if not isinstance(value_ast, ast.AST):
+        return None
+    return integer_to_float_expr(
+        value_ast,
+        dtype,
+        scalar_value_dtype(value.meta.get("val")),
+        ctx.cg.device_function,
+    )
+
+
+@full_lowering.register_codegen("cute")
+def codegen_full_cute(ctx: LoweringContext, node: Node) -> object:
+    converted = _integer_fill_cute(ctx, node, node.args[1])
+    return codegen_full(ctx, node) if converted is None else converted
+
+
+@scalar_tensor_lowering.register_codegen("cute")
+def codegen_scalar_tensor_cute(ctx: LoweringContext, node: Node) -> object:
+    converted = _integer_fill_cute(ctx, node, node.args[0])
+    return codegen_scalar_tensor(ctx, node) if converted is None else converted
 
 
 @where_lowering.register_codegen("cute")

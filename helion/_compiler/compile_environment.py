@@ -423,6 +423,32 @@ def _find_tensor_input_source(
     return None
 
 
+def _search_tensor_input_source(
+    tensor: torch.Tensor, arguments: typing.Mapping[str, object]
+) -> Source | None:
+    """The first source in ``arguments``, the kernel's arguments by parameter
+    name, that replays to ``tensor``."""
+    for name, value in arguments.items():
+        source = _find_tensor_input_source(
+            tensor, value, LocalSource(name, is_input=True)
+        )
+        if source is not None:
+            return source
+    return None
+
+
+def tensor_input_sources(
+    arguments: typing.Mapping[str, object], tensors: typing.Collection[torch.Tensor]
+) -> frozenset[Source]:
+    """The sources ``CompileEnvironment.tensor_input_source`` gives ``tensors``
+    in a binding of ``arguments``, the kernel's arguments by parameter name."""
+    return frozenset(
+        source
+        for tensor in tensors
+        if (source := _search_tensor_input_source(tensor, arguments)) is not None
+    )
+
+
 def tensor_descriptor_layout_signature_from_strides(
     strides: typing.Sequence[int | torch.SymInt | sympy.Integer],
     element_size: int,
@@ -796,6 +822,28 @@ class CompileEnvironment:
             f"helion_runtime_arg_values_{id(self)}",
             default=None,
         )
+        self._dispatch_guards_enforced: contextvars.ContextVar[bool] = (
+            contextvars.ContextVar(
+                f"helion_dispatch_guards_enforced_{id(self)}",
+                default=True,
+            )
+        )
+        self._input_alignment_limit: contextvars.ContextVar[int | None] = (
+            contextvars.ContextVar(
+                f"helion_input_alignment_limit_{id(self)}",
+                default=None,
+            )
+        )
+        self._symbolic_stride_sources: contextvars.ContextVar[frozenset[Source]] = (
+            contextvars.ContextVar(
+                f"helion_symbolic_stride_sources_{id(self)}",
+                default=frozenset(),
+            )
+        )
+        # Set when an input is an outer trace's FakeTensor (``_to_fake_tensor``):
+        # its hints are the ones that trace chose, recorded here so that code
+        # generation refuses them whether or not the FakeTensor is still alive.
+        self._binds_outer_trace_inputs = False
         # Host integer helpers such as cdiv/next_power_of_2 deliberately return
         # unbacked SymInts during tracing. Preserve the config expression beside
         # that symbol so a fixed block size derived from a user tunable can still
@@ -1088,6 +1136,75 @@ class CompileEnvironment:
             self._runtime_arg_values_by_name.reset(token)
 
     @property
+    def dispatch_guards_enforced(self) -> bool:
+        """Whether every call the code being generated serves passed this
+        binding's dispatch guards, so that what its cache key fixes (exact
+        input sizes and strides under ``input_tensor_metadata``, the size and
+        stride residues of a runtime input specialization) holds for each of
+        them.
+
+        True for the bound kernel's own launches: dispatch routes a call to it
+        only when the call matches its key.  False while Inductor renders the
+        kernel into a dynamic-shape graph (``without_dispatch_guards``): it
+        binds the kernel to placeholder inputs (every dynamic size 64, every
+        dynamic stride 1) and runs the code at every size the graph accepts.
+        """
+        return self._dispatch_guards_enforced.get()
+
+    @contextlib.contextmanager
+    def without_dispatch_guards(
+        self, symbolic_strides: typing.Collection[Source] = ()
+    ) -> typing.Iterator[None]:
+        """Generate code that runs without this binding's dispatch guards, for
+        calls whose inputs in ``symbolic_strides`` (``tensor_input_sources``)
+        come at any strides (``traced_strides_hold``)."""
+        token = self._dispatch_guards_enforced.set(False)
+        strides_token = self._symbolic_stride_sources.set(frozenset(symbolic_strides))
+        try:
+            yield
+        finally:
+            self._symbolic_stride_sources.reset(strides_token)
+            self._dispatch_guards_enforced.reset(token)
+
+    @property
+    def symbolic_stride_sources(self) -> frozenset[Source]:
+        """The inputs whose strides vary across the calls the code being
+        generated serves (``without_dispatch_guards``); none for the bound
+        kernel's own launches."""
+        return self._symbolic_stride_sources.get()
+
+    @property
+    def input_alignment_limit(self) -> int | None:
+        """The modulus, in bytes, of the input base-pointer residues that hold
+        for every call the code being generated serves, or None for those
+        the binding records.
+
+        None for the bound kernel's own launches: dispatch checks each
+        residue its runtime input specializations record.  Inductor renders
+        the kernel for its graph's inputs and buffers
+        (``limit_input_alignment``), which it aligns only to
+        ``GPU_ALIGN_BYTES``; the placeholder inputs it binds the kernel to
+        reproduce their residues only modulo that, static graphs included.
+        """
+        return self._input_alignment_limit.get()
+
+    def input_residues_hold_modulo(self, alignment: int) -> bool:
+        """Whether the bound base residues hold modulo ``alignment`` bytes for
+        every call the code being generated serves: always, unless an Inductor
+        render's ``input_alignment_limit`` is not a multiple of it."""
+        limit = self.input_alignment_limit
+        return limit is None or limit % alignment == 0
+
+    @contextlib.contextmanager
+    def limit_input_alignment(self, limit: int) -> typing.Iterator[None]:
+        """Generate code for callers that align inputs only to ``limit`` bytes."""
+        token = self._input_alignment_limit.set(limit)
+        try:
+            yield
+        finally:
+            self._input_alignment_limit.reset(token)
+
+    @property
     def active_debug_shape_renames(self) -> dict[sympy.Basic, sympy.Basic]:
         return self._debug_shape_rename_override.get() or self.debug_shape_renames
 
@@ -1364,16 +1481,7 @@ class CompileEnvironment:
         ):
             result = source
         else:
-            result = None
-            for local_name, value in root_values.items():
-                candidate = _find_tensor_input_source(
-                    fake_tensor,
-                    value,
-                    LocalSource(local_name, is_input=True),
-                )
-                if candidate is not None:
-                    result = candidate
-                    break
+            result = _search_tensor_input_source(fake_tensor, root_values)
 
         self._tensor_input_source_cache[cache_key] = result
         return result
@@ -2047,6 +2155,80 @@ class CompileEnvironment:
         if source is None:
             return None
         return _replay_tensor_input_source(source, self.runtime_arg_values_by_name)
+
+    def live_example_input(self, source: Source) -> torch.Tensor | None:
+        """The real tensor the input ``source`` replays to in the current call,
+        or None: a direct ``to_code`` no longer finds the example input alive
+        (the bound kernel holds them weakly), or the call replays a FakeTensor
+        (an outer trace's input)."""
+        runtime = _replay_tensor_input_source(source, self.runtime_arg_values_by_name)
+        if isinstance(runtime, torch.Tensor) and not isinstance(runtime, FakeTensor):
+            return runtime
+        return None
+
+    def traced_strides_hold(self, tensor: torch.Tensor) -> bool:
+        """Whether ``tensor``'s traced strides are its strides in every call
+        the code being generated serves, for a layout proof that reads them.
+
+        Always for the bound kernel's own launches.  Inductor renders a
+        dynamic-shape graph's kernel (``without_dispatch_guards``) from
+        placeholder inputs that give each stride the graph keeps symbolic a
+        stride of 1 (``lower_helion_kernel``), and the bind can trace that as
+        a literal: a graph that saw ``x[:, :64]`` and then ``x[:, ::2]`` keeps
+        the inner stride symbolic, its placeholder reads unit-stride, and the
+        code later runs at a stride of 2 (a binding the lowering reuses from
+        an earlier call traced that call's strides, which need not hold
+        either).  There an input whose graph strides are all static (one not
+        in ``symbolic_stride_sources``) holds, as does a view one such input
+        owns, and a tensor laid out from any other input (an allocation shaped
+        like it, say) holds only when no input of the graph has a symbolic
+        stride.
+        """
+        symbolic = self.symbolic_stride_sources
+        if self.dispatch_guards_enforced or not symbolic:
+            return True
+        owner = self.tensor_alignment_owner(tensor)
+        return owner is not None and owner[0] not in symbolic
+
+    def exact_input_metadata_holds(self) -> bool:
+        """Whether the binding's exact input sizes and strides hold in every
+        call the code being generated serves, so that their trace hints are
+        proofs: the binding keys them (the ``input_tensor_metadata`` fact), its
+        dispatch guards are enforced, and no input was bound from an outer
+        trace's FakeTensor (the conditions ``keyed_hint`` checks)."""
+        return (
+            "input_tensor_metadata" in self.compiler_fact_specialization_facts
+            and self.dispatch_guards_enforced
+            and not self._binds_outer_trace_inputs
+        )
+
+    def keyed_hint(self, value: int | torch.SymInt | sympy.Expr) -> int | None:
+        """The value ``value``, a traced size or stride (or an expression in
+        them), has in every call this binding serves, for a value its cache
+        key fixes (the caller checks the fact that does), or None.
+
+        The trace hint is that value only while the key's dispatch guards are
+        enforced (``dispatch_guards_enforced``), when no input was bound from
+        an outer trace's FakeTensor (whose hints that trace chose; recorded
+        at binding, so this does not depend on the FakeTensor staying alive)
+        and when ``value`` has no unbacked symbol (whose hint is made up).  A
+        live example input is not consulted: dispatch never routes one whose
+        metadata changed in place after binding to this binding, so the
+        binding decides whether or not the caller still holds it.
+        """
+        if not self.dispatch_guards_enforced or self._binds_outer_trace_inputs:
+            return None
+        if isinstance(value, int):
+            return value
+        expr = value._sympy_() if isinstance(value, torch.SymInt) else value
+        if isinstance(expr, sympy.Integer):
+            return int(expr)
+        if _has_unbacked(expr):
+            return None
+        try:
+            return int(shape_env_size_hint(self.shape_env, expr))
+        except (RuntimeError, TypeError, ValueError):
+            return None
 
     def register_runtime_input_specialization(
         self,
@@ -3165,6 +3347,7 @@ class CompileEnvironment:
         assert CompileEnvironment.current() is self
         assert not self.fake_mode.is_our_fake(tensor)
         if isinstance(tensor, FakeTensor):
+            self._binds_outer_trace_inputs = True
             # FakeTensor from an outer tracing context (e.g. make_fx, Dynamo).
             # Create fresh symbols in our own ShapeEnv to avoid leaking
             # foreign symbols whose var_to_range entries are missing,
@@ -3797,7 +3980,8 @@ class CompileEnvironment:
         A static value proves it directly.  A dynamic value is proven through
         the ``input_tensor_metadata`` specialization fact: the bound kernel is
         then keyed on the exact input sizes and strides, so the traced hint
-        is the runtime value.  Unbacked symbols have no such hint.
+        is the runtime value while that holds (``exact_input_metadata_holds``,
+        ``keyed_hint``).  Unbacked symbols have no such hint.
         """
         if divisor <= 1:
             return True
@@ -3814,15 +3998,10 @@ class CompileEnvironment:
             return False
         if isinstance(expr, sympy.Integer):
             return int(expr) % divisor == 0
-        if "input_tensor_metadata" not in self.compiler_fact_specialization_facts:
+        if not self.exact_input_metadata_holds():
             return False
-        if _has_unbacked(expr):
-            return False
-        try:
-            hint = int(shape_env_size_hint(self.shape_env, expr))
-        except (RuntimeError, TypeError, ValueError):
-            return False
-        return hint % divisor == 0
+        hint = self.keyed_hint(expr)
+        return hint is not None and hint % divisor == 0
 
     @property
     def backend(self) -> Backend:

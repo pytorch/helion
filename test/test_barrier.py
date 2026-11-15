@@ -467,8 +467,9 @@ class TestCuteBarrier(RefEagerTestBase, TestCase):
     @skipIfRefEager("launch-layout checks only run in compiled mode")
     def test_rejects_tile_reduction_narrower_than_phase_launch(self) -> None:
         """A reduction over a 128-thread tile axis in phase 1 shares thread axis
-        0 with phase 2's 512-thread tile, so the launch runs more lanes on that
-        axis than the reduction spans."""
+        1 with phase 2's 512-thread tile (phase 2's row sum takes axis 0 with
+        the two threads the launch leaves it), so the launch runs more lanes on
+        that axis than the reduction spans."""
 
         @helion.kernel(autotune_effort="none")
         def two_phase_tile_sums(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -486,8 +487,8 @@ class TestCuteBarrier(RefEagerTestBase, TestCase):
         y = torch.randn([64, 1024], device=DEVICE)
         with self.assertRaisesRegex(
             exc.BackendUnsupported,
-            r"reduction over tile block 1 spans 128 lanes on thread axis 0 but "
-            r"the hl\.barrier\(\) launch \(512, 1, 1\) runs 512 there",
+            r"reduction over tile block 1 spans 128 lanes on thread axis 1 but "
+            r"the hl\.barrier\(\) launch \(2, 512, 1\) runs 512 there",
         ):
             code_and_output(
                 two_phase_tile_sums,

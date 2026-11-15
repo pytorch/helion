@@ -20,6 +20,7 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import cpu_target
 from helion._testing.cute_codegen import forbid_native_compile
 from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
@@ -1463,6 +1464,39 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
             self.assertIn("def argmax_combine_tuple_fn_", code)
             self.assertIn("tl.associative_scan", code)
 
+    def test_scan_combine_keeps_the_casts_it_writes(self):
+        """A combine function that compares int64 values as fp32 ties the
+        values that round together (fp32's spacing is 128 around 2**30), so
+        the running maximum keeps the earlier of them."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def running_first_max(
+            values: torch.Tensor, positions: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            maxes = torch.empty_like(values)
+            argmaxes = torch.empty_like(positions)
+            for tile_m in hl.tile(values.size(0)):
+                row_maxes, row_argmaxes = hl.associative_scan(
+                    _first_max_as_fp32,
+                    (values[tile_m, :], positions[tile_m, :]),
+                    dim=1,
+                )
+                maxes[tile_m, :] = row_maxes
+                argmaxes[tile_m, :] = row_argmaxes
+            return maxes, argmaxes
+
+        values = 2**30 + torch.randint(0, 1024, (16, 64), device=DEVICE)
+        positions = torch.arange(64, device=DEVICE, dtype=torch.int32)
+        positions = positions.expand(16, 64).contiguous()
+        maxes, argmaxes = output_only(
+            running_first_max, (values, positions), block_sizes=[4]
+        )
+        expected_maxes, expected_argmaxes = _running_first_max(
+            values.cpu(), positions.cpu(), lambda v: v.float()
+        )
+        torch.testing.assert_close(maxes.cpu(), expected_maxes)
+        torch.testing.assert_close(argmaxes.cpu(), expected_argmaxes)
+
     @skipIfNotCUDA()
     @skipIfRefEager(
         "promoted-seed reduction_loops is only materialized in compiled mode"
@@ -1695,6 +1729,69 @@ def test_ordinary_tiled_tuple_scan_generated_values(reverse):
     expected = _ordinary_scan_expected(x, "prod", reverse) + _ordinary_scan_expected(
         x, "sum", reverse
     )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def _first_max_as_fp32(left_values, left_index, right_values, right_index):
+    take_right = right_values.float() > left_values.float()
+    return (
+        torch.where(take_right, right_values, left_values),
+        torch.where(take_right, right_index, left_index),
+    )
+
+
+def _first_max_of_integer_part(left_values, left_index, right_values, right_index):
+    take_right = right_values.to(torch.int32) > left_values.to(torch.int32)
+    return (
+        torch.where(take_right, right_values, left_values),
+        torch.where(take_right, right_index, left_index),
+    )
+
+
+def _running_first_max(values, positions, key, chunk_size=None):
+    """Each row's running maximum of ``key(values)`` with its position, the
+    first of equal keys kept, restarting every ``chunk_size`` columns."""
+    out_values, out_positions = values.clone(), positions.clone()
+    width = values.size(-1)
+    chunk_size = chunk_size or width
+    for row in range(values.size(0)):
+        best = 0
+        for column in range(width):
+            if column % chunk_size == 0:
+                best = column
+            if key(values[row, column]) > key(values[row, best]):
+                best = column
+            out_values[row, column] = values[row, best]
+            out_positions[row, column] = positions[row, best]
+    return out_values, out_positions
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _ordinary_tiled_first_max_scan(x: torch.Tensor, index: torch.Tensor):
+    positions = torch.empty_like(index)
+    for row in hl.tile(x.size(0), block_size=1):
+        for column in hl.tile(x.size(1), block_size=8):
+            _value, position = hl.associative_scan(
+                _first_max_of_integer_part,
+                (x[row, column], index[row, column]),
+                dim=-1,
+            )
+            positions[row, column] = position
+    return positions
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.usefixtures("_serial_scan_fallback")
+def test_scan_combine_casts_generated_values():
+    # The combine compares the values' integer parts: 1.2 and 1.9 tie, and
+    # the running maximum keeps the position of the earlier one.
+    x = torch.tensor([[0.5, 1.2, 1.9, 0.3, 2.1, 2.7, 1.0, 2.5] * 2] * 3)
+    index = torch.arange(16, dtype=torch.int32).expand(3, 16).contiguous()
+    with cpu_target():
+        bound = cpu_bind(_ordinary_tiled_first_max_scan, (x, index))
+        source = bound.to_code(bound.config_spec.default_config())
+    actual = _execute_direct_scan_program(source, (x, index))
+    _, expected = _running_first_max(x, index, lambda v: int(v), chunk_size=8)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 

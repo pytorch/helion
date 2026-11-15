@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from contextlib import contextmanager
 from contextlib import nullcontext
 import dataclasses
 import hashlib
@@ -53,6 +54,7 @@ from ..ast_extension import ExtendedAST
 from ..ast_extension import unparse
 from ..ast_read_writes import ReadWrites
 from ..compile_environment import HELION_STATIC_DIMS_ATTR
+from ..compile_environment import tensor_input_sources
 from ..generate_ast import generate_ast
 from ..indexing_strategy import SubscriptIndexing
 from ..output_header import _active_library_imports
@@ -64,11 +66,13 @@ from helion.runtime.config_cache import ConfigCache
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Collection
+    from collections.abc import Iterator
     from collections.abc import Sequence
     from contextlib import AbstractContextManager
     from typing import Any
     from typing import Iterable
 
+    from torch._guards import Source
     from torch._inductor.ir import MultiOutput
     from torch._inductor.scheduler import BaseSchedulerNode
 
@@ -102,6 +106,78 @@ class _FusionMetadata:
     prologue_vars: dict[str, dict[str, str]]
     prologue_fused_params: set[str]
     prologue_has_source: set[str]
+
+
+@contextmanager
+def inductor_call_facts(
+    bound_kernel: BoundKernel,
+    *,
+    symbolic_input_layouts: bool,
+    symbolic_strides: Collection[Source] = (),
+) -> Iterator[None]:
+    """The facts every call of ``bound_kernel``'s code holds when Inductor
+    runs it (``render_inductor_ast``): inputs aligned only to
+    ``GPU_ALIGN_BYTES``, and, in a graph with symbolic sizes or strides, none
+    of the binding's dispatch guards, nor the traced strides of its inputs in
+    ``symbolic_strides``.  Tuning a config for the graph sees them too, so it
+    times the code the render emits and keeps no config the render would
+    refuse.  A backend whose code reads none of these facts
+    (``Backend.binds_inductor_call_facts``) renders under the binding's own."""
+    env = bound_kernel.env
+    assert symbolic_input_layouts or not symbolic_strides
+    if not env.backend.binds_inductor_call_facts:
+        yield
+        return
+    with (
+        env.limit_input_alignment(GPU_ALIGN_BYTES),
+        env.without_dispatch_guards(symbolic_strides)
+        if symbolic_input_layouts
+        else nullcontext(),
+    ):
+        yield
+
+
+def render_inductor_ast(
+    bound_kernel: BoundKernel,
+    config: Config,
+    *,
+    symbolic_input_layouts: bool,
+    symbolic_strides: Collection[Source] = (),
+    store_transform: Callable[..., ast.AST] | None = None,
+    load_transform: Callable[..., ast.AST] | None = None,
+    extra_params: list[str] | None = None,
+) -> ast.Module:
+    """Generate ``bound_kernel``'s code for ``config`` as Inductor runs it.
+
+    Inductor calls the code with its graph's inputs and buffers, not through
+    the bound kernel's dispatch, and aligns them only to ``GPU_ALIGN_BYTES``:
+    ``lower_helion_kernel``'s placeholder inputs reproduce base residues only
+    modulo that, so no wider base alignment is proven from them.  A graph
+    with symbolic sizes or strides (``symbolic_input_layouts``) passes every
+    size it accepts, so nothing the binding's dispatch guards check holds,
+    and its inputs in ``symbolic_strides`` come at any strides.
+    """
+    # Work on a copy so the caller's Config is not mutated with
+    # normalize defaults specific to this BoundKernel's config_spec.
+    config = Config(**config.config)  # pyrefly: ignore[bad-argument-type]
+    env = bound_kernel.env
+    env.config_spec.normalize(config)
+    with (
+        env,
+        inductor_call_facts(
+            bound_kernel,
+            symbolic_input_layouts=symbolic_input_layouts,
+            symbolic_strides=symbolic_strides,
+        ),
+    ):
+        return generate_ast(
+            bound_kernel.host_function,  # pyrefly: ignore[bad-argument-type]
+            config,
+            emit_repro_caller=False,
+            store_transform=store_transform,
+            load_transform=load_transform,
+            extra_params=extra_params,
+        )
 
 
 class _FusionAutotuneAdapter:
@@ -152,7 +228,8 @@ class _FusionAutotuneAdapter:
         return self._bench_cached_paths.get(config)
 
     def extra_cache_key(self) -> str:
-        return self._fusion_context_hash
+        # The bound kernel's key holds the render's facts (``_call_facts``).
+        return self._bound_kernel.extra_cache_key() + self._fusion_context_hash
 
     def supports_subprocess_benchmark(self) -> bool:
         return False
@@ -162,6 +239,9 @@ class HelionTemplateBuffer(TemplateBuffer):
     """Inductor template buffer for Helion kernel."""
 
     _fusion_config_cache: ExactWeakKeyDictionary = ExactWeakKeyDictionary()
+    # Configs tuned on a binding of its own (``_tuning_kernel``) for a cached
+    # binding, by the render's facts, so its later lowerings tune once.
+    _tuned_config_cache: ExactWeakKeyDictionary = ExactWeakKeyDictionary()
 
     def __init__(
         self,
@@ -172,6 +252,8 @@ class HelionTemplateBuffer(TemplateBuffer):
         bound_kernel: BoundKernel,
         constant_args: dict[str, object],
         autotune_args: tuple[object, ...] | None = None,
+        symbolic_input_layouts: bool = False,
+        symbolic_strides: Collection[Source] = (),
         mutated_inputs: Iterable[IRNode] | None = None,
         allowed_prologue_inps: OrderedSet[str] | None = None,
         named_inputs: dict[str, IRNode] | None = None,
@@ -180,6 +262,13 @@ class HelionTemplateBuffer(TemplateBuffer):
         self._bound_kernel = bound_kernel
         self._constant_args_dict = constant_args
         self._autotune_args = autotune_args
+        # The graph passes inputs of dynamic sizes or strides, which
+        # ``lower_helion_kernel`` bound to placeholders: the code serves every
+        # size and stride the graph accepts, never checking the binding's
+        # cache key.  The inputs in ``symbolic_strides`` come at any strides.
+        self._symbolic_input_layouts = symbolic_input_layouts
+        self._symbolic_strides = frozenset(symbolic_strides)
+        self._tuning_bound_kernel: BoundKernel | None = None
         self._fusion_metadata: _FusionMetadata | None = None
 
         tb_self = self  # capture for closure
@@ -293,6 +382,45 @@ class HelionTemplateBuffer(TemplateBuffer):
         # Return placeholder — autotuning and AST generation happen in _finalize_codegen.
         return PartialRender("", kernel.render_hooks)
 
+    def _call_facts(self, bound_kernel: BoundKernel) -> AbstractContextManager[None]:
+        """``inductor_call_facts`` of this buffer's render, for ``bound_kernel``."""
+        return inductor_call_facts(
+            bound_kernel,
+            symbolic_input_layouts=self._symbolic_input_layouts,
+            symbolic_strides=self._symbolic_strides,
+        )
+
+    def _tunes_on_own_binding(self) -> bool:
+        """Whether the lowering tunes through a binding of its own
+        (``_tuning_kernel``): its binding is the kernel's cached one, which
+        also serves eager calls, and the backend's code reads facts the
+        render's calls may not hold (``Backend.binds_inductor_call_facts``).
+        Another backend tunes the cached binding itself, for the render and
+        eager calls alike."""
+        bk = self._bound_kernel
+        return bk._cache_managed and bk.env.backend.binds_inductor_call_facts
+
+    def _tuning_kernel(self) -> BoundKernel:
+        """The bound kernel the lowering tunes on, under ``_call_facts``.
+
+        Tuning compiles its candidates into a bound kernel's compile cache,
+        which is keyed by the config alone, and sets the kernel's config and
+        run function.  The binding ``lower_helion_kernel`` takes from the
+        kernel's cache also serves eager calls: they would run code compiled
+        under the render's facts, which are weaker than theirs, and the tuner
+        would time code an eager call compiled there instead of the render's.
+        So where the backend's code reads those facts, a cached binding tunes
+        through a binding of its own (``_tunes_on_own_binding``)."""
+        bk = self._bound_kernel
+        if not self._tunes_on_own_binding():
+            return bk
+        if self._tuning_bound_kernel is None:
+            assert self._autotune_args is not None
+            self._tuning_bound_kernel = self._helion_kernel._bind_isolated(
+                self._autotune_args
+            )
+        return self._tuning_bound_kernel
+
     def _finalize_codegen(
         self,
         hook_outputs: dict[str, str],
@@ -309,37 +437,69 @@ class HelionTemplateBuffer(TemplateBuffer):
             and hook_outputs
             and bk.settings.autotune_with_torch_compile_fusion
         )
+        # A config tuned under the render's facts is cached by them, on disk
+        # too (``BoundKernel.extra_cache_key``): one tuned for another render,
+        # or for the binding's own calls, may be one this render refuses.  A
+        # backend whose code reads none of them keys by none.
+        facts = (
+            (self._symbolic_input_layouts, self._symbolic_strides)
+            if bk.env.backend.binds_inductor_call_facts
+            else ()
+        )
         if use_fusion_autotune:
-            fusion_key = tuple(sorted(hook_outputs.items()))
+            fusion_key = (tuple(sorted(hook_outputs.items())), facts)
             bk_cache = self._fusion_config_cache.get(bk)
             if bk_cache is not None and fusion_key in bk_cache:
                 cfg = bk_cache[fusion_key]
             else:
+                # A config the user gave holds whatever the facts, so it binds
+                # no tuner.
                 cfg = bk._user_provided_config()
                 if cfg is None:
-                    fusion_context_hash = hashlib.sha256(
-                        repr(fusion_key).encode()
-                    ).hexdigest()
-                    adapter = _FusionAutotuneAdapter(
-                        bk,
-                        self._make_bench_kernel_factory(hook_outputs),
-                        fusion_context_hash,
-                    )
-                    cfg = bk.env.backend.autotune(
-                        adapter,  # pyrefly: ignore[bad-argument-type]
-                        self._autotune_args,  # pyrefly: ignore[bad-argument-type]
-                        force=False,
-                    )
+                    tuner = self._tuning_kernel()
+                    with self._call_facts(tuner):
+                        fusion_context_hash = hashlib.sha256(
+                            repr(fusion_key[0]).encode()
+                        ).hexdigest()
+                        adapter = _FusionAutotuneAdapter(
+                            tuner,
+                            self._make_bench_kernel_factory(hook_outputs),
+                            fusion_context_hash,
+                        )
+                        cfg = tuner.env.backend.autotune(
+                            adapter,  # pyrefly: ignore[bad-argument-type]
+                            self._autotune_args,  # pyrefly: ignore[bad-argument-type]
+                            force=False,
+                        )
                 if bk_cache is None:
                     bk_cache = {}
                     self._fusion_config_cache[bk] = bk_cache
                 bk_cache[fusion_key] = cfg
         else:
-            if self._autotune_args is not None:
-                bk.ensure_config_exists(
-                    self._autotune_args,  # pyrefly: ignore[bad-argument-type]
-                )
+            # A config the binding already has (an eager call tuned or set it)
+            # stays, as before, though the render may refuse it.
             cfg = bk._config
+            tuned = self._tuned_config_cache.get(bk)
+            if cfg is None and tuned is not None:
+                cfg = tuned.get(facts)
+            if cfg is None and self._autotune_args is not None:
+                # A config the user gave holds whatever the facts, so it
+                # binds no tuner.
+                cfg = (
+                    bk._user_provided_config() if self._tunes_on_own_binding() else None
+                )
+                if cfg is None:
+                    tuner = self._tuning_kernel()
+                    with self._call_facts(tuner):
+                        tuner.ensure_config_exists(
+                            self._autotune_args,  # pyrefly: ignore[bad-argument-type]
+                        )
+                    cfg = tuner._config
+                if self._tunes_on_own_binding():
+                    if tuned is None:
+                        tuned = {}
+                        self._tuned_config_cache[bk] = tuned
+                    tuned[facts] = cfg
 
         # Generate final AST with chosen config.
         assert cfg is not None, (
@@ -720,26 +880,19 @@ class HelionTemplateBuffer(TemplateBuffer):
         """Build AST for config, optionally rename for Inductor, and unparse."""
         fm = self._fusion_metadata
         assert fm is not None
-        # Work on a copy so the caller's Config is not mutated with
-        # normalize defaults specific to this BoundKernel's config_spec.
-        config = Config(**config.config)  # pyrefly: ignore[bad-argument-type]
-        self._bound_kernel.env.config_spec.normalize(config)
-        extra_params = [p for p, _ in self._extra_params]
-
-        with self._bound_kernel.env:
-            host_function = self._bound_kernel.host_function
-            root = generate_ast(
-                host_function,  # pyrefly: ignore[bad-argument-type]
-                config,
-                emit_repro_caller=False,
-                store_transform=self._codegen_epilogue_fusion
-                if fm.epilogue_idx_by_param
-                else None,
-                load_transform=self._codegen_prologue_fusion
-                if fm.prologue_fused_params
-                else None,
-                extra_params=extra_params,
-            )
+        root = render_inductor_ast(
+            self._bound_kernel,
+            config,
+            symbolic_input_layouts=self._symbolic_input_layouts,
+            symbolic_strides=self._symbolic_strides,
+            store_transform=self._codegen_epilogue_fusion
+            if fm.epilogue_idx_by_param
+            else None,
+            load_transform=self._codegen_prologue_fusion
+            if fm.prologue_fused_params
+            else None,
+            extra_params=[p for p, _ in self._extra_params],
+        )
         _strip_host_annotations(root, self._helion_kernel.name)
         if rename_with_placeholders:
             self._rename_with_placeholders(root)
@@ -1146,6 +1299,7 @@ def lower_helion_kernel(
 
     all_args: dict[str, object] = {**constant_args}
     has_static_dims = False
+    symbolic_stride_examples: list[torch.Tensor] = []
     for n, r in realized.items():
         # Reused as autotune_args; uninitialized memory may contain NaN
         # bytes that spuriously fail accuracy checks. rand_strided
@@ -1175,8 +1329,13 @@ def lower_helion_kernel(
             if static_dims:
                 setattr(example, HELION_STATIC_DIMS_ATTR, static_dims)
                 has_static_dims = True
+            # The placeholder stride of 1 proves no layout fact
+            # (``CompileEnvironment.traced_strides_hold``).
+            if not all(isinstance(s, (int, sympy.Integer)) for s in r.get_stride()):
+                symbolic_stride_examples.append(example)
         all_args[n] = example
     _rebuild_container_args(all_args)
+    symbolic_strides = tensor_input_sources(all_args, symbolic_stride_examples)
 
     fake_tensors: list[object] = [
         all_args.get(n, p.default)
@@ -1246,6 +1405,8 @@ def lower_helion_kernel(
             bound_kernel=bound,
             constant_args=constant_args,
             autotune_args=tuple(fake_tensors),
+            symbolic_input_layouts=has_symbolic_shapes,
+            symbolic_strides=symbolic_strides,
         )
         buf.epilogue_fusable_outputs = {}
         return ()
@@ -1332,6 +1493,8 @@ def lower_helion_kernel(
         bound_kernel=bound,
         constant_args=constant_args,
         autotune_args=tuple(fake_tensors),
+        symbolic_input_layouts=has_symbolic_shapes,
+        symbolic_strides=symbolic_strides,
     )
 
     # Validate on_tensor_leaf was called during build_multi_outputs.

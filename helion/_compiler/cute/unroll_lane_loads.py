@@ -46,6 +46,9 @@ lists only name SSA values; the DSL sees ``U`` independent loads followed by
 the compute, which is the order the tile program gives them (a tile load
 precedes everything after it for the whole tile, so lane ``n + 1``'s load
 moving above lane ``n``'s atomic is the program's order, not a reordering).
+The load phase runs ahead of the lanes' compute, so it never assigns a name a
+lane reads before assigning it (a loop-carried name): that assignment and the
+loads that read the name keep their place.
 
 Only loads that precede the body's first memory effect in program order
 move (a load after a store or atomic keeps its place, since the tile program
@@ -103,10 +106,12 @@ def lane_unroll_off_config(config: Config) -> Config:
 
 
 # Trace-time copies of one lane body (unroll factor times the extents of the
-# nested lane loops it hoists from) beyond which the pass declines.
+# nested lane loops it hoists from) beyond which the pass declines; the
+# loads-first split of ``cute/split_lane_loads.py`` shares the bound.
 _MAX_UNROLLED_LANES = 64
-# Vector packets a thread holds live across the load phase (unroll factor
-# times the packet loads of one lane body).  Every hoisted packet stays in
+# Vector packets a thread holds live across the load phase: the unroll
+# factor times the packets one lane body loads, each trip of a nested lane
+# loop it hoists from included.  Every hoisted packet stays in
 # registers until its lane computes: rope's 16-head lane with two 16-byte
 # packets per head unrolled 16 ways held 32 packets and cost 206 registers
 # per thread (12% of the SM's warps active, 8-10% slower than Triton under a
@@ -212,15 +217,6 @@ class _LevelPlan:
     # Original statements in order, with hoisted ones and nested levels.
     items: list[_Hoisted | _LevelPlan]
 
-    def hoisted_names(self) -> set[str]:
-        names: set[str] = set()
-        for item in self.items:
-            if isinstance(item, _Hoisted):
-                names.add(item.name)
-            else:
-                names |= item.hoisted_names()
-        return names
-
     def load_count(self) -> int:
         return sum(
             (1 if item.list_index is not None else 0)
@@ -231,20 +227,27 @@ class _LevelPlan:
 
     def packet_count(self) -> int:
         """Hoisted vector loads (``cute.arch.load(..., VectorType)`` and the
-        cache-hinted packet helpers) of one trip of this level."""
+        cache-hinted packet helpers) of one trip of this level: a nested
+        level's once per trip of it, as the load phase appends every one."""
         return sum(
             (1 if item.list_index is not None and _is_packet_load(item.stmt) else 0)
             if isinstance(item, _Hoisted)
-            else item.packet_count()
+            else item.extent * item.packet_count()
             for item in self.items
         )
 
     def nested_product(self) -> int:
-        product = 1
-        for item in self.items:
-            if isinstance(item, _LevelPlan):
-                product *= item.extent * item.nested_product()
-        return product
+        """Trace-time copies of the nested levels of one trip of this level:
+        a nested level's trips times its own copies, added over sibling
+        levels, which the load phase runs one after another; 1 without any."""
+        return (
+            sum(
+                item.extent * item.nested_product()
+                for item in self.items
+                if isinstance(item, _LevelPlan)
+            )
+            or 1
+        )
 
 
 class _Planner:
@@ -256,6 +259,19 @@ class _Planner:
         # targets, so lane variables are not counted here).
         self.write_counts: dict[str, int] = dict(rw.writes)
         self.next_list = 0
+        # For each statement of the nest, the names it reads or an earlier
+        # statement of its body reads, or one ahead of its loop in an
+        # enclosing body: a lane reads them before it assigns them.
+        self.read_before: dict[int, set[str]] = {}
+        self._record_reads(loop.body, set())
+
+    def _record_reads(self, body: list[ast.stmt], before: set[str]) -> None:
+        read = before
+        for stmt in body:
+            self.read_before[id(stmt)] = {*read, *ReadWrites.from_ast(stmt).reads}
+            if isinstance(stmt, ast.For):
+                self._record_reads(stmt.body, read)
+            read = self.read_before[id(stmt)]
 
     def plan(
         self,
@@ -263,15 +279,16 @@ class _Planner:
         extent: int,
         available: set[str],
         outer_pending: list[dict[str, ast.Assign]],
-    ) -> tuple[_LevelPlan, set[str]]:
+    ) -> tuple[_LevelPlan, list[str]]:
         """Plan one level.
 
         ``available``: names the load phase has defined when this level runs
         (outer lane variables and outer statements already hoisted).
         ``outer_pending``: the enclosing levels' pure candidates that could
         still move, innermost last.  Returns the plan and the names of outer
-        pending candidates this level's hoists read, which the caller must
-        hoist before this level's load loop.
+        pending candidates this level's hoists read, in first-read order, so
+        the caller hoists them deterministically before this level's load
+        loop.
         """
         lane_var = loop.target.id  # type: ignore[union-attr]
         available = {*available, lane_var}
@@ -281,7 +298,9 @@ class _Planner:
         # load needs them, in order; a load pulls its backward slice.
         pending: dict[str, ast.Assign] = {}
         hoisted: set[str] = set()
-        outer_deps: set[str] = set()
+        # Ordered: the caller hoists these in this order, which must not
+        # depend on string hashing.
+        outer_deps: dict[str, None] = {}
 
         def reachable(name: str) -> bool:
             return (
@@ -293,13 +312,16 @@ class _Planner:
             )
 
         def hoistable(stmt: ast.AST, target: str) -> bool:
-            if self.write_counts.get(target, 0) != 1:
+            # A name the lane reads before it assigns it (``acc = acc + 1``,
+            # or ``w = idx * 2`` ahead of ``idx = ...``) carries the value the
+            # previous lane left: assigned in the load phase, it would hold
+            # the last lane's value when the compute phase reads it.
+            if (
+                self.write_counts.get(target, 0) != 1
+                or target in self.read_before[id(stmt)]
+            ):
                 return False
-            return all(
-                reachable(name)
-                for name in ReadWrites.from_ast(stmt).reads
-                if name != target
-            )
+            return all(reachable(name) for name in ReadWrites.from_ast(stmt).reads)
 
         def pull(names: Iterable[str]) -> None:
             """Move the pending pure dependencies (transitively) first."""
@@ -312,7 +334,7 @@ class _Planner:
                     items.append(_Hoisted(dependency, name, None))
                     hoisted.add(name)
                 elif any(name in level for level in outer_pending):
-                    outer_deps.add(name)
+                    outer_deps[name] = None
 
         for stmt in loop.body:
             if _is_lane_loop(stmt) and not effect_seen:
@@ -347,7 +369,7 @@ class _Planner:
                 continue
             if not _is_effect_free(stmt):
                 effect_seen = True
-        return _LevelPlan(loop, extent, items), outer_deps
+        return _LevelPlan(loop, extent, items), list(outer_deps)
 
 
 def _index_text(index_vars: list[tuple[str, int]]) -> str:

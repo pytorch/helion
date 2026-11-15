@@ -33,19 +33,35 @@ those of ``packet_flush_names`` (the ``_cute_store_*_vec`` family).
 A consumer narrows the match to what it handles (a plain ``packet`` with
 no keywords and a ``Uint16`` / ``Uint32`` carrier, say) by reading the
 record's fields; the matcher itself only parses.
+
+The memory writes are wider than the packet stores: ``is_store_call`` names
+every generated write (stores, atomics, vector reductions into memory, bulk
+copies and the persistent vectorizer's store marker), ``store_pointer`` the
+address one writes through, and ``call_write_roots`` the tensors any call
+may write, the calls whose effects are unknown included.  The passes that
+move or reuse memory accesses ask these instead of keeping lists of their
+own.
 """
 
 from __future__ import annotations
 
 import ast
 import dataclasses
+from typing import TYPE_CHECKING
 from typing import Literal
 
+from ._ast_pass_utils import _is_proven_relocatable_call
 from ._ast_pass_utils import call_path
+from ._ast_pass_utils import call_path_str
 from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
 from .cache_policy_loads import MASKED_PACKET_LOAD_HELPER_NAMES
 from .cache_policy_loads import CachePolicy
 from .packet_flush_names import PACKET_FLUSH_HELPER_NAMES
+from .reduce_call import GROUPED_REDUCE_HELPERS
+from .reduce_call import ReduceScope
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 PacketKind = Literal[
     "load", "store", "arch_load", "packet", "hinted_packet", "masked_packet", "flush"
@@ -54,6 +70,50 @@ PacketKind = Literal[
 _ARCH_LOAD = ("cute", "arch", "load")
 _ARCH_STORE = ("cute", "arch", "store")
 _VECTOR_TYPE = ("ir", "VectorType", "get")
+# The branch-local persistent vectorizer's markers (``memory_ops``):
+# ``LOAD(block, width, dtype, eviction, PTR, scalar_load)`` and
+# ``STORE(block, width, dtype, PTR, value, mask)``.
+PERSISTENT_BRANCH_VEC_LOAD = "_helion_persistent_branch_vec_load"
+PERSISTENT_BRANCH_VEC_STORE = "_helion_persistent_branch_vec_store"
+# Calls that write no tensor besides those the relocation proofs accept:
+# the loops' iterators, a thread's fresh register tensor, the vectorizer's
+# load marker, the register conversions of packed bf16 and fp4, warp
+# shuffles and the pure selects and extrema of ``cutlass``, and the
+# calls that touch only shared memory or barrier state, which no tensor a
+# load reads aliases: shared-memory allocation and tensor views, the CTA,
+# mbarrier and cluster barriers, the signal that lets dependent grids
+# launch, and the grouped reductions, whose scratch is shared memory.  (The
+# wait for the grids before is none: it makes their writes visible.)
+_NO_MEMORY_WRITE = frozenset(
+    {
+        PERSISTENT_BRANCH_VEC_LOAD,
+        *GROUPED_REDUCE_HELPERS,
+        "_cute_bfloat16_x16_to_float16",
+        "_cute_float4_e2m1fn_x16_to_float16",
+        "cute.arch.alloc_smem",
+        "cute.arch.cluster_arrive",
+        "cute.arch.cluster_arrive_relaxed",
+        "cute.arch.cluster_wait",
+        "cute.arch.griddepcontrol_launch_dependents",
+        "cute.arch.make_warp_uniform",
+        "cute.arch.mbarrier_init",
+        "cute.arch.mbarrier_init_fence",
+        "cute.arch.shuffle_sync",
+        "cute.arch.shuffle_sync_bfly",
+        "cute.arch.shuffle_sync_down",
+        "cute.arch.shuffle_sync_up",
+        "cute.arch.sync_threads",
+        "cute.make_layout",
+        "cute.make_rmem_tensor",
+        "cute.make_tensor",
+        "cutlass.max",
+        "cutlass.min",
+        "cutlass.range",
+        "cutlass.range_constexpr",
+        "cutlass.select_",
+        "range",
+    }
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -205,6 +265,115 @@ def match_packet_access(node: ast.AST) -> PacketAccess | None:
             return None
         return PacketAccess("flush", node, node.args[0], None, None, name)
     return None
+
+
+def is_store_call(call: ast.Call) -> bool:
+    """Whether ``call`` is a generated memory write: a store, an atomic or
+    vector reduction into memory, a bulk copy, or the persistent
+    vectorizer's store marker."""
+    func = call.func
+    if isinstance(func, ast.Attribute):
+        return (
+            func.attr in ("store", "__setitem__")
+            or func.attr.startswith("atomic_")
+            # ``cute.copy(atom, src, dst)``: a bulk write to its destination.
+            or (
+                func.attr == "copy"
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "cute"
+            )
+        )
+    return isinstance(func, ast.Name) and (
+        func.id == PERSISTENT_BRANCH_VEC_STORE
+        # ``_cute_red_add_f32_vec(ptr, vals)``: a vector reduction into memory.
+        or func.id.startswith(
+            ("_cute_store_", "_cute_rank1_store_", "_cute_atomic_", "_cute_red_")
+        )
+    )
+
+
+def store_pointer(call: ast.Call) -> ast.expr | None:
+    """The address a generated write (``is_store_call``) writes through;
+    None when its destination is not an address operand (``cute.copy``'s
+    tensor view, the ``_cute_rank1_store_*`` helpers) and for any other
+    call."""
+    func = call.func
+    if isinstance(func, ast.Name):
+        if func.id == PERSISTENT_BRANCH_VEC_STORE:
+            return call.args[3] if len(call.args) == 6 else None
+        if func.id.startswith(("_cute_store_", "_cute_atomic_", "_cute_red_")):
+            return call.args[0] if call.args else None
+        return None
+    if not isinstance(func, ast.Attribute):
+        return None
+    if func.attr.startswith("atomic_"):
+        return call.args[0] if call.args else None
+    if func.attr == "store":
+        # ``cute.arch.store(ptr, value, ...)`` is a free function, while
+        # ``ptr.store(value)`` carries its destination on ``func.value``.
+        if call_path(func) == _ARCH_STORE:
+            return call.args[0] if call.args else None
+        return func.value
+    if func.attr == "__setitem__":
+        return func.value
+    return None
+
+
+def call_write_roots(
+    call: ast.Call, roots: Callable[[ast.expr], frozenset[str] | None]
+) -> frozenset[str] | None:
+    """The tensors ``call`` may write, ``roots`` naming those an address
+    reaches (None: not resolved): empty when the call writes no tensor,
+    None when it may write memory it does not name.
+
+    A generated write (``is_store_call``) writes the ``roots`` of its
+    address, or memory it does not name when it has none
+    (``store_pointer``).  A call writes no tensor when the relocation proofs
+    accept it with its loads and CTA reductions, when ``_NO_MEMORY_WRITE``
+    names it (iterators, fresh register tensors, the load marker, and the
+    calls that touch only shared memory or barrier state), when it is a
+    trace-time list's ``name.append(value)``, and when it is inline asm
+    declared ``is_pure``: that asm is lowered without side effects
+    (``inline_asm_helpers``), so the compiler already assumes it writes
+    nothing.  Any other call, impure inline asm among them, may write
+    anything.
+    """
+    if is_store_call(call):
+        pointer = store_pointer(call)
+        return None if pointer is None else roots(pointer)
+    func = call.func
+    name = call_path_str(func)
+    if name == "_cute_inline_asm_elementwise":
+        pure = any(
+            keyword.arg == "is_pure"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value is True
+            for keyword in call.keywords
+        )
+        return frozenset() if pure else None
+    if (
+        name in _NO_MEMORY_WRITE
+        or (
+            isinstance(func, ast.Attribute)
+            and func.attr == "append"
+            and isinstance(func.value, ast.Name)
+        )
+        or _is_proven_relocatable_call(call, allow_load=True, allow_reduction=True)
+    ):
+        return frozenset()
+    return None
+
+
+def fragment_writes(call: ast.Call) -> set[str]:
+    """The names of the register fragments ``call`` stores into in place,
+    which ``call_write_roots`` leaves out since they are no tensor: the
+    ``results`` of the fragment grouped reduce (all the names its argument
+    reads, when it is no plain name)."""
+    if call_path_str(call.func) != ReduceScope.SHARED_TWO_STAGE_FRAGMENT.value:
+        return set()
+    if len(call.args) < 2:
+        return set()
+    return {node.id for node in ast.walk(call.args[1]) if isinstance(node, ast.Name)}
 
 
 def vector_type_source(width: int, carrier: str) -> str:

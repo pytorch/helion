@@ -48,6 +48,7 @@ from .match_common import is_call
 from .match_common import is_neg_inf
 from .match_common import new_var_source
 from .match_common import packed_f32x2_multiply
+from .match_common import root_grid_origin_is_canonical
 from .match_common import scalar_value
 from .match_common import scale_operand
 from .match_common import unit_fixed_block
@@ -2436,7 +2437,9 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
 
     if not _attention_flash_gate_enabled() or not _attention_flash_supported():
         return None
-    if len(device_ir.grid_block_ids) != 1:
+    if len(device_ir.grid_block_ids) != 1 or not root_grid_origin_is_canonical(
+        device_ir
+    ):
         return None
     root_grid_ids = device_ir.grid_block_ids[0]
     env = CompileEnvironment.current()

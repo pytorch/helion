@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 from collections import Counter
+import dataclasses
 from functools import partial
 import math
 import re
@@ -20,18 +21,24 @@ from typing import TYPE_CHECKING
 from ..ast_read_writes import ReadWrites
 from ._ast_pass_utils import loop_extent
 from ._ast_pass_utils import names_read
+from ._ast_pass_utils import names_written
 from ._ast_pass_utils import reparse_expr as _clone_expr
 from ._ast_pass_utils import replace_call
 from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
 from .cache_policy_loads import CachePolicy
+from .packet_access import PERSISTENT_BRANCH_VEC_LOAD
+from .packet_access import PERSISTENT_BRANCH_VEC_STORE
+from .packet_access import call_write_roots
+from .packet_access import fragment_writes
 from .packet_access import match_packet_access
 from .packet_access import render_packet_load
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Mapping
 
-_LOAD_MARKER = "_helion_persistent_branch_vec_load"
-_STORE_MARKER = "_helion_persistent_branch_vec_store"
+_LOAD_MARKER = PERSISTENT_BRANCH_VEC_LOAD
+_STORE_MARKER = PERSISTENT_BRANCH_VEC_STORE
 _SYNTHETIC_LANE_RE = re.compile(r"synthetic_lane_(\d+)")
 _DTYPE_INFO = {
     "cutlass.BFloat16": ("cutlass.Uint16", 2, "_cute_store_u16_vec"),
@@ -1185,7 +1192,9 @@ def _uniform_guard(
     lane_var: str,
     width: int,
     local_writes: set[str],
+    canonical: Callable[[str], str],
 ) -> tuple[bool, ast.expr | None]:
+    """``local_writes`` holds canonical names (``canonical``)."""
     if mask is None:
         return True, None
     expanded = _expand(mask, definitions, lane_var)
@@ -1210,13 +1219,14 @@ def _uniform_guard(
                 ),
             )
             if any(
-                set(ReadWrites.from_ast(endpoint).reads) & local_writes
+                {canonical(name) for name in ReadWrites.from_ast(endpoint).reads}
+                & local_writes
                 for endpoint in endpoints
             ):
                 return False, None
             uniform.extend(endpoints)
             continue
-        if reads & local_writes:
+        if {canonical(name) for name in reads} & local_writes:
             return False, None
         uniform.append(term)
     if any(
@@ -1254,12 +1264,14 @@ def _safe_base_pointer(
     lane_var: str,
     local_writes: set[str],
     guard: ast.expr | None,
+    canonical: Callable[[str], str],
 ) -> ast.expr | None:
+    """``local_writes`` holds canonical names (``canonical``)."""
     expanded_with_lane = _expand(pointer, definitions, lane_var)
     if lane_var not in set(ReadWrites.from_ast(expanded_with_lane).reads):
         return None
     base = _expand(pointer, definitions, lane_var, ast.Constant(value=0))
-    if set(ReadWrites.from_ast(base).reads) & local_writes:
+    if {canonical(name) for name in ReadWrites.from_ast(base).reads} & local_writes:
         return None
     if any(
         isinstance(node, ast.Call)
@@ -1325,6 +1337,20 @@ class _RestoreLoadMarkers(ast.NodeTransformer):
         return self.generic_visit(node)
 
 
+@dataclasses.dataclass(frozen=True)
+class _HoistedPacket:
+    """A vector load placed before a lane loop, reusable by a later sibling
+    loop that loads the same packet."""
+
+    name: str
+    # Tensors the packet reads (None: unresolved) and names its address reads.
+    roots: frozenset[str] | None
+    names: frozenset[str]
+    # Whether its address reads an element of a name (``offs[0]``; a layout's
+    # ``stride[0]`` is no fragment).
+    reads_elements: bool
+
+
 class _BranchLocalPersistentVectorizer:
     def __init__(
         self,
@@ -1332,6 +1358,7 @@ class _BranchLocalPersistentVectorizer:
         proven_disjoint_tensor_pairs: set[frozenset[str]],
         proven_tensor_stride_values: Mapping[tuple[str, int], int],
         wide_packet_hints: bool = False,
+        rename_groups: Mapping[str, str] | None = None,
     ) -> None:
         self.name_counts = Counter(
             node.id
@@ -1346,6 +1373,16 @@ class _BranchLocalPersistentVectorizer:
         # Hinted 32-byte packets take their ``_32b`` helpers
         # (``cache_policy_loads.hint_wide_packets`` of the config).
         self.wide_packet_hints = wide_packet_hints
+        # Packets hoisted earlier in the statement list being transformed,
+        # by (block, width, dtype, address): the consume loop of a split
+        # persistent reduction reads the packet its accumulate loop loaded.
+        self.hoisted: dict[tuple[int, int, str, str], _HoistedPacket] = {}
+        # The final rename merges each group into one name (``lane_base_1``
+        # into ``lane_base``): writes and reads compare canonical names.
+        self.rename_groups = rename_groups or {}
+
+    def _canonical(self, name: str) -> str:
+        return self.rename_groups.get(name, name)
 
     def _fresh(self, prefix: str) -> str:
         while True:
@@ -1427,28 +1464,6 @@ class _BranchLocalPersistentVectorizer:
             return node.args[0]
         return node.func.value
 
-    @classmethod
-    def _store_pointer(cls, node: ast.Call) -> ast.AST | None:
-        marker = _marker_call(node, _STORE_MARKER, 6)
-        if marker is not None:
-            return marker.args[3]
-        func = node.func
-        if isinstance(func, ast.Name) and func.id.startswith(
-            ("_cute_store_", "_cute_atomic_")
-        ):
-            return node.args[0] if node.args else None
-        if not isinstance(func, ast.Attribute):
-            return None
-        if func.attr.startswith("atomic_"):
-            return node.args[0] if node.args else None
-        if func.attr == "store":
-            if node.args and cls._contains_arch_attribute(func.value):
-                return node.args[0]
-            return func.value
-        if func.attr == "__setitem__":
-            return func.value
-        return None
-
     def _has_aliasing_write_in_loop(
         self,
         body: list[ast.stmt],
@@ -1474,10 +1489,8 @@ class _BranchLocalPersistentVectorizer:
             for node in ast.walk(stmt):
                 if not isinstance(node, ast.Call):
                     continue
-                store_pointer = self._store_pointer(node)
-                if store_pointer is None or not self._may_alias(
-                    self._pointer_roots(store_pointer), load_roots
-                ):
+                written = call_write_roots(node, self._pointer_roots)
+                if written == frozenset() or not self._may_alias(written, load_roots):
                     continue
                 # A later exact store preserves this load's same-iteration
                 # ordering. Its identical injective lane mapping additionally
@@ -1559,10 +1572,8 @@ class _BranchLocalPersistentVectorizer:
             for node in ast.walk(stmt):
                 if node is store_marker or not isinstance(node, ast.Call):
                     continue
-                pointer = self._store_pointer(node)
-                if pointer is not None and self._may_alias(
-                    store_roots, self._pointer_roots(pointer)
-                ):
+                written = call_write_roots(node, self._pointer_roots)
+                if written != frozenset() and self._may_alias(store_roots, written):
                     if _store_accesses_are_iteration_independent(
                         store_marker,
                         node,
@@ -1587,9 +1598,38 @@ class _BranchLocalPersistentVectorizer:
     ) -> tuple[list[ast.stmt], ast.For, list[ast.stmt]]:
         assert isinstance(loop.target, ast.Name)
         lane_var = loop.target.id
+        # ``names_written`` adds the targets of the loops nested in the lane
+        # loop, which ``ReadWrites`` skips: an address reading an inner loop's
+        # index changes inside the lane loop, so it stays there.
         all_local_writes = {
-            name for stmt in loop.body for name in ReadWrites.from_ast(stmt).writes
+            self._canonical(name)
+            for stmt in loop.body
+            for name in set(ReadWrites.from_ast(stmt).writes) | names_written(stmt)
         }
+        fragments = {
+            self._canonical(name)
+            for stmt in loop.body
+            for node in ast.walk(stmt)
+            if isinstance(node, ast.Call)
+            for name in fragment_writes(node)
+        }
+        if fragments or any(
+            isinstance(node, ast.Subscript)
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+            for stmt in loop.body
+            for node in ast.walk(stmt)
+        ):
+            # A store into an element, through any name, may change an element
+            # another name reads (``alias = offs; alias[0] = alias[0] + 1``),
+            # as between loops (``_invalidate_hoisted``): every fragment the
+            # loop reads an element of, or a call stores into in place
+            # (``fragment_writes``), counts as written.
+            all_local_writes |= fragments | {
+                self._canonical(node.value.id)
+                for stmt in loop.body
+                for node in ast.walk(stmt)
+                if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name)
+            }
         definitions: dict[str, ast.expr] = {}
         before: list[ast.stmt] = []
         after: list[ast.stmt] = []
@@ -1630,7 +1670,12 @@ class _BranchLocalPersistentVectorizer:
                 ):
                     scalar_load, mask = load_info
                     guard_ok, guard = _uniform_guard(
-                        mask, definitions, lane_var, width, all_local_writes
+                        mask,
+                        definitions,
+                        lane_var,
+                        width,
+                        all_local_writes,
+                        self._canonical,
                     )
                     base = (
                         _safe_base_pointer(
@@ -1639,34 +1684,55 @@ class _BranchLocalPersistentVectorizer:
                             lane_var,
                             all_local_writes,
                             guard,
+                            self._canonical,
                         )
                         if guard_ok and isinstance(marker.args[4], ast.expr)
                         else None
                     )
                     if base is not None:
                         carrier, itemsize, _store_helper = dtype_info
-                        vec_name = self._fresh("_persistent_branch_vec")
-                        # An L2-policy hint is not a ``cute.arch.load``
-                        # kwarg: the packet goes through the inline-PTX
-                        # helper of its width (32 bytes: nc_l2_first, and
-                        # the L2 policies under ``cute_wide_packet_hints``).
-                        policy = CachePolicy.from_suffix(eviction)
-                        load_source = render_packet_load(
-                            ast.unparse(base),
-                            width,
-                            carrier,
-                            helper=policy.vector_helper(
-                                width * itemsize, wide_packets=self.wide_packet_hints
-                            ),
-                            kwargs=policy.load_kwargs,
-                        )
-                        vector_load = ast.parse(load_source, mode="eval").body
-                        before.append(
-                            ast.Assign(
-                                targets=[ast.Name(id=vec_name, ctx=ast.Store())],
-                                value=vector_load,
+                        assert isinstance(dtype, str)
+                        key = (block_id, width, dtype, ast.unparse(base))
+                        hoisted = self.hoisted.get(key)
+                        if hoisted is not None:
+                            # Nothing since the earlier loop's packet was
+                            # loaded may have written it or rebound a name of
+                            # its address (``_invalidate_hoisted``).
+                            vec_name = hoisted.name
+                        else:
+                            vec_name = self._fresh("_persistent_branch_vec")
+                            # An L2-policy hint is not a ``cute.arch.load``
+                            # kwarg: the packet goes through the inline-PTX
+                            # helper of its width (32 bytes: nc_l2_first, and
+                            # the L2 policies under ``cute_wide_packet_hints``).
+                            policy = CachePolicy.from_suffix(eviction)
+                            load_source = render_packet_load(
+                                ast.unparse(base),
+                                width,
+                                carrier,
+                                helper=policy.vector_helper(
+                                    width * itemsize,
+                                    wide_packets=self.wide_packet_hints,
+                                ),
+                                kwargs=policy.load_kwargs,
                             )
-                        )
+                            vector_load = ast.parse(load_source, mode="eval").body
+                            before.append(
+                                ast.Assign(
+                                    targets=[ast.Name(id=vec_name, ctx=ast.Store())],
+                                    value=vector_load,
+                                )
+                            )
+                            self.hoisted[key] = _HoistedPacket(
+                                vec_name,
+                                self._pointer_roots(base),
+                                frozenset(map(self._canonical, names_read(base))),
+                                any(
+                                    isinstance(node, ast.Subscript)
+                                    and isinstance(node.value, ast.Name)
+                                    for node in ast.walk(base)
+                                ),
+                            )
                         extract = ast.parse(
                             f"{carrier}({vec_name}[{lane_var}]).bitcast({dtype})",
                             mode="eval",
@@ -1701,7 +1767,14 @@ class _BranchLocalPersistentVectorizer:
                     else mask_arg
                 )
                 guard_ok, guard = (
-                    _uniform_guard(mask, definitions, lane_var, width, all_local_writes)
+                    _uniform_guard(
+                        mask,
+                        definitions,
+                        lane_var,
+                        width,
+                        all_local_writes,
+                        self._canonical,
+                    )
                     if isinstance(mask, (ast.expr, type(None)))
                     else (False, None)
                 )
@@ -1712,6 +1785,7 @@ class _BranchLocalPersistentVectorizer:
                         lane_var,
                         all_local_writes,
                         None,
+                        self._canonical,
                     )
                     if guard_ok and isinstance(store_marker.args[3], ast.expr)
                     else None
@@ -1829,7 +1903,51 @@ class _BranchLocalPersistentVectorizer:
                     break
         return value
 
+    def _invalidate_hoisted(self, statement: ast.stmt) -> None:
+        """Forget the hoisted packets ``statement`` may write (a call that
+        may write memory it does not name, ``call_write_roots``, writes all
+        of them) or whose address names it rebinds.  A store into an element,
+        through any name, ends the packets whose address reads an element of
+        a name: another name may hold the fragment
+        (``alias = offs; alias[0] = 8``)."""
+        if not self.hoisted:
+            return
+        written = {
+            self._canonical(name)
+            for name in set(ReadWrites.from_ast(statement).writes)
+            | names_written(statement)
+        }
+        write_roots = [
+            roots
+            for node in ast.walk(statement)
+            if isinstance(node, ast.Call)
+            and (roots := call_write_roots(node, self._pointer_roots)) != frozenset()
+        ]
+        # A call that stores into a fragment in place (``fragment_writes``)
+        # writes its elements too.
+        fragments = {
+            self._canonical(name)
+            for node in ast.walk(statement)
+            if isinstance(node, ast.Call)
+            for name in fragment_writes(node)
+        }
+        written |= fragments
+        stores_elements = bool(fragments) or any(
+            isinstance(node, ast.Subscript)
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+            for node in ast.walk(statement)
+        )
+        self.hoisted = {
+            key: packet
+            for key, packet in self.hoisted.items()
+            if not packet.names & written
+            and not (stores_elements and packet.reads_elements)
+            and not any(self._may_alias(roots, packet.roots) for roots in write_roots)
+        }
+
     def transform_body(self, body: list[ast.stmt]) -> list[ast.stmt]:
+        # Packets are reused only between sibling loops of one statement list.
+        outer, self.hoisted = self.hoisted, {}
         result: list[ast.stmt] = []
         for stmt in body:
             if isinstance(stmt, ast.For) and isinstance(stmt.target, ast.Name):
@@ -1842,11 +1960,16 @@ class _BranchLocalPersistentVectorizer:
                     result.extend(before)
                     result.append(loop)
                     result.extend(after)
+                    for emitted in (loop, *after):
+                        self._invalidate_hoisted(emitted)
                     continue
 
             store_marker = self._store_marker(stmt)
             if store_marker is not None:
-                result.extend(self._restore_store(store_marker))
+                restored = self._restore_store(store_marker)
+                result.extend(restored)
+                for emitted in restored:
+                    self._invalidate_hoisted(emitted)
                 continue
             for field in ("body", "orelse", "finalbody"):
                 child = getattr(stmt, field, None)
@@ -1855,6 +1978,8 @@ class _BranchLocalPersistentVectorizer:
                 ):
                     setattr(stmt, field, self.transform_body(child))
             result.append(stmt)
+            self._invalidate_hoisted(stmt)
+        self.hoisted = outer
         return result
 
 
@@ -1864,11 +1989,13 @@ def vectorize_branch_local_persistent_fragments(
     proven_disjoint_tensor_pairs: set[frozenset[str]] | None = None,
     proven_tensor_stride_values: Mapping[tuple[str, int], int] | None = None,
     wide_packet_hints: bool = False,
+    rename_groups: Mapping[str, str] | None = None,
 ) -> list[ast.stmt]:
     """Vectorize marked exact fragments and erase every unhandled marker.
 
     ``wide_packet_hints`` (``cache_policy_loads.hint_wide_packets`` of the
-    config) lets a hinted 32-byte packet take its ``_32b`` helper."""
+    config) lets a hinted 32-byte packet take its ``_32b`` helper.
+    ``rename_groups`` maps each name to the one the final rename gives it."""
     if not any(
         isinstance(node, ast.Name) and node.id in (_LOAD_MARKER, _STORE_MARKER)
         for stmt in body
@@ -1883,6 +2010,7 @@ def vectorize_branch_local_persistent_fragments(
         proven_disjoint_tensor_pairs or set(),
         proven_tensor_stride_values or {},
         wide_packet_hints,
+        rename_groups,
     )
     transformed = vectorizer.transform_body(body)
     # Most kernels have no persistent-fragment load markers.  Avoid running an

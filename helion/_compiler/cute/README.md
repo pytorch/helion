@@ -36,6 +36,7 @@ grep for it.
 | `device/`, `*_runtime.py`, `*_helpers.py` | device helpers traced into kernels (`ptx.py` primitive rows, `sync.py`, the family runtimes) |
 | `runtime_hooks.py`, `launch_shape.py`, `standalone.py` | the host-side hooks, the structural launch-shape check, the standalone exporter |
 | `target_facts.py`, `_codegen_modules.py` | the target model and the per-CTA SMEM probes, the op-handler modules registered through `@_decorators.codegen(op, "cute")` |
+| `smem_footprint.py` | the shared memory a rendered kernel allocates (its reduce helpers' buffers and unrolled copies included), the per-block check, the `cute_pdl_spread` pad's input |
 | `helion/runtime/cute/` | `launcher.py`, `host_wrappers/`, the launch caches and descriptors, the compile cache |
 
 ## 2. The compile pipeline, hook by hook
@@ -100,8 +101,11 @@ the launcher runs the module.  The CuTe backend plugs in at these points:
    `passes.pipeline.run_device_body_passes` (section 4),
    `passes.pdl.place_late_wait`; `finalize_kernel_def` ->
    `run_kernel_def_passes`, `pdl.insert_spread_pad`,
-   `pdl_ops.validate_explicit_launch`, `launch_attributes.module_statements`,
-   and `project_launch_block`. Core code then splices explicit
+   `pdl_ops.validate_explicit_launch`,
+   `smem_footprint.check_smem_budget` (a kernel past the per-block shared
+   memory maximum is `BackendUnsupported`, not a libNVVM failure),
+   `launch_attributes.module_statements`, and `project_launch_block`. Core
+   code then splices explicit
    `hl.pdl_*` entry/exit markers after every body rewrite, preserving source
    order. Explicit markers govern the launch protocol and disable automatic
    `cute_pdl` placement and spread padding. Whole-kernel/native launch paths
@@ -240,7 +244,8 @@ tcgen05 pipeline (`cute_mma.py`) composes `pipeline_smem`,
 
 `passes/pipeline.py` owns the order.  `PassContext` is the frozen record of
 everything the passes read besides the body, built once per render
-(`build_pass_context`).  `DEVICE_BODY_PROLOGUE` lowers the collective
+(`build_pass_context`).  `DEVICE_BODY_PROLOGUE` issues each atomic on the
+leader thread of the launch axes claimed after it, lowers the collective
 matmuls and decides the launch shape; `freeze_pass_context` seals it;
 `DEVICE_BODY_PASSES` (from `finalize_shared_reduce_groups` to
 `hoist_exact_invariant_divisions`) rewrite the body; `KERNEL_DEF_PASSES` run

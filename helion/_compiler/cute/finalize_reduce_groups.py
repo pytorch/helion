@@ -3,11 +3,13 @@ launch block is known.
 
 A reduction at the bottom of the lane index emits
 ``_cute_grouped_reduce_shared_two_stage(..., group_span=S, group_count=G)``
-(or the register tile's ``_cute_grouped_reduce_shared_columns``) before
-codegen has seen every thread axis (a sibling branch can still add a
-redundant axis), so ``ReductionStrategy._cute_runtime_lane_group_params``
-keys the helper's shared memory on the full runtime thread id and sizes ``G``
-for the 1024-thread CTA budget.  When the launch shape is proven static the
+(or the register tile's ``_cute_grouped_reduce_shared_columns``; the V-loop
+sink's ``_cute_grouped_reduce_shared_two_stage_fragment`` keeps the count of
+the per-lane reduces it replaces) before codegen has seen every thread axis
+(a sibling branch can still add a redundant axis), so
+``ReductionStrategy._cute_runtime_lane_group_params`` keys the helper's
+shared memory on the full runtime thread id and sizes ``G`` for the
+1024-thread CTA budget.  When the launch shape is proven static the
 over-provisioned count costs the kernel: the helper only takes its cheaper
 serial form (one warp fold, one barrier, every thread sums the per-warp
 partials) for a single group spanning the whole CTA, and the shared stage is
@@ -95,8 +97,10 @@ class _Finalize(ast.NodeTransformer):
                     dataclasses.replace(reduce, group_count=launched).render()
                 )
             return ast.copy_location(replacement, node)
-        # The register tile's column reduce takes a list of values: not of
-        # the scalar family, so its ``group_count`` keyword is resized in place.
+        # The register tile's column reduce and the V-loop sink's fragment
+        # combine take a list or fragment of values: not of the scalar family,
+        # so their ``group_count`` keyword is resized in place (the fragment
+        # with the per-lane reduces it replaces, so both pick the same form).
         launched = self._launched_groups(
             int_keyword(node, "group_span"), int_keyword(node, "group_count")
         )

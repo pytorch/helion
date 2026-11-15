@@ -140,13 +140,21 @@ _QUOT_EXP_HIGH = 126  # Ea - Eb <= 126: quotient cannot overflow
 
 @cute.jit
 def _opaque_f32(x: Float32) -> Float32:
-    """``x``, through an empty side-effecting asm (``=f,0`` ties the output
-    to the input register; no instruction is emitted).  Applied to the
-    hoisted bounds, which ptxas otherwise rematerializes from the divisor
-    (the ten-instruction exponent chain) at every read instead of keeping
-    two registers live."""
+    """``x``, through a pure opaque identity: an empty asm (``=f,0`` ties
+    the output to the input register; no instruction is emitted).  Applied
+    to the hoisted bounds, which ptxas otherwise rematerializes from the
+    divisor (the ten-instruction exponent chain) at every read instead of
+    keeping two registers live.
+
+    It must stay pure.  LLVM keeps every memory access on its own side of a
+    side-effecting asm, and the bounds sit between a rolled reduction's
+    sweeps: a later sweep that re-reads the row would issue its loads again,
+    and recompute what they feed, instead of reusing the first sweep's (the
+    rolled-softmax SASS check in ``test_cute_exact_division.py`` holds the
+    redo form to twice the plain render's loads and MUFU.EX2: the fast
+    path's and the redo path's)."""
     return inline_asm_elementwise(
-        (x,), asm="", constraints="=f,0", dtype=Float32, is_pure=False
+        (x,), asm="", constraints="=f,0", dtype=Float32, is_pure=True
     )
 
 

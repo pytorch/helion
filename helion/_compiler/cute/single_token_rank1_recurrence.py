@@ -1204,7 +1204,7 @@ def _plan_single_token_rank1_recurrence(
     state_head_stride = _VALUE_SIZE * _KEY_SIZE
     state_span = value_heads * state_head_stride
 
-    if "input_tensor_metadata" not in env.compiler_fact_specialization_facts:
+    if not env.exact_input_metadata_holds():
         return None
     runtime_tensors = tuple(env.runtime_value_for_tensor(tensor) for tensor in tensors)
     if not all(isinstance(tensor, torch.Tensor) for tensor in runtime_tensors):

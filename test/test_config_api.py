@@ -108,6 +108,7 @@ from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import ListOf
 from helion.autotuner.config_fragment import PowerOfTwoFragment
+from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import LoopOrderSpec
 from helion.autotuner.config_spec import MatmulFact
@@ -1892,6 +1893,25 @@ class TestSettingsEnv(TestCase):
         spec.normalize(config)
 
         self.assertEqual(config["block_sizes"][:3], [64, 64, 64])
+
+    def test_bounded_inner_block_size_keeps_its_minimum_and_pin(self) -> None:
+        # Clamped to an outer block of 8, an inner block whose minimum or
+        # structural pin is 16 stays at 16, wider than its extent: the clamp
+        # took it to 8.
+        for constraint in ("min_size", "pin"):
+            spec = ConfigSpec(backend=TritonBackend())
+            spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))
+            inner = BlockSizeSpec(block_id=1, size_hint=1024, bounded_by_block_id=0)
+            spec.block_sizes.append(inner)
+            if constraint == "min_size":
+                inner.update_min(16)
+            else:
+                inner.pin_structurally(16, reason="a test pin")
+            for block_sizes in ([8, 16], [8, 64]):
+                with self.subTest(constraint=constraint, block_sizes=block_sizes):
+                    config = {"block_sizes": block_sizes}
+                    spec.normalize(config)
+                    self.assertEqual(config["block_sizes"][:2], [8, 16])
 
     def test_bounded_inner_block_size_repairs_cute_num_threads(self) -> None:
         from helion._compiler.cute.backend import CuteBackend

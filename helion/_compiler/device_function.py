@@ -18,7 +18,6 @@ import sympy
 import torch
 from torch._dynamo.source import TensorProperty
 from torch._dynamo.source import TensorPropertySource
-from torch._subclasses.fake_tensor import FakeTensor
 from torch.fx.graph import _Namespace
 
 from .. import exc
@@ -85,11 +84,13 @@ def _exact_thread_block_dims(
     """Return a proven-static launch shape, or ``None`` when inference fails.
 
     ``None`` as well when a launch axis is sized by a kernel argument
-    (``TileStrategyDispatch.symbolic_thread_axes``): the static shape holds a
-    one for it, and a pass proving bounds from that one (the lane-tile bounds
-    simplifier erased the leader guard ``cute.arch.thread_idx()[axis] == 0``
-    of an atomic beside the axis, which then ran once per thread of it) would
-    prove the wrong thing.
+    (``TileStrategyDispatch.symbolic_thread_axes``) or claimed outside the
+    strategies by a free ``hl.arange`` dim
+    (``TileStrategyDispatch.synthetic_thread_axes``): the static shape holds
+    a one for it, and a pass proving bounds from that one (the lane-tile
+    bounds simplifier erased the leader guard ``cute.arch.thread_idx()[axis]
+    == 0`` of an atomic beside the axis, which then ran once per thread of
+    it) would prove the wrong thing.
     """
 
     try:
@@ -101,11 +102,13 @@ def _exact_thread_block_dims(
         ):
             return None
         result = int(thread_dims[0]), int(thread_dims[1]), int(thread_dims[2])
-        return result if all(dim > 0 for dim in result) else None
     except (TypeError, ValueError):
         # A sympy extent that is not an integer (``int()`` of a symbolic
         # thread count); every other failure of the strategies surfaces.
         return None
+    if not all(dim > 0 for dim in result) or tile_strategy.synthetic_thread_axes():
+        return None
+    return result
 
 
 @dataclasses.dataclass
@@ -1494,10 +1497,12 @@ class DeviceFunction:
         sizes and strides (see ``_tensor_key``), so under that setting every
         input stride is already a cache-safe fact; otherwise a stride is
         cache-safe only when the ``input_tensor_metadata`` compiler fact or an
-        explicit ``hl.specialize`` guard covers it.
+        explicit ``hl.specialize`` guard covers it.  The binding then decides
+        the value (``CompileEnvironment.keyed_hint``), and only while
+        its dispatch guards are enforced.
         """
         env = CompileEnvironment.current()
-        input_metadata_specialized = (
+        input_metadata_specialized = env.dispatch_guards_enforced and (
             env.settings.static_shapes
             or "input_tensor_metadata" in env.compiler_fact_specialization_facts
         )
@@ -1506,9 +1511,8 @@ class DeviceFunction:
             if not isinstance(arg, TensorArg):
                 continue
             source = env.tensor_input_source(arg.fake_value)
-            runtime = env.runtime_value_for_tensor(arg.fake_value)
-            if not isinstance(runtime, torch.Tensor) or isinstance(runtime, FakeTensor):
-                if source is not None or not input_metadata_specialized:
+            if source is None:
+                if not input_metadata_specialized:
                     continue
                 # A tensor the host function allocates (``torch.empty_like``)
                 # has no runtime value at compile time; its layout is what
@@ -1520,28 +1524,30 @@ class DeviceFunction:
                         result[arg.name, dim] = fake_stride
                 continue
             for dim, fake_stride in enumerate(arg.fake_value.stride()):
-                cache_safe = source is not None and (
+                cache_safe = (
                     input_metadata_specialized
                     or TensorPropertySource(source, TensorProperty.STRIDE, dim)
                     in env.specialized_strides
                 )
                 if not cache_safe:
                     continue
-                try:
-                    traced_stride = env.size_hint(fake_stride)
-                except (RuntimeError, TypeError, ValueError):
-                    continue
-                runtime_stride = runtime.stride(dim)
-                if runtime_stride == traced_stride:
-                    result[arg.name, dim] = traced_stride
+                stride = env.keyed_hint(fake_stride)
+                if stride is not None:
+                    result[arg.name, dim] = stride
         return result
 
     def proven_tensor_size_values(
         self,
     ) -> dict[tuple[str, int], tuple[str, int]]:
-        """Return cache-safe exact runtime sizes and their generated argument names."""
+        """Return cache-safe exact runtime sizes and their generated argument names.
+
+        The ``input_tensor_metadata`` compiler fact keys the bound kernel on
+        every input tensor's exact sizes, so an input's traced size hint is
+        its size in every call this bound kernel serves, while its dispatch
+        guards are enforced (``CompileEnvironment.keyed_hint``).
+        """
         env = CompileEnvironment.current()
-        if "input_tensor_metadata" not in env.compiler_fact_specialization_facts:
+        if not env.exact_input_metadata_holds():
             return {}
         result: dict[tuple[str, int], tuple[str, int]] = {}
         for tensor_arg in self.arguments:
@@ -1551,11 +1557,6 @@ class DeviceFunction:
                 continue
             fake_tensor = tensor_arg.fake_value
             if env.tensor_input_source(fake_tensor) is None:
-                continue
-            runtime_tensor = env.runtime_value_for_tensor(fake_tensor)
-            if not isinstance(runtime_tensor, torch.Tensor) or isinstance(
-                runtime_tensor, FakeTensor
-            ):
                 continue
             for dim, size in enumerate(fake_tensor.shape):
                 if isinstance(size, int) or isinstance(size._sympy_(), sympy.Integer):
@@ -1568,29 +1569,15 @@ class DeviceFunction:
                     is None
                 ):
                     continue
-                property_runtime = env.runtime_value_for_tensor(
-                    property_arg.tensor_arg.fake_value
-                )
-                if not isinstance(property_runtime, torch.Tensor) or isinstance(
-                    property_runtime, FakeTensor
+                # The launch passes the anchor's size in place of this one, so
+                # the key must fix both.
+                anchor = property_arg.tensor_arg.fake_value
+                value = env.keyed_hint(size)
+                if value is None or value != env.keyed_hint(
+                    anchor.size(property_arg.dim)
                 ):
                     continue
-                property_fake_size = property_arg.tensor_arg.fake_value.size(
-                    property_arg.dim
-                )
-                try:
-                    runtime_size = int(runtime_tensor.size(dim))
-                    source_hint = int(env.size_hint(size))
-                    property_size = int(property_runtime.size(property_arg.dim))
-                    property_hint = int(env.size_hint(property_fake_size))
-                except (RuntimeError, TypeError, ValueError):
-                    continue
-                if not (runtime_size == source_hint == property_size == property_hint):
-                    continue
-                result[tensor_arg.name, dim] = (
-                    property_arg.name,
-                    property_hint,
-                )
+                result[tensor_arg.name, dim] = (property_arg.name, value)
         return result
 
     def codegen_function_call(self) -> ast.AST:

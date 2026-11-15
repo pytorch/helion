@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from itertools import starmap
 from typing import TYPE_CHECKING
+from typing import TypeGuard
 from typing import cast
 
 import torch
 from torch.utils._pytree import tree_leaves
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from collections.abc import Sequence
 
     import sympy
@@ -17,6 +19,7 @@ if TYPE_CHECKING:
     from ..compile_environment import CompileEnvironment
     from ..device_function import DeviceFunction
     from ..device_ir import DeviceIR
+    from ..device_ir import ForLoopGraphInfo
     from ..device_ir import GraphInfo
 
 TileLoopPath = tuple[tuple[int, ...], ...]
@@ -137,6 +140,34 @@ def constexpr_live_graph_ids(
     return frozenset(live)
 
 
+def _root_graph_tile_loop_paths(
+    device_ir: DeviceIR,
+    graphs: Sequence[GraphInfo],
+) -> list[tuple[int, GraphInfo, TileLoopPath]]:
+    """Each graph reachable from a root, with the index of that root and the
+    stack of tiles active in the graph: the root's grid tile, then every
+    enclosing non-reduction tile loop.  Roots whose grids share a block size
+    give the same paths."""
+    from ..device_ir import control_flow_child_graph_ids
+
+    result: list[tuple[int, GraphInfo, TileLoopPath]] = []
+
+    def visit(root: int, graph_id: int, path: TileLoopPath) -> None:
+        info = graphs[graph_id]
+        if _is_tile_loop(info):
+            path = (*path, tuple(info.block_ids))
+        result.append((root, info, path))
+        for node in info.graph.nodes:
+            for child in control_flow_child_graph_ids(node):
+                visit(root, child, path)
+
+    for root, (root_id, block_ids) in enumerate(
+        zip(device_ir.root_ids, device_ir.grid_block_ids, strict=True)
+    ):
+        visit(root, root_id, (tuple(block_ids),))
+    return result
+
+
 def tile_loop_paths(
     device_ir: DeviceIR,
     graphs: Sequence[GraphInfo],
@@ -149,36 +180,85 @@ def tile_loop_paths(
     Read the codegen graphs so reduction rolling and epilogue subtiling are
     reflected in the result, and ignore unreachable graph copies.
     """
-    from ..device_ir import ForLoopGraphInfo
-    from ..device_ir import ReductionLoopGraphInfo
-    from ..device_ir import control_flow_child_graph_ids
+    return _maximal_paths(
+        path for _, _, path in _root_graph_tile_loop_paths(device_ir, graphs)
+    )
 
-    paths: dict[TileLoopPath, None] = {}
 
-    def visit(graph_id: int, path: TileLoopPath) -> None:
-        info = graphs[graph_id]
-        if (
-            isinstance(info, ForLoopGraphInfo)
-            and not isinstance(info, ReductionLoopGraphInfo)
-            and info.block_ids
-        ):
-            path = (*path, tuple(info.block_ids))
-        paths[path] = None
-        for node in info.graph.nodes:
-            for child in control_flow_child_graph_ids(node):
-                visit(child, path)
-
-    for root_id, block_ids in zip(
-        device_ir.root_ids, device_ir.grid_block_ids, strict=True
-    ):
-        visit(root_id, (tuple(block_ids),))
+def _maximal_paths(paths: Iterable[TileLoopPath]) -> tuple[TileLoopPath, ...]:
+    """The distinct ``paths`` that no other path extends, in order."""
+    unique = dict.fromkeys(paths)
     return tuple(
         path
-        for path in paths
+        for path in unique
         if not any(
-            len(other) > len(path) and other[: len(path)] == path for other in paths
+            len(other) > len(path) and other[: len(path)] == path for other in unique
         )
     )
+
+
+def _is_tile_loop(info: GraphInfo) -> TypeGuard[ForLoopGraphInfo]:
+    """Whether ``info`` is the body of a tile loop: a ``for`` over blocks that
+    is not a rolled reduction's."""
+    from ..device_ir import ForLoopGraphInfo
+    from ..device_ir import ReductionLoopGraphInfo
+
+    return (
+        isinstance(info, ForLoopGraphInfo)
+        and not isinstance(info, ReductionLoopGraphInfo)
+        and bool(info.block_ids)
+    )
+
+
+def tile_loop_facts(
+    env: CompileEnvironment,
+    device_ir: DeviceIR,
+    graphs: Sequence[GraphInfo],
+    block_ids: set[int],
+) -> tuple[dict[TileLoopPath, frozenset[int]], tuple[TileLoopPath, ...]]:
+    """Two facts of one walk over the graphs reachable from the roots.
+
+    The first maps the paths of :func:`tile_loop_paths`, in its order, each
+    to the ``block_ids`` it runs beside: the ones a graph uses between the
+    path's root and its innermost loop, or inside that loop.  A sibling
+    loop's graph is on its own path, not on this one, and only the graphs of
+    a root the path belongs to count: another root whose grid shares a block
+    size with this one has the same root level, a prefix of this path, but
+    its graphs run on its own grid for other rows.
+
+    The second is the path of each tile strategy a launch builds, ending at
+    the strategy's blocks: each root's grid, then each tile loop.  Loops
+    sharing their blocks (``hl.register_block_size``) share a strategy, but
+    ``TileStrategyDispatch.strategies`` lists it once per loop, and
+    ``CuteBackend.adjust_reduction_thread_count`` divides a reduction's
+    threads by every entry.
+    """
+    from ..active_blocks import active_block_ids
+
+    graph_paths = _root_graph_tile_loop_paths(device_ir, graphs)
+    used: dict[tuple[int, TileLoopPath], set[int]] = {}
+    for root, info, path in graph_paths:
+        found = block_ids & active_block_ids([info], (), env)
+        if found:
+            used.setdefault((root, path), set()).update(found)
+    owned = {(root, path) for root, _, path in graph_paths}
+    path_blocks = {
+        path: frozenset(
+            block_id
+            for (root, prefix), found in used.items()
+            if (root, path) in owned and path[: len(prefix)] == prefix
+            for block_id in found
+        )
+        for path in _maximal_paths(path for _, _, path in graph_paths)
+    }
+    loops = {
+        info.graph_id: path for _, info, path in graph_paths if _is_tile_loop(info)
+    }
+    strategy_paths = (
+        *((tuple(grid),) for grid in device_ir.grid_block_ids),
+        *loops.values(),
+    )
+    return path_blocks, strategy_paths
 
 
 def sibling_row_loop_blocks(

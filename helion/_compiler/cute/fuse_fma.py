@@ -22,6 +22,14 @@ Scope and safety:
 - Separately, marked distributed-scale subtractions from the existing scale
   hoister are contracted after a definite FP32 type proof. This makes that
   already chosen contraction independent of masked-load scheduling.
+- A ``cute.math`` call returns its operands' type, so it counts as fp32
+  only as follows.  ``_NON_FLOAT_MATH`` (``isnan``, ``absi`` and the other
+  integer and bool results) never does.  ``_OPERAND_TYPED_MATH`` (``abs``,
+  ``absf``, ``max``, ``min``, ``clamp``, which also take integers) does when
+  each operand, positional or keyword, is proven fp32.  Any other call
+  (``exp``, ``div``, ``fma``) does unless an operand is proven not to be
+  fp32 (``_proven_non_fp32``: ``cute.math.exp(cutlass.Float64(x))`` is a
+  Float64, and so is ``cute.math.exp(v)`` after ``v = cutlass.Float64(x)``).
 """
 
 from __future__ import annotations
@@ -52,7 +60,133 @@ def _collect_counts(
     return reads, writes
 
 
+def _proven_non_fp32(node: ast.expr) -> bool:
+    """Whether ``node`` is proven to hold a value other than fp32: a cast to
+    another ``cutlass`` type, a name assigned such a value
+    (``_mark_non_fp32_reads``), arithmetic, a negation, a selection or a
+    ``cute.math`` call with such an operand, whose type the result may take (counted
+    conservatively, also where it promotes to fp32), or a ``_NON_FLOAT_MATH``
+    call.  ``fpowi`` takes its base's type, its exponent being an integer.  A
+    plain load, whose type the code does not show, is not proven."""
+    if isinstance(node, ast.Name):
+        return getattr(node, _NON_FP32_ATTR, False)
+    if isinstance(node, ast.UnaryOp):
+        return _proven_non_fp32(node.operand)
+    if isinstance(node, ast.BinOp):
+        return _proven_non_fp32(node.left) or _proven_non_fp32(node.right)
+    if isinstance(node, ast.IfExp):
+        # ``torch.where`` of two such values.
+        return _proven_non_fp32(node.body) or _proven_non_fp32(node.orelse)
+    if not isinstance(node, ast.Call):
+        return False
+    func = ast.unparse(node.func)
+    if func.startswith(_NUMERIC_CASTS):
+        return func != "cutlass.Float32"
+    name = func.removeprefix("cute.math.")
+    if name == func:
+        return False
+    if name in _NON_FLOAT_MATH:
+        return True
+    if name == "fpowi":
+        operands = [
+            *node.args[:1],
+            *(kw.value for kw in node.keywords if kw.arg in (None, "base")),
+        ]
+    else:
+        operands = [*node.args, *(kw.value for kw in node.keywords)]
+    return any(_proven_non_fp32(arg) for arg in operands)
+
+
+# Set on a read of a name that is assigned a proven non-fp32 value.
+_NON_FP32_ATTR = "_helion_fuse_fma_non_fp32"
+
+
+def _mark_non_fp32_reads(body: list[ast.stmt]) -> None:
+    """Mark, in program order, the reads of each name assigned a value
+    ``_proven_non_fp32`` holds, so that a value computed from one is proven
+    too: codegen casts into a temporary (``v_0 = cutlass.Float64(load)``,
+    then ``cute.math.tanh(v_0)``), and a call that is no fp32 value
+    (``v_2 = cute.math.max(cutlass.Float64(v_0), ...)``) feeds the next
+    (``cute.math.sqrt(v_2)``).  A name assigned such a value anywhere counts
+    from then on, however else it is assigned."""
+    names: set[str] = set()
+
+    def mark(node: ast.AST) -> None:
+        for sub in ast.walk(node):
+            if (
+                isinstance(sub, ast.Name)
+                and isinstance(sub.ctx, ast.Load)
+                and sub.id in names
+            ):
+                setattr(sub, _NON_FP32_ATTR, True)
+
+    def visit(stmts: list[ast.stmt]) -> None:
+        for stmt in stmts:
+            if isinstance(stmt, (ast.For, ast.While, ast.If)):
+                mark(stmt.iter if isinstance(stmt, ast.For) else stmt.test)
+                visit(stmt.body)
+                visit(stmt.orelse)
+                continue
+            mark(stmt)
+            if isinstance(stmt, ast.Assign) and _proven_non_fp32(stmt.value):
+                # The names assigned, not a subscript target's base or index.
+                names.update(
+                    sub.id
+                    for target in stmt.targets
+                    for sub in ast.walk(target)
+                    if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store)
+                )
+
+    visit(body)
+
+
 _FLOAT_CALL_PREFIXES = ("cutlass.Float32", "cute.math.")
+_NUMERIC_CASTS = (
+    "cutlass.Boolean",
+    "cutlass.BFloat",
+    "cutlass.Float",
+    "cutlass.Int",
+    "cutlass.TFloat",
+    "cutlass.Uint",
+)
+# The operand parameters of the ``cute.math`` functions that also take
+# integers, and then return an integer (``absf`` is ``abs``).  They count as
+# fp32 only when every operand is proven fp32, though their operands share
+# one type and one would do.
+_OPERAND_TYPED_MATH = {
+    "abs": ("x",),
+    "absf": ("x",),
+    "clamp": ("x", "lo", "hi"),
+    "max": ("x", "y"),
+    "min": ("x", "y"),
+}
+# The ``cute.math`` functions that never return a float scalar: integer and
+# bool results whatever their operands, and ``sincos``'s pair.
+_NON_FLOAT_MATH = frozenset(
+    {"absi", "ipowi", "isfinite", "isinf", "isnan", "isnormal", "sincos"}
+)
+
+
+def _callee(call: ast.Call, float_names: set[str]) -> str:
+    """The function ``call`` calls, for ``_FLOAT_CALL_PREFIXES`` to match, or
+    "" for a ``cute.math`` call that may return something other than fp32,
+    which ``math.fma`` cannot take with fp32 operands (see the module
+    docstring): ``cute.math.max(p, q)`` on Int32 values is an integer, and
+    ``cute.math.exp(cutlass.Float64(x))`` a Float64."""
+    func = ast.unparse(call.func)
+    name = func.removeprefix("cute.math.")
+    if name == func:
+        return func
+    params = _OPERAND_TYPED_MATH.get(name)
+    if params is not None:
+        # A ``**`` argument, which has no keyword name, may hold an operand.
+        operands = [
+            *call.args[: len(params)],
+            *(kw.value for kw in call.keywords if kw.arg in (None, *params)),
+        ]
+        if not all(_is_float_expr(arg, float_names) for arg in operands):
+            return ""
+    return "" if _proven_non_fp32(call) else func
 
 
 def _is_float_expr(node: ast.expr, float_names: set[str]) -> bool:
@@ -67,7 +201,7 @@ def _is_float_expr(node: ast.expr, float_names: set[str]) -> bool:
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
         return _is_float_expr(node.operand, float_names)
     if isinstance(node, ast.Call):
-        func = ast.unparse(node.func)
+        func = _callee(node, float_names)
         return func.startswith(_FLOAT_CALL_PREFIXES)
     return False
 
@@ -207,6 +341,7 @@ def fuse_fma(
     body: list[ast.stmt], rename_groups: dict[str, str] | None = None
 ) -> list[ast.stmt]:
     reads, writes = _collect_counts(body)
+    _mark_non_fp32_reads(body)
     float_names: set[str] = set()
     _process_list(body, reads, writes, float_names, rename_groups or {})
     return contract_distributed_scale_subtractions(body, rename_groups or {})

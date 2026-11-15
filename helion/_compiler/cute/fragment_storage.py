@@ -25,7 +25,7 @@ def aligned_shared_bytes(count: int, dtype: torch.dtype) -> int:
 
 
 def metadata_guarded(env: CompileEnvironment, expr: sympy.Expr) -> bool:
-    if "input_tensor_metadata" not in env.compiler_fact_specialization_facts:
+    if not env.exact_input_metadata_holds():
         return False
     # The exact metadata guard covers sizes and strides, not runtime scalar
     # arguments, device values, or storage offsets.

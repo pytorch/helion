@@ -36,6 +36,8 @@ from .tile_strategy import ThreadAxisTracker
 from .tile_strategy import TileStrategy
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from .device_function import DeviceFunction
     from .inductor_lowering import CodegenState
     from .lane_loop_context import LaneLoopContext
@@ -75,7 +77,10 @@ def _strategies_concurrent_with_block(
     Drops reduction strategies that live in a control-flow branch mutually
     exclusive with ``block_index``'s branch so the per-block thread budget is
     not over-counted (CuTe branch-by-pid kernels). Outside that pattern (no
-    branch paths) this returns every strategy unchanged.
+    branch paths) this returns every strategy unchanged, those of other root
+    loops included: a kernel with several roots budgets a reduction by their
+    shared launch instead where it can
+    (``TileStrategyDispatch.shared_launch_reduction_threads``).
     """
     from .device_ir import DeviceIR
 
@@ -97,6 +102,28 @@ def _strategies_concurrent_with_block(
             continue
         result.append(strategy)
     return result
+
+
+def _fit_reduction_thread_count(
+    tile_dispatch: TileStrategyDispatch,
+    block_index: int,
+    requested: int,
+    strategies: list[TileStrategy],
+    keeps_threads: Callable[[int], bool] | None = None,
+) -> int:
+    """``requested`` threads for reduction ``block_index``, shrunk to what the
+    strategies it runs beside leave (``Backend.adjust_reduction_thread_count``)
+    or, in a kernel of several root loops, to what their shared launch leaves
+    (``TileStrategyDispatch.shared_launch_reduction_threads``, which asks a
+    persistent reduction's ``keeps_threads``)."""
+    shared = tile_dispatch.shared_launch_reduction_threads(
+        block_index, requested, keeps_threads
+    )
+    if shared is not None:
+        return shared
+    return CompileEnvironment.current().backend.adjust_reduction_thread_count(
+        requested, strategies
+    )
 
 
 S = TypeVar("S", bound="ReductionStrategy")
@@ -162,6 +189,13 @@ class PersistentReductionEmitter(ReductionEmitter["PersistentReductionStrategy"]
     @abc.abstractmethod
     def prove_merged_tiled_extent(self, numel: object) -> bool:
         """Whether the extent is a reshape-merged product of tile blocks."""
+
+    @abc.abstractmethod
+    def prove_lanes_keep_threads(
+        self, threads: int, numel: object, size_hint: int
+    ) -> bool:
+        """Whether ``plan_synthetic_lanes`` surely keeps a power-of-two count
+        of ``threads`` threads (asked while the strategy still chooses it)."""
 
     @abc.abstractmethod
     def plan_synthetic_lanes(
@@ -845,9 +879,24 @@ class PersistentReductionStrategy(ReductionStrategy):
                     # The shared axis is already in the budget as the partner.
                     self._cute_axis_partner = partner
                     concurrent = [s for s in concurrent if s is not partner]
-            self._thread_count = env.backend.adjust_reduction_thread_count(
-                self._thread_count, concurrent
-            )
+            if self._cute_axis_partner is not None:
+                self._thread_count = env.backend.adjust_reduction_thread_count(
+                    self._thread_count, concurrent
+                )
+            else:
+                self._thread_count = _fit_reduction_thread_count(
+                    tile_dispatch,
+                    block_index,
+                    self._thread_count,
+                    concurrent,
+                    None
+                    if emitter is None
+                    else functools.partial(
+                        emitter.prove_lanes_keep_threads,
+                        numel=numel,
+                        size_hint=size_hint,
+                    ),
+                )
         self._synthetic_cute_lane_var: str | None = None
         self._synthetic_cute_lane_extent = 1
         # Persistent reductions expose the same unroll-vec protocol as rolled
@@ -1100,8 +1149,8 @@ class LoopedReductionStrategy(ReductionStrategy):
             thread_count = 0
         tile_dispatch = getattr(fn, "tile_strategy", None)
         if tile_dispatch is not None:
-            thread_count = env.backend.adjust_reduction_thread_count(
-                thread_count, tile_dispatch.strategies
+            thread_count = _fit_reduction_thread_count(
+                tile_dispatch, block_index, thread_count, tile_dispatch.strategies
             )
         self._thread_count = thread_count
         if thread_count > 0:

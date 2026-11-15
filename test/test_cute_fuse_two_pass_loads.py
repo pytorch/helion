@@ -6,11 +6,13 @@ caches the first sweep's values in a small ``cute.make_rmem_tensor(...)``.
 The second sweep then reads from the fragment instead of issuing a
 second LDG, eliminating the duplicate HBM/L1 traffic.
 
-The pass canonicalizes per-sweep variable names (``mask_<N>``,
-``lane_base_<N>``, ``vec_lane_<N>``, ``_tile_unroll_vec_<N>_<M>``) so
-the two sweeps' load expressions compare equal modulo the rename
-suffix. Without canonicalization, ``vec_lane_1`` vs ``vec_lane_2``
-would mis-key the fuser's match table and the cache would never fire.
+The two sweeps spell their loads with per-sweep names (``mask_<N>``,
+``lane_base_<N>``, ``vec_lane_<N>``). A load key spells a name the sweep
+assigns by its definition, and the pass renames the later sweep's
+vector-lane loop variable to the first sweep's, so the two sweeps' load
+expressions compare equal. Without the rename, ``vec_lane_1`` vs
+``vec_lane_2`` would mis-key the fuser's match table and the cache would
+never fire.
 
 Lives in ``helion/_compiler/cute/fuse_two_pass_loads.py``.
 """
@@ -18,6 +20,7 @@ Lives in ``helion/_compiler/cute/fuse_two_pass_loads.py``.
 from __future__ import annotations
 
 import ast
+import re
 
 import pytest
 import torch
@@ -459,6 +462,756 @@ for synthetic_lane_7 in range(8):
     assert code.count(".load()") == 2
 
 
+def _fused(source: str) -> str:
+    result = fuse_two_pass_loads(
+        ast.parse(source).body,
+        tensor_dtypes={"x": "cutlass.Float32", "out": "cutlass.Float32"},
+        reload_modes={7: "register"},
+        proven_disjoint_tensor_pairs={frozenset(("x", "out"))},
+    )
+    return ast.unparse(ast.Module(body=result, type_ignores=[]))
+
+
+@pytest.mark.cpu_only
+def test_load_through_a_carried_index_is_not_fused() -> None:
+    # ``idx`` is carried from one iteration to the next: ``x[idx]`` is not
+    # ``x[0]``, the address ``idx = 0`` gives it in the first iteration
+    # only, so the second sweep must not read the cache of ``a = x[0]``.
+    code = _fused(
+        """
+idx = 0
+for synthetic_lane_7 in range(8):
+    b = (x.iterator + idx).load()
+    a = (x.iterator + 0).load()
+    acc = acc + a + b
+    idx = idx + 1
+idx = 0
+for synthetic_lane_7 in range(8):
+    c = (x.iterator + idx).load()
+    (out.iterator + synthetic_lane_7).store(c)
+    idx = idx + 1
+"""
+    )
+    assert "c = (x.iterator + idx).load()" in code
+
+
+@pytest.mark.cpu_only
+def test_load_through_a_name_the_sweep_redefines_is_keyed_by_it() -> None:
+    # Each sweep iteration redefines ``base`` before its lanes, so the
+    # ``base = 0`` before the sweep is not the address of ``v``: ``v`` and
+    # ``w`` read different elements, and the second sweep's ``v`` reads the
+    # cache of the first sweep's ``v``.
+    code = _fused(
+        """
+base = 0
+for roffset_7 in range(0, 64, 32):
+    base = roffset_7 * 1
+    for reduction_lane_7 in range(8):
+        v = (x.iterator + base + reduction_lane_7).load()
+        w = (x.iterator + 0 + reduction_lane_7).load()
+        acc = acc + v + w
+base = 0
+for roffset_7 in range(0, 64, 32):
+    base = roffset_7 * 1
+    for reduction_lane_7 in range(8):
+        v = (x.iterator + base + reduction_lane_7).load()
+        (out.iterator + base + reduction_lane_7).store(v)
+"""
+    )
+    first, second = code[: code.rindex("base = 0")], code[code.rindex("base = 0") :]
+    match = re.search(r"v = (_fuse_cache_\d+)\[", second)
+    assert match is not None
+    # Only the first sweep's ``v`` fills the cache the second sweep reads.
+    assert re.findall(rf"{match.group(1)}\[.*\] = (\w+)$", first, re.MULTILINE) == ["v"]
+
+
+@pytest.mark.cpu_only
+def test_load_through_a_definition_of_a_rewritten_name_is_keyed_by_it() -> None:
+    # ``c = k * 2`` holds the ``k`` from before the loop, not the ``k`` the
+    # loop rebinds: ``x[c]`` is not ``x[lane * 2]``.  Each sweep reads its
+    # own ``c``, rebound between them, so they read different elements.
+    code = _fused(
+        """
+k = 0
+c = k * 2
+for synthetic_lane_7 in range(8):
+    k = synthetic_lane_7
+    v = (x.iterator + c).load()
+    acc = acc + v
+c = k * 2
+for synthetic_lane_7 in range(8):
+    k = synthetic_lane_7
+    v = (x.iterator + c).load()
+    (out.iterator + synthetic_lane_7).store(v)
+"""
+    )
+    assert "_fuse_cache_" not in code
+    assert code.count("v = (x.iterator + c).load()") == 2
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("rebind", (False, True))
+def test_load_through_a_name_one_sweep_defines_is_not_fused(rebind: bool) -> None:
+    # The first sweep reads ``x[t]`` at each lane's own ``t``; the second
+    # reads the ``t`` left after the first sweep, or rebound between them.
+    between = "t = (y.iterator + 0).load()" if rebind else ""
+    code = _fused(
+        f"""
+for synthetic_lane_7 in range(8):
+    t = (y.iterator + synthetic_lane_7).load()
+    v = (x.iterator + t).load()
+    acc = acc + v
+{between}
+for synthetic_lane_7 in range(8):
+    v = (x.iterator + t).load()
+    (out.iterator + synthetic_lane_7).store(v)
+"""
+    )
+    assert code.count("v = (x.iterator + t).load()") == 2
+
+
+@pytest.mark.cpu_only
+def test_load_through_a_name_rebound_between_the_sweeps_is_not_fused() -> None:
+    code = _fused(
+        """
+t = (y.iterator + 0).load()
+for synthetic_lane_7 in range(8):
+    v = (x.iterator + t + synthetic_lane_7).load()
+    acc = acc + v
+t = (y.iterator + 1).load()
+for synthetic_lane_7 in range(8):
+    v = (x.iterator + t + synthetic_lane_7).load()
+    (out.iterator + synthetic_lane_7).store(v)
+"""
+    )
+    assert "_fuse_cache_" not in code
+
+
+@pytest.mark.cpu_only
+def test_sweep_whose_range_moves_is_not_fused() -> None:
+    # Equal range text, but ``start`` moves between the sweeps: the second
+    # sweep reads ``x[8:16]``, not the first sweep's ``x[0:8]``.
+    code = _fused(
+        """
+start = 0
+for synthetic_lane_7 in range(start, start + 8):
+    before = (x.iterator + synthetic_lane_7).load()
+    acc = acc + before
+start = 8
+for synthetic_lane_7 in range(start, start + 8):
+    after = (x.iterator + synthetic_lane_7).load()
+    (out.iterator + synthetic_lane_7).store(after)
+"""
+    )
+    assert "_fuse_cache_" not in code
+    assert code.count(".load()") == 2
+
+
+@pytest.mark.cpu_only
+def test_lane_loop_not_counting_from_zero_is_not_fused() -> None:
+    # The cache index takes the lane variable for the slot: lanes 1..8 would
+    # index past the 16 slots of two trips.
+    sweep = """
+for roffset_7 in range(0, 64, 32):
+    for reduction_lane_7 in range(1, 9):
+        value = (x.iterator + roffset_7 + reduction_lane_7).load()
+        {use}
+"""
+    code = _fused(
+        sweep.format(use="acc = acc + value")
+        + sweep.format(use="(out.iterator + roffset_7).store(value)")
+    )
+    assert "_fuse_cache_" not in code
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("later", "between", "fuses"),
+    [
+        # A lane count rebound between the sweeps runs sixteen lanes over the
+        # first sweep's eight slots per trip.
+        ("K", "K = 16", False),
+        # Another spelling of the same eight lanes.
+        ("8", "", True),
+    ],
+    ids=("rebound", "respelled"),
+)
+def test_lane_ranges_must_keep_their_trip_counts(
+    later: str, between: str, fuses: bool
+) -> None:
+    sweep = """
+for roffset_7 in range(0, 64, 32):
+    for reduction_lane_7 in range({lanes}):
+        value = (x.iterator + roffset_7 + reduction_lane_7).load()
+        {use}
+"""
+    result = fuse_two_pass_loads(
+        ast.parse(
+            sweep.format(lanes="K", use="acc = acc + value")
+            + between
+            + sweep.format(
+                lanes=later, use="(out.iterator + roffset_7).store(value + acc)"
+            )
+        ).body,
+        {"K": 8},
+        tensor_dtypes={"x": "cutlass.Float32", "out": "cutlass.Float32"},
+        reload_modes={7: "register"},
+        proven_disjoint_tensor_pairs={frozenset(("x", "out"))},
+    )
+    code = ast.unparse(ast.Module(body=result, type_ignores=[]))
+    assert ("_fuse_cache_" in code) is fuses
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "source",
+    [
+        # The first sweep sets its index to 0 before its load: every
+        # iteration writes slot 0, and the later sweep reads seven slots
+        # never written.
+        """
+for synthetic_lane_7 in range(8):
+    synthetic_lane_7 = 0
+    v = (x.iterator + synthetic_lane_7).load()
+    acc = acc + v
+for synthetic_lane_7 in range(8):
+    w = (x.iterator + 0).load()
+    (out.iterator + synthetic_lane_7).store(w)
+""",
+        # The later sweep advances its index before its load: its last
+        # iteration names a slot past the cache.
+        """
+for synthetic_lane_7 in range(8):
+    v = (x.iterator + synthetic_lane_7).load()
+    acc = acc + v
+for synthetic_lane_7 in range(8):
+    synthetic_lane_7 += 1
+    w = (x.iterator + synthetic_lane_7).load()
+    (out.iterator + synthetic_lane_7).store(w)
+""",
+        # The same for the lane loop's index.
+        """
+for roffset_7 in range(0, 64, 32):
+    for reduction_lane_7 in range(8):
+        reduction_lane_7 = 0
+        v = (x.iterator + roffset_7 + reduction_lane_7).load()
+        acc = acc + v
+for roffset_7 in range(0, 64, 32):
+    for reduction_lane_7 in range(8):
+        w = (x.iterator + roffset_7 + 0).load()
+        (out.iterator + roffset_7 + reduction_lane_7).store(w)
+""",
+    ],
+)
+def test_sweep_that_rebinds_its_index_is_not_fused(source: str) -> None:
+    # A cache slot is the one the sweep's indices name.
+    code = _fused(source)
+    assert "_fuse_cache_" not in code
+    assert code.count(".load()") == 2
+
+
+@pytest.mark.cpu_only
+def test_lane_loop_reusing_the_sweep_index_is_not_fused() -> None:
+    # The lane loop hides the sweep index, which the cache slot reads too:
+    # slot ``(lane - 0) // 1 * 8 + lane`` would reach 63 of 16.
+    sweep = """
+for synthetic_lane_7 in range(2):
+    for synthetic_lane_7 in range(8):
+        value = (x.iterator + synthetic_lane_7).load()
+        {use}
+"""
+    code = _fused(
+        sweep.format(use="acc = acc + value")
+        + sweep.format(use="(out.iterator + synthetic_lane_7).store(value + acc)")
+    )
+    assert "_fuse_cache_" not in code
+    assert code.count(".load()") == 2
+
+
+@pytest.mark.cpu_only
+def test_lane_index_read_after_its_loop_keeps_the_fusion() -> None:
+    # ``last = reduction_lane_7`` reads the lane index after the lane loop;
+    # both sweeps still read ``x[roffset_7 + lane]`` at equal iterations.
+    code = _fused(
+        """
+for roffset_7 in range(0, 64, 32):
+    for reduction_lane_7 in range(8):
+        v = (x.iterator + roffset_7 + reduction_lane_7).load()
+        acc = acc + v
+    last = reduction_lane_7
+for roffset_7 in range(0, 64, 32):
+    for reduction_lane_7 in range(8):
+        w = (x.iterator + roffset_7 + reduction_lane_7).load()
+        (out.iterator + roffset_7 + reduction_lane_7).store(w)
+"""
+    )
+    second = code[code.index("last = reduction_lane_7") :]
+    assert "_fuse_cache_" in second
+    assert ".load()" not in second
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("before", "first", "later"),
+    [
+        # The definitions before the sweeps differ only where each sweep
+        # loop overwrites them.
+        (("base = 0", "base = 0"), "base = roffset_7", "base = roffset_7 + 16"),
+        (("", ""), "base = roffset_7 * 1", "base = roffset_7 * 1 + 8"),
+    ],
+)
+def test_load_through_prefix_names_the_sweeps_define_apart_is_not_fused(
+    before: tuple[str, str], first: str, later: str
+) -> None:
+    # Each sweep's prefix defines ``base`` its own way, so the two sweeps'
+    # ``x[base + lane]`` read different elements.
+    code = _fused(
+        f"""
+{before[0]}
+for roffset_7 in range(0, 64, 32):
+    {first}
+    for reduction_lane_7 in range(8):
+        v = (x.iterator + base + reduction_lane_7).load()
+        acc = acc + v
+{before[1]}
+for roffset_7 in range(0, 64, 32):
+    {later}
+    for reduction_lane_7 in range(8):
+        v = (x.iterator + base + reduction_lane_7).load()
+        (out.iterator + roffset_7 + reduction_lane_7).store(v)
+"""
+    )
+    assert "_fuse_cache_" not in code
+    assert code.count("v = (x.iterator + base + reduction_lane_7).load()") == 2
+
+
+@pytest.mark.cpu_only
+def test_load_through_an_index_the_sweeps_load_apart_is_not_fused() -> None:
+    # Both sweeps write ``t``, from different tensors: ``x[t]`` is another
+    # element in each.
+    code = _fused(
+        """
+for synthetic_lane_7 in range(8):
+    t = (y.iterator + synthetic_lane_7).load()
+    v = (x.iterator + t).load()
+    acc = acc + v
+for synthetic_lane_7 in range(8):
+    t = (z.iterator + synthetic_lane_7).load()
+    v = (x.iterator + t).load()
+    (out.iterator + synthetic_lane_7).store(v)
+"""
+    )
+    assert code.count("v = (x.iterator + t).load()") == 2
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("first", "later"),
+    [
+        # In the lane body: ``c`` keeps ``k``'s value from before ``k``
+        # moves on, so it is ``x[lane * 2]``, not ``x[(lane + 1) * 2]``.
+        (
+            """
+for synthetic_lane_7 in range(8):
+    k = synthetic_lane_7
+    c = k * 2
+    k = synthetic_lane_7 + 1
+    v = (x.iterator + c).load()
+    acc = acc + v
+""",
+            """
+for synthetic_lane_7 in range(8):
+    v = (x.iterator + (synthetic_lane_7 + 1) * 2).load()
+    (out.iterator + synthetic_lane_7).store(v)
+""",
+        ),
+        # Before the sweeps: the first sweep's ``c`` is ``0 * 2``, the second
+        # sweep's ``1 * 2``.
+        (
+            """
+k = 0
+c = k * 2
+k = 1
+for synthetic_lane_7 in range(8):
+    v = (x.iterator + c + synthetic_lane_7).load()
+    acc = acc + v
+""",
+            """
+c = k * 2
+for synthetic_lane_7 in range(8):
+    v = (x.iterator + c + synthetic_lane_7).load()
+    (out.iterator + synthetic_lane_7).store(v)
+""",
+        ),
+    ],
+)
+def test_definition_whose_operand_is_rebound_is_not_inlined(
+    first: str, later: str
+) -> None:
+    code = _fused(first + later)
+    assert "_fuse_cache_" not in code
+    assert code.count(".load()") == 2
+
+
+@pytest.mark.cpu_only
+def test_load_through_a_fragment_written_between_the_sweeps_is_not_fused() -> None:
+    code = _fused(
+        """
+for synthetic_lane_7 in range(8):
+    v = (x.iterator + offs[0] + synthetic_lane_7).load()
+    acc = acc + v
+offs[0] = 8
+for synthetic_lane_7 in range(8):
+    v = (x.iterator + offs[0] + synthetic_lane_7).load()
+    (out.iterator + synthetic_lane_7).store(v)
+"""
+    )
+    assert "_fuse_cache_" not in code
+    assert code.count(".load()") == 2
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "source",
+    [
+        # The store between the sweeps.
+        """
+q = offs
+for synthetic_lane_7 in range(8):
+    v = (x.iterator + offs[0] + synthetic_lane_7).load()
+    acc = acc + v
+q[0] = 8
+for synthetic_lane_7 in range(8):
+    v = (x.iterator + offs[0] + synthetic_lane_7).load()
+    (out.iterator + synthetic_lane_7).store(v)
+""",
+        # The store in the first sweep: its later iterations read another
+        # element than its first.
+        """
+q = offs
+for synthetic_lane_7 in range(8):
+    v = (x.iterator + offs[0] + synthetic_lane_7).load()
+    acc = acc + v
+    q[0] = 8
+for synthetic_lane_7 in range(8):
+    v = (x.iterator + offs[0] + synthetic_lane_7).load()
+    (out.iterator + synthetic_lane_7).store(v)
+""",
+        # The store in the later sweep, before its load.
+        """
+q = offs
+for synthetic_lane_7 in range(8):
+    v = (x.iterator + offs[0] + synthetic_lane_7).load()
+    acc = acc + v
+for synthetic_lane_7 in range(8):
+    q[0] = 8
+    v = (x.iterator + offs[0] + synthetic_lane_7).load()
+    (out.iterator + synthetic_lane_7).store(v)
+""",
+        # The other name bound between the sweeps.
+        """
+for synthetic_lane_7 in range(8):
+    v = (x.iterator + offs[0] + synthetic_lane_7).load()
+    acc = acc + v
+q = offs
+q[0] = 8
+for synthetic_lane_7 in range(8):
+    v = (x.iterator + offs[0] + synthetic_lane_7).load()
+    (out.iterator + synthetic_lane_7).store(v)
+""",
+        # The sweeps' range read from the fragment: the later sweep runs
+        # other indices.
+        """
+q = bounds
+for synthetic_lane_7 in range(bounds[0], bounds[0] + 8):
+    v = (x.iterator + synthetic_lane_7).load()
+    acc = acc + v
+q[0] = 8
+for synthetic_lane_7 in range(bounds[0], bounds[0] + 8):
+    v = (x.iterator + synthetic_lane_7).load()
+    (out.iterator + synthetic_lane_7).store(v)
+""",
+    ],
+)
+def test_load_through_a_fragment_stored_through_another_name_is_not_fused(
+    source: str,
+) -> None:
+    # ``q = offs`` makes ``q`` another name for the fragment ``offs``, so
+    # ``q[0] = 8`` changes the element ``offs[0]`` the loads read.
+    code = _fused(source)
+    assert "_fuse_cache_" not in code
+    assert code.count(".load()") == 2
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "effect",
+    [
+        "cute.arch.atomic_add(out.iterator + 0, cutlass.Float32(1.0))",
+        "(out.iterator + 0).atomic_add(cutlass.Float32(1.0))",
+        (
+            "_cute_inline_asm_elementwise((), asm='mov.u32 $0, %clock;', "
+            "constraints='=r', dtype=cutlass.Int32, is_pure=False)"
+        ),
+        "_cute_flex_load_vec(y.iterator + 0, cutlass.Int32)",
+    ],
+    ids=("atomic", "atomic-method", "impure-asm", "helper"),
+)
+def test_load_through_a_value_with_effects_is_not_fused(effect: str) -> None:
+    # Each sweep computes ``slot`` again: an atomic returns another old value
+    # each time, and asm not declared pure (a clock read) or a helper that
+    # reads memory (a flex load) may too, so the sweeps' ``x[slot * 8 +
+    # lane]`` need not read the same elements.
+    code = _fused(
+        f"""
+for synthetic_lane_7 in range(8):
+    slot = {effect}
+    v = (x.iterator + slot * 8 + synthetic_lane_7).load()
+    acc = acc + v
+for synthetic_lane_7 in range(8):
+    slot = {effect}
+    w = (x.iterator + slot * 8 + synthetic_lane_7).load()
+    (out.iterator + synthetic_lane_7).store(w + acc)
+"""
+    )
+    assert "w = (x.iterator + slot * 8 + synthetic_lane_7).load()" in code
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("source", "fuses"),
+    [
+        # A break of a loop nested in the lane loop ends only that loop.
+        (
+            """
+for roffset_7 in range(0, 64, 32):
+    for reduction_lane_7 in range(8):
+        for k in range(4):
+            if k == 2:
+                break
+        v = (x.iterator + roffset_7 + reduction_lane_7).load()
+        acc = acc + v
+for roffset_7 in range(0, 64, 32):
+    for reduction_lane_7 in range(8):
+        v = (x.iterator + roffset_7 + reduction_lane_7).load()
+        (out.iterator + roffset_7 + reduction_lane_7).store(v)
+""",
+            True,
+        ),
+        (
+            """
+for roffset_7 in range(0, 64, 32):
+    for reduction_lane_7 in range(8):
+        while acc > 0:
+            acc = acc - 1
+            if acc < 3:
+                break
+        v = (x.iterator + roffset_7 + reduction_lane_7).load()
+        acc = acc + v
+for roffset_7 in range(0, 64, 32):
+    for reduction_lane_7 in range(8):
+        v = (x.iterator + roffset_7 + reduction_lane_7).load()
+        (out.iterator + roffset_7 + reduction_lane_7).store(v)
+""",
+            True,
+        ),
+        # A loop's ``else`` runs in the lane loop: its ``continue`` skips
+        # the rest of the lane's iteration.
+        (
+            """
+for roffset_7 in range(0, 64, 32):
+    for reduction_lane_7 in range(8):
+        for k in range(4):
+            acc = acc + k
+        else:
+            continue
+        v = (x.iterator + roffset_7 + reduction_lane_7).load()
+        acc = acc + v
+for roffset_7 in range(0, 64, 32):
+    for reduction_lane_7 in range(8):
+        v = (x.iterator + roffset_7 + reduction_lane_7).load()
+        (out.iterator + roffset_7 + reduction_lane_7).store(v)
+""",
+            False,
+        ),
+    ],
+)
+def test_only_an_exit_of_the_sweep_or_lane_loop_leaves_an_iteration_early(
+    source: str, fuses: bool
+) -> None:
+    code = _fused(source)
+    assert ("_fuse_cache_" in code) is fuses
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("leave", ("break", "continue"))
+def test_first_sweep_that_leaves_an_iteration_early_is_not_fused(leave: str) -> None:
+    # The first sweep skips the load of lane 3 (``continue``) or of lanes 3
+    # to 7 (``break``): the second sweep would read slots no load wrote.
+    code = _fused(
+        f"""
+for synthetic_lane_7 in cutlass.range_constexpr(8):
+    if cutlass.const_expr(synthetic_lane_7 == 3):
+        {leave}
+    v = (x.iterator + synthetic_lane_7).load()
+    acc = acc + v
+for synthetic_lane_7 in cutlass.range_constexpr(8):
+    v = (x.iterator + synthetic_lane_7).load()
+    (out.iterator + synthetic_lane_7).store(v)
+"""
+    )
+    assert "_fuse_cache_" not in code
+    assert code.count(".load()") == 2
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "source",
+    [
+        # ``for base in range(2)`` rebinds ``base`` when ``cond`` holds: the
+        # first sweep's ``x[base + lane]`` is not the later ``x[0 + lane]``.
+        """
+for roffset_7 in range(0, 64, 32):
+    base = 0
+    if cond:
+        for base in range(2):
+            pass
+    for reduction_lane_7 in range(8):
+        v = (x.iterator + base + reduction_lane_7).load()
+        acc = acc + v
+for roffset_7 in range(0, 64, 32):
+    for reduction_lane_7 in range(8):
+        w = (x.iterator + 0 + reduction_lane_7).load()
+        (out.iterator + roffset_7 + reduction_lane_7).store(w)
+""",
+        # The later sweep loops over ``lane_b``: its ``lane_a`` is the first
+        # sweep's last lane, not the lane of the iteration.
+        """
+for roffset_7 in range(0, 64, 32):
+    for lane_a in range(8):
+        v = (x.iterator + roffset_7 + lane_a).load()
+        acc = acc + v
+for roffset_7 in range(0, 64, 32):
+    for lane_b in range(8):
+        w = (x.iterator + roffset_7 + lane_a).load()
+        (out.iterator + roffset_7 + lane_b).store(w)
+""",
+        # The same with the vector-lane names the pass renames from sweep to
+        # sweep: the later ``vec_lane_1`` is still the first sweep's last lane.
+        """
+for roffset_7 in range(0, 64, 32):
+    for vec_lane_1 in range(8):
+        v = (x.iterator + roffset_7 + vec_lane_1).load()
+        acc = acc + v
+for roffset_7 in range(0, 64, 32):
+    for vec_lane_2 in range(8):
+        w = (x.iterator + roffset_7 + vec_lane_1).load()
+        (out.iterator + roffset_7 + vec_lane_2).store(w)
+""",
+        # The same through definitions the later keys inline: a name bound to
+        # the first sweep's lane between the sweeps, read in the later lane
+        # loop, through the later sweep's prefix, or beside the later lane.
+        """
+for roffset_7 in range(0, 64, 32):
+    for vec_lane_1 in range(8):
+        v = (x.iterator + roffset_7 + vec_lane_1).load()
+        acc = acc + v
+last = vec_lane_1
+for roffset_7 in range(0, 64, 32):
+    for vec_lane_2 in range(8):
+        w = (x.iterator + roffset_7 + last).load()
+        (out.iterator + roffset_7 + vec_lane_2).store(w)
+""",
+        """
+for roffset_7 in range(0, 64, 32):
+    for vec_lane_1 in range(8):
+        v = (x.iterator + roffset_7 + vec_lane_1).load()
+        acc = acc + v
+saved = vec_lane_1
+for roffset_7 in range(0, 64, 32):
+    base = saved
+    for vec_lane_2 in range(8):
+        w = (x.iterator + roffset_7 + base).load()
+        (out.iterator + roffset_7 + vec_lane_2).store(w)
+""",
+        """
+for roffset_7 in range(0, 64, 32):
+    for vec_lane_1 in range(8):
+        v = (x.iterator + roffset_7 + vec_lane_1 + vec_lane_1).load()
+        acc = acc + v
+t = vec_lane_1
+for roffset_7 in range(0, 64, 32):
+    for vec_lane_2 in range(8):
+        w = (x.iterator + roffset_7 + t + vec_lane_2).load()
+        (out.iterator + roffset_7 + vec_lane_2).store(w)
+""",
+        # The later sweep advances ``start`` after its load, while its cache
+        # index reads ``start`` in every iteration.
+        """
+start = 0
+for synthetic_lane_7 in range(start, start + 8):
+    before = (x.iterator + synthetic_lane_7).load()
+    acc = acc + before
+for synthetic_lane_7 in range(start, start + 8):
+    after = (x.iterator + synthetic_lane_7).load()
+    (out.iterator + synthetic_lane_7).store(after)
+    start = start + 1
+""",
+        # ``offs[0] = 8`` changes ``p[0]`` through the other name: the first
+        # sweep's ``c`` is the element before the store, the later one's the
+        # element after it.
+        """
+p = offs
+c = p[0]
+offs[0] = 8
+for synthetic_lane_7 in range(8):
+    v = (x.iterator + c + synthetic_lane_7).load()
+    acc = acc + v
+c = p[0]
+for synthetic_lane_7 in range(8):
+    w = (x.iterator + c + synthetic_lane_7).load()
+    (out.iterator + synthetic_lane_7).store(w)
+""",
+    ],
+)
+def test_sweeps_that_may_read_other_elements_are_not_fused(source: str) -> None:
+    code = _fused(source)
+    assert "_fuse_cache_" not in code
+    assert code.count(".load()") == 2
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("pure", (False, True))
+@pytest.mark.parametrize("where", ("between", "consume", "in_place"))
+def test_inline_asm_of_unknown_effects_orders_the_sweeps(
+    where: str, pure: bool
+) -> None:
+    # Inline asm not declared pure may write any tensor: between the sweeps,
+    # or in the consume loop, it keeps the later sweep's loads, also where
+    # that loop stores each element back into ``x`` (the in-place snapshot
+    # proof).  Declared pure, it writes nothing.
+    asm = (
+        "_cute_inline_asm_elementwise((acc,), asm='add.f32 $0, $1, $1;', "
+        f"constraints='=f,f', dtype=cutlass.Float32, is_pure={pure})"
+    )
+    between = f"v = {asm}" if where == "between" else ""
+    inside = "" if where == "between" else f"v = {asm}"
+    target = "x" if where == "in_place" else "out"
+    code = _fused(
+        f"""
+for synthetic_lane_7 in range(8):
+    before = (x.iterator + synthetic_lane_7).load()
+    acc = acc + before
+{between}
+for synthetic_lane_7 in range(8):
+    after = (x.iterator + synthetic_lane_7).load()
+    {inside}
+    ({target}.iterator + synthetic_lane_7).store(after)
+"""
+    )
+    assert ("_fuse_cache_" in code) is pure
+
+
 @pytest.mark.parametrize("prove_x_y_disjoint", (False, True))
 @pytest.mark.parametrize("write_kind", ("store", "atomic"))
 def test_consumer_loop_write_is_a_backedge_barrier(
@@ -531,10 +1284,11 @@ def _disable_online_to_3pass(monkeypatch: pytest.MonkeyPatch) -> None:
 class TestCuteFuseTwoPassLoads(TestCase):
     def test_fuser_fires_with_vec_hoist(self) -> None:
         """When the vec hoist runs, the two sweeps' loads use names like
-        ``lane_base_1`` vs ``lane_base_2``, ``vec_lane_1`` vs ``vec_lane_2``,
-        and ``_tile_unroll_vec_1_0`` vs ``_tile_unroll_vec_1_1``. The
-        alias map canonicalizes these so the fuser matches and emits one
-        ``_fuse_cache_*`` fragment instead of re-reading from gmem.
+        ``lane_base_1`` vs ``lane_base_2`` and ``vec_lane_1`` vs
+        ``vec_lane_2``. The keys spell ``lane_base_<N>`` by its definition
+        and the pass renames ``vec_lane_2`` to ``vec_lane_1``, so the fuser
+        matches and emits one ``_fuse_cache_*`` fragment instead of
+        re-reading from gmem.
 
         The cache_size cap is 64; for inner-tile trip=8 and lane_trip=1
         the cache_size=8 fits.

@@ -3689,6 +3689,31 @@ def gated_round_vec(x: cute.TensorSSA, dtype: type[Numeric]) -> cute.TensorSSA:
     return dst.load()
 
 
+def gated_mul_ftz_vec(a: cute.TensorSSA, b: cute.TensorSSA) -> cute.TensorSSA:
+    """``a * b`` per element with the flush-to-zero multiply.
+
+    ``mul.rn.ftz`` reads a subnormal operand as zero and flushes a subnormal
+    product; the TensorSSA ``*`` keeps both.  With ``b`` the
+    ``rcp.approx.ftz`` of a divisor this is the pointwise lowering's
+    ``fast_math`` division, ``div.approx.ftz.f32``, bit for bit: ptxas lowers
+    that division to the same ``MUFU.RCP`` and ``FMUL.FTZ``, and the DSL's
+    ``div(approx=True)`` takes scalars only.  The gate vectors have an even
+    width, and their pairs multiply as ``mul.rn.ftz.f32x2`` (every gated body
+    targets sm_100): as many ``FMUL2`` as the TensorSSA product.
+    """
+    n = cute.size(a.shape)
+    lhs = cute.make_rmem_tensor((n,), cutlass.Float32)
+    rhs = cute.make_rmem_tensor((n,), cutlass.Float32)
+    out = cute.make_rmem_tensor((n,), cutlass.Float32)
+    lhs.store(a)
+    rhs.store(b)
+    for k in range(0, n, 2):
+        out[k], out[k + 1] = cute.arch.mul_packed_f32x2(
+            (lhs[k], lhs[k + 1]), (rhs[k], rhs[k + 1]), ftz=True
+        )
+    return out.load()
+
+
 def tcgen05_fence_before_thread_sync() -> None:
     """``tcgen05.fence::before_thread_sync``: order this thread's prior tcgen05
     operations (the allocation's TMEM-address write to shared memory, TMEM
