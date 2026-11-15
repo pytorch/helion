@@ -85,8 +85,19 @@ def make_precompiler(
         # forms makes the benchmark worker compile every candidate a second time.
         use_runtime_argument_packing = get_triton_version().release >= (3, 7)
         if use_runtime_argument_packing:
+            from triton import knobs
             from triton.runtime.jit import compute_cache_key
 
+            # JITFunction.run() also specializes on a stages-inspection hook's
+            # pipeline (hl.prefetch_code installs one); without it the parent
+            # misses the kernel this precompile compiles.
+            hook = knobs.runtime.add_stages_inspection_hook
+            if hook is not None:
+                # Called with no arguments, the hook returns its cache key and
+                # hash (PipelineStagesHook types only the stages call).
+                key_hook = cast("Callable[[], tuple[str, str]]", hook)
+                _, inspect_stages_hash = key_hook()
+                specialization.append(f'("custom_pipeline", {inspect_stages_hash})')
             key = compute_cache_key(kernel_key_cache, specialization, options)
         else:
             key = str(specialization) + str(options)

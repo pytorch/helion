@@ -2450,6 +2450,22 @@ class TestBaselinePrecompileCache(TestCase):
         self.assertGreater(cubins, 0)
 
     @skipIfNotCUDA()
+    def test_a_forked_baseline_precompile_keys_on_a_stages_hook(self) -> None:
+        # A stages-inspection hook (hl.prefetch_code installs one) adds its
+        # pipeline to the kernel's specialization in JITFunction.run(); the
+        # precompile has to compile that same specialization.
+        from triton import knobs
+
+        def hook(*args: object) -> tuple[str, str] | None:
+            return None if args else ("stages-hook", "stages-hook")
+
+        with patch.object(knobs.runtime, "add_stages_inspection_hook", hook):
+            pids, cubins = self._baseline_compiles("fork", 1536)
+        self.assertTrue(pids)
+        self.assertNotIn(os.getpid(), pids)
+        self.assertGreater(cubins, 0)
+
+    @skipIfNotCUDA()
     @pytest.mark.slow
     def test_a_spawned_baseline_precompile_compiles_for_the_run(self) -> None:
         # A spawned child loads the arguments from a file, which holds them as
