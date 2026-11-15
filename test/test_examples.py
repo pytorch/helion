@@ -1524,17 +1524,36 @@ class TestExamples(RefEagerTestBase, TestCase):
         indices = torch.randint(0, num_nodes, (num_edges,), device=DEVICE).sort()[0]
         input_data = torch.randn(num_edges, num_features, device=DEVICE, dtype=dtype)
 
-        args = (indices, input_data, num_nodes)
-
         # Import and use the reference implementation
         mod = import_path(EXAMPLES_DIR / "segment_reduction.py")
-        expected = mod.segmented_reduction_pytorch(*args)
 
-        check_example(
-            "segment_reduction",
-            args,
-            expected,
-            fn_name="segmented_reduction_helion",
+        # Random segments, then one segment on node 0, whose last row only the
+        # last-row flush ends: its masked next index (0) equals its own.
+        for segment_ids in (indices, torch.zeros_like(indices)):
+            args = (segment_ids, input_data, num_nodes)
+            check_example(
+                "segment_reduction",
+                args,
+                mod.segmented_reduction_pytorch(*args),
+                fn_name="segmented_reduction_helion",
+            )
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("checks the example's Triton reference, not a kernel")
+    def test_segment_reduction_triton_reference(self):
+        """The example's Triton reference ends the last segment at the last
+        element too: one segment on node 0 over 1001 rows, which leaves the
+        last block partial at every block size it autotunes over."""
+        mod = import_path(EXAMPLES_DIR / "segment_reduction.py")
+        indices = torch.zeros(1001, dtype=torch.int64, device=DEVICE)
+        # Small integers: the atomic adds sum them exactly in any order.
+        input_data = torch.randint(-4, 5, (1001, 32), device=DEVICE).float()
+        args = (indices, input_data, 4)
+        torch.testing.assert_close(
+            mod.segmented_reduction_triton(*args),
+            mod.segmented_reduction_pytorch(*args),
+            rtol=0,
+            atol=0,
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
@@ -2403,6 +2422,38 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfXPU("Timeout on XPU")
     def test_fused_linear_jsd(self):
+        args, expected = self._fused_linear_jsd_case()
+        check_example(
+            "fused_linear_jsd",
+            args,
+            expected,
+            fn_name="fused_linear_jsd_kernel",
+            block_sizes=[64],
+        )
+
+    @skipIfXPU("Timeout on XPU")
+    # Pallas has no reduction_loops: it would rerun the persistent config.
+    @onlyBackends(["triton", "cute"])
+    def test_fused_linear_jsd_rolled(self):
+        """Both softmaxes rolled: reduction_loops=[64] splits the max, sum and
+        consumer passes over each 256-wide row into sweeps of 64 columns."""
+        args, expected = self._fused_linear_jsd_case()
+        check_example(
+            "fused_linear_jsd",
+            args,
+            expected,
+            fn_name="fused_linear_jsd_kernel",
+            emit_code=False,
+            block_sizes=[64],
+            reduction_loops=[64],
+        )
+
+    @staticmethod
+    def _fused_linear_jsd_case() -> tuple[
+        tuple[float, int, float, torch.Tensor, torch.Tensor], torch.Tensor
+    ]:
+        """fused_linear_jsd_kernel's arguments for 64 rows of 256 logits, and
+        the loss of the PyTorch reference."""
         beta = 0.5
         ignore_index = -100
         temperature = 1.0
@@ -2436,14 +2487,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             student_input,
             teacher_input,
         )
-
-        check_example(
-            "fused_linear_jsd",
-            args,
-            expected,
-            fn_name="fused_linear_jsd_kernel",
-            block_sizes=[64],
-        )
+        return args, expected
 
     def test_fused_linear_jsd_flushed_probabilities(self):
         """Rows whose softmax probabilities are fp32 subnormals.

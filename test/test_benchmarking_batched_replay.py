@@ -2,15 +2,26 @@ from __future__ import annotations
 
 import logging
 import math
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
+from unittest.mock import Mock
 
 import pytest
 import torch
+from torch.profiler import ProfilerActivity
+from torch.profiler import profile
+from torch.profiler import supported_activities
 
 from helion._dist_utils import all_ranks_agree
 from helion._testing import DEVICE
 from helion._testing import skipIfRocm
+from helion.autotuner import benchmark_job
 from helion.autotuner import benchmarking
+from helion.autotuner.benchmark_job import KernelTimerProbeJob
+from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
+from helion.autotuner.benchmark_worker import BenchmarkTimeout
+from helion.autotuner.benchmark_worker import BenchmarkWorker
+from helion.autotuner.benchmark_worker import BenchmarkWorkerUnkillable
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -398,6 +409,9 @@ def test_l2_flush_mode_literals(monkeypatch) -> None:
     assert benchmarking._l2_flush_mode() == "replay"
     monkeypatch.setenv("HELION_AUTOTUNE_L2_FLUSH", "call")
     assert benchmarking._l2_flush_mode() == "call"
+    # the kernel timer serves the final selection only
+    monkeypatch.setenv("HELION_AUTOTUNE_L2_FLUSH", "kernel")
+    assert benchmarking._l2_flush_mode() == "call"
 
 
 def test_final_selection_regime_follows_the_search_regime(monkeypatch) -> None:
@@ -423,8 +437,421 @@ def test_final_selection_regime_follows_the_search_regime(monkeypatch) -> None:
     # the timers take the regime as an argument; the search regime is the default
     assert benchmarking._resolve_l2_flush_mode(None) == "off"
     assert benchmarking._resolve_l2_flush_mode("call") == "call"
+    assert benchmarking._resolve_l2_flush_mode("kernel") == "kernel"
     with pytest.raises(ValueError, match="l2_flush_mode"):
         benchmarking._resolve_l2_flush_mode("flush")
+
+
+@pytest.mark.cpu_only
+def test_backend_default_replaces_only_the_default_search_regime(
+    monkeypatch,
+) -> None:
+    """A backend's final-selection regime (CuTe: ``kernel``) replaces the
+    default per-call flush only; an explicit search or final regime wins."""
+    monkeypatch.delenv("HELION_AUTOTUNE_FINAL_L2_FLUSH", raising=False)
+    monkeypatch.delenv("HELION_AUTOTUNE_L2_FLUSH", raising=False)
+    assert benchmarking.final_selection_l2_flush_mode("kernel") == "kernel"
+    monkeypatch.setenv("HELION_AUTOTUNE_L2_FLUSH", "1")
+    assert benchmarking.final_selection_l2_flush_mode("kernel") == "call"
+    monkeypatch.setenv("HELION_AUTOTUNE_L2_FLUSH", "0")
+    assert benchmarking.final_selection_l2_flush_mode("kernel") == "replay"
+    monkeypatch.delenv("HELION_AUTOTUNE_L2_FLUSH")
+    monkeypatch.setenv("HELION_AUTOTUNE_FINAL_L2_FLUSH", "call")
+    assert benchmarking.final_selection_l2_flush_mode("kernel") == "call"
+    monkeypatch.setenv("HELION_AUTOTUNE_FINAL_L2_FLUSH", "kernel")
+    assert benchmarking.final_selection_l2_flush_mode() == "kernel"
+    # a search variable naming the kernel timer reaches the final selection
+    monkeypatch.delenv("HELION_AUTOTUNE_FINAL_L2_FLUSH")
+    monkeypatch.setenv("HELION_AUTOTUNE_L2_FLUSH", "kernel")
+    assert benchmarking.final_selection_l2_flush_mode() == "kernel"
+    # a per-call flushed regime takes no second (cold) column; a warm one's
+    # cold column takes the backend's timer
+    monkeypatch.delenv("HELION_AUTOTUNE_TARGET_REGIME", raising=False)
+    assert benchmarking.final_selection_second_regime("kernel") is None
+    assert benchmarking.final_selection_second_regime("replay") == "call"
+    assert benchmarking.final_selection_second_regime("replay", "kernel") == "kernel"
+
+
+_TRACE = (
+    skipIfRocm("the CUDA activity trace is NVIDIA-only"),
+    pytest.mark.skipif(DEVICE.type != "cuda", reason="requires CUDA"),
+    pytest.mark.skipif(
+        ProfilerActivity.CUDA not in supported_activities(),
+        reason="requires CUDA activity tracing",
+    ),
+)
+
+
+def _trace_test(fn: Callable[..., None]) -> Callable[..., None]:
+    for mark in _TRACE:
+        fn = mark(fn)
+    return fn
+
+
+@pytest.fixture
+def traced_windows(monkeypatch) -> list[int]:
+    """The call counts of the trace windows split during a test: the kernel
+    timer's tests assert that the trace path ran, not the CUDA-event
+    fallback."""
+    windows: list[int] = []
+    split = benchmarking._kernel_trace_samples
+
+    def recorded(
+        events: list[benchmarking._TraceEvent], count: int, per_flush: int
+    ) -> list[tuple[int, float]] | None:
+        windows.append(count)
+        return split(events, count, per_flush)
+
+    monkeypatch.setattr(benchmarking, "_kernel_trace_samples", recorded)
+    return windows
+
+
+@_trace_test
+def test_kernel_timer_reads_each_calls_trace_durations(traced_windows) -> None:
+    """``kernel`` samples are per-call spans of the call's kernels (graph
+    replayed, as the final selection times them); a call that launches the
+    flush's own memset still splits at the markers."""
+    from triton import runtime
+
+    a = torch.randn(512, 512, device=DEVICE)
+    out = torch.empty_like(a)
+    # int32, like Triton's flush buffer: the call's memset is the flush's own
+    scratch = torch.empty(1 << 20, dtype=torch.int32, device=DEVICE)
+
+    def call() -> None:
+        scratch.zero_()
+        torch.mm(a, a, out=out)
+
+    samples = benchmarking.do_bench(
+        call,
+        return_mode="all",
+        fixed_repetitions=7,
+        default_cudagraph=True,
+        l2_flush_mode="kernel",
+    )
+    assert isinstance(samples, list)
+    assert len(samples) == 7
+    assert traced_windows == [7]
+
+    def durations_ms(run: Callable[[], object]) -> list[float]:
+        def synchronized() -> None:
+            run()
+            torch.cuda.synchronize()
+
+        return [
+            (event.end - event.start) / 1e6
+            for event in benchmarking._cuda_kernel_events(synchronized)
+        ]
+
+    cache = runtime.driver.active.get_empty_cache_for_benchmark()  # type: ignore[attr-defined]
+    flush_ms = min(
+        durations_ms(lambda: runtime.driver.active.clear_cache(cache))  # type: ignore[attr-defined]
+    )
+    mm_ms = min(durations_ms(lambda: torch.mm(a, a, out=out)))
+    # each sample holds the call's memset and mm, never the flush
+    assert all(mm_ms <= sample < flush_ms for sample in samples)
+
+
+@_trace_test
+def test_kernel_timer_sizes_windows_with_the_flush(traced_windows) -> None:
+    """The flush runs before every warmup and timed call, so it sizes the
+    windows with the call (a short call sized alone runs thousands of 256 MB
+    flushes)."""
+    a = torch.randn(64, 64, device=DEVICE)
+    calls: list[None] = []
+
+    def short_call() -> None:
+        calls.append(None)
+        torch.mm(a, a)
+
+    benchmarking.do_bench(short_call, warmup=20, rep=20, l2_flush_mode="kernel")
+    # a flush takes tens of microseconds: 40 ms hold about a thousand (sized
+    # by the call alone, over ten thousand)
+    assert len(calls) < 3000
+    assert traced_windows
+
+
+@_trace_test
+def test_kernel_timer_probes_a_long_call_once(traced_windows) -> None:
+    """A call longer than both windows is one traced call, estimate and
+    sample at once (``do_bench``'s long-kernel probe)."""
+    calls: list[None] = []
+
+    def long_call() -> None:
+        calls.append(None)
+        torch.cuda._sleep(50_000_000)
+
+    reading = benchmarking.do_bench(
+        long_call, warmup=1, rep=1, probe_long_kernel=True, l2_flush_mode="kernel"
+    )
+    # the setup call, then the traced probe
+    assert len(calls) == 2
+    assert traced_windows == [1]
+    start, end = (
+        torch.cuda.Event(enable_timing=True),
+        torch.cuda.Event(enable_timing=True),
+    )
+    start.record()
+    long_call()
+    end.record()
+    torch.cuda.synchronize()
+    assert reading == pytest.approx(start.elapsed_time(end), rel=0.2)
+
+
+@_trace_test
+def test_kernel_timer_resets_gradients_before_every_call(traced_windows) -> None:
+    x = torch.ones(4, device=DEVICE, requires_grad=True)
+    seen: list[bool] = []
+
+    def backward_call() -> None:
+        seen.append(x.grad is None)
+        x.sum().backward()
+
+    benchmarking.do_bench(
+        backward_call,
+        grad_to_none=[x],  # pyrefly: ignore[bad-argument-type]
+        fixed_repetitions=3,
+        l2_flush_mode="kernel",
+    )
+    assert seen[-3:] == [True, True, True]
+    assert traced_windows == [3]
+
+
+@_trace_test
+def test_kernel_timer_resizes_a_window_whose_estimate_ran_long(
+    traced_windows,
+) -> None:
+    """The windows are sized by an estimate; when the calls then run far
+    shorter (here: the estimate's calls sleep), the first session settles
+    too few calls past the traced warmup, and a second one sized by the
+    traced call period times them."""
+    a = torch.randn(64, 64, device=DEVICE)
+    calls = [0]
+
+    def call() -> None:
+        calls[0] += 1
+        # the setup call and the estimate
+        if calls[0] <= 1 + benchmarking._KERNEL_TIMER_ESTIMATE_CALLS:
+            torch.cuda._sleep(5_000_000)
+        torch.mm(a, a)
+
+    reading = benchmarking.do_bench(call, warmup=20, rep=20, l2_flush_mode="kernel")
+    assert reading < 1.0  # milliseconds: no sleeping call is timed
+    # a second, longer session sized by the traced call period
+    assert len(traced_windows) == 2
+    assert traced_windows[1] > traced_windows[0]
+
+
+@_trace_test
+def test_kernel_timer_builds_its_marker_outside_the_trace(
+    monkeypatch, traced_windows
+) -> None:
+    """The marker of a device the process has not timed on yet is built
+    before the session: its buffer would otherwise put a kernel of its own
+    between the first flush and its marker."""
+    a = torch.randn(64, 64, device=DEVICE)
+    monkeypatch.setattr(benchmarking, "_trace_markers", {})
+    reading = benchmarking.do_bench(
+        lambda: torch.mm(a, a), fixed_repetitions=3, l2_flush_mode="kernel"
+    )
+    assert reading < math.inf
+    assert traced_windows == [3]
+
+
+@_trace_test
+def test_kernel_timer_yields_to_a_profiler_of_another_thread(monkeypatch) -> None:
+    """A profiling session of any thread (the process-wide flag) keeps the
+    process that times the windows off the trace (a second session would
+    cancel the first one's); the parent's check, which starts no session,
+    does not ask (a parent's profiler does not hold the worker's trace)."""
+    monkeypatch.setattr(benchmarking.autograd_profiler, "_is_profiler_enabled", True)
+    assert benchmarking.kernel_timer_unready_reason() is not None
+    assert benchmarking.kernel_timer_available()
+
+
+@_trace_test
+def test_worker_probe_learns_the_trace() -> None:
+    """The final selection asks the benchmark worker whether it traces
+    (``KernelTimerProbeJob``) before it labels a column ``kernel``."""
+    assert KernelTimerProbeJob(torch.cuda.current_device())() is None
+    assert benchmarking._flush_trace
+
+
+@_trace_test
+@pytest.mark.slow
+def test_worker_probe_runs_in_the_benchmark_worker() -> None:
+    """The probe's profiling session runs in the killable worker, not here."""
+    worker = BenchmarkWorker(device=None, log_warning=logging.getLogger().warning)
+    try:
+        assert worker.run(KernelTimerProbeJob(0), timeout=120.0) is None
+    finally:
+        worker.shutdown()
+
+
+def _no_trace(run: Callable[[], None]) -> list[object]:
+    """A trace that saw nothing: ``run`` runs, its activities are lost."""
+    run()
+    return []
+
+
+@_trace_test
+def test_kernel_timer_falls_back_to_events(monkeypatch, caplog) -> None:
+    """A running profiler (a second session would cancel its trace) and an
+    empty flush trace (another tool holds the activity API; remembered and
+    said once for the process) time per-call flushed with CUDA events; a
+    trace that does not split into the flushed calls reads infinite."""
+    a = torch.randn(64, 64, device=DEVICE)
+
+    def call() -> None:
+        torch.mm(a, a)
+
+    with profile(activities=[ProfilerActivity.CUDA]) as outer:
+        reading = benchmarking.do_bench(
+            call, fixed_repetitions=3, l2_flush_mode="kernel"
+        )
+        torch.cuda.synchronize()
+    assert isinstance(reading, float)
+    assert reading > 0.0
+    assert any(event.device_type.name == "CUDA" for event in outer.events())
+
+    monkeypatch.setattr(benchmarking, "_flush_trace", 1)
+    monkeypatch.setattr(benchmarking, "_cuda_kernel_events", _no_trace)
+    with caplog.at_level(logging.WARNING, logger=benchmarking.__name__):
+        reading = benchmarking.do_bench(
+            call, fixed_repetitions=3, l2_flush_mode="kernel"
+        )
+    # another scale than its rivals' would mislead: the window cannot win
+    assert reading == math.inf
+    assert "could not split" in caplog.text
+
+    caplog.clear()
+    monkeypatch.setattr(benchmarking, "_flush_trace", None)
+    with caplog.at_level(logging.WARNING, logger=benchmarking.__name__):
+        for _ in range(2):
+            reading = benchmarking.do_bench(
+                call, fixed_repetitions=3, l2_flush_mode="kernel"
+            )
+    assert isinstance(reading, float)
+    assert reading < math.inf
+    assert benchmarking._flush_trace == 0
+    assert caplog.text.count("timing per-call flushed with CUDA events") == 1
+
+
+@pytest.mark.cpu_only
+def test_worker_probe_is_asked_once_and_explains_a_refusal() -> None:
+    """``worker_kernel_timer_available`` runs the probe in the worker once,
+    logs its reason (a raising probe as a warning), turns any failed probe
+    into False and re-raises an unkillable worker."""
+
+    def provider(run: Mock) -> LocalBenchmarkProvider:
+        instance = object.__new__(LocalBenchmarkProvider)
+        instance._worker_kernel_timer = None
+        instance.args = ()
+        instance.settings = SimpleNamespace(autotune_benchmark_timeout=60)
+        instance.log = Mock()
+        instance.steady_window_benchmark_available = Mock(return_value=True)  # type: ignore[method-assign]
+        instance._get_benchmark_worker = Mock(return_value=Mock(run=run))  # type: ignore[method-assign]
+        return instance
+
+    ready = provider(Mock(return_value=None))
+    assert ready.worker_kernel_timer_available()
+    assert ready.worker_kernel_timer_available()
+    ready._get_benchmark_worker().run.assert_called_once()  # type: ignore[attr-defined]
+    held = provider(Mock(return_value="the CUDA activity trace is held"))
+    assert not held.worker_kernel_timer_available()
+    assert "is held" in held.log.debug.call_args.args[0]  # type: ignore[attr-defined]
+    assert not provider(
+        Mock(side_effect=BenchmarkTimeout("t"))
+    ).worker_kernel_timer_available()
+    # a torch nightly renaming a private profiler API the trace path reads:
+    # a raising probe is said loudly, unlike a reason it returns
+    failing = provider(Mock(side_effect=AttributeError("renamed")))
+    assert not failing.worker_kernel_timer_available()
+    assert "probe failed" in failing.log.warning.call_args.args[0]  # type: ignore[attr-defined]
+    with pytest.raises(BenchmarkWorkerUnkillable):
+        provider(
+            Mock(side_effect=BenchmarkWorkerUnkillable("w"))
+        ).worker_kernel_timer_available()
+
+
+@_trace_test
+def test_worker_job_times_a_kernel_window(monkeypatch) -> None:
+    """A worker job asked for a ``kernel`` window times the candidate from the
+    trace, under its arguments' device."""
+    a = torch.randn(256, 256, device=DEVICE)
+    monkeypatch.setattr(
+        benchmark_job,
+        "_load_compiled_fn_for_worker",
+        lambda spec: lambda x: torch.mm(x, x),
+    )
+    monkeypatch.setattr(benchmark_job, "_unload_compiled_fn", lambda fn: None)
+    monkeypatch.setattr(benchmark_job, "load_trusted_kernel_args", lambda path: (a,))
+    job = benchmark_job.BenchmarkJob(
+        fn_spec=None,  # pyrefly: ignore[bad-argument-type]
+        args_path="",
+        l2_flush_mode="kernel",
+        fixed_repetitions=3,
+    )
+    reading = job()
+    assert 0.0 < reading < math.inf
+
+
+@pytest.mark.cpu_only
+def test_worker_job_refuses_an_untraceable_kernel_window(monkeypatch) -> None:
+    """A worker job asked for a ``kernel`` window it cannot trace fails
+    rather than time with CUDA events under the ``kernel`` label."""
+    monkeypatch.setattr(
+        benchmark_job, "_load_compiled_fn_for_worker", lambda spec: lambda: None
+    )
+    monkeypatch.setattr(benchmark_job, "_unload_compiled_fn", lambda fn: None)
+    monkeypatch.setattr(benchmark_job, "load_trusted_kernel_args", lambda path: ())
+    monkeypatch.setattr(benchmark_job, "steady_graph_dispatch", lambda device: None)
+    monkeypatch.setattr(benchmark_job, "synchronize_device", lambda: None)
+    monkeypatch.setattr(
+        benchmark_job, "kernel_timer_unready_reason", lambda: "the trace is held"
+    )
+    job = benchmark_job.BenchmarkJob(
+        fn_spec=None,  # pyrefly: ignore[bad-argument-type]
+        args_path="",
+        l2_flush_mode="kernel",
+    )
+    with pytest.raises(RuntimeError, match="the trace is held"):
+        job()
+
+
+@pytest.mark.cpu_only
+def test_kernel_trace_samples_split_calls_at_the_markers() -> None:
+    """The marker after each flush delimits the calls: a call's own fill may
+    share the flush's name and size, calls may launch different kernels, and
+    each sample is the call's first start and its span (first start to last
+    end), exact on epoch-nanosecond timestamps. A trace whose markers do not
+    match the calls is refused."""
+
+    marker = benchmarking._TRACE_MARKER
+
+    def event(name: str, start_us: int, end_us: int) -> benchmarking._TraceEvent:
+        epoch = 1_794_110_432_668_685_631  # Kineto's clock, in ns
+        return benchmarking._TraceEvent(
+            name, epoch + 1000 * start_us, epoch + 1000 * end_us + 7
+        )
+
+    trace = [
+        event("memset", 0, 45),
+        event(marker, 46, 47),
+        event("memset", 48, 93),  # the call's own 256 MB fill
+        event("mm", 94, 105),
+        event("memset", 106, 151),
+        event(marker, 152, 153),
+        event("mm", 154, 160),
+        event("mm", 158, 170),  # a dependent launch overlapping its primary
+    ]
+    samples = benchmarking._kernel_trace_samples(trace, 2, 1)
+    assert samples is not None
+    assert [ms for _start, ms in samples] == [0.057007, 0.016007]
+    assert samples[1][0] - samples[0][0] == 106_000
+    assert benchmarking._kernel_trace_samples(trace, 3, 1) is None
+    assert benchmarking._kernel_trace_samples(trace[1:], 2, 1) is None
+    assert benchmarking._kernel_trace_samples(trace[:6], 2, 1) is None
 
 
 @skipIfRocm("CUDA graph benchmarking is NVIDIA-only")

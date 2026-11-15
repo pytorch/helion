@@ -478,12 +478,7 @@ def snapshot_capture_slots(
 
 
 def snapshot_logical_shape(node: Node) -> tuple[int | torch.SymInt, ...]:
-    target = cast("Node", node.args[0]).meta["val"]
-    indices = [
-        index.meta["val"] if isinstance(index, Node) else index
-        for index in cast("list[Node | int | slice | None]", node.args[1])
-    ]
-    return tuple(SubscriptIndexing.compute_shape(target, indices))
+    return tuple(SubscriptIndexing.node_shape(node))
 
 
 def snapshot_chains(
@@ -640,11 +635,7 @@ def snapshot_chains(
                 continue
             if node.target is memory_ops.store:
                 target = cast("Node", node.args[0])
-                indices = [
-                    i.meta["val"] if isinstance(i, Node) else i
-                    for i in cast("list[Node | int | slice | None]", node.args[1])
-                ]
-                shape = SubscriptIndexing.compute_shape(target.meta["val"], indices)
+                shape = snapshot_logical_shape(node)
                 if target.target is not _tracing_ops._host_tensor or not (
                     len(shape) == len(logical) == 1
                     and dimension(shape[0]) == dimension(logical[0])

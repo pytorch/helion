@@ -27,6 +27,7 @@ from .state import CuteTcgen05State
 
 if TYPE_CHECKING:
     import ast
+    from collections.abc import Callable
     from collections.abc import Sequence
 
     import torch
@@ -325,9 +326,12 @@ class CuteTcgen05StoreValue(_CuteTcgen05OrientationMixin):
     use_tma_store_epilogue: bool = False
     tma_store_full_tiles_only: bool = False
     partial_output_tma_store: bool = False
-    # Output element dtype (cutlass type string, e.g. "cutlass.BFloat16")
-    # used when computing the tcgen05 epilogue tile.
-    epi_elem_dtype_str: str = ""
+    # The partial-output store's staged rows load one tile ahead
+    # (``cute_mma``'s ``tcgen05_partial_output_row_lookahead``).
+    partial_output_row_lookahead: bool = False
+    # Element dtype the tcgen05 epilogue tile is sized by (the matmul plan's:
+    # the widest output store's); ``None`` sizes it by the store's own dtype.
+    epi_elem_dtype: torch.dtype | None = None
     explicit_epi_tile_m: int | None = None
     explicit_epi_tile_n: int | None = None
     explicit_d_store_box_n: int | None = None
@@ -504,16 +508,15 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
 
     @property
     def c_input_aux_tensor_descriptors(self) -> tuple[Tcgen05AuxTensorDescriptor, ...]:
-        """Aux descriptors staged by the C-input warp.
+        """Aux descriptors staged by the C-input warp
+        (``Tcgen05AuxTensorDescriptor.stages_through_smem_ring``).
 
-        Exact-shape rank-2 MxN aux tensors use the SMEM-ring producer.
-        Broadcast row vectors and leading-passthrough rank-3 residuals stay on
-        the direct per-thread load path; the producer scheduler is 2-D only.
+        The producer scheduler is 2-D only: broadcast row vectors,
+        leading-passthrough rank-3 residuals and boolean masks stay on the
+        direct per-thread load path.
         """
         return tuple(
-            d
-            for d in self.aux_tensor_descriptors
-            if d.broadcast_axis is None and d.host_tensor_val.ndim == 2
+            d for d in self.aux_tensor_descriptors if d.stages_through_smem_ring
         )
 
     @property
@@ -630,6 +633,25 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
 
 
 @dataclasses.dataclass(frozen=True)
+class Tcgen05EpiRowPrefetch:
+    """A staged row-vector operand the epilogue role loads one tile ahead.
+
+    ``program_id``'s static role-local while renders ``issue(translate,
+    slot, suffix)`` ahead of its loop for the role's first tile and at the
+    top of every iteration for the next one, on a lookahead copy of the
+    role's tile scheduler: ``translate`` maps each of ``coordinates`` (the
+    store lowering's expressions over the current tile's coordinates) onto
+    the lookahead tile's, ``slot`` is the SMEM row slot the asynchronous copy
+    fills and ``suffix`` keeps the two renderings' locals apart. The store
+    lowering then waits for the current tile's copy (``cp.async.wait_group
+    1``) where it used to copy the row synchronously.
+    """
+
+    coordinates: tuple[str, ...]
+    issue: Callable[[Callable[[str], str], str, str], str]
+
+
+@dataclasses.dataclass(frozen=True)
 class CuteVloopWrapperFact:
     """A grid tile axis partitioned into an outer lane loop x constexpr V-loop.
 
@@ -726,6 +748,10 @@ class CuteDeviceFunctionState:
         # Kernel-wide per-node lowering facts.
         self.explicit_rng_seed_exprs: set[str] = set()
         self.uniform_comparison_marker: str | None = None
+        # The DSL type of each name a hoisted uniform cutoff binds
+        # (``lower_uniform_comparisons``), which its tuple assignment does not
+        # show: ``sweep_values`` types a carried dropout mask from them.
+        self.uniform_cutoff_dtypes: dict[str, str] = {}
         self.signed_byte_packets: dict[Node, SignedBytePacket] = {}
         # The load_eviction_policies slot each load node took
         # (``memory_ops._cute_load_eviction_slot``): a load lowered again (a
@@ -741,6 +767,9 @@ class CuteDeviceFunctionState:
         self.published_scalar_requests: list[PublishedScalarRequest] = []
         self.register_producer_requests: list[RegisterProducerRequest] = []
         self.shared_arena_requests: list[SharedArenaRequest] = []
+        # The storages whose atomics ``cute_privatize_atomics`` redirects
+        # (``atomic_privatization.privatized_storages``), once computed.
+        self.privatized_storages: frozenset[int] | None = None
 
     # -- tcgen05 registries -----------------------------------------------------
 

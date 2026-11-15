@@ -294,6 +294,10 @@ class PallasBackend(Backend):
         return True
 
     @property
+    def lowers_mask_select(self) -> bool:
+        return True
+
+    @property
     def state(self) -> BackendState:
         return BackendState.BETA
 
@@ -493,6 +497,10 @@ class PallasBackend(Backend):
 
     def supports_config_key(self, key: str) -> bool:
         return key in self._PALLAS_SUPPORTED_KEYS
+
+    def flattened_tile_shares_one_index(self) -> bool:
+        # A flattened loop flattens the grid only; each tile keeps its block.
+        return False
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
         return f"pl.program_id({dim})"
@@ -1797,7 +1805,7 @@ class PallasBackend(Backend):
             for scratch in scratch_shapes:
                 sources = scratch.shape_sources or (None,) * len(scratch.shape)
                 shape_dims = [
-                    host.literal_expr(size)
+                    host.literal_expr(size, device_fn.config)
                     if source is None
                     else f"{device_fn.tensor_arg(source[0]).host_str()}.size({source[1]})"
                     for size, source in zip(scratch.shape, sources, strict=True)

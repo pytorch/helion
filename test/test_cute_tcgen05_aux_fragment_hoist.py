@@ -248,7 +248,11 @@ def test_facts_distinguish_aux_on_every_store() -> None:
     assert gated.aux_kernel_detected and gated.exact_shape_aux_kernel_detected
     assert not gated.aux_loads_on_every_store
     assert gated.rowvec_aux_facts == Tcgen05RowvecAuxFacts(
-        output_itemsize=2, rows=(), output_count=2, exact_aux_count=1
+        output_itemsize=2,
+        rows=(),
+        output_count=2,
+        exact_aux_itemsizes=(2,),
+        ring_aux_itemsizes=(2,),
     )
     assert repair.pre_acc_wait_admissible_via_fanout(gated)
 
@@ -335,6 +339,46 @@ def test_placement_collapses_to_the_default_where_pre_acc_wait_is_unsampled() ->
     )
     with pytest.raises(InvalidConfig, match="no per-subtile auxiliary loads"):
         normalized(bound, base_config(PRE))
+
+
+def _fp32_residual(
+    x: torch.Tensor, w: torch.Tensor, residual: torch.Tensor
+) -> torch.Tensor:
+    """An FP32 exact-shape operand of an FP16 output."""
+    m, n = x.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(n):
+            acc = torch.addmm(acc, x[tile_m, tile_k], w[tile_k, tile_n])
+        out[tile_m, tile_n] = (acc + residual[tile_m, tile_n]).to(x.dtype)
+    return out
+
+
+def test_register_budgets_price_a_wider_operand_at_its_own_size() -> None:
+    """The register budgets price an FP32 residual of an FP16 output at four
+    bytes an element (``aux_fragment_itemsize``), not the output's two: the
+    prefetch ring the 128x128 tile admits is shallower than the FP16
+    residual's."""
+    narrow = state_of(bind(residual_single))
+    wide = state_of(
+        helion.kernel(
+            _fp32_residual, backend="cute", static_shapes=True, autotune_effort="full"
+        )._bind_isolated(
+            (
+                torch.empty((4096, 1024), dtype=torch.float16),
+                torch.empty((1024, 1024), dtype=torch.float16),
+                torch.empty((4096, 1024), dtype=torch.float32),
+            )
+        )
+    )
+    assert smem.aux_fragment_itemsize(narrow.rowvec_aux_facts) == 2
+    assert smem.aux_fragment_itemsize(wide.rowvec_aux_facts) == 4
+    config = base_config(PRE)
+    narrow_depth = smem.aux_prefetch_depth_limit(narrow, dict(config))
+    wide_depth = smem.aux_prefetch_depth_limit(wide, dict(config))
+    assert narrow_depth is not None and wide_depth is not None
+    assert wide_depth < narrow_depth
 
 
 def test_hoist_admission_is_strict_and_budgeted() -> None:
@@ -518,15 +562,15 @@ def test_smem_model_charges_one_c_ring_per_output() -> None:
     # ab=6 + c=4 fits one ring (224 KiB) but not two (256 KiB): the sampled
     # rings are shallowed to the deepest AB depth the two rings leave.
     sample = base_config(tcgen05_ab_stages=6, tcgen05_c_stages=4)
-    repair._fix_multi_output_ring_search_config(state, sample)
+    repair._fix_c_ring_search_config(state, sample)
     assert (sample["tcgen05_ab_stages"], sample["tcgen05_c_stages"]) == (5, 4)
     sample = base_config(tcgen05_ab_stages=6, tcgen05_c_stages=2)
-    repair._fix_multi_output_ring_search_config(state, sample)
+    repair._fix_c_ring_search_config(state, sample)
     assert (sample["tcgen05_ab_stages"], sample["tcgen05_c_stages"]) == (6, 2)
     # A single-output kernel is untouched by this gate.
     single = state_of(bind(residual_single))
     sample = base_config(tcgen05_ab_stages=6, tcgen05_c_stages=4)
-    repair._fix_multi_output_ring_search_config(single, sample)
+    repair._fix_c_ring_search_config(single, sample)
     assert (sample["tcgen05_ab_stages"], sample["tcgen05_c_stages"]) == (6, 4)
     # An explicit config is refused where its two rings provably overflow
     # (128x128x128: ab=3 is 192 KiB, two 4-stage C rings 64 KiB more -- the
@@ -543,6 +587,31 @@ def test_smem_model_charges_one_c_ring_per_output() -> None:
     assert normalized(bound, deep | {"tcgen05_c_stages": 2})["tcgen05_c_stages"] == 2
     repaired = normalized(bound, deep, fix_invalid=True)
     assert (repaired["tcgen05_ab_stages"], repaired["tcgen05_c_stages"]) == (3, 2)
+
+
+def test_smem_model_charges_each_epilogue_groups_c_ring() -> None:
+    """Each epilogue warp group keeps its own ``c_stages`` stages of the C
+    ring, which the single-output gates do not price: the arena judges a
+    two-group config's rings, shallowing a sample's AB ring and refusing an
+    explicit config that overflows (the one-CTA 128x256x64 tile at ab=4 beside
+    two groups' (128, 64) rings: 262 KB of 232, which NVVM refused)."""
+    bound = bind(residual_single)
+    deep = base_config(
+        block_sizes=[128, 256, 64],
+        tcgen05_ab_stages=4,
+        tcgen05_c_stages=2,
+        tcgen05_epi_warp_groups=2,
+    )
+    with pytest.raises(InvalidConfig, match="overflows the per-CTA SMEM budget"):
+        normalized(bound, deep)
+    repaired = normalized(bound, deep, fix_invalid=True)
+    assert (repaired["tcgen05_ab_stages"], repaired["tcgen05_epi_warp_groups"]) == (
+        3,
+        2,
+    )
+    # One group's ring leaves room for the fourth stage.
+    one_group = normalized(bound, deep | {"tcgen05_epi_warp_groups": 1})
+    assert one_group["tcgen05_ab_stages"] == 4
 
 
 def _group(bound: BoundKernel[Any], key: str) -> Any:

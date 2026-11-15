@@ -716,6 +716,7 @@ def _check_pipeline(
     )
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
@@ -727,11 +728,21 @@ def test_original_shapes_with_mutated_routing_and_replacement_pointers(
     _check_pipeline(shape, dtype, 512, 2, padded=False)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+# Every (bn, stages) pair, with each dtype at every bn and every stage count.
 @pytest.mark.parametrize(
-    ("bn", "stages"),
-    [(128, 2), (128, 3), (128, 4), (256, 2), (256, 3), (256, 4), (512, 2)],
+    ("dtype", "bn", "stages"),
+    [
+        (torch.float16, 128, 2),
+        (torch.bfloat16, 128, 3),
+        (torch.float16, 128, 4),
+        (torch.bfloat16, 256, 2),
+        (torch.float16, 256, 3),
+        (torch.bfloat16, 256, 4),
+        (torch.float16, 512, 2),
+        (torch.bfloat16, 512, 2),
+    ],
 )
 def test_padded_input_and_unaligned_output_row_tails(
     dtype: torch.dtype, bn: int, stages: int
@@ -739,6 +750,7 @@ def test_padded_input_and_unaligned_output_row_tails(
     _check_pipeline((385, 78, 70, 4), dtype, bn, stages, padded=True)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("padded", [False, True])

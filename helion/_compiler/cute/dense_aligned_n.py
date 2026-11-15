@@ -16,9 +16,12 @@ from .pipeline_smem import pipeline_smem_bytes
 from .strategies import TCGEN05_LAYOUT_OVERRIDES_KEYS
 from .tcgen05_constants import TCGEN05_EPI_SUBTILE_N_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_EPI_WARP_GROUPS_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_PAIR_TILE_FIXED_KBLOCKS
+from .tcgen05_constants import TCGEN05_PAIR_TILE_STREAM_RATIO
 from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_NS
 from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
+from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 
 if TYPE_CHECKING:
@@ -68,7 +71,29 @@ def dense_aligned_n_defaults(
         "l2_groupings": [1],
         "loop_orders": [[0, 1]],
         "num_sm_multiplier": 1,
+        # The family's own epilogue tile: a seed merged onto a default that
+        # names explicit layout overrides (the direct-entry default's
+        # (128, 32) tile) must not inherit them.
+        **dict.fromkeys(TCGEN05_LAYOUT_OVERRIDES_KEYS),
     }
+
+
+def pair_tile_wave_cost(
+    m: int, n: int, k: int, *, width: int, block_m: int, sm_pairs: int
+) -> float:
+    """Wave-quantized time of a 16-bit pair-tile grid over ``m`` x ``n``
+    (arbitrary units: 256-column K-block MMAs). Each of the
+    ``ceil(m / block_m) x ceil(n / width)`` tiles takes ``ceil(k / 64)`` K
+    blocks, each the larger of its MMA time (its width) and its operand
+    stream (``TCGEN05_PAIR_TILE_STREAM_RATIO`` x (block_m + width): a narrow
+    tile reloads the A tile per N tile), plus a fixed prologue and epilogue
+    (``TCGEN05_PAIR_TILE_FIXED_KBLOCKS`` 256-wide K blocks); ``sm_pairs`` tiles
+    run per wave."""
+    tiles = -(-m // block_m) * -(-n // width)
+    k_blocks = -(-k // DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K)
+    k_block = max(float(width), TCGEN05_PAIR_TILE_STREAM_RATIO * (block_m + width))
+    fixed = TCGEN05_PAIR_TILE_FIXED_KBLOCKS * TCGEN05_TWO_CTA_BLOCK_N
+    return -(-tiles // sm_pairs) * (k_blocks * k_block + fixed)
 
 
 @dataclass(frozen=True)
@@ -122,10 +147,10 @@ def dense_aligned_n_plan(
             for candidate in (public, physical)
             for value, (low, high) in zip(candidate, bounds, strict=True)
         )
-        # The 16-bit pair clips a partial last M tile in its TMA store; the
-        # M-edge schedule needs whole K tiles.
-        or (m % bm and not (sixteen_bit and k % bk == 0))
-        or n % width
+        # The 16-bit pair clips a partial last M or N tile in its TMA store
+        # (its loads zero-fill past the edge); the edge schedule needs whole
+        # K tiles.
+        or ((m % bm or n % width) and not (sixteen_bit and k % bk == 0))
         or k < bk
         or (k + bk - 1) // bk > TCGEN05_TWO_CTA_MAX_K_TILES
         or type(c_stages) is not int
@@ -135,7 +160,6 @@ def dense_aligned_n_plan(
         or store_mode not in ("normal", "direct")
         or config.get("pid_type")
         not in ("persistent_blocked", "persistent_interleaved")
-        or any(config.get(key) is not None for key in TCGEN05_LAYOUT_OVERRIDES_KEYS)
         or config.get("tcgen05_grouped_mode") is not None
         or config.get("cute_split_k_workspace")
     ):
@@ -147,21 +171,27 @@ def dense_aligned_n_plan(
     )
     if sixteen_bit:
         pinned.pop("l2_groupings")
-        if config.get("tcgen05_cluster_n") == 2 and (n // width) % 2 == 0:
+        # N pairing (A multicast) takes whole, evenly split N tiles: the
+        # N-edge cluster schedule covers the power-of-two widths only.
+        if (
+            config.get("tcgen05_cluster_n") == 2
+            and n % width == 0
+            and (n // width) % 2 == 0
+        ):
             pinned.pop("tcgen05_cluster_n")
     if any(config.get(key, value) != value for key, value in pinned.items()):
         return None
     # The physical tile is a paired instruction: M128 FP8 with a 64-row,
     # N-permuted per-CTA BF16 D ring, or 16-bit M256 with 128 rows per CTA.
     # Its allocations are exactly those of the native paired pipeline at this
-    # width, with the configured epilogue subtile and warp groups; a plain
-    # 16-bit store on whole N and K tiles (a partial last M tile is clipped by
-    # the TMA store) at a width ``cute_mma``'s plain narrow rule covers takes
-    # the plan's (128, 32) subtile, any other C stage the model's own
-    # with-source tile.
+    # width and stored dtype, with the configured epilogue subtile and warp
+    # groups; a plain 16-bit store on whole N and K tiles (a partial last M
+    # tile is clipped by the TMA store) at a width ``cute_mma``'s plain narrow
+    # rule covers takes the plan's (128, 32) subtile, any other C stage (an
+    # FP32 output, a partial last N tile) the model's own with-source tile.
     allocations = Tcgen05PipelineSmemFacts(
         facts.input_dtype.itemsize,
-        2,
+        facts.output_dtype.itemsize,
         facts.capacity_bytes,
         output_column_major=facts.output_column_major,
     )
@@ -190,9 +220,11 @@ def dense_aligned_n_plan(
         if configured_subtile_n is not None
         else TCGEN05_PLAIN_NARROW_SUBTILE_N
         if sixteen_bit
+        and facts.output_dtype in (torch.float16, torch.bfloat16)
         and width in TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_NS
         and facts.plain_epilogue
         and store_mode == "normal"
+        and n % width == 0
         and k % bk == 0
         else None
     )

@@ -7491,8 +7491,10 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
             backend=SimpleNamespace(
                 config_value_priors_version=1,
                 # Like the CuTe backend: no precompile pool, so the cache
-                # policy reports no precompile mode.
+                # policy reports no precompile mode, and the trace kernel
+                # timer for its final selection.
                 supports_precompile=lambda: False,
+                default_final_selection_regime=lambda: "kernel",
             ),
             backend_name="cute",
             cute_flash_search_enabled=True,
@@ -8148,10 +8150,17 @@ class TestCuteAutotuner(TestCase):
         # elimination. The set still excludes Triton-style knobs that
         # the CuTe path does not consume.
         # Resident packet controls are explicit CuTe config fields; unseeded
-        # configs retain their false-only search domains.
+        # configs retain their false-only search domains.  On sm_100 the
+        # fp32 adds can pair into packed instructions.
+        pair_lane_math = (
+            {"cute_pair_lane_math"}
+            if gen.config_spec.cute_pair_lane_math_sites
+            else set()
+        )
         self.assertEqual(
             flat_keys,
-            {
+            pair_lane_math
+            | {
                 "block_sizes",
                 "num_threads",
                 "cute_compiler_pipeline",
@@ -8172,11 +8181,16 @@ class TestCuteAutotuner(TestCase):
                 "cute_scalar_epilogue_owner_fold",
                 "cute_warp_fp32_redux",
                 "cute_register_tile_warp_fold",
+                "cute_register_tile_cooperative_fold",
                 "cute_register_tile_store_first",
                 "cute_replicated_reduction",
                 "cute_vector_packet_unroll",
                 "cute_vloop_sink",
                 "cute_lane_unroll",
+                "cute_unpadded_rows",
+                "cute_grid_lane_jam",
+                "cute_scratch_forwarding",
+                "cute_uniform_lane_compares",
                 "cute_pdl",
                 "cute_pdl_release",
                 "cute_pdl_spread",

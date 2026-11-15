@@ -176,13 +176,21 @@ class Config(Mapping[str, object]):
         cute_replicated_reduction: bool | None = None,
         cute_vector_packet_unroll: bool | None = None,
         cute_vloop_sink: bool | None = None,
+        cute_grid_lane_jam: bool | None = None,
+        cute_scratch_forwarding: bool | None = None,
+        cute_pair_lane_math: bool | None = None,
         cute_lane_unroll: int | None = None,
+        cute_unpadded_rows: bool | None = None,
+        cute_bool_byte_packets: bool | None = None,
+        cute_uniform_lane_compares: bool | None = None,
+        cute_tail_peel: bool | None = None,
         cute_wide_packet_hints: bool | None = None,
         cute_pdl: bool | None = None,
         cute_pdl_capture_overlap: bool | None = None,
         cute_pdl_release: CutePdlReleaseLiteral | None = None,
         cute_pdl_spread: bool | None = None,
         cute_warp_aggregated_atomics: bool | None = None,
+        cute_privatize_atomics: bool | None = None,
         cute_packet_prefetch: int | None = None,
         cute_reduction_pipeline_depth: int | None = None,
         cute_host_paired_sum: CuteHostPairedSumLiteral | None = None,
@@ -236,13 +244,14 @@ class Config(Mapping[str, object]):
                 in-place 16-byte state loads. Zero disables the transformation.
             cute_async_load_lookahead: Async-copy groups kept ahead of compute.
             cute_async_load_group_rows: Per-thread row iterations in each group.
-            cute_exact_div_form: How CuTe lowers an fp32 division by a
-                loop-invariant divisor (a row sum, a scalar argument); both
-                forms give the IEEE quotient bit for bit. ``"redo"`` (default)
-                speculates the Markstein sequence over the loop and re-runs
-                the loop with ``div.rn`` on a hard case (a loop the redo
-                cannot take keeps its plain division), ``"plain"`` keeps one
-                ``div.rn`` per element.
+            cute_exact_div_form: Under ``Settings.cute_exact_division``
+                (IEEE fp32 division, off by default), how CuTe lowers an fp32
+                division by a loop-invariant divisor (a row sum, a scalar
+                argument); both forms give the IEEE quotient bit for bit.
+                ``"redo"`` (default) speculates the Markstein sequence over
+                the loop and re-runs the loop with ``div.rn`` on a hard case
+                (a loop the redo cannot take keeps its plain division),
+                ``"plain"`` keeps one ``div.rn`` per element.
             cute_async_load_cache: PTX cp.async cache policy ("cg" or "ca").
             cute_async_store_policy: Cache policy for the matching in-place
                 16-byte state store ("default" or "l2_evict_last").
@@ -251,7 +260,9 @@ class Config(Mapping[str, object]):
             cute_signed_bitfield_bf16: Convert proved signed byte fields to BF16
                 using the existing vector load/store packets. Disabled by default.
             cute_proven_bounds: Remove CuTe index guards only when exact launch
-                dimensions and cache-specialized tensor sizes prove them true.
+                dimensions and cache-specialized tensor sizes prove them true,
+                and divide the Int32 indices those facts prove nonnegative
+                (``//``, ``%``) in unsigned arithmetic.
             cute_affine_scan_schedule: Physical schedule for a compatible affine
                 scan. ``"ordinary"`` disables the direct lowering;
                 ``"direct_m16n8_v1"`` and ``"direct_m16n16_v1"`` select the
@@ -268,9 +279,114 @@ class Config(Mapping[str, object]):
                 per-lane register accumulators, one grouped cross-thread combine
                 per row tile. Disabled by default. Kernels where nothing can be
                 sunk generate exactly the knob-off code.
-            cute_lane_unroll: Unroll factor (1, 2, 4, 8, 16) for the row lane
-                loop of a sunk vector nest; every copy's vector loads issue
-                before any copy's accumulates. Only applies with cute_vloop_sink.
+            cute_grid_lane_jam: Interleave the lanes of a grid lane loop into
+                the device loops it wraps: the lanes' copies of each
+                statement run side by side, their loads of consecutive
+                elements become one vector load and their grouped reduces
+                one fragment reduce. The results are bitwise unchanged,
+                except that the lanes' adds into a ``cute_privatize_atomics``
+                copy are summed per cell before one shared-memory add (that
+                knob leaves their order unspecified). Disabled by default; a
+                lane loop the pass cannot prove independent across lanes
+                keeps the knob-off code.
+            cute_scratch_forwarding: Serve a later sweep's reload of what an
+                earlier sweep stored into a kernel-local scratch tensor (a
+                host ``torch.empty`` only the kernel's loads and stores
+                reach) from the earlier sweep's registers, and drop the
+                stores, the kernel argument and the allocation of a scratch
+                tensor nothing reads any more.  The results are bitwise
+                unchanged: the forwarded value passes through an opaque
+                register move, as the reload did.  It saves the workspace's
+                traffic but keeps its values live across the sweeps.
+                Disabled by default.
+            cute_pair_lane_math: Run the exps, exact divisions and fp32
+                products, sums, differences and fmas of adjacent vector
+                lanes together as Blackwell's packed fp32 instructions
+                (sm_100): fewer instructions per element, at the cost of
+                the registers the second lane holds early. The results are
+                bitwise unchanged. It also folds the maxima and minima of
+                bf16 and f16 vector lanes as packed half2 words. Disabled by
+                default; offered to the autotuner for kernels with fp32 exps,
+                sigmoids, divisions or arithmetic, or bf16/f16 max or min
+                reductions, without ``fast_math`` or a matmul.
+            cute_lane_unroll: Unroll factor (1, 2, 4, 8, 16) for per-thread
+                lane loops: every unrolled lane's loads, the scalar loads of
+                its vector loop included, issue before the first of them
+                computes, and a vector loop's scalar loads issue before the
+                stores it makes after them even when the lane loop has a
+                single trip or stays rolled. It takes the row lane loop of a
+                sunk vector nest (with cute_vloop_sink), else the lane loops
+                of tile axes the config gives fewer threads than elements, of
+                looped reductions whose chunk spans more than one vector per
+                thread and of persistent reduction rows their threads do not
+                cover; kernels where no loop takes it generate exactly the
+                knob-off code. With the loads apart from the arithmetic, LLVM
+                may contract into one FMA a float multiply and add that the
+                knob-off code rounds separately (a product feeding an add
+                whose other operand is a masked load stays in that load's
+                branch there), so float results can round differently, and so
+                can values computed from them (a comparison, an integer cast,
+                an argmax). Integer and boolean values that do not depend on
+                such arithmetic, masks drawn from Philox words included, do
+                not change.
+            cute_unpadded_rows: Run a persistent reduction row whose static
+                length is not a power of two unpadded and unmasked when the
+                config gives it a whole number of warps that one vector per
+                thread covers exactly (768 = 96 threads x 8): the multi-warp
+                vector row, combined across warps through shared memory,
+                instead of one warp walking the padded row in masked scalar
+                lanes. Normalized away where no row has such a layout; a row
+                an ``hl.reduce`` reduces keeps its padded slots, which fold
+                the reduce's ``other``. A kept row that the code generator
+                then runs on another row's threads (a full slice beside
+                another) or as a resident reduction refuses the config. Off
+                by default.
+                The sums run in another order (a fold of each thread's vector,
+                then across lanes and warps, rather than across 32 scalar lanes
+                and one warp), and without the masked loads' branches LLVM may
+                contract float multiply-adds differently, so results can differ
+                from the padded row's by more than an ulp.
+            cute_bool_byte_packets: Load a bool row that a looped reduction
+                reads along its reduction dim as byte packets: one integer of
+                2, 4 or 8 bytes per lane, each element a byte compared against
+                zero, instead of one byte load per element. The packets cost
+                fewer instructions and load requests; where a later sweep
+                reloads the row from L2, the faster first sweep can leave less
+                of it there. Results are bitwise unchanged. Off by default;
+                offered to the autotuner for kernels whose looped reduction
+                reads a bool row.
+            cute_uniform_lane_compares: Compare a vector's lane base, once per
+                vector, instead of each lane where a lane index meets a
+                bound that is a multiple of the vector width (a chunk's tile
+                mask, the bounds of a de-linearized ``x[r // hw, r % hw]``):
+                no lane reaches the next multiple.  Both multiples are
+                proven on the generated code (constants, constexpr extents,
+                block sizes); a bound only known at run time, as under
+                dynamic shapes, keeps the per-lane compare.  The knob also
+                gives a Python remainder by a positive constant a known
+                factor, so quotients and remainders of one (``(e % 64) //
+                32``, ``(e % 64) % 32``) take the vector base's as well;
+                those are exact integer identities, behind the knob only so
+                that the code with it off is the code without it.  Integer
+                and boolean results, masks included, do not change.
+                Its only numeric effect is FMA contraction where per-lane
+                selects kept products unfused: with the masks one value per
+                vector, LLVM may fuse into one FMA a float multiply and add
+                that the knob-off code rounds separately, and those
+                elements can differ by about one ulp.  Off by default;
+                offered to the autotuner on kernels with CuTe lane loops.
+            cute_tail_peel: Run a device loop's complete tiles apart from its
+                partial last tile (a static extent that is not a multiple of
+                the tile, such as an odd vocabulary) so that their lanes load
+                8- or 16-byte packets instead of masked scalars; the last tile
+                keeps its masks.  Each value is computed as before, from the same
+                elements in the same order; like ``cute_uniform_lane_compares``
+                its only possible numeric effect is FMA contraction where
+                per-lane selects kept products unfused.  Off by default;
+                offered to the autotuner on kernels with an ``hl.tile`` loop
+                over a static extent that loads a float tensor along its tile
+                and no matmul, and elsewhere rejected (an explicit False is
+                dropped).
             cute_wide_packet_hints: Carry the ``l2_last`` / ``l1_l2_first`` /
                 ``l1_l2_last`` load eviction policies onto 32-byte CuTe packets
                 (``cute_vector_widths`` 8 for fp32, 16 for bf16/fp16) through
@@ -356,6 +472,17 @@ class Config(Mapping[str, object]):
             cute_warp_aggregated_atomics: Combine relaxed Int32 zero/one ticket
                 reservations for equal addresses within each active warp. Each
                 lane retains its own valid fetch-add return value. Off by default.
+            cute_privatize_atomics: Accumulate the relaxed ``hl.atomic_add``
+                updates of a small fp32 or int32 tensor (16 KiB in all) that the
+                kernel touches only through such adds in a shared-memory copy
+                per CTA, and add each changed cell to the tensor once after the
+                CTA's last tile. This changes the fp32 summation order. Off by
+                default; offered only for tensors of static shape and rank at
+                least 1, proven not to alias the kernel's other tensors, whose
+                views share one dtype, in kernels without a matmul,
+                ``hl.barrier()``, an atomic that is not relaxed, asm not
+                declared pure, an access through a stack tensor
+                (``hl.stacktensor_like``) or a remote copy or barrier.
             cute_packet_prefetch: Prefetch 2, 4, or 8 independent vector packets
                 in a proved complete tile; 0 (the default) keeps the original order.
                 Requires cute_proven_bounds and storage-disjointness proof.
@@ -454,13 +581,21 @@ class Config(Mapping[str, object]):
             "cute_replicated_reduction": cute_replicated_reduction,
             "cute_vector_packet_unroll": cute_vector_packet_unroll,
             "cute_vloop_sink": cute_vloop_sink,
+            "cute_grid_lane_jam": cute_grid_lane_jam,
+            "cute_scratch_forwarding": cute_scratch_forwarding,
+            "cute_pair_lane_math": cute_pair_lane_math,
             "cute_lane_unroll": cute_lane_unroll,
+            "cute_unpadded_rows": cute_unpadded_rows,
+            "cute_bool_byte_packets": cute_bool_byte_packets,
+            "cute_uniform_lane_compares": cute_uniform_lane_compares,
+            "cute_tail_peel": cute_tail_peel,
             "cute_wide_packet_hints": cute_wide_packet_hints,
             "cute_pdl": cute_pdl,
             "cute_pdl_capture_overlap": cute_pdl_capture_overlap,
             "cute_pdl_release": cute_pdl_release,
             "cute_pdl_spread": cute_pdl_spread,
             "cute_warp_aggregated_atomics": cute_warp_aggregated_atomics,
+            "cute_privatize_atomics": cute_privatize_atomics,
             "cute_packet_prefetch": cute_packet_prefetch,
             "cute_reduction_pipeline_depth": cute_reduction_pipeline_depth,
             "cute_host_paired_sum": cute_host_paired_sum,

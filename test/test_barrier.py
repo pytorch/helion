@@ -185,19 +185,16 @@ class TestBarrier(RefEagerTestBase, TestCase):
                 self.graphs_added: list[int] = []
                 self.outer_count = 0
 
-            def has_matmul_with_rdim(self, graph: torch.fx.Graph) -> bool:
-                return False
-
-            def has_indexing_along_rdim(self, graph: torch.fx.Graph) -> bool:
-                return False
-
-            def has_stack_tensor_with_rdim(self, graph: torch.fx.Graph) -> bool:
-                return False
-
-            def has_unrollable_reduction(self, graph: torch.fx.Graph) -> bool:
+            def cannot_roll_graph(self, graph: torch.fx.Graph) -> bool:
                 return False
 
             def has_pinned_rdim(self) -> bool:
+                return False
+
+            def tied_rdims(self) -> list[int]:
+                return []
+
+            def reads_padded_range(self, graph: torch.fx.Graph) -> bool:
                 return False
 
             def process(self, graph: torch.fx.Graph) -> torch.fx.Graph:
@@ -231,6 +228,7 @@ class TestBarrier(RefEagerTestBase, TestCase):
             ),
             backend_name="triton",
             backend=fake_backend,
+            subscript_extent_reductions={},
         )
 
         # The fake roller adds an empty subgraph (only an output node), so the
@@ -472,8 +470,9 @@ class TestCuteBarrier(RefEagerTestBase, TestCase):
     @skipIfRefEager("launch-layout checks only run in compiled mode")
     def test_rejects_tile_reduction_narrower_than_phase_launch(self) -> None:
         """A reduction over a 128-thread tile axis in phase 1 shares thread axis
-        0 with phase 2's 512-thread tile, so the launch runs more lanes on that
-        axis than the reduction spans."""
+        1 with phase 2's 512-thread tile (phase 2's row sum takes axis 0 with
+        the two threads the launch leaves it), so the launch runs more lanes on
+        that axis than the reduction spans."""
 
         @helion.kernel(autotune_effort="none")
         def two_phase_tile_sums(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -491,8 +490,8 @@ class TestCuteBarrier(RefEagerTestBase, TestCase):
         y = torch.randn([64, 1024], device=DEVICE)
         with self.assertRaisesRegex(
             exc.BackendUnsupported,
-            r"reduction over tile block 1 spans 128 lanes on thread axis 0 but "
-            r"the hl\.barrier\(\) launch \(512, 1, 1\) runs 512 there",
+            r"reduction over tile block 1 spans 128 lanes on thread axis 1 but "
+            r"the hl\.barrier\(\) launch \(2, 512, 1\) runs 512 there",
         ):
             code_and_output(
                 two_phase_tile_sums,

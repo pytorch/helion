@@ -86,8 +86,12 @@ def segmented_reduction_helion(
         )
         tuple_in = (vals, idxs.float().unsqueeze(1).expand_as(vals))
         out_vals, _ = hl.associative_scan(combine_fn_helion, tuple_in, dim=0)
-        mask = (idxs != idxs_next) | (
-            tile_e.index % tile_e.block_size == tile_e.block_size - 1
+        # A segment ends where the next id differs, at the end of a tile and at
+        # the last row, whose masked next id (0) may equal its own.
+        mask = (
+            (idxs != idxs_next)
+            | (tile_e.index % tile_e.block_size == tile_e.block_size - 1)
+            | (tile_e.index == num_elements - 1)
         )
         segment_vals = torch.where(mask.unsqueeze(1), out_vals, 0.0)
         hl.atomic_add(output, [idxs, tile_f], segment_vals)
@@ -181,8 +185,13 @@ def _segmented_reduction_triton(
         axis=0,
         combine_fn=combine_fn_triton,
     )
-    # if offset % BLOCK_SIZE == -1, it means the last element of the segment
-    segment_start = (idxs != idxs_next) | (offsets % BLOCK_SIZE == BLOCK_SIZE - 1)
+    # A segment ends where the next index differs, at the end of the block and
+    # at the last element, whose masked next index may equal its own.
+    segment_start = (
+        (idxs != idxs_next)
+        | (offsets % BLOCK_SIZE == BLOCK_SIZE - 1)
+        | (offsets == E - 1)
+    )
     tl.atomic_add(out_ptr + idxs * C + feature_id, result_values, mask & segment_start)
 
 

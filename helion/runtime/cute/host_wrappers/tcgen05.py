@@ -56,6 +56,7 @@ def append_epilogue_tma_wrapper(
     orientation: str = "mn",
     column_major: bool = False,
     bounded_output_shift: bool = False,
+    extents: tuple[int, int] | None = None,
 ) -> None:
     assert len(kernel_args) == 2
     assert orientation in ("mn", "nm")
@@ -70,11 +71,13 @@ def append_epilogue_tma_wrapper(
         value is not None for value in (epi_tile_m, epi_tile_n, d_store_box_n)
     )
     if epi_tile_raw_expr is not None:
-        # The bm=128 CtaGroup.TWO family threads the device-exact (N-mode
-        # permuted) epilogue-tile expression verbatim so the host TMA-store
-        # atom is built from the same layout the device r2s copy writes
-        # through. The plain ``epi_tile_m/n`` integer keys cannot express
-        # the permutation. See ``tcgen05_two_cta_m128_epilogue_tile_expr``.
+        # The device-exact epilogue-tile expression, threaded verbatim so the
+        # host TMA-store atom is built from the same layout the device r2s
+        # copy writes through: the bm=128 CtaGroup.TWO family's N-mode
+        # permuted tile (which the plain ``epi_tile_m/n`` integer keys cannot
+        # express; see ``tcgen05_two_cta_m128_epilogue_tile_expr``), and the
+        # tile a store narrower than the matmul plan's epilogue dtype walks
+        # (sized by the plan's dtype, not this output's).
         assert not explicit_epi_tile
         epi_tile_expr = epi_tile_raw_expr
     elif explicit_epi_tile:
@@ -139,9 +142,14 @@ def append_epilogue_tma_wrapper(
             f"(arg{tensor_idx}.iterator - cutlass.Int64(arg{tensor_idx}_shape0) "
             f"* cutlass.Int64(arg{tensor_idx}_stride0))"
         )
+    if extents is not None and not worklist_nm_store and not bounded_output_shift:
+        # A destination larger than the GEMM (``d_extents``): the TensorMap
+        # clips the edge tiles at the GEMM's (M, N), a column-major one too.
+        rows, cols = extents
+        rank3_gmem_shape = f"({rows}, {cols}, 1)"
     gmem_layout = (
         ctx.descriptors.layout(f"arg{tensor_idx}", output=True)
-        if ctx.descriptors is not None
+        if ctx.descriptors is not None and extents is None
         else f"{rank3_gmem_shape}, stride={rank3_gmem_stride}"
     )
     # Keep these layout arguments in sync with the device-side
@@ -190,9 +198,30 @@ def emit_d_tma(ctx: HostWrapperContext, plan: dict[str, object]) -> None:
     output_dtype = str(plan["output_dtype"])
     kernel_args = [str(arg) for arg in cast("list[object]", plan["kernel_args"])]
     d_tensor_name = None
-    if bool(plan.get("d_leading_passthrough")):
+    hier_layout = plan.get("d_hier_layout")
+    if hier_layout is not None:
+        # A fused view/permute store (``radix_store``): the TMA store
+        # addresses the destination through its proved hierarchical
+        # [M, N] layout instead of the argument's own shape.
+        hier_shape, hier_stride = cast("list[str]", hier_layout)
+        d_tensor_name = f"{kernel_args[0]}_d_hier"
+        ctx.body.append(
+            f"    {d_tensor_name} = cute.make_tensor(arg{d_idx}.iterator, "
+            f"layout=cute.make_layout({hier_shape}, stride={hier_stride}))"
+        )
+    elif bool(plan.get("d_leading_passthrough")):
         d_tensor_name = f"{kernel_args[0]}_d_tma"
         ctx.append_permuted_cute_tensor_view(d_tensor_name, d_idx, (1, 2, 0))
+    elif (d_extents := plan.get("d_extents")) is not None:
+        # A destination larger than the GEMM: the TensorMap clips the edge
+        # tiles at the GEMM's (M, N), not at the destination's shape.
+        rows, cols = cast("list[int]", d_extents)
+        d_tensor_name = f"{kernel_args[0]}_d_view"
+        ctx.body.append(
+            f"    {d_tensor_name} = cute.make_tensor(arg{d_idx}.iterator, "
+            f"layout=cute.make_layout(({rows}, {cols}), "
+            f"stride=(arg{d_idx}_stride0, arg{d_idx}_stride1)))"
+        )
     append_epilogue_tma_wrapper(
         ctx,
         tensor_idx=d_idx,
@@ -211,6 +240,11 @@ def emit_d_tma(ctx: HostWrapperContext, plan: dict[str, object]) -> None:
         orientation=tcgen05_plan_orientation(plan),
         column_major=bool(plan.get("d_column_major")),
         bounded_output_shift=bool(plan.get("bounded_output_shift")),
+        extents=(
+            None
+            if (d_extents := plan.get("d_extents")) is None
+            else cast("tuple[int, int]", tuple(cast("list[int]", d_extents)))
+        ),
     )
 
 
@@ -231,6 +265,18 @@ def emit_aux_tma(ctx: HostWrapperContext, plan: dict[str, object]) -> None:
         dtype=input_dtype,
         kernel_args=kernel_args,
         copy_op="cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()",
+        # The ring stages the kernel's epilogue subtile, which the
+        # epilogue (output) dtype sizes; an operand of another dtype keeps
+        # that subtile in its own element type. Without this a bf16
+        # residual of an FP32 output got a (128, 64) box beside the
+        # kernel's (128, 32) stage and wrote past its ring (illegal
+        # address).
+        epi_tile_raw_expr=tcgen05_default_epilogue_tile_expr(
+            bm,
+            bn,
+            str(plan["epi_dtype"]),
+            c_layout="cutlass.utils.layout.LayoutEnum.ROW_MAJOR",
+        ),
     )
 
 
@@ -498,8 +544,19 @@ def emit_ab_tma(ctx: HostWrapperContext, plan: dict[str, object]) -> None:
             "cute", "shared rank-2 RHS requires the N,M dynamic rank-2 worklist route"
         )
     kernel_args = [str(arg) for arg in cast("list[object]", plan["kernel_args"])]
-    assert len(kernel_args) == 4
-    tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b = kernel_args
+    # ``a_cp_async``: the kernel's epilogue warps copy A with ``cp.async``
+    # (``cute_mma``'s ``tcgen05_cp_async_a``; no TensorMap can address it), so
+    # the wrapper builds B's TMA atom only.
+    a_cp_async = bool(plan.get("a_cp_async"))
+    if a_cp_async:
+        assert len(kernel_args) == 2
+        tma_atom_b, tma_tensor_b = kernel_args
+        # No A atom: the wrapper locals below (``{tma_atom_a}_tiled_mma``, ...)
+        # take a prefix of their own.
+        tma_atom_a, tma_tensor_a = f"{tma_atom_b}_cpa", ""
+    else:
+        assert len(kernel_args) == 4
+        tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b = kernel_args
 
     # CtaGroup.TWO is selected when ``cluster_m == 2 and bm == 256`` —
     # the V=2 path. ``cluster_n`` extends the cluster along the N axis
@@ -688,7 +745,9 @@ def emit_ab_tma(ctx: HostWrapperContext, plan: dict[str, object]) -> None:
         ctx.append_permuted_cute_tensor_view(lhs_tma, lhs_idx, lhs_tma_order)
     if rhs_tma_order is not None:
         ctx.append_permuted_cute_tensor_view(rhs_tma, rhs_idx, rhs_tma_order)
-    lhs_tma_setup_lines = () if lhs_tma_order is not None else lhs_tma_setup
+    lhs_tma_setup_lines = (
+        () if lhs_tma_order is not None or a_cp_async else lhs_tma_setup
+    )
     rhs_tma_setup_lines = () if rhs_tma_order is not None else rhs_tma_setup
     ctx.body.extend(
         (
@@ -732,22 +791,28 @@ def emit_ab_tma(ctx: HostWrapperContext, plan: dict[str, object]) -> None:
             #   multicast is active (cluster_n>1). The cluster_n=1
             #   form is pinned by
             #   ``test_tcgen05_role_local_monolithic_codegen_markers``.
-            (
-                f"    {tma_atom_a}, {tma_tensor_a} = cute.nvgpu.make_tiled_tma_atom_A("
-                "cutlass.utils.blackwell_helpers.cluster_shape_to_tma_atom_A("
-                f"{cluster_shape}, {tiled_mma}.thr_id), "
-                f"{lhs_tma_arg}, "
-                f"cute.slice_({smem_a_layout}, (None, None, None, 0)), "
-                f"({bm}, {bn}, {bk}), {tiled_mma}"
-                + (
-                    f", cute.tiled_divide(cute.make_layout({row_profile.producer_cluster!r}), ({tiled_mma}.thr_id.shape,)).shape"
-                    if row_profile is not None
-                    else f", {cluster_layout_vmnk}.shape"
-                    if cluster_n > 1
-                    else ""
+            *(
+                ()
+                if a_cp_async
+                else (
+                    (
+                        f"    {tma_atom_a}, {tma_tensor_a} = cute.nvgpu.make_tiled_tma_atom_A("
+                        "cutlass.utils.blackwell_helpers.cluster_shape_to_tma_atom_A("
+                        f"{cluster_shape}, {tiled_mma}.thr_id), "
+                        f"{lhs_tma_arg}, "
+                        f"cute.slice_({smem_a_layout}, (None, None, None, 0)), "
+                        f"({bm}, {bn}, {bk}), {tiled_mma}"
+                        + (
+                            f", cute.tiled_divide(cute.make_layout({row_profile.producer_cluster!r}), ({tiled_mma}.thr_id.shape,)).shape"
+                            if row_profile is not None
+                            else f", {cluster_layout_vmnk}.shape"
+                            if cluster_n > 1
+                            else ""
+                        )
+                        + tma_internal_type_arg
+                        + ")"
+                    ),
                 )
-                + tma_internal_type_arg
-                + ")"
             ),
             # See the asymmetry comment above ``make_tiled_tma_atom_A``
             # for why ``_B`` always passes the cluster shape and ``_A``

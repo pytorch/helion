@@ -1,8 +1,12 @@
 """SM100+ 32/16-byte noncoherent loads with an L2 evict-first policy.
 
-``memory_ops`` emits these only for a full, naturally aligned packet of a
-source that no store or atomic in the kernel can alias, on SM100+ with
-CUDA 13+; every other ``nc_l2_first`` site keeps its ordinary load.
+``memory_ops`` emits these for a full, naturally aligned packet of a source
+that no store or atomic in the kernel can alias, on SM100+ with CUDA 13+.
+The predicated packets of a masked row strip (``masked_packet_load``) take
+the same noncoherent evict-first load at an ``nc_l2_first`` site, at every
+width from 4 to 64 bytes, as they carry every L2 policy family, at 32 and 64
+bytes too without ``cute_wide_packet_hints`` (the unpredicated 32-byte
+packet stays plain there); a scalar load keeps its ordinary form.
 """
 
 from __future__ import annotations
@@ -10,6 +14,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .l2_policy import _load_vector_with_policy
+from .l2_policy import _policy_assembly
 
 if TYPE_CHECKING:
     from ._mlir_compat import ir
@@ -19,11 +24,7 @@ _ASM_NC_L2_FIRST_32B = (
 )
 # The static ``L2::evict_first`` qualifier is only legal on 32-byte loads, so
 # the 16-byte form builds the same policy and passes it as a cache hint.
-_ASM_NC_L2_FIRST_16B = (
-    "{ .reg .b64 policy; "
-    "createpolicy.fractional.L2::evict_first.b64 policy, 1.0; "
-    "ld.global.nc.L2::cache_hint.v4.b32 {$0,$1,$2,$3}, [$4], policy; }"
-)
+_ASM_NC_L2_FIRST_16B = _policy_assembly(4, "nc_l2_first")
 
 
 def load_nc_l2_evict_first_32b(pointer: object, vector_type: ir.VectorType) -> ir.Value:

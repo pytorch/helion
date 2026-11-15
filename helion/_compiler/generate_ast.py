@@ -33,6 +33,8 @@ from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
 from .output_header import get_needed_import_lines
 from .program_id import ForEachProgramID
+from .scratch_tensors import drop_unused_scratch_arguments
+from .scratch_tensors import is_allocation_call
 from .tile_strategy import DeviceGridState
 from .tile_strategy import DeviceLoopState
 from .tile_strategy import EmitPipelineLoopState
@@ -41,6 +43,7 @@ from .variable_origin import ArgumentOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Collection
     from collections.abc import Iterator
 
     from torch.fx.node import Node
@@ -95,15 +98,19 @@ _PURE_SCALAR_CALL_MODULES = frozenset({"cutlass", "operator"})
 
 def _is_pure_scalar_expr(expr: ast.expr) -> bool:
     """Whether ``expr`` only combines names and constants: arithmetic,
-    comparisons, ``operator`` calls and ``cutlass`` scalar casts."""
+    comparisons, ``operator`` calls, ``cutlass`` scalar casts and the
+    backend's side-effect-free helpers (``Backend.pure_scalar_helpers``)."""
+    pure_helpers = CompileEnvironment.current().backend.pure_scalar_helpers
     for node in ast.walk(expr):
         if isinstance(node, ast.Call):
             func = node.func
-            if not (
-                isinstance(func, ast.Attribute)
-                and isinstance(func.value, ast.Name)
-                and func.value.id in _PURE_SCALAR_CALL_MODULES
-                and not node.keywords
+            if node.keywords or not (
+                (
+                    isinstance(func, ast.Attribute)
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id in _PURE_SCALAR_CALL_MODULES
+                )
+                or (isinstance(func, ast.Name) and func.id in pure_helpers)
             ):
                 return False
         elif not isinstance(
@@ -455,6 +462,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             mark_in_divergent_control_flow=backend.supports_intra_loop_barriers(
                 in_divergent_control_flow=True
             ),
+            atomics=backend.intra_loop_barriers_order_atomics,
         )
 
     def ensure_module_statements(self, source: str) -> None:
@@ -471,8 +479,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self,
         body: list[ast.AST],
         stmt: ast.AST | str | None,
+        axis_sizes: dict[int, int] | None = None,
     ) -> None:
-        """Append a statement while preserving its exact FX owner."""
+        """Append a statement while preserving its exact FX owner; its thread
+        indices count toward the launch on ``axis_sizes``, by default the
+        thread axes active where it is emitted."""
 
         if stmt is None:
             return
@@ -484,7 +495,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             self._statements_by_owner_node_id.setdefault(id(owner_node), []).append(
                 (body, stmt)
             )
-        self._record_statement_thread_references([stmt])
+        self._record_statement_thread_references([stmt], axis_sizes)
 
     def add_statement(self, stmt: ast.AST | str | None) -> None:
         self.append_statement(self.statements_stack[-1], stmt)
@@ -868,6 +879,10 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 for finalize in device_loop.body_finalizers:
                     finalize()
             finally:
+                # The loop's nest (its header, the lane loops around the body
+                # and their setup) is emitted below, once the loop is closed,
+                # but its thread indices run on the loop's own axes too.
+                nest_axis_sizes = self._current_active_thread_axis_sizes()
                 for idx in device_loop.block_ids:
                     self.active_device_loops[idx].pop()
         # The body is complete: the CuTe per-thread lane loops nested around
@@ -877,7 +892,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             for statement in self.device_function.cta_barrier():
                 self.add_statement(statement)
         self.statements_stack[-1].extend(device_loop.outer_prefix)
-        self.add_statement(device_loop.for_node)
+        self.append_statement(
+            self.statements_stack[-1], device_loop.for_node, nest_axis_sizes
+        )
         self.statements_stack[-1].extend(device_loop.outer_suffix)
 
     @contextlib.contextmanager
@@ -1227,7 +1244,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         elif isinstance(type_info := node._type_info, TileIndexType):
             return expr_from_string(
                 self.host_function.literal_expr(
-                    self.device_function.resolved_block_size(type_info.block_id)
+                    self.device_function.resolved_block_size(type_info.block_id),
+                    self.device_function.config,
                 )
             )
         elif isinstance(type_info, SequenceType) and all(
@@ -1243,7 +1261,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     [
                         self.device_function.resolved_block_size(x.block_id)
                         for x in values
-                    ]
+                    ],
+                    self.device_function.config,
                 )
             )
         elif isinstance(fn_type_info := func_node._type_info, CallableType) and (
@@ -1309,25 +1328,47 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 return node
         return node
 
-    def host_dead_code_elimination(self) -> None:
-        dce_vars: OrderedSet[str] = OrderedSet()
+    def host_dead_code_elimination(
+        self, dead_allocations: Collection[str] = ()
+    ) -> None:
+        """``dead_allocations``: host names of scratch tensors whose kernel
+        parameter went (``drop_unused_scratch_arguments``); their unread
+        ``torch.empty``-family allocations go too."""
+        dce_vars: OrderedSet[str] = OrderedSet(dead_allocations)
         allow_compiler_shape_helpers = (
             self.device_function.config.cross_loop_pipeline != "barrier"
         )
+
+        def pure(stmt: ast.Assign) -> bool:
+            return definitely_does_not_have_side_effects(
+                stmt.value, allow_compiler_shape_helpers=allow_compiler_shape_helpers
+            )
+
         for stmt in self.host_statements:
             if (
                 isinstance(stmt, ast.Assign)
-                and definitely_does_not_have_side_effects(
-                    stmt.value,
-                    allow_compiler_shape_helpers=allow_compiler_shape_helpers,
-                )
+                and pure(stmt)
                 and all(isinstance(name, ast.Name) for name in stmt.targets)
             ):
                 for name in stmt.targets:
                     assert isinstance(name, ast.Name)
                     dce_vars.add(name.id)
 
-        dead_assignment_elimination(self.host_statements, list(dce_vars))
+        def removable(stmt: ast.Assign) -> bool:
+            # A host variable is a user's: beside its pure assignment it may
+            # have others with effects (``flag = 0`` and ``flag = x.add_(1)``,
+            # flag never read), which must run.  A dead scratch tensor's
+            # allocation goes too: its one binding (``kernel_local_scratch``),
+            # a factory call that runs no user code.
+            (target,) = stmt.targets
+            assert isinstance(target, ast.Name)
+            return pure(stmt) or (
+                target.id in dead_allocations and is_allocation_call(stmt.value)
+            )
+
+        dead_assignment_elimination(
+            self.host_statements, list(dce_vars), removable=removable
+        )
         dead_expression_elimination(self.host_statements)
 
 
@@ -1389,7 +1430,8 @@ def generate_ast(
     ``GenerateAST`` (``prologue_first_indexing``), so a retry starts it afresh.
     """
     prefix_length = len(_host_prefix) if _host_prefix is not None else 0
-    policy = CompileEnvironment.current().backend.retry_policy()
+    backend = CompileEnvironment.current().backend
+    policy = backend.retry_policy()
     with policy.scope():
         while True:
             try:
@@ -1516,7 +1558,11 @@ def _generate_ast(
                 if failure is error:
                     raise
                 raise failure from error
-            codegen.host_dead_code_elimination()
+            codegen.host_dead_code_elimination(
+                drop_unused_scratch_arguments(
+                    func, codegen.device_function, kernel_def, codegen.host_statements
+                )
+            )
 
             # Retarget output-only tensor allocations to ``device='meta'`` so
             # the factory call produces a zero-storage metadata-only tensor

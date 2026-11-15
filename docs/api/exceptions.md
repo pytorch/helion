@@ -269,6 +269,12 @@ These exceptions occur when Helion language functions are used incorrectly with 
 .. autoclass:: TunableNameConflict
 
    Raised for duplicate tunable parameter names.
+
+.. autoclass:: TunableSpecialized
+
+   Raised when a tunable, or a value a helper computes from it, would be
+   evaluated at its hint while the kernel is traced, so every config would
+   compute with the hint.
 ```
 
 ## Language and Syntax Errors
@@ -359,9 +365,10 @@ Warnings can be suppressed by including them in the `ignore_warnings` setting:
 
 .. autoclass:: FastMathUnused
 
-   Warns when a kernel uses operations (fp32 division, exp, sigmoid, rsqrt, erf, and
-   on Triton max/min, ...) that the ``fast_math`` setting would lower to faster
-   approximate forms, but the setting is off. Enable it with ``@helion.kernel(fast_math=True)`` or
+   Warns when a kernel uses operations (fp32 division, exp, rsqrt, erf, on CuTe
+   also sqrt, log, log2, sin, cos and tanh, and on Triton sigmoid and max/min, ...)
+   that the ``fast_math`` setting would lower to faster approximate forms, but
+   the setting is off. Enable it with ``@helion.kernel(fast_math=True)`` or
    ``HELION_FAST_MATH=1`` when the kernel's consumers tolerate the approximations.
 
 ```

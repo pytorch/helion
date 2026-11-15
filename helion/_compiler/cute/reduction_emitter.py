@@ -40,6 +40,7 @@ import logging
 import operator
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import Literal
 from typing import NoReturn
 from typing import TypeVar
 from typing import cast
@@ -52,6 +53,11 @@ from torch._inductor.runtime.runtime_utils import next_power_of_2
 
 from ... import exc
 from ..._compat import shape_env_size_hint
+from ...language import memory_ops
+from ...language._tracing_ops import _host_tensor
+from ...language.atomic_ops import ATOMIC_OPS
+from ...language.reduce_ops import _reduce
+from ...language.scan_ops import _associative_scan
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
@@ -78,12 +84,18 @@ from ..tile_strategy import PerThreadNDTileStrategy
 from ..tile_strategy import TileStrategy
 from ..tile_strategy import VecLaneWrapper
 from ..tile_strategy import _to_sympy
+from ..utils import compute_slice_size
 from . import thread_budget
 from .analysis.broadcast_axis import explicitly_replicated_axis
 from .argreduce import codegen_packed_reduction
 from .device_state import CuteVloopWrapperFact
+from .execution_plans import VloopSinkLayoutRefused
 from .fold_lane_reductions import fold_site_key
 from .integer_loop_reduction import defer_collective
+from .iota_utils import cute_arange_index_source
+from .iota_utils import cute_padded_range_length
+from .lane_cluster_split import cluster_split_races
+from .lane_loops.markers import HELION_REDUCTION_VLOOP_ATTR
 from .lane_loops.markers import HELION_VECTOR_REDUCTION_OWNER_ATTR
 from .lane_loops.markers import _create_lane_loop
 from .lane_loops.markers import _grouped_two_stage_reduce_stmts
@@ -94,19 +106,30 @@ from .matmul_fallback import _widen_lane_layout_for_barrier_phases
 from .reduce_call import ReduceCall
 from .reduce_call import ReduceScope
 from .reduce_call import runtime_lane_expr
+from .reduction_coordinates import reduced_block_ids
+from .reduction_lanes import WARP_THREADS
+from .reduction_lanes import fits_row_packets
+from .reduction_lanes import looped_reduction_lanes
+from .reduction_lanes import masked_row_lanes
+from .reduction_lanes import requested_lane_unroll
+from .reduction_lanes import tiled_row_threads
+from .reduction_lanes import whole_vector_lanes
 from .register_tile_admission import RegisterTileUnsupported
 from .resident_reductions import ResidentReductionLayout
 from .resident_reductions import feature_index_expression
 from .resident_reductions import supports_resident_threads
 from .resident_sequence import sequence_reduction_expr
+from .state import cute_codegen_state
 from .state import cute_env_state
 from .synthetic_axes import record_strategy_axis_branch_path
 from .thread_budget import CUTE_REGISTER_TILE_MAX_ELEMENTS
 from .thread_budget import MAX_THREADS_PER_BLOCK
 from .tile_packing import packed_grid_block
+from .unpadded_rows import unpadded_row_layout
 
 if TYPE_CHECKING:
     from ..device_function import DeviceFunction
+    from ..generate_ast import GenerateAST
     from ..inductor_lowering import CodegenState
 
 log = logging.getLogger(__name__)
@@ -148,7 +171,7 @@ def _cute_reduction_smem_bytes(num_elements: int, dtype: torch.dtype) -> int:
 
 
 _CUTE_LOOPED_REDUCTION_MAX_ELEMENTS_PER_THREAD = 256
-_CUTE_WARP_REDUCTION_THREADS = 32
+_CUTE_WARP_REDUCTION_THREADS = WARP_THREADS
 
 
 def cute_looped_reduction_block_size(size_hint: int, max_threads: int) -> int:
@@ -167,15 +190,22 @@ def cute_live_reduction_threads(max_threads: int) -> int:
 def _cute_blocks_share_a_value(
     env: CompileEnvironment, first: int, second: int
 ) -> bool:
-    """Whether some tile value of the kernel carries both blocks as dims.
+    """Whether some tile value of the kernel, or the region some load, store
+    or atomic subscript spans with the operands combined over it (a stored
+    value, an atomic's update), carries both blocks as dims.
 
     Two full-slice axes held by one value (rope's ``q[tile_b, :, tile_t,
     :half]`` holds the head axis and the half-dim axis) need the cross
     product of their coordinates, which only distinct thread axes (or a lane
     loop) provide; axes that never meet in a value (the q heads and the k
-    heads) may index one thread axis.  A literal dim is matched to a block
-    by its extent, as the literal-dim holders do; an extent several blocks
-    share counts as both (fails closed).
+    heads) may index one thread axis.  A scalar stored into ``out[tile, :16,
+    :8]`` meets both slices only in its subscript, and an atomic adding each
+    element of a row at 16 gathered columns (``hl.atomic_add(out, [tile,
+    indices[:]], row[:, :, None])``) meets the row and the indices only in
+    its subscript and update together.  An argument tensor is no
+    tile value: its dims meet only where a subscript spans them.  A literal
+    dim is matched to a block by its extent, as the literal-dim holders do;
+    an extent several blocks share counts as both (fails closed).
     """
 
     def blocks_of(size: object) -> set[int]:
@@ -193,14 +223,67 @@ def _cute_blocks_share_a_value(
             and env.known_equal(info.size, size)
         }
 
+    def subscript_blocks(node: torch.fx.Node) -> set[int]:
+        if len(node.args) < 2 or not isinstance(node.args[1], (list, tuple)):
+            return set()
+        # Slice bounds can be nodes too (``:d // 2`` of a dynamic dim).
+        tensor, index = torch.fx.map_arg(node.args[:2], lambda arg: arg.meta["val"])
+        found: set[int] = set()
+        if isinstance(tensor, (list, tuple)):
+            # A stack tensor's ``(tensor_like, pointers)``: the access spans
+            # the pointers' dims before the subscript's.
+            tensor, pointers = tensor
+            assert isinstance(pointers, torch.Tensor)
+            for size in pointers.shape:
+                found |= blocks_of(size)
+        assert isinstance(tensor, torch.Tensor) and isinstance(index, (list, tuple))
+        consumed = sum(1 for idx in index if idx is not None and idx is not Ellipsis)
+        dim = 0
+        for idx in index:
+            if idx is None:
+                continue
+            if idx is Ellipsis:
+                dim += tensor.ndim - consumed
+                continue
+            if isinstance(idx, slice):
+                if dim < tensor.ndim:
+                    found |= blocks_of(compute_slice_size(idx, tensor.shape[dim]))
+            elif isinstance(idx, torch.Tensor):
+                for size in idx.shape:
+                    found |= blocks_of(size)
+            elif isinstance(idx, torch.SymInt):
+                # A tile's block; a point index (``tile.begin``, an int)
+                # spans none.
+                block_id = env.get_block_id(idx)
+                if block_id is not None:
+                    found.add(block_id)
+            dim += 1
+        return found
+
     for graph_info in HostFunction.current().device_ir.graphs:
         for node in graph_info.graph.nodes:
-            value = node.meta.get("val")
-            if not isinstance(value, torch.Tensor):
-                continue
             found: set[int] = set()
-            for size in value.shape:
-                found |= blocks_of(size)
+            value = node.meta.get("val")
+            if isinstance(value, torch.Tensor) and node.target is not _host_tensor:
+                for size in value.shape:
+                    found |= blocks_of(size)
+            if node.op == "call_function" and (
+                node.target in (memory_ops.load, memory_ops.store)
+                or node.target in ATOMIC_OPS
+            ):
+                found |= subscript_blocks(node)
+                # The operands after the subscript (a stored value, an
+                # atomic's update, a mask) combine with every element of
+                # the region it spans, also along dims it lacks.
+                for operand in node.args[2:]:
+                    operand_value = (
+                        operand.meta.get("val")
+                        if isinstance(operand, torch.fx.Node)
+                        else None
+                    )
+                    if isinstance(operand_value, torch.Tensor):
+                        for size in operand_value.shape:
+                            found |= blocks_of(size)
             if first in found and second in found:
                 return True
     return False
@@ -258,6 +341,115 @@ def _cute_is_folded_matmul_contraction(block_index: int) -> bool:
     return (
         env.canonical_block_id(block_index) in matmul_contraction_block_ids()
         and not kernel_has_half_precision_matmul()
+    )
+
+
+def _configured_block_entry(
+    fn: DeviceFunction,
+    key: Literal["num_threads", "cute_vector_widths"],
+    block_index: int,
+    default: int,
+) -> int:
+    """The entry ``fn``'s config spells in ``key`` for ``block_index``, or
+    ``default``."""
+    spec = CompileEnvironment.current().config_spec
+    sequence = spec.num_threads if key == "num_threads" else spec.cute_vector_widths
+    return sequence.config_get(
+        cast("list[int]", fn.config.config.get(key, []) or []), block_index, default
+    )
+
+
+def _live_lane_extent(
+    lane_extent: int, numel: object, threads: int, *, proven_bounds: bool, unroll: int
+) -> int:
+    """The scalar lanes of a masked persistent row that hold an element.
+
+    The row walks its padded extent (768 elements pad to 1024) in lanes of
+    ``threads`` consecutive elements, so with a static ``numel`` every lane
+    from ``ceil(numel / threads)`` on is masked in every thread: it loads
+    and stores nothing, and each reduction folds into its accumulator only
+    the value ``_mask_to`` substitutes, after every live lane.  For torch's
+    reductions that value is the combine's identity (``hl.reduce`` folds its
+    ``other`` instead, ``_block_has_user_reduce``).  Those trailing lanes
+    are dropped, as far as ``masked_row_lanes`` lets them.
+    """
+    if isinstance(numel, (int, sympy.Integer)) and int(numel) > 0:
+        return masked_row_lanes(
+            int(numel),
+            threads,
+            lane_extent,
+            proven_bounds=proven_bounds,
+            unroll=unroll,
+        )
+    return lane_extent
+
+
+def _kernel_calls(
+    fn: DeviceFunction, targets: tuple[object, ...]
+) -> list[torch.fx.Node]:
+    """The nodes of ``fn``'s device graphs that call one of ``targets``."""
+    return [
+        node
+        for graph in fn.codegen.codegen_graphs
+        for node in graph.graph.nodes
+        if node.target in targets
+    ]
+
+
+def _reduced_block_id(node: torch.fx.Node) -> int | None:
+    """The block an ``hl.reduce`` node reduces, or None when it reduces every
+    dim or a dim of no block."""
+    dim = node.args[2] if len(node.args) > 2 else None
+    if dim is None:
+        return None
+    inputs = node.args[1]
+    first = cast(
+        "torch.fx.Node", inputs[0] if isinstance(inputs, (tuple, list)) else inputs
+    )
+    value = cast("torch.Tensor", first.meta["val"])
+    return CompileEnvironment.current().get_block_id(
+        value.shape[cast("int", dim) % value.ndim]
+    )
+
+
+def _block_has_user_reduce(fn: DeviceFunction, block_index: int) -> bool:
+    """Whether an ``hl.reduce`` may reduce ``block_index`` (``_reduced_block_id``
+    is the block or None).  Its masked elements fold the user's ``other`` (0
+    by default), which need not be its combine's identity: under a sum,
+    ``other=1.0`` counts the padded slots, so their number is part of its
+    result."""
+    env = CompileEnvironment.current()
+    canonical = env.canonical_block_id(block_index)
+    return any(
+        block_id is None or env.canonical_block_id(block_id) == canonical
+        for block_id in map(_reduced_block_id, _kernel_calls(fn, (_reduce,)))
+    )
+
+
+def _scanned_block_id(node: torch.fx.Node) -> int | None:
+    """The block a scan node runs along, or None for a dim of no block (the
+    scan lowering then matches the dim's extent against the blocks,
+    ``_resolve_dim_block_id``).  Read from its first input, which has its
+    shape: a scan of a tuple has no value of its own in the graph."""
+    inputs = node.args[1]
+    first = cast(
+        "torch.fx.Node", inputs[0] if isinstance(inputs, (tuple, list)) else inputs
+    )
+    value = cast("torch.Tensor", first.meta["val"])
+    return CompileEnvironment.current().get_block_id(
+        value.shape[cast("int", node.args[2]) % value.ndim]
+    )
+
+
+def _block_is_scanned(fn: DeviceFunction, block_index: int) -> bool:
+    """Whether a scan may run along ``block_index`` (``_scanned_block_id`` is
+    the block or None).  Normalization's lane model reads the same blocks
+    from ``cute_scanned_block_ids``."""
+    env = CompileEnvironment.current()
+    canonical = env.canonical_block_id(block_index)
+    return any(
+        block_id is None or env.canonical_block_id(block_id) == canonical
+        for block_id in map(_scanned_block_id, _kernel_calls(fn, (_associative_scan,)))
     )
 
 
@@ -809,11 +1001,81 @@ class CuteReductionEmitter(ReductionEmitter[S]):
         raise exc.BackendUnsupported("cute", "reduction lane owner is not proven")
 
 
+def _reads_padded_range_load(
+    cg: GenerateAST, reduction: torch.fx.Node, block_id: int
+) -> bool:
+    """Whether ``reduction`` reduces, through dtype conversions only, a load
+    masked to the padded range on ``block_id``'s lanes (``_cute_combined_mask``
+    bounds a load indexed by such a range, or by pointwise ops on it, by the
+    range's length)."""
+    # A composite lowering (``_inductor_lowering_extra``: ``var_mean`` sums
+    # ``(x - mean) ** 2``) reduces values of its own, so only a reduction
+    # whose argument is the reduced value counts.
+    value = reduction.args[0] if reduction.args else None
+    while isinstance(value, torch.fx.Node) and value.target in (
+        torch.ops.prims.convert_element_type.default,
+        torch.ops.aten._to_copy.default,
+    ):
+        value = value.args[0]
+    if not isinstance(value, torch.fx.Node) or value.target is not memory_ops.load:
+        return False
+    index = value.args[1]
+    bound = cute_codegen_state(cg).padded_range_blocks
+    return isinstance(index, (list, tuple)) and any(
+        bound.get(source) == block_id
+        for source in map(cute_arange_index_source, index)
+        if source is not None
+    )
+
+
+def select_past_padded_ranges(
+    state: CodegenState,
+    input_name: str,
+    ranges: list[tuple[str, int]],
+    fill: float | bool,
+    acc_dtype: torch.dtype,
+) -> str:
+    """A variable holding ``input_name`` with the lanes past padded ranges set
+    to ``fill``: each of ``ranges`` is the index of a reduction dim's lanes and
+    the length of the range on them (``cute_padded_range_length``).  The
+    select is in the dtype the reduction accumulates in: the lowering's values
+    of a half precision input are float32 already, and a select in the input's
+    dtype would round them (and overflow a squared deviation) before the sum.
+    """
+    env = CompileEnvironment.current()
+    backend = env.backend
+    # CuTe cannot select between float8 scalars (``_mask_to``).
+    select_dtype = (
+        torch.float32
+        if acc_dtype.itemsize == 1 and acc_dtype.is_floating_point
+        else acc_dtype
+    )
+    index_dtype = backend.dtype_str(env.index_dtype)
+    in_range = " and ".join(
+        f"{index_dtype}({index}) < {length}" for index, length in ranges
+    )
+    masked = expr_from_string(
+        f"({{value}} if {in_range} else {{fill}})",
+        value=backend.cast_ast(expr_from_string(input_name), select_dtype),
+        fill=backend.cast_ast(expr_from_string(constant_repr(fill)), select_dtype),
+    )
+    if select_dtype != acc_dtype:
+        masked = backend.cast_ast(masked, acc_dtype)
+    return state.codegen.lift(masked, prefix="padded_range_masked").id
+
+
 class CutePersistentReductionEmitter(
     CuteReductionEmitter[PersistentReductionStrategy], PersistentReductionEmitter
 ):
     """Thread layout, synthetic lanes and cross-warp combines of a
     full-extent (persistent) reduction."""
+
+    # Set while ``reduce_ops._reduce_along`` emits the reductions of an
+    # hl.reduce input whose lanes past each padded range hold hl.reduce's
+    # ``other`` already (``reduce_ops._fill_padded_range_lanes``): they are
+    # elements of the reduction then, as on Triton, and the identity would
+    # replace them.
+    padded_range_filled: bool = False
 
     def claims_thread_axis(self) -> bool:
         if self.strategy._cute_axis_partner is not None:
@@ -846,6 +1108,27 @@ class CutePersistentReductionEmitter(
             return next_power_of_2(size_hint)
         return None
 
+    def plan_unpadded_extent(
+        self, fn: DeviceFunction, block_index: int, numel: int
+    ) -> bool:
+        # ``cute_unpadded_rows``: a row whose length is not a power of two
+        # runs unpadded when the config gives it a whole number of warps that
+        # one vector per thread covers exactly (768 = 96 threads x 8), the
+        # multi-warp vector row ``plan_synthetic_lanes`` keeps.  A row an
+        # ``hl.reduce`` reduces keeps its padded slots, which fold the user's
+        # ``other`` (``cute_user_reduce_block_ids``).
+        if (
+            fn.config.config.get("cute_unpadded_rows") is not True
+            or block_index
+            in CompileEnvironment.current().config_spec.cute_user_reduce_block_ids
+        ):
+            return False
+        return unpadded_row_layout(
+            _configured_block_entry(fn, "num_threads", block_index, 0),
+            _configured_block_entry(fn, "cute_vector_widths", block_index, 1),
+            numel,
+        )
+
     def plan_max_threads(self, max_threads: int) -> int:
         strategy = self.strategy
         max_threads = cute_live_reduction_threads(max_threads)
@@ -860,15 +1143,12 @@ class CutePersistentReductionEmitter(
 
     def plan_thread_count(self, size_hint: int, max_threads: int) -> None:
         strategy = self.strategy
-        env = CompileEnvironment.current()
         # Persistent reductions use the same per-block thread-count
         # knob as rolled reductions.  A smaller live subgroup keeps
         # unrelated tile axes from inflating the CTA and lets each
         # thread retain a short contiguous reduction fragment.
-        requested = env.config_spec.num_threads.config_get(
-            cast("list[int]", strategy.fn.config.config.get("num_threads", []) or []),
-            strategy.block_index,
-            0,
+        requested = _configured_block_entry(
+            strategy.fn, "num_threads", strategy.block_index, 0
         )
         if isinstance(requested, int):
             strategy._cute_requested_threads = requested
@@ -901,30 +1181,55 @@ class CutePersistentReductionEmitter(
             )
         )
 
+    def prove_lanes_keep_threads(
+        self, threads: int, numel: object, size_hint: int
+    ) -> bool:
+        # Past one warp, a row that walks synthetic lanes (its padded extent
+        # is wider than its threads, or it is a merged tiled extent) folds
+        # them to a warp.  A vector row, a register tile or a resident row
+        # would keep its threads, but they count as folding here.
+        return threads <= _CUTE_WARP_REDUCTION_THREADS or (
+            next_power_of_2(max(1, size_hint)) <= threads
+            and not self.prove_merged_tiled_extent(numel)
+        )
+
     def plan_synthetic_lanes(
         self,
         lane_extent: int | None,
         size_hint: int,
         mask_var: str | None,
         merged_tiled_extent: bool,
+        numel: sympy.Expr,
     ) -> None:
         strategy = self.strategy
         env = CompileEnvironment.current()
         block_index = strategy.block_index
         fn = strategy.fn
+        # A block indexing its partner's axis keeps the partner's thread
+        # count: each thread then walks its own lanes, the surplus masked
+        # (``plan_axis_partner``), and no combine runs over this block.
+        shared_axis = strategy._cute_axis_partner is not None
+        if strategy._unpadded_extent:
+            # ``plan_unpadded_extent`` admitted the config's layout, one vector
+            # per thread; nothing past the row may be addressed, so any other
+            # outcome refuses the config.
+            lane_extent = self._unpadded_lanes(size_hint, shared_axis)
         if (
             lane_extent is not None
-            and strategy._thread_count * lane_extent
-            != next_power_of_2(max(1, size_hint))
+            and not shared_axis
+            and not strategy._unpadded_extent
         ):
             # Uneven synthetic slices would let an unmasked vector or
             # register row access beyond its padded reduction extent.
             # Keep a power-of-two live count within the thread budget
-            # so every slice fits, then plan the layout from that count.
-            strategy._thread_count = 1 << (strategy._thread_count.bit_length() - 1)
-            lane_extent = env.backend.create_synthetic_reduction_lanes(
-                strategy._thread_count, size_hint
-            )
+            # so every slice fits, then plan the layout from that count
+            # (``tiled_row_threads`` keeps threads whose slices tile it).
+            tiled = tiled_row_threads(strategy._thread_count, size_hint)
+            if tiled != strategy._thread_count:
+                strategy._thread_count = tiled
+                lane_extent = env.backend.create_synthetic_reduction_lanes(
+                    tiled, size_hint
+                )
         # A merged tiled axis can still contain a serial source lane
         # when its configured total extent fits in one warp. Keep an
         # explicit logical owner for the reduction; after wrapping,
@@ -939,13 +1244,8 @@ class CutePersistentReductionEmitter(
         # dtype.
         requested_vec = 1
         if mask_var is None and not strategy._cute_resident_reduction:
-            configured_vec = env.config_spec.cute_vector_widths.config_get(
-                cast(
-                    "list[int]",
-                    fn.config.config.get("cute_vector_widths", []) or [],
-                ),
-                block_index,
-                1,
+            configured_vec = _configured_block_entry(
+                fn, "cute_vector_widths", block_index, 1
             )
             if isinstance(configured_vec, int) and configured_vec > 1:
                 requested_vec = configured_vec
@@ -992,6 +1292,7 @@ class CutePersistentReductionEmitter(
         )
         if (
             lane_extent is not None
+            and not shared_axis
             and strategy._thread_count > _CUTE_WARP_REDUCTION_THREADS
             and not strategy._cute_resident_reduction
             and not multiwarp_vector_row
@@ -1001,6 +1302,21 @@ class CutePersistentReductionEmitter(
             lane_extent = env.backend.create_synthetic_reduction_lanes(
                 strategy._thread_count, size_hint
             )
+        if (
+            lane_extent is not None
+            and mask_var is not None
+            # A resident row's registers span its whole feature extent,
+            # threads x lanes (``ResidentReductionLayout``).
+            and not strategy._cute_resident_reduction
+            and not _block_has_user_reduce(fn, block_index)
+        ):
+            lane_extent = _live_lane_extent(
+                lane_extent,
+                numel,
+                strategy._thread_count,
+                proven_bounds=fn.config.config.get("cute_proven_bounds") is True,
+                unroll=requested_lane_unroll(fn.config.config),
+            )
         if lane_extent is not None:
             strategy._synthetic_cute_lane_var = fn.new_var(
                 f"synthetic_lane_{block_index}",
@@ -1008,13 +1324,8 @@ class CutePersistentReductionEmitter(
             )
             strategy._synthetic_cute_lane_extent = lane_extent
             if strategy._cute_resident_reduction:
-                width = env.config_spec.cute_vector_widths.config_get(
-                    cast(
-                        "list[int]",
-                        fn.config.config.get("cute_vector_widths", []) or [],
-                    ),
-                    block_index,
-                    1,
+                width = _configured_block_entry(
+                    fn, "cute_vector_widths", block_index, 1
                 )
                 fn.cute_state.lanes.resident_reduction_layouts[
                     strategy._synthetic_cute_lane_var
@@ -1032,6 +1343,50 @@ class CutePersistentReductionEmitter(
             # one-warp vector loads exactly as a 32-thread request does.
             if requested_vec > 1 and lane_extent == requested_vec:
                 strategy._cute_reduction_vec_width = requested_vec
+            elif (
+                whole_vector_lanes(lane_extent, requested_vec)
+                and fits_row_packets(
+                    env.config_spec.cute_row_itemsizes.get(
+                        env.canonical_block_id(block_index)
+                    ),
+                    requested_vec,
+                    env.config_spec.target_device_capability,
+                )
+                and not shared_axis
+                and not strategy._unpadded_extent
+                and not strategy._cute_register_tile_predicted
+                # The parallel scans walk the cyclic lanes
+                # (``PersistentReductionStrategy.cute_lane_axis``).
+                and not _block_is_scanned(fn, block_index)
+            ):
+                # Several V-wide chunks per thread, ``threads * V`` elements
+                # apart: each lane step of the constexpr loop reads element
+                # ``lane % V`` of chunk ``lane // V``, so consecutive threads
+                # hold consecutive vectors and a scalar access of another
+                # tensor on the row (an unaligned one) spans ``threads * V``
+                # elements per warp instruction instead of the whole row.
+                strategy._cute_reduction_vec_width = requested_vec
+                strategy._cute_reduction_vec_chunks = lane_extent // requested_vec
+        if strategy._unpadded_extent and strategy._cute_reduction_vec_width <= 1:
+            raise exc.BackendUnsupported(
+                "cute",
+                "cute_unpadded_rows: the row did not become one vector per thread",
+            )
+
+    def _unpadded_lanes(self, size_hint: int, shared_axis: bool) -> int:
+        """The lanes of an unpadded row: the config's vector width, when its
+        threads survived the thread budget whole."""
+        strategy = self.strategy
+        threads = strategy._thread_count
+        if shared_axis:
+            refusal = f"the {size_hint}-wide row runs on another block's threads"
+        elif strategy._cute_resident_reduction:
+            refusal = f"the {size_hint}-wide row is resident in registers"
+        elif threads != strategy._cute_requested_threads:
+            refusal = f"{threads} threads do not cover the {size_hint}-wide row exactly"
+        else:
+            return size_hint // threads
+        raise exc.BackendUnsupported("cute", f"cute_unpadded_rows: {refusal}")
 
     def check_shared_thread_extent(self, extent: int) -> None:
         strategy = self.strategy
@@ -1048,29 +1403,151 @@ class CutePersistentReductionEmitter(
         self,
         concurrent: list[TileStrategy],
         size_hint: int,
-    ) -> PersistentReductionStrategy | None:
-        """A concurrent sibling full-slice block whose thread axis this block
+    ) -> ReductionStrategy | None:
+        """A concurrent sibling block whose thread axis this full-slice block
         shares, or ``None``.
 
-        Two full-slice axes of one pure pointwise tile body (rope's q heads
-        and k heads) are independent per-thread lane loops.  When one owns a
-        thread axis, every statement of the other runs once per thread of
-        that axis, repeating its loads and stores ``threads`` times; when the
-        config spells the same explicit thread count for both, this block
-        indexes the sibling's axis instead (``thread_idx()[axis]`` is a head
-        of each), each thread walking its own share of both axes.  Only a
-        kernel without reductions qualifies (``pointwise_facts``: there is no
-        cross-thread combine to keep per axis), and both static extents must
-        be multiples of the shared count so no thread falls outside either.
-        ``concurrent`` already excludes the strategies of mutually exclusive
-        branches (``_strategies_concurrent_with_block``).
+        A full-slice axis that no reduction reduces (rope's q heads and k
+        heads, the half rows of rotate_half) is an independent per-thread
+        lane loop.  When a sibling owns a thread axis, every statement of the
+        slice runs once per thread of that axis, repeating its loads and
+        stores ``threads`` times; this block indexes the sibling's axis
+        instead (``thread_idx()[axis]`` is a head of each), each thread
+        walking its own share of both axes, and takes the sibling's thread
+        count.  No value may carry this block beside a block of that axis
+        (``_meets_axis_in_a_value``).  The sibling is
+
+        * in a kernel without reductions (``pointwise_facts``), another
+          full-slice axis when the config spells the same explicit thread
+          count for both and both static extents are multiples of it, so no
+          thread falls outside either (``_pointwise_axis_partner``);
+        * otherwise a reduction owning a thread axis (an RMSNorm row beside
+          the half rows of rotate_half), unless the config spells another
+          thread count for this block (``_reduction_axis_partner``).  The
+          threads past this block's extent are masked.
         """
+        strategy = self.strategy
+        env = CompileEnvironment.current()
+        if env.config_spec.pointwise_facts:
+            partner = self._pointwise_axis_partner(concurrent, size_hint)
+        else:
+            partner = self._reduction_axis_partner(concurrent, size_hint)
+        if partner is None:
+            return None
+        threads = partner._reduction_thread_count()
+        strategy._thread_count = threads
+        lanes = env.backend.create_synthetic_reduction_lanes(threads, size_hint)
+        if threads * (lanes or 1) > size_hint and strategy._mask_var is None:
+            strategy._mask_var = strategy.fn.new_var(
+                f"mask_{strategy.block_index}", dce=True
+            )
+        return partner
+
+    def _meets_axis_in_a_value(
+        self, partner: ReductionStrategy, concurrent: list[TileStrategy]
+    ) -> bool:
+        """Whether a value or subscript carries this block beside the
+        partner's, or beside a block already indexing the partner's axis: it
+        needs the cross product of their coordinates
+        (``_cute_blocks_share_a_value``)."""
+        env = CompileEnvironment.current()
+        return any(
+            _cute_blocks_share_a_value(
+                env, self.strategy.block_index, other.block_index
+            )
+            for other in concurrent
+            if other is partner
+            or (
+                isinstance(other, PersistentReductionStrategy)
+                and other._cute_axis_partner is partner
+            )
+        )
+
+    def _reduction_axis_partner(
+        self, concurrent: list[TileStrategy], size_hint: int
+    ) -> ReductionStrategy | None:
+        """The first reduction of ``concurrent`` owning a thread axis this
+        unreduced block may index (``plan_axis_partner``).
+
+        Only torch reductions' combines are modeled: a kernel with a matmul,
+        an ``hl.reduce`` or a scan keeps its layout.  The reduction must run
+        beside every other reduction, so that none takes the same axis from a
+        section that never runs with it: the kernel has one root loop (and so
+        one ``hl.barrier()`` phase, as every phase holds root loops of its
+        own), and the reduction sits outside every dynamic branch
+        (``TileStrategyDispatch._strategy_branches``).  An unreduced block has
+        no branch path of its own, so ``concurrent`` keeps the strategies of
+        every branch.  A persistent reduction folding its own lanes emits its
+        reduction marker inside its lane loop, which must stay the innermost
+        one (``validate_lane_reduce_owners``): this block's lanes, nested
+        inside it, would take that place.
+
+        The reduction must also have at least the threads this block would
+        claim on an axis of its own.  With fewer, the block would run on
+        fewer threads in a smaller CTA, while the repeats it saves are cheap:
+        the few repeating threads sit side by side in a warp and share each
+        load (a 4096-wide slice beside a sum over 4 elements takes 8 threads
+        of its own, and runs 1.6x slower on the sum's 4).
+        """
+        strategy = self.strategy
+        env = CompileEnvironment.current()
+        device_ir = HostFunction.current().device_ir
+        if (
+            len(device_ir.grid_block_ids) != 1
+            or env.config_spec.matmul_facts
+            or _kernel_calls(strategy.fn, (_reduce, _associative_scan))
+        ):
+            return None
+        reduced = reduced_block_ids(strategy.fn.codegen)
+        numel = env.specialize_expr(env.block_sizes[strategy.block_index].numel)
+        if (
+            strategy.block_index in reduced
+            or find_block_size_symbols(_to_sympy(numel))[0]
+        ):
+            # Its own combine would run over the partner's threads; an extent
+            # of tile blocks (a reshape-merged axis) keeps the lane layout
+            # that maps it back to their coordinates.
+            return None
+        branch_paths = strategy.fn.tile_strategy.reduction_branch_paths()
+        requested = strategy._cute_requested_threads
+        own_threads = env.backend.adjust_reduction_thread_count(
+            strategy._thread_count, concurrent
+        )
+        for sibling in concurrent:
+            if not (
+                isinstance(
+                    sibling, (PersistentReductionStrategy, LoopedReductionStrategy)
+                )
+                and sibling.block_index in reduced
+                and not any(branch_paths.get(sibling.block_index, ()))
+                and sibling._claims_thread_axis()
+            ):
+                continue
+            threads = sibling._reduction_thread_count()
+            if (
+                requested in (0, threads)
+                and threads >= own_threads
+                and not (
+                    isinstance(sibling, PersistentReductionStrategy)
+                    and sibling._synthetic_cute_lane_var is not None
+                    and env.backend.create_synthetic_reduction_lanes(threads, size_hint)
+                    is not None
+                )
+                and not self._meets_axis_in_a_value(sibling, concurrent)
+            ):
+                return sibling
+        return None
+
+    def _pointwise_axis_partner(
+        self, concurrent: list[TileStrategy], size_hint: int
+    ) -> PersistentReductionStrategy | None:
+        """The full-slice sibling of a pure pointwise kernel spelling this
+        block's explicit thread count (``plan_axis_partner``)."""
         strategy = self.strategy
         env = CompileEnvironment.current()
         requested = strategy._cute_requested_threads
         if (
-            not env.config_spec.pointwise_facts
-            or requested <= 1
+            requested <= 1
             or strategy._thread_count != requested
             or size_hint % requested
         ):
@@ -1085,14 +1562,17 @@ class CutePersistentReductionEmitter(
                 and sibling._cute_axis_partner is None
                 and sibling._cute_requested_threads == requested
                 and sibling._thread_count == requested
+                # Another root's block shares no CTA with this one, whose
+                # root's own blocks would take the axis it leaves them.
+                and strategy.fn.tile_strategy.blocks_share_one_root(
+                    strategy.block_index, sibling.block_index
+                )
             ):
                 partner_numel = env.block_sizes[sibling.block_index].numel
                 if (
                     isinstance(partner_numel, (int, sympy.Integer))
                     and int(partner_numel) % requested == 0
-                    and not _cute_blocks_share_a_value(
-                        env, strategy.block_index, sibling.block_index
-                    )
+                    and not self._meets_axis_in_a_value(sibling, concurrent)
                 ):
                     return sibling
         return None
@@ -1162,6 +1642,7 @@ class CutePersistentReductionEmitter(
         assert synthetic_lane_var is not None
         axis = strategy._get_thread_axis()
         vec_width = strategy._cute_reduction_vec_width
+        chunks = strategy._cute_reduction_vec_chunks
         if vec_width > 1:
             # With exactly one V-wide chunk per thread, blocked and strided
             # layouts coincide: thread ``t`` owns ``[t*V, (t+1)*V)``.
@@ -1169,6 +1650,10 @@ class CutePersistentReductionEmitter(
             # so memory lowering can splice one LDG/STG vector around the
             # constexpr per-element loop.  The dummy one-trip outer loop is
             # retained only as a container and elided by ``wrap_body``.
+            # Several chunks per thread keep the one constexpr loop over all
+            # of the thread's elements; chunk ``c`` starts ``c * threads * V``
+            # past the thread's base, and the late branch-local vectorizer
+            # places one packet per chunk.
             base_index_var = strategy.fn.new_var(
                 f"reduction_lane_base_{block_idx}", dce=False
             )
@@ -1178,8 +1663,9 @@ class CutePersistentReductionEmitter(
                 f"({strategy._index_init_expr(block_size_var, env.index_type(), block_idx)})"
                 f" * {vec_width}"
             )
-            vec_for = _create_lane_loop(synthetic_lane_var, vec_width, [])
-            vec_iter = expr_from_string(f"cutlass.range_constexpr({vec_width})")
+            lane_count = vec_width * chunks
+            vec_for = _create_lane_loop(synthetic_lane_var, lane_count, [])
+            vec_iter = expr_from_string(f"cutlass.range_constexpr({lane_count})")
             assert isinstance(vec_iter, ast.expr)
             vec_for.iter = vec_iter
             lane_body: list[ast.AST] = [
@@ -1190,7 +1676,7 @@ class CutePersistentReductionEmitter(
             context.lane_body = lane_body
             context.vloop = vec_for
             context.vec_lane_var = synthetic_lane_var
-            current_grid.add_lane_loop(block_idx, synthetic_lane_var, vec_width)
+            current_grid.add_lane_loop(block_idx, synthetic_lane_var, lane_count)
             current_grid.vec_lane_wrappers[synthetic_lane_var] = VecLaneWrapper(
                 outer_for=outer_for,
                 vloop=vec_for,
@@ -1203,20 +1689,31 @@ class CutePersistentReductionEmitter(
             # the lane loops of the other full-slice axes it encloses, so a
             # load addressed by one of their lanes can become one packet
             # (the branch-local persistent vectorizer widens the markers
-            # inside each sunk V-loop; this pass widens none itself).
-            strategy.fn.cute_state.lanes.vloop_sink_wrappers[synthetic_lane_var] = (
-                CuteVloopWrapperFact(
-                    block_id=block_idx,
-                    vec_width=vec_width,
-                    lane_var=synthetic_lane_var,
-                    vec_lane_var=synthetic_lane_var,
-                    base_index_var=base_index_var,
-                    index_var=strategy.index_var(block_idx),
-                    mask_var=strategy._mask_var,
-                    uniform_vector_mask=strategy._mask_var is None,
+            # inside each sunk V-loop; this pass widens none itself).  A
+            # loop over several chunks is not one V-loop and is not sunk.
+            if chunks == 1:
+                strategy.fn.cute_state.lanes.vloop_sink_wrappers[synthetic_lane_var] = (
+                    CuteVloopWrapperFact(
+                        block_id=block_idx,
+                        vec_width=vec_width,
+                        lane_var=synthetic_lane_var,
+                        vec_lane_var=synthetic_lane_var,
+                        base_index_var=base_index_var,
+                        index_var=strategy.index_var(block_idx),
+                        mask_var=strategy._mask_var,
+                        uniform_vector_mask=strategy._mask_var is None,
+                    )
                 )
-            )
-            index_expr = f"{base_index_var} + cutlass.Int32({synthetic_lane_var})"
+                index_expr = f"{base_index_var} + cutlass.Int32({synthetic_lane_var})"
+            else:
+                strategy.fn.cute_state.lanes.chunked_reduction_lanes[
+                    synthetic_lane_var
+                ] = vec_width
+                index_expr = (
+                    f"{base_index_var} + cutlass.Int32({synthetic_lane_var}"
+                    f" // {vec_width} * {strategy._thread_count * vec_width}"
+                    f" + {synthetic_lane_var} % {vec_width})"
+                )
         else:
             # A scalar synthetic lane over a grid of one-vector tile
             # wrappers becomes a trace-time loop OUTSIDE those wrappers
@@ -1597,6 +2094,32 @@ class CutePersistentReductionEmitter(
             backend.dtype_str(fake_output.dtype),
         )
 
+    def _mask_padded_range_lanes(
+        self,
+        state: CodegenState,
+        input_name: str,
+        reduction_type: str,
+        acc_dtype: torch.dtype,
+        length: int,
+    ) -> str:
+        """``input_name`` with the lanes past a padded range's ``length``
+        (``cute_padded_range_length``) set to the reduction's identity.
+
+        Triton's counterpart is ``ReductionLowering._mask_padded_range_lanes``
+        (``_padded_iota_dims``, ``Backend.mask_padded_range_lanes``), which
+        CuTe leaves at None: its ranges run on the reduction's own lanes,
+        found by ``cute_padded_range_length``.  Both follow the same values
+        (pointwise ops, ``LANE_PRESERVING_OPS``), so keep the two in step."""
+        identity = ir.Reduction.default_accumulator(reduction_type, acc_dtype)
+        if not isinstance(identity, (float, int, bool)):
+            raise exc.BackendUnsupported(
+                "cute", f"a {reduction_type} reduction of a padded hl.arange's lanes"
+            )
+        index = self.strategy.index_var(self.strategy.block_index)
+        return select_past_padded_ranges(
+            state, input_name, [(index, length)], identity, acc_dtype
+        )
+
     def emit_reduction(
         self,
         state: CodegenState,
@@ -1609,6 +2132,28 @@ class CutePersistentReductionEmitter(
         strategy = self.strategy
         env = CompileEnvironment.current()
         backend = env.backend
+        assert state.fx_node is not None
+        acc_dtype = reduction_acc_dtype(reduction_type, fake_input, fake_output)
+        if (
+            not self.padded_range_filled
+            and (
+                length := cute_padded_range_length(
+                    state.codegen, state.fx_node, strategy.block_index
+                )
+            )
+            is not None
+            and not (
+                # The load over the range fills the lanes past it with zero
+                # already, the identity of a sum.
+                ir.Reduction.default_accumulator(reduction_type, fake_input.dtype) == 0
+                and _reads_padded_range_load(
+                    state.codegen, state.fx_node, strategy.block_index
+                )
+            )
+        ):
+            input_name = self._mask_padded_range_lanes(
+                state, input_name, reduction_type, acc_dtype, length
+            )
         if backend.is_indexed_reduction(reduction_type):
             packed = codegen_packed_reduction(
                 state,
@@ -1622,7 +2167,6 @@ class CutePersistentReductionEmitter(
             )
             if packed is not None:
                 return packed
-        acc_dtype = reduction_acc_dtype(reduction_type, fake_input, fake_output)
         default = ir.Reduction.default_accumulator(reduction_type, acc_dtype)
         if (
             strategy._synthetic_cute_lane_var is not None
@@ -1767,7 +2311,10 @@ class CutePersistentReductionEmitter(
         else:
             cross_warp = None
         if cross_warp is None:
-            return None
+            # The strategy's own reduction, of the masked lanes if any.
+            cross_warp = strategy.call_reduction_function(
+                input_name, reduction_type, dim, fake_input, fake_output
+            )
         return expr_from_string(
             strategy.maybe_reshape(cross_warp, dim, fake_input, fake_output)
         )
@@ -1813,12 +2360,6 @@ class CuteLoopedReductionEmitter(
         strategy = self.strategy
         env = CompileEnvironment.current()
         if thread_count > 0 and block_size > thread_count:
-            strategy._cute_reduction_lane_extent = (
-                block_size + thread_count - 1
-            ) // thread_count
-            strategy._loop_block_size = (
-                thread_count * strategy._cute_reduction_lane_extent
-            )
             strategy._cute_reduction_lane_var = fn.new_var(
                 f"reduction_lane_{block_index}",
                 dce=False,
@@ -1835,15 +2376,14 @@ class CuteLoopedReductionEmitter(
                 block_index,
                 1,
             )
-            if (
-                isinstance(vec_width, int)
-                and vec_width > 1
-                and strategy._cute_reduction_lane_extent % vec_width == 0
-            ):
-                strategy._cute_reduction_vec_width = vec_width
-                strategy._cute_reduction_lane_extent = (
-                    strategy._cute_reduction_lane_extent // vec_width
-                )
+            lanes, width = looped_reduction_lanes(
+                block_size,
+                thread_count,
+                vec_width if isinstance(vec_width, int) else 1,
+            )
+            strategy._cute_reduction_lane_extent = lanes
+            strategy._cute_reduction_vec_width = width
+            strategy._loop_block_size = thread_count * lanes * width
 
     def plan_chunk_mask(self, block_index: int, mask_var: str | None) -> None:
         strategy = self.strategy
@@ -1905,16 +2445,24 @@ class CuteLoopedReductionEmitter(
             or _block_has_indexed_reduction(strategy.fn, strategy.block_index)
         ):
             return
-        # Statements outside the roll loop execute once per cluster CTA —
-        # benign for plain (idempotent) stores, but a read-modify-write
-        # would repeat ``cluster_n`` times.
-        if HostFunction.current().device_ir.has_atomic_ops():
-            return
         # Sibling thread axes (e.g. a multi-row grid tile with block_m > 1)
         # would make the whole-CTA cluster reduce fold unrelated rows.
         grid_state = state.codegen.current_grid_state
         if grid_state is not None and any(
             size > 1 for size in grid_state.thread_axis_sizes.values()
+        ):
+            return
+        # A thread that walks several tile rows (``num_threads`` 1 for a tile
+        # of 8 rows) runs the roll loop and its finalize once per row in the
+        # tile's per-thread lane loop, but a cluster exchange's single-phase
+        # mbarrier admits one round per kernel
+        # (``validate_cluster_reduce_placement``): keep the CTA reduce.
+        if grid_state is not None and any(
+            extent > 1
+            and not grid_state.lane_loop_block_ids.get(
+                lane_var, frozenset()
+            ).isdisjoint(grid_state.block_ids)
+            for lane_var, extent in grid_state.lane_loops
         ):
             return
         numel = env.specialize_expr(env.block_sizes[strategy.block_index].numel)
@@ -1939,6 +2487,10 @@ class CuteLoopedReductionEmitter(
         # Cluster rank-relative begin/end expressions use cutlass.Int32.
         # A logical extent can fit while the padded final slice overflows.
         if static_numel and slice_len * cl > 2**31 - 1:
+            return
+        # Statements outside the roll loop execute once per cluster CTA —
+        # benign only for plain stores of a tensor nothing else accesses.
+        if cluster_split_races(strategy, strategy.block_index):
             return
         strategy._cute_rolled_cluster_n = cl
         strategy._cute_rolled_cluster_slice_len = slice_len
@@ -2024,7 +2576,14 @@ class CuteLoopedReductionEmitter(
         reduce_axis = strategy._get_thread_axis()
 
         def refuse(reason: str) -> NoReturn:
-            raise exc.BackendUnsupported(
+            # Under the layout ``cute_vloop_sink`` planned (the reduce axis
+            # above the vector tile's lanes), the kernel is generated again
+            # with the default one, as for the argreduce
+            # (``check_indexed_reduction_lanes``).
+            refusal = VloopSinkLayoutRefused.refusal_type(
+                cute_env_state(env).vloop_sink_reduction_layout_planned
+            )
+            raise refusal(
                 "cute",
                 f"rolled {reduction_type} over thread axis {reduce_axis} "
                 f"interleaved with {pre} sibling lanes below it: {reason}",
@@ -2309,7 +2868,9 @@ class CuteLoopedReductionEmitter(
         if block_mapping:
             return
         trips_var = f"_REDUCTION_TRIPS_{strategy.block_index}"
-        host_numel = HostFunction.current().sympy_expr(numel)
+        host_numel = HostFunction.current().sympy_expr(
+            numel, state.device_function.config
+        )
         state.device_function.constexpr_arg_with_host_def(
             trips_var,
             f"({host_numel} + {block_size_var} - 1) // {block_size_var}",
@@ -2425,6 +2986,7 @@ class CuteLoopedReductionEmitter(
                     ).body[0],
                 )
                 vec_for.body = inner_body  # type: ignore[assignment]
+                setattr(vec_for, HELION_REDUCTION_VLOOP_ATTR, True)
                 # The lane-loop body holds the per-lane base index, then any
                 # dispatcher-requested vec hoists, then the constexpr loop.
                 base_stmt = statement_from_string(
@@ -2540,8 +3102,14 @@ class CuteLoopedReductionEmitter(
             strategy._thread_count > 1
             and self._cute_lanes_below_reduce_axis(state, device_loop)[0] > 1
         ):
-            # The argreduce finalize folds consecutive lanes too.
-            raise exc.BackendUnsupported(
+            # The argreduce finalize folds consecutive lanes too.  Under the
+            # layout ``cute_vloop_sink`` planned, the kernel is generated
+            # again with the default one.
+            env_state = cute_env_state(CompileEnvironment.current())
+            refusal = VloopSinkLayoutRefused.refusal_type(
+                env_state.vloop_sink_reduction_layout_planned
+            )
+            raise refusal(
                 "cute",
                 f"rolled {reduction_type} over thread axis "
                 f"{strategy._get_thread_axis()} interleaved with sibling "
@@ -3131,7 +3699,7 @@ class CuteBlockReductionEmitter(
         # lives above the reduce axis as independent sub-groups: it must count
         # toward the group count and the linear lane, or the sub-groups would
         # share the helper's shared-memory slots.
-        packed = packed_grid_block(env, strategy.fn.config)
+        packed = packed_grid_block(env.config_spec, strategy.fn.config)
         packed_block = None if packed is None else packed[0]
         for block_id, axis, extent, _info in active_thread_blocks:
             if (

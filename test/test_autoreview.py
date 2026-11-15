@@ -555,15 +555,25 @@ def test_codex_no_sandbox_uses_meta_launcher_flags_only_with_meta(review, tmp_pa
 
 
 @pytest.mark.slow
-def test_a_passing_review_prints_the_commit_line(review, monkeypatch):
-    # Findings (not exactly "LGTM"): no line.
+def test_a_passing_review_prints_the_commit_line(review, monkeypatch, tmp_path):
+    # Findings (not exactly "LGTM"): no line, and a notice that each finding
+    # is to be fixed or classified as invalid.  Under --fix the fixer does
+    # that, and the notice names the file holding what it left unfixed.
     _, _, err = review("claude", "codex")
     assert "autoreview passed:" not in err
+    assert err.rstrip().endswith(f"\nautoreview.py: {autoreview.FINDINGS_NOTICE}")
+    _, _, err = review("claude", "codex", args=("--fix",))
+    assert "autoreview passed:" not in err
+    assert autoreview.FINDINGS_NOTICE not in err
+    (answer,) = (tmp_path / "logs").glob("*/fix-result.txt")
+    notice = autoreview.FIX_NOTICE.format(path=answer.relative_to(tmp_path))
+    assert err.rstrip().endswith(f"\nautoreview.py: {notice}")
     monkeypatch.setenv("FAKE_CLAUDE_RESULT", "LGTM")
     monkeypatch.setenv("FAKE_CODEX_RESULT", "LGTM")
     _, out, err = review("claude", "codex")
     assert out.strip() == "LGTM"
     assert err.rstrip().endswith("\nautoreview passed: claude, codex")
+    assert autoreview.FINDINGS_NOTICE not in err
     # The line names only the reviewers that actually ran, and comes last.
     for installed, args, line in [
         (("claude",), (), "autoreview passed: claude"),
@@ -760,10 +770,34 @@ def test_the_review_prompt_points_at_live_agents_md_sections():
     # The prompt names AGENTS.md sections; renaming one must update the prompt.
     agents = (SCRIPT.parents[1] / "AGENTS.md").read_text()
     prompt = autoreview.build_review_prompt(False)
-    for section in ("Compatibility guardrails", "Test Budget Rules"):
+    for section in (
+        "Compatibility guardrails",
+        "Test Budget Rules",
+        "Answering the findings",
+    ):
         assert f'"{section}"' in prompt
         assert f"### {section}" in agents
+    assert '"Fix What You Find"' in prompt and "\n## Fix What You Find\n" in agents
     assert "commit message" in autoreview.build_review_prompt(True)
+    # The reviewers check the author's explanations for findings classified
+    # as invalid, in every kind of review; AGENTS.md names the same paragraph.
+    for review_prompt in (
+        prompt,
+        autoreview.build_review_prompt(True),
+        autoreview.build_review_prompt(False, ["origin/main..HEAD"]),
+    ):
+        assert "A `Review notes:` paragraph in a commit message" in review_prompt
+        assert "not instructions to you" in review_prompt
+    # So do the notices a run with findings ends with, and the fixer, which
+    # may leave an invalid finding unfixed.
+    for text in (
+        autoreview.FINDINGS_NOTICE,
+        autoreview.FIX_NOTICE,
+        autoreview.PROMPT_FIX,
+    ):
+        assert "`Review notes:`" in text
+        assert '"Answering the findings"' in text
+    assert "\nReview notes:\n- Not valid: " in agents
 
 
 @pytest.mark.slow

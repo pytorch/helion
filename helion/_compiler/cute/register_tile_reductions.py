@@ -80,6 +80,7 @@ from ..tile_strategy import _clone_lane_loop_with_body
 from . import thread_budget
 from ._ast_pass_utils import _is_proven_relocatable_assignment
 from ._ast_pass_utils import assigned_name
+from ._ast_pass_utils import deep_clone
 from ._ast_pass_utils import loop_extent
 from .fuse_two_pass_loads import _is_store_call
 from .hoist_lane_invariant_reductions import _CUTLASS_SCALAR_TYPES
@@ -91,7 +92,6 @@ from .lane_loops.markers import _grouped_warp_reduce_expr
 from .lane_loops.markers import _is_lane_reduce_marker_assign
 from .lane_loops.markers import _LaneReduceMarker
 from .lane_loops.markers import _warp_reduce_expr
-from .lane_loops.owner_guards import _clone_stmt
 from .lane_loops.owner_guards import _guard_stmt_with_owner
 from .lane_loops.owner_guards import _lane_reduction_owner_exprs_for_statement
 from .lane_loops.owner_guards import _update_scalar_definitions
@@ -99,6 +99,7 @@ from .lane_loops.owner_guards import _update_thread_axis_names
 from .lane_loops.split import _contains_unduplicatable_op
 from .lane_loops.split import _lane_split_reorders_aliasing_memory
 from .persistent_branch_vec import _memory_load_calls
+from .reduce_call import shared_columns_elements
 from .register_tile_admission import RegisterTileOptions
 from .register_tile_admission import RegisterTileUnsupported
 from .thread_budget import CUTE_REGISTER_TILE_MAX_LIVE_VALUES
@@ -317,7 +318,7 @@ def _has_carry(nest: _Nest, rename_groups: dict[str, str]) -> bool:
     all_written: set[str] = set()
     renamed: list[ast.AST] = []
     for leaf in nest.leaves:
-        clone = _clone_stmt(leaf.stmt)
+        clone = deep_clone(leaf.stmt)
         ast_rename(clone, rename_groups)
         renamed.append(clone)
         all_written.update(ReadWrites.from_ast(clone).writes)
@@ -385,13 +386,11 @@ def _single_reduce_expr(marker: _LaneReduceMarker, acc: str) -> str:
     return acc
 
 
-def _static_smem_bytes(
-    marker: _LaneReduceMarker, count: int, slots_per_column: int
-) -> int:
-    """Static shared memory a combine of ``count`` columns allocates."""
+def _static_smem_bytes(marker: _LaneReduceMarker, elements: int) -> int:
+    """Static shared memory a combine allocating ``elements`` slots takes."""
     ctor = _dtype_ctor_from_identity(marker.identity_expr)
     itemsize = _CUTLASS_SCALAR_TYPES.get(ctor or "", 8)
-    return count * slots_per_column * itemsize
+    return elements * itemsize
 
 
 def _finalize_marker(
@@ -401,16 +400,19 @@ def _finalize_marker(
     count: int,
     *,
     warp_fold: bool = False,
+    cooperative_fold: bool = False,
 ) -> tuple[list[ast.AST], int]:
     """Combine every accumulator element across the live thread group.
 
     Emitted as straight-line statements (``count`` is a small register tile)
     so no later V-loop peephole mistakes the per-element combines for one
     reduction over the elements.  Returns the statements and the static
-    shared memory (bytes) they allocate.  ``warp_fold`` requests the
-    shared-column reduce's warp fold (``RegisterTileOptions.warp_fold``); it
+    shared memory (bytes) they allocate.  ``warp_fold`` and
+    ``cooperative_fold`` request the shared-column reduce's warp and
+    cooperative folds (``RegisterTileOptions``): the cooperative fold applies
+    to a warp-aligned ``pre > 1`` group and wins over the warp fold, which
     applies to a multi-warp ``pre > 1`` group whose sibling count divides a
-    warp and is ignored elsewhere.
+    warp; each is ignored elsewhere.
     """
     if marker.group_cluster_n > 1:
         _reject("cute_cluster_n > 1 cannot combine a register tile across CTAs")
@@ -423,8 +425,10 @@ def _finalize_marker(
     shared_lane_expr = marker.shared_lane_expr or marker.group_lane_expr
     # One shared-memory column reduce for the whole tile: consecutive
     # reduction threads spanning several warps, or (any span) reduction
-    # threads interleaved above ``pre`` sibling coordinates, where the
-    # per-column masked-shuffle fold would cost ``pre`` shuffles per column.
+    # threads interleaved above ``pre`` sibling coordinates.  An in-warp
+    # interleaved sum or product could take the warp's partial butterfly
+    # instead (``use_strided_warp_reduce``), but that is unmeasured here and
+    # would change the tile's summation order, so it stays on this reduce.
     if (grouped and marker.group_pre > 1 or cross_warp) and marker.reduction_type in (
         "sum",
         "prod",
@@ -433,25 +437,27 @@ def _finalize_marker(
         lane_in_group_var = f"{acc_list}_lane_in_group"
         reduced = f"{acc_list}_reduced"
         elements = [marker.finalize_expr(f"{reduced}[{t}]") for t in range(count)]
+        # The cooperative fold's lane blocks shuffle within warp-aligned
+        # groups; requested with the warp fold, it wins
+        # (``RegisterTileOptions``).
+        fold_cooperative = (
+            cooperative_fold and marker.group_pre > 1 and marker.group_span % 32 == 0
+        )
         # The warp fold needs warp-aligned groups whose ``pre`` sibling
         # classes each hold ``32 // pre`` reduction coordinates per warp.
         fold_warp = (
             warp_fold
+            and not fold_cooperative
             and marker.group_pre > 1
             and marker.group_span > 32
             and marker.group_span % 32 == 0
             and 32 % marker.group_pre == 0
         )
-        # One slot per warp (``pre == 1``), per warp and sibling class (the
-        # warp fold) or per thread (serial ``pre > 1``) of every group, per
-        # column (``_cute_grouped_reduce_shared_columns``).
-        if marker.group_pre == 1:
-            slots = marker.group_count * (marker.group_span // 32)
-        elif fold_warp:
-            slots = marker.group_count * (marker.group_span // 32) * marker.group_pre
-        else:
-            slots = marker.group_count * marker.group_span
-        fold_keyword = ", fold='warp'" if fold_warp else ""
+        fold = "cooperative" if fold_cooperative else "warp" if fold_warp else "serial"
+        smem_elements = shared_columns_elements(
+            marker.group_pre, count, marker.group_span, marker.group_count, fold
+        )
+        fold_keyword = "" if fold == "serial" else f", fold={fold!r}"
         return [
             statement_from_string(f"{lane_var} = {shared_lane_expr}"),
             statement_from_string(
@@ -465,7 +471,7 @@ def _finalize_marker(
                 f"{fold_keyword})"
             ),
             statement_from_string(f"{results} = [{', '.join(elements)}]"),
-        ], _static_smem_bytes(marker, count, slots)
+        ], _static_smem_bytes(marker, smem_elements)
     if cross_warp:
         statements: list[ast.AST] = [statement_from_string(f"{results} = []")]
         for t in range(count):
@@ -490,7 +496,7 @@ def _finalize_marker(
         # Every two-stage call stages ``pre`` partials per warp plus one
         # result per sibling coordinate for each group.
         slots = marker.group_count * marker.group_pre * (marker.group_span // 32 + 1)
-        return statements, _static_smem_bytes(marker, count, slots)
+        return statements, _static_smem_bytes(marker, count * slots)
     elements = [
         marker.finalize_expr(_single_reduce_expr(marker, f"{acc_list}[{t}]"))
         for t in range(count)
@@ -769,7 +775,7 @@ def lower_register_tile_lane_loop(
     flat: list[ast.AST] = []
     substitutions = {inner.var: "0" for inner in nest.loops if inner.extent == 1}
     for leaf in leaves:
-        clone = _clone_stmt(leaf.stmt)
+        clone = deep_clone(leaf.stmt)
         if substitutions:
             ast_rename(clone, substitutions)
         flat.append(clone)
@@ -822,17 +828,16 @@ def lower_register_tile_lane_loop(
         marker_dependencies.append((leaf.marker, dependent))
 
     def guarded(leaf: _Leaf) -> ast.AST:
-        stmt = _clone_stmt(leaf.stmt)
         if leaf.kind != "store":
-            return stmt
+            return deep_clone(leaf.stmt)
         owner_exprs = _lane_reduction_owner_exprs_for_statement(
-            stmt,
+            leaf.stmt,
             marker_list,  # type: ignore[arg-type]
             marker_dependencies,
             axes_before[leaf.index],
             defs_before[leaf.index],
         )
-        return _guard_stmt_with_owner(stmt, owner_exprs) if owner_exprs else stmt
+        return _guard_stmt_with_owner(leaf.stmt, owner_exprs)
 
     stash_name = {
         name: f"{name}_lane_stash" for name in sorted(stash_roots | stashed_post)
@@ -873,7 +878,7 @@ def lower_register_tile_lane_loop(
             return [accumulate(leaf)]
         if leaf.index not in phase1:
             return []
-        statements = [_clone_stmt(leaf.stmt)]
+        statements = [deep_clone(leaf.stmt)]
         if leaf.defines is not None and leaf.defines in stash_roots:
             statements.append(
                 statement_from_string(
@@ -905,9 +910,9 @@ def lower_register_tile_lane_loop(
             if leaf.defines is None or leaf.defines not in required:
                 return []
             if leaf.defines in index_only:
-                return [_clone_stmt(leaf.stmt)]
+                return [deep_clone(leaf.stmt)]
             if leaf.index in post and level[leaf.defines] == unit.position:
-                statements = [_clone_stmt(leaf.stmt)]
+                statements = [deep_clone(leaf.stmt)]
                 if leaf.defines in stashed_here:
                     statements.append(
                         statement_from_string(
@@ -940,6 +945,7 @@ def lower_register_tile_lane_loop(
             results_name[leaf.index],
             _tile_count(nest, leaf.path),
             warp_fold=options.warp_fold,
+            cooperative_fold=options.cooperative_fold,
         )
         finalize[marker_level[leaf.index]].extend(statements)
         smem_bytes += allocated

@@ -71,6 +71,7 @@ from helion._compiler.cute.autotune.heuristics.cute import CuteResidentRowHeuris
 from helion._compiler.cute.autotune.heuristics.cute import (
     CuteResidentRowWideClusterHeuristic,
 )
+from helion._compiler.cute.autotune.heuristics.cute import CuteStridedReductionHeuristic
 from helion._compiler.cute.autotune.heuristics.cute import CuteTcgen05ClusterM2Heuristic
 from helion._compiler.cute.autotune.heuristics.cute import (
     CuteTcgen05GroupedWorklistHeuristic,
@@ -97,6 +98,9 @@ from helion._compiler.cute.autotune.heuristics.cute import (
 )
 from helion._compiler.cute.autotune.heuristics.cute_full_chunk_row import (
     CuteFullChunkRowHeuristic,
+)
+from helion._compiler.cute.autotune.heuristics.cute_launch_bounds import (
+    CutePointwiseMinBlocksHeuristic,
 )
 from helion._compiler.cute.autotune.heuristics.cute_rolled_cluster_packet import (
     CuteRolledClusterPacketHeuristic,
@@ -220,6 +224,9 @@ from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG
 from helion._compiler.cute.tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT,
 )
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY,
@@ -1146,7 +1153,10 @@ class TestAutotunerHeuristic(TestCase):
             with self.subTest(default=default):
                 provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
                 provider.args = ()
-                provider.settings = MagicMock(autotune_baseline_fn=None)
+                # No precompile pool: the baseline compiles in-process only.
+                provider.settings = MagicMock(
+                    autotune_baseline_fn=None, autotune_precompile=None
+                )
                 provider.config_spec = MagicMock()
                 provider.config_spec.autotune_reference_config.return_value = reference
                 provider.config_spec.default_config.return_value = default
@@ -1396,6 +1406,7 @@ class TestAutotunerHeuristic(TestCase):
             frozenset({"config_num_sm", "input_tensor_metadata"}),
         )
         for heuristic in (
+            CuteStridedReductionHeuristic,
             CuteTcgen05ClusterM2Heuristic,
             TritonH100FormulaMatmulHeuristic,
             TritonH100MultiMatmulHeuristic,
@@ -4337,6 +4348,17 @@ _CUTE_HEURISTIC_ORDER = (
     "cute_fragment_pure_producer_regions",
     "cute_radix_selection",
     "cute_fragment_half_mma",
+    "cute_strided_reduction",
+    "cute_privatize_atomics",
+    "cute_rolled_row_loads_first",
+    "cute_persistent_lane_unroll",
+    "cute_persistent_unpadded_rows",
+    "cute_grid_lane_jam",
+    "cute_transposed_store_seeds",
+    "cute_split_column_reduction",
+    "cute_reduction_lane_jam",
+    "cute_reduction_lane_jam_forwarding",
+    "cute_delinearized_row_reduction",
 )
 
 
@@ -4355,19 +4377,22 @@ class TestHeuristicRegistry(TestCase):
         self.assertEqual(CuteBackend().autotuner_heuristics(), CUTE_HEURISTICS)
 
     def test_cute_appended_families_stay_outside_the_ranked_tuple(self) -> None:
-        # Both are planted after every post-processing step, never ranked.
+        # They are planted after every post-processing step, never ranked.
         self.assertNotIn(CuteFullChunkRowHeuristic, CUTE_HEURISTICS)
         self.assertNotIn(CuteRolledClusterPacketHeuristic, CUTE_HEURISTICS)
-        self.assertEqual(CUTE_SEED_FACT_HEURISTICS, (CuteRolledClusterPacketHeuristic,))
+        self.assertNotIn(CutePointwiseMinBlocksHeuristic, CUTE_HEURISTICS)
+        self.assertEqual(
+            CUTE_SEED_FACT_HEURISTICS,
+            (CuteRolledClusterPacketHeuristic, CutePointwiseMinBlocksHeuristic),
+        )
         self.assertEqual(
             CuteBackend().seed_fact_heuristics(), CUTE_SEED_FACT_HEURISTICS
         )
-        self.assertEqual(
-            compiler_seed_specialization_facts(
-                "cute", (CuteRolledClusterPacketHeuristic.name,)
-            ),
-            CuteRolledClusterPacketHeuristic.CACHE_SPECIALIZATION_FACTS,
-        )
+        for heuristic in CUTE_SEED_FACT_HEURISTICS:
+            self.assertEqual(
+                compiler_seed_specialization_facts("cute", (heuristic.name,)),
+                heuristic.CACHE_SPECIALIZATION_FACTS,
+            )
 
     def test_other_backend_registries_are_pinned(self) -> None:
         expected = {
@@ -10582,7 +10607,10 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
 
     @onlyBackends(["cute"])
-    def test_cute_tcgen05_aux_tma_seed_rejects_mixed_exact_aux_dtype(self) -> None:
+    def test_cute_tcgen05_aux_tma_seed_admits_mixed_exact_aux_dtype(self) -> None:
+        """Each staged operand keeps its own dtype in its ring: a bf16 and an
+        FP32 residual of a 16-bit output both take the aux-TMA seeds."""
+
         @helion.kernel(backend="cute")
         def cute_matmul_two_residuals(
             x: torch.Tensor,
@@ -10613,8 +10641,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
 
         spec = bound.config_spec
         self.assertTrue(spec.tcgen05.aux_kernel_detected)
-        self.assertFalse(spec.tcgen05.exact_shape_aux_kernel_detected)
-        self.assertFalse(
+        self.assertTrue(spec.tcgen05.exact_shape_aux_kernel_detected)
+        self.assertTrue(
             any(
                 config.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
                 == TCGEN05_AUX_LOAD_MODE_TMA
@@ -10623,7 +10651,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
 
     @onlyBackends(["cute"])
-    def test_cute_tcgen05_aux_tma_seed_rejects_unrelated_exact_aux_store(
+    def test_cute_tcgen05_aux_tma_seed_skips_an_adopted_aux_only_store(
         self,
     ) -> None:
         @helion.kernel(backend="cute")
@@ -10653,13 +10681,20 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             bound = cute_matmul_and_elementwise_store.bind(args)
 
         spec = bound.config_spec
-        # The residual load belongs to a separate elementwise store, not the
-        # matmul epilogue, so no aux-only matmul search axis is productive.
-        self.assertFalse(spec.tcgen05.aux_kernel_detected)
+        # The matmul's epilogue adopts the store of the residual alone, so the
+        # epilogue reads an aux operand (``aux_kernel_detected``); but the
+        # residual reaches no accumulator chain, so no aux TMA seed stages it,
+        # and no seed hoists aux loads ahead of the accumulator wait (``out``
+        # has none to hoist).
+        self.assertTrue(spec.tcgen05.aux_kernel_detected)
         self.assertFalse(spec.tcgen05.exact_shape_aux_kernel_detected)
-        self.assertNotIn(
-            TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
-            {key for key, _count, _is_sequence in spec.flat_key_layout()},
+        self.assertFalse(spec.tcgen05.aux_loads_on_every_store)
+        self.assertFalse(
+            any(
+                config.config.get(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY)
+                == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+                for config in spec.compiler_seed_configs
+            )
         )
         self.assertFalse(
             any(
@@ -10921,8 +10956,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         # fits (the foundation depth); ab=3 + c=4 overflows (matching the
         # cycle-90 probe where a directly sampled 256x256 ab=3 + c=4 hit a raw
         # ``ptxas: too much shared`` error). Uses a plain (no-epilogue) matmul so
-        # the residual aux-TMA projection (which forces ab=2) does not claim the
-        # sampled candidate — the admission gate is the only thing acting on c=4.
+        # the residual aux-TMA projection (which sets the producer's ring) does
+        # not claim the sampled candidate — the admission gate is the only
+        # thing acting on c=4.
         # The SMEM budget is MOCKED to the B200 value so the gate is exercised
         # deterministically on any cute host (``@onlyBackends`` does not imply
         # B200).
@@ -11195,10 +11231,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertTrue(residual_tcfg.exact_shape_aux_kernel_detected)
 
         # The plain output has an exact allocation proof for deeper paired-CTA
-        # pipelines. Auxiliary loads keep the legacy fragment, whose high is
-        # the operand dtype's deep-ring cap (12 for 16-bit operands: the
-        # one-wave 256x64x64 ring runs 9 stages, the one-CTA 128x64x64 ring
-        # 8); the separate AB/source-C budget checks below decide what fits.
+        # pipelines, and so do the bias and residual epilogues below; the
+        # separate AB/source-C budget checks below decide what fits.
         self.assertTrue(surface.paired_pipeline_search_enabled(plain_tcfg))
         self.assertEqual(
             surface.optional_fragments(plain_tcfg, for_search=True)[
@@ -11206,17 +11240,20 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             ].high,
             TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
         )
-        # The broadcast (rowvec) bias keeps the legacy fragment: no allocation
-        # proof, the dtype hard cap. An exact-shape 16-bit auxiliary load is a
+        # The broadcast (rowvec) bias records its row in the allocation proof
+        # (a ``pre_acc_wait`` row stage the model charges) and takes the
+        # budget-aware ring. An exact-shape 16-bit auxiliary load is a
         # register-resident SIMT load that takes no shared memory, so the
         # residual kernel keeps the complete allocation proof (facts that record
         # the auxiliary loads) and the same budget-aware ring as the plain GEMM.
-        self.assertIsNone(bias_tcfg.pipeline_smem_facts)
-        bias_ab_fragment = surface.optional_fragments(bias_tcfg, for_search=True)[
-            "tcgen05_ab_stages"
-        ]
-        self.assertEqual(bias_ab_fragment.high, smem._get_dtype_ab_stages_hard_cap(2))
-        self.assertEqual(bias_ab_fragment.high, 12)
+        self.assertIsNotNone(bias_tcfg.pipeline_smem_facts)
+        self.assertEqual(len(bias_tcfg.pipeline_smem_facts.rows), 1)
+        self.assertEqual(
+            surface.optional_fragments(bias_tcfg, for_search=True)[
+                "tcgen05_ab_stages"
+            ].high,
+            TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
+        )
         self.assertIsNotNone(residual_tcfg.pipeline_smem_facts)
         self.assertTrue(residual_tcfg.pipeline_smem_facts.has_auxiliary_loads)
         self.assertEqual(

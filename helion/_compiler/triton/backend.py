@@ -18,8 +18,10 @@ import torch
 
 from ... import _compat
 from ... import exc
+from ..ast_extension import expr_from_string
 from ..backend import Backend
 from ..backend import BackendState
+from ..backend import HandlerOpOverrides
 from ..backend import LauncherInfo
 from ..backend import log
 
@@ -39,6 +41,7 @@ if TYPE_CHECKING:
     from ..device_function import DeviceBodyContext
     from ..device_function import DeviceFunction
     from ..emitter_protocols import RetryPolicy
+    from ..inductor_lowering import GenerateASTFromInductor
     from ..inductor_lowering import GraphInterpreter
 
     InductorOpOverrides = OpsHandler[Any]
@@ -59,6 +62,20 @@ def _triton_jit_supports_do_not_specialize() -> bool:
 
 # Triton options a config asked for that this build lacks, warned once each.
 _warned_unavailable_options: set[str] = set()
+
+
+# Under fast_math Triton also lowers torch.sigmoid with libdevice's fast exp
+# and divide (``inductor_lowering``), and the max/min reductions and
+# torch.maximum / torch.minimum to ``tl.max`` / ``tl.maximum`` without the NaN
+# propagation torch has (``TritonBackend.reduction_expr``, ``overrides.py``);
+# the CuTe backend keeps its sigmoid and the NaN-propagating forms either way.
+_TRITON_FAST_MATH: dict[object, str] = {
+    torch.ops.aten.sigmoid.default: "sigmoid",
+    torch.ops.aten.amax.default: "max/min reductions",
+    torch.ops.aten.amin.default: "max/min reductions",
+    torch.ops.aten.maximum.default: "maximum/minimum",
+    torch.ops.aten.minimum.default: "maximum/minimum",
+}
 
 
 class TritonBackend(Backend):
@@ -87,6 +104,9 @@ class TritonBackend(Backend):
     def uses_triton_compiler(self) -> bool:
         return True
 
+    def handler_op_overrides(self) -> HandlerOpOverrides:
+        return TritonHandlerOpOverrides()
+
     def llm_prompt_profile(self) -> LlmPromptProfile:
         from ...autotuner.llm.profile import LlmPromptProfile
 
@@ -110,12 +130,23 @@ class TritonBackend(Backend):
         return True
 
     @property
+    def lowers_mask_select(self) -> bool:
+        return True
+
+    @property
     def merges_reduction_dims(self) -> bool:
         return True
 
     @property
     def warns_fast_math_unused(self) -> bool:
         return True
+
+    def fast_math_name(self, node: torch.fx.Node) -> str | None:
+        from ..inductor_lowering import functional_target
+
+        return _TRITON_FAST_MATH.get(functional_target(node)) or super().fast_math_name(
+            node
+        )
 
     @property
     def supports_autotune_multi(self) -> bool:
@@ -349,6 +380,13 @@ class TritonBackend(Backend):
     def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
         return f"tl.where({mask}, {true_val}, {false_val})"
 
+    def mask_padded_range_lanes(
+        self, value: str, length: int, dim: int, ndim: int, identity: str
+    ) -> str | None:
+        from ..indexing_strategy import padded_lanes_mask
+
+        return self.where_expr(padded_lanes_mask(length, dim, ndim), value, identity)
+
     def minimum_expr(self, a: str, b: str) -> str:
         return f"tl.minimum({a}, {b})"
 
@@ -535,6 +573,8 @@ class TritonBackend(Backend):
             )
         if reduction_type == "prod":
             return f"triton_helpers.prod({input_name}, {dim})"
+        if reduction_type == "any":
+            return f"triton_helpers.any({input_name}, {dim})"
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
 
     def reduction_combine_expr(
@@ -884,6 +924,31 @@ class GluonBackend(TritonBackend):
         return "triton"
 
 
+class TritonHandlerOpOverrides(HandlerOpOverrides):
+    def div_rn(
+        self, handler: GenerateASTFromInductor, a: object, b: object
+    ) -> str | None:
+        # Triton's ``/`` is ``div.full.f32``: a reciprocal and a multiply,
+        # within 2 ulp.  ``tl.div_rn`` is ``div.rn.f32``; like ``/`` it
+        # divides in fp32 (half-precision and integer operands are promoted
+        # first) and the result stays fp32, for the consumer to cast.
+        return handler._lift(
+            expr_from_string(
+                "tl.div_rn({a}, {b})",
+                a=handler._create_cast_expr(a, torch.float32),
+                b=handler._create_cast_expr(b, torch.float32),
+            )
+        )
+
+
+class TileIRHandlerOpOverrides(TritonHandlerOpOverrides):
+    def div_rn(
+        self, handler: GenerateASTFromInductor, a: object, b: object
+    ) -> str | None:
+        # ``tl.div_rn`` was not tried on TileIR: it keeps ``/``.
+        return None
+
+
 class TileIRBackend(TritonBackend):
     """TileIR code generation backend (extends Triton)."""
 
@@ -894,6 +959,9 @@ class TileIRBackend(TritonBackend):
     @property
     def uses_triton_compiler(self) -> bool:
         return False
+
+    def handler_op_overrides(self) -> HandlerOpOverrides:
+        return TileIRHandlerOpOverrides()
 
     def llm_prompt_profile(self) -> LlmPromptProfile:
         # The prompts name this backend by its registry name.

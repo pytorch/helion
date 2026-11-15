@@ -27,7 +27,7 @@ pytestmark = pytest.mark.cpu_only
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def _while_recipe(x, limits, swap: hl.constexpr, steps: hl.constexpr):
+def _while_recipe(x, limits, steps: hl.constexpr):
     out = torch.empty_like(x)
     for row in hl.grid(x.size(0)):
         lane = hl.arange(x.size(1))
@@ -36,10 +36,7 @@ def _while_recipe(x, limits, swap: hl.constexpr, steps: hl.constexpr):
         iteration = hl.full([], 0, dtype=torch.int32)
         limit = limits[row]
         while iteration < limit:
-            if swap:
-                left, right = right, left
-            else:
-                left, right = left + right, left - right
+            left, right = left + right, left - right
             for _packet in range(steps):
                 left = torch.gather(left + 1, 0, ((lane * 3 + 1) % x.size(1)).long())
             iteration = iteration + 1
@@ -47,15 +44,32 @@ def _while_recipe(x, limits, swap: hl.constexpr, steps: hl.constexpr):
     return out
 
 
-def _bind(*, swap: bool = False):
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _while_with_branch(x, limits):
+    # The plan refuses an ``if`` in the loop's body.
+    out = torch.empty_like(x)
+    for row in hl.grid(x.size(0)):
+        lane = hl.arange(x.size(1))
+        left = x[row, lane]
+        iteration = hl.full([], 0, dtype=torch.int32)
+        limit = limits[row]
+        while iteration < limit:
+            if limit > 1:
+                left = left + 1
+            iteration = iteration + 1
+        out[row, lane] = left
+    return out
+
+
+def _bind(*, branch: bool = False):
+    kernel, constexprs = (_while_with_branch, ()) if branch else (_while_recipe, (2,))
     with mock_cuda_unavailable(), _target(), forbid_native_compile():
         return cpu_bind(
-            _while_recipe,
+            kernel,
             (
                 torch.arange(48).reshape(3, 16).float(),
                 torch.tensor([0, 1, 3], dtype=torch.int32),
-                swap,
-                2,
+                *constexprs,
             ),
         )
 
@@ -141,13 +155,13 @@ def test_two_configs_in_one_environment_plan_their_own_graph_copies() -> None:
 
 @skipIfRefEager("plans the traced graphs")
 def test_refusal_is_raised_fresh_and_the_environment_is_collected() -> None:
-    bound = _bind(swap=True)
+    bound = _bind(branch=True)
     graphs = bound.host_function.device_ir.graphs
     call = _while_call(graphs)
     with bound.env:
-        with pytest.raises(exc.InvalidConfig, match="explicit initialized phi") as a:
+        with pytest.raises(exc.InvalidConfig, match="nested while/if") as a:
             resident_while_plan(call, graphs)
-        with pytest.raises(exc.InvalidConfig, match="explicit initialized phi") as b:
+        with pytest.raises(exc.InvalidConfig, match="nested while/if") as b:
             resident_while_plan(call, graphs)
     assert a.value is not b.value
     assert str(a.value) == str(b.value)

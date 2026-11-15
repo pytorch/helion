@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 from contextlib import contextmanager
-import dataclasses
 import sys
 from types import FunctionType
 from types import ModuleType
@@ -13,17 +12,16 @@ import pytest
 import torch
 
 import helion
-from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.state import cute_env_state
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._testing import cpu_render_target
 from helion._testing import import_example
 from helion._testing import patch_target_facts
+from helion._testing.cute_codegen import compile_reference
+from helion._testing.cute_codegen import reference_host_function
+from helion._testing.cute_codegen import run_cpu_reference
 from helion._testing.cute_structural_kernels import _matmul
 import helion.language as hl
-from helion.runtime.ref_mode import RefMode
-from helion.runtime.ref_mode import RefModeContext
-from helion.runtime.ref_mode import RefModeTorchFunctionMode
 
 pytestmark = pytest.mark.cpu_only
 
@@ -340,30 +338,10 @@ def _inputs(
     return a, b
 
 
-class _CpuRefMode(RefModeTorchFunctionMode):
-    def _handle_mm_with_bias(
-        self,
-        args: tuple[object, ...],
-        kwargs: dict[str, object],
-        mm_func: object,
-        op_name: str,
-    ) -> torch.Tensor:
-        assert op_name == "addmm"
-        accumulator, lhs, rhs = (cast("torch.Tensor", arg) for arg in args[:3])
-        assert accumulator.dtype is torch.float32
-        assert accumulator.device.type == lhs.device.type == rhs.device.type == "cpu"
-        assert not kwargs
-        return accumulator + lhs.float() @ rhs.float()
-
-
 def _run_transformed_reference(
     bound: BoundKernel[Any], args: tuple[torch.Tensor, ...]
 ) -> torch.Tensor:
-    host = _host(bound)
-    with bound.env, host:
-        definition = host.codegen_function_def(list(host.body))
-    definition = ast.parse(ast.unparse(ast.fix_missing_locations(definition))).body[0]
-    assert isinstance(definition, ast.FunctionDef)
+    definition = reference_host_function(bound)
     for node in ast.walk(definition):
         if not isinstance(node, ast.For):
             continue
@@ -373,25 +351,8 @@ def _run_transformed_reference(
         else:
             value = ast.Constant(8)
         node.iter.keywords.append(ast.keyword(arg="block_size", value=value))
-    namespace = dict(bound.kernel.fn.__globals__)
-    namespace["_default_cute_launcher"] = None
-    exec(
-        compile(
-            ast.fix_missing_locations(ast.Module(body=[definition], type_ignores=[])),
-            "<stripmine-reference>",
-            "exec",
-        ),
-        namespace,
-    )
-    with _cpu_target():
-        env = CompileEnvironment(
-            torch.device("cpu"),
-            dataclasses.replace(bound.settings, ref_mode=RefMode.EAGER),
-        )
-    context = RefModeContext(env, None)
-    context.func_mode = _CpuRefMode()
-    with context:
-        result = namespace[definition.name](*args)
+    reference = compile_reference(bound, definition, "<stripmine-reference>")
+    result = run_cpu_reference(bound, reference, args)
     assert isinstance(result, torch.Tensor)
     return result
 

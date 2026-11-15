@@ -21,6 +21,7 @@ import dataclasses
 import functools
 import os
 from pathlib import Path
+import re
 import sys
 from typing import TYPE_CHECKING
 from typing import Any
@@ -30,6 +31,7 @@ from unittest.mock import patch
 import torch
 
 from .._compiler.cute import cute_flash
+from .._compiler.cute import cute_flash_gated
 from .._compiler.cute.autotune.config_generation_ext import cute_generation_extension
 from .._compiler.cute.autotune.flash_surface import enable_cute_flash_search
 from .._compiler.cute.backend import CuteBackend
@@ -47,22 +49,37 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from collections.abc import Sequence
 
+    from .._compiler.cute.cute_flash_gated import GatedAttentionMatch
     from ..runtime.kernel import BoundKernel
     from ..runtime.kernel import ConfigLike
     from ..runtime.kernel import Kernel
 
 __all__ = [
+    "APPROX_GATE_DIVISION",
+    "PLAIN_GATE_DIVISION",
     "bind_flash_kernel",
     "compile_and_run",
     "compile_and_source",
     "compiled_source",
     "flash_config_spec",
     "frozen_overrides",
+    "gated_attention_match",
     "memoized_flash_fragments",
     "render_flash_config",
     "seeds_per_codegen_branch",
     "shared_flash_generation",
 ]
+
+# A fused gated-attention body's gate division: the ``/`` of the plain path
+# (``div.full.f32``, or the IEEE divide under ``cute_exact_division``), and
+# the approximate reciprocal multiply the ``fast_math`` setting selects (with
+# the exp, the lines of the gate program that differ between the two modes).
+PLAIN_GATE_DIVISION = re.compile(r"flash_g\d+ = flash_g\d+ / flash_g\d+$", re.MULTILINE)
+APPROX_GATE_DIVISION = re.compile(
+    r"flash_g\d+ = _helion_flash_rt\.gated_mul_ftz_vec\(flash_g\d+, "
+    r"cute\.math\.rcp\(flash_g\d+, approx=True, ftz=True\)\)$",
+    re.MULTILINE,
+)
 
 _FRAGMENT_CACHE: dict[object, dict[str, Any]] = {}
 _FRAGMENT_VERIFIED: set[object] = set()
@@ -327,6 +344,15 @@ def compiled_source(bound: BoundKernel[Any], config: ConfigLike) -> str:
     """
     bound.set_config(config)
     return compile_and_source(bound, config)[1]
+
+
+def gated_attention_match(bound: BoundKernel[Any]) -> GatedAttentionMatch | None:
+    """The config-independent gated-attention matcher
+    (``cute_flash_gated.match_gated_attention``) on ``bound``'s device IR."""
+    env, host_function = bound.env, bound.host_function
+    assert env is not None and host_function is not None
+    with env, host_function:
+        return cute_flash_gated.match_gated_attention(host_function.device_ir)
 
 
 def compile_and_run(

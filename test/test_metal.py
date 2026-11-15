@@ -178,6 +178,21 @@ def masked_copy(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="metal", static_shapes=True)
+def carry_exp_sum(x: torch.Tensor) -> torch.Tensor:
+    """A per-lane accumulator updated from each tile's loads, summed after
+    the loop (``mask_loop_carries``)."""
+    m, n = x.shape
+    bn = hl.register_block_size(n)
+    out = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m, bn], dtype=x.dtype)
+        for tile_n in hl.tile(n, block_size=bn):
+            acc = acc + torch.exp(x[tile_m, tile_n])
+        out[tile_m] = acc.sum(-1)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Kernel definitions – arithmetic
 # ---------------------------------------------------------------------------
@@ -603,6 +618,21 @@ class TestMetalBoundsMasking(unittest.TestCase):
                 self.assertRaisesRegex(exc.BackendUnsupported, "not known until"),
             ):
                 kernel(x[:, 0] if kernel is flat else x)
+
+    def test_loop_carry_keeps_a_partial_tiles_fill_values_out(self) -> None:
+        """500 columns end in a 4-column tile of a 16-lane carry: the
+        update's ``torch.exp`` takes 0 in the 12 padded lanes
+        (``_mask_select``), each of which would otherwise add ``exp(0)``."""
+        x = torch.randn(64, 500, device=DEVICE)
+        result, _, msl = _run_with_msl(
+            carry_exp_sum, (x,), helion.Config(block_sizes=[16, 4])
+        )
+        torch.testing.assert_close(result, torch.exp(x).sum(-1), rtol=1e-4, atol=1e-4)
+        self.assertRegex(
+            msl,
+            r"_mask_select\w* = \(mask_\d+ \? \w+ : static_cast<float>\(0\)\);",
+            "the operand select not found in generated MSL",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -5744,6 +5774,17 @@ def permuted_slice_sum(y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="metal", autotune_effort="none")
+def permuted_unit_dim_sum(x: torch.Tensor) -> torch.Tensor:
+    """A sum over an extent-1 dim lowers element-wise: its ``[tm, tn, 1]``
+    input meets the ``[tm, tn]`` result without the unit dim."""
+    m, n = x.shape
+    out = torch.empty([n, m], dtype=x.dtype, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        out[tn, tm] = (x[tm, tn][:, :, None] * 2.0).sum(-1).T
+    return out
+
+
+@helion.kernel(backend="metal", autotune_effort="none")
 def dot_permuted_lhs(x: torch.Tensor, s: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """A computed, transposed lhs over a tile K (mamba2_chunk_state's form)."""
     k, m = x.shape
@@ -6133,6 +6174,13 @@ class TestMetalPermute(unittest.TestCase):
         torch.testing.assert_close(
             self._run(permuted_slice_sum, (y,))[0], y.sum(1).T, rtol=1e-4, atol=1e-4
         )
+
+    def test_permute_beside_a_unit_dim_reduction(self) -> None:
+        """The input of a reduction over an extent-1 dim meets its result
+        without the unit dim (``size1_reduction_positions``), so the kernel
+        that permutes is accepted and each thread reads its own element."""
+        x = torch.randn(48, 80, device=DEVICE)
+        torch.testing.assert_close(self._run(permuted_unit_dim_sum, (x,))[0], (x * 2).T)
 
     def test_permute_into_dot(self) -> None:
         tiled = helion.Config(block_sizes=[16, 16, 16], num_threads=[4, 4, 16])

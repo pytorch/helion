@@ -13,7 +13,6 @@ pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
 import helion
-from helion import exc
 from helion._compiler.cute import cute_epilogue as epilogue
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_aux import aux_config as _config
@@ -345,19 +344,25 @@ def test_computed_aux_cast_codegen_keeps_both_rounding_boundaries(
 
 
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
-def test_aux_cast_does_not_widen_tma_transport_dtype_admission(
-    dtype: torch.dtype,
-) -> None:
+def test_aux_cast_does_not_narrow_tma_transport_dtype(dtype: torch.dtype) -> None:
+    """A computed cast of FP32 operands to the output's dtype does not narrow
+    their TMA transport: each ring stages its operand in its own dtype (the
+    rings take exact-shape operands of any dtype) and both rounding
+    boundaries run in registers."""
     args = (
         torch.empty((256, 128), dtype=dtype),
         torch.empty((128, 512), dtype=dtype),
         torch.empty((256, 512), dtype=torch.float32),
         torch.empty((256, 512), dtype=torch.float32),
     )
-    with (
-        cpu_codegen(),
-        pytest.raises(exc.BackendUnsupported, match="auxiliary tensor dtype to match"),
-    ):
-        _computed_cast_aux._bind_isolated(args).to_code(
+    with cpu_codegen():
+        code = _computed_cast_aux._bind_isolated(args).to_code(
             _config(block_sizes=[128, 128, 64], tcgen05_aux_load_mode="tma")
         )
+    for index in (0, 1):
+        assert (
+            f"tcgen05_aux_smem_layout_{index} = cutlass.utils.blackwell_helpers."
+            "make_smem_layout_epi(cutlass.Float32,"
+        ) in code
+    narrow = "cutlass.BFloat16" if dtype == torch.bfloat16 else "cutlass.Float16"
+    assert f".to({narrow})" in code

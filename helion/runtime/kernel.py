@@ -84,6 +84,7 @@ from .._dist_utils import kernel_uses_symm_mem
 from .._logging import LazyString
 from .._utils import _read_cell
 from .._utils import counters
+from .._utils import indexing_uses_tensor_descriptor
 from .._utils import next_power_of_2
 from ..autotuner.base_search import _AutotunableKernel
 from ..autotuner.benchmark_provider import _SEARCHING_CANDIDATES
@@ -142,12 +143,15 @@ class _TensorDescriptorOperationGuard(Protocol):
 
 
 def _td_guard_active_for_config(
-    guard: _TensorDescriptorOperationGuard, config: Config
+    guard: _TensorDescriptorOperationGuard,
+    config: Config,
+    descriptor_memory_ops: frozenset[int],
 ) -> bool:
-    return any(
-        _indexing_config_uses_tensor_descriptor(config.indexing, index)
-        for index in guard.memory_op_indices
-    ) or any(
+    """Whether ``config`` indexes one of ``guard``'s memory ops through a
+    tensor descriptor.  ``descriptor_memory_ops`` holds the loads and stores
+    its code does, by their facts' ``indexing_index``
+    (``BoundKernel._descriptor_memory_ops``)."""
+    return not guard.memory_op_indices.isdisjoint(descriptor_memory_ops) or any(
         _indexing_config_uses_tensor_descriptor(config.atomic_indexing, index)
         for index in guard.atomic_op_indices
     )
@@ -3933,10 +3937,21 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
     def extra_cache_key(self) -> str:
         """Return extra data folded into the disk-cache key.
 
-        Returns ``""`` by default, leaving the cache key unchanged.
+        Returns ``""`` by default, leaving the cache key unchanged.  Code
+        generated for calls that hold fewer facts than the binding's own
+        launches (an Inductor render, ``inductor_call_facts``) keys by those
+        facts: a config tuned for one set of calls may be refused for another.
         """
         policy = self.kernel.cute_structural_policy
-        return "" if policy is None else f"cute_structural_policy:{policy.identity()}"
+        key = "" if policy is None else f"cute_structural_policy:{policy.identity()}"
+        env = self.env
+        if env.input_alignment_limit is not None or not env.dispatch_guards_enforced:
+            strides = sorted(map(repr, env.symbolic_stride_sources))
+            key += (
+                f"call_facts:{env.input_alignment_limit}:"
+                f"{env.dispatch_guards_enforced}:{strides}"
+            )
+        return key
 
     def supports_subprocess_benchmark(self) -> bool:
         return True
@@ -4465,10 +4480,21 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         else:
             candidate_configs = None
 
-        def guard_is_active(guard: _TensorDescriptorOperationGuard) -> bool:
-            return candidate_configs is None or any(
-                _td_guard_active_for_config(guard, config)
+        # Each candidate with the memory ops its code indexes through
+        # tensor descriptors.
+        candidates = (
+            None
+            if candidate_configs is None
+            else [
+                (config, self._descriptor_memory_ops(config))
                 for config in candidate_configs
+            ]
+        )
+
+        def guard_is_active(guard: _TensorDescriptorOperationGuard) -> bool:
+            return candidates is None or any(
+                _td_guard_active_for_config(guard, config, memory_ops)
+                for config, memory_ops in candidates
             )
 
         def descriptor_extent_cap(
@@ -4480,7 +4506,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     if self.env.device.type == "cuda"
                     else None
                 )
-            if candidate_configs is None:
+            if candidates is None:
                 return (
                     CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
                     if self.env.device.type == "cuda"
@@ -4488,8 +4514,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 )
             active_configs = tuple(
                 config
-                for config in candidate_configs
-                if _td_guard_active_for_config(guard, config)
+                for config, memory_ops in candidates
+                if _td_guard_active_for_config(guard, config, memory_ops)
             )
             # Registered block sizes resolve through the host function's origins.
             assert self.host_function is not None
@@ -4774,6 +4800,48 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 runtime_args,
             ):
                 seen.update(new_descriptors)
+
+    def _descriptor_memory_ops(self, config: Config) -> frozenset[int]:
+        """The facts' ``indexing_index`` (``memory_op_facts``) of the loads
+        and stores the code for ``config`` indexes through tensor
+        descriptors.  ``indexing`` follows that code's slots, which a config
+        that rolls a reduction orders differently from the facts
+        (``DeviceIR.config_memory_op_fact_pairs``)."""
+        indexing = config.indexing
+        if not indexing_uses_tensor_descriptor(indexing):
+            return frozenset()
+        every_op = frozenset(
+            fact.indexing_index for fact in self.config_spec.memory_op_facts
+        )
+        if indexing == "tensor_descriptor":
+            # Every load and store, in any order.
+            return every_op
+        assert self.host_function is not None
+        device_ir = self.host_function.device_ir
+        try:
+            with self.env:
+                graphs = device_ir.config_codegen_graphs(config)
+        except Exception:
+            # Its code cannot be built, so its compile fails too, which
+            # autotuning skips; guard discovery must not make that failure
+            # eager.  Count every load and store as a descriptor's.
+            log.debug(
+                "descriptor guards: the codegen graphs of %s do not build",
+                config,
+                exc_info=True,
+            )
+            return every_op
+        from .._compiler.device_ir import codegen_memory_op_fact_pairs
+
+        with self.env:
+            pairs = codegen_memory_op_fact_pairs(graphs, device_ir.root_ids)
+        return frozenset(
+            fact.indexing_index
+            for fact, config_fact in pairs
+            if _indexing_config_uses_tensor_descriptor(
+                indexing, config_fact.indexing_index
+            )
+        )
 
     def _fixed_config_for_td_layout_guards(self) -> Config | None:
         """Return the fixed config if TD layout guards can be filtered safely."""

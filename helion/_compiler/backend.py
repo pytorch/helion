@@ -180,6 +180,17 @@ class HandlerOpOverrides:
     def rsqrt(self, handler: GenerateASTFromInductor, x: object) -> str | None:
         return None
 
+    def div_rn(
+        self, handler: GenerateASTFromInductor, a: object, b: object
+    ) -> str | None:
+        """The round-to-nearest fp32 quotient of a 32-bit or 16-bit float
+        division (operands widened, the quotient left in fp32), on a backend
+        whose ``/`` is not one; ``None`` where it is.  Asked for a quotient
+        that is then truncated or floored
+        (``GenerateASTFromInductor.truediv``), and for a lowering's
+        ``ops.div_rn`` (``GenerateASTFromInductor.div_rn``)."""
+        return None
+
     def integer_shift(
         self, handler: GenerateASTFromInductor, name: str, x: object, y: object
     ) -> str | None:
@@ -253,6 +264,21 @@ class DeviceIRStage(enum.Enum):
     AFTER_KERNEL_MATMUL_FACT = "after_kernel_matmul_fact"
     # After ``build_pointwise_facts``, the last lowering step (``analysis`` set).
     AFTER_POINTWISE_FACTS = "after_pointwise_facts"
+
+
+# Operations whose lowering has a faster approximate form under the fast_math
+# setting on the Triton and CuTe backends (``inductor_lowering`` and the cute
+# ``exp2_fastmath`` / ``exact_division`` / gelu templates), by the name
+# ``exc.FastMathUnused`` reports them under; a backend can count more, or
+# fewer (``Backend.fast_math_name``).
+FAST_MATH_SENSITIVE_TARGETS: dict[object, str] = {
+    torch.ops.aten.reciprocal.default: "reciprocal",
+    torch.ops.aten.exp.default: "exp",
+    torch.ops.aten.exp2.default: "exp2",
+    torch.ops.aten.rsqrt.default: "rsqrt",
+    torch.ops.aten.erf.default: "erf",
+    torch.ops.aten.gelu.default: "gelu",
+}
 
 
 class Backend(abc.ABC):
@@ -364,9 +390,24 @@ class Backend(abc.ABC):
         return False
 
     @property
+    def intra_loop_barriers_order_atomics(self) -> bool:
+        """Whether a load after an atomic of its loop body takes the barrier
+        ``mark_intra_loop_raw_barriers`` asks for, as one after a store does;
+        a backend whose own barrier pass orders atomics says False."""
+        return True
+
+    @property
     def lowers_chunk_unbind(self) -> bool:
         """Whether ``torch.chunk`` / ``torch.unbind`` of a size-two axis lower
         on the device (through ``hl.split``)."""
+        return False
+
+    @property
+    def lowers_mask_select(self) -> bool:
+        """Whether the backend lowers ``_mask_select``, with which
+        ``mask_loop_carries`` keeps a partial tile's padded lanes out of a
+        loop carry; without it such a carry takes the values those lanes
+        load (FlyDSL)."""
         return False
 
     def barrier_allows_pid_type(self, pid_type: str) -> bool:
@@ -402,6 +443,14 @@ class Backend(abc.ABC):
         """Whether a statically known program count may be folded into the
         grouped-ordering arithmetic (``L2GroupingProgramIDs``)."""
         return False
+
+    @property
+    def relowered_memory_ops_take_new_slots(self) -> bool:
+        """Whether a load or store that code generation lowers again (a
+        ``while`` condition, again at the end of the loop's body) takes the
+        next per-memory-op config slots (``indexing``,
+        ``load_eviction_policies``) rather than the ones it took first."""
+        return True
 
     @property
     def reduction_loops_allow_non_power_of_two(self) -> bool:
@@ -453,6 +502,23 @@ class Backend(abc.ABC):
         ``fast_math`` setting is off (``exc.FastMathUnused``)."""
         return False
 
+    def fast_math_name(self, node: torch.fx.Node) -> str | None:
+        """The name ``exc.FastMathUnused`` reports ``node``, a floating-point
+        operation, under when the ``fast_math`` setting changes how it lowers,
+        else None: one of ``FAST_MATH_SENSITIVE_TARGETS``, or a plain true
+        division.  None does not promise the same lowering: a backend may
+        also pass a fast-math flag to operations the warning does not count
+        (for example ``log1p``, and ``tanh`` on ROCm's Triton)."""
+        from .inductor_lowering import _is_plain_true_division
+        from .inductor_lowering import functional_target
+
+        # An in-place op lowers as its functional overload, and changes with
+        # the setting as that does.
+        name = FAST_MATH_SENSITIVE_TARGETS.get(functional_target(node))
+        if name is None and _is_plain_true_division(node):
+            return "fp32 division"
+        return name
+
     @property
     def supports_autotune_multi(self) -> bool:
         """Whether ``Kernel.autotune_multi`` can run on this backend."""
@@ -480,6 +546,21 @@ class Backend(abc.ABC):
         return False
 
     @property
+    def binds_inductor_call_facts(self) -> bool:
+        """Whether code generated for an Inductor graph reads facts its calls
+        may not hold: base alignment past ``GPU_ALIGN_BYTES``, the binding's
+        dispatch guards, the traced strides of inputs the graph keeps
+        symbolic.
+
+        Such a backend renders and tunes for the graph under the graph's
+        facts (``inductor_call_facts``), tunes on a binding of its own and
+        keys its configs by those facts.  A backend whose code reads none of
+        them keeps one binding, and one tuned config, for eager calls and
+        Inductor renders alike.
+        """
+        return False
+
+    @property
     def supports_inductor_fusion(self) -> bool:
         """Whether generated kernels apply Inductor's prologue/epilogue hooks.
 
@@ -487,6 +568,20 @@ class Backend(abc.ABC):
         kernel through ``load_transform``/``store_transform``.  A backend that
         does not honor those hooks must lower its kernels unfused; otherwise
         Inductor would drop the fused producers and consumers.
+        """
+        return False
+
+    @property
+    def drops_unread_scratch_arguments(self) -> bool:
+        """Whether a kernel-local scratch tensor the finished kernel no longer
+        reads loses its parameter and launcher argument
+        (``scratch_tensors.drop_unused_scratch_arguments``).
+
+        Only a backend whose late passes drop such a tensor's stores needs
+        it.  The removal deletes one positional argument of the launch, so a
+        backend whose launcher keywords hold positions into those arguments
+        (Pallas's output and in-place indices, Metal's by-value list) keeps
+        it off.
         """
         return False
 
@@ -922,6 +1017,11 @@ class Backend(abc.ABC):
         ``Lowering``'s)."""
         return NotImplemented
 
+    # Generated-code helper functions with no side effects: dead-code
+    # elimination may drop a scalar assignment whose value only calls them
+    # (``generate_ast._is_pure_scalar_expr``).
+    pure_scalar_helpers: frozenset[str] = frozenset()
+
     def process_fake_tensor_load(
         self,
         tensor: torch.Tensor,
@@ -990,6 +1090,16 @@ class Backend(abc.ABC):
         """Extra ``ConfigSpec`` fragments (config key -> fragment) this backend
         adds to every kernel's search space; ``{}`` for none."""
         return {}
+
+    def default_final_selection_regime(self) -> str | None:
+        """The regime the autotuner's final selection times finalists in
+        when neither ``HELION_AUTOTUNE_L2_FLUSH`` nor
+        ``HELION_AUTOTUNE_FINAL_L2_FLUSH`` names one (see
+        ``final_selection_l2_flush_mode``); a per-call flushed one (``call``
+        or ``kernel``) also times a warm selection's cold tie-break column
+        (``final_selection_second_regime``). ``None`` keeps the search's
+        regime and a ``call`` column."""
+        return None
 
     def autotuner_heuristics(self) -> tuple[AutotunerHeuristicType, ...]:
         """The compiler-seed heuristics this backend plants, in ranked order.
@@ -1243,6 +1353,17 @@ class Backend(abc.ABC):
         """Generate a backend-specific conditional select expression."""
         raise exc.BackendUnsupported(self.name, "where")
 
+    def mask_padded_range_lanes(
+        self, value: str, length: int, dim: int, ndim: int, identity: str
+    ) -> str | None:
+        """``value``, the input of a persistent reduction over dim ``dim`` of
+        an ``ndim``-dim value, with that dim's lanes past the ``length``
+        elements of a padded ``hl.arange`` set to the reduction's
+        ``identity``, or None to leave the input as it is: the default, for
+        backends whose reductions do not read those lanes through this path
+        (masking them in their own emitter, or not padding the range)."""
+        return None
+
     def minimum_expr(self, a: str, b: str) -> str:
         """Generate a backend-specific minimum expression."""
         raise exc.BackendUnsupported(self.name, "minimum")
@@ -1260,6 +1381,14 @@ class Backend(abc.ABC):
     ) -> str:
         """Expression of a ``shape_dims`` tensor filled with ``value_expr`` in ``dtype``."""
         raise exc.BackendUnsupported(self.name, "full tensor creation")
+
+    def widen_reduction_acc_dtype(
+        self, reduction_type: str, dtype: torch.dtype
+    ) -> torch.dtype:
+        """The dtype a ``reduction_type`` reduction accumulates and combines in,
+        given ``dtype``, the computation dtype of its operands
+        (``reduction_strategy.reduction_acc_dtype``)."""
+        return dtype
 
     def reduction_acc_init_expr(
         self, shape_dims: list[str], value_expr: str, dtype: torch.dtype
@@ -1409,8 +1538,8 @@ class Backend(abc.ABC):
         """Generate the cross-thread reduction expression.
 
         ``dtype`` is the accumulation dtype (``reduction_acc_dtype``: the
-        output's computation dtype, the input's for argmin/argmax) when the
-        caller knows it.
+        output's computation dtype, the input's for argmin/argmax, as
+        :meth:`widen_reduction_acc_dtype` widens it) when the caller knows it.
         Backends that allocate typed scratch storage for the reduction (e.g.
         Metal's ``threadgroup`` buffers) need it; the rest ignore it.
         """
@@ -1505,10 +1634,10 @@ class Backend(abc.ABC):
         return constant_repr(value)
 
     def scalar_float_operand_ast(
-        self, x: ast.AST, value: torch.SymFloat, *, computes_in_float64: bool
+        self, x: ast.AST, value: torch.SymFloat | float, *, computes_in_float64: bool
     ) -> ast.AST:
         """``x`` computes ``value``, a SymFloat operand (a Python-float host
-        scalar) of an Inductor op.
+        scalar) of an Inductor op, or a float a scalar node holds.
 
         The op computes with it as a float32 scalar, as torch rounds such a
         scalar to float32 (also the opmath of fp16/bf16 math, see
@@ -1820,15 +1949,23 @@ class Backend(abc.ABC):
     def shares_sibling_thread_axes(self) -> bool:
         """Whether sibling tile loops and mutually exclusive pid branches share
         CUDA thread axes: the dispatcher then widens narrower siblings to the
-        launch and lets exclusive branches share an axis."""
+        launch, lets exclusive branches share an axis, and lays a loop that
+        several grid roots run out after each root's own grid (elsewhere the
+        roots must agree on its axis)."""
         return False
 
-    def inactive_broadcast_alias_block_ids(
-        self, fn: DeviceFunction, strategies: Sequence[TileStrategy]
-    ) -> set[int]:
-        """Reduction blocks that merely alias an existing tile's coordinates
-        (register broadcasting) and get no reduction strategy of their own."""
-        return set()
+    def check_reduction_blocks(
+        self,
+        fn: DeviceFunction,
+        block_ids: Sequence[int],
+        live_graph_ids: frozenset[int] | None,
+    ) -> None:
+        """Refuse a kernel whose live reduction blocks (``block_ids``, the ones
+        ``reduction_strategy_block_ids`` gives a strategy) this backend cannot
+        lay out beside its tile loops in the graphs this config emits
+        (``live_graph_ids``, the result of :meth:`constexpr_live_graph_ids`);
+        the dispatcher asks before it plans any strategy."""
+        return None
 
     def roots_may_reserve_distinct_thread_axes(self) -> bool:
         """Whether separate root loops may reserve different synthetic or
@@ -1890,6 +2027,26 @@ class Backend(abc.ABC):
                 )
                 total_threads *= nt if nt > 0 else bs
         return total_threads
+
+    def thread_axis_extent_limits(self) -> tuple[int, ...] | None:
+        """The most threads each launch axis takes (CUDA: 1024, 1024, 64): the
+        per-thread planner caps an automatic thread count it places on a
+        narrower axis and walks the rest of the tile in a lane loop, and in a
+        kernel of several root loops a reduction whose shared-launch threads
+        would push a tile past its axis's extent keeps the backend's budget
+        (``TileStrategyDispatch.shared_launch_reduction_threads``); ``None``
+        when no axis is narrower than the per-block thread limit."""
+        return None
+
+    def per_thread_reduction_lays_out_tiles(
+        self, config_spec: ConfigSpec, config: Config, tile_threads: int
+    ) -> bool:
+        """Whether a reduction under ``config``, beside tiles of
+        ``tile_threads`` threads, lays the tiles' thread axes out itself (a
+        CuTe register tile puts them below its own axis), so the per-thread
+        planner cannot tell which launch axis a tile lands on and caps no
+        automatic thread count (``thread_axis_extent_limits``)."""
+        return False
 
     def packed_grid_block(self, config: Config) -> tuple[int, int] | None:
         """``(block_id, tiles_per_block)`` of the grid axis packed several
@@ -2040,6 +2197,23 @@ class Backend(abc.ABC):
         origin (``grid_origin_var``) for the backend's root emitters."""
         return False
 
+    def flattened_tile_shares_one_index(self) -> bool:
+        """Whether a flattened tile's dims share one index, a run of the
+        flattened loop rather than a block of it: one dimension of the
+        values (``TileStrategyDispatch.physical_dims``) or one thread axis.
+        No dim of the tile is then a dim of its own, so an op along one pins
+        its loop unflattened (``pin_unflattened_loops``).  ``False`` keeps
+        the tile's block shape and every dim of it."""
+        return True
+
+    def reduces_every_dim_one_at_a_time(self) -> bool:
+        """Whether ``hl.reduce`` without a dim reduces one dim at a time
+        rather than the whole value at once (``tl.reduce(x, None, fn)``).
+        One at a time, each dim of a flattened tile would reduce the whole
+        tile (``flattened_tile_shares_one_index``), so such a reduction pins
+        the loops of its tile dims unflattened."""
+        return False
+
     def reflattens_pointwise_tiles(self) -> bool:
         """Whether a flatten-loop spec a partial-block access disables stays a
         candidate (``ConfigSpec.cute_reflatten_candidates``) for the device-IR
@@ -2100,6 +2274,25 @@ class Backend(abc.ABC):
         tile's range (whether every V-wide chunk starts aligned and stays
         inside the extent follows from them)."""
         return None
+
+    def record_flattened_vloop_wrapper(
+        self,
+        fn: DeviceFunction,
+        wrapper: VecLaneWrapper,
+        *,
+        block_id: int,
+        lane_var: str,
+        index_var: str,
+        mask_var: str | None,
+        begin: object,
+        extent: object,
+    ) -> bool:
+        """Whether a one-block flattened tile prepares its constexpr V-loop
+        ``wrapper`` for sinking under ``fn``'s config, noting it as
+        ``record_vloop_wrapper`` does.  The tile then spells its element
+        index from the chunk base and the V-lane, and its bounds mask from
+        that index (the same values).  ``False`` leaves the tile as it is."""
+        return False
 
     def apply_lane_cluster_split(
         self, strategy: PerThreadNDTileStrategy, state: CodegenState
@@ -2558,13 +2751,8 @@ class Backend(abc.ABC):
 
         env = CompileEnvironment.current()
         block_size_infos = [env.block_sizes[i] for i in block_ids]
-        # A registered tile can also appear in a multidimensional loop.
-        # Its permutation applies only there; a one-dimensional loop has
-        # no order to configure.
-        loop_order = (
-            env.config_spec.loop_orders.config_get(config.loop_orders, block_ids[0])
-            if len(block_ids) > 1
-            else None
+        loop_order = env.config_spec.loop_orders.config_get_for_tile(
+            config.loop_orders, block_ids
         ) or [*range(len(block_ids))]
         l2_grouping = env.config_spec.l2_groupings.config_get(
             config.l2_groupings, block_ids[0], 1

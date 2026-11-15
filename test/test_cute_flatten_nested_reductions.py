@@ -12,6 +12,7 @@ import torch
 import helion
 from helion._compiler.cute.flatten_nested_reductions import flatten_nested_reductions
 from helion._testing import import_example
+from helion._testing import pairwise
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
@@ -199,10 +200,12 @@ def test_original_reduction_precision_is_required(dtype: torch.dtype) -> None:
 CUDA_DEVICE = "cuda"
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("columns", [4, 69, 128])
-@pytest.mark.parametrize("rows_per_tile", [1, 2])
-@pytest.mark.parametrize("unaligned", [False, True])
+@pytest.mark.parametrize(
+    ("columns", "rows_per_tile", "unaligned"),
+    pairwise(columns=(4, 69, 128), rows_per_tile=(1, 2), unaligned=(False, True)),
+)
 def test_flattened_reductions_preserve_tails_empty_rows_and_graph_updates(
     columns: int, rows_per_tile: int, unaligned: bool
 ) -> None:

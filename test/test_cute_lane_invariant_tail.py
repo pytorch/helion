@@ -686,6 +686,7 @@ def _rows() -> torch.Tensor:
     return torch.randn((8, 256), device=DEVICE)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "config", [_CONFIG, _CONFIG_FEW_THREADS], ids=["threads32", "threads8"]
@@ -699,6 +700,7 @@ def test_zero_after_the_copy_matches_reference(config: dict[str, object]) -> Non
     torch.testing.assert_close(sums, x.sum(dim=1))
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "config", [_CONFIG, _CONFIG_FEW_THREADS], ids=["threads32", "threads8"]
@@ -711,6 +713,7 @@ def test_zero_after_the_softmax_matches_reference(config: dict[str, object]) -> 
     torch.testing.assert_close(out, expected)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_reduced_value_stored_into_the_copied_row_matches_reference() -> None:
     x = _rows()
@@ -720,6 +723,7 @@ def test_reduced_value_stored_into_the_copied_row_matches_reference() -> None:
     torch.testing.assert_close(out, expected)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_store_into_another_tensor_matches_reference() -> None:
     x = _rows()
@@ -729,6 +733,7 @@ def test_store_into_another_tensor_matches_reference() -> None:
     torch.testing.assert_close(flags, x.sum(dim=1))
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "kernel",

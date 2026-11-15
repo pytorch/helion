@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     from .config_fragment import ConfigSpecFragment
     from .config_generation import ConfigGeneration
     from .config_generation import FlatConfig
+    from .config_spec import BlockSizeSpec
     from .config_spec import ConfigSpec
     from .config_spec import ReductionLoopSpec
 
@@ -201,6 +202,16 @@ class BackendSearchSurface:
         """Drop the inert knobs of a normalized promoted default."""
         return
 
+    def overlay_promoted_default(
+        self,
+        config_spec: ConfigSpec,
+        base: dict[str, object],
+        promoted: Mapping[str, object],
+    ) -> None:
+        """Drop the keys of the base default (``base``) that a promoted
+        default's own knobs (``promoted``, layered over it next) re-derive."""
+        return
+
     def prepare_flat_config(
         self, config_spec: ConfigSpec, config: dict[str, object]
     ) -> None:
@@ -251,6 +262,15 @@ class BackendSearchSurface:
         keeps the value as given."""
         return value
 
+    def block_size_default(
+        self, config_spec: ConfigSpec, block: BlockSizeSpec, default: int
+    ) -> int:
+        """The default (non-autotuned) size of ``block``.  ``default`` is what
+        ``generic_block_size_default`` gives for the spec's block count and
+        the product of its padded reduction-loop extents; the base surface
+        keeps it."""
+        return default
+
     def family_fragments(
         self, config_spec: ConfigSpec, family: str
     ) -> Mapping[str, ConfigSpecFragment]:
@@ -273,8 +293,10 @@ class ConfigGenerationExtension:
     pipeline: ``narrow_search_choices`` before the flat field table is
     collected, ``repair_flat_config`` on every flat config it produces
     (defaults, random draws, mutations, ``flatten``),
-    ``conditional_neighbor_updates`` when constructing search neighbors, and
-    ``initial_population_flats`` first thing in ``random_population_flat``.
+    ``conditional_neighbor_updates`` when constructing search neighbors,
+    ``shrink_for_threads`` when ``shrink_config`` bounds a random or mutated
+    config without ``num_warps``, and ``initial_population_flats`` first
+    thing in ``random_population_flat``.
     The structural-coverage hooks size and seed the population-based searches
     (``PatternSearch``, ``PopulationBasedSearch``); the defaults describe a
     surface without a structural design.  The CuTe implementation (SIMT
@@ -303,6 +325,15 @@ class ConfigGenerationExtension:
         prerequisites are searchable and no frozen coordinate would change.
         """
         return {}
+
+    def shrink_for_threads(
+        self, flat_config: FlatConfig, max_elements_per_thread: int
+    ) -> None:
+        """Shrink a random or mutated config without ``num_warps`` in place
+        so that each thread walks at most ``max_elements_per_thread``
+        elements: its block sizes, and any thread count it sets that the
+        launch could not take; the default leaves the config as drawn."""
+        return
 
     def initial_population_flats(
         self,

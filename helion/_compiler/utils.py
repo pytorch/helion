@@ -86,23 +86,36 @@ def normalize_slice(slice_obj: slice, size: int | torch.SymInt) -> slice:
     return slice(start, stop, slice_obj.step)
 
 
+def indexed_dims(rank: int, index: Sequence[object]) -> list[int | None]:
+    """For each element of ``index`` into a tensor of ``rank`` dims, the dim it
+    indexes: ``None`` for ``None`` (a new dim) and for ``Ellipsis``, which
+    spans the dims the other elements leave."""
+    consumed = sum(1 for idx in index if idx is not None and idx is not Ellipsis)
+    dims: list[int | None] = []
+    dim = 0
+    for idx in index:
+        if idx is Ellipsis:
+            dims.append(None)
+            dim += rank - consumed
+        elif idx is None:
+            dims.append(None)
+        else:
+            dims.append(dim)
+            dim += 1
+    return dims
+
+
 def normalize_index_slices(
     shape: Sequence[int | torch.SymInt], index: Sequence[object]
 ) -> list[object]:
     """``index`` into a tensor of ``shape`` with each slice normalized
     (``normalize_slice``) against the dim it indexes."""
-    consumed = sum(1 for idx in index if idx is not None and idx is not Ellipsis)
-    result: list[object] = []
-    dim = 0
-    for idx in index:
-        if idx is Ellipsis:
-            dim += len(shape) - consumed
-        elif isinstance(idx, slice) and dim < len(shape):
-            idx = normalize_slice(idx, shape[dim])
-        if idx is not None and idx is not Ellipsis:
-            dim += 1
-        result.append(idx)
-    return result
+    return [
+        normalize_slice(idx, shape[dim])
+        if isinstance(idx, slice) and dim is not None and dim < len(shape)
+        else idx
+        for idx, dim in zip(index, indexed_dims(len(shape), index), strict=True)
+    ]
 
 
 def compute_slice_size(

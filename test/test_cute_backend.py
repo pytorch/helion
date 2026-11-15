@@ -36,6 +36,8 @@ from helion._compiler.cute.device_state import Tcgen05GroupedSchedulerMode
 from helion._compiler.cute.flash_policy import get_flash_target_policy
 from helion._compiler.cute.flash_tuning import FlashPackedExp2Mode
 from helion._compiler.cute.flash_tuning import FlashSoftmaxLowering
+from helion._compiler.cute.reduce_routing import use_interleaved_shared_reduce
+from helion._compiler.cute.reduce_routing import use_strided_warp_reduce
 from helion._compiler.cute.state import cute_env_state
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._compiler.cute.tcgen05_config import facts
@@ -84,12 +86,11 @@ cute = pytest.importorskip("cutlass.cute")
 
 mma_support = importlib.import_module("helion._compiler.cute.mma_support")
 get_cute_mma_support = mma_support.get_cute_mma_support
-_cute_grouped_reduce_shared_tree = importlib.import_module(
-    "helion._compiler.cute.reduce_helpers"
-)._cute_grouped_reduce_shared_tree
-_cute_grouped_reduce_shared_two_stage = importlib.import_module(
-    "helion._compiler.cute.reduce_helpers"
-)._cute_grouped_reduce_shared_two_stage
+_reduce_helpers = importlib.import_module("helion._compiler.cute.reduce_helpers")
+_cute_grouped_reduce_shared_tree = _reduce_helpers._cute_grouped_reduce_shared_tree
+_cute_grouped_reduce_shared_two_stage = (
+    _reduce_helpers._cute_grouped_reduce_shared_two_stage
+)
 _cute_flash = importlib.import_module("helion._compiler.cute.cute_flash")
 _cute_backend = importlib.import_module("helion._compiler.cute.backend")
 _attention_match = importlib.import_module(
@@ -199,6 +200,14 @@ def cute_sigmoid(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="cute")
+def cute_sigmoid_multiply_add(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(out.size()):
+        out[tile] = torch.sigmoid(x[tile]) * 2.0 + 1.0
+    return out
+
+
+@helion.kernel(backend="cute")
 def cute_pointwise_chain(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(out.size()):
@@ -232,6 +241,17 @@ def cute_cancelling_math(x: torch.Tensor) -> torch.Tensor:
         out[2, tile] = torch.log1p(value)
         out[3, tile] = torch.exp2(value)
     return out
+
+
+def _exp(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size()):
+        out[tile] = torch.exp(x[tile])
+    return out
+
+
+cute_exp = helion.kernel(backend="cute")(_exp)
+cute_exp_fast_math = helion.kernel(backend="cute", fast_math=True)(_exp)
 
 
 @helion.kernel(backend="cute")
@@ -555,6 +575,78 @@ def cute_interleaved_reduce_max(
     out[group, lane_mod_pre, lane_in_group // pre] = result
 
 
+# ``(pre, span)`` of the strided warp reduce test: siblings across a whole
+# warp and a sub-warp span, then one lane per sibling, which keeps the masked
+# passes (``use_strided_warp_reduce``).
+_STRIDED_WARP_PAIRS = ((2, 32), (4, 32), (16, 32), (4, 16), (8, 8))
+# Each reduction type (a launch takes its index) and its identity, built in
+# the kernel.
+_STRIDED_WARP_REDUCTIONS = (
+    ("sum", lambda: cutlass.Float32(0.0)),
+    ("max", lambda: cutlass.Float32(float("-inf"))),
+    ("min", lambda: cutlass.Float32(float("inf"))),
+    ("prod", lambda: cutlass.Float32(1.0)),
+    ("any", lambda: cutlass.Int32(0)),
+)
+
+
+@cute.jit
+def _strided_warp_reduce_rows(
+    inp,
+    out,
+    ref,
+    reduction: cutlass.Constexpr[int],
+    fp32_redux: cutlass.Constexpr[int],
+):
+    """Row ``k`` reduces with the ``k``-th ``(pre, span)``: ``out`` by the
+    warp dispatcher, ``ref`` by one masked pass per sibling of the warp
+    reduction the dispatcher would otherwise run."""
+    lane = cutlass.Int32(cute.arch.thread_idx()[0])
+    reduction_type, identity = _STRIDED_WARP_REDUCTIONS[reduction]
+    warp_op, _ = _reduce_helpers._resolve_ops(
+        reduction_type, fp32_redux=bool(fp32_redux)
+    )
+    for k in cutlass.range_constexpr(len(_STRIDED_WARP_PAIRS)):
+        pre, span = _STRIDED_WARP_PAIRS[k]
+        out[k, lane] = _reduce_helpers._cute_grouped_reduce_warp(
+            inp[k, lane],
+            reduction_type,
+            identity(),
+            lane,
+            pre=pre,
+            group_span=span,
+            fp32_redux=bool(fp32_redux),
+        )
+        ref[k, lane] = _reduce_helpers._cute_grouped_reduce_warp_body(
+            inp[k, lane], warp_op, identity(), lane, pre=pre, group_span=span
+        )
+
+
+@cute.kernel
+def cute_strided_warp_reduce(
+    inp,
+    out,
+    ref,
+    reduction: cutlass.Constexpr[int],
+    fp32_redux: cutlass.Constexpr[int],
+):
+    _strided_warp_reduce_rows(inp, out, ref, reduction, fp32_redux)
+
+
+@cute.kernel
+def cute_strided_warp_reduce_routing(
+    inp,
+    out,
+    ref,
+    reduction: cutlass.Constexpr[int],
+    fp32_redux: cutlass.Constexpr[int],
+):
+    """The same rows for the routing test: a kernel of its own keeps its
+    own compiled launchers, so its launch traces the dispatcher whichever
+    test ran first in the process."""
+    _strided_warp_reduce_rows(inp, out, ref, reduction, fp32_redux)
+
+
 @helion.kernel(backend="cute")
 def cute_matmul_addmm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     m, k = x.size()
@@ -641,6 +733,21 @@ def cute_matmul_direct(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     )
     for tile_m, tile_n, tile_k in hl.tile([m, n, k]):
         out[tile_m, tile_n] = torch.matmul(x[tile_m, tile_k], y[tile_k, tile_n])
+    return out
+
+
+# A kernel with a config keeps the config schema without the CuTe structural
+# passes, whose full-slice matmul tiling gives N and K block sizes of their own.
+@helion.kernel(
+    backend="cute",
+    config=helion.Config(block_sizes=[32], indexing="block_ptr"),
+    static_shapes=True,
+)
+def cute_grouped_n_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, _n = x.size()
+    out = torch.empty([m, y.size(1)], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        out[tile_m, :] = x[tile_m, :] @ y[:, :]
     return out
 
 
@@ -11929,6 +12036,36 @@ class TestCuteBackend(TestCase):
         (x,) = args
         torch.testing.assert_close(out, torch.sigmoid(x), rtol=1e-3, atol=1e-3)
 
+    def test_pointwise_float64_sigmoid_stays_float64(self) -> None:
+        # The fp32 contract (rcp.approx of ex2.approx) has no float64 form; a
+        # float64 sigmoid is the IEEE quotient of the float64 exp, as eager
+        # computes it, not an fp32 result widened back (about 5e-8 off).
+        x = torch.cat(
+            [
+                torch.linspace(-750.0, 750.0, 4093, dtype=torch.float64),
+                torch.randn(4096, dtype=torch.float64) * 8,
+                torch.tensor(
+                    [float("inf"), float("-inf"), float("nan"), 0.0, -0.0, 1e-300],
+                    dtype=torch.float64,
+                ),
+            ]
+        ).to(DEVICE)
+        code, out = code_and_output(cute_sigmoid, (x,))
+        self.assertIn("cute.math.exp(", code)
+        self.assertNotIn("approx=True", code)
+        torch.testing.assert_close(
+            out, torch.sigmoid(x), rtol=0, atol=0, equal_nan=True
+        )
+
+    def test_pointwise_float64_sigmoid_then_multiply_add_compiles(self) -> None:
+        # fuse_fma must not contract the float64 sigmoid with the multiply-add:
+        # the DSL's fma takes one numeric type, and the Python literals would
+        # come in as Float32 beside the Float64 sigmoid.
+        x = (torch.randn(4096, dtype=torch.float64) * 8).to(DEVICE)
+        code, out = code_and_output(cute_sigmoid_multiply_add, (x,))
+        self.assertNotIn("cute.math.fma(", code)
+        torch.testing.assert_close(out, torch.sigmoid(x) * 2.0 + 1.0)
+
     def test_pointwise_chain(self) -> None:
         args = (
             torch.randn(65, 23, device=DEVICE, dtype=torch.float32),
@@ -12073,6 +12210,38 @@ class TestCuteBackend(TestCase):
         torch.testing.assert_close(out, expected, rtol=1e-6, atol=0, equal_nan=True)
         for name in ("erfc", "expm1", "log1p", "exp2"):
             self.assertIn(f"cute.math.{name}(", code)
+
+    def test_pointwise_exp_reduces_its_argument_exactly(self) -> None:
+        # exp2(x * log2(e)) rounds the product first: 2 + 1.17 |x| ulp, about
+        # 60 near the overflow threshold.  Without fast_math exp is libdevice's
+        # expf (eager's), within 2 ulp of float64 down to the denormal
+        # results, and a float64 exp stays in float64 (with fast_math too:
+        # there is no float64 fast form).
+        special = [float("nan"), float("inf"), -float("inf"), 0.0, -0.0]
+        x = torch.cat(
+            [
+                torch.tensor(special, device=DEVICE, dtype=torch.float64),
+                torch.linspace(-104.0, 89.0, 8192, device=DEVICE, dtype=torch.float64),
+            ]
+        )
+        for kernel, dtype, rtol, atol in (
+            # Two ulp of a normal result and of a denormal one.
+            (cute_exp, torch.float32, 2.0**-22, 2.0**-148),
+            (cute_exp, torch.float64, 2.0**-51, 0.0),
+            (cute_exp_fast_math, torch.float64, 2.0**-51, 0.0),
+        ):
+            with self.subTest(dtype=str(dtype), fast_math=kernel.settings.fast_math):
+                value = x.to(dtype)
+                code, out = code_and_output(kernel, (value,))
+                torch.testing.assert_close(
+                    out,
+                    torch.exp(value.double()).to(dtype),
+                    rtol=rtol,
+                    atol=atol,
+                    equal_nan=True,
+                )
+                self.assertIn("cute.math.exp(", code)
+                self.assertNotIn("cute.math.exp2(", code)
 
     def test_pointwise_remainder_and_fmod(self) -> None:
         # remainder takes the divisor's sign (Python), fmod the dividend's (C);
@@ -12475,8 +12644,6 @@ class TestCuteBackend(TestCase):
         (``pre < 32``, a partial butterfly) and the block form (``pre >= 32``,
         every thread writes) both reduce each sibling over its ``span // pre``
         threads, for every group of the CTA, and broadcast the result."""
-        from helion._compiler.cute.reduce_helpers import _use_interleaved_shared_reduce
-
         for pre, span in [
             (2, 64),
             (4, 128),
@@ -12485,7 +12652,7 @@ class TestCuteBackend(TestCase):
             (64, 512),
             (256, 512),
         ]:
-            self.assertTrue(_use_interleaved_shared_reduce(pre, span))
+            self.assertTrue(use_interleaved_shared_reduce(pre, span))
             x = torch.randn(2, pre, span // pre, device=DEVICE, dtype=torch.float32)
             for kernel, expected in (
                 (cute_interleaved_reduce_sum, x.sum(dim=2, keepdim=True)),
@@ -12499,9 +12666,128 @@ class TestCuteBackend(TestCase):
                     torch.testing.assert_close(
                         out, expected.expand_as(x), rtol=1e-5, atol=1e-5
                     )
-        self.assertFalse(_use_interleaved_shared_reduce(1, 64))
-        self.assertFalse(_use_interleaved_shared_reduce(3, 48))
-        self.assertFalse(_use_interleaved_shared_reduce(48, 96))
+        self.assertFalse(use_interleaved_shared_reduce(1, 64))
+        self.assertFalse(use_interleaved_shared_reduce(3, 48))
+        self.assertFalse(use_interleaved_shared_reduce(48, 96))
+
+    def test_strided_warp_reduce_matches_sibling_passes(self) -> None:
+        """``pre`` siblings interleaved in a warp: one partial butterfly gives
+        each sibling the bits of a masked full-span pass per sibling for
+        every reduction type, signed zeros (a sum maps -0.0 to +0.0), NaN
+        payloads, infinities and denormals included, and so does the
+        ``fp32_redux`` dispatch of the extrema."""
+        for pre, span in _STRIDED_WARP_PAIRS[:-1]:
+            self.assertTrue(use_strided_warp_reduce(pre, span))
+        # Without a shuffle the butterfly's combines with constant identities
+        # can fold away and keep a NaN payload the masked passes canonicalize.
+        self.assertFalse(use_strided_warp_reduce(8, 8))
+        self.assertFalse(use_strided_warp_reduce(1, 32))
+        self.assertFalse(use_strided_warp_reduce(4, 64))
+        self.assertFalse(use_strided_warp_reduce(3, 24))
+        self.assertFalse(use_strided_warp_reduce(8, 4))
+        gen = torch.Generator().manual_seed(0)
+        rows = len(_STRIDED_WARP_PAIRS)
+        # NaNs: torch's, one with a payload, and a negative one.
+        nans = torch.tensor(
+            [0x7FC00000, 0x7FC00001, 0xFFC00000 - (1 << 32)], dtype=torch.int32
+        ).view(torch.float32)
+        special = torch.cat(
+            [
+                torch.tensor([float("inf"), float("-inf"), 1e-40, -1e-40, 0.0, -0.0]),
+                nans,
+            ]
+        )
+
+        def floats(scale: float, offset: float) -> torch.Tensor:
+            x = torch.randn(rows, 32, generator=gen) * scale + offset
+            lanes = torch.rand(rows, 32, generator=gen) < 0.25
+            x[lanes] = special[
+                torch.randint(len(special), (int(lanes.sum()),), generator=gen)
+            ]
+            for k, (pre, span) in enumerate(_STRIDED_WARP_PAIRS):
+                # Sibling 1 of the first group: only negative zeros.
+                x[k, 1:span:pre] = -0.0
+            return x
+
+        x = floats(1.0, 0.0)
+        cases = [
+            ("sum", False, x, torch.sum),
+            ("max", False, x, torch.amax),
+            ("min", False, x, torch.amin),
+            # Factors near one keep the products finite.
+            ("prod", False, floats(0.1, 1.0), torch.prod),
+            ("any", False, (torch.rand(rows, 32, generator=gen) < 0.2).int(), None),
+            ("max", True, x, torch.amax),
+            ("min", True, x, torch.amin),
+        ]
+        names = [name for name, _identity in _STRIDED_WARP_REDUCTIONS]
+        for reduction_type, fp32_redux, values, reduce in cases:
+            with self.subTest(reduction_type=reduction_type, fp32_redux=fp32_redux):
+                values = values.to(DEVICE)
+                out = torch.full_like(values, 7)
+                ref = torch.full_like(values, 7)
+                default_cute_launcher(
+                    cute_strided_warp_reduce,
+                    (1,),
+                    values,
+                    out,
+                    ref,
+                    names.index(reduction_type),
+                    int(fp32_redux),
+                    block=(32, 1, 1),
+                )
+                self.assertTrue(
+                    torch.equal(out.view(torch.int32), ref.view(torch.int32))
+                )
+                for k, (pre, span) in enumerate(_STRIDED_WARP_PAIRS):
+                    grouped = values[k].view(32 // span, span // pre, pre)
+                    expected = (
+                        grouped.any(dim=1).int()
+                        if reduce is None
+                        else reduce(grouped, dim=1)
+                    )
+                    torch.testing.assert_close(
+                        out[k],
+                        expected[:, None, :].expand(-1, span // pre, -1).reshape(32),
+                        equal_nan=True,
+                    )
+                if reduction_type == "sum":
+                    # The negative zeros sum to +0.0, as the masked passes did.
+                    self.assertEqual(out[:, 1].view(torch.int32).tolist(), [0] * rows)
+
+    def test_fp32_redux_extrema_take_the_strided_warp_reduce_where_redux_cannot(
+        self,
+    ) -> None:
+        """``redux.sync`` reduces an fp32 value over a whole warp on the SM100
+        family; there the native extrema keep one pass per sibling.  A
+        narrower span falls back to the shuffle reduction, which the partial
+        butterfly matches bit for bit, so it takes the butterfly."""
+        x = torch.randn(len(_STRIDED_WARP_PAIRS), 32, device=DEVICE)
+        strided = _reduce_helpers._cute_grouped_reduce_warp_strided_body
+        with patch.object(
+            _reduce_helpers,
+            "_cute_grouped_reduce_warp_strided_body",
+            side_effect=strided,
+        ) as traced:
+            out = torch.empty_like(x)
+            ref = torch.empty_like(x)
+            default_cute_launcher(
+                cute_strided_warp_reduce_routing,
+                (1,),
+                x,
+                out,
+                ref,
+                2,  # min
+                1,
+                block=(32, 1, 1),
+            )
+        self.assertTrue(torch.equal(out, ref))
+        native = (
+            _reduce_helpers._REDUX_SYNC_AVAILABLE
+            and torch.cuda.get_device_capability()[0] == 10
+        )
+        spans = sorted({call.kwargs["group_span"] for call in traced.call_args_list})
+        self.assertEqual(spans, [16] if native else [16, 32])
 
     def test_permute_transposes_tile_values(self) -> None:
         """The slot re-binds the transposed tile's dims: the store exchanges
@@ -13072,9 +13358,14 @@ class TestCuteBackend(TestCase):
                 )
                 self.assertNotIn("cute.gemm(", code)
 
-    def test_batched_strided_matrix_layouts_fall_back(self) -> None:
+    def test_batched_strided_matrix_layouts_take_tcgen05(self) -> None:
+        """An M-major A or a K-major B of a batched matmul loads through its
+        own strides' TensorMap view: both enter the tcgen05 search and run
+        the native MMA."""
+        if not get_cute_mma_support().tcgen05_f16bf16:
+            self.skipTest("tcgen05 F16/BF16 MMA is not supported on this machine")
         contiguous_x = torch.randn(2, 64, 32, device=DEVICE, dtype=HALF_DTYPE)
-        contiguous_y = torch.randn(2, 32, 8, device=DEVICE, dtype=HALF_DTYPE)
+        contiguous_y = torch.randn(2, 32, 32, device=DEVICE, dtype=HALF_DTYPE)
         cases = (
             (
                 torch.randn(2, 32, 64, device=DEVICE, dtype=HALF_DTYPE).transpose(
@@ -13084,19 +13375,19 @@ class TestCuteBackend(TestCase):
             ),
             (
                 contiguous_x,
-                torch.randn(2, 8, 32, device=DEVICE, dtype=HALF_DTYPE).transpose(
+                torch.randn(2, 32, 32, device=DEVICE, dtype=HALF_DTYPE).transpose(
                     -1, -2
                 ),
             ),
         )
-        config = helion.Config(block_sizes=[1, 64, 8, 16])
+        config = helion.Config(block_sizes=[1, 64, 32, 16])
         with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
             for args in cases:
                 with self.subTest(
                     lhs_stride=args[0].stride(), rhs_stride=args[1].stride()
                 ):
                     bound = cute_batched_baddbmm_tcgen05.bind(args)
-                    self.assertFalse(bound.config_spec.tcgen05.search_enabled)
+                    self.assertTrue(bound.config_spec.tcgen05.search_enabled)
                     code = bound.to_code(config)
                     out = bound.compile_config(config)(*args)
                     torch.cuda.synchronize()
@@ -13106,7 +13397,59 @@ class TestCuteBackend(TestCase):
                         atol=1e-1,
                         rtol=1e-2,
                     )
-                    self.assertNotIn("cute.gemm(", code)
+                    self.assertIn("cute.gemm(", code)
+
+    def test_batched_layouts_outside_tcgen05_keep_other_lowerings(self) -> None:
+        """Batched matmuls the tcgen05 search does not serve run their default
+        configs correctly on the other lowerings: a K-major B narrower than 32
+        columns and not a multiple of 16, batched or shared by the batches
+        under an M-major A (its 8-column stages need 64-byte k-blocks: N=24
+        raised at the default config), and fp32 operands, row- or
+        column-major (the search's scalar lowering read one k per K tile:
+        relative error 0.97 at 4 x 512x512x512)."""
+
+        def half(*shape: int) -> torch.Tensor:
+            return torch.randn(*shape, device=DEVICE, dtype=HALF_DTYPE)
+
+        x = half(2, 64, 32)
+        m_major_x = half(2, 32, 64).transpose(-1, -2)
+        cases = (
+            (cute_batched_baddbmm_tcgen05, (x, half(2, 8, 32).transpose(-1, -2))),
+            (cute_batched_baddbmm_tcgen05, (x, half(2, 24, 32).transpose(-1, -2))),
+            (cute_mixed_rank_batched_dot_tcgen05, (m_major_x, half(8, 32).T)),
+            (
+                cute_batched_baddbmm_tcgen05,
+                (
+                    torch.randn(4, 512, 512, device=DEVICE),
+                    torch.randn(4, 512, 512, device=DEVICE),
+                ),
+            ),
+            (
+                cute_batched_baddbmm_tcgen05,
+                (
+                    torch.randn(4, 512, 512, device=DEVICE).transpose(-1, -2),
+                    torch.randn(4, 512, 512, device=DEVICE),
+                ),
+            ),
+        )
+        for kernel, args in cases:
+            with self.subTest(
+                kernel=kernel.name,
+                dtype=args[0].dtype,
+                lhs_stride=args[0].stride(),
+                rhs_shape=tuple(args[1].shape),
+            ):
+                kernel.reset()
+                bound = kernel.bind(args)
+                self.assertFalse(bound.config_spec.tcgen05.search_enabled)
+                out = bound.compile_config(bound.config_spec.default_config())(*args)
+                torch.cuda.synchronize()
+                torch.testing.assert_close(
+                    out.float(),
+                    torch.matmul(args[0].float(), args[1].float()),
+                    atol=1e-1,
+                    rtol=1e-2,
+                )
 
     def test_mixed_rank_batched_dot_uses_tcgen05(self) -> None:
         support = get_cute_mma_support()
@@ -13137,6 +13480,17 @@ class TestCuteBackend(TestCase):
                     torch.randn(256, 64, device=DEVICE, dtype=HALF_DTYPE).T,
                 ),
                 "'lhs_tma_order': (1, 2, 0)",
+            ),
+            # an M-major A beside the shared B, staged through TMA
+            (
+                cute_mixed_rank_batched_dot_tcgen05,
+                (
+                    torch.randn(4, 64, 256, device=DEVICE, dtype=HALF_DTYPE).transpose(
+                        -1, -2
+                    ),
+                    torch.randn(64, 256, device=DEVICE, dtype=HALF_DTYPE),
+                ),
+                "'a_k_major': False",
             ),
         )
         with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
@@ -14630,7 +14984,7 @@ class TestCuteBackend(TestCase):
             # (64 KiB), so the plain kernel's ab=6 overflows at 256x256x64
             # (NVVM rejected the compiled kernel) and ab=5 is the deepest fit.
             with self.assertRaisesRegex(
-                InvalidConfig, "2 output stores keep one C ring each"
+                InvalidConfig, r"beside 2 C rings \(one per output store"
             ):
                 render(cute_matmul_mma_two_outputs, (x, y))
             code = render(cute_matmul_mma_two_outputs, (x, y), tcgen05_ab_stages=5)
@@ -14815,12 +15169,16 @@ class TestCuteBackend(TestCase):
         x = torch.empty((2048, 4096), device=DEVICE, dtype=torch.float16)
         y = torch.empty((4096, 2048), device=DEVICE, dtype=torch.float16)
         bias = torch.empty(2048, device=DEVICE, dtype=torch.float16)
+        # The paired-pipeline family (persistent_blocked; the allocation
+        # proof covers the bias row) seeds every tile beside these; the
+        # static 2x2 family is the persistent_interleaved one.
         seeds = [
             seed.config
             for seed in cute_matmul_mma_epilogue.bind(
                 (x, y, bias)
             ).config_spec.autotune_seed_configs()
             if seed.config.get("tcgen05_cluster_n") == 2
+            and seed.config["pid_type"] != "persistent_blocked"
         ]
         staged = sorted(
             (seed["block_sizes"][1], seed["block_sizes"][2], seed["tcgen05_ab_stages"])
@@ -14860,7 +15218,15 @@ class TestCuteBackend(TestCase):
             ),
         ):
             spec = cute_matmul_mma_epilogue.bind((x, y, bias)).config_spec
-            seed_configs = [dict(seed.config) for seed in spec.autotune_seed_configs()]
+            # The paired-pipeline family (persistent_blocked) seeds every
+            # tile, 256x256 pairs included, as it does for a plain GEMM; the
+            # allocation proof covers the bias row. The families below are
+            # the one-wave-gated ones.
+            seed_configs = [
+                dict(seed.config)
+                for seed in spec.autotune_seed_configs()
+                if seed.config.get("pid_type") != "persistent_blocked"
+            ]
             tiles = {
                 (
                     tuple(seed["block_sizes"]),
@@ -14928,7 +15294,11 @@ class TestCuteBackend(TestCase):
             y = torch.empty((4096, 2048), device=DEVICE, dtype=torch.float16)
             bias = torch.empty(2048, device=DEVICE, dtype=torch.float16)
             spec = cute_matmul_mma_epilogue.bind((x, y, bias)).config_spec
-            seed_configs = [dict(seed.config) for seed in spec.autotune_seed_configs()]
+            seed_configs = [
+                dict(seed.config)
+                for seed in spec.autotune_seed_configs()
+                if seed.config.get("pid_type") != "persistent_blocked"
+            ]
             constraints = spec.tcgen05.cluster_m2_search_constraints
         assert constraints is not None
         self.assertFalse(constraints.one_wave_only)
@@ -14967,8 +15337,9 @@ class TestCuteBackend(TestCase):
 
         The one-wave tiles are not seeded for source-C epilogues, so a sampled
         256x64 two-CTA tile projects to 256x256 as before; and since codegen
-        rejects any ``tcgen05_ab_stages >= 3`` with a productive C-input warp,
-        a deep sample keeps its ring and loses the warp (ab=2 keeps it).
+        rejects an AB ring deeper than the C-input warp's ring leaves (six
+        64-deep stages hold more than two 128-deep ones), a deep sample keeps
+        its ring and loses the warp (ab=2 keeps it).
         """
         x = torch.empty((2048, 4096), device=DEVICE, dtype=torch.bfloat16)
         y = torch.empty((4096, 2048), device=DEVICE, dtype=torch.bfloat16)
@@ -15308,26 +15679,38 @@ class TestCuteBackend(TestCase):
             for seed in spec.autotune_seed_configs()
             if seed.config.get("tcgen05_cluster_n") == 2
         ]
-        staged = sorted(
-            (
-                seed["block_sizes"][1],
-                seed["block_sizes"][2],
-                seed["tcgen05_ab_stages"],
-                seed.get("tcgen05_aux_load_placement"),
+
+        def staged(pid_type: str) -> list[tuple[object, ...]]:
+            return sorted(
+                (
+                    seed["block_sizes"][1],
+                    seed["block_sizes"][2],
+                    seed["tcgen05_ab_stages"],
+                    seed.get("tcgen05_aux_load_placement"),
+                )
+                for seed in seed_configs
+                if seed["pid_type"] == pid_type
             )
-            for seed in seed_configs
-        )
+
         # The multi-tile 256x128 pair seed keeps the stage next to its
         # 8-deep ring: at bn=128 the row stage and the (128, 64) C ring are
         # half the 256-wide seeds' and fit beside 8 x 24 KiB of AB stages.
         self.assertEqual(
-            staged,
+            staged("persistent_interleaved"),
             [
                 (128, 64, 8, "pre_acc_wait"),
                 (256, 64, 5, "pre_acc_wait"),
                 (256, 128, 3, None),
             ],
         )
+        # The paired-pipeline family (persistent_blocked; the allocation
+        # proof covers the row) seeds each 2x2 tile at the deepest ring the
+        # same model fits for each placement: the row stage takes one AB
+        # stage of the 256x256x64 tile under pre_acc_wait.
+        paired = staged("persistent_blocked")
+        self.assertIn((256, 64, 5, "pre_acc_wait"), paired)
+        self.assertIn((256, 64, 6, "post_acc_wait"), paired)
+        self.assertNotIn((256, 64, 6, "pre_acc_wait"), paired)
         tcgen05 = spec._cute_tcgen05_config
         facts = tcgen05.rowvec_aux_facts
         assert facts is not None
@@ -15402,6 +15785,7 @@ class TestCuteBackend(TestCase):
             )
             for seed in chain_spec.autotune_seed_configs()
             if seed.config.get("tcgen05_cluster_n") == 2
+            and seed.config["pid_type"] != "persistent_blocked"
         )
         self.assertEqual(
             chain_seeds,
@@ -15948,29 +16332,65 @@ class TestCuteBackend(TestCase):
         torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
         self.assertNotIn("cute.gemm", code)
 
-    def test_matmul_direct_grouped_n_uses_mma(self) -> None:
-        @helion.kernel(
-            backend="cute",
-            config=helion.Config(block_sizes=[32], indexing="block_ptr"),
-            static_shapes=True,
-        )
-        def grouped_n_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, _n = x.size()
-            out = torch.empty([m, y.size(1)], dtype=x.dtype, device=x.device)
-            for tile_m in hl.tile(m):
-                out[tile_m, :] = x[tile_m, :] @ y[:, :]
-            return out
-
+    def test_matmul_direct_grouped_n_declines_one_vector_rows(self) -> None:
+        # The direct warp-MMA tiles give lane ``l`` of thread ``t`` column
+        # ``l * threads + t``.  A row of one V-wide vector per thread (4 over
+        # 32 threads, 8 over 16) holds column ``t * V + l`` there instead, so
+        # those configs take another lowering and store every column where it
+        # belongs.
         args = (
             torch.randn(256, 128, device=DEVICE, dtype=HALF_DTYPE),
             torch.randn(128, 128, device=DEVICE, dtype=HALF_DTYPE),
         )
-        code, out = code_and_output(grouped_n_matmul, args)
+        expected = (args[0].float() @ args[1].float()).to(HALF_DTYPE)
+        for row_threads, width in ((32, 4), (16, 8)):
+            with self.subTest(row_threads=row_threads, width=width):
+                code, out = code_and_output(
+                    cute_grouped_n_matmul,
+                    args,
+                    block_sizes=[32],
+                    indexing="block_ptr",
+                    num_threads=[32, row_threads],
+                    cute_vector_widths=[width, 1],
+                )
+                torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
+                self.assertNotIn("cute.nvgpu.warp.MmaF16BF16Op", code)
+
+    def test_matmul_direct_grouped_n_uses_mma(self) -> None:
+        args = (
+            torch.randn(256, 128, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(128, 128, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        code, out = code_and_output(cute_grouped_n_matmul, args)
         expected = args[0].float() @ args[1].float()
         torch.testing.assert_close(out, expected.to(out.dtype), atol=1e-1, rtol=1e-2)
         self.assertIn("cute.gemm", code)
         self.assertIn("cute.nvgpu.warp.MmaF16BF16Op", code)
         self.assertNotIn("dot_serial_result", code)
+
+    def test_matmul_direct_grouped_n_declines_vectorized_rows(self) -> None:
+        # The direct warp-MMA tiles give lane ``l`` of thread ``t`` column
+        # ``l * threads + t``.  A row of 4-wide vectors holds element
+        # ``l % 4`` of its chunk ``l // 4`` there instead (one vector per
+        # thread over 32 threads, four chunks over 8), so those configs take
+        # another lowering and store every column where it belongs.
+        args = (
+            torch.randn(256, 128, device=DEVICE, dtype=HALF_DTYPE),
+            torch.randn(128, 128, device=DEVICE, dtype=HALF_DTYPE),
+        )
+        expected = (args[0].float() @ args[1].float()).to(HALF_DTYPE)
+        for row_threads in (8, 32):
+            with self.subTest(row_threads=row_threads):
+                code, out = code_and_output(
+                    cute_grouped_n_matmul,
+                    args,
+                    block_sizes=[32],
+                    indexing="block_ptr",
+                    num_threads=[32, row_threads],
+                    cute_vector_widths=[4, 1],
+                )
+                torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-2)
+                self.assertNotIn("cute.nvgpu.warp.MmaF16BF16Op", code)
 
     def test_matmul_direct_grouped_n_rounds_to_declared_dtype(self) -> None:
         # The direct warp-MMA path accumulates in fp32; a bf16 x bf16 matmul
@@ -16178,50 +16598,36 @@ class TestCuteBackend(TestCase):
         self.assertIn("dot_serial_result", code)
 
     def test_matmul_direct_grouped_n_respects_mma_override(self) -> None:
-        @helion.kernel(
-            backend="cute",
-            config=helion.Config(block_sizes=[32], indexing="block_ptr"),
-            static_shapes=True,
-        )
-        def grouped_n_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, _n = x.size()
-            out = torch.empty([m, y.size(1)], dtype=x.dtype, device=x.device)
-            for tile_m in hl.tile(m):
-                out[tile_m, :] = x[tile_m, :] @ y[:, :]
-            return out
-
         args = (
             torch.randn(256, 128, device=DEVICE, dtype=HALF_DTYPE),
             torch.randn(128, 128, device=DEVICE, dtype=HALF_DTYPE),
         )
-        with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "universal"}, clear=False):
-            code, out = code_and_output(grouped_n_matmul, args)
+        # Compiled configs stay cached on the kernel: compile this one under
+        # the override, and drop that build for the tests after it.
+        cute_grouped_n_matmul.reset()
+        try:
+            with patch.dict(
+                os.environ, {"HELION_CUTE_MMA_IMPL": "universal"}, clear=False
+            ):
+                code, out = code_and_output(cute_grouped_n_matmul, args)
+        finally:
+            cute_grouped_n_matmul.reset()
         expected = args[0].float() @ args[1].float()
         torch.testing.assert_close(out, expected.to(out.dtype), atol=1e-1, rtol=1e-2)
         self.assertNotIn("cute.gemm", code)
 
     def test_matmul_direct_grouped_n_mismatched_threads_falls_back(self) -> None:
-        @helion.kernel(
-            backend="cute",
-            config=helion.Config(
-                block_sizes=[64],
-                num_threads=[32],
-                indexing="block_ptr",
-            ),
-            static_shapes=True,
-        )
-        def grouped_n_matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, _n = x.size()
-            out = torch.empty([m, y.size(1)], dtype=x.dtype, device=x.device)
-            for tile_m in hl.tile(m):
-                out[tile_m, :] = x[tile_m, :] @ y[:, :]
-            return out
-
         args = (
             torch.randn(256, 128, device=DEVICE, dtype=HALF_DTYPE),
             torch.randn(128, 128, device=DEVICE, dtype=HALF_DTYPE),
         )
-        code, out = code_and_output(grouped_n_matmul, args)
+        code, out = code_and_output(
+            cute_grouped_n_matmul,
+            args,
+            block_sizes=[64],
+            num_threads=[32],
+            indexing="block_ptr",
+        )
         expected = args[0].float() @ args[1].float()
         torch.testing.assert_close(out, expected.to(out.dtype), atol=1e-1, rtol=1e-2)
         self.assertNotIn("cute.gemm", code)
@@ -16305,9 +16711,7 @@ class TestCuteBackend(TestCase):
                 return ("launched", args)
 
         def fake_compile(
-            jit_func: object,
-            *args: object,
-            options: str | None = None,
+            jit_func: object, args: tuple[object, ...], options: str | None
         ) -> FakeCompiled:
             compiled_calls.append((jit_func, args, options))
             return FakeCompiled()
@@ -16317,14 +16721,26 @@ class TestCuteBackend(TestCase):
                 "helion.runtime.cute.launcher._create_cute_wrapper",
                 return_value="jit-wrapper",
             ),
-            patch("cutlass.cute.compile", side_effect=fake_compile),
+            patch(
+                "helion.runtime.cute.compile_cache.compile_with_options",
+                side_effect=fake_compile,
+            ),
         ):
             launcher = _get_compiled_cute_launcher(cute_kernel, schema_key, block)
             first = launcher(1, 2, 3)
             second = launcher(4, 5, 6)
 
+        # The launcher's defaults: the FFI bridge, and fp32 division as
+        # ``div.full.f32`` (``merge_default_compile_options``).
         self.assertEqual(
-            compiled_calls, [("jit-wrapper", (1, 2, 3), "--enable-tvm-ffi")]
+            compiled_calls,
+            [
+                (
+                    "jit-wrapper",
+                    (1, 2, 3),
+                    "--enable-tvm-ffi nvvm-options=-prec-div=0",
+                )
+            ],
         )
         self.assertEqual(launched_args, [(1, 2, 3), (4, 5, 6)])
         self.assertEqual(first, ("launched", (1, 2, 3)))
@@ -16509,9 +16925,7 @@ class TestCuteBackend(TestCase):
                 return ("launched", args)
 
         def fake_compile(
-            jit_func: object,
-            *args: object,
-            options: str | None = None,
+            jit_func: object, args: tuple[object, ...], options: str | None
         ) -> FakeCompiled:
             compiled_calls.append((jit_func, args, options))
             return FakeCompiled()
@@ -16521,7 +16935,10 @@ class TestCuteBackend(TestCase):
                 "helion.runtime.cute.launcher._create_cute_wrapper",
                 return_value="jit-wrapper",
             ),
-            patch("cutlass.cute.compile", side_effect=fake_compile),
+            patch(
+                "helion.runtime.cute.compile_cache.compile_with_options",
+                side_effect=fake_compile,
+            ),
         ):
             launcher = _get_compiled_cute_launcher(
                 cute_kernel,
@@ -16531,13 +16948,19 @@ class TestCuteBackend(TestCase):
             )
             result = launcher(1, 2, 3)
 
-        # The runtime merges ``--enable-tvm-ffi`` into any caller-provided
+        # The runtime merges its defaults into any caller-provided
         # compile_options so the generic launcher always benefits from
         # the FFI bridge (e.g. when the autotuner selects
         # ``tcgen05_cubin_lineinfo=True``).
         self.assertEqual(
             compiled_calls,
-            [("jit-wrapper", (1, 2, 3), "--generate-line-info --enable-tvm-ffi")],
+            [
+                (
+                    "jit-wrapper",
+                    (1, 2, 3),
+                    "--generate-line-info --enable-tvm-ffi nvvm-options=-prec-div=0",
+                )
+            ],
         )
         self.assertEqual(result, ("launched", (1, 2, 3)))
 
@@ -17542,7 +17965,10 @@ class TestCuteBackend(TestCase):
             patch(
                 "helion.runtime.cute.launcher._ensure_cute_dsl_arch_env"
             ) as ensure_arch,
-            patch("cutlass.cute.compile", return_value=FakeCompiled()),
+            patch(
+                "helion.runtime.cute.compile_cache.compile_with_options",
+                return_value=FakeCompiled(),
+            ),
         ):
             first = default_cute_launcher(cute_kernel, (1,), 7, block=(32, 1, 1))
             second = default_cute_launcher(cute_kernel, (1,), 7, block=(32, 1, 1))
@@ -17582,7 +18008,10 @@ class TestCuteBackend(TestCase):
                 return_value="stream",
             ),
             patch("helion.runtime.cute.launcher._ensure_cute_dsl_arch_env"),
-            patch("cutlass.cute.compile", return_value=FakeCompiled()),
+            patch(
+                "helion.runtime.cute.compile_cache.compile_with_options",
+                return_value=FakeCompiled(),
+            ),
         ):
             positive = default_cute_launcher(cute_kernel, (1,), 0.0)
             negative = default_cute_launcher(cute_kernel, (1,), -0.0)

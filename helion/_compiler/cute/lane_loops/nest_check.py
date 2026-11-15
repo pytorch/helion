@@ -25,6 +25,7 @@ from ...ast_read_writes import ReadWrites
 from ...compile_environment import CompileEnvironment
 from ...device_function import DeviceFunction
 from ...host_function import NoCurrentFunction
+from ...reduction_strategy import LoopedReductionStrategy
 from ...tile_strategy import DeviceGridState
 from ...tile_strategy import DeviceLoopState
 from ...tile_strategy import _apply_wrapper_barriers
@@ -45,6 +46,7 @@ from .placement import distribute_lane_loops
 from .placement import full_nest_inexactness
 from .placement import inexact_nest_error
 from .statements import LanePlacement
+from .statements import _packets
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -56,16 +58,22 @@ if TYPE_CHECKING:
     from .statements import LaneScope
 
 
-def tile_begin_shifts(state: DeviceLoopState) -> dict[sympy.Symbol, sympy.Expr | None]:
+def tile_begin_shifts(
+    state: DeviceLoopState, *, per_thread_loops: bool
+) -> dict[sympy.Symbol, sympy.Expr | None]:
     """The begin symbol of each block this loop iterates and its step per iteration.
 
     The symbols the access regions of the body use for this loop's tiles
     (``tile_begin_symbol``, keyed on this loop instance).  A loop over one
     block advances its begin by the block size each iteration; a nest
     over several blocks steps them in turn, so the next iteration's
-    begins are unrelated to the current ones (None).
+    begins are unrelated to the current ones (None).  With
+    ``per_thread_loops`` the barrier pass also counts the per-thread loops
+    around the body as iterations (``DeviceLoopState.per_thread_loops``):
+    the next iteration may then be the next lane or vector element of the
+    same tile, whose begins have not moved, so they are None too.
     """
-    single = len(state.block_ids) == 1
+    single = len(state.block_ids) == 1 and not per_thread_loops
     return {
         tile_begin_symbol(block_id, state): (
             block_size_symbol(state.strategy.fn.block_size_var(block_id))
@@ -165,22 +173,62 @@ def check_lane_loop_nest(state: DeviceLoopState) -> None:
     axis_sizes, definitions, masks, constants, enclosing = _thread_barrier_context(
         state
     )
+    # The per-thread loops between this loop and its body that the lane
+    # nest does not hold (a looped reduction's lane loop and V-loop) run
+    # inside each of its iterations: the pass takes them as further
+    # iterations, in program order, and the statements they run before the
+    # body (a lane's base index) as definitions reaching it.  Without them
+    # the base index is a value of unknown origin, the same on every thread,
+    # and a store through it looks like one element every thread writes.
+    # Their iterations are lanes of the tile statements, not iterations of
+    # the program: a pair that may meet in two of them is rejected
+    # (``lane_variables``), where a barrier would order only other threads.
+    # Their packets, loaded before the body and flushed after it, are
+    # accesses of every element of a lane's vector (``packets_before``,
+    # ``packets_after``).
+    inner_loops, inner_variables, inner_definitions, inner_tails = (
+        state.per_thread_loops()
+    )
+    packet_calls: dict[int, tuple[str, str]] = {}
+    for loop in inner_loops:
+        packet_calls.update(_packets(loop))
+
+    def with_packets(statements: list[ast.AST]) -> list[ast.AST]:
+        return [
+            statement
+            for statement in statements
+            if any(id(call) in packet_calls for call in ast.walk(statement))
+        ]
+
     add_thread_barriers(
         nest,
         scopes,
         rename_groups=rename_groups,
         axis_sizes=axis_sizes,
-        definitions=definitions,
+        definitions=[*definitions, *inner_definitions],
         masks=masks,
         constants=constants,
         # A branch condition may vary per thread; a block-wide barrier in
         # a branch some threads skip would deadlock.
         allow_barriers=not _in_divergent_control_flow(),
-        loop_variables=state.loop_variables(),
+        loop_variables=state.loop_variables() | inner_variables,
         loop_body=loop_body,
-        loop_shifts=tile_begin_shifts(state),
-        # The loops around the body: those around this loop, then its own.
-        loop_headers=[*enclosing, *state.loop_headers()],
+        loop_shifts=tile_begin_shifts(state, per_thread_loops=bool(inner_loops)),
+        # The loops around the body: those around this loop, then its own
+        # (the per-thread loops among them iterate inside its iterations).
+        loop_headers=[*enclosing, *state.loop_headers(), *inner_loops],
+        lane_variables=inner_variables,
+        packets_before=with_packets(inner_definitions),
+        packets_after=with_packets(inner_tails),
+        packet_calls=packet_calls,
+        # A looped reduction's iterations are chunks of one tile statement,
+        # which the program runs over every chunk before the next statement;
+        # its tile begins move by a block per chunk.
+        chunk_shifts=(
+            tile_begin_shifts(state, per_thread_loops=False)
+            if isinstance(state.strategy, LoopedReductionStrategy)
+            else None
+        ),
     )
     if placement is not None:
         _emit_lane_placement(state, placement, setup_by_lane)
@@ -320,11 +368,11 @@ def _thread_barrier_context(
     (a device loop's body addresses the grid's axes too), the tile masks
     among them, the values of the block-size constants (the bounds of the
     loops inside the body name them) and the loops around this loop: the
-    enclosing device loops and the enclosing loops' lane loops (a lane nest
-    is materialized after its body, so a loop nested in the body sees the
-    lane variables as names), whose variables are one value each
-    throughout the body, nonnegative and below their bounds
-    (``AddressMaps`` models the loops around a body).
+    enclosing device loops, their per-thread loops and the enclosing loops'
+    lane loops (a lane nest is materialized after its body, so a loop
+    nested in the body sees the lane variables as names), whose variables
+    are one value each throughout the body, nonnegative and below their
+    bounds (``AddressMaps`` models the loops around a body).
     """
     axis_sizes = dict(state.thread_axis_sizes)
     own, masks = state.lane_index_definitions()
@@ -379,9 +427,17 @@ def _thread_barrier_context(
                 # An enclosing loop's ``for`` statements join their parent's
                 # list once its body is complete, so the loops around this
                 # one are read from their states: the device loop's own
-                # headers and the lane loops it nests around its body.
+                # headers, its per-thread loops (a looped reduction's lane
+                # loop and V-loop, with what they run before its body: the
+                # lane's base index) and the lane loops it nests around its
+                # body.
                 if isinstance(enclosing, DeviceLoopState):
                     enclosing_loops.extend(enclosing.loop_headers())
+                    inner_loops, _variables, inner_definitions, _tails = (
+                        enclosing.per_thread_loops()
+                    )
+                    enclosing_loops.extend(inner_loops)
+                    definitions.extend(inner_definitions)
                 enclosing_loops.extend(enclosing.lane_loop_headers())
     definitions.extend(own)
     return axis_sizes, definitions, masks, constants, enclosing_loops

@@ -4,35 +4,13 @@ import builtins
 from typing import TYPE_CHECKING
 from typing import cast
 
-import sympy
 import torch
 
-from .._compiler.compile_environment import CompileEnvironment
-from .._compiler.compile_environment import _to_sympy
+from .._compiler.compile_environment import compute_symbolic_min_max
 from . import _decorators
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-
-
-def compute_symbolic_min_max(
-    args: tuple[int | torch.SymInt, ...], op: object
-) -> torch.SymInt | int:
-    env = CompileEnvironment.current()
-    shape_env = env.shape_env
-    sympy_op = sympy.Min if op is builtins.min else sympy.Max
-    hint_fn = min if op is builtins.min else max
-
-    expr = _to_sympy(args[0])
-    hint = env.size_hint(args[0])
-
-    for arg in args[1:]:
-        rhs_expr = _to_sympy(arg)
-        rhs_hint = env.size_hint(arg)
-        expr = sympy_op(expr, rhs_expr)  # type: ignore[call-arg]
-        hint = hint_fn(hint, rhs_hint)  # type: ignore[arg-type]
-
-    return shape_env.create_symintnode(expr, hint=hint)  # type: ignore[return-value]
 
 
 def _compute_scalar_tensor_min_max(
@@ -59,6 +37,16 @@ def _compute_scalar_tensor_min_max(
     return result
 
 
+def _unpack_one_sequence(
+    args: tuple[int | torch.SymInt | torch.Tensor, ...],
+) -> tuple[int | torch.SymInt | torch.Tensor, ...]:
+    """The items of a single list or tuple argument (``min([a, b])``), which
+    Python's min and max compare as the separate arguments."""
+    if len(args) == 1 and isinstance(args[0], (list, tuple)):
+        return tuple(args[0])
+    return args
+
+
 @_decorators.device_func_replacement(builtins.min)
 def _builtin_min(
     *args: int | torch.SymInt | torch.Tensor,
@@ -74,6 +62,7 @@ def _builtin_min(
     Returns:
         The minimum value with the corresponding scalar representation.
     """
+    args = _unpack_one_sequence(args)
     if any(isinstance(arg, torch.Tensor) for arg in args):
         return _compute_scalar_tensor_min_max(args, torch.minimum)
     return compute_symbolic_min_max(args, op=builtins.min)  # type: ignore[arg-type]
@@ -94,6 +83,7 @@ def _builtin_max(
     Returns:
         The maximum value with the corresponding scalar representation.
     """
+    args = _unpack_one_sequence(args)
     if any(isinstance(arg, torch.Tensor) for arg in args):
         return _compute_scalar_tensor_min_max(args, torch.maximum)
     return compute_symbolic_min_max(args, op=builtins.max)  # type: ignore[arg-type]

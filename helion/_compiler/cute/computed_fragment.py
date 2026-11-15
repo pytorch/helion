@@ -63,8 +63,11 @@ from .fragment_shared_arena import SharedArenaRequest
 from .fragment_shared_arena import plan_shared_arena
 from .full_reduction_owner import fragment_store_destinations
 from .full_reduction_owner import requires_full_reduction_owner
+from .handler_ops import integer_to_float_expr
+from .handler_ops import scalar_value_dtype
 from .local_atomic import local_atomic_allocations
 from .local_atomic import prove_local_atomics
+from .matmul_utils import cute_static_k_invariant_extent
 from .native_s2f6_contract import native_s2f6_asm_matches
 from .pure_producer_regions import pure_producer_plan
 from .reduction_coordinates import captured_reduction_coordinates
@@ -204,7 +207,15 @@ class FragmentOps(GenerateASTFromInductor):
         # Fragment loads and shared buffers contain logical typed scalars.
         # The parent handler's FP8 byte decoder belongs to ordinary raw-byte
         # global loads; applying it to a typed Float8 register corrupts its bits.
-        return self._lift(self._create_cast_expr(x, dtype))
+        # An integer or a bool still becomes a float as in the pointwise
+        # lowering, where MLIR could fold an 8-bit float conversion into it.
+        x_ast = self._to_ast(x)
+        converted = integer_to_float_expr(
+            x_ast, dtype, src_dtype, self.cg.device_function
+        )
+        if converted is not None:
+            return self._lift(converted)
+        return self._lift(self._create_cast_expr(x_ast, dtype))
 
     def index_expr(self, expr: sympy.Expr, dtype: torch.dtype) -> str:
         return self._lift(
@@ -222,6 +233,20 @@ class FragmentCompiler(
     """The computed-fragment root owner: the graph walk and node dispatch over
     the general-purpose fragment emitters, plus the inductor-backed pointwise
     lowering of a fragment node."""
+
+    def convert(
+        self, expression: str, source: torch.dtype | None, dtype: torch.dtype
+    ) -> str:
+        """``expression``, of dtype ``source``, cast to ``dtype``: an integer
+        or a bool becomes a float as in the pointwise lowering
+        (``integer_to_float_expr``), where MLIR could fold an 8-bit float
+        conversion into it."""
+        converted = integer_to_float_expr(
+            expr_from_string(expression), dtype, source, self.cg.device_function
+        )
+        if converted is None:
+            return self.cast(expression, dtype)
+        return ast.unparse(converted)
 
     def pointwise_read(
         self,
@@ -915,7 +940,9 @@ class FragmentCompiler(
             return Fragment(
                 self.shape(fake.shape),
                 fake.dtype,
-                lambda coords: self.cast(f"({offset}) + ({coords[0]})", fake.dtype),
+                lambda coords: self.convert(
+                    f"({offset}) + ({coords[0]})", self.env.index_dtype, fake.dtype
+                ),
                 logical_domain=lambda coords: (
                     f"({offset}) + ({coords[0]}) < ({bound})",
                 ),
@@ -978,7 +1005,13 @@ class FragmentCompiler(
             result = Fragment(
                 shape,
                 fake.dtype,
-                lambda _: self.cast(self.scalar(value), fake.dtype),
+                lambda _: self.convert(
+                    self.scalar(value),
+                    value.dtype
+                    if isinstance(value, Fragment)
+                    else scalar_value_dtype(value),
+                    fake.dtype,
+                ),
                 dependencies=(value,) if isinstance(value, Fragment) else (),
                 logical_domain=(
                     lambda coords: tuple(
@@ -1572,6 +1605,12 @@ def computed_fragment_supported(
         static_k = isinstance(left.shape[-1], int) and left.shape[-1] > 1
         if bid is not None:
             static_k = env.block_sizes[bid].reduction
+        # No tile or full slice walks K: a plain static extent, or the kept
+        # extent of a range subscript that no full slice joined.
+        free_k = bid is None or (
+            bid in env.subscript_extent_block_ids
+            and bid not in env.subscript_extents_joined_by_slice
+        )
         return (
             left.dtype == right.dtype
             and left.dtype in (torch.float16, torch.bfloat16, torch.float32)
@@ -1601,6 +1640,16 @@ def computed_fragment_supported(
                         or left.ndim > 2
                         or right.ndim > 2
                     )
+                )
+                # A computed operand along such a K has no scalar recipe
+                # unless the pair is K-invariant: the fallback needs an
+                # active K tile or plain load views.  The extent a range
+                # subscript padded to could repeat another axis here, which
+                # gave the dot this owner only at such sizes.
+                or (
+                    free_k
+                    and (computed(lhs) or computed(rhs))
+                    and cute_static_k_invariant_extent(lhs, rhs) is None
                 )
             )
         )
@@ -1808,6 +1857,7 @@ def computed_fragment_supported(
                 "max",
                 "min",
                 "prod",
+                "any",
                 "argmin",
                 "argmax",
             ):

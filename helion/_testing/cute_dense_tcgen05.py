@@ -23,6 +23,8 @@ import helion.language as hl
 if TYPE_CHECKING:
     from collections.abc import Generator
 
+    from helion.runtime.kernel import BoundKernel
+
 # ``cpu_codegen_target`` reports the full opt-in capacity as the AB budget.
 # ``gb300_target`` restores the production probes, including the 28 KiB AB
 # reserve, so selection is priced on the real budget.
@@ -313,6 +315,55 @@ def plain_mm_into(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def bias_mm_into(
+    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor, out: torch.Tensor
+) -> None:
+    """Inductor's addmm epilogue: an FP32 accumulator plus a bias row."""
+    m, k = a.shape
+    n = b.shape[1]
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        out[rows, cols] = (bias[cols].to(torch.float32) + acc).to(out.dtype)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def promoted_bias_mm_into(
+    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor, out: torch.Tensor
+) -> None:
+    """``acc + bias``: the 16-bit row joins the FP32 accumulator unrounded, so a
+    ``pre_acc_wait`` epilogue stages it promoted to FP32."""
+    m, k = a.shape
+    n = b.shape[1]
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        out[rows, cols] = (acc + bias[cols]).to(out.dtype)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def scale_bias_mm_into(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale: torch.Tensor,
+    bias: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """Two row operands: a per-column scale and a bias row."""
+    m, k = a.shape
+    n = b.shape[1]
+    for rows, cols in hl.tile((m, n)):
+        acc = hl.zeros((rows, cols), dtype=torch.float32)
+        for inner in hl.tile(k):
+            acc = torch.addmm(acc, a[rows, inner], b[inner, cols])
+        out[rows, cols] = (
+            acc * scale[cols].to(torch.float32) + bias[cols].to(torch.float32)
+        ).to(out.dtype)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def output_reading_mm(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
     """An argument output that the epilogue also reads."""
     m, k = a.shape
@@ -454,3 +505,68 @@ def unsupported_epilogue_mm(
             result = acc * (aux[cols] * aux[cols])
         out[rows, cols] = result.to(torch.bfloat16)
     return out
+
+
+def batched_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """``bmm(a, b)``, undecorated: callers pick the kernel settings."""
+    batch, m, k = a.shape
+    _, _, n = b.shape
+    out = torch.empty((batch, m, n), dtype=a.dtype, device=a.device)
+    for tile_b, tile_m, tile_n in hl.tile((batch, m, n)):
+        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.baddbmm(
+                acc, a[tile_b, tile_m, tile_k], b[tile_b, tile_k, tile_n]
+            )
+        out[tile_b, tile_m, tile_n] = acc.to(out.dtype)
+    return out
+
+
+def bind_bmm(
+    shape: tuple[int, int, int, int],
+    dtype: torch.dtype,
+    *,
+    a_m_major: bool = False,
+    b_k_major: bool = False,
+) -> BoundKernel:
+    """``batched_gemm`` bound on CPU over ``(batch, m, n, k)``; an M-major A
+    is a transposed [B, K, M] tensor, a K-major B a transposed [B, N, K]
+    one."""
+    batch, m, n, k = shape
+    a = torch.empty((batch, k, m) if a_m_major else (batch, m, k), dtype=dtype)
+    b = torch.empty((batch, n, k) if b_k_major else (batch, k, n), dtype=dtype)
+    args = (a.transpose(1, 2) if a_m_major else a, b.mT if b_k_major else b)
+    return helion.kernel(batched_gemm, backend="cute", static_shapes=True).bind(args)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def scaled_bmm_into(
+    a: torch.Tensor, b: torch.Tensor, mask: torch.Tensor, out: torch.Tensor
+) -> None:
+    """Attention scores ``bmm(a, b) * 0.125 + mask`` into ``out``, a view
+    whose rows may be padded past N (softmax's 1001-element rows)."""
+    batch, m, k = a.shape
+    n = b.shape[2]
+    for tile_b, tile_m, tile_n in hl.tile((batch, m, n)):
+        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.baddbmm(
+                acc, a[tile_b, tile_m, tile_k], b[tile_b, tile_k, tile_n]
+            )
+        out[tile_b, tile_m, tile_n] = (
+            acc * 0.125 + mask[tile_m, tile_n].to(torch.float32)
+        ).to(torch.bfloat16)
+
+
+def scaled_bmm_args(
+    batch: int, m: int, n: int, k: int, *, row: int, device: torch.device | str
+) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+    """``scaled_bmm_into``'s operands -- a bf16 ``[batch, m, k]`` A, a
+    K-major ``[batch, k, n]`` B, an ``[m, n]`` mask and an output whose rows
+    hold ``row`` elements -- and the padded ``[batch, m, row]`` buffer the
+    output views (``row > n`` pads its rows)."""
+    a = torch.randn(batch, m, k, device=device, dtype=torch.bfloat16)
+    b = torch.randn(batch, n, k, device=device, dtype=torch.bfloat16).mT
+    mask = torch.randn(m, n, device=device, dtype=torch.bfloat16)
+    padded = torch.empty(batch, m, row, device=device, dtype=torch.bfloat16)
+    return (a, b, mask, padded[..., :n]), padded

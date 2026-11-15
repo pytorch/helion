@@ -332,8 +332,11 @@ def analyze_native_gemm(
 
 def prove_full_tile_schedule_facts(
     gemm: NativeGemm | None,
+    *,
+    output_dtypes: tuple[torch.dtype, ...] = (torch.float16, torch.bfloat16),
 ) -> Tcgen05FullTileScheduleFacts | None:
-    """Admit one aligned rank-two MMA with a supported single epilogue."""
+    """Admit one aligned rank-two MMA with a supported single epilogue
+    storing one of ``output_dtypes``."""
     if gemm is None:
         return None
     operands = gemm.candidate.operands
@@ -355,7 +358,7 @@ def prove_full_tile_schedule_facts(
             for leaf in gemm.chain.auxiliary_tensor_loads
         )
         or gemm.output.ndim != 2
-        or gemm.output.dtype not in (torch.float16, torch.bfloat16)
+        or gemm.output.dtype not in output_dtypes
     ):
         return None
     return Tcgen05FullTileScheduleFacts(

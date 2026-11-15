@@ -17,6 +17,7 @@ import itertools
 import os
 from pathlib import Path
 import re
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
@@ -30,12 +31,12 @@ import helion
 from helion._compiler.cute import cute_mma_dag as dag
 from helion._compiler.cute import cutedsl_compat
 from helion._compiler.cute.autotune.heuristics.cute_mma_dag import CuteMmaDagHeuristic
-from helion._compiler.cute.cute_mma_dag_emitter_base import _float_literal
 from helion._compiler.cute.cute_mma_dag_emitter_base import _Layout
 from helion._compiler.cute.cute_mma_dag_tcgen05 import tcgen05_corner_seeds
 from helion._compiler.cute.cute_mma_dag_tcgen05 import tcgen05_seed_configs
 from helion._compiler.cute.cute_warp_mma_gemm import _swizzled_chunk
 from helion._compiler.cute.cute_warp_mma_gemm import warp_mma_warp_layout
+from helion._compiler.cute.math_templates import float_literal
 from helion._compiler.cute.state import cute_env_state
 from helion._compiler.host_function import SymbolOrigin
 from helion._compiler.source_location import UnknownLocation
@@ -71,6 +72,8 @@ from helion._testing.cute_mma_dag import cast_tensor
 from helion._testing.cute_mma_dag import run_cute
 from helion._testing.cute_mma_dag import run_triton
 from helion._testing.cute_mma_dag import tensors
+from helion._testing.cute_sass import cute_launcher_cubins
+from helion._testing.cute_sass import cute_launcher_sass
 from helion.autotuner.config_fragment import EnumFragment
 from helion.runtime.cute import sass_check
 from helion.runtime.cute.standalone_launcher import _standalone_validate_mma_dag_aliases
@@ -7994,7 +7997,7 @@ def test_float_literals_spell_non_finite_values_as_calls(
 ) -> None:
     # ``repr(float("inf"))`` is the bare name ``inf``, undefined in the
     # generated module: the DSL source spells it as a ``float(...)`` call.
-    assert _float_literal(value) == literal
+    assert float_literal(value) == literal
 
 
 def test_a_non_finite_fill_beside_a_fragment_renders_as_a_call() -> None:
@@ -8556,6 +8559,47 @@ def test_a_half_addmm_into_an_fp32_accumulator_is_a_dot() -> None:
         (node,) = nodes
         assert dag.accumulating_addmm_dtype(node) is None
         assert not dag._is_dot(node)
+
+
+def test_the_standalone_export_carries_the_shared_ptx_rows() -> None:
+    # ``_mma_dag_runtime`` re-exports ``stg_b32`` / ``unpack_f16x2`` from
+    # ``device/ptx.py``: the export has to carry the table builder with its
+    # rows and bind the re-exports to them.  (The warp_mma GEMM family renders
+    # the rows too but its launch plan is not exportable yet.)
+    # test_cute_standalone.py runs the export with ``helion`` unimportable,
+    # in the slow tier.
+    bound = _bind_fn(
+        _accumulating_addmm,
+        _accumulating_addmm_inputs(),
+        cute_materialize_transformed_operands=False,
+    )
+    with bound.env:
+        default = bound.config_spec.default_config()
+        config = bound.config_spec.normalized_config(
+            helion.Config(
+                **{
+                    **default.config,
+                    "cute_mma_dag": "warp",
+                    # The TMA ring adds a descriptor-preparation plan the
+                    # exporter refuses; per-thread packets leave the alias plan.
+                    "cute_mma_dag_loads": "lane",
+                }
+            )
+        )
+    code = bound.to_code(config)
+    for name in ("stg_b32", "unpack_f16x2"):
+        assert f"{RT}.{name}(" in code, name
+    # The export reads the SM count from the device properties: the modelled
+    # B200's 148.
+    with patch(
+        "torch.cuda.get_device_properties",
+        return_value=SimpleNamespace(multi_processor_count=148),
+    ):
+        code = bound.to_code(
+            config, options=helion.OutputCodeOptions(allow_helion_deps=False)
+        )
+    assert "_make_standalone_ptx" in code
+    assert "_make_standalone_mma_dag_runtime" in code
 
 
 def test_a_pointwise_operand_over_loaded_tiles_is_a_pass_chain() -> None:
@@ -12654,17 +12698,7 @@ def test_the_hinted_decode_kernels_sass_has_no_collision_under_several_configs()
         compiled = bound.compile_config(normalized)
         (out,) = tensors(compiled(*args))
         torch.cuda.synchronize()
-        module = sys.modules[compiled.__module__]
-        cute_kernel = next(
-            value
-            for value in vars(module).values()
-            if getattr(value, "_helion_cute_sass_checks", ())
-        )
-        (launcher,) = cute_kernel._helion_cute_compiled_launchers.values()
-        sass = "\n".join(
-            sass_check.disassemble(blob)
-            for blob in sass_check._cubin_blobs(launcher._compiled.ir_module)
-        )
+        sass = cute_launcher_sass(compiled)
         (texts,) = sass_check.functions(sass)
         ldgsts = [text for text in texts if text.startswith("LDGSTS")]
         assert ldgsts, (block_n, warps)
@@ -12680,12 +12714,7 @@ def test_the_hinted_decode_kernels_sass_has_no_collision_under_several_configs()
         assert all(
             ur in written for text in ldgsts for ur in re.findall(r"\bUR\d+\b", text)
         ), (ldgsts, sorted(written))
-        assert (
-            sass_check.assembler(
-                next(iter(sass_check._cubin_blobs(launcher._compiled.ir_module)))
-            )
-            is not None
-        )
+        assert sass_check.assembler(cute_launcher_cubins(compiled)[0]) is not None
         _, (plain,) = _run_cute(fn, args, _device_config([1, block_n], warps, 4))
         assert torch.equal(out, plain), (block_n, warps)
 

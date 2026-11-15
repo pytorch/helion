@@ -112,7 +112,6 @@ from .cute_mma_dag import cluster_split_axis
 from .cute_mma_dag import staged_store_reason
 from .cute_mma_dag import streamed_loop_subject
 from .cute_mma_dag_emitter_base import _RUNTIME
-from .cute_mma_dag_emitter_base import _float_literal
 from .cute_mma_dag_emitter_base import _reduce_combine
 from .cute_mma_dag_emitter_base import _shape
 from .cute_mma_dag_tcgen05 import _PRIMS
@@ -158,6 +157,7 @@ from .cute_mma_dag_tcgen05 import resident_slots
 from .cute_mma_dag_tcgen05 import tcgen05_atom_bytes
 from .cute_mma_dag_tcgen05 import tcgen05_tmem_cols
 from .cute_warp_mma_gemm import _swizzled_chunk
+from .math_templates import float_literal
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -4672,7 +4672,7 @@ class Tcgen05RegionMmaDagEmitter(Tcgen05MmaDagEmitter):
                     self.emit(f"{self.vreg(carry.slot)} = {self.vreg(source)}")
                 continue
             self.emit(
-                f"{self.vreg(carry.slot)} = cutlass.Float32({_float_literal(carry.init_fill)})"
+                f"{self.vreg(carry.slot)} = cutlass.Float32({float_literal(carry.init_fill)})"
             )
 
     def emit_reduce(self, step: Reduce, loaded: set[int]) -> None:
@@ -4784,7 +4784,7 @@ class Tcgen05RegionMmaDagEmitter(Tcgen05MmaDagEmitter):
         assert family is not None
         width = 16 if self.half_rows(family) else 32
         guard = self.vec_extent_predicate(source)
-        identity = _float_literal(0.0 if step.kind == "sum" else float("-inf"))
+        identity = float_literal(0.0 if step.kind == "sum" else float("-inf"))
         value = self.bind("md_s", f"cutlass.Float32({identity})") if guard else None
         with self.block(f"if {guard}:" if guard else None):
             self.evaluator.vec_reg = (0, 0)

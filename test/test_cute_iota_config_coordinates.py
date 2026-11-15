@@ -58,6 +58,9 @@ def _cpu_codegen_target() -> Generator[None, None, None]:
             "cutlass.cute.compile", side_effect=AssertionError("CPU only")
         ) as compilation,
     ):
+        # ``cute.compile[options](...)``, the launchers' spelling, is the same
+        # forbidden call (``forbid_native_compile``).
+        compilation.__getitem__.return_value = compilation
         yield
         current_device.assert_not_called()
         capability.assert_not_called()

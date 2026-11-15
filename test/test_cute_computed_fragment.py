@@ -1317,7 +1317,10 @@ def _native_same_axis_statistic(
 def test_same_axis_statistic_broadcast_from_another_lane_owner_is_refused():
     # The amax's lanes belong to the free hl.arange, not to the row tile's
     # lane loop that consumes the broadcast statistic; lowering it there gave
-    # wrong values (17 and 1000 columns).
+    # wrong values (17 and 1000 columns).  The amax reduces the range's 32
+    # padded lanes while the range runs on lanes of its own, which
+    # ``cute_padded_range_length`` refuses before the lane split's owner check
+    # (test_cute_lane_reduction_ownership.py covers that one).
     with (
         mock_cuda_unavailable(),
         _target(),
@@ -1334,7 +1337,8 @@ def test_same_axis_statistic_broadcast_from_another_lane_owner_is_refused():
         config = bound.config_spec.default_config()
         config.config["reduction_loops"] = [None]
         with pytest.raises(
-            helion.exc.BackendUnsupported, match="nested in a different lane owner"
+            helion.exc.BackendUnsupported,
+            match="padded lanes of an hl.arange that does not run on the reduction",
         ):
             bound.to_code(config)
 
@@ -5146,12 +5150,28 @@ def test_resident_while_plan_current_captures_not_node_args():
     assert changed.invariant_slots == (0, 4)
 
 
-def test_resident_while_plan_rejects_actual_ambiguous_swap():
+def test_resident_while_plan_accepts_actual_swap_rejects_ambiguous_merge():
+    """After ``left, right = right, left`` the loop body's outputs are its
+    own inputs, which it carries out in variables of their own
+    (``_collect_outputs``), so the merge of each name after the loop enters
+    from its own value before the loop: the swap plans and renders the
+    resident loop.  Without those copies the merge of ``left`` entered from
+    the loop's ``right`` output, a phi the plan cannot tie to an entry
+    value: refused."""
     from helion._compiler.cute.resident_while import resident_while_plan
 
     _bound, call, graphs = _resident_while_bound()
     assert resident_while_plan(call, graphs).nested_fors
-    _bound, call, graphs = _resident_while_bound(swap=True)
+    bound, call, graphs = _resident_while_bound(swap=True)
+    assert resident_while_plan(call, graphs).nested_fors
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        config = bound.config_spec.default_config()
+        config.config["cute_fragment_bounded_gather"] = True
+        assert "while fragment_while_take" in bound.to_code(config)
+    # The merge of ``left`` as traced without the copies.
+    outputs = {user.args[1]: user for user in call.users}
+    for phi in list(outputs[2].users):
+        phi.args = (outputs[1], phi.args[1])
     with pytest.raises(exc.InvalidConfig, match="explicit initialized phi"):
         resident_while_plan(call, graphs)
 

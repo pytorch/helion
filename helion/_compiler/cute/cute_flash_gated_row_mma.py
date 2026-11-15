@@ -471,11 +471,12 @@ def _emit_gated_row_mma_device_body(
         assert match.q.lane_constant is not None
         lane_expr = f"cutlass.Int32({match.q.lane_constant})"
     predicate_value = emitter.emit(match.if_predicate)
-    row_terms = [_to_b(emitter.emit(term)) for term in match.store_skip_terms]
+    row_terms = emitter.store_row_terms()
     # The jagged length those terms compare the row with (``tile_q.index <
     # off[b + 1] - off[b]``, a CTA-level scalar): Q rows at or past it are
-    # zero-filled instead of read -- the gate zeroes their P and the store
-    # skips them, so nothing downstream sees the row.
+    # zero-filled instead of read.  The gate zeroes their P, so the row's
+    # value never reads them: the store skips the row, or past the last
+    # sequence (``GatedAttentionMatch.rows_end``) stores the zero accumulator.
     row_bounds: list[str] = []
     for term in match.store_skip_terms:
         if term.target in _LT_TARGETS:

@@ -75,7 +75,7 @@ def context_from_device_function(
     from ..compile_environment import CompileEnvironment
     from ..device_function import TensorArg
     from ..device_function import TensorDescriptorArg
-    from .memory_ops import runtime_tensor_has_specialized_alignment
+    from .memory_ops import tensor_has_specialized_base_alignment
 
     env = CompileEnvironment.current()
     strides = fn.proven_tensor_stride_values()
@@ -96,12 +96,16 @@ def context_from_device_function(
                 (
                     size
                     for size in (32, 16, 8, 4, 2)
-                    if runtime_tensor_has_specialized_alignment(
-                        env, arg.fake_value, size
-                    )
+                    if tensor_has_specialized_base_alignment(env, arg.fake_value, size)
                 ),
                 0,
             )
+
+            # The launcher declares a tensor pointer at most 16-byte aligned
+            # (``helion.runtime.cute.arg_signature.pointer_alignment``), and
+            # the DSL verifies a copy atom against that declaration, so no
+            # copy may rely on more, however aligned the input is.
+            alignment = min(alignment, 16)
             inputs[arg.name] = TensorCopyInput(
                 dtype,
                 (shape[0], shape[1]),

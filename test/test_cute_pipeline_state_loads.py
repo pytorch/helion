@@ -10,7 +10,10 @@ from unittest.mock import patch
 import pytest
 import torch
 from torch._dynamo.source import LocalSource
+from torch._dynamo.source import TensorProperty
+from torch._dynamo.source import TensorPropertySource
 from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.fx.experimental.symbolic_shapes import DimDynamic
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from helion._compiler.compile_environment import CompileEnvironment
@@ -24,6 +27,7 @@ from helion._compiler.cute.pipeline_state_loads import pipeline_state_loads
 from helion._compiler.device_function import DeviceFunction
 from helion._compiler.device_function import TensorArg
 from helion._compiler.device_function import TensorSizeArg
+from helion._testing.binding_state import with_binding_state
 
 pytestmark = pytest.mark.cpu_only
 
@@ -1173,9 +1177,21 @@ def test_scalar_pair_full_range_proof_rejects_rebound_size_argument() -> None:
     assert result.count("if cutlass.Int32(aux_index) < aux_size else") == 2
 
 
-def test_exact_size_facts_require_matching_replayable_runtime_anchor() -> None:
-    shape_env = ShapeEnv(duck_shape=False)
-    shared_size = shape_env.create_unbacked_symint()
+def _stub_environment(**attributes: object) -> SimpleNamespace:
+    """A ``CompileEnvironment`` stand-in with a bound kernel's binding state
+    and the real readers of it (``with_binding_state``), reading the given
+    attributes (``runtime_value_for_tensor``, ``shape_env``); a test clears
+    ``dispatch_guards_enforced`` or marks an outer-trace binding itself."""
+    env = with_binding_state(SimpleNamespace())
+    vars(env).update(attributes)
+    return env
+
+
+def _exact_size_function(
+    shape_env: ShapeEnv, shared_size: torch.SymInt
+) -> tuple[DeviceFunction, torch.Tensor, torch.Tensor]:
+    """``aux`` (2, n) and ``anchor`` (3, n), whose size n the launch passes
+    for both as ``anchor_size``."""
     with FakeTensorMode(shape_env=shape_env):
         source_fake = torch.empty(
             (2, shared_size),
@@ -1187,69 +1203,95 @@ def test_exact_size_facts_require_matching_replayable_runtime_anchor() -> None:
             device="cuda",  # @ignore-device-lint
             dtype=torch.bfloat16,
         )
-
-    source_arg = TensorArg("aux", source_fake, "aux")
     anchor_arg = TensorArg("anchor", anchor_fake, "anchor")
     property_arg = TensorSizeArg("anchor_size", anchor_arg, 1)
     function = object.__new__(DeviceFunction)
-    function.arguments = [source_arg, anchor_arg, property_arg]
+    function.arguments = [
+        TensorArg("aux", source_fake, "aux"),
+        anchor_arg,
+        property_arg,
+    ]
     function._tensor_properties = {
         (TensorSizeArg, shape_env.replace(shared_size._sympy_())): property_arg
     }
+    return function, source_fake, anchor_fake
 
-    source_token = object()
-    anchor_token = object()
-    sources: dict[int, object] = {
-        id(source_fake): source_token,
-        id(anchor_fake): anchor_token,
-    }
+
+def test_exact_size_facts_come_from_the_keyed_trace() -> None:
+    """The ``input_tensor_metadata`` fact keys the binding on both inputs'
+    exact sizes, so the trace hint is ``aux``'s size, and ``anchor_size``'s,
+    in every call the binding serves."""
+    shape_env = ShapeEnv(duck_shape=False)
+    size_source = TensorPropertySource(
+        LocalSource("anchor", is_input=True), TensorProperty.SIZE, 1
+    )
+    shared_size = cast(
+        "torch.SymInt",
+        shape_env.create_symintnode(
+            shape_env.create_symbol(4608, size_source, dynamic_dim=DimDynamic.DYNAMIC),
+            hint=4608,
+            source=size_source,
+        ),
+    )
+    function, source_fake, anchor_fake = _exact_size_function(shape_env, shared_size)
+    sources: dict[int, object] = {id(source_fake): object(), id(anchor_fake): object()}
     runtimes: dict[int, object] = {
         id(source_fake): torch.empty((2, 4608), dtype=torch.bfloat16),
         id(anchor_fake): torch.empty((3, 4608), dtype=torch.bfloat16),
     }
-    env = SimpleNamespace(
+    env = _stub_environment(
         compiler_fact_specialization_facts={"input_tensor_metadata"},
         shape_env=shape_env,
         tensor_input_source=lambda tensor: sources.get(id(tensor)),
         runtime_value_for_tensor=lambda tensor: runtimes.get(id(tensor)),
-        size_hint=lambda size: 4608,
     )
+    proven = ("anchor_size", 4608)
 
     with patch.object(CompileEnvironment, "current", return_value=env):
-        assert function.proven_tensor_size_values()["aux", 1] == (
-            "anchor_size",
-            4608,
-        )
+        assert function.proven_tensor_size_values()["aux", 1] == proven
 
-        # A post-bind resize changes the weakly held runtime tensor but not the
-        # cache-keyed fake trace hint.  It cannot strengthen a compiled bound.
-        runtimes[id(source_fake)] = torch.empty((2, 4609), dtype=torch.bfloat16)
-        assert ("aux", 1) not in function.proven_tensor_size_values()
-        runtimes[id(source_fake)] = torch.empty((2, 4608), dtype=torch.bfloat16)
+        for fake, rows in ((source_fake, 2), (anchor_fake, 3)):
+            live = runtimes[id(fake)]
+            # A direct ``to_code`` may find the example input collected, or
+            # resized in place after binding (dispatch no longer routes it
+            # here): neither changes the proof.
+            for stand_in in (None, torch.empty((rows, 4609), dtype=torch.bfloat16)):
+                runtimes[id(fake)] = stand_in
+                assert function.proven_tensor_size_values()["aux", 1] == proven
+            runtimes[id(fake)] = live
 
-        # The launch argument comes from the deduplicated property's anchor.
-        # A same-symbol runtime mismatch must not prove the source dimension.
-        runtimes[id(anchor_fake)] = torch.empty((3, 4607), dtype=torch.bfloat16)
-        assert ("aux", 1) not in function.proven_tensor_size_values()
+        # A binding made from an outer trace's FakeTensors has that trace's
+        # hints, not runtime sizes, whether or not the FakeTensors are alive.
+        env._binds_outer_trace_inputs = True
+        assert function.proven_tensor_size_values() == {}
+        env._binds_outer_trace_inputs = False
 
-        runtimes[id(anchor_fake)] = torch.empty((3, 4608), dtype=torch.bfloat16)
-        sources.pop(id(source_fake))
-        assert ("aux", 1) not in function.proven_tensor_size_values()
+        # Only inputs' sizes are keyed.
+        for fake in (source_fake, anchor_fake):
+            token = sources.pop(id(fake))
+            assert ("aux", 1) not in function.proven_tensor_size_values()
+            sources[id(fake)] = token
 
-        sources[id(source_fake)] = source_token
-        sources.pop(id(anchor_fake))
-        assert ("aux", 1) not in function.proven_tensor_size_values()
+        # Inductor's render of a dynamic-shape graph runs at every size.
+        env.dispatch_guards_enforced = False
+        assert function.proven_tensor_size_values() == {}
+        env.dispatch_guards_enforced = True
 
-        sources[id(anchor_fake)] = anchor_token
-        runtimes[id(source_fake)] = source_fake
-        assert ("aux", 1) not in function.proven_tensor_size_values()
-
-        runtimes[id(source_fake)] = torch.empty((2, 4608), dtype=torch.bfloat16)
-        runtimes[id(anchor_fake)] = anchor_fake
-        assert ("aux", 1) not in function.proven_tensor_size_values()
-
-        runtimes[id(anchor_fake)] = torch.empty((3, 4608), dtype=torch.bfloat16)
         env.compiler_fact_specialization_facts = set()
+        assert function.proven_tensor_size_values() == {}
+
+    # An unbacked size has no hint (``CompileEnvironment.size_hint`` makes one
+    # up, 8192 by default), so it is never proven.
+    unbacked_shape_env = ShapeEnv(duck_shape=False)
+    function, source_fake, anchor_fake = _exact_size_function(
+        unbacked_shape_env, unbacked_shape_env.create_unbacked_symint()
+    )
+    env.shape_env = unbacked_shape_env
+    env.compiler_fact_specialization_facts = {"input_tensor_metadata"}
+    sources.clear()
+    sources.update({id(source_fake): object(), id(anchor_fake): object()})
+    runtimes.clear()
+    with patch.object(CompileEnvironment, "current", return_value=env):
         assert function.proven_tensor_size_values() == {}
 
 
@@ -1344,25 +1386,20 @@ def test_runtime_alignment_fact_rejects_odd_bf16_storage_offset() -> None:
     assert aligned.data_ptr() % 4 == 0
     assert unaligned.data_ptr() % 4 == 2
     source = LocalSource("aux", is_input=True)
-    specialization = SimpleNamespace(
-        sources=(source,), classifier=_persistent_vec_alignment_matrix_signature
-    )
+    specialization = SimpleNamespace(sources=(source,))
     bound_result = _persistent_vec_alignment_matrix_signature((aligned,))
 
     def environment(runtime: torch.Tensor) -> SimpleNamespace:
-        return SimpleNamespace(
+        return _stub_environment(
             runtime_value_for_tensor=lambda _: runtime,
-            tensor_input_source=lambda _: source,
             runtime_arg_values_by_name={"aux": runtime},
+            tensor_input_source=lambda _: source,
             runtime_input_specializations={
                 _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY: specialization
             },
-            runtime_input_specialization_matches_bound=(
-                lambda key, result: (
-                    key == _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
-                    and result == bound_result
-                )
-            ),
+            bound_runtime_input_specialization_results={
+                _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY: bound_result
+            },
         )
 
     assert runtime_tensor_has_specialized_alignment(
@@ -1373,6 +1410,43 @@ def test_runtime_alignment_fact_rejects_odd_bf16_storage_offset() -> None:
     )
 
 
+def test_runtime_alignment_fact_rejects_an_outer_trace_fake_tensor() -> None:
+    """A binding from an outer trace's FakeTensors (Dynamo, make_fx) has no
+    live example input, and the callers that go on to read the replayed
+    tensor's sizes and strides (the rank-1 recurrences) would take the ones
+    that trace chose: refused, though the bound signature proves the
+    alignment, whether or not the FakeTensor is still alive."""
+    aligned = torch.empty(16, dtype=torch.bfloat16)
+    fake = FakeTensorMode().from_tensor(aligned)
+    source = LocalSource("aux", is_input=True)
+    specialization = SimpleNamespace(sources=(source,))
+    bound_result = _persistent_vec_alignment_matrix_signature((aligned,))
+
+    def environment(runtime: torch.Tensor | None) -> SimpleNamespace:
+        env = _stub_environment(
+            runtime_value_for_tensor=lambda _: runtime,
+            runtime_arg_values_by_name={} if runtime is None else {"aux": runtime},
+            tensor_input_source=lambda _: source,
+            runtime_input_specializations={
+                _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY: specialization
+            },
+            bound_runtime_input_specialization_results={
+                _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY: bound_result
+            },
+        )
+        # The binding records its outer-trace inputs when it converts them.
+        env._binds_outer_trace_inputs = runtime is not aligned
+        return env
+
+    assert runtime_tensor_has_specialized_alignment(
+        cast("CompileEnvironment", environment(aligned)), aligned, 4
+    )
+    for runtime in (fake, None):
+        assert not runtime_tensor_has_specialized_alignment(
+            cast("CompileEnvironment", environment(runtime)), aligned, 4
+        )
+
+
 def test_runtime_alignment_fact_rejects_post_bind_realignment() -> None:
     base = torch.empty(17, dtype=torch.bfloat16)
     bound_value = base[1:17]
@@ -1380,23 +1454,18 @@ def test_runtime_alignment_fact_rejects_post_bind_realignment() -> None:
     assert bound_value.data_ptr() % 4 == 2
     assert current_value.data_ptr() % 4 == 0
     source = LocalSource("aux", is_input=True)
-    specialization = SimpleNamespace(
-        sources=(source,), classifier=_persistent_vec_alignment_matrix_signature
-    )
+    specialization = SimpleNamespace(sources=(source,))
     bound_result = _persistent_vec_alignment_matrix_signature((bound_value,))
-    env = SimpleNamespace(
+    env = _stub_environment(
         runtime_value_for_tensor=lambda _: current_value,
-        tensor_input_source=lambda _: source,
         runtime_arg_values_by_name={"aux": current_value},
+        tensor_input_source=lambda _: source,
         runtime_input_specializations={
             _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY: specialization
         },
-        runtime_input_specialization_matches_bound=(
-            lambda key, result: (
-                key == _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
-                and result == bound_result
-            )
-        ),
+        bound_runtime_input_specialization_results={
+            _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY: bound_result
+        },
     )
 
     assert not runtime_tensor_has_specialized_alignment(
@@ -1411,23 +1480,18 @@ def test_runtime_alignment_fact_rejects_post_bind_size_divisibility_change() -> 
     assert bound_value.data_ptr() == current_value.data_ptr()
     assert bound_value.stride() == current_value.stride()
     source = LocalSource("aux", is_input=True)
-    specialization = SimpleNamespace(
-        sources=(source,), classifier=_persistent_vec_alignment_matrix_signature
-    )
+    specialization = SimpleNamespace(sources=(source,))
     bound_result = _persistent_vec_alignment_matrix_signature((bound_value,))
-    env = SimpleNamespace(
+    env = _stub_environment(
         runtime_value_for_tensor=lambda _: current_value,
-        tensor_input_source=lambda _: source,
         runtime_arg_values_by_name={"aux": current_value},
+        tensor_input_source=lambda _: source,
         runtime_input_specializations={
             _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY: specialization
         },
-        runtime_input_specialization_matches_bound=(
-            lambda key, result: (
-                key == _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
-                and result == bound_result
-            )
-        ),
+        bound_runtime_input_specialization_results={
+            _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY: bound_result
+        },
     )
 
     assert not runtime_tensor_has_specialized_alignment(
@@ -1435,42 +1499,91 @@ def test_runtime_alignment_fact_rejects_post_bind_size_divisibility_change() -> 
     )
 
 
-def test_proven_stride_rejects_post_bind_metadata_mutation() -> None:
+def test_runtime_alignment_fact_rejects_another_input_changed_after_binding() -> None:
+    """The callers go on to read every input's live sizes and strides, so an
+    input other than the proven one whose metadata changed after binding
+    refuses the proof too; a collected input is skipped."""
+    backing = torch.empty(32, dtype=torch.bfloat16)
+    aux = backing[:16]
+    other_bound = backing[16:23]
+    other_now = backing[16:24]
+    aux_source = LocalSource("aux", is_input=True)
+    other_source = LocalSource("other", is_input=True)
+    specialization = SimpleNamespace(sources=(aux_source, other_source))
+    bound_result = _persistent_vec_alignment_matrix_signature((aux, other_bound))
+
+    def holds(live: dict[str, torch.Tensor]) -> bool:
+        env = _stub_environment(
+            runtime_value_for_tensor=lambda _: aux,
+            runtime_arg_values_by_name=live,
+            tensor_input_source=lambda _: aux_source,
+            runtime_input_specializations={
+                _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY: specialization
+            },
+            bound_runtime_input_specialization_results={
+                _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY: bound_result
+            },
+        )
+        return runtime_tensor_has_specialized_alignment(
+            cast("CompileEnvironment", env), aux, 4
+        )
+
+    assert holds({"aux": aux, "other": other_bound})
+    assert holds({"aux": aux})
+    assert not holds({"aux": aux, "other": other_now})
+
+
+def test_proven_strides_come_from_the_keyed_trace() -> None:
+    """The ``input_tensor_metadata`` fact keys the binding on exact strides,
+    so the trace decides whether a direct ``to_code`` finds the example input
+    alive, collected or changed in place after binding (dispatch no longer
+    routes it here).  A binding made from an outer trace's FakeTensors proves
+    no input stride, and a render without the dispatch guards proves none,
+    for an input or for a host allocation laid out from the inputs' metadata."""
     traced = torch.empty_strided((4, 8), (8, 1))
-    current = torch.empty_strided((4, 8), (1, 4))
-    source = LocalSource("value", is_input=True)
-    env = SimpleNamespace(
+    allocated = torch.empty_strided((4, 8), (8, 1))
+    sources = {id(traced): LocalSource("value", is_input=True)}
+    runtimes: dict[int, object] = {}
+    env = _stub_environment(
         settings=SimpleNamespace(static_shapes=False),
         compiler_fact_specialization_facts=frozenset(("input_tensor_metadata",)),
-        tensor_input_source=lambda _: source,
-        runtime_value_for_tensor=lambda _: current,
+        tensor_input_source=lambda tensor: sources.get(id(tensor)),
+        runtime_value_for_tensor=lambda tensor: runtimes.get(id(tensor)),
         specialized_strides=set(),
-        size_hint=int,
     )
     device_function = object.__new__(DeviceFunction)
-    device_function.arguments = [TensorArg("value", traced, "value")]
+    device_function.arguments = [
+        TensorArg("value", traced, "value"),
+        TensorArg("out", allocated, "out"),
+    ]
+    proven = {("value", 0): 8, ("value", 1): 1, ("out", 0): 8, ("out", 1): 1}
 
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(CompileEnvironment, "current", lambda: env)
-        assert device_function.proven_tensor_stride_values() == {}
-        env.runtime_value_for_tensor = lambda _: traced
+        for live in (traced, torch.empty_strided((4, 8), (1, 4)), None):
+            runtimes[id(traced)] = live
+            assert device_function.proven_tensor_stride_values() == proven
+        env._binds_outer_trace_inputs = True
         assert device_function.proven_tensor_stride_values() == {
-            ("value", 0): 8,
-            ("value", 1): 1,
+            ("out", 0): 8,
+            ("out", 1): 1,
         }
+        env._binds_outer_trace_inputs = False
+        runtimes[id(traced)] = traced
+        env.dispatch_guards_enforced = False
+        assert device_function.proven_tensor_stride_values() == {}
 
 
 def test_proven_stride_static_shapes_needs_no_metadata_fact() -> None:
     """``static_shapes`` keys the kernel on exact strides, so they are proven
     without the ``input_tensor_metadata`` fact or an ``hl.specialize`` guard."""
     traced = torch.empty_strided((4, 8), (8, 1))
-    env = SimpleNamespace(
+    env = _stub_environment(
         settings=SimpleNamespace(static_shapes=True),
         compiler_fact_specialization_facts=frozenset(),
         tensor_input_source=lambda _: LocalSource("value", is_input=True),
         runtime_value_for_tensor=lambda _: traced,
         specialized_strides=set(),
-        size_hint=int,
     )
     device_function = object.__new__(DeviceFunction)
     device_function.arguments = [TensorArg("value", traced, "value")]

@@ -48,9 +48,11 @@ from ._ast_pass_utils import names_read
 from ._ast_pass_utils import rename_names
 from ._ast_pass_utils import resolve_alias
 from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
+from .fuse_two_pass_loads import FUSE_CACHE_PREFIX
 from .fuse_two_pass_loads import _is_store_call
 from .fuse_two_pass_loads import _store_tensor_roots
 from .fuse_two_pass_loads import _tensor_arg_roots
+from .lane_loops.owner_guards import _is_atomic_call
 from .licm_profitability import repeated_work_is_profitable
 from .packet_access import match_packet_access
 from .scalar_recipe import PURE_HELPERS
@@ -281,13 +283,6 @@ def _statement_effects(stmt: ast.stmt) -> _Effects:
     return _Effects(frozenset(reads), frozenset(writes))
 
 
-def _is_atomic_call(call: ast.Call) -> bool:
-    path = call_path_str(call.func)
-    return path is not None and (
-        path.split(".")[-1].startswith("atomic_") or path.startswith("_cute_atomic_")
-    )
-
-
 def _is_proven_scalar_bitcast(call: ast.Call) -> bool:
     """Recognize the generated scalar-constructor ``.bitcast`` form only."""
     if (
@@ -403,7 +398,7 @@ def _is_hoistable_statement(stmt: ast.stmt, tensor_names: set[str]) -> bool:
             if not (
                 isinstance(target, ast.Subscript)
                 and isinstance(target.value, ast.Name)
-                and target.value.id.startswith("_fuse_cache_")
+                and target.value.id.startswith(FUSE_CACHE_PREFIX)
             ):
                 return False
     elif isinstance(stmt, ast.For):
@@ -893,6 +888,15 @@ def _identity_lane_index(node: ast.AST, lane_var: str) -> bool:
     return isinstance(node, ast.Name) and node.id == lane_var
 
 
+def _single_slot_index(node: ast.AST) -> bool:
+    """The index of a single slot (``cache[0]``), where
+    ``fuse_two_pass_loads`` caches a value every lane shares: a candidate,
+    whose one store and lane-free value its readers check."""
+    return (
+        isinstance(node, ast.Constant) and type(node.value) is int and node.value == 0
+    )
+
+
 def _collect_subscript_accesses(body: list[ast.stmt]) -> dict[str, set[int]]:
     result: dict[str, set[int]] = {}
     for stmt in body:
@@ -984,10 +988,11 @@ def _cache_stores(
                 continue
             target = stmt.targets[0]
             root = _subscript_root(target)
-            if (
-                root not in rmem
-                or rmem[root].extent != info.extent
-                or not _identity_lane_index(target.slice, info.lane_var)
+            if root not in rmem or not (
+                rmem[root].extent == info.extent
+                and _identity_lane_index(target.slice, info.lane_var)
+                or rmem[root].extent == 1
+                and _single_slot_index(target.slice)
             ):
                 continue
             result.setdefault(root, []).append(
@@ -1181,7 +1186,11 @@ class _VectorExpressionResolver:
         root = _subscript_root(node)
         if root not in self.rmem:
             return None
-        if (
+        # A single slot may hold a value every lane of its producer shares:
+        # the checks below take its one store and reject a value that reads
+        # the lane.
+        single = self.rmem[root].extent == 1 and _single_slot_index(node.slice)
+        if not single and (
             context.info is None
             or self.rmem[root].extent != context.info.extent
             or not _identity_lane_index(node.slice, context.info.lane_var)
@@ -1191,9 +1200,12 @@ class _VectorExpressionResolver:
         if len(stores) != 1:
             raise _VectorCacheReject
         producer = stores[0]
-        if producer.info.extent != context.info.extent or not (
-            producer.info.outer_index < context.info.outer_index
-            or producer.info.outer_index == context.info.outer_index
+        if (
+            not single
+            and producer.info.extent != cast("_ConstexprLoopInfo", context.info).extent
+        ) or not (
+            producer.info.outer_index < context.outer_index
+            or producer.info.outer_index == context.outer_index
             and producer.body_index < context.body_index
         ):
             raise _VectorCacheReject
@@ -1222,6 +1234,11 @@ class _VectorExpressionResolver:
                 self.float_scalar_names,
             )
             != self.rmem[root].dtype
+        ):
+            raise _VectorCacheReject
+        if single and any(
+            isinstance(child, ast.Name) and child.id == "__constexpr_lane"
+            for child in ast.walk(normalized)
         ):
             raise _VectorCacheReject
         return normalized
@@ -1714,9 +1731,24 @@ def _hoist_lane_invariant_constexpr_chain(
         for name in cache_names
         if rmem[name] == _RmemInfo(extent=extent, dtype=dtype)
     )
-    if not reusable:
+    # A value every lane shares takes a single slot, where it would have
+    # taken a slot per lane: the hoisted values take a fragment of their own
+    # in that case, and the single slot goes with the chain's other caches.
+    # The gate is whether such a slot stands in for that fragment, not
+    # whether the hoist pays: elsewhere the renders stay as they were, on
+    # purpose.
+    declarations: list[ast.stmt] = []
+    if reusable:
+        cache_name = reusable[0]
+    elif any(rmem[name] == _RmemInfo(extent=1, dtype=dtype) for name in cache_names):
+        (cache_name,) = _fresh_names(occupied_names, 1)
+        declarations.append(
+            statement_from_string(
+                f"{cache_name} = cute.make_rmem_tensor({extent}, {dtype})"
+            )
+        )
+    else:
         return [loop]
-    cache_name = reusable[0]
     source = next((candidate for candidate in group if not candidate.cache_names), None)
     if source is None:
         return [loop]
@@ -1811,7 +1843,7 @@ def _hoist_lane_invariant_constexpr_chain(
         )
     _prune_selected_outer_assignments(loop, selected_statement_ids)
     obsolete_rmem.update(cache_names - {cache_name})
-    return [*cast("list[ast.stmt]", hoisted_top), precompute, loop]
+    return [*cast("list[ast.stmt]", hoisted_top), *declarations, precompute, loop]
 
 
 def _hoist_constexpr_scalar_invariants(

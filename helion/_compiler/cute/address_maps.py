@@ -456,18 +456,12 @@ class AddressMaps:
         literal (a block-size constant included).  A symbolic start or step
         leaves the variable itself as the unknown.
         """
-        iterator = loop.iter
         start: sympy.Expr = sympy.Integer(0)
         step: sympy.Expr = sympy.Integer(1)
         count: int | None = None
         stop: sympy.Expr | None = None
-        if (
-            isinstance(iterator, ast.Call)
-            and ast.unparse(iterator.func) in _LOOP_CALLS
-            and not iterator.keywords
-            and 1 <= len(iterator.args) <= 3
-        ):
-            arguments = [self.translate(argument, local) for argument in iterator.args]
+        arguments = self._loop_arguments(loop, local)
+        if arguments is not None:
             if len(arguments) == 1:
                 (stop,) = arguments
             elif len(arguments) == 2:
@@ -483,6 +477,38 @@ class AddressMaps:
         elif stop is not None and stop.is_Integer:
             count = max(-((int(start) - int(stop)) // int(step)), 0)
         return sympy.Add(start, sympy.Mul(step, symbol)), count
+
+    def _loop_arguments(
+        self, loop: ast.For, local: _Local
+    ) -> list[sympy.Expr | None] | None:
+        """The translated arguments of ``loop``'s ``range`` call (one to
+        three, a None for each the translation does not know), or None when
+        it iterates over anything else."""
+        iterator = loop.iter
+        if not (
+            isinstance(iterator, ast.Call)
+            and ast.unparse(iterator.func) in _LOOP_CALLS
+            and not iterator.keywords
+            and 1 <= len(iterator.args) <= 3
+        ):
+            return None
+        return [self.translate(argument, local) for argument in iterator.args]
+
+    def trip_count(self, loop: ast.For) -> int | None:
+        """The number of iterations of ``loop``, when its bounds' span and its
+        step are integers whatever its start (a cluster split's chunk walk
+        starts at its CTA's slice, one chunk long); None otherwise."""
+        arguments = self._loop_arguments(loop, _Local(loop.iter, self.renames))
+        if arguments is None or len(arguments) < 2:
+            return None
+        start, stop, *rest = arguments
+        step = rest[0] if rest else sympy.Integer(1)
+        if start is None or stop is None or step is None:
+            return None
+        span = sympy.simplify(sympy.Add(stop, sympy.Mul(-1, start)))
+        if not (span.is_Integer and step.is_Integer and int(step) > 0):
+            return None
+        return max(-(-int(span) // int(step)), 0)
 
     # -- translation ---------------------------------------------------------
 
@@ -751,13 +777,21 @@ class AddressMaps:
 
         The packet holds one element per iteration of the V-loop
         ``variable``, so the term of any of them is the first's plus the
-        loop's variable.  None when ``term`` is unknown or the V-loop is no
-        variable of the proof (a packet of unknown extent).
+        loop's variable: the variable of a loop of the body, or of a loop
+        around it (a looped reduction's V-loop, whose lane hoists and
+        flushes the packets), one value per instance of the access.  None
+        when ``term`` is unknown or the V-loop is no variable of the proof
+        (a packet of unknown extent).
         """
-        symbol = loop_symbol(variable)
-        if term is None or symbol not in self.ranges:
+        if term is None:
             return None
-        return sympy.Add(term, symbol)
+        symbol = loop_symbol(variable)
+        if symbol in self.ranges:
+            return sympy.Add(term, symbol)
+        name = self.renames.get(variable, variable)
+        if uniform_symbol(name) in self.iteration_values:
+            return sympy.Add(term, uniform_symbol(name))
+        return None
 
     # -- bounds ----------------------------------------------------------------
 
@@ -962,6 +996,104 @@ class AddressMaps:
         if key not in self._proofs:
             self._proofs[key] = self._prove(first, second, ranges, differing, exact)
         return self._proofs[key]
+
+    def apart_in_later_iterations(
+        self,
+        first: Sequence[sympy.Expr | None],
+        second: Sequence[sympy.Expr | None],
+        *,
+        loops: Iterable[str],
+        ranges: Mapping[sympy.Expr, Bound | None],
+        varying: Iterable[str] = (),
+    ) -> bool:
+        """Whether the access ``second``, run at least one iteration of the
+        loops ``loops`` after ``first``, never reaches an element of it.
+
+        Each access has its own variables (thread coordinates, iterations,
+        unknowns) and its own values of ``varying``, as in ``same_thread``;
+        the iterations of ``loops`` are the first access's plus the number
+        of steps between the two, at least one.  Along some dimension the
+        second term minus the first must be affine with integer
+        coefficients in the steps and in variables of known ranges, and the
+        steps' coefficient must keep it on one side of zero: the store of
+        ``x[t, :n]`` and the load of ``x[t, 64:]`` in a later chunk of a
+        looped reduction, which reads past every element the earlier chunk
+        stored.  A bounded index counts as the sum of its parts.  False
+        whenever this cannot be shown.
+        """
+        names = set(loops)
+        if len(first) != len(second) or not all(
+            uniform_symbol(name) in self.iteration_values for name in names
+        ):
+            return False
+        later = sympy.Symbol("_helion_later_iterations", integer=True, positive=True)
+        moved = {iteration_symbol(name) for name in names}
+        # The second access's values: the loops' variables as their
+        # iterations, a varying value they do not model as another value.
+        values = {
+            **{
+                symbol: _other_side(symbol)
+                for symbol in map(uniform_symbol, varying)
+                if symbol not in self.iteration_values
+            },
+            **self.iteration_values,
+        }
+        substitution: dict[sympy.Expr, sympy.Expr] = {
+            symbol: cast("sympy.Expr", sympy.Add(symbol, later))
+            if symbol in moved
+            else _other_side(symbol)
+            for symbol in {*self.ranges, *ranges}
+            if isinstance(symbol, sympy.Symbol)
+        }
+        extents: dict[sympy.Expr, int] = {
+            symbol: bound
+            for symbol, bound in ranges.items()
+            if isinstance(symbol, sympy.Symbol) and isinstance(bound, int)
+        }
+        extents.update(
+            {
+                substitution[symbol]: bound
+                for symbol, bound in list(extents.items())
+                if symbol not in moved
+            }
+        )
+
+        def whole(term: sympy.Expr) -> sympy.Expr:
+            return cast(
+                "sympy.Expr",
+                term.replace(
+                    lambda node: node.func is _BOUNDED, lambda node: node.args[0]
+                ),
+            )
+
+        def apart(a: sympy.Expr, b: sympy.Expr) -> bool:
+            mine = whole(a).xreplace(self.iteration_values)
+            theirs = whole(b).xreplace(values).xreplace(substitution)
+            difference = sympy.expand(sympy.Add(theirs, sympy.Mul(-1, mine)))
+            terms = difference.as_coefficients_dict()
+            if not all(
+                coefficient.is_Integer
+                and (term == 1 or term == later or term in extents)
+                for term, coefficient in terms.items()
+            ):
+                return False
+            step = int(terms.get(later, 0))
+            low = high = int(terms.get(sympy.Integer(1), 0))
+            for term, coefficient in terms.items():
+                if term in extents:
+                    reach = int(coefficient) * (extents[term] - 1)
+                    low, high = low + min(reach, 0), high + max(reach, 0)
+            # ``step`` once per later iteration, of which there is at least one.
+            if step > 0:
+                return step + low >= 1
+            if step < 0:
+                return step + high <= -1
+            return low >= 1 or high <= -1
+
+        return any(
+            a is not None and b is not None and apart(a, b)
+            for a, b in zip(first, second, strict=True)
+        )
 
     def _prove(
         self,

@@ -742,6 +742,16 @@ PTX_ROW_EXPORTS: dict[str, tuple[str, ...]] = {
         "tma_store_3d",
         "tma_store_commit_group",
     ),
+    # Rows generated kernels import from ``device.ptx`` itself
+    # (``CuteBackend.library_imports``; ``pair_lane_math`` renders them).
+    "device.ptx": ("exact_div_fast_f32x2", "exp_f32x2_parts"),
+    "device.half_extrema": (
+        "max_nan_bf16x2",
+        "max_nan_f16x2",
+        "min_nan_bf16x2",
+        "min_nan_f16x2",
+        "unpack_f16x2",
+    ),
 }
 
 # Traced ``llvm.inline_asm`` of each row: (asm text, constraint string, carries
@@ -841,6 +851,43 @@ PTX_ROW_FINGERPRINTS: dict[str, _Fingerprint] = {
         ("i32", "i64"),
         None,
         None,
+    ),
+    "exact_div_fast_f32x2": (
+        (
+            "{.reg .f32 nb; .reg .b64 a, yy, nbb, q, e, r;"
+            " neg.f32 nb, $4; mov.b64 a, {$2, $3};"
+            " mov.b64 yy, {$5, $5}; mov.b64 nbb, {nb, nb};"
+            " mul.rn.f32x2 q, a, yy; fma.rn.f32x2 e, q, nbb, a;"
+            " fma.rn.f32x2 r, e, yy, q; mov.b64 {$0, $1}, r;}"
+        ),
+        "=f,=f,f,f,f,f",
+        False,
+        ("f32", "f32", "f32", "f32"),
+        _F32_PAIR,
+        ("Float32", "Float32"),
+    ),
+    "exp_f32x2_parts": (
+        (
+            "{.reg .f32 t0, t1, n0, n1, r0, r1, c1, half, k252, kmag, kpos, l2e, c2;"
+            " .reg .b64 x, t, n, nt, r, kk252, kkmag, kkpos, ll2e, cc2;"
+            " mov.b32 c1, 0f3BBB989D; mov.b32 half, 0f3F000000;"
+            " mov.b32 k252, 0f437C0000; mov.b32 kmag, 0f4B400001;"
+            " mov.b32 kpos, 0f4B40007F; mov.b32 l2e, 0f3FB8AA3B; mov.b32 c2, 0f32A57060;"
+            " fma.rn.f32 t0, $4, c1, half; cvt.sat.f32.f32 t0, t0;"
+            " fma.rn.f32 t1, $5, c1, half; cvt.sat.f32.f32 t1, t1;"
+            " mov.b64 t, {t0, t1}; mov.b64 x, {$4, $5};"
+            " mov.b64 kk252, {k252, k252}; mov.b64 kkmag, {kmag, kmag};"
+            " mov.b64 kkpos, {kpos, kpos}; mov.b64 ll2e, {l2e, l2e}; mov.b64 cc2, {c2, c2};"
+            " fma.rm.f32x2 n, t, kk252, kkmag; sub.rn.f32x2 nt, kkpos, n;"
+            " fma.rn.f32x2 r, x, ll2e, nt; fma.rn.f32x2 r, x, cc2, r;"
+            " mov.b64 {n0, n1}, n; shl.b32 $2, n0, 23; shl.b32 $3, n1, 23;"
+            " mov.b64 {r0, r1}, r; ex2.approx.ftz.f32 $0, r0; ex2.approx.ftz.f32 $1, r1;}"
+        ),
+        "=f,=f,=f,=f,f,f",
+        False,
+        ("f32", "f32"),
+        _F32_QUAD,
+        ("Float32", "Float32", "Float32", "Float32"),
     ),
     "f32_bits": (
         "mov.b32 $0, $1;",
@@ -1097,6 +1144,38 @@ PTX_ROW_FINGERPRINTS: dict[str, _Fingerprint] = {
         ("i32", "i32", "i32", "i32", "i32", "i32", "f32", "f32", "f32", "f32"),
         _F32_QUAD,
         ("Float32", "Float32", "Float32", "Float32"),
+    ),
+    "max_nan_bf16x2": (
+        "max.NaN.bf16x2 $0, $1, $2;",
+        "=r,r,r",
+        False,
+        ("i32", "i32"),
+        "i32",
+        "Uint32",
+    ),
+    "max_nan_f16x2": (
+        "max.NaN.f16x2 $0, $1, $2;",
+        "=r,r,r",
+        False,
+        ("i32", "i32"),
+        "i32",
+        "Uint32",
+    ),
+    "min_nan_bf16x2": (
+        "min.NaN.bf16x2 $0, $1, $2;",
+        "=r,r,r",
+        False,
+        ("i32", "i32"),
+        "i32",
+        "Uint32",
+    ),
+    "min_nan_f16x2": (
+        "min.NaN.f16x2 $0, $1, $2;",
+        "=r,r,r",
+        False,
+        ("i32", "i32"),
+        "i32",
+        "Uint32",
     ),
     "movmatrix_b16": (
         "movmatrix.sync.aligned.m8n8.trans.b16 $0, $1;",

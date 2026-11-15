@@ -128,8 +128,16 @@ def test_kernel_metadata_and_cache_keys_are_frozen() -> None:
     )
     assert metadata.run_id == fixture["kernel_metadata_run_id"]
     assert metadata.to_dict() == fixture["kernel_metadata_dict"]
-    # Disk-cache and specialization-key entries (kernel.py).
-    bound = SimpleNamespace(kernel=SimpleNamespace(cute_structural_policy=policy))
+    # Disk-cache and specialization-key entries (kernel.py), for a binding
+    # whose calls hold every fact its code relies on (no call-fact key).
+    bound = SimpleNamespace(
+        kernel=SimpleNamespace(cute_structural_policy=policy),
+        env=SimpleNamespace(
+            input_alignment_limit=None,
+            dispatch_guards_enforced=True,
+            symbolic_stride_sources=(),
+        ),
+    )
     assert (
         BoundKernel.extra_cache_key(bound)  # type: ignore[arg-type]
         == f"cute_structural_policy:{policy.identity()}"

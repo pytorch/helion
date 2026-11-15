@@ -37,7 +37,7 @@ def gathered_tensor_facts(
     Dynamic scalar arguments and device metadata contents are never constants.
     """
     env = CompileEnvironment.current()
-    if "input_tensor_metadata" not in env.compiler_fact_specialization_facts:
+    if not env.exact_input_metadata_holds():
         return None
     tensor_args = [arg for arg in df.arguments if isinstance(arg, TensorArg)]
     guarded: dict[sympy.Expr, sympy.Integer] = {}
@@ -53,8 +53,9 @@ def gathered_tensor_facts(
         if env.tensor_input_source(arg.fake_value) is None:
             continue
         for value in (*arg.fake_value.shape, *arg.fake_value.stride()):
-            key = expression(value)
-            guarded[key] = sympy.Integer(env.size_hint(value))
+            hint = env.keyed_hint(value)
+            if hint is not None:
+                guarded[expression(value)] = sympy.Integer(hint)
 
     def exact(value: int | torch.SymInt | sympy.Expr) -> int | None:
         key = value if isinstance(value, sympy.Expr) else expression(value)

@@ -145,23 +145,26 @@ the finishing phase and any backend-specific refinement) the retained
 shortlist is re-timed in the clock regime a deployment timer sees, with a
 thermal warmup, one screen when the shortlist is long, and four rounds of
 500+500 ms steady windows per finalist in alternating order; the median
-across rounds picks the returned config.  This adds roughly 60-150 s to
-every full-effort autotune on every backend (the search's own 50-200 ms
+across rounds picks the returned config.  (The CuTe backend times each
+window in the benchmark worker per call flushed from the CUDA activity
+trace instead: the warmup and at most 1000 timed calls, traced in one
+session; see `HELION_AUTOTUNE_TARGET_REGIME`.)  This adds roughly 60-150 s
+to every full-effort autotune on every backend (the search's own 50-200 ms
 windows mis-rank finalists by 3-6% on power-limited GPUs such as B200, and
 a window needs about 500 ms of warmup after the idle gap between windows
-before the B200 power limiter settles).  When the selection times in a warm
-L2 regime (`HELION_AUTOTUNE_L2_FLUSH=replay` or `0`), finalists tied within
-1% are timed again per call flushed and the cold readings break the tie;
-`HELION_AUTOTUNE_TARGET_REGIME=call|replay|0` names the regime the kernel
-is scored in and selects by that column outright (see
+before the B200 power limiter settles).  When the selection times in a
+warm L2 regime (`HELION_AUTOTUNE_L2_FLUSH=replay` or `0`), finalists tied
+within 1% are timed again per call flushed and the cold readings break the
+tie; `HELION_AUTOTUNE_TARGET_REGIME=call|replay|0|kernel` names the regime
+the kernel is scored in and selects by that column outright (see
 [Settings](api/settings.md)).  Where the kernel's surface names family
 knobs (knobs whose value picks a distinct kernel body, such as the CuTe
 flash pipeline family), the best shortlisted config of up to two families
 the ranking would drop, each within 1.25x of the best reading, joins the
 shortlist and the survivors of the screen, so the steady windows, which
 run at the sustained power-capped clock, see every body in contention and
-not only the one the search's boost-clock windows preferred.
-Set `HELION_AUTOTUNE_FINAL_SELECTION_ROUNDS=0` to fall back to the cheaper
+not only the one the search's boost-clock windows preferred. Set
+`HELION_AUTOTUNE_FINAL_SELECTION_ROUNDS=0` to fall back to the cheaper
 single-pass final verification; under `HELION_AUTOTUNE_BUDGET_SECONDS` the
 search stops early enough for the phase (its estimate plus one generation
 of overrun, together at most a quarter of the budget but never less than

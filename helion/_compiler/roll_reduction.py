@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import torch
 from torch.fx import map_arg
 
+from .._utils import next_power_of_2
 from ..language import _MEMORY_OPS
 from ..language import _tracing_ops
 from ..language import atomic_add
@@ -35,8 +36,12 @@ from .aten_lowering import aten_lowering_dispatch
 from .compile_environment import CompileEnvironment
 from .fx_side_effects import is_impure_node
 from .host_function import HostFunction
+from .indexing_strategy import _padded_iota_dims_once
+from .indexing_strategy import load_index_axes
+from .indexing_strategy import padded_index_dims
 from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import ReductionLowering
+from .loop_dependency_checker import reaches_through_pointers
 from .runtime_tensor_guards import register_tensor_alias_specializations
 from .runtime_tensor_guards import tensors_have_proven_disjoint_storage
 
@@ -86,12 +91,18 @@ class ReductionRoller:
         enable_fusion: bool = False,
         *,
         allow_unbound_alias_facts: bool = False,
+        subscript_extent: bool = False,
     ) -> None:
         self.device_ir = device_ir
         self.rdim = rdim
         self.graph_id_to_info = graph_id_to_info
         self.enable_fusion = enable_fusion
         self.allow_unbound_alias_facts = allow_unbound_alias_facts
+        # True rolls a subscript extent's dim as older versions rolled the
+        # power of two they padded it to (``DeviceIR._padded_range_dims``): a
+        # value with the dim on several axes uses it once, since those axes
+        # had literal sizes then, which name no reduction dim.
+        self.subscript_extent = subscript_extent
         # inner graph contains ops on the reduction dimension
         self.inner_args: list[torch.fx.Node] = []
         self.inner_graph: torch.fx.Graph = torch.fx.Graph()
@@ -139,7 +150,9 @@ class ReductionRoller:
     def _compute_has_effect(self, node: torch.fx.Node) -> bool:
         if node.op != "call_function":
             return False
-        if node.target in (_tracing_ops._phi, _tracing_ops._new_var):
+        if node.target in (_tracing_ops._phi, _tracing_ops._new_var, prefetch):
+            # A prefetch only warms a cache: it orders nothing, and running
+            # it again in a later sweep changes no result.
             return False
         if children := self._nested_nodes(node):
             # Control-flow markers are impure for DCE, not intrinsically
@@ -354,7 +367,7 @@ class ReductionRoller:
             val = node.meta.get("val", None)
             num_rdims = self._count_rdim_axes_in_val(val)
 
-        if num_rdims > 1:
+        if num_rdims > 1 and not self.subscript_extent:
             raise NotImplementedError(
                 "multiple reduction dims of same size not supported"
             )
@@ -391,6 +404,11 @@ class ReductionRoller:
         itself. The shape is computed the same way as for loads, so the
         store and load resolve their slices to the same block_id.
         """
+        if reaches_through_pointers(target) and target:
+            # A stack tensor ``(tensor_like, dev_ptrs)``: the subscript
+            # indexes the tensor-like's dims.
+            assert isinstance(target, (list, tuple))
+            target = target[0]
         if not isinstance(target, torch.fx.Node):
             return 0
         target_val = target.meta.get("val")
@@ -431,43 +449,40 @@ class ReductionRoller:
         outputs = {}
         inner_node_set = set(inner_nodes)
         for orig_node, inner_node in inner_nodes.items():
+            # A later loop reading a value re-adds it (``readd`` below), so
+            # only users outside the loops need it as an output.  Kept as one
+            # for a later loop, it would stay live here with nothing here
+            # reading it, loads included, and the CuTe DSL keeps a dead
+            # cache-hint load (side-effecting inline asm) in the sweep.
             needs_output = orig_node not in self.outer_nodes and (
                 self.is_reduction(orig_node)
-                or any(user not in inner_node_set for user in orig_node.users)
+                or any(
+                    user not in inner_node_set
+                    and not self.should_go_in_inner_graph(user)
+                    for user in orig_node.users
+                )
             )
             if needs_output:
                 outputs[orig_node] = inner_node
             self.available.add(orig_node)
         graph = self.inner_graph
         graph.output([*outputs.values()])
-        graph_id = self.device_ir.add_reduction_loop_graph(
-            graph,
-            block_index=self.rdim.block_id,
-            node_args=self.inner_args,
-        )
-        self.graphs_added.append(graph_id)
-
-        location_meta = {
-            "location": next(iter(inner_nodes)).meta["location"],
-            "stack_trace": next(iter(inner_nodes)).meta.get("stack_trace", ""),
-        }
-        output_node = self.outer_graph.call_function(
-            _for_loop,
-            (graph_id, [0], [self.size_node(location_meta)], self.inner_args),
-            {},
-        )
-        output_node.meta.update(location_meta)
-        output_node.meta["val"] = [n.meta["val"] for n in outputs]
-        output_node.meta["lowering"] = APIFuncLowering(_for_loop)
-        for i, orig_node in enumerate(outputs):
-            self.outer_nodes[orig_node] = n = self.outer_graph.call_function(
-                operator.getitem,
-                (output_node, i),
-                {},
-            )
-            n.meta.update(location_meta)
-            n.meta["val"] = orig_node.meta["val"]
-            n.meta["lowering"] = aten_lowering_dispatch[n.target](n)
+        # Pass only the arguments the live nodes read: this loop's argument
+        # list leaves out the values only its dead nodes read (the later loop
+        # that re-adds those nodes reads them itself).
+        graph.eliminate_dead_code(is_impure_node=is_impure_node)
+        node_args = []
+        for placeholder, arg in zip(
+            graph.find_nodes(op="placeholder"), self.inner_args, strict=True
+        ):
+            if placeholder.users:
+                node_args.append(arg)
+            else:
+                graph.erase_node(placeholder)
+        # A loop left with nothing to compute (an impure outer node split it
+        # off ahead of the loop reading its values) is not emitted.
+        if any(node.op == "call_function" for node in graph.nodes):
+            self._emit_loop(graph, node_args, [*outputs], next(iter(inner_nodes)))
 
         self.inner_args = []
         self.inner_graph = torch.fx.Graph()
@@ -484,7 +499,11 @@ class ReductionRoller:
                 or self.is_reduction(node)
             ):
                 return
-            if node.op == "placeholder":
+            if inner_nodes[node].op == "placeholder":
+                # The loop read the value from outside it (an outer node, a
+                # loop output), and so does this one: running it again here
+                # would reload a per-row scalar on every iteration, after
+                # any store to its tensor in between.
                 self.get_inner_arg(node)
                 return
             if self._has_effect(node):
@@ -523,6 +542,46 @@ class ReductionRoller:
             if {*node.users} - self.seen:
                 readd(node)
 
+    def _emit_loop(
+        self,
+        graph: torch.fx.Graph,
+        node_args: list[torch.fx.Node],
+        outputs: list[torch.fx.Node],
+        first: torch.fx.Node,
+    ) -> None:
+        """Add ``graph`` as a reduction loop over the rolled block, called with
+        ``node_args``, and give each of ``outputs`` (the original nodes whose
+        values the loop returns, in order) its result in the outer graph, at
+        the location of ``first``, the loop's first node."""
+        graph_id = self.device_ir.add_reduction_loop_graph(
+            graph,
+            block_index=self.rdim.block_id,
+            node_args=node_args,
+        )
+        self.graphs_added.append(graph_id)
+
+        location_meta = {
+            "location": first.meta["location"],
+            "stack_trace": first.meta.get("stack_trace", ""),
+        }
+        output_node = self.outer_graph.call_function(
+            _for_loop,
+            (graph_id, [0], [self.size_node(location_meta)], node_args),
+            {},
+        )
+        output_node.meta.update(location_meta)
+        output_node.meta["val"] = [n.meta["val"] for n in outputs]
+        output_node.meta["lowering"] = APIFuncLowering(_for_loop)
+        for i, orig_node in enumerate(outputs):
+            self.outer_nodes[orig_node] = n = self.outer_graph.call_function(
+                operator.getitem,
+                (output_node, i),
+                {},
+            )
+            n.meta.update(location_meta)
+            n.meta["val"] = orig_node.meta["val"]
+            n.meta["lowering"] = aten_lowering_dispatch[n.target](n)
+
     def get_inner_arg(self, node: torch.fx.Node) -> torch.fx.Node:
         """Get the input node for the inner graph"""
         if node in self.inner_nodes:
@@ -560,6 +619,27 @@ class ReductionRoller:
             placeholder.meta.update(node.meta)
         self.inner_args.append(outer_node)
         return placeholder
+
+    def cannot_roll_graph(
+        self,
+        graph: torch.fx.Graph,
+        *,
+        free_ranges: bool = True,
+        reductions: bool = True,
+    ) -> bool:
+        """Check if a graph uses the rdim in a way no loop over it can take:
+        a matmul, fixed indexing or ``dev_ptrs`` stacking with the rdim, or
+        (with ``reductions``) a use along a non-tile axis
+        (``has_unrollable_rdim_use``, which ``free_ranges`` goes to)."""
+        return (
+            self.has_matmul_with_rdim(graph)
+            or self.has_indexing_along_rdim(graph)
+            or self.has_stack_tensor_with_rdim(graph)
+            or (
+                reductions
+                and self.has_unrollable_rdim_use(graph, free_ranges=free_ranges)
+            )
+        )
 
     def has_matmul_with_rdim(self, graph: torch.fx.Graph) -> bool:
         """Check if a graph contains matmul operations with rdim inputs."""
@@ -659,8 +739,79 @@ class ReductionRoller:
         """
         return not self.rdim.var._sympy_().free_symbols
 
-    def has_unrollable_reduction(self, graph: torch.fx.Graph) -> bool:
-        """Check if a graph reduces over the rdim along a non-tile axis.
+    def tied_rdims(self) -> list[int]:
+        """The block ids of the other rdims a guard tied the rdim's block to.
+
+        A literal dim (``BlockSizeInfo.literal_size``: a padded factory's, or
+        that of a subscript of a padded ``hl.arange``) does not join a
+        dynamic full slice of its size, but an elementwise op between the two
+        guards their blocks equal and names its result by only one of them,
+        as ``torch.where(hl.arange(n)[None, :] == t, -1.0, row)`` beside
+        ``row = x[tile, :]`` does under dynamic shapes.  Rolling either dim
+        would chunk the values that name it while the values that name the
+        other keep its full extent, and the op between them would combine a
+        chunk with the full extent (a shape mismatch on Triton).
+        """
+        env = CompileEnvironment.current()
+        return [
+            info.block_id
+            for info in env.block_sizes
+            if info.reduction
+            and info.block_id != self.rdim.block_id
+            and env.known_equal(info.var, self.rdim.var)
+        ]
+
+    def range_meets_full_slice(self, graph: torch.fx.Graph) -> bool:
+        """Check if one op reads both a value computed from an ``iota`` on the
+        rdim's lanes and a loaded one, such as ``x[tile, :] + hit`` for
+        ``hit`` computed from ``hl.arange(n)[None, :]``.
+
+        Versions that padded a subscript of a range to a power of two typed
+        such an op with the padded size beside the load's dim of ``n``, which
+        guarded that dim to the power of two
+        (``DeviceIR._record_legacy_reduction_loops``).  Values that cross
+        into control flow are not followed.
+        """
+        env = CompileEnvironment.current()
+
+        def on_rdim(node: torch.fx.Node) -> bool:
+            val = node.meta.get("val")
+            return isinstance(val, torch.Tensor) and any(
+                env.resolve_block_id(dim) == self.rdim.block_id for dim in val.size()
+            )
+
+        def reach(seeds: list[torch.fx.Node]) -> set[torch.fx.Node]:
+            # The values on the rdim's lanes computed from ``seeds``.
+            reached: set[torch.fx.Node] = set()
+            stack = seeds
+            while stack:
+                node = stack.pop()
+                if node in reached or not on_rdim(node):
+                    continue
+                reached.add(node)
+                stack.extend(node.users)
+            return reached
+
+        ranges = reach(
+            [
+                node
+                for node in graph.nodes
+                if node.target is torch.ops.prims.iota.default
+            ]
+        )
+        loads = reach(
+            [node for node in graph.nodes if node.target is load and node not in ranges]
+        )
+        return not ranges.isdisjoint(loads)
+
+    def has_unrollable_rdim_use(
+        self, graph: torch.fx.Graph, *, free_ranges: bool = True
+    ) -> bool:
+        """Check if a graph reduces over the rdim along a non-tile axis, or
+        reads a free ``iota`` over the rdim inside the loop.
+
+        ``free_ranges=False`` checks only the reductions: versions before the
+        free ``iota`` half had only that half.
 
         A reduction can only be rolled into a loop when the dimension being
         reduced is indexed by a re-bindable block index var (e.g. a ``hl.tile``
@@ -671,7 +822,11 @@ class ReductionRoller:
         and it does not index a load directly.  Otherwise it is a fixed
         full-extent ``iota`` outside the loop, and any value inside the loop
         computed from it is wrong: a shape mismatch on Triton (issue #2643),
-        an unrelated coordinate on CuTe.  Such reductions stay persistent.
+        an unrelated coordinate on CuTe.  Such reductions stay persistent, and
+        so does the dim when no reduction reads the ``iota`` but a value
+        inside the loop is computed from it, as in
+        ``torch.where(cols[None, :] == t, -1.0, row)`` for
+        ``cols = hl.arange(n)`` beside ``row = x[tile, :]``.
 
         On CuTe a free ``iota`` that only reductions read, through values
         computed outside the loop, still rolls when the computed-fragment
@@ -681,7 +836,8 @@ class ReductionRoller:
         (``LoopedReductionStrategy.codegen_reduction``).
 
         Detected by walking back from each reduction over ``self.rdim`` and
-        checking each input ``iota`` node sized to the rdim. The output-shape
+        checking each input ``iota`` node sized to the rdim, and forward from
+        each ``iota`` sized to the rdim outside the loop. The output-shape
         of a load is not a reliable signal: when the arange size coincides
         with another reduction of the same size,
         ``allocate_reduction_dimension`` unifies them and the load axis
@@ -722,9 +878,10 @@ class ReductionRoller:
             except NotImplementedError:
                 return True
 
-        def read_inside_loop(iota: torch.fx.Node) -> bool:
+        def read_inside_loop(iota: torch.fx.Node, *, control_flow: bool = True) -> bool:
             # Whether a value inside the loop is computed from ``iota``; a
-            # reduction of a value from outside the loop ends the walk.
+            # reduction of a value from outside the loop ends the walk, and so
+            # does control flow unless ``control_flow`` counts it as inside.
             seen: set[torch.fx.Node] = set()
             stack = list(iota.users)
             while stack:
@@ -736,6 +893,10 @@ class ReductionRoller:
                     source = node.args[0]
                     if isinstance(source, torch.fx.Node) and inside_loop(source):
                         return True
+                    continue
+                if not control_flow and (
+                    is_for_loop_target(node.target) or node.target is _if
+                ):
                     continue
                 if inside_loop(node):
                     return True
@@ -774,7 +935,132 @@ class ReductionRoller:
                 reduction.meta[FREE_IOTA_REDUCTION_META] = True
             return False
 
-        return any(self.is_reduction(node) and unrollable(node) for node in graph.nodes)
+        # A free ``iota`` read inside the loop keeps the dim persistent also
+        # when no reduction reads it.  The walk does not enter control flow:
+        # CuTe's rank-1 recurrences pass such a range into a branch, and
+        # counting the branch as a read would take the dim from them
+        # (test_cute_single_token_rank1_recurrence.py).  A range read only
+        # pointwise inside control flow is therefore not caught here.
+        return any(
+            (self.is_reduction(node) and unrollable(node))
+            or (
+                free_ranges
+                and is_rdim_iota(node)
+                and not inside_loop(node)
+                and read_inside_loop(node, control_flow=False)
+            )
+            for node in graph.nodes
+        )
+
+    def reads_padded_range(self, graph: torch.fx.Graph) -> bool:
+        """Check if a reduction over the rdim reads a padded ``iota`` on the
+        rdim's lanes.
+
+        ``hl.arange(200)`` of a static extent that is not a power of two runs
+        over 256 lanes, and a load over it, ``hl.load(x, [i, hl.arange(200)])``
+        in a grid kernel, has the padded size 256: a reduction over the load
+        gets a reduction dim of 256 that names neither the range nor the load.
+        The roller leaves both outside a loop over that dim, at their full
+        extent, so every chunk would fold the same values (a shape mismatch on
+        Triton).  Such a dim stays persistent, as it does when the range is
+        256 long (``has_unrollable_rdim_use``), but keeps its reduction_loops
+        slot, pinned (``ReductionLoopSpec.pinned``): older versions offered it.
+
+        The walk follows the values on the rdim's lanes back from each
+        reduction over it, to one computed from a padded range
+        (``_padded_iota_dims``) or a load indexed by one.  A range reduced away
+        before does not reach the lanes: ``hl.arange(200).sum()`` scaling a
+        row, or a 3000-column load summed beside a 4096-column row.
+        """
+        size = self.rdim.size
+        if not isinstance(size, int):
+            return False
+        env = CompileEnvironment.current()
+
+        def on_rdim(node: torch.fx.Node) -> bool:
+            val = node.meta.get("val")
+            return isinstance(val, torch.Tensor) and any(
+                env.resolve_block_id(dim) == self.rdim.block_id for dim in val.size()
+            )
+
+        # One walk over the graph, which meets a value on several paths.
+        memo: dict[tuple[torch.fx.Node, bool], tuple[int | None, ...] | None] = {}
+
+        def same_shape(node: torch.fx.Node, other: torch.fx.Node) -> bool:
+            # ``known_equal``: comparing the symbolic sizes would add guards.
+            val = node.meta.get("val")
+            other_val = other.meta.get("val")
+            return (
+                isinstance(val, torch.Tensor)
+                and isinstance(other_val, torch.Tensor)
+                and val.ndim == other_val.ndim
+                and all(map(env.known_equal, val.shape, other_val.shape))
+            )
+
+        def padded_to_rdim(node: torch.fx.Node, *, any_axis: bool) -> bool | None:
+            """Whether a padded range's lanes are on an axis of ``node`` on the
+            rdim's lanes, or with ``any_axis`` on any axis; None where no walk
+            gives ``node`` padded dims (a reduction).  A load's dims are its
+            indices' (``load_index_axes``): ``x[tile, rows, :]`` puts the
+            range on its second dim, beside the 256 columns."""
+            dims = _padded_iota_dims_once(node, False, memo)
+            if (
+                dims is None
+                and node.target is load
+                and (axes := load_index_axes(node)) is not None
+            ):
+                index = node.args[1]
+                assert isinstance(index, (list, tuple))
+                dims = padded_index_dims(
+                    node,
+                    axes,
+                    lambda position: _padded_iota_dims_once(
+                        index[position], False, memo
+                    ),
+                )
+            if dims is None:
+                return None
+            val = node.meta.get("val")
+            return any(
+                length is not None
+                and next_power_of_2(length) == size
+                and (
+                    any_axis
+                    or not isinstance(val, torch.Tensor)
+                    or val.ndim != len(dims)
+                    or env.resolve_block_id(val.size(axis)) == self.rdim.block_id
+                )
+                for axis, length in enumerate(dims)
+            )
+
+        for node in graph.nodes:
+            if not self.is_reduction(node):
+                continue
+            seen: set[torch.fx.Node] = set()
+            stack = [arg for arg in node.all_input_nodes if on_rdim(arg)]
+            while stack:
+                value = stack.pop()
+                if value in seen:
+                    continue
+                seen.add(value)
+                # A value's padded dims follow its inputs' onto its own axes:
+                # in ``hl.arange(200)[:, None] * row[None, :]`` the range pads
+                # the first axis, which has a reduction dim of its own, not the
+                # row's columns.  Where the walk does not follow a value, an
+                # input of its shape is padded on the same axes, and one of
+                # another shape (the range a load's padded size comes from)
+                # wherever it is padded.
+                found = padded_to_rdim(value, any_axis=False)
+                if found or (
+                    found is None
+                    and any(
+                        padded_to_rdim(arg, any_axis=not same_shape(arg, value))
+                        for arg in value.all_input_nodes
+                    )
+                ):
+                    return True
+                stack.extend(arg for arg in value.all_input_nodes if on_rdim(arg))
+        return False
 
     def has_stack_tensor_with_rdim(self, graph: torch.fx.Graph) -> bool:
         """Check if a graph contains stack tensors with rdim inputs."""

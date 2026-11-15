@@ -668,6 +668,7 @@ def test_unchanged_examples_emit_logical_reduction_phases(
 CUDA_DEVICE = "cuda"
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize(
     "kind,shape,dtype,static,tile,threads,vector,schedule,nonfinite",

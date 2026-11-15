@@ -70,6 +70,7 @@ from ..tcgen05_constants import TCGEN05_REGION_PID_TYPE_INHERIT
 from ..tcgen05_constants import TCGEN05_REGION_PID_TYPES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_SMALL_GRID_DIRECT_STORE_MAX_BN
 from ..tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
+from ..tcgen05_constants import TCGEN05_SPLIT_K_MIN_SLICE_K_TILES
 from ..tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from ..tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
@@ -92,6 +93,7 @@ from ..tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
 from ..tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_L2_GROUPING
 from ..tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_SIZE
 from ..tcgen05_constants import TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS
+from ..tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from ..tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
 from ..tcgen05_constants import tcgen05_direct_entry_stage_tuple_allowed
 from ..tcgen05_constants import tcgen05_rowvec_stage_smem_bytes
@@ -101,6 +103,7 @@ from . import facts
 from . import repair
 from . import smem
 from . import surface
+from .knobs import long_n_sweep_l2_grouping
 
 if TYPE_CHECKING:
     from ....autotuner.config_fragment import BlockSizeFragment
@@ -453,7 +456,7 @@ def region_two_cta_seed_configs(state: CuteTcgen05Config) -> list[Config]:
     fragments = [
         cast("BlockSizeFragment", item._fragment(spec)) for item in spec.block_sizes
     ]
-    pairs_per_wave = max(1, (state.device_sm_count or 148) // 2)
+    pairs_per_wave = facts._sm_pairs(state)
     placement = (
         TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
         if state.aux_loads_on_every_store
@@ -732,9 +735,13 @@ def _paired_pipeline_seed_configs(
                     continue
                 block_sizes = facts._matmul_seed_block_sizes(state, bm=bm, bn=bn, bk=bk)
                 assert block_sizes is not None
+                # A 128-row pair beside a column-major output reads its
+                # row operands per subtile after the wait
+                # (``pre_acc_wait_column_major_half_pair``).
                 placements = (
                     ("post_acc_wait", "pre_acc_wait")
                     if pipeline_facts.has_auxiliary_loads
+                    and not (pipeline_facts.output_column_major and bm == 128)
                     else ("post_acc_wait",)
                 )
                 # The epilogue-issued aux ring (``epi_tma``) is a second
@@ -743,7 +750,7 @@ def _paired_pipeline_seed_configs(
                 # model fits beside the rings, with both placements.
                 aux_modes: tuple[str, ...] = (TCGEN05_AUX_LOAD_MODE_SIMT,)
                 if (
-                    pipeline_facts.exact_aux_count > 0
+                    pipeline_facts.ring_aux_itemsizes
                     and state.exact_aux_tma_provable
                     and bm == TCGEN05_TWO_CTA_BLOCK_M
                     and pipeline_facts.input_dtype_bytes == 2
@@ -873,8 +880,9 @@ def _small_grid_seed_configs(state: CuteTcgen05Config) -> list[Config]:
     A GEMM with fewer 128x128 output tiles than SMs is bound by per-CTA
     fixed latency and by each SM's L2->SMEM bandwidth, not by MMA
     throughput. Small one-CTA tiles spread the operand re-reads over more
-    SMs (the cuBLAS heuristic picks 64x8 .. 64x32 tiles there); the paired
-    two-CTA seeds above cover the machine-filling shapes. The tiles are
+    SMs (the cuBLAS heuristic picks 64x8 .. 64x32 tiles there), beside the
+    paired seeds' 128-row pairs, which the small-grid default takes where
+    one fills more SMs. The tiles are
     chosen from the problem's geometry only: whole tiles, the widest K
     packet the search admits, and an AB ring no deeper than the K loop.
 
@@ -1020,18 +1028,26 @@ def _split_k_seed_configs(state: CuteTcgen05Config) -> list[Config]:
         if sm_count > 0 and tiles >= sm_count:
             continue
         for bk in (128, 64):
-            if not bk_fragment.low <= bk <= bk_fragment.high:
+            if not (
+                bk_fragment.low <= bk <= bk_fragment.high
+                and surface.split_k_tiles_supported(state, bm=bm, bn=bn, bk=bk)
+            ):
                 continue
             k_tiles = -(-k // bk)
             splits = [
                 split
                 for split in choices
-                if k_tiles // split >= 4 and tiles * split >= sm_count
+                if k_tiles // split >= TCGEN05_SPLIT_K_MIN_SLICE_K_TILES
+                and tiles * split >= sm_count
             ][:2]
             if not splits:
                 # No split reaches one wave with four tiles per split:
                 # the deepest split that keeps four tiles.
-                splits = [split for split in choices if k_tiles // split >= 4][-1:]
+                splits = [
+                    split
+                    for split in choices
+                    if k_tiles // split >= TCGEN05_SPLIT_K_MIN_SLICE_K_TILES
+                ][-1:]
             fit = smem.max_ab_stages_that_fit(state, bm=bm, bn=bn, bk=bk, cluster_m=1)
             block_sizes = facts._matmul_seed_block_sizes(state, bm=bm, bn=bn, bk=bk)
             assert block_sizes is not None
@@ -1692,6 +1708,10 @@ def full_tile_direct_entry_seed_eligible(state: CuteTcgen05Config) -> bool:
     # flat-role / FFI seed config is rejected.
     if state.matmul_has_non_tcgen05_operand:
         return False
+    # The pair's two CTAs share each tile, where codegen refuses an atomic
+    # (``reject_atomics_beside_warp_roles``).
+    if state.kernel_has_atomics:
+        return False
     # The flat-role launch path hard-requires the TMA A/B pipeline and the
     # TMA store epilogue, which codegen disables when an operand's or the
     # output destination's alignment is unprovable.
@@ -1740,6 +1760,18 @@ def full_tile_direct_entry_seed_eligible(state: CuteTcgen05Config) -> bool:
     return full_tile_direct_entry_seed_pipeline(state) is not None
 
 
+def _direct_entry_l2_grouping(state: CuteTcgen05Config) -> int:
+    """The direct-entry pair's M-tile grouping
+    (``long_n_sweep_l2_grouping``): 2 (the measured direct-entry
+    default), or ``TCGEN05_LONG_N_SWEEP_L2_GROUPING`` on a long N sweep,
+    where grouping 2 re-reads B every two M tiles."""
+    extents = state.matmul_compile_time_static_extents
+    n = extents[1] if extents is not None else None
+    if not isinstance(n, int):
+        return 2
+    return long_n_sweep_l2_grouping(-(-n // TCGEN05_TWO_CTA_BLOCK_N), short=2)
+
+
 def full_tile_direct_entry_seed_config(
     state: CuteTcgen05Config, *, l2_groupings: list[object] | None = None
 ) -> Config | None:
@@ -1777,7 +1809,7 @@ def full_tile_direct_entry_seed_config(
     assert state.matmul_block_ids is not None
     l2_groupings[
         state.config_spec.l2_groupings.block_id_to_index(state.matmul_block_ids[0])
-    ] = 2
+    ] = _direct_entry_l2_grouping(state)
     seed: dict[str, Any] = {
         "block_sizes": block_sizes,
         "l2_groupings": l2_groupings,
@@ -1944,7 +1976,7 @@ def _plain_clc_seed_config(
         # preserves the interleaved rasterization order it cancels into,
         # and l2_groupings=[1] costs ~13% at fp16 16384^3 (780 vs 899
         # TFLOP/s pinned) vs the measured-good [4].
-        "l2_groupings": [4],
+        "l2_groupings": [TCGEN05_TWO_CTA_SEED_L2_GROUPING],
         "tcgen05_cluster_m": 2,
         "tcgen05_num_epi_warps": 4,
         "tcgen05_ab_stages": ab_stages,
@@ -1994,7 +2026,7 @@ def _plain_m_pair_seed_config(state: CuteTcgen05Config) -> Config | None:
     seed_config: dict[str, Any] = {
         "block_sizes": [pair_bm, TCGEN05_TWO_CTA_BLOCK_N, bk],
         "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
-        "l2_groupings": [4],
+        "l2_groupings": [TCGEN05_TWO_CTA_SEED_L2_GROUPING],
         "tcgen05_cluster_m": 2,
         "tcgen05_cluster_n": 1,
         "tcgen05_num_epi_warps": 4,
@@ -2172,7 +2204,7 @@ def _plain_edge_seed_config(state: CuteTcgen05Config) -> Config | None:
             bk,
         ],
         "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
-        "l2_groupings": [4],
+        "l2_groupings": [TCGEN05_TWO_CTA_SEED_L2_GROUPING],
         "tcgen05_cluster_m": 2,
         "tcgen05_num_epi_warps": 4,
         "tcgen05_ab_stages": ab_stages,
@@ -2326,7 +2358,7 @@ def _plain_cluster_n2_seed_config(
             bk,
         ],
         "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
-        "l2_groupings": [4],
+        "l2_groupings": [TCGEN05_TWO_CTA_SEED_L2_GROUPING],
         "tcgen05_cluster_m": 2,
         "tcgen05_cluster_n": 2,
         "tcgen05_num_epi_warps": 4,
@@ -2586,7 +2618,9 @@ def autotune_seed_configs(state: CuteTcgen05Config) -> list[Config]:
         # edge seed's 852 TFLOP/s.
         edge_n2_seed_config: dict[str, Any] = dict(plain_edge_seed.config)
         edge_n2_seed_config["tcgen05_cluster_n"] = 2
-        seeds.append(Config(**edge_n2_seed_config))
+        # A cluster pairs N tiles: an odd static N tile count refuses it.
+        if repair._cluster_n2_n_tile_refusal(state, edge_n2_seed_config) is None:
+            seeds.append(Config(**edge_n2_seed_config))
     if plain_clc_seed is not None:
         # Deep-staged bk=64 variant of the plain CLC seed: halving the K
         # tile and doubling the AB pipeline depth absorbs UMMA latency on

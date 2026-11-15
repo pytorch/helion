@@ -4677,6 +4677,11 @@ class TestFragmentPredicatePreprocessingCPU(unittest.TestCase):
             ast.dump(ast.parse("a and b and c", mode="eval")),
         )
 
+    # Starts an interpreter that imports torch and the CuTe DSL, which the
+    # Test Budget Rules put in the slow tier; the in-process
+    # test_private_actual_sdk_preprocessor_and_legacy_scope runs the
+    # preprocessor on pull requests.
+    @pytest.mark.slow
     def test_actual_sdk_preprocesses_reservation_masks(self):
         import importlib.util
         from pathlib import Path
@@ -12951,7 +12956,10 @@ class TestUniformRegionTreeCheckpointCPU(unittest.TestCase):
         bound = self._bound()
         tree = uniform_region_tree(bound.host_function.device_ir.graphs)
         self.assertEqual(len(tree.frames), 9)
-        self.assertEqual(len(tree.auxiliary_graph_ids), 4)
+        # The roller refuses both reduction dims ("for loop with mixed
+        # reduction dim usage"), so the device IR keeps none of the loop
+        # graphs the branch bodies rolled before the refusal.
+        self.assertEqual(tree.auxiliary_graph_ids, ())
         self.assertEqual(sum(f.role == "while_body" for f in tree.frames), 2)
         self.assertEqual(sum(f.role == "if_true" for f in tree.frames), 2)
         self.assertEqual(sum(len(f.local_targets) for f in tree.frames), 4)
@@ -12970,6 +12978,20 @@ class TestUniformRegionTreeCheckpointCPU(unittest.TestCase):
             "initialize_update_final_read_epoch_transfer_and_retirement",
             tree.requirements,
         )
+
+    def test_unreachable_reduction_loop_graphs_are_auxiliary(self):
+        # A rolled reduction's loop graphs are reached by no call, and the
+        # tree keeps them beside its frames.  The fixture's dims refuse their
+        # rolls, so its device IR holds none: append one.
+        from helion._compiler.cute.uniform_region_tree import uniform_region_tree
+        from helion._compiler.device_ir import ReductionLoopGraphInfo
+
+        graphs = list(self._bound().host_function.device_ir.graphs)
+        loop = ReductionLoopGraphInfo(
+            graph_id=len(graphs), graph=torch.fx.Graph(), node_args=[], block_ids=[0]
+        )
+        tree = uniform_region_tree([*graphs, loop])
+        self.assertEqual(tree.auxiliary_graph_ids, (loop.graph_id,))
 
     def test_reused_callee_foreign_capture_and_semantic_kwargs_decline(self):
         from helion._compiler.cute.uniform_region_tree import uniform_region_tree

@@ -72,16 +72,22 @@ def deepest_fitting_ab_stages(
 
 
 class Tcgen05PipelineSmemFacts(NamedTuple):
-    """One store ring and its proved FP32 broadcast rows; no other scratch.
+    """One store ring and its proved broadcast rows; no other scratch.
 
-    ``has_auxiliary_loads`` records exact-shape (or, for FP8, broadcast)
-    auxiliary operands of the epilogue chain: register-resident SIMT loads
-    that add no shared memory but offer the aux-placement seeds.
-    ``exact_aux_count`` is the number of exact-shape rank-2 auxiliary
-    operands of the output's dtype: the staged aux load modes
-    (``tcgen05_aux_load_mode`` in ``TCGEN05_AUX_LOAD_MODES_STAGED``) keep one
-    ``tcgen05_aux_stages``-deep ring of epilogue subtiles per operand, which
-    the AB ring must leave room for.
+    ``rows`` lists the N-broadcast rows (FP8 FP32 scale rows, 16-bit or FP32
+    bias rows) a ``pre_acc_wait`` epilogue stages in shared memory.
+    ``has_auxiliary_loads`` records the auxiliary operands of the epilogue
+    chain (exact-shape tiles, broadcast rows; FP8 columns): register-resident
+    SIMT loads under ``post_acc_wait`` that offer the aux-placement seeds.
+    ``exact_aux_itemsizes`` holds the element size of each exact-shape rank-2
+    auxiliary operand: the staged aux load modes (``tcgen05_aux_load_mode`` in
+    ``TCGEN05_AUX_LOAD_MODES_STAGED``) keep one ``tcgen05_aux_stages``-deep
+    ring of epilogue subtiles per operand in its own dtype, which the AB ring
+    must leave room for; ``ring_aux_itemsizes`` lists the operands those rings
+    carry (``stages_through_smem_ring``: a boolean mask stays on the direct
+    read, which the register mechanisms still prefetch and hoist).
+    ``epilogue_transcendental_ops`` counts the distinct transcendental unary
+    ops the chain applies (``Tcgen05UnaryEpilogueChain.transcendental_op_count``).
     """
 
     input_dtype_bytes: int
@@ -90,7 +96,14 @@ class Tcgen05PipelineSmemFacts(NamedTuple):
     rows: tuple[Tcgen05RowvecAuxRow, ...] = ()
     has_auxiliary_loads: bool = False
     output_column_major: bool = False
-    exact_aux_count: int = 0
+    exact_aux_itemsizes: tuple[int, ...] = ()
+    ring_aux_itemsizes: tuple[int, ...] = ()
+    epilogue_transcendental_ops: int = 0
+
+    @property
+    def epilogue_transcendental(self) -> bool:
+        """Whether the chain applies a transcendental unary op."""
+        return self.epilogue_transcendental_ops > 0
 
 
 def pipeline_region_graphs(
@@ -136,10 +149,22 @@ def analyze_pipeline_smem_facts(
     *,
     capacity_bytes: int,
     allow_leading_passthrough: bool = False,
-    allow_fp8_broadcasts: bool = False,
+    allow_broadcasts: bool = False,
 ) -> Tcgen05PipelineSmemFacts | None:
+    """The allocation facts of ``candidate``'s paired pipeline, or ``None``.
+
+    ``allow_broadcasts`` admits broadcast epilogue operands (FP8 scale rows
+    and columns, 16-bit bias rows), and with them the whole FP8 family, where
+    the caller's launch charges their stages: the single-root, unfissioned
+    kernel, whose ``pre_acc_wait`` row stage the stage limit prices. A
+    materialized region's limits price no placement, so its launches keep
+    refusing them.
+    """
     from .aux_tensor import analyze_tcgen05_matmul_store_chains
+    from .aux_tensor import stages_through_smem_ring
+    from .cute_epilogue import tcgen05_rowvec_aux_row
     from .cute_mma import _tcgen05_tma_matrix_major
+    from .radix_store import proven_radix_store_layout
 
     operands = candidate.operands
     rank = 3 if operands.has_leading_passthrough else 2
@@ -162,34 +187,46 @@ def analyze_pipeline_smem_facts(
         return None
     store, chain = stores[0]
     rows: list[Tcgen05RowvecAuxRow] = []
-    if operands.lhs.source_fake.dtype == torch.float8_e4m3fn:
+    fp8 = operands.lhs.source_fake.dtype == torch.float8_e4m3fn
+    if fp8 and (
+        not allow_broadcasts
+        or operands.has_leading_passthrough
+        or operands.lhs.source_to_logical_order is not None
+        or operands.rhs.source_to_logical_order is not None
+        or operands.rhs.rhs_is_grouped
+    ):
+        return None
+    # FP8: every auxiliary leaf is an FP32 scale row (axis 1, or the explicit
+    # (1, N) row at axis 0) or column (axis 2). 16-bit: exact-shape tiles (a residual, a mask of the output's
+    # shape), which the SIMT aux path loads per subtile into registers with
+    # no shared memory, plus 16- or 32-bit bias rows: ``bias[tile_n]`` (axis
+    # 1) stages through shared memory under ``pre_acc_wait``, a row stage the
+    # model charges, and the explicit (1, N) row (axis 0) is read in place.
+    # Broadcast columns of a 16-bit epilogue are not modeled.
+    axes, dtypes = (
+        ((0, 1, 2), (torch.float32,))
+        if fp8
+        else ((0, 1), (torch.float16, torch.bfloat16, torch.float32))
+    )
+    for leaf in chain.auxiliary_tensor_loads:
+        if leaf.broadcast_axis is None and not fp8:
+            continue
+        source = leaf.load_node.args[0]
+        tensor = source.meta.get("val") if isinstance(source, torch.fx.Node) else None
         if (
-            not allow_fp8_broadcasts
-            or operands.has_leading_passthrough
-            or operands.lhs.source_to_logical_order is not None
-            or operands.rhs.source_to_logical_order is not None
-            or operands.rhs.rhs_is_grouped
+            not allow_broadcasts
+            or leaf.broadcast_axis not in axes
+            or not isinstance(tensor, torch.Tensor)
+            or tensor.dtype not in dtypes
+            or any(
+                extent != 1 and stride not in (0, 1)
+                for extent, stride in zip(tensor.shape, tensor.stride(), strict=True)
+            )
         ):
             return None
-        for leaf in chain.auxiliary_tensor_loads:
-            source = leaf.load_node.args[0]
-            if not isinstance(source, torch.fx.Node):
-                return None
-            tensor = source.meta.get("val")
-            if (
-                leaf.broadcast_axis not in (0, 1, 2)
-                or not isinstance(tensor, torch.Tensor)
-                or tensor.dtype != torch.float32
-                or any(
-                    extent != 1 and stride not in (0, 1)
-                    for extent, stride in zip(
-                        tensor.shape, tensor.stride(), strict=True
-                    )
-                )
-            ):
-                return None
-            if leaf.broadcast_axis == 1:
-                rows.append(Tcgen05RowvecAuxRow(itemsize=4, promoted=False))
+        if leaf.broadcast_axis == 1:
+            rows.append(tcgen05_rowvec_aux_row(chain, leaf, tensor.dtype.itemsize))
+    if fp8:
         for scalar in chain.runtime_scalars:
             if scalar.is_host_scalar:
                 continue
@@ -204,14 +241,6 @@ def analyze_pipeline_smem_facts(
                 or tensor.ndim != 0
             ):
                 return None
-    elif any(leaf.broadcast_axis is not None for leaf in chain.auxiliary_tensor_loads):
-        # A 16-bit epilogue may read exact-shape auxiliary tiles (a residual,
-        # a mask of the output's shape): the SIMT aux path loads them per
-        # subtile into registers and allocates no shared memory, so the
-        # static two-CTA arena is the plain one-ring budget.  Broadcast rows
-        # and columns stage through shared memory under ``pre_acc_wait`` and
-        # are modeled only for the FP8 family above.
-        return None
     # A second output can introduce another store ring, even when it does not
     # consume this MMA. Do not borrow its memory for the AB pipeline.
     if has_other_store(graphs, store):
@@ -220,18 +249,26 @@ def analyze_pipeline_smem_facts(
     if not isinstance(output_node, torch.fx.Node):
         return None
     output = output_node.meta["val"]
-    output_major = (
-        _tcgen05_tma_matrix_major(output) if isinstance(output, torch.Tensor) else None
-    )
+    radix_layout = proven_radix_store_layout(store)
+    radix_store = radix_layout is not None
+    if radix_layout is not None:
+        # A hierarchical (radix) destination stages the row-major [M, N] tile,
+        # or the column-major one when its rows hold the contiguous run.
+        output_major = "col" if radix_layout.column_major else "row"
+    elif isinstance(output, torch.Tensor):
+        output_major = _tcgen05_tma_matrix_major(output)
+    else:
+        output_major = None
     if (
         not isinstance(output, torch.Tensor)
-        or output.ndim != rank
+        or (output.ndim != rank and not radix_store)
         or output.dtype not in (torch.float16, torch.bfloat16, torch.float32)
         or output_major not in ("row", "col")
         or (output_major == "col") != candidate.output_column_major
     ):
         return None
-    exact_aux_count = 0
+    exact_aux_itemsizes: list[int] = []
+    ring_aux_itemsizes: list[int] = []
     for leaf in chain.auxiliary_tensor_loads:
         source = leaf.load_node.args[0]
         tensor = source.meta.get("val") if isinstance(source, torch.fx.Node) else None
@@ -239,17 +276,20 @@ def analyze_pipeline_smem_facts(
             leaf.broadcast_axis is None
             and isinstance(tensor, torch.Tensor)
             and tensor.ndim == 2
-            and tensor.dtype == output.dtype
         ):
-            exact_aux_count += 1
+            exact_aux_itemsizes.append(tensor.dtype.itemsize)
+            if stages_through_smem_ring(leaf.broadcast_axis, tensor):
+                ring_aux_itemsizes.append(tensor.dtype.itemsize)
     return Tcgen05PipelineSmemFacts(
         operands.lhs.source_fake.dtype.itemsize,
         output.dtype.itemsize,
         capacity_bytes,
-        tuple(rows),
-        bool(chain.auxiliary_tensor_loads),
-        candidate.output_column_major,
-        exact_aux_count,
+        rows=tuple(rows),
+        has_auxiliary_loads=bool(chain.auxiliary_tensor_loads),
+        output_column_major=candidate.output_column_major,
+        exact_aux_itemsizes=tuple(exact_aux_itemsizes),
+        ring_aux_itemsizes=tuple(ring_aux_itemsizes),
+        epilogue_transcendental_ops=chain.transcendental_op_count,
     )
 
 
@@ -279,7 +319,7 @@ def pipeline_smem_bytes(
     pins it (below), and both families use the destination's actual row- or
     column-major layout.
     A staged aux load mode adds one ``aux_stages``-deep ring of epilogue
-    subtiles per exact-shape auxiliary operand (``facts.exact_aux_count``)
+    subtiles per operand a staged ring carries (``facts.ring_aux_itemsizes``)
     plus its full/empty barriers.  ``epi_warp_groups`` multiplies the C
     stages (each epilogue warp group owns ``c_stages`` stages of the ring,
     ``tcgen05_epi_warp_groups``) and ``epi_subtile_n`` pins the 256-row
@@ -343,9 +383,8 @@ def pipeline_smem_bytes(
         tcgen05_aux_ring_smem_bytes_per_cta(
             epi_tile_m=epi_m,
             epi_tile_n=epi_n,
-            dtype_bytes=facts.output_dtype_bytes,
             aux_stages=aux_stages,
-            ring_count=facts.exact_aux_count,
+            ring_itemsizes=facts.ring_aux_itemsizes,
         )
         if aux_load_mode in TCGEN05_AUX_LOAD_MODES_STAGED
         else 0
@@ -411,11 +450,11 @@ def one_cta_pipeline_smem_bytes(
     and the flat 16-bit launches of an ordered barrier chain run the same
     role-local CtaGroup.ONE schedule).  A staged aux load mode adds one
     ``aux_stages``-deep ring of the DEFAULT epilogue subtile per exact-shape
-    auxiliary operand (``facts.exact_aux_count``), ``epi_warp_groups``
-    multiplies the C stages and ``epi_subtile_n`` pins the C subtile to
-    ``(min(bm, 128), epi_subtile_n)`` (``tcgen05_epi_subtile_n``), as the
-    paired model does.  This function does not change any legacy one- or
-    two-CTA allocation model.
+    auxiliary operand the ring carries (``facts.ring_aux_itemsizes``),
+    ``epi_warp_groups`` multiplies the C stages and ``epi_subtile_n`` pins
+    the C subtile to ``(min(bm, 128), epi_subtile_n)``
+    (``tcgen05_epi_subtile_n``), as the paired model does.  This function
+    does not change any legacy one- or two-CTA allocation model.
     """
     assert one_cta_pipeline_tile_modeled(
         bm=bm, bn=bn, bk=bk, c_stages=c_stages, acc_stages=acc_stages
@@ -433,9 +472,8 @@ def one_cta_pipeline_smem_bytes(
         tcgen05_aux_ring_smem_bytes_per_cta(
             epi_tile_m=epi_m,
             epi_tile_n=epi_n,
-            dtype_bytes=facts.output_dtype_bytes,
             aux_stages=aux_stages,
-            ring_count=facts.exact_aux_count,
+            ring_itemsizes=facts.ring_aux_itemsizes,
         )
         if aux_load_mode in TCGEN05_AUX_LOAD_MODES_STAGED
         else 0

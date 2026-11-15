@@ -44,6 +44,27 @@ def test_ordered_computed_storage_view_replay(shift):
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("rows", [3, 12])
+def test_computed_dot_rows_that_repeat_no_other_axis(rows):
+    # The rows keep their extent through ``hl.arange(rows)[:, None]``; at 3
+    # and 12 it repeats neither the contraction's 8 nor the columns' 9.
+    x = torch.randn(2 * 128, device=DEVICE, dtype=torch.bfloat16).as_strided(
+        (2, rows, 8), (128, 8, 1)
+    )
+    y = torch.randn(2, 8, 9, device=DEVICE, dtype=torch.bfloat16)
+    bound = computed_metadata_phases.bind((x, y, None))
+    config = dict(bound.config_spec.default_config()) | {
+        "pid_type": "flat",
+        "cute_fragment_half_mma": True,
+    }
+    compiled = bound.compile_config(helion.Config.from_dict(config))
+    value = (x.float() * (8**-0.5)).to(x.dtype).float() @ y.float()
+    expected = value + value.amax(dim=1, keepdim=True) + 1.0
+    torch.testing.assert_close(compiled(x, y, None), expected, rtol=1e-5, atol=1e-5)
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("mode,bias", [("fast", 3), ("missing", 7)])
 def test_ordered_membership_native_replay(mode, bias):
     x = torch.arange(7, device=DEVICE).float()

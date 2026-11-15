@@ -18,6 +18,7 @@ from helion.autotuner.benchmarking import _make_cudagraph_replay
 import helion.language as hl
 
 matmul_split_k = import_example("matmul_split_k").matmul_split_k
+segmented_reduction = import_example("segment_reduction").segmented_reduction_helion
 
 CUDA_DEVICE = "cuda"
 
@@ -538,9 +539,15 @@ def test_packed_atomic_epilogue_respects_the_target_capability(
         (64, 1024), dtype=torch.float16 if dtype is torch.float32 else dtype
     )
     y = torch.empty((1024, 128), dtype=x.dtype)
+    config = _vector_epilogue_config()
+    if capability is not None and capability < (9, 0):
+        # Below sm_90 libNVVM compiles 48 KiB of static shared memory, so the
+        # four-stage ring (57344 bytes) is refused at codegen there; three
+        # stages (45056 bytes) compile.
+        config = helion.Config(**{**config.config, "cute_collective_stages": 3})
     with mock_cuda_unavailable():
         bound = cpu_bind(kernel, (x, y), capability=capability)
-        code = bound.to_code(_vector_epilogue_config())
+        code = bound.to_code(config)
     assert ("_cute_red_add_" in code) == packed
     assert "cute.arch.atomic_add(" in code
 
@@ -550,9 +557,6 @@ def test_half_output_vector_lanes_match_the_reference(dtype: torch.dtype) -> Non
     """GPU: the generic V-loop flush of a half output (segmented reduction, one
     thread per 4-wide strip) packs the lanes into one red and matches an fp32
     index_add rounded once (at most 64 fp16 adds per node)."""
-    from test.test_cute_scan_tile_atomics import STRIP
-    from test.test_cute_scan_tile_atomics import _segmented_reduction
-
     from helion._testing import DEVICE
 
     torch.manual_seed(7)
@@ -562,10 +566,19 @@ def test_half_output_vector_lanes_match_the_reference(dtype: torch.dtype) -> Non
     ).values
     values = (torch.randn(num_elements, num_features, device=DEVICE) * 0.05).to(dtype)
     kernel = helion.kernel(
-        _segmented_reduction, backend="cute", static_shapes=True, autotune_effort="none"
+        segmented_reduction.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
     )
     bound = kernel._bind_isolated((indices, values, num_nodes))
-    config = helion.Config(**{**bound.config_spec.default_config().config, **STRIP})
+    # 16-row strips, one thread per 4-wide group of a 128-wide feature tile.
+    strip = {
+        "block_sizes": [16, 128],
+        "num_threads": [1, 32],
+        "cute_vector_widths": [1, 4],
+    }
+    config = helion.Config(**{**bound.config_spec.default_config().config, **strip})
     code = bound.to_code(config)
     assert (
         "_cute_red_add_f16_vec("

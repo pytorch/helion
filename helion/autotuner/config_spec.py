@@ -34,6 +34,7 @@ from .._compiler.cute.flash_facts import FlashEnv
 from .._compiler.cute.flash_facts import FlashSurfaceFacts
 from .._utils import indexing_uses_tensor_descriptor
 from .._utils import prev_power_of_2
+from .._utils import widest_halvable
 from ..exc import InvalidConfig
 from ..runtime.config import _copy_config_structure
 from ..runtime.triton.launcher import get_num_xcd
@@ -537,8 +538,9 @@ class ReductionKernelFact(NamedTuple):
     non-reduction loop, parallel grid axes, the complete live-tile timeline, and axes whose
     contiguous memory access makes them coalescing-sensitive.
 
-    Built by ``build_reduction_kernel_fact``. ``reductions`` may be empty (a kernel with only
-    GRID_TILE / DECLINED reductions, or none) — the seed then declines.
+    Built by ``build_reduction_kernel_fact``. ``reductions`` holds every occurrence, GRID_TILE
+    and DECLINED ones included, so it is empty only for a kernel without reductions; the
+    reduction seed declines when no member is sized (``SIZED_REDUCTION_CATEGORIES``).
     """
 
     reductions: tuple[ReductionDescriptor, ...]
@@ -572,14 +574,18 @@ class MatmulWithReductionEpilogueFact(NamedTuple):
 
 class MemoryOpFact(NamedTuple):
     """Metadata linking one ``Config.indexing`` slot to its graph memory op, one entry per
-    load/store in graph-traversal order (so ``memory_op_facts[i]`` describes ``config.indexing[i]``).
+    lowering of a load/store in the order code generation lowers them (a ``while`` condition's
+    load gets two on a backend that slots each lowering): ``indexing_index`` is the slot for the
+    configs that roll no reduction (a load of a ``tile.index`` value or of a stack tensor, which
+    takes none, has one after the others), and ``DeviceIR.config_memory_op_facts`` gives the
+    facts of any config.
     Lets heuristics reason about *which* load/store a slot is, not a bare positional index.
 
     The reduction-fact builders consume the enrichment fields below (all reduction-AGNOSTIC — no
     notion of which axis is "the" reduction; the builders index them by the reduction's ``block_id``).
     """
 
-    indexing_index: int  # slot in Config.indexing (== position in this list)
+    indexing_index: int  # slot in Config.indexing of a config that rolls no reduction
     kind: str  # "load" | "store"
     eviction_index: int | None  # slot in Config.load_eviction_policies, else None
     tensor_name: str | None  # host buffer name being accessed, e.g. "x", "weight"
@@ -699,11 +705,12 @@ class PointwiseElementwiseFact(NamedTuple):
 def shrink_block_sizes_for_numel_constraints(
     constraints: list[TensorNumelConstraint],
     block_sizes: list[int],
-    min_sizes: list[int],
+    min_sizes: Sequence[int | None],
 ) -> None:
     """Shrink *block_sizes* in-place so every *constraint* is satisfied.
 
-    Halves the largest involved block size first for balanced tiles.
+    Halves the largest involved block size first for balanced tiles, never
+    below its entry of *min_sizes* (``None``: a size that never shrinks).
     Fixed-point loop handles cross-constraint interactions.
     """
     prev = list(block_sizes)
@@ -712,13 +719,9 @@ def shrink_block_sizes_for_numel_constraints(
             while not constraint.check_fn(
                 *(block_sizes[i] for i in constraint.block_indices)
             ):
-                best_idx: int | None = None
-                best_val = -1
-                for i in constraint.block_indices:
-                    can_halve = block_sizes[i] // 2 >= min_sizes[i]
-                    if can_halve and block_sizes[i] > best_val:
-                        best_val = block_sizes[i]
-                        best_idx = i
+                best_idx = widest_halvable(
+                    (i, block_sizes[i], min_sizes[i]) for i in constraint.block_indices
+                )
                 if best_idx is None:
                     log.warning(
                         "tensor numel constraint unsatisfiable at minimum "
@@ -730,6 +733,17 @@ def shrink_block_sizes_for_numel_constraints(
         if block_sizes == prev:
             break
         prev = list(block_sizes)
+
+
+def fit_thread_count(threads: int, block_size: int) -> int:
+    """The largest power of two at most ``threads`` that divides
+    ``block_size`` (at least 1): a ``num_threads`` entry fitted to its block.
+    ``NumThreadsSpec`` takes any whole number of warps, and halving one that
+    is not a power of two (96) never divides a power-of-two block."""
+    threads = prev_power_of_2(threads, block_size)
+    while threads > 1 and block_size % threads != 0:
+        threads //= 2
+    return threads
 
 
 DEFAULT_NUM_WARPS = 4
@@ -948,10 +962,46 @@ class ConfigSpec:
         # before configs are normalized.
         self.reduction_block_ids: set[int] = set()
         self.cute_indexed_reduction_block_ids: set[int] = set()
+        # The reduction blocks with a static extent, and that extent (a
+        # dynamic one is planned from its hint and never runs unpadded).
+        self.cute_static_reduction_extents: dict[int, int] = {}
+        # The reduction blocks an ``hl.reduce`` may reduce: its padded slots
+        # fold the user's ``other``, which need not be the combine's
+        # identity, so such a row never runs unpadded.
+        self.cute_user_reduce_block_ids: set[int] = set()
+        # The reduction blocks a scan may run along (``_block_is_scanned``):
+        # their parallel scans walk the cyclic lanes, so such a row never
+        # holds several packets per thread.
+        self.cute_scanned_block_ids: set[int] = set()
+        # Set by DeviceIR analysis: per block, the widest element of a value
+        # a load or a store moves along it (``row_itemsizes``).  A persistent
+        # row holds several packets per thread only where they fit
+        # (``fits_row_packets``).
+        self.cute_row_itemsizes: dict[int, int] = {}
         # Non-reduction tiles that execute simultaneously. Sibling loops and
         # separate roots reuse physical axes during CuTe launch planning.
-        self.cute_tile_loop_paths: tuple[TileLoopPath, ...] = ()
+        # Their paths (``cute_tile_loop_paths``), each with the reduction
+        # blocks it runs beside: used between the path's root and its
+        # innermost loop, or inside that loop.
+        self.cute_tile_loop_path_reductions: dict[TileLoopPath, frozenset[int]] = {}
+        # The static size of each block on the ``cute_tile_loop_paths`` that
+        # no config tunes: a fixed ``hl.tile`` block size, or an ``hl.grid``'s
+        # step (``hl.grid(0, 64, 8)`` records 8, although its loop runs one
+        # thread per index).
+        self.cute_tile_fixed_block_sizes: dict[int, int] = {}
+        # The blocks on those paths whose fixed size is not a static int: an
+        # expression of tunables (``block_size=next_power_of_2(bm)``), or
+        # another SymInt such as a dynamic size or an int argument.
+        self.cute_tile_symbolic_fixed_blocks: frozenset[int] = frozenset()
+        # The path of each tile strategy a launch builds, ending at its
+        # blocks: every root's grid and every tile loop, so a path repeats
+        # when loops share their blocks.
+        self.cute_tile_strategy_paths: tuple[TileLoopPath, ...] = ()
         self.cute_inactive_tile_block_ids: set[int] = set()
+        # The loops of the ``cute_tile_loop_paths`` (block-id tuples) the
+        # per-thread planner lays out N-D whatever their ``flatten_loops`` entry
+        # (``per_thread_planning.tile_loop_keeps_nd_layout``).
+        self.cute_nd_tile_loops: frozenset[tuple[int, ...]] = frozenset()
         # Whether fp32 matmuls stay exact (dot_precision ieee / tf32x3): the
         # SIMT GEMM knob's precondition, recorded by DeviceIR.
         self.cute_fp32_dot_exact: bool = False
@@ -994,6 +1044,11 @@ class ConfigSpec:
         self.cute_reduction_reloads: BlockIdSequence[CuteReductionReloadSpec] = (
             BlockIdSequence()
         )
+        # Set by DeviceIR analysis: a looped row reduction the lane jam takes
+        # (``CuteReductionLaneJamHeuristic.is_eligible``) beside a kernel-local
+        # workspace a later sweep reads back, so ``cute_scratch_forwarding``
+        # is tunable at every extent.
+        self.cute_scratch_forwarding_sites = False
         # Device-IR facts enable this only for plausible in-place 16-bit state
         # updates. Generated-AST matching is stricter and remains authoritative.
         self.cute_resident_reduction_blocks: set[int] = set()
@@ -1005,11 +1060,29 @@ class ConfigSpec:
         self.cute_register_tile_reduction_blocks: set[int] = set()
         self.cute_async_load_pipeline_enabled = False
         self.cute_bf16x2_recurrence_enabled = False
+        # Set by DeviceIR analysis: a reduction over a strided full slice
+        # beside a contiguous grid tile, the layout the strided-reduction seeds
+        # sink (``CuteStridedReductionHeuristic.strided_reduction``), so
+        # ``cute_vloop_sink`` and ``cute_lane_unroll`` are tunable at every
+        # extent.
+        self.cute_strided_reduction_sites = False
         self.cute_signed_bitfield_bf16_available = False
-        # Set by DeviceIR analysis: an fp32 quotient whose divisor is a
-        # scalar or a broadcast row value (``hoist_loop_invariant_recip``'s
-        # exact hoist can apply), so ``cute_exact_div_form`` is tunable.
+        # Set by DeviceIR analysis: the reductions whose ``reduction_loops``
+        # slot may roll (is not pinned) along which a load reads a bool
+        # tensor, none in a kernel with a matmul; ``cute_bool_byte_packets``
+        # is tunable when there are any (``bool_reduction_row_blocks``).
+        self.cute_bool_byte_packet_blocks: frozenset[int] = frozenset()
+        # Set by DeviceIR analysis: the blocks of the device loops over a
+        # static extent that load a float tensor along their tile, none in a
+        # kernel with a matmul; ``cute_tail_peel`` is tunable when there are
+        # any (``tail_peel_blocks``).
+        self.cute_tail_peel_blocks: frozenset[int] = frozenset()
+        # Set by DeviceIR analysis under ``Settings.cute_exact_division``: an
+        # fp32 quotient whose divisor is a scalar or a broadcast row value
+        # (``hoist_loop_invariant_recip``'s exact hoist can apply), so
+        # ``cute_exact_div_form`` is tunable.
         self.cute_exact_division_sites = False
+        self.cute_pair_lane_math_sites = False
         self.cute_scaled_mma_available = False
         self.cute_mxfp8_fused_scales_available = False
         self.cute_mxfp8_sf_tma_available = False
@@ -1021,7 +1094,12 @@ class ConfigSpec:
         self.cute_proven_bounds_enabled = False
         self.cute_rng_packet_enabled = False
         self.cute_warp_aggregated_atomics_enabled = False
+        self.cute_privatize_atomics_enabled = False
         self.cute_packet_prefetch_enabled = False
+        # Set by DeviceIR analysis: a max, a min or an ``any`` reduction whose
+        # warp reduction ``cute_warp_fp32_redux`` takes natively on the target
+        # (``has_native_redux_reduction``), so the knob is tunable.
+        self.cute_native_redux_sites = False
         self.range_unroll_factors: BlockIdSequence[RangeUnrollFactorSpec] = (
             BlockIdSequence()
         )
@@ -1502,6 +1580,13 @@ class ConfigSpec:
         }
 
     @property
+    def cute_tile_loop_paths(self) -> tuple[TileLoopPath, ...]:
+        """The CuTe tile loop paths: the keys of
+        ``cute_tile_loop_path_reductions``, which records each path's
+        reductions."""
+        return tuple(self.cute_tile_loop_path_reductions)
+
+    @property
     def compiler_coverage_groups(self) -> tuple[CompilerCoverageGroup, ...]:
         return self._compiler_coverage_groups
 
@@ -1643,6 +1728,17 @@ class ConfigSpec:
         self.range_multi_buffers._remove_duplicates()
         self.range_flattens._remove_duplicates()
         self.static_ranges._remove_duplicates()
+
+    def pin_flatten_loop(self, block_id: int) -> None:
+        """Pin the flatten_loops choice of ``block_id``'s loop to False.
+
+        Its slot stays (``FlattenLoopSpec.pinned``).  So does that of a CuTe
+        pointwise re-registration candidate (``cute_reflatten_candidates``):
+        CuTe re-offers it pinned, so a config saved before the pin still loads.
+        """
+        for spec in (*self.flatten_loops, *self.cute_reflatten_candidates):
+            if block_id in spec.block_ids:
+                spec.pinned = True
 
     def disallow_pid_type(
         self, pid_type: PidTypeLiteral, reason: str | None = None
@@ -1910,6 +2006,68 @@ class ConfigSpec:
                 "or 16, or an N tile of at least 16"
             )
 
+    def clamp_bounded_block_sizes(self, config: dict[str, Any]) -> None:
+        """Clamp inner block sizes that are bounded by an outer block (e.g.
+        ``hl.tile(outer.begin, outer.end)``) to the outer's block size in
+        ``config``, which the inner extent can never exceed, and fit the
+        ``num_threads`` entries of the clamped blocks to their new sizes.  A
+        block keeps its minimum and its structural pin, as ``_normalize``
+        does: below the minimum it stays at the minimum, wider than its
+        extent, and a pinned block stays at its pin.  ``config`` holds
+        normalized ``block_sizes`` and ``num_threads``."""
+        block_sizes_list = config.get("block_sizes")
+        if not isinstance(block_sizes_list, list):
+            return
+        # The new size of each block the clamp changes, by block id.
+        clamped: dict[int, int] = {}
+        new_block_sizes = list(block_sizes_list)
+        for i, spec in enumerate(self.block_sizes):
+            bb = spec.bounded_by_block_id
+            minimum = spec.shrink_minimum
+            if (
+                bb is None
+                or minimum is None
+                or i >= len(new_block_sizes)
+                or new_block_sizes[i] is None
+            ):
+                continue
+            try:
+                outer_index = self.block_sizes.block_id_to_index(bb)
+            except KeyError:
+                continue
+            outer_val = (
+                new_block_sizes[outer_index]
+                if outer_index < len(new_block_sizes)
+                else None
+            )
+            if (
+                isinstance(outer_val, int)
+                and isinstance(new_block_sizes[i], int)
+                and new_block_sizes[i] > max(outer_val, minimum)
+            ):
+                new_block_sizes[i] = clamped[spec.block_id] = max(outer_val, minimum)
+        if not clamped:
+            return
+        config["block_sizes"] = new_block_sizes
+        num_threads = config.get("num_threads")
+        if not isinstance(num_threads, list):
+            return
+        new_num_threads = list(num_threads)
+        # Fit the slots of the clamped blocks, found by block id: the two
+        # sequences need not share an order.
+        for i, nt_spec in enumerate(self.num_threads):
+            if i >= len(new_num_threads):
+                break
+            num_thread = new_num_threads[i]
+            if (
+                nt_spec.block_id not in clamped
+                or type(num_thread) is not int
+                or num_thread <= 0
+            ):
+                continue
+            new_num_threads[i] = fit_thread_count(num_thread, clamped[nt_spec.block_id])
+        config["num_threads"] = new_num_threads
+
     def normalize(
         self,
         config: helion.Config | dict[str, object],
@@ -1926,7 +2084,7 @@ class ConfigSpec:
             _cute_register_tiles: If False, a CuTe persistent reduction whose
                 threads cannot cover its extent is looped even when the config
                 spells out a per-thread register tile
-                (``_cute_config_forms_register_tile``).  ``generate_ast`` uses
+                (``cute_config_forms_register_tile``).  ``generate_ast`` uses
                 it to regenerate a kernel whose register tile the lowering
                 rejected as the config without the register tile.
         """
@@ -2061,58 +2219,9 @@ class ConfigSpec:
 
         surface.normalize_after_sequences(self, config, fix_invalid=_fix_invalid)
 
-        # Clamp inner block sizes that are bounded by an outer block
-        # (e.g. ``hl.tile(outer.begin, outer.end)``): at this point the
-        # outer's concrete block size for this config is known, and the
-        # inner extent can never exceed it.
-        block_sizes_list = config.get("block_sizes")
-        if isinstance(block_sizes_list, list):
-            changed = False
-            new_block_sizes = list(block_sizes_list)
-            for i, spec in enumerate(self.block_sizes):
-                bb = spec.bounded_by_block_id
-                if (
-                    bb is None
-                    or i >= len(new_block_sizes)
-                    or new_block_sizes[i] is None
-                ):
-                    continue
-                try:
-                    outer_index = self.block_sizes.block_id_to_index(bb)
-                except KeyError:
-                    continue
-                outer_val = (
-                    new_block_sizes[outer_index]
-                    if outer_index < len(new_block_sizes)
-                    else None
-                )
-                if (
-                    isinstance(outer_val, int)
-                    and isinstance(new_block_sizes[i], int)
-                    and new_block_sizes[i] > outer_val
-                ):
-                    new_block_sizes[i] = outer_val
-                    changed = True
-            if changed:
-                config["block_sizes"] = new_block_sizes
-                num_threads = config.get("num_threads")
-                if isinstance(num_threads, list):
-                    new_num_threads = list(num_threads)
-                    for i, (block_size, num_thread) in enumerate(
-                        zip(new_block_sizes, new_num_threads, strict=False)
-                    ):
-                        if (
-                            type(block_size) is not int
-                            or type(num_thread) is not int
-                            or num_thread <= 0
-                        ):
-                            continue
-                        if num_thread > block_size:
-                            num_thread = 1 << (max(block_size, 1).bit_length() - 1)
-                        while num_thread > 1 and block_size % num_thread != 0:
-                            num_thread //= 2
-                        new_num_threads[i] = max(num_thread, 1)
-                    config["num_threads"] = new_num_threads
+        # The sequences are normalized, so each outer block's size for this
+        # config is known: clamp the inner blocks it bounds.
+        self.clamp_bounded_block_sizes(config)
 
         if self.supports_config_key("num_threads"):
             num_threads = cast("list[int]", config.get("num_threads", []))
@@ -2725,9 +2834,12 @@ class ConfigSpec:
                     if min_block >= 2:
                         min_block = 1 << (min_block.bit_length() - 1)
                         min_block = min(min_block, spec.max_size)
-                        spec.autotuner_min = assert_integer_power_of_two(
+                        raised = assert_integer_power_of_two(
                             max(min_block, spec.autotuner_min)
                         )
+                        if raised != spec.autotuner_min:
+                            spec.occupancy_floor = (spec.autotuner_min, raised)
+                        spec.autotuner_min = raised
 
     def _grid_floor_groups(self) -> list[tuple[int, ...]]:
         """Root grids for the occupancy floor, each owning a full budget."""
@@ -2803,8 +2915,7 @@ class ConfigSpec:
         # A promoted seed only specifies the knobs it cares about (e.g. block_sizes); layer it over
         # the full base defaults so every other key — including user register_tunable defaults — is
         # preserved rather than dropped.
-        merged = dict(self.autotune_reference_config().config)
-        merged.update(self.compiler_default_config.config)
+        merged = self.promoted_default_values(self.compiler_default_config.config)
         config = helion.Config.from_dict(merged)
         # Then normalize, so a promoted compiler default has the same canonical field set as the
         # ``_base_default_config`` path: without this its ``repr``/equality differs from its own
@@ -2814,6 +2925,18 @@ class ConfigSpec:
         self.search_surface.trim_default_config(self, config)
         self._shrink_for_numel_constraints(config)
         return config
+
+    def promoted_default_values(
+        self, promoted: Mapping[str, object]
+    ) -> dict[str, object]:
+        """The base default with ``promoted`` layered over it, as
+        ``default_config`` merges a compiler default: the backend first drops
+        the base keys the promoted knobs re-derive
+        (``BackendSearchSurface.overlay_promoted_default``)."""
+        merged = dict(self.autotune_reference_config().config)
+        self.search_surface.overlay_promoted_default(self, merged, promoted)
+        merged.update(promoted)
+        return merged
 
     def _shrink_for_numel_constraints(self, config: helion.Config) -> None:
         """Shrink block_sizes in *config* in-place so every tensor numel
@@ -2826,12 +2949,10 @@ class ConfigSpec:
             or not self.tensor_numel_constraints
         ):
             return
-        min_sizes = [
-            max(self.block_sizes[i].min_size, self.block_sizes[i].structural_pin or 1)
-            for i in range(len(block_sizes))
-        ]
         shrink_block_sizes_for_numel_constraints(
-            self.tensor_numel_constraints, block_sizes, min_sizes
+            self.tensor_numel_constraints,
+            block_sizes,
+            [self.block_sizes[i].shrink_minimum for i in range(len(block_sizes))],
         )
 
     def shrink_block_sizes_once(self, config: helion.Config) -> helion.Config | None:
@@ -2845,17 +2966,11 @@ class ConfigSpec:
         block_sizes = config.config.get("block_sizes")
         if not isinstance(block_sizes, list) or not block_sizes:
             return None
-        best_idx: int | None = None
-        best_val = -1
-        for i, value in enumerate(block_sizes):
-            if not isinstance(value, int):
-                continue
-            if self.block_sizes[i].structural_pin is not None:
-                # Normalization would restore the pinned size: no progress.
-                continue
-            if value // 2 >= max(self.block_sizes[i].min_size, 1) and value > best_val:
-                best_val = value
-                best_idx = i
+        best_idx = widest_halvable(
+            (i, value, self.block_sizes[i].shrink_minimum)
+            for i, value in enumerate(block_sizes)
+            if isinstance(value, int)
+        )
         if best_idx is None:
             return None
         shrunk = [*block_sizes]
@@ -3360,6 +3475,26 @@ class L2GroupingSpec(_PowerOfTwoBlockIdItem):
         return 1
 
 
+def generic_block_size_default(total_ndim: int, reduction_numel: int) -> int:
+    """The default size of each of ``total_ndim`` block sizes beside reduction
+    loops whose padded extents multiply to ``reduction_numel``."""
+    if total_ndim <= 2 and reduction_numel <= 128:
+        return 32
+    if total_ndim >= 3 and reduction_numel > 1:
+        # With 3+ tiled dimensions and a non-trivial reduction/full-slice
+        # dimension, the total tensor numel (default^total_ndim *
+        # reduction_numel) grows quickly and can cause Triton JIT
+        # compilation to hang or exceed shared memory limits.
+        # Compute a default that keeps total numel <= 32768 (safe for
+        # 64KB shared memory with 2-byte elements like bf16).
+        target = 32768
+        per_dim = int((target / reduction_numel) ** (1.0 / total_ndim))
+        return max(1, 1 << (per_dim.bit_length() - 1)) if per_dim >= 1 else 1
+    if reduction_numel <= 256:
+        return 16
+    return 1
+
+
 class BlockSizeSpec(_PowerOfTwoBlockIdItem):
     def __init__(
         self,
@@ -3409,6 +3544,10 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         self.structural_pin: int | None = None
         self.structural_pin_reason: str = ""
         self._structural_pin_warned: set[int] = set()
+        # The search floors before and after ``ConfigSpec.raise_grid_block_minimums``
+        # raised this block's, ``None`` where it did not
+        # (``drop_occupancy_floor``).
+        self.occupancy_floor: tuple[int, int] | None = None
         if self.max_size < self.min_size:
             self.max_size = self.min_size
         assert self.min_size <= self.max_size
@@ -3452,6 +3591,15 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
             result = self.min_size
         return result
 
+    def drop_occupancy_floor(self) -> None:
+        """Restore the search floor ``ConfigSpec.raise_grid_block_minimums``
+        raised, unless another surface has raised it since."""
+        if (
+            self.occupancy_floor is not None
+            and self.autotuner_min == self.occupancy_floor[1]
+        ):
+            self.autotuner_min = self.occupancy_floor[0]
+
     def pin_structurally(self, value: int, *, reason: str) -> None:
         """Pin this block size to the one value a fused lowering admits.
 
@@ -3464,6 +3612,15 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         self.max_size = value
         self.structural_pin = value
         self.structural_pin_reason = reason
+
+    @property
+    def shrink_minimum(self) -> int | None:
+        """The smallest size shrinking may give this block, or ``None`` when
+        it is structurally pinned: normalization restores the pinned size, so
+        shrinking makes no progress."""
+        if self.structural_pin is not None:
+            return None
+        return max(self.min_size, 1)
 
     def update_min(self, value: int) -> None:
         self.min_size = assert_integer_power_of_two(max(value, self.min_size))
@@ -3515,26 +3672,23 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         self.max_size = min(self.max_size, next_power_of_2(max(value, 1)))
 
     def _fragment(self, base: ConfigSpec) -> BlockSizeFragment:
-        total_ndim = len(base.block_sizes)
         reduction_numel = _product(
             [next_power_of_2(spec.size_hint) for spec in base.reduction_loops]
         )
-        if total_ndim <= 2 and reduction_numel <= 128:
-            default = 32
-        elif total_ndim >= 3 and reduction_numel > 1:
-            # With 3+ tiled dimensions and a non-trivial reduction/full-slice
-            # dimension, the total tensor numel (default^total_ndim *
-            # reduction_numel) grows quickly and can cause Triton JIT
-            # compilation to hang or exceed shared memory limits.
-            # Compute a default that keeps total numel <= 32768 (safe for
-            # 64KB shared memory with 2-byte elements like bf16).
-            target = 32768
-            per_dim = int((target / reduction_numel) ** (1.0 / total_ndim))
-            default = max(1, 1 << (per_dim.bit_length() - 1)) if per_dim >= 1 else 1
-        elif reduction_numel <= 256:
-            default = 16
-        else:
-            default = 1
+        return self._fragment_with_default(
+            base,
+            base.search_surface.block_size_default(
+                base,
+                self,
+                generic_block_size_default(len(base.block_sizes), reduction_numel),
+            ),
+        )
+
+    def _fragment_with_default(
+        self, base: ConfigSpec, default: int
+    ) -> BlockSizeFragment:
+        """The fragment around ``default``, the size the search surface gives
+        the block, which this fits to the block's bounds."""
         low = min(max(self.min_size, self.autotuner_min), self.max_size)
         # Clamp the default within the dimension so allow_overshoot only widens
         # the autotuner *search*, never the default (non-autotuned) block size.
@@ -3586,13 +3740,21 @@ class NumThreadsSpec(_PowerOfTwoBlockIdItem):
 
 
 class FlattenLoopSpec(_BlockIdItem):
-    def _fragment(self, base: ConfigSpec) -> BooleanFragment:
+    # Set by ``ConfigSpec.pin_flatten_loop`` for a loop with an op along one
+    # of its tile dims (``pin_unflattened_loops``), which a flattened tile
+    # cannot express: the slot stays, so the config shape does not depend on
+    # the analysis, but its value is pinned to False.
+    pinned: bool = False
+
+    def _fragment(self, base: ConfigSpec) -> BooleanFragment | EnumFragment:
+        if self.pinned:
+            return EnumFragment((False,))
         return BooleanFragment()
 
     def _normalize(self, name: str, value: object) -> bool:
         if not isinstance(value, bool):
             raise InvalidConfig(f"{name} must be a boolean, got {value!r}") from None
-        return value
+        return value and not self.pinned
 
     def _fill_missing(self) -> bool:
         return False
@@ -3612,7 +3774,17 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         self.size_hint = size_hint
         self.allow_non_power_of_two = allow_non_power_of_two
         self.allow_full_extent = allow_full_extent
+        # Why the dim stays persistent, for one that keeps its slot without a
+        # loop: an effectful replay, or a dim older versions offered a loop
+        # (``DeviceIR.register_rollable_reductions``).  The slot stays, so
+        # the configs they saved line up with this version's by position,
+        # but its value is pinned to None and the search space leaves it out.
         self.persistent_reason = persistent_reason
+
+    @property
+    def pinned(self) -> bool:
+        """Whether the slot is pinned to None (``persistent_reason``)."""
+        return self.persistent_reason is not None
 
     def _full_extent_chunk(self) -> int | None:
         # A padded single iteration can preserve vector packets where an exact
@@ -3786,12 +3958,18 @@ class CuteReductionReloadSpec(_BlockIdItem):
     Rolled or persistent LayerNorm/RMSNorm-style kernels sweep the same input
     several times (reduce, then consume).  ``"register"`` caches the earliest
     sweep's loads in a per-thread register fragment (fastest when the
-    per-thread slice is small; spills to local memory when it is not).
-    ``"gmem"`` re-loads from global memory on later sweeps (the row is usually
-    still resident in L2, and no registers are burned).  ``"auto"`` (default)
-    keeps the legacy size heuristic in ``fuse_two_pass_loads``. The optional
-    ``"register_prefetch"`` mode retains register reloads and also prefetches
-    one proven read-only consumer packet across a one-trip reduction.
+    per-thread slice is small; spills to local memory when it is not), and
+    the values that sweep computes from them with pure inline asm (the
+    Philox chain of a word0 ``hl.rand`` draw) or a transcendental (``exp``,
+    ``exp2``, ``log``, ``log2``, ``tanh``, ``erf``), which the later sweeps
+    then read instead of recomputing.  ``"gmem"`` re-loads from global memory
+    on later sweeps (the row is usually still resident in L2, and no
+    registers are burned) and recomputes those values.  ``"auto"`` (default)
+    keeps the legacy size heuristic in ``fuse_two_pass_loads`` and carries
+    the inline asm values, not the transcendentals.  The optional
+    ``"register_prefetch"`` mode carries what ``"register"`` does and also
+    prefetches one proven read-only consumer packet across a one-trip
+    reduction.
     """
 
     def __init__(self, *, block_id: int) -> None:
@@ -3855,6 +4033,9 @@ class CuteVectorWidthSpec(_BlockIdItem):
     V=1 disables vectorization (scalar loads). V=2/4/8/16 emits
     ``cute.arch.load(..., ir.VectorType.get([V], elem_dtype.mlir_type))``
     for the inner reduction load. SM100+ also admits 32-byte vectors.
+    A persistent reduction row whose threads each hold a multiple of V
+    elements keeps that many V-wide packets per thread, ``threads * V``
+    elements apart (one packet when V covers the thread's slice).
     """
 
     def __init__(

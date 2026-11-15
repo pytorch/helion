@@ -91,6 +91,8 @@ from ..tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENTS
 from ..tcgen05_constants import TCGEN05_AUX_PREFETCH_MAX_SUBTILES
 from ..tcgen05_constants import TCGEN05_AUX_PREFETCH_SUBTILES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_CHOICES
+from ..tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_DEFAULT
+from ..tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_VALIDATION_CHOICES
 from ..tcgen05_constants import TCGEN05_AUX_STAGES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENTS
@@ -457,6 +459,8 @@ def _aux_tma_edge_search_enabled(state: CuteTcgen05Config) -> bool:
     return (
         state.exact_shape_aux_kernel_detected
         and state.exact_aux_tma_provable
+        # an operand the producer's ring carries (not only a boolean mask)
+        and not facts.exact_aux_mask_only(state)
         and constraints is not None
         and constraints.allow_edge_k_tail_family
     )
@@ -475,6 +479,8 @@ def _aux_tma_full_tile_search_enabled(state: CuteTcgen05Config) -> bool:
         state.exact_shape_aux_kernel_detected
         and state.exact_aux_tma_provable
         and not state.matmul_has_leading_passthrough
+        # an operand the producer's ring carries (not only a boolean mask)
+        and not facts.exact_aux_mask_only(state)
         and constraints is not None
         and not constraints.allow_edge_k_tail_family
         and not constraints.one_wave_only
@@ -519,6 +525,8 @@ def split_k_search_choices(state: CuteTcgen05Config) -> tuple[int, ...]:
         or extents is None
         or fragments is None
         or state.matmul_leading_work_multiplier != 1
+        # a batch of one: codegen splits no leading passthrough axis
+        or state.matmul_has_leading_passthrough
         or state.grouped_worklist_smem_facts is not None
         or any(value is None or value <= 0 for value in extents)
     ):
@@ -535,6 +543,17 @@ def split_k_search_choices(state: CuteTcgen05Config) -> tuple[int, ...]:
     k_tiles = -(-k // fragments[2].low)
     return tuple(
         split for split in TCGEN05_SPLIT_K_SEARCH_CHOICES if 1 < split <= k_tiles
+    )
+
+
+def split_k_tiles_supported(
+    state: CuteTcgen05Config, *, bm: int, bn: int, bk: int
+) -> bool:
+    """Whether split-K runs ``bm x bn x bk`` tiles: whole tiles, or any on
+    the flat-edge TMA path (``split_k_flat_edge_tma``, recorded at bind:
+    the partial tiles' K tails and edges store through it)."""
+    return state.split_k_flat_edge_tma or facts._static_full_tiles(
+        state, bm=bm, bn=bn, bk=bk
     )
 
 
@@ -803,15 +822,20 @@ def allow_deep_direct_entry_validation(
 def epilogue_group_search_enabled(state: CuteTcgen05Config) -> bool:
     """Whether the epilogue subtile and warp-group knobs are searched.
 
-    Both act on a heavy epilogue -- several output stores or an
-    exact-shape auxiliary read -- whose per-subtile chain a one-tile
-    per-CTA grid leaves exposed; a plain store's search keeps its
-    surface (an explicit config is validated everywhere).
+    Both act on a heavy epilogue -- several output stores, an exact-shape
+    auxiliary read or a transcendental op (whose default runs two groups,
+    three over a CTA pair's short K loop,
+    ``CuteTcgen05DefaultTileHeuristic._multi_group_epilogue_values``)
+    -- whose per-subtile chain a one-tile per-CTA grid leaves exposed; a
+    plain store's search keeps its surface (an explicit config is
+    validated everywhere).
     """
     facts = state.rowvec_aux_facts
+    pipeline = state.pipeline_smem_facts
     return state.search_enabled and (
         state.exact_shape_aux_kernel_detected
         or (facts is not None and facts.output_count >= 2)
+        or (pipeline is not None and pipeline.epilogue_transcendental)
     )
 
 
@@ -896,6 +920,25 @@ def prepare_override_normalization(
                 "fixed block_sizes overrides cannot select a different physical N tile"
             )
         config[TILE_N_KEY] = 0
+    drop_stale_persistence_model(state, config, overrides)
+
+
+def drop_stale_persistence_model(
+    state: CuteTcgen05Config,
+    config: dict[str, object],
+    overrides: Mapping[str, object],
+) -> None:
+    """Drop ``config``'s persistence model where a ``pid_type`` layered
+    from ``overrides`` contradicts it, so normalization derives it from
+    that ``pid_type`` (``ConfigSpec.promoted_default_values`` layers a
+    compiler default over the base default the same way).
+
+    A flat base's ``non_persistent`` beside a promoted persistent
+    ``pid_type`` made strategy validation reset the promoted strategy
+    fields, which dropped a residual pair's aux-TMA producer but kept the
+    producer's two-stage AB ring on the SIMT loads (B200, bf16
+    1000x4096x4096 + residual: 0.61 of the ATen GEMM, 0.79 on the
+    producer)."""
     if "pid_type" not in overrides:
         return
     if TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY in overrides:
@@ -1468,9 +1511,10 @@ def optional_fragments(
     if not for_search or epilogue_group_search_enabled(state):
         # The epilogue subtile width and the epilogue warp groups of the
         # role-local TMA-store epilogue: searched on kernels whose
-        # epilogue is heavy (two outputs or an exact-shape auxiliary
-        # read), validated everywhere. Plain enum fields: the coverage
-        # group ``cute.epi_warp_groups`` owns the groups coordinate.
+        # epilogue is heavy (two outputs, an exact-shape auxiliary read or
+        # a transcendental step), validated everywhere. Plain enum fields:
+        # the coverage group ``cute.epi_warp_groups`` owns the groups
+        # coordinate.
         fragments[TCGEN05_EPI_SUBTILE_N_CONFIG_KEY] = EnumFragment(
             TCGEN05_EPI_SUBTILE_N_CHOICES
         )
@@ -1560,6 +1604,27 @@ def _clear_target1_tvm_ffi_promotion_surface(config: dict[str, object]) -> None:
             config.pop(key, None)
 
 
+def ungroup_batch_slowest_walk(
+    state: CuteTcgen05Config, config: dict[str, object]
+) -> None:
+    """Walk a batch-slowest grid ungrouped: on a batched grid the matmul's
+    L2 grouping groups the batch with the M tiles, so a grouping above 1
+    interleaves two batches' tiles into the walk ``batch_slowest`` orders
+    by batch, as its seeds' ungrouped walk does not (B200, the direct
+    entry over 256 x 512x1024x64 and 512 x 512x512x64: within 2% of the
+    grouping by 2)."""
+    assert state.matmul_block_ids is not None
+    groupings = config.get("l2_groupings")
+    if not isinstance(groupings, list):
+        # A pair seed carries no grouping: the base default's (the
+        # direct entry's 2) would apply under it.
+        groupings = [item._fill_missing() for item in state.config_spec.l2_groupings]
+    index = state.config_spec.l2_groupings.block_id_to_index(state.matmul_block_ids[0])
+    config["l2_groupings"] = [
+        1 if position == index else value for position, value in enumerate(groupings)
+    ]
+
+
 def aux_load_mode_autotune_fragments(
     state: CuteTcgen05Config,
 ) -> dict[str, ConfigSpecFragment]:
@@ -1577,7 +1642,7 @@ def epi_tma_search_enabled(state: CuteTcgen05Config) -> bool:
     """Whether ``tcgen05_aux_load_mode="epi_tma"`` is on the search surface.
 
     The epilogue-issued aux ring needs an exact-shape rank-2 auxiliary
-    operand of the output's dtype (``exact_shape_aux_kernel_detected``)
+    operand of any dtype (``exact_shape_aux_kernel_detected``)
     on a rank-2 matmul; every per-config condition (static full tiles,
     the standard TMA-store epilogue, the SMEM budget) is judged by
     ``_normalize_epi_tma`` on the sample.
@@ -1587,6 +1652,8 @@ def epi_tma_search_enabled(state: CuteTcgen05Config) -> bool:
         and state.exact_shape_aux_kernel_detected
         and state.exact_aux_tma_provable
         and not state.matmul_has_leading_passthrough
+        # an operand the ring carries (not only a boolean mask)
+        and not facts.exact_aux_mask_only(state)
     )
 
 
@@ -1595,20 +1662,44 @@ def aux_stages_autotune_fragments(
 ) -> dict[str, ConfigSpecFragment]:
     """Per-config aux-pipeline stage-count knob.
 
-    Admitted only under ``_aux_tma_edge_search_enabled``, which pins the
+    Searched only under ``_aux_tma_edge_search_enabled``, which pins the
     surface to the validated edge+K-tail family with ``cluster_m=2``
-    and the c-input warp + aux-TMA combination. Configs outside that
-    gate never see the knob; codegen at the default of 2 is unchanged.
+    and the c-input warp + aux-TMA combination. Outside that gate the
+    knob encodes only the compiler seeds' depths other than the default
+    of 2 (search-only, so the search itself keeps 2), and is absent
+    where no seed carries one.
 
-    Cycle 46 intentionally keeps this scoped to the edge+K-tail gate
-    even though ``_aux_tma_search_enabled`` was widened to admit the
+    Cycle 46 intentionally keeps the search scoped to the edge+K-tail
+    gate even though ``_aux_tma_search_enabled`` was widened to admit the
     full-tile cluster_m=2 family. The stage-count choices were tuned
     on the T8/CLC edge rows; exposing them to T14/T20/T25/T28 would
     let autotune sample stage counts on shapes they were not measured
     on.
     """
     if not _aux_tma_edge_search_enabled(state):
-        return {}
+        # A promoted compiler default may carry a deeper epilogue-issued
+        # ring (the short-K ``epi_tma`` default of
+        # ``CuteTcgen05DefaultTileHeuristic``): the knob encodes the
+        # seeds' depths, search-only where they widen it, so the default
+        # survives the flat round trip.
+        seed_choices = _compiler_seed_values(
+            state.config_spec.compiler_seed_configs,
+            TCGEN05_AUX_STAGES_CONFIG_KEY,
+            int,
+            lambda value: value in TCGEN05_AUX_STAGE_COUNT_VALIDATION_CHOICES,
+        )
+        if not any(
+            choice != TCGEN05_AUX_STAGE_COUNT_DEFAULT for choice in seed_choices
+        ):
+            return {}
+        return {
+            TCGEN05_AUX_STAGES_CONFIG_KEY: _enum_fragment_with_seed_values(
+                (TCGEN05_AUX_STAGE_COUNT_DEFAULT,),
+                seed_choices,
+                search_choices=(TCGEN05_AUX_STAGE_COUNT_DEFAULT,),
+                search_only_if_widened=True,
+            )
+        }
     return {
         TCGEN05_AUX_STAGES_CONFIG_KEY: EnumFragment(TCGEN05_AUX_STAGE_COUNT_CHOICES)
     }

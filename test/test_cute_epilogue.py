@@ -365,7 +365,7 @@ class TestCuteEpilogue(unittest.TestCase):
 
     @onlyBackends(["cute"])
     def test_tcgen05_fused_reused_auxiliary_load_codegen(self) -> None:
-        """Repeated uses of one FX load retain distinct leaf-to-local bindings."""
+        """Two steps reading one FX load share its leaf: one load, one local."""
 
         @helion.kernel(backend="cute", static_shapes=True)
         def scaled_fp8(
@@ -409,7 +409,8 @@ class TestCuteEpilogue(unittest.TestCase):
         ]
         self.assertGreaterEqual(len(chain_lines), 2)
         self.assertIn("tcgen05_aux_loaded_0", chain_lines[0])
-        self.assertIn("tcgen05_aux_loaded_1", chain_lines[1])
+        self.assertIn("tcgen05_aux_loaded_0", chain_lines[1])
+        self.assertNotIn("tcgen05_aux_loaded_1", code)
 
     @onlyBackends(["cute"])
     def test_tcgen05_fused_auxiliary_unary_expr_codegen(self) -> None:

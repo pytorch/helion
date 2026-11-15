@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 
     from ..runtime.config import Config
     from .device_ir import DeviceIR
+    from .scratch_tensors import ScratchTensors
     from .source_location import SourceLocation
     from .type_info import TypeInfo
 
@@ -241,6 +242,12 @@ class HostFunction:
         self.local_types: dict[str, TypeInfo] | None = None
         # Whether Backend.customize_ast rewrote the kernel body.
         self.backend_rewrote_ast = False
+        # Whether this host function compiles one stage of a larger host
+        # program, which a backend splits into several launches: the other
+        # stages may read what it allocates (``kernel_local_scratch``).
+        self.partial_program = False
+        # Its kernel-local scratch tensors (``find_kernel_local_scratch``).
+        self.scratch_tensors: ScratchTensors | None = None
 
     # Backward-compatible accessors
 
@@ -430,6 +437,11 @@ class HostFunction:
         )
 
     def sympy_expr(self, expr: sympy.Expr, config: Config | None = None) -> str:
+        """``expr`` as host code.  Under ``config`` a tunable without a host
+        origin takes its selected value (``resolve_tunable_expr``), and a
+        symbol no host variable names its value under the config
+        (``CompileEnvironment.config_constants``).  One host function serves
+        every config, so each caller passes its own."""
         env = CompileEnvironment.current()
         with contextlib.suppress(Exception):
             expr = env.shape_env.simplify(expr)
@@ -438,7 +450,14 @@ class HostFunction:
             resolved = self.resolve_tunable_expr(expr, config)
             if isinstance(resolved, (int, float, bool)):
                 return constant_repr(resolved)
-            expr = resolved
+            constants = env.config_constants(resolved, config)
+            # A host variable that names the whole expression passes its
+            # value in where the config's values leave another symbol, which
+            # no variable names alone (``block = next_power_of_2(foo) *
+            # next_power_of_2(n)``).
+            if constants.free_symbols and expr in self.expr_to_origin:
+                return self.expr_to_origin[expr].origin.host_str()
+            expr = constants
         if not expr.free_symbols:
             return pexpr(expr)
         if expr in self.expr_to_origin:

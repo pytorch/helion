@@ -6,6 +6,7 @@ import contextlib
 import copy
 import dataclasses
 import functools
+import itertools
 import logging
 import math
 import operator
@@ -35,6 +36,7 @@ from torch.utils import _pytree as pytree
 from .. import Config
 from .. import exc
 from .. import language as hl
+from .._utils import next_power_of_2
 from ..autotuner.config_fragment import _BUILTIN_TUNABLE_FRAGMENTS
 from ..autotuner.config_fragment import ConfigSpecFragment
 from ..autotuner.config_spec import FULL_EXTENT_CATEGORIES
@@ -61,8 +63,10 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .ast_read_writes import ReadWrites
 from .aten_lowering import resolve_reduction_sizes
+from .aten_lowering import restate_reduction_extents
 from .backend import DeviceIRStage
 from .compile_environment import CompileEnvironment
+from .compile_environment import _symint_expr
 from .compile_environment import warning
 from .container_identity import compare_container_identity
 from .container_identity import record_opaque_container_result
@@ -73,6 +77,7 @@ from .host_function import HostFunction
 from .host_function import SymbolOrigin
 from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import CodegenState
+from .inductor_lowering import ReductionLowering
 from .inductor_lowering import codegen_call_with_graph
 from .inductor_lowering import prepare_graph_lowerings
 from .logical_reduction_dims import install_logical_reduction_decompositions
@@ -82,6 +87,7 @@ from .merge_reduction_dims import _MERGE_OPS
 from .merge_reduction_dims import chain_reduction_dims
 from .merge_reduction_dims import merge_reduction_dims
 from .node_masking import defer_pallas_load_masks
+from .node_masking import mask_loop_carries
 from .node_masking import remove_unnecessary_masking
 from .roll_reduction import EffectfulReductionReplay
 from .roll_reduction import ReductionRoller
@@ -100,6 +106,7 @@ from .type_info import NestedFunctionType
 from .type_info import NumericType
 from .type_info import SequenceType
 from .type_info import StackTensorType
+from .type_info import SymIntType
 from .type_info import TensorAttributeType
 from .type_info import TensorType
 from .type_info import TileIndexType
@@ -109,6 +116,7 @@ from .type_info import _eval_compare
 from .type_info import _eval_unary
 from .type_info import tensor_may_have_many_elements
 from .type_info import tile_spanned_by_slice
+from .unflattened_loops import pin_unflattened_loops
 from .variable_origin import AttributeOrigin
 from .variable_origin import CollectionLengthOrigin
 from .variable_origin import DeviceOrigin
@@ -129,6 +137,7 @@ if TYPE_CHECKING:
     from ..autotuner.config_spec import AccumulatorFact
     from ..autotuner.config_spec import MemoryOpFact
     from .backend import Backend
+    from .compile_environment import BlockSizeInfo
     from .cute.execution_plans import CuTeGridExecutionPlan
     from .device_function import DeviceFunction
     from .device_ir_analysis import DeviceIRAnalysis
@@ -522,6 +531,171 @@ def control_flow_child_graph_ids(node: torch.fx.Node) -> tuple[int, ...]:
     return tuple(graph_id for graph_id, _slot in _control_flow_graph_entries(node))
 
 
+def codegen_node_order(
+    graphs: Sequence[GraphInfo],
+    root_ids: Sequence[int],
+    *,
+    repeat_conditions: bool | None = None,
+    unreached: bool = True,
+) -> Iterator[tuple[int, torch.fx.Node]]:
+    """The nodes of ``graphs``, with their graph ids, in the order code
+    generation lowers them, which is the order loads and stores take their
+    config slots (``indexing``, ``load_eviction_policies``): the roots in
+    turn, each control-flow call followed by the graphs it runs (an ``if``
+    branch before the ``else``, a ``while`` condition before its body).
+    Code generation lowers a graph at every call of it (reduction rolling
+    copies an ``if`` into each loop it makes, every copy calling the same
+    branches) and lowers a ``while`` condition again at the end of the body
+    (``WhileLoopGraphInfo.codegen``).  With ``repeat_conditions`` the walk
+    does the same, by default where the current backend's loads and stores
+    take new slots each time they are lowered
+    (``Backend.relowered_memory_ops_take_new_slots``); otherwise it walks
+    each graph once.  With ``unreached``, the graphs no root runs follow in
+    list order, each called graph once: the loop graphs reduction rolling
+    registers, whose loads and stores take the slots the configs that roll
+    can use (a config that rolls has its own order,
+    ``codegen_memory_op_fact_pairs``).
+    """
+    if repeat_conditions is None:
+        repeat_conditions = (
+            CompileEnvironment.current().backend.relowered_memory_ops_take_new_slots
+        )
+    by_id = {info.graph_id: info for info in graphs}
+    # Rolling replaces a graph's payload and appends the new payload under
+    # an id of its own, which no call runs: a payload a call reached is not
+    # walked again among the unreached graphs.
+    walked: set[torch.fx.Graph] = set()
+
+    def walk(info: GraphInfo, every_call: bool) -> Iterator[tuple[int, torch.fx.Node]]:
+        walked.add(info.graph)
+        for node in info.graph.nodes:
+            yield info.graph_id, node
+            children = control_flow_child_graph_ids(node)
+            for child_id in children:
+                child = by_id[child_id]
+                if every_call or child.graph not in walked:
+                    yield from walk(child, every_call)
+            if repeat_conditions and node.target is _tracing_ops._while_loop:
+                yield from walk(by_id[children[0]], every_call=True)
+
+    for root_id in root_ids:
+        if by_id[root_id].graph not in walked:
+            yield from walk(by_id[root_id], every_call=repeat_conditions)
+    if unreached:
+        for info in graphs:
+            if info.graph not in walked:
+                yield from walk(info, every_call=False)
+
+
+# On each load and store node ``DeviceIRAnalysis.memory_op_facts`` describes:
+# its facts, one per set of slots it takes (two for one in a ``while``
+# condition on a backend that slots each lowering).  Node copies keep their
+# meta (``GraphInfo.copy``, reduction rolling), so the loads and stores of a
+# config's codegen graphs carry the facts of the nodes they copy.
+MEMORY_OP_FACT_META = "memory_op_fact"
+
+
+def takes_indexing_slot(node: torch.fx.Node) -> bool:
+    """Whether code generation gives a load or store an ``indexing`` slot.
+    A load of a ``tile.index`` value (``_maybe_materialize_tile_index_load``)
+    or of a stack tensor takes none: the Triton lowering gives it only its
+    ``load_eviction_policies`` slot, and the Pallas one neither."""
+    from ..language import memory_ops
+    from ..language import tile_index
+
+    if node.target is not memory_ops.load:
+        return True
+    tensor = node.args[0]
+    if isinstance(tensor, torch.fx.Node):
+        return tensor.target is not tile_index
+    return not isinstance(tensor, (tuple, list))
+
+
+def memory_op_slots(
+    graphs: Sequence[GraphInfo],
+    root_ids: Sequence[int],
+    *,
+    repeat_conditions: bool | None = None,
+    unreached: bool = True,
+) -> list[tuple[int, torch.fx.Node, int]]:
+    """The loads, stores and atomics of ``graphs`` in ``codegen_node_order``,
+    each with its graph id and the config slot code generation numbers it:
+    the loads and stores count up the ``indexing`` slots together, the
+    atomics the ``atomic_indexing`` ones.  The loads that take no
+    ``indexing`` slot (``takes_indexing_slot``) get the slots after the
+    others, which code generation never reads, so the ``indexing`` list
+    keeps one slot for each load and store.  The pieces of a subtiled
+    epilogue store or atomic share their primary's slot, so only the
+    primary is listed."""
+    from ..language import memory_ops
+    from ..language.atomic_ops import ATOMIC_OPS
+
+    ops = [
+        (graph_id, node)
+        for graph_id, node in codegen_node_order(
+            graphs, root_ids, repeat_conditions=repeat_conditions, unreached=unreached
+        )
+        if node.op == "call_function"
+        and (
+            node.target in (memory_ops.load, memory_ops.store)
+            or node.target in ATOMIC_OPS
+        )
+        and (
+            "epilogue_subtile_group_id" not in node.meta
+            or node.meta.get("epilogue_subtile_primary_output", False)
+        )
+    ]
+    indexed = [
+        node.target not in ATOMIC_OPS and takes_indexing_slot(node)
+        for _graph_id, node in ops
+    ]
+    atomic_slots = itertools.count()
+    indexing_slots = itertools.count()
+    unread_slots = itertools.count(sum(indexed))
+    return [
+        (
+            graph_id,
+            node,
+            next(
+                indexing_slots
+                if takes_slot
+                else atomic_slots
+                if node.target in ATOMIC_OPS
+                else unread_slots
+            ),
+        )
+        for (graph_id, node), takes_slot in zip(ops, indexed, strict=True)
+    ]
+
+
+def codegen_memory_op_fact_pairs(
+    graphs: Sequence[GraphInfo], root_ids: Sequence[int]
+) -> list[tuple[MemoryOpFact, MemoryOpFact]]:
+    """``DeviceIR.config_memory_op_fact_pairs`` of the config whose codegen
+    graphs are ``graphs``: the loads and stores of ``memory_op_slots`` with
+    the facts of the nodes they copy (``MEMORY_OP_FACT_META``, one per set of
+    slots the node takes), renumbered to their slots."""
+    from ..language import memory_ops
+
+    pairs: list[tuple[MemoryOpFact, MemoryOpFact]] = []
+    times: dict[torch.fx.Node, int] = {}
+    eviction_slots = itertools.count()
+    for _graph_id, node, slot in memory_op_slots(graphs, root_ids, unreached=False):
+        if node.target not in (memory_ops.load, memory_ops.store):
+            continue
+        # A pass that splits a load copies its meta to the split nodes too.
+        facts = node.meta.get(MEMORY_OP_FACT_META)
+        assert facts is not None, f"{node.name} has no memory-op facts"
+        # The node's facts, one per set of slots it takes, in turn.
+        times[node] = times.get(node, 0) + 1
+        fact = facts[min(times[node], len(facts)) - 1]
+        eviction = None if fact.eviction_index is None else next(eviction_slots)
+        pairs.append(
+            (fact, fact._replace(indexing_index=slot, eviction_index=eviction))
+        )
+    return pairs
+
+
 def control_flow_parent_entries(
     graphs: Sequence[GraphInfo],
 ) -> dict[int, tuple[torch.fx.Node, int]]:
@@ -650,6 +824,37 @@ class IfGraphInfo(NodeArgsGraphInfo):
             "else_arg_names": self.else_arg_names,
             "branches_outputs": self.branches_outputs,
         }
+
+    def result_source(
+        self, if_node: torch.fx.Node, index: int
+    ) -> tuple[int, int] | torch.fx.Node | None:
+        """Where result ``index`` of ``if_node``, the ``_if`` this graph is
+        the if branch of, comes from: a branch output, as ``(graph_id,
+        output_index)``, or for a variable this branch does not assign, the
+        outer value it passes through (an input of either branch), or None
+        when that value is not a node.
+
+        ``WalkDeviceAST._create_if_subgraph`` lays the results out as the if
+        branch's slot of each of ``branches_outputs``, then the else branch's.
+        """
+        assert self.branches_outputs is not None
+        side, entry = divmod(index, len(self.branches_outputs))
+        slot = self.branches_outputs[entry][side]
+        if isinstance(slot, int):
+            graph_id = if_node.args[1 + side]
+            assert isinstance(graph_id, int)
+            return graph_id, slot
+        # ``_if`` returns every joined variable for each side, including
+        # those the side did not assign: an input of one of the branches.
+        assert self.if_arg_names is not None and self.else_arg_names is not None
+        if_args, else_args = if_node.args[3:5]
+        assert isinstance(if_args, (list, tuple))
+        assert isinstance(else_args, (list, tuple))
+        inputs = dict(zip(self.if_arg_names, if_args, strict=True)) | dict(
+            zip(self.else_arg_names, else_args, strict=True)
+        )
+        value = inputs[slot]
+        return value if isinstance(value, torch.fx.Node) else None
 
     def copy_outer_outputs(
         self, state: CodegenState, outputs: list[object], branch: int
@@ -933,12 +1138,11 @@ class WhileLoopGraphInfo(NodeArgsGraphInfo):
             state.codegen.divergent_control_flow(),
             state.codegen.set_statements(body_statements),
         ):
-            outputs = codegen_call_with_graph(
-                state.codegen,
-                self.graph,
-                args,
-                copy_named_args=False,
-            )
+            # The body reads copies of its inputs, as a for loop's body does:
+            # the merges after the loop give an input's name to its updated
+            # value, which the body may compute before its last read of the
+            # input.
+            outputs = codegen_call_with_graph(state.codegen, self.graph, args)
             loop_condition_update: list[ast.AST] = []
             cond_expr_loop = emit_condition(loop_condition_update)
         body_statements.extend(loop_condition_update)
@@ -968,6 +1172,53 @@ class RolledReductionInfo(NamedTuple):
     can_be_rolled_by_caller: bool
 
 
+# Why a dim older versions rolled, and no loop computes, keeps its saved slot.
+_RETIRED_LOOP_REASON = "no loop over this reduction computes it correctly"
+# Why a dim whose reductions read a range it pads keeps its slot unrolled.
+_PADDED_RANGE_REASON = "its reductions read a range padded past its extent"
+
+
+def _rolled_reduction_info(
+    roller: ReductionRoller, graph_id: int
+) -> RolledReductionInfo:
+    """What ``roller`` made of the original graph ``graph_id``."""
+    return RolledReductionInfo(
+        rolled_block_ids=[roller.rdim.block_id],
+        original_graph_id=graph_id,
+        used_rdim=len(roller.graphs_added) > 0,
+        can_be_rolled_by_caller=roller.outer_count == 0
+        and len(roller.graphs_added) == 1,
+    )
+
+
+class _RdimRollAnalysis(NamedTuple):
+    """What ``register_rollable_reductions``'s first pass found for a dim."""
+
+    rdim: BlockSizeInfo
+    # A config may roll the dim: some original graph reduces over it.
+    allow_loop: bool
+    # The original graphs whose reductions over the dim roll.
+    used_graphs: set[int]
+    # Some graph reduces over the dim twice (``reduction_fusion``).
+    fusible: bool
+    # Why the dim stays persistent in a slot of its own
+    # (``ReductionLoopSpec.persistent_reason``), else None.
+    persistent_reason: str | None
+
+
+def _reduction_loop_spec(
+    block_id: int, size_hint: int, *, persistent_reason: str | None = None
+) -> ReductionLoopSpec:
+    backend = CompileEnvironment.current().backend
+    return ReductionLoopSpec(
+        block_id=block_id,
+        size_hint=size_hint,
+        allow_non_power_of_two=backend.reduction_loops_allow_non_power_of_two,
+        allow_full_extent=backend.reduction_loops_allow_full_extent,
+        persistent_reason=persistent_reason,
+    )
+
+
 @dataclasses.dataclass
 class KernelPhase:
     roots: list[int]  # store root indices
@@ -989,6 +1240,12 @@ class DeviceIR:
         # A CuTe codegen view can restrict reduction strategies to one launch.
         # Axis identities and configuration slots remain owned by the full IR.
         self.codegen_active_block_ids: frozenset[int] | None = None
+        # Reduction dims a backend rewrite removed reductions over (CuTe folds
+        # the sum of a one-hot row); the unused ones retire with merged dims.
+        self.retirable_reduction_block_ids: set[int] = set()
+        # The sums of a one-hot row CuTe folded into closed form, which leave
+        # the row's loads and stores as the kernel's traffic.
+        self.folded_one_hot_sums: int = 0
         # Owning HostFunction (captured in ``lower_to_device_ir``).
         self.host_function: HostFunction | None = None
         # Root ``for`` statements in source order (captured in ``lower_to_device_ir``).
@@ -1000,8 +1257,8 @@ class DeviceIR:
 
         Used to gate optimizations that would replay side effects — e.g.
         the CuTe cluster row-split executes every non-rolled statement once
-        per cluster CTA, which is benign for plain (idempotent) stores but
-        would repeat a read-modify-write ``cluster_n`` times.
+        per cluster CTA, which would repeat an atomic update ``cluster_n``
+        times (that split checks plain loads and stores separately).
         """
         if self._has_atomic_ops is None:
             from helion.language.atomic_ops import ATOMIC_OPS
@@ -1100,8 +1357,6 @@ class DeviceIR:
         (``DeviceFunction.evaluate_constexpr_condition``) is no decision: only
         its taken side runs, and it is walked without extending the path.
         """
-        from .inductor_lowering import ReductionLowering
-
         result: dict[int, list[list[tuple[int, int]]]] = {}
 
         def walk(graph_id: int, path: list[tuple[int, int]]) -> None:
@@ -1149,7 +1404,8 @@ class DeviceIR:
         be rolled, records lightweight RolledReductionInfo entries, and registers
         config_spec entries for the autotuner. Subgraphs created by the roller
         (e.g. ReductionLoopGraphInfo) are kept so the analysis layer can account
-        for their loads/stores in the indexing config.
+        for their loads/stores in the indexing config; those of a reduction dim
+        the roller refuses are dropped.
         """
         env = CompileEnvironment.current()
         env.backend.rewrite_device_ir(
@@ -1165,48 +1421,65 @@ class DeviceIR:
         )
         if not rdims:
             return
-        from .inductor_lowering import ReductionLowering
-
         num_original_graphs = len(self.graphs)
 
         # First pass: run roller analysis for all reduction dims and
         # record which original graphs use each rdim.
-        rdim_results = []
+        rdim_results: list[_RdimRollAnalysis] = []
+        # The dims older versions rolled that the roller now refuses for a
+        # free range or a tie (``_legacy_loop_graphs``), with the original
+        # graphs of their loops.
+        retired: dict[int, set[int]] = {}
         for rdim in rdims:
             graph_to_info: dict[int, RolledReductionInfo] = {}
             allow_loop = False
 
             # Check if any graph contains matmul, fixed indexing or dev_prts
-            # stacking with rdim, or reduces over rdim along a non-tile
-            # (hl.arange) axis that cannot be sliced inside the reduction loop.
-            can_roll_graphs = True
-            for graph_info in self.graphs[:num_original_graphs]:
-                roller = ReductionRoller(self, rdim, {}, allow_unbound_alias_facts=True)
-                if (
-                    roller.has_matmul_with_rdim(graph_info.graph)
-                    or roller.has_indexing_along_rdim(graph_info.graph)
-                    or roller.has_stack_tensor_with_rdim(graph_info.graph)
-                    or roller.has_unrollable_reduction(graph_info.graph)
-                ):
-                    can_roll_graphs = False
-                    break
+            # stacking with rdim, or uses rdim along a non-tile (hl.arange)
+            # axis that cannot be sliced inside the reduction loop.
+            can_roll_graphs = not any(
+                ReductionRoller(
+                    self, rdim, {}, allow_unbound_alias_facts=True
+                ).cannot_roll_graph(graph_info.graph)
+                for graph_info in self.graphs[:num_original_graphs]
+            )
 
             roller = ReductionRoller(self, rdim, {}, allow_unbound_alias_facts=True)
             # Registered aliases still load through their owner's symbol.
             # Rolling just the alias would leave full-domain loads unsliced.
-            if roller.has_pinned_rdim() or (
-                isinstance(rdim.size, torch.SymInt)
-                and env.registered_extent_owner(rdim.block_id) is not None
+            if (
+                roller.has_pinned_rdim()
+                or roller.tied_rdims()
+                or (
+                    isinstance(rdim.size, torch.SymInt)
+                    and env.registered_extent_owner(rdim.block_id) is not None
+                )
             ):
                 can_roll_graphs = False
 
             if not can_roll_graphs:
-                rdim_results.append((rdim, False, set(), None))
+                rdim_results.append(_RdimRollAnalysis(rdim, False, set(), False, None))
+                if env.backend_name != "pallas" and (
+                    graphs := self._legacy_loop_graphs(
+                        rdim.block_id, num_original_graphs
+                    )
+                ):
+                    retired[rdim.block_id] = graphs
                 continue
+
+            # A dim whose reductions read a range it pads stays persistent;
+            # its slot stays, pinned, for the configs older versions saved.
+            pinned = any(
+                roller.reads_padded_range(graph_info.graph)
+                for graph_info in self.graphs[:num_original_graphs]
+            )
 
             used_graphs: set[int] = set()
             all_graphs_processed = True
             persistent_reason = None
+            fusible = False
+            num_graphs = len(self.graphs)
+            num_rolled = len(self.rolled_reductions)
             for graph_id in range(num_original_graphs):
                 graph_info = self.graphs[graph_id]
                 assert graph_id == graph_info.graph_id
@@ -1228,13 +1501,7 @@ class DeviceIR:
                         # graphs, including its callers. The axis cannot roll,
                         # but a plain refusal elsewhere must still veto its
                         # compatibility slot regardless of graph order.
-                        reduction_info = RolledReductionInfo(
-                            rolled_block_ids=[rdim.block_id],
-                            original_graph_id=graph_id,
-                            used_rdim=len(roller.graphs_added) > 0,
-                            can_be_rolled_by_caller=roller.outer_count == 0
-                            and len(roller.graphs_added) == 1,
-                        )
+                        reduction_info = _rolled_reduction_info(roller, graph_id)
                         graph_to_info[graph_id] = reduction_info
                         self.rolled_reductions.append(reduction_info)
                         # The failed replay follows an already emitted sweep.
@@ -1245,13 +1512,7 @@ class DeviceIR:
                         continue
                     persistent_reason = None
                     break
-                reduction_info = RolledReductionInfo(
-                    rolled_block_ids=[rdim.block_id],
-                    original_graph_id=graph_id,
-                    used_rdim=len(roller.graphs_added) > 0,
-                    can_be_rolled_by_caller=roller.outer_count == 0
-                    and len(roller.graphs_added) == 1,
-                )
+                reduction_info = _rolled_reduction_info(roller, graph_id)
                 allow_loop = allow_loop or reduction_info.used_rdim
                 if reduction_info.used_rdim:
                     used_graphs.add(graph_id)
@@ -1265,12 +1526,27 @@ class DeviceIR:
                     if reduction_count >= 2 and env.config_spec.supports_config_key(
                         "reduction_fusion"
                     ):
-                        env.config_spec.reduction_fusion_available = True
+                        fusible = True
                 self.rolled_reductions.append(reduction_info)
                 graph_to_info[graph_id] = reduction_info
             if not all_graphs_processed:
                 allow_loop = False
-            rdim_results.append((rdim, allow_loop, used_graphs, persistent_reason))
+                if persistent_reason is None:
+                    # The dim stays persistent, so no config emits the loops
+                    # its rollers registered: those of the graphs that rolled,
+                    # and any a roller registered in the graph it then
+                    # refused.  Drop them and their entries, or their loads
+                    # would take config slots.  (An effectful replay keeps
+                    # its analysis graphs, and with them its slots.)
+                    del self.graphs[num_graphs:]
+                    del self.rolled_reductions[num_rolled:]
+            elif pinned and allow_loop:
+                persistent_reason = _PADDED_RANGE_REASON
+            rdim_results.append(
+                _RdimRollAnalysis(
+                    rdim, allow_loop, used_graphs, fusible, persistent_reason
+                )
+            )
 
         env.backend.rewrite_device_ir(
             DeviceIRStage.REDUCTION_ROLLING_ANALYZED, self.host_function, self
@@ -1279,20 +1555,16 @@ class DeviceIR:
         # Second pass: register reduction loop specs, ensuring that each
         # original graph is only rolled for one reduction dim at a time.
         graphs_with_rolled_rdim: set[int] = set()
-        for rdim, allow_loop, used_graphs, persistent_reason in rdim_results:
+        for rdim, allow_loop, used_graphs, fusible, persistent_reason in rdim_results:
             if not allow_loop and persistent_reason is None:
                 continue
             if used_graphs & graphs_with_rolled_rdim:
                 continue
             if env.backend_name != "pallas":
                 env.config_spec.reduction_loops.append(
-                    ReductionLoopSpec(
-                        block_id=rdim.block_id,
-                        size_hint=rdim.size_hint(),
-                        allow_non_power_of_two=(
-                            env.backend.reduction_loops_allow_non_power_of_two
-                        ),
-                        allow_full_extent=env.backend.reduction_loops_allow_full_extent,
+                    _reduction_loop_spec(
+                        rdim.block_id,
+                        rdim.size_hint(),
                         persistent_reason=persistent_reason,
                     )
                 )
@@ -1300,11 +1572,240 @@ class DeviceIR:
                     env.backend.register_reduction_loop_config_slots(
                         env, rdim.block_id, rdim.size_hint()
                     )
+                    # Only a dim whose loops a config can emit fuses them:
+                    # not one that stays persistent.
+                    if fusible and persistent_reason is None:
+                        env.config_spec.reduction_fusion_available = True
             graphs_with_rolled_rdim |= used_graphs
+        if env.backend_name != "pallas":
+            # The dims with a loop, and those an effectful replay keeps in a
+            # pinned slot: older versions rolled both.
+            rolled = {
+                rdim.block_id: used_graphs
+                for rdim, allow_loop, used_graphs, _, reason in rdim_results
+                if allow_loop or reason is not None
+            }
+            self._record_legacy_reduction_loops(rolled, retired, num_original_graphs)
 
         env.backend.rewrite_device_ir(
             DeviceIRStage.REDUCTION_LOOPS_REGISTERED, self.host_function, self
         )
+
+    def _legacy_loop_graphs(self, block_id: int, num_original_graphs: int) -> set[int]:
+        """The original graphs of the loop an older version offered the
+        reduction dim ``block_id``, which the roller now refuses.
+
+        Older versions rolled a dim beside a free ``hl.arange`` that only
+        pointwise ops, loads and stores read inside the loop (the free-range
+        half of ``has_unrollable_rdim_use``, which they lacked) and a dim a guard
+        ties to another reduction dim (``tied_rdims``), and the configs
+        they saved have a reduction_loops entry for its loop.  Empty when they
+        refused the dim too, or did not have it: a subscript extent's dim was
+        a power of two then (``subscript_extent_block_ids``), and a full
+        slice meeting it got pinned to that power of two, as a tie with one
+        shows now.
+        """
+        env = CompileEnvironment.current()
+        subscript_dims = env.subscript_extent_block_ids
+        if block_id in subscript_dims:
+            return set()
+        rdim = env.block_sizes[block_id]
+        roller = ReductionRoller(self, rdim, {})
+        if (
+            roller.has_pinned_rdim()
+            or not subscript_dims.isdisjoint(roller.tied_rdims())
+            # A registered extent's alias: older versions reduced over the
+            # registered block itself, which takes no reduction_loops slot.
+            or (
+                isinstance(rdim.size, torch.SymInt)
+                and env.registered_extent_owner(block_id) is not None
+            )
+        ):
+            return set()
+        # The first pass refused the dim, which past these checks, and those
+        # of ``_old_loop_graphs``, only a tie or a free range read inside the
+        # loop does.
+        return self._old_loop_graphs(block_id, num_original_graphs)
+
+    def _old_loop_graphs(
+        self, block_id: int, num_original_graphs: int, *, subscript_extent: bool = False
+    ) -> set[int]:
+        """The original graphs of the loop older versions offered the reduction
+        dim ``block_id``, rolling it as they did: replaying in a later loop
+        whatever it reads, which the roller now refuses where that is unsafe
+        (``EffectfulReductionReplay``), and with ``subscript_extent``, using
+        the dim once on a value that has it on several axes
+        (``ReductionRoller``).  Empty when they refused the dim: for a use
+        no loop can take (``cannot_roll_graph``, less its free-range half,
+        which they lacked, and for a subscript extent less its other half
+        too: they offered the padded dim a loop beside the range the
+        reduction read), or in the roll itself."""
+        rdim = CompileEnvironment.current().block_sizes[block_id]
+        if any(
+            ReductionRoller(
+                self, rdim, {}, subscript_extent=subscript_extent
+            ).cannot_roll_graph(
+                graph_info.graph, free_ranges=False, reductions=not subscript_extent
+            )
+            for graph_info in self.graphs[:num_original_graphs]
+        ):
+            return set()
+        num_graphs = len(self.graphs)
+        graph_to_info: dict[int, RolledReductionInfo] = {}
+        try:
+            for graph_id in range(num_original_graphs):
+                roller = ReductionRoller(
+                    self, rdim, graph_to_info, subscript_extent=subscript_extent
+                )
+                # The roller finishes the graph before refusing a replay,
+                # which older versions rolled.
+                with contextlib.suppress(EffectfulReductionReplay):
+                    roller.process(self.graphs[graph_id].graph)
+                graph_to_info[graph_id] = _rolled_reduction_info(roller, graph_id)
+        except NotImplementedError:
+            return set()
+        finally:
+            # No config rolls the dim: drop the loop graphs the rollers made.
+            del self.graphs[num_graphs:]
+        return {i for i, info in graph_to_info.items() if info.used_rdim}
+
+    def _record_legacy_reduction_loops(
+        self,
+        rolled: dict[int, set[int]],
+        retired: dict[int, set[int]],
+        num_original_graphs: int,
+    ) -> None:
+        """Lay out the reduction_loops slots as older versions did when they
+        offered a loop to dims this one keeps persistent: each such dim keeps
+        a slot at its old position, pinned to None
+        (``ReductionLoopSpec.pinned``), so the entries of the configs they
+        saved, also with trailing ones left off, line up with this version's
+        by position.
+
+        Besides the dims ``rolled`` now or kept in a slot pinned for an
+        effectful replay, by block id with the original graphs of their loops,
+        older versions offered a loop to the dims in ``retired`` and to the
+        power-of-two dims that reductions over a subscript extent's dim
+        allocated (``_padded_range_dims``), at the block ids
+        ``CompileEnvironment.subscript_extent_reductions`` records.  Such a
+        reduction joined a dim of that power of two when one existed, or a
+        later one joined it; that dim, at the earliest position either had,
+        then carried the range's reads too, and had a loop only when they
+        rolled as well.  Their second pass, like this one, gave each
+        original graph to the first of those dims that rolls it.  A dim with
+        a slot that older versions did not offer a loop keeps it, after
+        theirs.
+        """
+        env = CompileEnvironment.current()
+        if not retired and not env.subscript_extent_reductions:
+            return
+        slots = env.config_spec.reduction_loops
+        # (block id or position, later-allocated, graphs, block id)
+        # (sort key, graphs, block id).  A key is the block id older versions
+        # allocated the dim at, then whether this version allocated it, then,
+        # for the power-of-two dims of reductions recorded at the same block
+        # count, the order of those reductions (each allocated one then).
+        candidates: list[tuple[tuple[int, bool, int], set[int], int]] = []
+        order = {
+            block_id: i for i, block_id in enumerate(env.subscript_extent_reductions)
+        }
+        # The dims of the powers of two a range's reads kept from rolling, and
+        # the original graphs older versions rolled them in for the others,
+        # with the earliest key older versions allocated them at.
+        refused: set[int] = set()
+        joined_graphs: dict[int, set[int]] = {}
+        joined_keys: dict[int, tuple[int, bool, int]] = {}
+        for size, block_ids in self._padded_range_dims(num_original_graphs).items():
+            old_graphs = [
+                self._old_loop_graphs(
+                    block_id, num_original_graphs, subscript_extent=True
+                )
+                for block_id in block_ids
+            ]
+            rolls = all(old_graphs)
+            graphs = set().union(*old_graphs)
+            key = min(
+                (env.subscript_extent_reductions[block_id], False, order[block_id])
+                for block_id in block_ids
+            )
+            joined = [
+                info.block_id
+                for info in env.block_sizes
+                if info.reduction
+                and isinstance(info.size, (int, torch.SymInt))
+                and env.known_equal(info.size, size)
+            ]
+            if joined:
+                # Older versions' reduction joined that dim, or it joined theirs.
+                for block_id in joined:
+                    if rolls:
+                        joined_graphs.setdefault(block_id, set()).update(graphs)
+                        joined_keys[block_id] = min(
+                            key, joined_keys.get(block_id, (block_id, True, 0))
+                        )
+                    else:
+                        refused.add(block_id)
+            elif rolls:
+                candidates.append((key, graphs, min(block_ids)))
+        for block_id, graphs in (*rolled.items(), *retired.items()):
+            if block_id in env.subscript_extent_block_ids or block_id in refused:
+                continue
+            candidates.append(
+                (
+                    joined_keys.get(block_id, (block_id, True, 0)),
+                    graphs | joined_graphs.get(block_id, set()),
+                    block_id,
+                )
+            )
+        legacy: list[ReductionLoopSpec] = []
+        claimed: set[int] = set()
+        for _key, graphs, block_id in sorted(candidates, key=operator.itemgetter(0)):
+            if graphs & claimed:
+                continue
+            claimed |= graphs
+            if block_id in slots.valid_block_ids():
+                legacy.append(slots.block_id_lookup(block_id))
+            else:
+                hint = env.block_sizes[block_id].size_hint()
+                legacy.append(
+                    _reduction_loop_spec(
+                        block_id, hint, persistent_reason=_RETIRED_LOOP_REASON
+                    )
+                )
+        legacy_ids = [spec.block_id for spec in legacy]
+        if [spec.block_id for spec in slots][: len(legacy)] == legacy_ids:
+            return
+        added = [spec for spec in slots if spec.block_id not in legacy_ids]
+        slots.clear()
+        slots.extend([*legacy, *added])
+
+    def _padded_range_dims(self, num_original_graphs: int) -> dict[int, list[int]]:
+        """The subscript extents' dims that reductions are lowered over and
+        whose ranges older versions padded, by that power of two
+        (``CompileEnvironment.subscript_extent_reductions``).
+
+        A range typed beside a full slice of its extent read the slice's dim
+        then, unless an op between the two had guarded that dim to the power
+        of two (``ReductionRoller.range_meets_full_slice``).  The slice joins
+        the range's dim now (``subscript_extents_joined_by_slice``).
+        """
+        env = CompileEnvironment.current()
+        padded: dict[int, list[int]] = {}
+        for block_id in env.subscript_extent_reductions:
+            info = env.block_sizes[block_id]
+            if (
+                block_id in env.subscript_extents_joined_by_slice
+                and block_id not in env.subscript_extents_joined_in_loop
+                and not any(
+                    ReductionRoller(self, info, {}).range_meets_full_slice(
+                        graph_info.graph
+                    )
+                    for graph_info in self.graphs[:num_original_graphs]
+                )
+            ):
+                continue
+            padded.setdefault(next_power_of_2(info.size_hint()), []).append(block_id)
+        return padded
 
     def _categorize_reduction(
         self, block_id: int, grid_ids: set[int]
@@ -1647,6 +2148,63 @@ class DeviceIR:
                     cast("Sequence[torch.fx.Node]", parent.args[slot])
                 )
 
+    def config_memory_op_facts(self, config: Config) -> list[MemoryOpFact]:
+        """The config facts of ``config_memory_op_fact_pairs``."""
+        return [fact for _persistent, fact in self.config_memory_op_fact_pairs(config)]
+
+    def config_memory_op_fact_pairs(
+        self, config: Config
+    ) -> list[tuple[MemoryOpFact, MemoryOpFact]]:
+        """The facts of the loads and stores the code for ``config`` lowers,
+        in the order it lowers them: each pairs the
+        ``config_spec.memory_op_facts`` entry of a load or store with that fact
+        renumbered to the config, whose ``indexing_index`` and
+        ``eviction_index`` are the slots that code gives it.
+
+        ``config_spec.memory_op_facts`` follows the slot order of the configs
+        that roll no reduction.  Rolling one reorders the slots: the loads its
+        loop does not need can land ahead of the loop, and a load whose value
+        a later loop needs is lowered again there, under a slot of its own.  A
+        seed that sets per-slot values for a config that rolls reads them
+        here.  As in ``memory_op_slots``, the loads that take no ``indexing``
+        slot have the slots after the others.
+
+        Both branches of an ``if`` count, as in ``memory_op_facts``: where the
+        config's block sizes decide the condition, the CuTe lowering emits
+        only the branch taken, so the loads after it take earlier
+        ``load_eviction_policies`` slots than these facts give them.
+        """
+        return codegen_memory_op_fact_pairs(
+            self.config_codegen_graphs(config), self.root_ids
+        )
+
+    def config_codegen_graphs(self, config: Config) -> list[GraphInfo]:
+        """The graphs whose loads and stores the code for ``config`` lowers in
+        their order: these graphs unless it rolls a reduction (the pieces of
+        a subtiled store and the hoisted polls keep their slots), else its
+        codegen graphs (``build_codegen_graphs``)."""
+        env = CompileEnvironment.current()
+        config = env.backend.codegen_config(config)
+        if not self._rolled_reduction_block_ids(config):
+            return self.graphs
+        assert self.host_function is not None
+        # A roll asks for the storage facts of the bound inputs (a store
+        # between two sweeps may alias the row the later one reloads), and
+        # seed registration reads these graphs before the runtime's storage
+        # snapshot: evaluate the registered classifiers here and restore the
+        # prior snapshot afterwards, as the CuTe facts hooks do.
+        saved = env.bound_runtime_input_specialization_results
+        try:
+            if not saved and env.runtime_arg_values_by_name:
+                env.snapshot_runtime_input_specialization_results(
+                    env.runtime_arg_values_by_name
+                )
+            # Rolling reads the host function's origins, as codegen does.
+            with self.host_function:
+                return self.build_codegen_graphs(config)
+        finally:
+            env.bound_runtime_input_specialization_results = saved
+
     def _hoist_inband_polls(self) -> None:
         """Move each inband peer load, with its pure inputs, up to the previous
         impure node or load, so consecutive polls share one wait.
@@ -1694,19 +2252,23 @@ class DeviceIR:
                         anchor.append(moved)
                         anchor = moved
 
+    def _rolled_reduction_block_ids(self, config: Config) -> list[int]:
+        """The reduction blocks whose loops ``config`` rolls: a dim kept
+        persistent (``ReductionLoopSpec.persistent_reason``) rolls for no
+        value, also one a seed sets before the config is normalized."""
+        loops = CompileEnvironment.current().config_spec.reduction_loops
+        return [
+            spec.block_id
+            for spec in loops
+            if spec.persistent_reason is None
+            and loops.config_get(config.reduction_loops, spec.block_id, None)
+            is not None
+        ]
+
     def _apply_rolling(self, config: Config) -> None:
         """Apply reduction rolling on the graph copies."""
         env = CompileEnvironment.current()
-        reduction_loops = config.reduction_loops
-
-        enabled_reduction_blocks = [
-            spec.block_id
-            for spec in env.config_spec.reduction_loops
-            if env.config_spec.reduction_loops.config_get(
-                reduction_loops, spec.block_id, None
-            )
-            is not None
-        ]
+        enabled_reduction_blocks = self._rolled_reduction_block_ids(config)
         if not enabled_reduction_blocks:
             return
 
@@ -1818,7 +2380,6 @@ class DeviceIR:
             return
 
         from ..language import memory_ops
-        from ..language.atomic_ops import ATOMIC_OPS
         from .epilogue_subtiling import apply_epilogue_subtiling
 
         env = CompileEnvironment.current()
@@ -1827,45 +2388,37 @@ class DeviceIR:
             for info in env.block_sizes
             if info.is_tile
         }
+        # The extent ``config`` gives each tile, or None where it stays
+        # dynamic: which tiles the split may take.
+        configured_extents = {
+            block_id: env.config_value(size, config)
+            for block_id, size in configured_block_sizes.items()
+        }
         descriptor_output_nodes_by_graph: dict[int, set[torch.fx.Node]] = {}
-        memory_op_index = 0
-        atomic_op_index = 0
-        for graph_info in self.graphs:
-            descriptor_output_nodes: set[torch.fx.Node] = set()
-            for node in graph_info.graph.nodes:
-                if node.op != "call_function":
-                    continue
-                if node.target is memory_ops.load:
-                    memory_op_index += 1
-                elif node.target is memory_ops.store:
-                    if _indexing_uses_tensor_descriptor(
-                        config.indexing,
-                        memory_op_index,
-                    ):
-                        descriptor_output_nodes.add(node)
-                    memory_op_index += 1
-                elif node.target in ATOMIC_OPS:
-                    if _indexing_uses_tensor_descriptor(
-                        config.atomic_indexing,
-                        atomic_op_index,
-                    ):
-                        descriptor_output_nodes.add(node)
-                    atomic_op_index += 1
-            if descriptor_output_nodes:
-                descriptor_output_nodes_by_graph[graph_info.graph_id] = (
-                    descriptor_output_nodes
-                )
+        # The slots of these graphs, the ones this config lowers: numbered in
+        # the order codegen lowers them, as codegen does.
+        for graph_id, node, slot in memory_op_slots(
+            self.graphs, self.root_ids, unreached=False
+        ):
+            if node.target is memory_ops.load:
+                continue
+            indexing = (
+                config.indexing
+                if node.target is memory_ops.store
+                else config.atomic_indexing
+            )
+            if _indexing_uses_tensor_descriptor(indexing, slot):
+                descriptor_output_nodes_by_graph.setdefault(graph_id, set()).add(node)
 
         for graph_info in self.graphs:
             # Epilogue output ops can live in nested/reduction/control-flow graphs,
-            # not just roots.  The indexing configs are global across codegen_graphs:
-            # this mirrors the existing load/store/atomic counters used when
-            # registering indexing tunables and tensor-descriptor layout guards.
+            # not just roots.  The indexing configs are global across codegen_graphs.
             apply_epilogue_subtiling(
                 graph_info.graph,
                 split_factor,
                 configured_block_sizes,
                 descriptor_output_nodes_by_graph.get(graph_info.graph_id, set()),
+                configured_extents,
             )
 
     def __enter__(self) -> None:
@@ -2022,17 +2575,35 @@ class WalkDeviceAST(NodeVisitor):
         writes: dict[str, int],
         include_new: bool = False,
     ) -> LiftGraphArgs:
-        return LiftGraphArgs(
-            {
-                k: v
-                for k, v in subgraph_scope.items()
-                if k in writes
-                and (include_new or k in self.scope)
-                and self.scope.get(k) is not v
-                # Host tensors bound in the body (e.g. `for peer in peers`) stay static.
-                and not (isinstance(v, torch.Tensor) and not self.should_become_arg(v))
-            }
-        )
+        outputs = {
+            k: v
+            for k, v in subgraph_scope.items()
+            if k in writes
+            and (include_new or k in self.scope)
+            and self.scope.get(k) is not v
+            # Host tensors bound in the body (e.g. `for peer in peers`) stay static.
+            and not (isinstance(v, torch.Tensor) and not self.should_become_arg(v))
+        }
+        # Each output gets its own variable, or the ``_phi`` merges after the
+        # loop or branch would make the names one: an in-place method returns
+        # its receiver (``result = acc.add_(1)`` binds both names to one
+        # tensor), and a ``while`` body traces the tensors bound outside it,
+        # which the loop's outputs are then tracked onto.
+        claimed = [*self.scope.values()]
+        for k, v in outputs.items():
+            if isinstance(v, torch.Tensor) and not isinstance(v, Tile):
+                if any(v is w for w in claimed):
+                    outputs[k] = _new_var(v)
+                claimed.append(v)
+        return LiftGraphArgs(outputs)
+
+    @staticmethod
+    def _rebound(rw: ReadWrites) -> dict[str, int]:
+        """The names ``rw``'s statements rebind: assigned ones and the tensors
+        an in-place method mutates (``acc.add_(x)``), which ``make_fx`` rebinds
+        to the in-place node's output, so a loop or branch must carry them out
+        as it does an assigned value."""
+        return {**rw.method_writes, **rw.writes}
 
     @staticmethod
     def _rw_names(rw: ReadWrites) -> tuple[str, ...]:
@@ -2440,7 +3011,9 @@ class WalkDeviceAST(NodeVisitor):
             ) -> tuple[list[object], LiftGraphArgs]:
                 subgraph_walker._assign(node.target, inner_type.proxy())
                 subgraph_walker._body(node.body)
-                loop_outputs = self._collect_outputs(subgraph_walker.scope, rw.writes)
+                loop_outputs = self._collect_outputs(
+                    subgraph_walker.scope, self._rebound(rw)
+                )
                 return loop_outputs.get_graph_args(), loop_outputs
 
             block_ids: list[int] = []
@@ -2544,7 +3117,20 @@ class WalkDeviceAST(NodeVisitor):
             subgraph_walker: WalkDeviceAST,
         ) -> tuple[list[object], LiftGraphArgs]:
             subgraph_walker._body(node.body)
-            loop_outputs = self._collect_outputs(subgraph_walker.scope, body_rw.writes)
+            # The body traces the loop's own tensors, not copies, so a tensor an
+            # in-place method mutated (``acc.add_(x)``) is still the object
+            # bound outside the loop: give it a fresh variable to carry out.
+            for name in body_rw.method_writes:
+                value = subgraph_walker.scope.get(name)
+                if (
+                    isinstance(value, torch.Tensor)
+                    and value is self.scope.get(name)
+                    and self.should_become_arg(value)
+                ):
+                    subgraph_walker.scope[name] = _new_var(value)
+            loop_outputs = self._collect_outputs(
+                subgraph_walker.scope, self._rebound(body_rw)
+            )
             return loop_outputs.get_graph_args(), loop_outputs
 
         body_graph_id, outputs = self._trace_graph(
@@ -2644,7 +3230,7 @@ class WalkDeviceAST(NodeVisitor):
         ) -> tuple[list[object], LiftGraphArgs]:
             subgraph_walker._body(stmts)
             outputs_local = self._collect_outputs(
-                subgraph_walker.scope, rw.writes, include_new=True
+                subgraph_walker.scope, self._rebound(rw), include_new=True
             )
             return outputs_local.get_graph_args(), outputs_local
 
@@ -2749,29 +3335,34 @@ class WalkDeviceAST(NodeVisitor):
         # (i.e. same as ordering of values in track_tensor_tree above)
         if_graph.branches_outputs = []
 
-        def get_output_idx(name: str, output_values: dict[str, object]) -> int:
-            return next(i for i, n in enumerate(output_values) if n == name)
+        def get_output_idx(name: str, outputs: LiftGraphArgs) -> int:
+            # A branch graph returns only its graph outputs
+            # (``get_graph_args``), not every value the branch assigns.
+            value = outputs.values[name]
+            return next(
+                i for i, arg in enumerate(outputs.get_graph_args()) if arg is value
+            )
 
         for name in common_output_names:
             if_value = if_output_values[name]
             else_value = else_output_values[name]
             self.scope[name] = _tracing_ops._phi(if_value, else_value)
-            if_output_index = get_output_idx(name, if_output_values)
-            else_output_index = get_output_idx(name, else_output_values)
+            if_output_index = get_output_idx(name, if_outputs)
+            else_output_index = get_output_idx(name, else_outputs)
             if_graph.branches_outputs.append((if_output_index, else_output_index))
 
         for name in if_nonlocal_outputs_names:
             self.scope[name] = _tracing_ops._phi(
                 self.scope[name], if_output_values[name]
             )
-            if_output_index = get_output_idx(name, if_output_values)
+            if_output_index = get_output_idx(name, if_outputs)
             if_graph.branches_outputs.append((if_output_index, name))
 
         for name in else_nonlocal_output_names:
             self.scope[name] = _tracing_ops._phi(
                 self.scope[name], else_output_values[name]
             )
-            else_output_index = get_output_idx(name, else_output_values)
+            else_output_index = get_output_idx(name, else_outputs)
             if_graph.branches_outputs.append((name, else_output_index))
 
         return if_graph_idx
@@ -3209,6 +3800,20 @@ class WalkDeviceAST(NodeVisitor):
             return self._call_nested_function(
                 func_type_info, args, kwargs, arg_origins, node
             )
+        # pyrefly: ignore [missing-attribute]
+        result_type_info = node._type_info
+        if (
+            isinstance(func_type_info, CallableType)
+            and func_type_info.value in CallableType._new_symint_on_host_fns()
+            and isinstance(result_type_info, SymIntType)
+            and _symint_expr(result_type_info.value)
+            in CompileEnvironment.current().config_value_expressions
+        ):
+            # A host helper over config values (``next_power_of_2(foo)``):
+            # the type pass recorded its value as an expression of the
+            # config, which running the helper again here would replace
+            # with the tunables' hints.
+            return result_type_info.value
         if isinstance(func_type_info, CallableType) and (
             replacement := get_device_func_replacement(func_type_info.value)
         ):
@@ -3416,6 +4021,12 @@ def _root_loop_has_canonical_task_origin(
     """Return whether local PIDs map to zero-based, unit-stride coordinates."""
     if not isinstance(iter_expr, ast.Call) or not iter_expr.args:
         return False
+    if any(isinstance(arg, ast.Starred) for arg in iter_expr.args) or any(
+        keyword.arg is None for keyword in iter_expr.keywords
+    ):
+        # ``hl.tile(*ranges)`` or ``hl.grid(n, **options)``: the begin and
+        # the step are not spelled out.
+        return False
     if len(iter_expr.args) == 1 or (
         len(iter_expr.args) >= 2
         and isinstance(iter_expr.args[1], ast.Constant)
@@ -3553,15 +4164,17 @@ def _indexing_uses_tensor_descriptor(
 
 
 def _count_device_atomics(device_ir: DeviceIR) -> int:
-    """Count the number of atomic operations in device code for autotuning."""
-    from ..language import atomic_ops
+    """The ``atomic_indexing`` slots code generation numbers: one per atomic,
+    and one more each time a backend that slots each lowering lowers a
+    ``while`` condition's atomic again (``memory_op_slots``)."""
+    from ..language.atomic_ops import ATOMIC_OPS
 
-    atomic_count = 0
-    for graph_info in device_ir.graphs:
-        for node in graph_info.graph.nodes:
-            if node.op == "call_function" and node.target in vars(atomic_ops).values():
-                atomic_count += 1
-    return atomic_count
+    return sum(
+        node.target in ATOMIC_OPS
+        for _graph_id, node, _slot in memory_op_slots(
+            device_ir.graphs, device_ir.root_ids
+        )
+    )
 
 
 def _register_load_store_tunables(
@@ -3651,14 +4264,11 @@ def _register_tensor_descriptor_layout_guards(device_ir: DeviceIR) -> None:
     env = CompileEnvironment.current()
 
     from .._compat import supports_tensor_descriptor
-    from ..language import atomic_ops
     from ..language import memory_ops
     from .indexing_strategy import _contiguous_integer_tensor_index
 
     if not supports_tensor_descriptor():
         return
-
-    atomic_targets = tuple(getattr(atomic_ops, name) for name in atomic_ops.__all__)
 
     def tensor_arg_value(arg: object) -> object:
         if isinstance(arg, torch.fx.Node):
@@ -3680,31 +4290,25 @@ def _register_tensor_descriptor_layout_guards(device_ir: DeviceIR) -> None:
                 return True
         return False
 
-    memory_op_index = 0
-    atomic_op_index = 0
-    for graph_info in device_ir.graphs:
-        for node in graph_info.graph.nodes:
-            if node.op != "call_function":
-                continue
-            if node.target in (memory_ops.load, memory_ops.store):
-                tensor = tensor_arg_value(node.args[0])
-                if isinstance(tensor, torch.Tensor) and 2 <= tensor.ndim <= 5:
-                    env.register_tensor_descriptor_layout_guard(
-                        tensor,
-                        memory_op_index=memory_op_index,
-                        has_derived_block_extent=has_derived_block_extent(node),
-                    )
-                memory_op_index += 1
-                continue
-            if node.target in atomic_targets:
-                tensor = tensor_arg_value(node.args[0])
-                if isinstance(tensor, torch.Tensor) and 2 <= tensor.ndim <= 5:
-                    env.register_tensor_descriptor_layout_guard(
-                        tensor,
-                        atomic_op_index=atomic_op_index,
-                        has_derived_block_extent=has_derived_block_extent(node),
-                    )
-                atomic_op_index += 1
+    # The slots of the configs that roll no reduction; one that rolls can
+    # reorder them (``BoundKernel`` maps them through
+    # ``DeviceIR.config_memory_op_fact_pairs``).
+    for _graph_id, node, slot in memory_op_slots(device_ir.graphs, device_ir.root_ids):
+        tensor = tensor_arg_value(node.args[0])
+        if not (isinstance(tensor, torch.Tensor) and 2 <= tensor.ndim <= 5):
+            continue
+        if node.target in (memory_ops.load, memory_ops.store):
+            env.register_tensor_descriptor_layout_guard(
+                tensor,
+                memory_op_index=slot,
+                has_derived_block_extent=has_derived_block_extent(node),
+            )
+        else:
+            env.register_tensor_descriptor_layout_guard(
+                tensor,
+                atomic_op_index=slot,
+                has_derived_block_extent=has_derived_block_extent(node),
+            )
 
 
 def _root_phases(phases: list[KernelPhase], root_count: int) -> tuple[int, ...]:
@@ -3764,40 +4368,10 @@ def _install_dependency_phases(
             graph_info.phase_index = phase_index
 
 
-# Operations whose lowering has a faster approximate form under the fast_math
-# setting on the Triton and CuTe backends (``inductor_lowering`` and the cute
-# ``exp2_fastmath`` / ``exact_division`` / gelu templates), by the name the
-# warning reports them under.
-_FAST_MATH_SENSITIVE_TARGETS: dict[object, str] = {
-    torch.ops.aten.reciprocal.default: "reciprocal",
-    torch.ops.aten.exp.default: "exp",
-    torch.ops.aten.exp2.default: "exp2",
-    torch.ops.aten.sigmoid.default: "sigmoid",
-    torch.ops.aten.rsqrt.default: "rsqrt",
-    torch.ops.aten.erf.default: "erf",
-    torch.ops.aten.gelu.default: "gelu",
-}
-# Triton only: under fast_math the max/min reductions and torch.maximum /
-# torch.minimum lower to ``tl.max`` / ``tl.maximum`` without the NaN
-# propagation torch has (``TritonBackend.reduction_expr``, ``overrides.py``);
-# the CuTe backend keeps the NaN-propagating forms either way.
-_FAST_MATH_SENSITIVE_TRITON_TARGETS: dict[object, str] = {
-    torch.ops.aten.amax.default: "max/min reductions",
-    torch.ops.aten.amin.default: "max/min reductions",
-    torch.ops.aten.maximum.default: "maximum/minimum",
-    torch.ops.aten.minimum.default: "maximum/minimum",
-}
-
-
 def fast_math_sensitive_ops(device_ir: DeviceIR, backend: Backend) -> list[str]:
     """Names of the floating-point operations in ``device_ir`` that the
     ``fast_math`` setting would lower to approximate forms on ``backend``,
-    sorted."""
-    from .inductor_lowering import _is_plain_true_division
-
-    targets = dict(_FAST_MATH_SENSITIVE_TARGETS)
-    if backend.uses_triton_compiler:
-        targets.update(_FAST_MATH_SENSITIVE_TRITON_TARGETS)
+    sorted (``Backend.fast_math_name``)."""
     names: set[str] = set()
     for graph_info in device_ir.graphs:
         for node in graph_info.graph.nodes:
@@ -3806,9 +4380,7 @@ def fast_math_sensitive_ops(device_ir: DeviceIR, backend: Backend) -> list[str]:
             val = node.meta.get("val")
             if not (isinstance(val, torch.Tensor) and val.dtype.is_floating_point):
                 continue
-            name = targets.get(node.target)
-            if name is None and _is_plain_true_division(node):
-                name = "fp32 division"
+            name = backend.fast_math_name(node)
             if name is not None:
                 names.add(name)
     return sorted(names)
@@ -3829,6 +4401,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
     device_ir = DeviceIR()
     device_ir.host_function = func
     with func, device_ir, compile_lock:
+        CompileEnvironment.current().renew_pinned_subscript_extents()
         visitor = WalkHostAST(device_ir)
         for stmt in func.body:
             visitor.visit(stmt)
@@ -3852,8 +4425,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
 
         # Resolve source-level sizes before RNG lowering introduces internal
         # size queries that identify physical tile coordinates.
+        extents = restate_reduction_extents()
         for graph in device_ir.graphs:
-            resolve_reduction_sizes(graph.graph)
+            resolve_reduction_sizes(graph.graph, extents)
         merged_rdims = merge_reduction_dims(device_ir.graphs)
         backend = CompileEnvironment.current().backend
         backend.rewrite_device_ir(DeviceIRStage.BEFORE_RANDOM_OPS, func, device_ir)
@@ -3864,6 +4438,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         for graph in device_ir.graphs:
             prepare_graph_lowerings(graph.graph)
         backend.rewrite_device_ir(DeviceIRStage.AFTER_GRAPH_LOWERINGS, func, device_ir)
+        pin_unflattened_loops(device_ir)
         is_pallas = CompileEnvironment.current().backend.name == "pallas"
         if is_pallas:
             from .pallas.canonicalize_jagged_bounds import canonicalize_jagged_bounds
@@ -3876,6 +4451,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             if is_pallas:
                 defer_pallas_load_masks(graph.graph)
             remove_unnecessary_masking(graph.graph)
+        mask_loop_carries(device_ir.graphs)
 
         warp_specialize_specs = (
             CompileEnvironment.current().config_spec.range_warp_specialize
@@ -3887,7 +4463,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             # warp-specialized (see intra_loop_raw_reread_block_ids); its
             # slot stays in the config space pinned to None.
             reread_block_ids = intra_loop_raw_reread_block_ids(
-                device_ir.graphs, device_ir.root_ids, device_ir.grid_block_ids
+                device_ir.graphs,
+                device_ir.root_ids,
+                device_ir.grid_block_ids,
+                atomics=backend.intra_loop_barriers_order_atomics,
             )
             for spec in warp_specialize_specs:
                 if reread_block_ids.intersection(spec.block_ids):
@@ -3901,11 +4480,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         # is post-processing computed from the completed DeviceIR.
         from .epilogue_subtiling import has_epilogue_subtiling_candidate
 
-        has_epilogue_subtile_candidate = False
-        for graph_info in device_ir.graphs:
-            if has_epilogue_subtiling_candidate(graph_info.graph):
-                has_epilogue_subtile_candidate = True
-                break
+        has_epilogue_subtile_candidate = has_epilogue_subtiling_candidate(
+            graph_info.graph for graph_info in device_ir.graphs
+        )
         config_spec = CompileEnvironment.current().config_spec
         config_spec.epilogue_subtile_candidate_enabled = has_epilogue_subtile_candidate
         config_spec.epilogue_subtile_k_hint = 0
@@ -3916,8 +4493,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         # Phase 1: roll + register the reduction_loops spec. The ReductionKernelFact is built
         # in Phase 3 (after analysis derives memory_op_facts) so it can read the enriched
         # load/store facts.
-        if merged_rdims:
-            # Merged dims can leave their per-dim rdims unused.  Stop treating
+        retirable_rdims = merged_rdims | device_ir.retirable_reduction_block_ids
+        if retirable_rdims:
+            # Merged dims can leave their per-dim rdims unused, and so can a
+            # rewrite that removed the reductions over a dim.  Stop treating
             # them as reductions, or they would gain unused tuning slots and
             # rolling analysis. CuTe would also claim a thread axis for each.
             # Only rdims nothing uses are demoted: a later slice of the same
@@ -3926,7 +4505,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
 
             unused_rdims = unused_block_ids(
                 device_ir.graphs,
-                merged_rdims,
+                retirable_rdims,
                 used_block_ids=device_ir.codegen_active_block_ids,
             )
             for block_id in unused_rdims:
@@ -3967,7 +4546,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
 
         # Collect per-load/store metadata so heuristics can map each Config.indexing
         # slot to its graph op.
-        memory_op_facts = analysis.memory_op_facts(env, func)
+        memory_op_facts = analysis.memory_op_facts(device_ir, env, func)
         tile_accesses = analysis.tile_accesses(device_ir, env, func)
         config_spec.memory_op_facts = memory_op_facts
         from .. import _dist_utils

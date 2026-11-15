@@ -29,6 +29,7 @@ from ...autotuner.config_spec import CuteReductionReloadSpec
 from ...autotuner.config_spec import CuteVectorWidthSpec
 from ...autotuner.config_spec import NumThreadsSpec
 from ..compile_environment import CompileEnvironment
+from ..compile_environment import FixedBlockSizeSource
 from . import target_facts
 from .autotune.flash_surface import enable_cute_flash_gated_search
 from .autotune.flash_surface import enable_cute_flash_search
@@ -54,6 +55,7 @@ def _cute_tcgen05_output_store_facts(
     """``(output dtype width, store count)`` of one MMA, for the SMEM fit estimate."""
     from .cute_mma import _trace_mma_to_stores
 
+    # The adopted stores of epilogue inputs alone own C rings too.
     stores = _trace_mma_to_stores(node, device_ir.graphs)
     if not stores:
         return None, 1
@@ -185,21 +187,78 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
     env = CompileEnvironment.current()
     env_state = cute_env_state(env)
     register_lane_vector_width_specs(config_spec)
+    from .half_extremum_folds import has_half_extremum_reduction
     from .hoist_loop_invariant_recip import has_hoistable_fp32_divisions
+    from .pair_lane_math import has_fp32_arithmetic
+    from .pair_lane_math import has_pairable_exps_or_divisions
     from .signed_bitfield import has_signed_byte_field
     from .tile_packing import tile_pack_counts
 
     config_spec.cute_tile_pack_counts = tile_pack_counts(env, device_ir)
 
-    # An fp32 quotient by a scalar or a broadcast row value: the exact
-    # division hoist can apply, so its form is tunable.
-    config_spec.cute_exact_division_sites = has_hoistable_fp32_divisions(
-        info.graph for info in device_ir.graphs
+    # Under ``Settings.cute_exact_division``, an fp32 quotient by a scalar or
+    # a broadcast row value: the exact division hoist can apply, so its form
+    # is tunable.
+    config_spec.cute_exact_division_sites = (
+        env.settings.cute_exact_division
+        and has_hoistable_fp32_divisions(info.graph for info in device_ir.graphs)
+    )
+    # Exps (sigmoids lower through one), exact divisions or fp32 products,
+    # sums and differences to pair over vector lanes in Blackwell's packed
+    # fp32 instructions, or half-precision maxima to fold as half2 words;
+    # not in a kernel with a matmul (its facts are recorded by now).
+    config_spec.cute_pair_lane_math_sites = (
+        config_spec.target_device_capability is not None
+        and config_spec.target_device_capability >= (10, 0)
+        and not env.settings.fast_math
+        and not config_spec.matmul_facts
+        and (
+            has_pairable_exps_or_divisions(
+                device_ir, exact_division=env.settings.cute_exact_division
+            )
+            or has_fp32_arithmetic(device_ir)
+            or has_half_extremum_reduction(device_ir)
+        )
     )
 
+    # A reduction over a strided full slice beside a contiguous grid tile:
+    # sinking its V-loop and unrolling its lanes are tunable at every extent,
+    # though the seeds that sink it fit only some.
+    from .autotune.heuristics.cute import CuteStridedReductionHeuristic
+
+    config_spec.cute_strided_reduction_sites = (
+        CuteStridedReductionHeuristic.strided_reduction(env, device_ir) is not None
+    )
     config_spec.cute_signed_bitfield_bf16_available = (
         config_spec.target_device_capability == (10, 0)
         and any(has_signed_byte_field(info.graph) for info in device_ir.graphs)
+    )
+    # The reductions that may roll along a bool row a load reads: their byte
+    # packets are tunable (``cute_bool_byte_packets``), not in a kernel with
+    # a matmul (its facts are recorded by now).
+    from .memory_ops import bool_reduction_row_blocks
+
+    config_spec.cute_bool_byte_packet_blocks = (
+        frozenset()
+        if config_spec.matmul_facts
+        else bool_reduction_row_blocks(env, device_ir, config_spec)
+    )
+    # A device loop over a static extent that loads a float tensor along its
+    # tile: running its complete tiles apart, their lanes in packets, is
+    # tunable (``cute_tail_peel``).
+    from .peel_vector_tails import tail_peel_blocks
+
+    config_spec.cute_tail_peel_blocks = (
+        frozenset()
+        if config_spec.matmul_facts
+        else tail_peel_blocks(device_ir, config_spec)
+    )
+    # A max, a min or an ``any`` whose warp reduction ``redux.sync`` takes on
+    # this target: ``cute_warp_fp32_redux`` is tunable.
+    from .native_warp_reduction import has_native_redux_reduction
+
+    config_spec.cute_native_redux_sites = has_native_redux_reduction(
+        device_ir, config_spec.target_device_capability
     )
     # Enable the flash-attention autotune surface when
     # the dense flash dataflow is detected, analogous to how a matmul
@@ -463,7 +522,7 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
                         allow_leading_passthrough=(
                             candidate.operands.has_leading_passthrough
                         ),
-                        allow_fp8_broadcasts=(
+                        allow_broadcasts=(
                             len(device_ir.root_ids) == 1
                             and env_state.fission_plan is None
                         ),
@@ -585,11 +644,42 @@ def register_grid_tile_slots(
             register_tensor_alias_specializations(env)
 
 
+def row_itemsizes(env: CompileEnvironment, device_ir: DeviceIR) -> dict[int, int]:
+    """Per block, the widest element of a value a load or a store moves
+    along it: the block is one of the value's dims (a full slice
+    ``x[row, :]`` included), and a stored value has the tensor's dtype
+    (``store`` converts it while tracing).  A persistent row holds several
+    packets per thread only where they fit (``fits_row_packets``)."""
+    from ...language.memory_ops import load
+    from ...language.memory_ops import store
+
+    widest: dict[int, int] = {}
+    for info in device_ir.graphs:
+        for node in info.graph.nodes:
+            if node.op != "call_function" or node.target not in (load, store):
+                continue
+            moved = node if node.target is load else node.args[2]
+            value = moved.meta.get("val") if isinstance(moved, torch.fx.Node) else None
+            if not isinstance(value, torch.Tensor):
+                continue
+            for size in value.shape:
+                if (
+                    isinstance(size, torch.SymInt)
+                    and (block_id := env.get_block_id(size)) is not None
+                ):
+                    block_id = env.canonical_block_id(block_id)
+                    widest[block_id] = max(
+                        widest.get(block_id, 0), value.dtype.itemsize
+                    )
+    return widest
+
+
 def register_reduction_layout_slots(
     func: HostFunction | None, device_ir: DeviceIR, analysis: DeviceIRAnalysis | None
 ) -> None:
     """Per static reduction block: ``num_threads``, vector width, lane layout
-    and reload slots, whether or not the block rolls into a loop."""
+    and reload slots, whether or not the block rolls into a loop; and the
+    widest element moved along each block (``cute_row_itemsizes``)."""
     env = CompileEnvironment.current()
     # Every reduction dim has exactly one roller result, in ``rdims`` order;
     # only the dim itself is read here.
@@ -606,6 +696,28 @@ def register_reduction_layout_slots(
     vector_blocks = set(env.config_spec.cute_vector_widths.valid_block_ids())
     lane_layout_blocks = set(env.config_spec.cute_lane_layouts.valid_block_ids())
     reload_blocks = set(env.config_spec.cute_reduction_reloads.valid_block_ids())
+    # The blocks the ``hl.reduce`` calls reduce, None for a call that reduces
+    # every dim or a dim of no block (``_block_has_user_reduce``).
+    from ...language.reduce_ops import _reduce
+    from ...language.scan_ops import _associative_scan
+    from .reduction_emitter import _reduced_block_id
+    from .reduction_emitter import _scanned_block_id
+
+    user_reduced = [
+        _reduced_block_id(node)
+        for graph_info in device_ir.graphs
+        for node in graph_info.graph.nodes
+        if node.target is _reduce
+    ]
+    # Likewise the blocks the scans run along (``_block_is_scanned``).
+    scanned = [
+        _scanned_block_id(node)
+        for graph_info in device_ir.graphs
+        for node in graph_info.graph.nodes
+        if node.target is _associative_scan
+    ]
+    # The packets a persistent row may hold (``fits_row_packets``).
+    env.config_spec.cute_row_itemsizes = row_itemsizes(env, device_ir)
     for rdim in rdims:
         # Reduction lowering materializes output-range blocks even
         # when the range is exactly an already-active tile symbol.
@@ -617,6 +729,21 @@ def register_reduction_layout_slots(
         if not isinstance(rdim.size, (int, torch.SymInt)):
             continue
         size_hint = rdim.size_hint()
+        # The extent ``PersistentReductionStrategy`` plans from: only a
+        # static one may run unpadded (``plan_unpadded_extent``).
+        numel = env.specialize_expr(rdim.numel)
+        if isinstance(numel, (int, sympy.Integer)):
+            env.config_spec.cute_static_reduction_extents[rdim.block_id] = int(numel)
+        if any(
+            block_id is None or env.canonical_block_id(block_id) == rdim.block_id
+            for block_id in user_reduced
+        ):
+            env.config_spec.cute_user_reduce_block_ids.add(rdim.block_id)
+        if any(
+            block_id is None or env.canonical_block_id(block_id) == rdim.block_id
+            for block_id in scanned
+        ):
+            env.config_spec.cute_scanned_block_ids.add(rdim.block_id)
         if rdim.block_id not in num_thread_blocks:
             env.config_spec.num_threads.append(
                 NumThreadsSpec(
@@ -774,20 +901,68 @@ def restrict_tcgen05_multi_root_search(
 def record_tile_loop_facts(
     func: HostFunction | None, device_ir: DeviceIR, analysis: DeviceIRAnalysis | None
 ) -> None:
-    """After the structural analysis: tile loop paths, boundary-only grid
-    blocks and whether an fp32 dot is exact on this target."""
+    """After the structural analysis: tile loop paths, the reduction blocks
+    on each and the path of each tile strategy, boundary-only grid blocks,
+    the sizes of the paths' fixed blocks, the loops the planner never
+    flattens and whether an fp32 dot is exact on this target."""
     env = CompileEnvironment.current()
     config_spec = env.config_spec
+    from ..per_thread_planning import tile_loop_keeps_nd_layout
     from .loop_nesting import boundary_only_grid_blocks
-    from .loop_nesting import tile_loop_paths
+    from .loop_nesting import tile_loop_facts
 
-    config_spec.cute_tile_loop_paths = tile_loop_paths(device_ir, device_ir.graphs)
+    path_reductions, strategy_paths = tile_loop_facts(
+        env, device_ir, device_ir.graphs, config_spec.reduction_block_ids
+    )
+    config_spec.cute_tile_loop_path_reductions = path_reductions
+    config_spec.cute_tile_strategy_paths = strategy_paths
+    fixed = {
+        block_id: source.value
+        for path in config_spec.cute_tile_loop_paths
+        for level in path
+        for block_id in level
+        if isinstance(
+            source := env.block_sizes[block_id].block_size_source,
+            FixedBlockSizeSource,
+        )
+    }
+    config_spec.cute_tile_fixed_block_sizes = {
+        block_id: value for block_id, value in fixed.items() if type(value) is int
+    }
+    config_spec.cute_tile_symbolic_fixed_blocks = frozenset(
+        block_id for block_id, value in fixed.items() if type(value) is not int
+    )
     config_spec.cute_inactive_tile_block_ids = boundary_only_grid_blocks(
         env, device_ir, device_ir.graphs
+    )
+    config_spec.cute_nd_tile_loops = frozenset(
+        level
+        for path in config_spec.cute_tile_loop_paths
+        for level in path
+        if tile_loop_keeps_nd_layout(
+            device_ir,
+            device_ir.graphs,
+            level,
+            config_spec.cute_inactive_tile_block_ids,
+        )
     )
     from .mma_support import cute_fp32_dot_uses_tf32
 
     config_spec.cute_fp32_dot_exact = not cute_fp32_dot_uses_tf32()
+
+
+def record_scratch_forwarding_sites(
+    func: HostFunction | None, device_ir: DeviceIR, analysis: DeviceIRAnalysis | None
+) -> None:
+    """After the tile loop facts the lane jam's eligibility reads: whether
+    the kernel's structure takes ``cute_scratch_forwarding``
+    (``ConfigSpec.cute_scratch_forwarding_sites``)."""
+    from .autotune.heuristics.cute import CuteReductionLaneJamForwardingHeuristic
+
+    env = CompileEnvironment.current()
+    env.config_spec.cute_scratch_forwarding_sites = (
+        CuteReductionLaneJamForwardingHeuristic.is_eligible(env, device_ir)
+    )
 
 
 def register_matmul_alias_specializations(

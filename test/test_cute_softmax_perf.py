@@ -279,8 +279,8 @@ class TestCuteHoistLoopInvariantRecip(TestCase):
     # ``TestCuteCanonicalSoftmaxArtifact`` (shared compile).
 
     def test_recip_hoist_does_not_fire_on_loop_dependent_divisor(self) -> None:
-        """When the divisor changes per-iteration (e.g. ``local_sum``
-        computed inside the loop), the pass must NOT hoist it.  Pinning
+        """When the divisor changes per iteration (here per element), the
+        pass must NOT hoist it.  Pinning
         this guards against accidentally hoisting genuinely loop-dependent
         divides which would produce wrong values.
         """
@@ -292,9 +292,8 @@ class TestCuteHoistLoopInvariantRecip(TestCase):
             for tile_m in hl.tile(m):
                 for tile_n in hl.tile(n):
                     values = x[tile_m, tile_n]
-                    # The divisor changes per tile_n iteration.
-                    local_sum = torch.sum(values, dim=1, keepdim=True)
-                    out[tile_m, tile_n] = values / local_sum
+                    # The divisor changes per element and tile_n iteration.
+                    out[tile_m, tile_n] = values / (values + 1)
             return out
 
         x = torch.randn(4096, 1024, device=DEVICE, dtype=HALF_DTYPE)
@@ -305,7 +304,7 @@ class TestCuteHoistLoopInvariantRecip(TestCase):
             num_threads=[0, 32],
             cute_vector_widths=[1, 4],
         )
-        # No reciprocal hoist — local_sum is recomputed every iter.
+        # No reciprocal hoist: the divisor is recomputed for every element.
         self.assertNotIn("_helion_inv_div_", code)
 
     def test_recip_hoist_disable_env(self) -> None:
@@ -425,14 +424,13 @@ class TestCuteCanonicalSoftmaxArtifact(TestCase):
         # both were SSA snapshots; with the snapshot removed the inner
         # use reads the root directly.
         self.assertEqual(code.count("_copy"), 0)
-        # P17 FMA scale hoist: needs fast_math (see the next test); here
-        # both sweeps keep the exact ``(x - max) * log2(e)`` exponent.
+        # P17 FMA scale hoist: fast_math only (see the next test); here both
+        # sweeps keep the exact natural ``exp(x - max)``, which has no scale
+        # to distribute (the gate itself is checked end to end in
+        # ``test_cute_gdn_recurrence.py``).
         self.assertNotIn("_helion_scaled_", code)
         self.assertIn("v_10 = v_9 - mi\n", code)
-        self.assertIn(
-            "v_11 = cute.math.exp2(cutlass.Float32(v_10) * 1.4426950408889634)\n",
-            code,
-        )
+        self.assertIn("v_11 = cute.math.exp(cutlass.Float32(v_10))\n", code)
         self.assertIn("v_6 = v_5 - v_1\n", code)
         # The online-softmax rescale update contracts to a single FMA
         # (``di = di*exp(mi-mi_next) + sum`` — same fusion quack applies).

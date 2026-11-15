@@ -1755,7 +1755,7 @@ def _uniform_reuse_names(
 
 def _copy_tensor_facts(df: DeviceFunction) -> dict[str, CopyTensorFacts]:
     from ..device_function import TensorArg
-    from .memory_ops import runtime_tensor_has_specialized_alignment
+    from .memory_ops import tensor_has_specialized_base_alignment
 
     env = CompileEnvironment.current()
     strides = df.proven_tensor_stride_values()
@@ -1772,7 +1772,7 @@ def _copy_tensor_facts(df: DeviceFunction) -> dict[str, CopyTensorFacts]:
         values = tuple(strides.get((argument.name, dim)) for dim in range(tensor.ndim))
         if any(value is None for value in values):
             continue
-        if not runtime_tensor_has_specialized_alignment(env, tensor, 16):
+        if not tensor_has_specialized_base_alignment(env, tensor, 16):
             continue
         result[argument.name] = CopyTensorFacts(
             env.backend.dtype_str(tensor.dtype), cast("tuple[int, ...]", values), 16
@@ -2945,7 +2945,16 @@ def lower_collective_matmul(
     # the same final renaming already applied to the generated function.
     module = ast.Module(body=body, type_ignores=[])
     ast_rename(module, rename_groups)
-    if df.config.get("cute_collective_compute", "warp") == "tma_gather":
+    # The gathered pipeline takes its operands' exact sizes and strides
+    # (``gathered_tensor_facts``); where the calls this code serves skip the
+    # binding's dispatch guards (Inductor's render of a dynamic graph), so
+    # that nothing proves those, the warp lowering below runs the
+    # contraction, as without the knob.  Elsewhere the gathered lowering
+    # proves them or refuses the config.
+    if (
+        df.config.get("cute_collective_compute", "warp") == "tma_gather"
+        and CompileEnvironment.current().dispatch_guards_enforced
+    ):
         from .gathered_mma_lowering import lower_gathered_matmul
 
         return lower_gathered_matmul(

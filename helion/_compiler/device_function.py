@@ -18,7 +18,6 @@ import sympy
 import torch
 from torch._dynamo.source import TensorProperty
 from torch._dynamo.source import TensorPropertySource
-from torch._subclasses.fake_tensor import FakeTensor
 from torch.fx.graph import _Namespace
 
 from .. import exc
@@ -95,11 +94,13 @@ def _exact_thread_block_dims(
     """Return a proven-static launch shape, or ``None`` when inference fails.
 
     ``None`` as well when a launch axis is sized by a kernel argument
-    (``TileStrategyDispatch.symbolic_thread_axes``): the static shape holds a
-    one for it, and a pass proving bounds from that one (the lane-tile bounds
-    simplifier erased the leader guard ``cute.arch.thread_idx()[axis] == 0``
-    of an atomic beside the axis, which then ran once per thread of it) would
-    prove the wrong thing.
+    (``TileStrategyDispatch.symbolic_thread_axes``) or claimed outside the
+    strategies by a free ``hl.arange`` dim
+    (``TileStrategyDispatch.synthetic_thread_axes``): the static shape holds
+    a one for it, and a pass proving bounds from that one (the lane-tile
+    bounds simplifier erased the leader guard ``cute.arch.thread_idx()[axis]
+    == 0`` of an atomic beside the axis, which then ran once per thread of
+    it) would prove the wrong thing.
     """
 
     try:
@@ -111,11 +112,13 @@ def _exact_thread_block_dims(
         ):
             return None
         result = int(thread_dims[0]), int(thread_dims[1]), int(thread_dims[2])
-        return result if all(dim > 0 for dim in result) else None
     except (TypeError, ValueError):
         # A sympy extent that is not an integer (``int()`` of a symbolic
         # thread count); every other failure of the strategies surfaces.
         return None
+    if not all(dim > 0 for dim in result) or tile_strategy.synthetic_thread_axes():
+        return None
+    return result
 
 
 @dataclasses.dataclass
@@ -874,12 +877,20 @@ class DeviceFunction:
         resolved = host.resolve_tunable_expr(expr, self.config)
         if isinstance(resolved, (int, float, bool)):
             return env.backend.scalar_literal_expr(resolved)
-        expr = resolved
-        if not expr.free_symbols:
-            return env.backend.sympy_printer_expr(expr)
+        constants = env.config_constants(resolved, self.config)
+        if not constants.free_symbols:
+            return env.backend.sympy_printer_expr(constants)
+        expr_to_origin = host.expr_to_origin
+        # A name for the whole expression passes its value in where the
+        # config's values leave a symbol nothing names alone
+        # (``HostFunction.sympy_expr``).
+        if expr is not constants and expr in self.expr_to_var_info:
+            return self.expr_to_var_info[expr].name
+        if expr is not constants and expr in expr_to_origin:
+            return self._lift_sympy_arg(expr)
+        expr = constants
         if expr in self.expr_to_var_info:
             return self.expr_to_var_info[expr].name
-        expr_to_origin = HostFunction.current().expr_to_origin
         if expr in expr_to_origin:
             return self._lift_sympy_arg(expr)
         if env.backend.lowers_integer_powers:
@@ -920,6 +931,17 @@ class DeviceFunction:
         env = CompileEnvironment.current()
         origin = HostFunction.current().expr_to_origin[expr]
         if isinstance(origin.origin, TensorSizeOrigin):
+            # A size the config fixes (``out.size(1)`` of ``torch.empty([m,
+            # helion.next_power_of_2(foo)])``) is its value under the config:
+            # a shape needs a constant, which the size argument is not.
+            expression = env.config_value_expression(expr)
+            if expression is not None:
+                value = (
+                    expression
+                    if isinstance(expression, int)
+                    else expression.evaluate(self.config)
+                )
+                return env.backend.sympy_printer_expr(sympy.Integer(value))
             assert origin.fake_value is not None
             arg = self.tensor_size(
                 origin.fake_value,
@@ -1180,7 +1202,9 @@ class DeviceFunction:
                 # literal avoids specializing a dynamic stride solely to build
                 # a launch-time descriptor.
                 strides[-1] = "1"
-                host_block_size = ", ".join(map(host_function.literal_expr, block_size))
+                host_block_size = ", ".join(
+                    host_function.literal_expr(size, self.config) for size in block_size
+                )
                 descriptor = (
                     "_helion_tensor_descriptor("
                     if ring_swizzle is None
@@ -1232,11 +1256,21 @@ class DeviceFunction:
 
     def expr_arg(self, sym: sympy.Expr, origin: Origin) -> NumericArgument:
         if sym not in self._expr_args:
-            # A tunable-only expression is constant for each compiled config.
+            env = CompileEnvironment.current()
+            # An expression over tunables, and over the values a host helper
+            # computes from them (config_value_expressions), is constant for
+            # each compiled config.
             arg_type = (
                 ConstExprArg
                 if sym in self._constexpr_exprs
-                or CompileEnvironment.current().is_tunable_expr(sym)
+                or (
+                    sym.free_symbols
+                    and all(
+                        symbol in env.tunable_symbols
+                        or symbol in env.config_value_expressions
+                        for symbol in sym.free_symbols
+                    )
+                )
                 else SymbolArgument
             )
             arg = arg_type(
@@ -1561,10 +1595,12 @@ class DeviceFunction:
         sizes and strides (see ``_tensor_key``), so under that setting every
         input stride is already a cache-safe fact; otherwise a stride is
         cache-safe only when the ``input_tensor_metadata`` compiler fact or an
-        explicit ``hl.specialize`` guard covers it.
+        explicit ``hl.specialize`` guard covers it.  The binding then decides
+        the value (``CompileEnvironment.keyed_hint``), and only while
+        its dispatch guards are enforced.
         """
         env = CompileEnvironment.current()
-        input_metadata_specialized = (
+        input_metadata_specialized = env.dispatch_guards_enforced and (
             env.settings.static_shapes
             or "input_tensor_metadata" in env.compiler_fact_specialization_facts
         )
@@ -1573,9 +1609,8 @@ class DeviceFunction:
             if not isinstance(arg, TensorArg):
                 continue
             source = env.tensor_input_source(arg.fake_value)
-            runtime = env.runtime_value_for_tensor(arg.fake_value)
-            if not isinstance(runtime, torch.Tensor) or isinstance(runtime, FakeTensor):
-                if source is not None or not input_metadata_specialized:
+            if source is None:
+                if not input_metadata_specialized:
                     continue
                 # A tensor the host function allocates (``torch.empty_like``)
                 # has no runtime value at compile time; its layout is what
@@ -1587,28 +1622,30 @@ class DeviceFunction:
                         result[arg.name, dim] = fake_stride
                 continue
             for dim, fake_stride in enumerate(arg.fake_value.stride()):
-                cache_safe = source is not None and (
+                cache_safe = (
                     input_metadata_specialized
                     or TensorPropertySource(source, TensorProperty.STRIDE, dim)
                     in env.specialized_strides
                 )
                 if not cache_safe:
                     continue
-                try:
-                    traced_stride = env.size_hint(fake_stride)
-                except (RuntimeError, TypeError, ValueError):
-                    continue
-                runtime_stride = runtime.stride(dim)
-                if runtime_stride == traced_stride:
-                    result[arg.name, dim] = traced_stride
+                stride = env.keyed_hint(fake_stride)
+                if stride is not None:
+                    result[arg.name, dim] = stride
         return result
 
     def proven_tensor_size_values(
         self,
     ) -> dict[tuple[str, int], tuple[str, int]]:
-        """Return cache-safe exact runtime sizes and their generated argument names."""
+        """Return cache-safe exact runtime sizes and their generated argument names.
+
+        The ``input_tensor_metadata`` compiler fact keys the bound kernel on
+        every input tensor's exact sizes, so an input's traced size hint is
+        its size in every call this bound kernel serves, while its dispatch
+        guards are enforced (``CompileEnvironment.keyed_hint``).
+        """
         env = CompileEnvironment.current()
-        if "input_tensor_metadata" not in env.compiler_fact_specialization_facts:
+        if not env.exact_input_metadata_holds():
             return {}
         result: dict[tuple[str, int], tuple[str, int]] = {}
         for tensor_arg in self.arguments:
@@ -1618,11 +1655,6 @@ class DeviceFunction:
                 continue
             fake_tensor = tensor_arg.fake_value
             if env.tensor_input_source(fake_tensor) is None:
-                continue
-            runtime_tensor = env.runtime_value_for_tensor(fake_tensor)
-            if not isinstance(runtime_tensor, torch.Tensor) or isinstance(
-                runtime_tensor, FakeTensor
-            ):
                 continue
             for dim, size in enumerate(fake_tensor.shape):
                 if isinstance(size, int) or isinstance(size._sympy_(), sympy.Integer):
@@ -1635,29 +1667,15 @@ class DeviceFunction:
                     is None
                 ):
                     continue
-                property_runtime = env.runtime_value_for_tensor(
-                    property_arg.tensor_arg.fake_value
-                )
-                if not isinstance(property_runtime, torch.Tensor) or isinstance(
-                    property_runtime, FakeTensor
+                # The launch passes the anchor's size in place of this one, so
+                # the key must fix both.
+                anchor = property_arg.tensor_arg.fake_value
+                value = env.keyed_hint(size)
+                if value is None or value != env.keyed_hint(
+                    anchor.size(property_arg.dim)
                 ):
                     continue
-                property_fake_size = property_arg.tensor_arg.fake_value.size(
-                    property_arg.dim
-                )
-                try:
-                    runtime_size = int(runtime_tensor.size(dim))
-                    source_hint = int(env.size_hint(size))
-                    property_size = int(property_runtime.size(property_arg.dim))
-                    property_hint = int(env.size_hint(property_fake_size))
-                except (RuntimeError, TypeError, ValueError):
-                    continue
-                if not (runtime_size == source_hint == property_size == property_hint):
-                    continue
-                result[tensor_arg.name, dim] = (
-                    property_arg.name,
-                    property_hint,
-                )
+                result[tensor_arg.name, dim] = (property_arg.name, value)
         return result
 
     def codegen_function_call(self) -> ast.AST:
@@ -1744,28 +1762,32 @@ class DeviceFunction:
         # pointers referenced only by placeholder strings, not the AST body).
         # sourceless_prologue_params are intentionally NOT exempted — they are
         # fully inlined by the prologue hook and should be removed by DCE.
-        args_to_remove = {
-            arg.name
-            for arg in self.arguments
-            # pyrefly: ignore [unbound-name]
-            if arg.name not in rw.reads and arg.name not in self.placeholder_args
-        }
-        if args_to_remove:
-            self.arguments = [
-                arg for arg in self.arguments if arg.name not in args_to_remove
-            ]
-            for cache in cast(
-                "list[dict[object, Argument]]",
-                [
-                    self._tensor_args,
-                    self._tensor_descriptor_args,
-                    self._expr_args,
-                    self._tensor_properties,
-                ],
-            ):
-                for k, v in [*cache.items()]:
-                    if v.name in args_to_remove:
-                        del cache[k]
+        self.drop_arguments(
+            {
+                arg.name
+                for arg in self.arguments
+                # pyrefly: ignore [unbound-name]
+                if arg.name not in rw.reads and arg.name not in self.placeholder_args
+            }
+        )
+
+    def drop_arguments(self, names: set[str]) -> None:
+        """Remove the arguments named ``names`` and their cache entries."""
+        if not names:
+            return
+        self.arguments = [arg for arg in self.arguments if arg.name not in names]
+        for cache in cast(
+            "list[dict[object, Argument]]",
+            [
+                self._tensor_args,
+                self._tensor_descriptor_args,
+                self._expr_args,
+                self._tensor_properties,
+            ],
+        ):
+            for k, v in [*cache.items()]:
+                if v.name in names:
+                    del cache[k]
 
     def register_helper_function(
         self, helper_graph_info: HelperFunctionGraphInfo
@@ -1796,6 +1818,8 @@ class DeviceFunction:
         # accidentally turn a module constexpr into a host-wrapper local.
         dead_assignment_elimination(cast("list[ast.AST]", cloned_body), self.dce_vars)
         dead_expression_elimination(cast("list[ast.AST]", cloned_body))
+        if not cloned_body:
+            cloned_body.append(ast.Pass())
         reads = set(ReadWrites.from_list(cloned_body).reads)
         local_names = {
             node.id
@@ -1805,7 +1829,9 @@ class DeviceFunction:
         }
         helper_names = {name for name, _, _, _ in self.triton_outlined_helpers}
         environment = CompileEnvironment.current()
-        for name in reads:
+        # Sorted: the module declares these constexprs in insertion order, and
+        # a set's order follows the string hash seed.
+        for name in sorted(reads):
             if not name.startswith("_BLOCK_SIZE_"):
                 continue
             suffix = name.removeprefix("_BLOCK_SIZE_")
@@ -1919,7 +1945,7 @@ class DeviceFunction:
         """Add all deferred RDIM definitions to host statements."""
         backend = CompileEnvironment.current().backend
         for var_name, expr in self.deferred_rdim_defs:
-            expr_str = HostFunction.current().sympy_expr(expr)
+            expr_str = HostFunction.current().sympy_expr(expr, self.config)
             stmt = statement_from_string(
                 f"{var_name} = {backend.dynamic_rdim_size_expr(expr_str)}"
             )

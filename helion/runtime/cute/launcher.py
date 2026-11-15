@@ -87,7 +87,9 @@ from .capture_pdl_launch import prepare_capture_launch
 from .compile_cache import CompiledCuteLauncher as _CompiledCuteLauncher
 from .compile_cache import disk_cache_key as _cute_disk_cache_key
 from .compile_cache import function_globals
-from .compile_cache import merge_tvm_ffi_compile_option as _merge_tvm_ffi_compile_option
+from .compile_cache import (
+    merge_default_compile_options as _merge_default_compile_options,
+)
 from .compile_cache import (
     patch_cutlass_jit_shutdown_unload as _patch_cutlass_jit_shutdown_unload,
 )
@@ -138,6 +140,8 @@ from .launch_descriptor import (
 from .launch_descriptor import bake_tensor_shapes as _cute_bake_tensor_shapes_guard
 from .launch_descriptor import cluster_shape as _cute_cluster_shape
 from .launch_descriptor import cute_launch_descriptor
+from .launch_descriptor import min_blocks_per_mp as _cute_min_blocks_per_mp
+from .launch_descriptor import preferred_smem_carveout as _cute_preferred_smem_carveout
 from .launch_descriptor import use_pdl as _cute_use_pdl
 from .occupancy import resident_clusters as _cute_resident_clusters
 from .plan_facts import plan_int_value as _plan_int_value
@@ -151,6 +155,7 @@ from .plan_facts import (
 from .plan_facts import tcgen05_plan_orientation as _tcgen05_plan_orientation
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Hashable
     from collections.abc import Sequence
 
@@ -437,6 +442,9 @@ def _create_cute_wrapper(
     cluster_shape = _cute_cluster_shape(cute_kernel, wrapper_plans)
     if cluster_shape is not None:
         launch_suffix += f", cluster={list(cluster_shape)!r}"
+    preferred_smem_carveout = _cute_preferred_smem_carveout(cute_kernel, wrapper_plans)
+    if preferred_smem_carveout is not None:
+        launch_suffix += f", preferred_smem_carveout={preferred_smem_carveout}"
     # G2-H (cute_plan.md, see plan: G2-H CLC): CLC kernels need PDL
     # enabled at the host launch so ``nvvm.clusterlaunchcontrol_try_cancel``
     # returns valid responses. ``use_pdl`` is set on the per-matmul
@@ -446,24 +454,11 @@ def _create_cute_wrapper(
     # mirrors how ``cluster_m``/``cluster_n`` flow through this layer.
     if any(plan.get("use_pdl") for plan in wrapper_plans) or _cute_use_pdl(cute_kernel):
         launch_suffix += ", use_pdl=True"
-    # The fa4 flash topology (16-warp/512-thread) uses ``cute.arch.setmaxregister``
-    # for per-warp register reallocation (softmax warps inc to 200; mma/corr/load/empty
-    # dec). ptxas only emits the ``EIATTR_REG_RECONFIG`` that HONORS those ``setmaxnreg``
-    # ops when the kernel declares ``min_blocks_per_mp`` (>= 1); WITHOUT it ptxas
-    # SILENTLY DROPS every setmaxnreg and all warps are stuck at the static uniform
-    # split -- so the softmax warp never reaches its 200-reg grant and spills its
-    # resident row to local memory. fa4 already pins 1 CTA/SM (512 threads + TMEM = 1
-    # tcgen05 unit/SM + smem near the cap), so ``min_blocks_per_mp=1`` matches its real
-    # occupancy and enables the reallocation (=1 avoids the smem-carveout path >1 would
-    # trigger). NOT applied to ws_overlap (256-thread): forcing 1 CTA/SM there cuts its
-    # 2-blocks/SM occupancy and regresses it ~4pp.
-    explicit_min_blocks = getattr(
-        cast("Any", cute_kernel), "_helion_cute_min_blocks_per_mp", None
-    )
-    if isinstance(explicit_min_blocks, int) and explicit_min_blocks > 0:
-        launch_suffix += f", min_blocks_per_mp={explicit_min_blocks}"
-    elif any(plan.get("topology") == "fa4" for plan in wrapper_plans):
-        launch_suffix += ", min_blocks_per_mp=1"
+    # An emitter's count, else one CTA per SM for the fa4 flash topology, whose
+    # setmaxnreg reallocation ptxas honors only then (``min_blocks_per_mp``).
+    min_blocks = _cute_min_blocks_per_mp(cute_kernel, wrapper_plans)
+    if min_blocks is not None:
+        launch_suffix += f", min_blocks_per_mp={min_blocks}"
     # A whole-root plan (block-scaled GEMM, the recurrence schedules) replaces
     # the generic launch with its host entry call; the checks above leave at
     # most one such plan.
@@ -564,7 +559,7 @@ def _cute_compiled_launcher_discriminator(
     arch_args: tuple[object, ...] | None,
     cluster_shape: object = None,
 ) -> tuple[tuple[object, ...], str, int | None]:
-    merged_compile_options = _merge_tvm_ffi_compile_option(compile_options)
+    merged_compile_options = _merge_default_compile_options(compile_options)
     num_sm = _cute_num_sm_from_arch_args(arch_args)
     resident_clusters = _cute_resident_clusters(
         cluster_shape, _cute_device_from_arch_args(arch_args)
@@ -595,7 +590,9 @@ def _get_compiled_cute_launcher(
     # cast/pointer work in ``generate_execution_args``. We merge rather
     # than replace because other flags (e.g. ``--generate-line-info`` when
     # ``tcgen05_cubin_lineinfo`` is True) can already be in
-    # ``compile_options``.
+    # ``compile_options``.  The division option is merged the same way
+    # (``merge_default_compile_options``): ``div.full.f32`` unless the
+    # kernel's launch chose the IEEE division.
     cluster_shape = getattr(
         cast("Any", cute_kernel), "_helion_cute_cluster_shape", None
     )
@@ -685,6 +682,43 @@ def _cute_current_stream() -> object:
     """
     _gmem, _make_ptr, current_stream_obj = _get_cute_launcher_imports()
     return cast("Any", current_stream_obj)()
+
+
+# ``standalone_launcher._standalone_ensure_cuda_context``, imported on the first
+# launch after torch initializes CUDA: that module loads cutlass and
+# ``cuda.bindings``, which a CPU-only process may not have.
+_STANDALONE_ENSURE_CUDA_CONTEXT: Callable[[], None] | None = None
+
+
+def _ensure_cuda_context() -> None:
+    """Make the current device's primary CUDA context current on this thread,
+    before every launch (the fast relaunch included).
+
+    Without a current context the compiled host code of a launch that sets
+    function attributes (``cudaFuncSetAttribute``, ``cuKernelGetAttribute``)
+    aborts the process (the CuTe DSL runtime's ``cuda_dialect_assert_success``:
+    "invalid device context"), and a thread can lack one at any launch.  A new
+    thread starts without one until a runtime-API call initializes it there,
+    PyTorch's autograd device threads among them (c10 skips ``cudaSetDevice``
+    for the device a thread already defaults to), and other code can clear
+    the context, or pop one it pushed on a thread that had none, after one was
+    made current.  The check is the exported launcher's
+    (``standalone_launcher._standalone_ensure_cuda_context``, one
+    ``cuCtxGetCurrent`` call when a context is current, which keeps that
+    module Helion-free), imported and run once torch has initialized CUDA.
+    """
+    global _STANDALONE_ENSURE_CUDA_CONTEXT
+    check = _STANDALONE_ENSURE_CUDA_CONTEXT
+    if check is None:
+        if not torch.cuda.is_initialized():
+            # No CUDA work in this process yet (a stub launch in a CPU-only
+            # test): nothing to make current, and libcuda may not even be
+            # installed.
+            return
+        from .standalone_launcher import _standalone_ensure_cuda_context as check
+
+        _STANDALONE_ENSURE_CUDA_CONTEXT = check
+    check()
 
 
 @dataclass(frozen=True)
@@ -3711,6 +3745,7 @@ def default_cute_launcher(
     *args: object,
     **kwargs: object,
 ) -> object:
+    _ensure_cuda_context()
     pending = prepare_capture_launch(cute_kernel, args, grid)
     result = _default_cute_launcher_untracked(cute_kernel, grid, *args, **kwargs)
     if pending is not None:

@@ -53,6 +53,23 @@ def rank_two_aux(
     return out
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def two_residual_aux(
+    lhs: torch.Tensor, rhs: torch.Tensor, r0: torch.Tensor, r1: torch.Tensor
+) -> torch.Tensor:
+    """Two exact-shape operands added to the accumulator."""
+    m, k = lhs.shape
+    n = rhs.shape[1]
+    out = torch.empty_like(r0)
+    for mi, ni in hl.tile([m, n]):
+        acc = hl.zeros([mi, ni], dtype=torch.float32)
+        for ki in hl.tile(k):
+            acc = torch.addmm(acc, lhs[mi, ki], rhs[ki, ni])
+        acc = acc + r0[mi, ni].to(torch.float32)
+        out[mi, ni] = (acc + r1[mi, ni].to(torch.float32)).to(out.dtype)
+    return out
+
+
 # The role-local tcgen05 GEMM configuration the AUX tests start from; a
 # sparse base, independent of the host.
 AUX_CONFIG_BASE: dict[str, Any] = {

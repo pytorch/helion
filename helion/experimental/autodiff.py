@@ -1320,6 +1320,7 @@ class GraphAnalyzer:
         get_node_dtype: Callable[[Node], torch.dtype | None],
         maybe_cast: Callable[[Node, torch.dtype], Node],
         mask_ph: Node | None,
+        scan_block: torch.SymInt | None,
     ) -> None:
         """Lower one Helion sub-graph node into the scan combine_fn graph ``cg``.
 
@@ -1327,7 +1328,9 @@ class GraphAnalyzer:
         (the main loop) and ``_inline_branch_nodes`` (per branch node): Helion
         tracing ops are aliased/resolved, ``hl.full``→``aten.full``,
         ``hl.dot``→a rank-appropriate matmul, ``subscript``→unsqueeze,
-        ``_mask_to`` re-applies the OOB mask when a scan mask is present,
+        ``_mask_to`` and ``_mask_select`` re-apply the OOB mask when a scan
+        mask is present (``mask_ph``, over the elements of the scanned block,
+        whose size the loop body's values spell ``scan_block``),
         ``eq``/``_if`` are statically resolved, and everything else is copied
         with matmul-dtype reconciliation.
         """
@@ -1336,18 +1339,32 @@ class GraphAnalyzer:
         tn = getattr(n.target, "__name__", "")
         if tn == "_host_tensor" or tn == "load" or n in store_nodes:
             return
-        if tn == "_mask_to" and mask_ph is not None:
+        if tn in ("_mask_to", "_mask_select") and mask_ph is not None:
             # Re-apply the forward's OOB masking inside the scan so padded
             # (non-block-divisible) positions don't pollute reductions like the
             # softmax max/sum. mask_ph is [block_size]; it broadcasts against
-            # the value's trailing (key) dim.
+            # the value's trailing (key) dim.  A loop carry's update
+            # (``mask_loop_carries``) selects an operand's identity there, or
+            # the carry itself in place of the whole update, along each of
+            # the value's dims on the scanned block, wherever it is.
             src = n.args[0]
             fill = n.args[1]
             if isinstance(src, Node) and src in sub_node_map:
-                w = cg.call_function(
-                    torch.ops.aten.where.ScalarOther,
-                    (mask_ph, sub_node_map[src], fill),
-                )
+                mask = mask_ph
+                if tn == "_mask_select":
+                    mask = self._scan_mask_along_block(
+                        cg, mask_ph, scan_block, src.meta.get("val")
+                    )
+                if isinstance(fill, Node):
+                    w = cg.call_function(
+                        torch.ops.aten.where.self,
+                        (mask, sub_node_map[src], sub_node_map[fill]),
+                    )
+                else:
+                    w = cg.call_function(
+                        torch.ops.aten.where.ScalarOther,
+                        (mask, sub_node_map[src], fill),
+                    )
                 if n.meta:
                     w.meta = n.meta.copy()
                     fake = n.meta.get("val")
@@ -1355,7 +1372,7 @@ class GraphAnalyzer:
                         node_dtype_map[w] = fake.dtype
                 sub_node_map[n] = w
             return
-        if tn in ("_new_var", "_mask_to"):
+        if tn in ("_new_var", "_mask_to", "_mask_select"):
             src = n.args[0]
             if isinstance(src, Node) and src in sub_node_map:
                 sub_node_map[n] = sub_node_map[src]
@@ -1513,6 +1530,7 @@ class GraphAnalyzer:
                     get_node_dtype,
                     maybe_cast,
                     mask_ph,
+                    scan_block,
                 )
                 branch_out = next(
                     bn for bn in branch_info.graph.nodes if bn.op == "output"
@@ -1643,8 +1661,12 @@ class GraphAnalyzer:
         # Per-step validity mask xs (present only when the scan dim was padded);
         # ordered right after the tiled xs to match the scan's xs tuple.
         mask_ph: Node | None = None
+        scan_block: torch.SymInt | None = None
         if scan_mask_present:
             mask_ph = cg.placeholder("scan_mask")
+            # The first tiled load's index on the scanned block holds its size.
+            load, _, tile_dim = tiled_loads[0]
+            scan_block = load.args[1][tile_dim].meta.get("val")
         for i, ai in enumerate(additional_indices):
             add_ph = cg.placeholder(f"add_outer_{i}")
             sub_node_map[sub_phs[ai]] = add_ph
@@ -1705,6 +1727,7 @@ class GraphAnalyzer:
                 _get_node_dtype,
                 _maybe_cast,
                 mask_ph,
+                scan_block,
             )
 
         out_node = next(n for n in sub_info.graph.nodes if n.op == "output")
@@ -1781,6 +1804,7 @@ class GraphAnalyzer:
         get_node_dtype: Callable[[Node], torch.dtype | None],
         maybe_cast: Callable[[Node, torch.dtype], Node],
         mask_ph: Node | None,
+        scan_block: torch.SymInt | None,
     ) -> None:
         """Inline a statically-taken ``_if`` branch's nodes into ``cg`` via the
         shared per-node lowering (recurses for nested ``_if``)."""
@@ -1796,7 +1820,53 @@ class GraphAnalyzer:
                 get_node_dtype,
                 maybe_cast,
                 mask_ph,
+                scan_block,
             )
+
+    @staticmethod
+    def _scan_mask_along_block(
+        cg: torch.fx.Graph,
+        mask_ph: Node,
+        scan_block: torch.SymInt | None,
+        value: object,
+    ) -> Node:
+        """``mask_ph``, the scan step's mask over the elements of the scanned
+        block, laid along every dim of ``value``, a fake tensor, of size
+        ``scan_block``: viewed as ``[block_size, 1, ...]`` before trailing
+        dims, and ANDed over several such dims."""
+        dims = (
+            [
+                dim
+                for dim, size in enumerate(value.shape)
+                if isinstance(size, torch.SymInt)
+                and scan_block is not None
+                and size.node.expr == scan_block.node.expr
+            ]
+            if isinstance(value, torch.Tensor)
+            else []
+        )
+        if not dims:
+            raise exc.AutodiffNotSupported(
+                "a loop carry's padded-lane select has no dim on the scanned block"
+            )
+        assert isinstance(value, torch.Tensor)
+        mask: Node | None = None
+        for dim in dims:
+            along = (
+                mask_ph
+                if dim == value.ndim - 1
+                else cg.call_function(
+                    torch.ops.aten.view.default,
+                    (mask_ph, [-1] + [1] * (value.ndim - 1 - dim)),
+                )
+            )
+            mask = (
+                along
+                if mask is None
+                else cg.call_function(torch.ops.aten.logical_and.default, (mask, along))
+            )
+        assert mask is not None
+        return mask
 
     @staticmethod
     def _wrap_combine_fn_for_unit_carry(

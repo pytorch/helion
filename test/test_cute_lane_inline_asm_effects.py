@@ -124,7 +124,12 @@ def test_serial_interchange_declines_replaying_an_opaque_producer() -> None:
 def test_pure_producers_keep_both_split_paths() -> None:
     for result in (
         split_lane_loop_reductions([_lane_loop(shared=True, purity="True")]),
-        interchange_lane_outside_serial_reductions([_serial_loop("True")]),
+        # ``column``'s store follows the stores of ``out`` only while the
+        # two are disjoint, which the interchange asks to be proven.
+        interchange_lane_outside_serial_reductions(
+            [_serial_loop("True")],
+            proven_disjoint_tensor_pairs={frozenset(("out", "column"))},
+        ),
     ):
         calls = [
             node

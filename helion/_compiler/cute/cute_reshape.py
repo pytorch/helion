@@ -1820,7 +1820,7 @@ def rebound_block_dims(
     consumer_sizes: Sequence[int | torch.SymInt],
     consumer_block_ids: Sequence[int | None],
     *,
-    lower_rank_by_block_id: bool,
+    pointwise_placement: bool,
 ) -> list[tuple[int, int, int]]:
     """Dims of ``value`` that a consumer binds to a different block id.
 
@@ -1830,18 +1830,23 @@ def rebound_block_dims(
     is right-aligned (``PointwiseLowering._check_block_broadcast_compatibility``)
     and a store or atomic value is right-aligned whatever its rank
     (``tl.store`` / ``tl.atomic_*`` receive it unexpanded), so the consumer
-    reads the element at the same *position*.  Only a lower-rank pointwise
-    operand is placed by ``TileDispatch.broadcast_expand_dims``
-    (``lower_rank_by_block_id``): every source dim is matched to a result dim,
-    a tile dim to the one with its canonical block id, a non-tile dim to an
-    unused non-tile dim of equal size or else the last unused dim, and the
-    source dims then occupy the matched positions *in order* (the expansion
-    only inserts ``None``, it never permutes), so ``b[tile1, tile0]`` meets a
+    reads the element at the same *position*.  A pointwise operand of another
+    rank is placed as a PointwiseLowering reads it (``pointwise_placement``).
+    A lower-rank one is placed as ``TileDispatch.broadcast_expand_dims``
+    places it: every source dim is matched to a result dim, a tile dim to the
+    one with its canonical block id, a non-tile dim to an unused non-tile dim
+    of equal size or else the last unused dim, and the source dims then
+    occupy the matched positions *in order* (the expansion only inserts
+    ``None``, it never permutes), so ``b[tile1, tile0]`` meets a
     ``[tile0, tile1, tile2]`` result positionally while ``b[tile1]`` is its
-    middle-dim broadcast.  The SIMT lowering keeps each thread's element by
-    block-id coordinates, so a dim bound to another block id must be
-    exchanged between threads (or the program refused).  Returns
-    ``(value_dim, value_block_id, consumer_block_id)`` for each such dim.
+    middle-dim broadcast.  A higher-rank one is the input of a reduction over
+    extent-1 dims, which inductor lowers element-wise; it meets the result
+    without the reduced dims (``size1_reduction_positions``).
+
+    The SIMT lowering keeps each thread's element by block-id coordinates, so
+    a dim bound to another block id must be exchanged between threads (or the
+    program refused).  Each such dim comes back as
+    ``(value_dim, value_block_id, consumer_block_id)``.
     Dims that are not block ids (static extents; a reduction dim is a block
     id here, cute pads factory tensors so every slice gets one) or that
     broadcast (stride 0, or a block whose extent under ``config`` is 1, on
@@ -1858,7 +1863,7 @@ def rebound_block_dims(
         value,
         consumer_sizes,
         consumer_block_ids,
-        lower_rank_by_block_id=lower_rank_by_block_id,
+        pointwise_placement=pointwise_placement,
     )
     rebound: list[tuple[int, int, int]] = []
     for dim, size in enumerate(value.shape):
@@ -2015,7 +2020,7 @@ def subscript_rebound_block_dims(
         value,
         [*leading, *slot_sizes],
         block_ids,
-        lower_rank_by_block_id=False,
+        pointwise_placement=False,
     )
 
 
@@ -2097,7 +2102,7 @@ def kernel_may_rebind_block_ids(graphs: Sequence[GraphInfo]) -> bool:
         value: object,
         sizes: Sequence[int | torch.SymInt],
         block_ids: Sequence[int | None],
-        lower_rank_by_block_id: bool,
+        pointwise_placement: bool,
     ) -> bool:
         return (
             isinstance(value, torch.Tensor)
@@ -2109,7 +2114,7 @@ def kernel_may_rebind_block_ids(graphs: Sequence[GraphInfo]) -> bool:
                     value,
                     sizes,
                     block_ids,
-                    lower_rank_by_block_id=lower_rank_by_block_id,
+                    pointwise_placement=pointwise_placement,
                 )
             )
         )
@@ -2142,16 +2147,14 @@ def kernel_may_rebind_block_ids(graphs: Sequence[GraphInfo]) -> bool:
             consumer = rebound_consumer_dims(node)
             if consumer is None or not consumer[0]:
                 continue
-            sizes, lower_rank_by_block_id = consumer
+            sizes, pointwise_placement = consumer
             block_ids = tensor_dim_block_ids(env, sizes)
             if target is torch.ops.aten.gather.default:
                 gather_dim = node.args[1] if len(node.args) > 1 else node.kwargs["dim"]
                 assert isinstance(gather_dim, int)
                 block_ids[gather_dim % len(block_ids)] = None
             if any(
-                rebinds(
-                    operand.meta.get("val"), sizes, block_ids, lower_rank_by_block_id
-                )
+                rebinds(operand.meta.get("val"), sizes, block_ids, pointwise_placement)
                 for operand in rebound_operands(node)
             ):
                 return True
@@ -2188,7 +2191,7 @@ def check_pointwise_rebound_block_ids(
     consumer = rebound_consumer_dims(node)
     if consumer is None or not consumer[0]:
         return {}
-    consumer_sizes, lower_rank_by_block_id = consumer
+    consumer_sizes, pointwise_placement = consumer
     df = cg.device_function
     env = CompileEnvironment.current()
     config = df.config
@@ -2218,7 +2221,7 @@ def check_pointwise_rebound_block_ids(
             operand_val,
             consumer_sizes,
             result_block_ids,
-            lower_rank_by_block_id=lower_rank_by_block_id,
+            pointwise_placement=pointwise_placement,
         )
         if not rebound:
             continue
