@@ -17,17 +17,24 @@ import types
 import pytest
 
 from helion._compiler.ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
+from helion._compiler.ast_read_writes import HELION_VEC_LANE_OF_ATTR
 from helion._compiler.cute.unroll_lane_loads import unroll_lane_loads
 
 pytestmark = pytest.mark.cpu_only
 
 
-def _unroll(source: str) -> tuple[str, bool]:
+def _unroll(source: str, *, vloops: bool = False) -> tuple[str, bool]:
+    """Unroll the top-level lane loops of ``source`` 4 ways; with ``vloops``,
+    the ``for`` loops directly in their bodies are tile V-loops of the lane
+    loop (``HELION_VEC_LANE_OF_ATTR``, as a ``VecLaneWrapper`` tags them)."""
     body = ast.parse(textwrap.dedent(source)).body
     for stmt in body:
         if isinstance(stmt, ast.For):
             assert isinstance(stmt.target, ast.Name)
             setattr(stmt, HELION_LANE_LOOP_VAR_ATTR, stmt.target.id)
+            for inner in stmt.body if vloops else ():
+                if isinstance(inner, ast.For):
+                    setattr(inner, HELION_VEC_LANE_OF_ATTR, stmt.target.id)
     new_body, fired = unroll_lane_loads(body, 4, lambda name: name)
     return "\n".join(ast.unparse(stmt) for stmt in new_body), fired
 
@@ -78,6 +85,24 @@ def test_a_load_of_a_loop_carried_value_stays_in_place() -> None:
         """
     )
     assert not fired
+
+
+def test_a_v_loop_load_of_a_loop_carried_value_stays_in_place() -> None:
+    # The same through the trips of a tile V-loop, a level of its own: copied
+    # into the load phase, ``offset = offset + 1`` also ran there, and the
+    # compute phase loaded and stored past the 16 elements.
+    source = textwrap.dedent(
+        """
+        offset = base
+        for lane in range(4):
+            for vec_lane_0 in cutlass.range_constexpr(4):
+                offset = offset + 1
+                v = (x.iterator + offset).load()
+                (out.iterator + offset).store(v)
+        """
+    )
+    code, _fired = _unroll(source, vloops=True)
+    assert _stores(code, base=0) == _stores(source, base=0)
 
 
 def test_a_load_of_lane_arithmetic_moves_with_it() -> None:

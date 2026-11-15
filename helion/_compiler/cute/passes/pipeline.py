@@ -217,8 +217,9 @@ def _collect_constexpr_values(ctx: DeviceBodyContext) -> dict[str, int]:
 
 def _tensor_dtypes_str_skip(fn: DeviceFunction, env: CompileEnvironment) -> dict:
     # ``dtype_str`` raises for dtypes the cute backend has no canonical
-    # spelling for (e.g. uint32 barrier flags, which SIMT loads treat as raw
-    # bytes); such tensors simply don't participate in load fusion.
+    # spelling for.  Such a tensor's plain ``(PTR).load()`` does not
+    # participate in load fusion; a scalar ``cute.arch.load`` names its dtype
+    # and a masked load's default gives one, so those still do.
     tensor_dtypes: dict[str, str] = {}
     for arg in fn.arguments:
         if isinstance(arg, TensorArg):
@@ -753,6 +754,25 @@ def _hoist_lane_invariant_reductions(s: _DeviceBodyState) -> None:
     )
 
 
+def _hoist_lane_invariant_loads(s: _DeviceBodyState) -> None:
+    # A lane-invariant scalar load (a dropout seed read from a tensor) that
+    # a lane split left in its sweep is issued once per lane, and LLVM keeps
+    # the integer arithmetic on it (the Philox key schedule) in the loop as
+    # well.  Integer loads only, so no float operand moves.
+    from ..hoist_lane_invariant_loads import hoist_lane_invariant_loads
+
+    ctx = s.ctx
+    s.kernel_body = hoist_lane_invariant_loads(
+        s.kernel_body,
+        tensor_dtypes=ctx.tensor_dtypes_str_skip,
+        proven_disjoint_tensor_pairs=ctx.proven_disjoint_tensor_pairs,
+        rename_groups=ctx.rename_groups,
+        integer_names=frozenset(ctx.constexpr_values)
+        | (ctx.param_uniform_names - ctx.float_scalar_names),
+        float_names=ctx.float_scalar_names,
+    )
+
+
 def _hoist_factored_reductions(s: _DeviceBodyState) -> None:
     from ..factor_affine_reductions import hoist_factored_reductions
 
@@ -889,11 +909,12 @@ def _fragment_mma_dot(s: _DeviceBodyState) -> None:
 def _plan_lane_unroll(s: _DeviceBodyState) -> None:
     # ``cute_lane_unroll`` without vector-loop sinking, or with a sunk
     # nest whose lane loops the sinking pass left rolled (their loads
-    # were persistent markers, now packets): unroll the lane loops (of
-    # the grid or of a device loop) at trace time with every unrolled
-    # lane's loads (packets and scalars alike) issued before the first
-    # lane's compute.  The knob-off code is regenerated when no loop
-    # takes the unroll.
+    # were persistent markers, now packets): unroll the lane loops (of a
+    # grid or device-loop tile axis, of a looped reduction's chunk, of a
+    # persistent reduction row) at trace time with every unrolled lane's
+    # loads (packets and scalars alike) issued before the first lane's
+    # compute.  The knob-off code is regenerated when no loop takes the
+    # unroll.
     from ..fold_lane_reductions import lanes_with_sites
 
     fn = s.fn
@@ -919,11 +940,11 @@ def _wants_lane_unroll(s: _DeviceBodyState) -> bool:
 
 
 def _unroll_lane_loads(s: _DeviceBodyState) -> None:
-    # Issue all of a grid lane loop's vec loads before its first
-    # store (ptxas cannot prove the store doesn't alias the next
-    # iteration's load, so unsplit loops keep only ONE load in
-    # flight per thread; the triton backend and handwritten CuTe
-    # kernels both load the whole tile fragment first).
+    # Issue all of a lane loop's loads before its first store (ptxas
+    # cannot prove the store doesn't alias the next iteration's load,
+    # so unsplit loops keep only ONE load in flight per thread; the
+    # triton backend and handwritten CuTe kernels both load the whole
+    # tile fragment first).
     from ..unroll_lane_loads import LaneUnrollNotApplied
     from ..unroll_lane_loads import unroll_lane_loads
 
@@ -935,7 +956,7 @@ def _unroll_lane_loads(s: _DeviceBodyState) -> None:
         constexpr_values=s.ctx.constexpr_values,
     )
     # With sinking the knob belongs to the sunk nest's lane loops
-    # (``_normalize_cute_vloop_sink``); a nest that offers none
+    # (``_normalize_cute_lane_knobs``); a nest that offers none
     # keeps its code rather than regenerating knob-off.
     if s.knob_unroll > 1 and not unrolled and not s.sinking:
         raise LaneUnrollNotApplied
@@ -952,6 +973,17 @@ def _fold_lane_reductions(s: _DeviceBodyState) -> None:
         s.kernel_body,
         {lane: keys for lane, keys in s.fold_sites.items() if lane in s.folded_lanes},
         s.ctx.new_var,
+    )
+
+
+def _stash_sibling_lane_loads(s: _DeviceBodyState) -> None:
+    from ..stash_lane_loads import stash_sibling_lane_loads
+
+    s.kernel_body = stash_sibling_lane_loads(
+        s.kernel_body,
+        s.ctx.new_var,
+        rename_groups=s.ctx.rename_groups,
+        kernel_tensors=s.ctx.tensor_arg_names,
     )
 
 
@@ -1341,6 +1373,27 @@ def _hoist_exact_invariant_divisions(s: _DeviceBodyState) -> None:
     )
 
 
+def _jam_grid_lanes(s: _DeviceBodyState) -> None:
+    # After every structural pass: the jam copies each lane's finished
+    # statements, so the lanes compute exactly what the rolled loop did.
+    from ..jam_grid_lanes import jam_grid_lanes
+
+    ctx = s.ctx
+    s.kernel_body = jam_grid_lanes(
+        s.kernel_body,
+        rename_groups=ctx.rename_groups,
+        tensors={
+            arg.name: arg.fake_value
+            for arg in ctx.fn.arguments
+            if isinstance(arg, TensorArg)
+        },
+        proven_disjoint_tensor_pairs=ctx.proven_disjoint_tensor_pairs,
+        constexpr_values=ctx.constexpr_values,
+        env=ctx.env,
+        new_var=ctx.new_var,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Post-rename stage: ``finalize_kernel_def``
 # ---------------------------------------------------------------------------
@@ -1533,6 +1586,7 @@ DEVICE_BODY_PASSES: tuple[DeviceBodyPass, ...] = (
         _hoist_lane_invariant_reductions,
         requires=(LAUNCH_SHAPE,),
     ),
+    DeviceBodyPass("hoist_lane_invariant_loads", _always, _hoist_lane_invariant_loads),
     DeviceBodyPass("hoist_factored_reductions", _fast_math, _hoist_factored_reductions),
     DeviceBodyPass("fuse_fp8_pair_decode", _always, _fuse_fp8_pair_decode),
     DeviceBodyPass(
@@ -1572,6 +1626,14 @@ DEVICE_BODY_PASSES: tuple[DeviceBodyPass, ...] = (
         _has_folded_lanes,
         _fold_lane_reductions,
         requires=("lane_unroll_plan", "lane_loads_unrolled"),
+    ),
+    DeviceBodyPass(
+        "stash_sibling_lane_loads",
+        # Only after the lane unroll: the passes over a split lane loop are
+        # trace-time loops by now.
+        _wants_lane_unroll,
+        _stash_sibling_lane_loads,
+        requires=("lane_loads_unrolled",),
     ),
     DeviceBodyPass(
         "split_lane_loads",
@@ -1703,6 +1765,13 @@ DEVICE_BODY_PASSES: tuple[DeviceBodyPass, ...] = (
             "rolled_cluster_pairs_fused",
             "scalar_epilogue_lowered",
         ),
+        provides=("exact_divisions_hoisted",),
+    ),
+    DeviceBodyPass(
+        "jam_grid_lanes",
+        _config_flag("cute_grid_lane_jam"),
+        _jam_grid_lanes,
+        requires=("exact_divisions_hoisted",),
     ),
 )
 

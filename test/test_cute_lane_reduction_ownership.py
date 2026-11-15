@@ -21,6 +21,7 @@ from test.test_cute_sibling_layout_safety import _config
 import helion
 from helion._compiler.ast_read_writes import HELION_VEC_LANE_OF_ATTR
 from helion._compiler.ast_read_writes import ast_rename
+from helion._compiler.cute._ast_pass_utils import deep_clone
 from helion._compiler.cute.lane_loops import split as lane_split
 from helion._compiler.cute.lane_loops.markers import _create_lane_loop
 from helion._compiler.cute.lane_loops.markers import _is_lane_reduce_marker_assign
@@ -34,7 +35,6 @@ from helion._compiler.cute.lane_loops.markers import validate_lane_reduce_owners
 from helion._compiler.cute.lane_loops.owner_guards import _ATOMIC_HELPERS
 from helion._compiler.cute.lane_loops.owner_guards import _VECTOR_ATOMIC_HELPERS
 from helion._compiler.cute.lane_loops.owner_guards import _atomic_pointer_and_value
-from helion._compiler.cute.lane_loops.owner_guards import _clone_stmt
 from helion._compiler.cute.lane_loops.owner_guards import _lane_reduce_owner_expr
 from helion._compiler.cute.lane_loops.owner_guards import _loop_body_scalar_definitions
 from helion._compiler.cute.lane_loops.owner_guards import (
@@ -310,9 +310,9 @@ def test_distinct_lane_owner_rejected_even_for_equal_extents(
         split_lane_loop_reductions([loop])
 
 
-def test_marker_owner_survives_text_and_lane_cloning() -> None:
+def test_marker_owner_survives_statement_and_lane_cloning() -> None:
     statement = ast.parse(f"reduced = {_marker('axis')}").body[0]
-    cloned = _clone_stmt(statement)
+    cloned = deep_clone(statement)
     marker = _is_lane_reduce_marker_assign(cloned)
     assert marker is not None and marker.owner_lane == "axis"
     loop = _create_lane_loop("axis", 8, [statement])
@@ -616,7 +616,7 @@ def test_mixed_marker_and_partial_carry_remains_lane_varying(
         for index, statement in enumerate(loop.body)
         if _is_lane_reduce_marker_assign(statement) is not None
     }
-    normalized = [_clone_stmt(statement) for statement in loop.body]
+    normalized = [deep_clone(statement) for statement in loop.body]
     for statement in normalized:
         ast_rename(statement, renames)
     # The legacy marker-taint test misses the independent partial in both

@@ -11,6 +11,8 @@ time), so every kernel here binds with static shapes.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 import torch
 
@@ -311,3 +313,42 @@ def test_a_tile_start_off_a_packet_multiple_stays_scalar(
         code = bound.to_code(config)
     assert ("_tile_unroll_vec_" in code) is packed
     assert ("_tile_store_vals_" in code) is packed
+
+
+def _masked_double_tile_from(
+    x: torch.Tensor, mask: torch.Tensor, start: hl.constexpr
+) -> torch.Tensor:
+    k = x.shape[0]
+    out = torch.zeros_like(x)
+    for tk, tn in hl.tile([0, start], [k, start + 128]):
+        out[tk, tn] = torch.where(mask[tk, tn], x[tk, tn] * 2, 0)
+    return out
+
+
+@pytest.mark.parametrize(("start", "packed"), [(0, True), (1, False), (8, True)])
+def test_a_bool_tile_packet_needs_the_same_start(start: int, packed: bool) -> None:
+    """A bool row's tile packet, one ``Uint64`` of eight bytes per lane,
+    needs the tile to start at a multiple of eight as well."""
+    bound = cpu_bind(
+        helion.kernel(
+            _masked_double_tile_from,
+            backend="cute",
+            static_shapes=True,
+            autotune_effort="none",
+        ),
+        (
+            torch.empty((64, 144), dtype=torch.bfloat16),
+            torch.empty((64, 144), dtype=torch.bool),
+            start,
+        ),
+    )
+    config = helion.Config(
+        block_sizes=[8, 128], num_threads=[8, 16], cute_vector_widths=[1, 8]
+    )
+    with mock_cuda_unavailable():
+        code = bound.to_code(config)
+    mask_packet = re.search(
+        r"_tile_unroll_vec_\w+ = cute\.arch\.load\(mask\.iterator\b.*cutlass\.Uint64\)",
+        code,
+    )
+    assert (mask_packet is not None) is packed

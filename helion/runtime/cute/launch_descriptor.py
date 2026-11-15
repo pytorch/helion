@@ -60,6 +60,54 @@ def use_pdl(cute_kernel: object) -> bool:
     return getattr(cast("Any", cute_kernel), "_helion_cute_use_pdl", False) is True
 
 
+def min_blocks_per_mp(
+    cute_kernel: object, wrapper_plans: Sequence[dict[str, object]] = ()
+) -> int | None:
+    """The ``min_blocks_per_mp`` (ptxas ``minnctapersm``) to launch
+    ``cute_kernel`` with, ``None`` for none.
+
+    An emitter's ``_helion_cute_min_blocks_per_mp`` wins.  The fa4 flash
+    topology otherwise declares one CTA per SM: ptxas honors the kernel's
+    ``setmaxnreg`` register reallocation (the softmax warps' 200-register
+    grant) only when the kernel declares ``min_blocks_per_mp``, and fa4 holds
+    one CTA per SM anyway (512 threads, TMEM, shared memory near the cap).
+    The 256-thread ws_overlap topology runs two CTAs per SM and declares
+    none.
+    """
+    explicit = getattr(cast("Any", cute_kernel), "_helion_cute_min_blocks_per_mp", None)
+    if type(explicit) is int and explicit > 0:
+        return explicit
+    if any(plan.get("topology") == "fa4" for plan in wrapper_plans):
+        return 1
+    return None
+
+
+# ``CU_SHAREDMEM_CARVEOUT_DEFAULT``: the driver's own "no preference" value of
+# ``CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT``.
+DRIVER_DEFAULT_SMEM_CARVEOUT = -1
+
+
+def preferred_smem_carveout(
+    cute_kernel: object, wrapper_plans: Sequence[dict[str, object]] = ()
+) -> int | None:
+    """The ``preferred_smem_carveout`` to pass the CuTe DSL's launch of
+    ``cute_kernel``, ``None`` for none.
+
+    A launch with ``min_blocks_per_mp`` above 1 passes
+    ``DRIVER_DEFAULT_SMEM_CARVEOUT``.  Without a preference the DSL has the
+    compiler size the kernel's carveout from the launch's dynamic shared
+    memory alone, which leaves out the static allocations (``alloc_smem``
+    tiles, the cross-warp reduce buffers) and caps the CTAs per SM at what
+    fits in that carveout.  Any preference stops that calculation, and the
+    driver sizes the carveout for the occupancy the other limits allow; -1
+    is the driver's own "no preference", should a DSL apply the value.
+    """
+    min_blocks = min_blocks_per_mp(cute_kernel, wrapper_plans)
+    if min_blocks is not None and min_blocks > 1:
+        return DRIVER_DEFAULT_SMEM_CARVEOUT
+    return None
+
+
 def cluster_shape(
     cute_kernel: object, wrapper_plans: Sequence[dict[str, object]]
 ) -> tuple[int, int, int] | None:

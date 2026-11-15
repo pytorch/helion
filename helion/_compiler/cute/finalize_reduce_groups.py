@@ -27,8 +27,9 @@ claimed axis exceeds the static shape, and the launcher checks the recorded
 assumption against the ``block=`` it finally emits.
 
 The pass walks the body rather than recording emitted sites: the lane split
-and the vector-loop sink clone statements through unparse-and-reparse, so
-node identities do not survive to this point.
+and the vector-loop sink copy statements into new nodes (``deep_clone``,
+``vector_reduction_packets._clone``), so node identities do not survive to
+this point.
 """
 
 from __future__ import annotations

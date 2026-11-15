@@ -1,8 +1,9 @@
 """Trace-time lane unrolling with every unrolled lane's loads issued first.
 
 A synthetic lane loop (``DeviceGridState.wrap_body`` for a grid axis, the
-device-loop body for a ``hl.tile`` axis inside the kernel) walks a thread's
-elements of one tile axis one at a time, and the CuTe DSL lowers its
+device-loop body for a ``hl.tile`` axis inside the kernel, and the lanes of
+a looped reduction's chunk or of a persistent reduction row) walks a
+thread's elements of one axis one at a time, and the CuTe DSL lowers its
 ``range(N)`` to an ``scf.for``::
 
     for lane_0 in range(N):
@@ -46,17 +47,33 @@ lists only name SSA values; the DSL sees ``U`` independent loads followed by
 the compute, which is the order the tile program gives them (a tile load
 precedes everything after it for the whole tile, so lane ``n + 1``'s load
 moving above lane ``n``'s atomic is the program's order, not a reordering).
-The load phase runs ahead of the lanes' compute, so it never assigns a name a
-lane reads before assigning it (a loop-carried name): that assignment and the
-loads that read the name keep their place.
+
+A looped reduction's lane computes its vector in a constexpr V-loop
+(``HELION_REDUCTION_VLOOP_ATTR``) whose loads before its first memory effect
+are tile loads of the chunk, which the program issues before the chunk's
+stores: that V-loop is one more level, its element loads moving one copy
+per element.
 
 Only loads that precede the body's first memory effect in program order
 move (a load after a store or atomic keeps its place, since the tile program
 issues it after that effect for every element), together with the pure index
-arithmetic they need, which is re-derived in the compute phase.  A statement
-moves only when every name it reads is defined outside the loop, is a lane
-variable, or is defined exactly once in the loop by a statement that moved
-before it: a loop-carried value or a name defined twice pins its readers.
+arithmetic they need, which is re-derived in the compute phase.  A V-loop
+nested in the body is one more level: its trips are trace-time copies
+already, but a scalar load in it (a vector axis that is not the loaded
+tensor's contiguous dim, such as a transposed tile's rows) issues after the
+previous trip's stores, so its leading loads move into the load phase like a
+nested lane loop's.  A nest whose V-loop stores or atomically updates after
+such a load takes the split even when its lane loop has a single trip or
+cannot be unrolled further (a factor of 1: the lane loop stays rolled around
+the two phases).  When the V-loop's copies break the unroll's bounds, the
+V-loop stays in place, a statement with memory effects, and the loads ahead
+of it still move.  A statement moves only when every name it reads is
+defined outside the loop, is a lane variable, or is defined exactly once in
+the loop by a statement that moved before it, and when its own name is not
+read earlier in the lane body: a loop-carried value or a name defined twice
+pins its readers, and a loop-carried name's assignment keeps its place (in
+the load phase it would leave the last lane's value where the lane reads
+the carried one).
 Bodies still holding ``_helion_*`` compiler markers, reversed lane loops and
 already-constexpr lane loops are left alone, and so is a body holding any loop
 the trace keeps rolled other than a lane loop and a loop of one trip (a looped
@@ -82,6 +99,7 @@ from ...runtime.config import Config
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
+from ..ast_read_writes import HELION_VEC_LANE_OF_ATTR
 from ..ast_read_writes import ReadWrites
 from ._ast_pass_utils import _is_proven_relocatable_call
 from ._ast_pass_utils import call_path
@@ -89,9 +107,13 @@ from ._ast_pass_utils import loop_extent
 from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
 from .fuse_two_pass_loads import _range_bounds
 from .fuse_two_pass_loads import _trip_count_for
+from .lane_loops.markers import HELION_REDUCTION_VLOOP_ATTR
 from .lane_loops.markers import _literal_range_trips
+from .lane_loops.owner_guards import _memory_write_calls
 from .lane_loops.statements import contains_compiler_marker
 from .packet_access import match_packet_access
+from .scalar_policy_loads import is_extended_scalar_load
+from .scalar_policy_loads import scalar_load_policy
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -219,6 +241,21 @@ def _runs_once(loop: ast.For, trips: int | None) -> bool:
     return not loop.orelse and trips is not None and trips <= 1
 
 
+def _vloop_extent(stmt: ast.AST) -> int | None:
+    """The extent of a tile V-loop (a ``cutlass.range_constexpr(V)``,
+    ``V >= 2``, that a ``VecLaneWrapper`` tags with the lane loop around it,
+    ``HELION_VEC_LANE_OF_ATTR``), else ``None``.  A persistent reduction's
+    V-loop is its own lane loop (the tag names its own variable) and is no
+    such level, nor is a V-loop an earlier pass rebuilt without the tag (the
+    per-lane fold of ``hoist_warp_reduce``)."""
+    extent = loop_extent(stmt, kinds=("constexpr",), minimum=2)
+    if extent is None:
+        return None
+    lane = getattr(stmt, HELION_VEC_LANE_OF_ATTR, None)
+    target = stmt.target  # type: ignore[attr-defined]
+    return extent if lane is not None and lane != target.id else None
+
+
 def _ascending_range_extent(loop: ast.AST) -> int | None:
     """``for <name> in range(<int>)`` -> the extent; ``None`` for anything else."""
     return loop_extent(loop, kinds=("range",), minimum=1)
@@ -252,27 +289,25 @@ def _is_packet_load(stmt: ast.AST) -> bool:
     )
 
 
-def _has_scalar_policy_load(loop: ast.For) -> bool:
-    """Whether the body loads a scalar through ``cute.arch.load`` with a
-    cache-policy keyword (``cop=`` / ``level1_eviction_priority=``).
+def _has_extended_scalar_load(loop: ast.For) -> bool:
+    """Whether the body loads a scalar through a hinted ``cute.arch.load``
+    that reaches NVVM as an extended load (``is_extended_scalar_load``).
 
     The CuTe DSL's compiler aborts (a native abort, no diagnostic) on the
-    trace-time unrolled form of such a body (repro:
-    ``/tmp/segred/run_gen.py /tmp/segred/gen_crash1.py asis`` on 2026-09-29,
-    cutlass 4.7); the rolled form and the 16-byte vector helper forms
-    compile, so the unroll declines these bodies and the knob-off code is
-    kept.
+    trace-time unrolled form of a body holding such loads: the SDK's
+    load/store vectorizer groups the extended loads with ordinary ones.  The
+    unroll declines such a body and keeps the knob-off code.  The 4- and
+    8-byte scalar hints are no such loads: ``lower_scalar_policy_loads``
+    spells them as exact-policy PTX, which the vectorizer leaves alone.
     """
-    for call in _calls(loop):
-        if not call.keywords or ast.unparse(call.func) != "cute.arch.load":
-            continue
-        if len(call.args) >= 2 and (
-            isinstance(call.args[1], ast.Call)
-            and ast.unparse(call.args[1].func) == "ir.VectorType.get"
-        ):
-            continue
-        return True
-    return False
+    return any(is_extended_scalar_load(call) for call in _calls(loop))
+
+
+def _has_lowered_scalar_load(loop: ast.For) -> bool:
+    """Whether the body holds a hinted 4- or 8-byte scalar load, one that
+    ``lower_scalar_policy_loads`` spells as exact-policy PTX
+    (``scalar_load_policy``)."""
+    return any(scalar_load_policy(call) is not None for call in _calls(loop))
 
 
 def _is_effect_free(node: ast.AST) -> bool:
@@ -295,6 +330,24 @@ def _candidate_target(stmt: ast.AST) -> str | None:
     return None
 
 
+def _nested_level(stmt: ast.AST, vloops: bool) -> tuple[int, bool] | None:
+    """``(extent, tile V-loop)`` of a statement the planner takes as one
+    more level, else ``None``: a nested lane loop; a tile V-loop
+    (``_vloop_extent``, when ``vloops``), whose scalar loads issue after the
+    previous trip's stores; or a looped reduction's V-loop
+    (``HELION_REDUCTION_VLOOP_ATTR``), whose loads before its first memory
+    effect are tile loads of the chunk too.  A V-loop's loads move one copy
+    per element."""
+    if getattr(stmt, HELION_REDUCTION_VLOOP_ATTR, False):
+        extent = loop_extent(stmt, kinds=("constexpr",))
+        return None if extent is None else (extent, False)
+    if vloops and (extent := _vloop_extent(stmt)) is not None:
+        return extent, True
+    if _is_lane_loop(stmt) and (extent := _ascending_range_extent(stmt)) is not None:
+        return extent, False
+    return None
+
+
 @dataclasses.dataclass
 class _Hoisted:
     """One statement of a lane body that moves into the load phase."""
@@ -314,6 +367,8 @@ class _LevelPlan:
     extent: int
     # Original statements in order, with hoisted ones and nested levels.
     items: list[_Hoisted | _LevelPlan]
+    # A V-loop level (``_vloop_extent``) rather than a lane loop.
+    vloop: bool = False
 
     def load_count(self) -> int:
         return sum(
@@ -334,6 +389,33 @@ class _LevelPlan:
             for item in self.items
         )
 
+    def vloop_split(self) -> bool:
+        """Whether a nested V-loop level hoists a load that a memory write of
+        that V-loop follows: the split then moves the load ahead of the
+        write, which pays off without any copies of the lane body.  A V-loop
+        that only collects values (a packet's flush comes after it) already
+        issues its loads back to back."""
+        return any(
+            isinstance(item, _LevelPlan)
+            and ((item.vloop and item.writes_after_load()) or item.vloop_split())
+            for item in self.items
+        )
+
+    def writes_after_load(self) -> bool:
+        """Whether a store or atomic of this level's loop body follows one of
+        the loads the level hoists."""
+        hoisted = {
+            id(item.stmt)
+            for item in self.items
+            if isinstance(item, _Hoisted) and item.list_index is not None
+        }
+        load_seen = False
+        for stmt in self.loop.body:
+            if load_seen and _memory_write_calls(stmt):
+                return True
+            load_seen = load_seen or id(stmt) in hoisted
+        return False
+
     def nested_product(self) -> int:
         """Trace-time copies of the nested levels of one trip of this level:
         a nested level's trips times its own copies, added over sibling
@@ -351,7 +433,9 @@ class _LevelPlan:
 class _Planner:
     """Decide which statements of one lane loop nest move into the load phase."""
 
-    def __init__(self, loop: ast.For) -> None:
+    def __init__(self, loop: ast.For, *, vloops: bool = True) -> None:
+        # Whether tile V-loops are nested levels (``_vloop_extent``).
+        self.vloops = vloops
         rw = ReadWrites.from_ast(loop)
         # Names written anywhere in the nest (``visit_For`` skips loop
         # targets, so lane variables are not counted here).
@@ -435,21 +519,22 @@ class _Planner:
                     outer_deps[name] = None
 
         for stmt in loop.body:
-            if _is_lane_loop(stmt) and not effect_seen:
-                nested_extent = _ascending_range_extent(stmt)
-                if nested_extent is not None:
-                    nested, nested_deps = self.plan(
-                        stmt,  # type: ignore[arg-type]
-                        nested_extent,
-                        {*available, *hoisted},
-                        [*outer_pending, pending],
-                    )
-                    if nested.load_count():
-                        pull(nested_deps)
-                        items.append(nested)
-                    if not _is_effect_free(stmt):
-                        effect_seen = True
-                    continue
+            level = None if effect_seen else _nested_level(stmt, self.vloops)
+            if level is not None:
+                nested_extent, is_vloop = level
+                nested, nested_deps = self.plan(
+                    stmt,  # type: ignore[arg-type]
+                    nested_extent,
+                    {*available, *hoisted},
+                    [*outer_pending, pending],
+                )
+                nested.vloop = is_vloop
+                if nested.load_count():
+                    pull(nested_deps)
+                    items.append(nested)
+                if not _is_effect_free(stmt):
+                    effect_seen = True
+                continue
             target = _candidate_target(stmt)
             if target is not None:
                 assert isinstance(stmt, ast.Assign)
@@ -559,7 +644,9 @@ def _unroll_factor(
     packet_count: int,
     statements: int,
 ) -> int:
-    factor = 1
+    """The largest unroll choice within ``unroll`` and the bounds, 0 when
+    not even a single lane body fits them."""
+    factor = 0
     for choice in _CUTE_LANE_UNROLL_CHOICES:
         if (
             choice <= unroll
@@ -570,6 +657,37 @@ def _unroll_factor(
         ):
             factor = choice
     return factor
+
+
+def _plan_unroll(
+    loop: ast.For,
+    extent: int,
+    unroll: int,
+    statements: int,
+    *,
+    require_full: bool,
+    vloops: bool,
+) -> tuple[_Planner, _LevelPlan, int] | None:
+    """A plan of ``loop``'s loads-first unroll and its factor, or ``None``
+    when it hoists no load or no factor within ``unroll`` keeps its copies,
+    packets and traced statements within the bounds.  A forced unroll needs
+    every lane (``require_full``).  A factor of 1 (the lane loop stays rolled
+    around the two phases) applies only when a V-loop's loads split from
+    the writes that follow them (``_LevelPlan.vloop_split``), which needs
+    V-loop levels (``vloops``), never planned for a forced unroll."""
+    planner = _Planner(loop, vloops=vloops)
+    plan, _deps = planner.plan(loop, extent, set(), [])
+    smallest = 1 if plan.vloop_split() else 2
+    factor = _unroll_factor(
+        extent, unroll, plan.nested_product(), plan.packet_count(), statements
+    )
+    if (
+        not plan.load_count()
+        or factor < smallest
+        or (require_full and factor != extent)
+    ):
+        return None
+    return planner, plan, factor
 
 
 def _unroll_one(
@@ -583,24 +701,34 @@ def _unroll_one(
     extent = _ascending_range_extent(loop)
     if (
         extent is None
-        or extent < 2
         or contains_compiler_marker(list(loop.body))
-        or _has_scalar_policy_load(loop)
+        or _has_extended_scalar_load(loop)
+        # A forced unroll (the cross-lane fold's) runs whatever the knob
+        # says, so it copies a body holding a hinted scalar load in place:
+        # moving those loads first would change the code without the knob.
+        or (require_full and _has_lowered_scalar_load(loop))
     ):
-        return None
-    planner = _Planner(loop)
-    plan, _deps = planner.plan(loop, extent, set(), [])
-    if not plan.load_count():
         return None
     # A forced unroll copies the body in place otherwise (``_force_constexpr``).
     statements = 0 if require_full else _trace_size(loop.body, constexpr_values)
     if statements is None:
         return None
-    factor = _unroll_factor(
-        extent, unroll, plan.nested_product(), plan.packet_count(), statements
+    # V-loops are nested levels unless their copies break the bounds; the
+    # plan without them, which keeps a V-loop in place, stands then.  A
+    # forced unroll (the cross-lane fold's) runs whatever the knob says, so
+    # it keeps its V-loops in place: moving their loads first would change
+    # the code without the knob.
+    planned = None
+    if not require_full:
+        planned = _plan_unroll(
+            loop, extent, unroll, statements, require_full=False, vloops=True
+        )
+    planned = planned or _plan_unroll(
+        loop, extent, unroll, statements, require_full=require_full, vloops=False
     )
-    if factor < 2 or (require_full and factor != extent):
+    if planned is None:
         return None
+    planner, plan, factor = planned
     lists = [new_var(f"{_LIST_PREFIX}{i}") for i in range(planner.next_list)]
     lane_var = loop.target.id  # type: ignore[union-attr]
     list_inits = [statement_from_string(f"{name} = []") for name in lists]

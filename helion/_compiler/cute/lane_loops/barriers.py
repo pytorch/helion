@@ -48,25 +48,27 @@ and the store ``x[t]`` of the next) cannot be ordered by any barrier and is
 rejected, as the loop would have to be split; only a pair whose equal terms
 force the loop's own variable equal is confined to its lane (the V-loop's
 variable forced equal confines a pair to a vector lane, not to a lane of the
-loop around it).  A device loop inside a lane loop runs whole once per lane,
-so its body's accesses of one tensor are paired the same way, with the
-device loop's iteration free on both sides: the previous row's element read
-per lane beside the row's store (``x[t0.index - 1, tk]`` and ``x[t0, tk]``),
-or an address every lane shares beside a per-lane one, is rejected; two
-accesses confined to a lane, two that never meet (only the literal bounds
-of their recorded regions count there: the loop's own tile begins differ
-between the iterations the passes pair), or two stores whose addresses
-ignore the lane (re-applied in program order) are not.  A statement's own
-stores meet each other, across the lanes' passes as across the device
-loop's iterations, when the map from the instance to the element folds
-(the lane or thread and the iteration summed into one index); the terms
-show the fold when they know every value in them, and a map through a
-value loaded per thread or per lane (a jagged tile's rows begin at an
-offset loaded per row) is not modelled.  A packet
-(a vector load hoisted above a V-loop, the flush of its stores) is every one
-of its elements: its term along the vectorized dimension is the per-thread
-base's plus the V-loop's variable, so the packet's later elements are
-compared as much as its first.
+loop around it).  A looped reduction's lane loop and V-loop around a device
+loop's body, which the nest does not hold, run such lanes too, one chunk at
+a time: a pair that may meet in two lanes of one chunk is rejected the same
+way (``lane_variables``).  A device loop inside a lane loop runs whole once
+per lane, so its body's accesses of one tensor are paired the same way, with
+the device loop's iteration free on both sides: the previous row's element
+read per lane beside the row's store (``x[t0.index - 1, tk]`` and
+``x[t0, tk]``), or an address every lane shares beside a per-lane one, is
+rejected; two accesses confined to a lane, two that never meet (only the
+literal bounds of their recorded regions count there: the loop's own tile
+begins differ between the iterations the passes pair), or two stores whose
+addresses ignore the lane (re-applied in program order) are not.  A
+statement's own stores meet each other, across the lanes' passes as across
+the device loop's iterations, when the map from the instance to the element
+folds (the lane or thread and the iteration summed into one index); the
+terms show the fold when they know every value in them, and a map through a
+value loaded per thread or per lane (a jagged tile's rows begin at an offset
+loaded per row) is not modelled.  A packet (a vector load hoisted above a
+V-loop, the flush of its stores) is every one of its elements: its term
+along the vectorized dimension is the per-thread base's plus the V-loop's
+variable, so the packet's later elements are compared as much as its first.
 
 Design note: the ownership model and its proofs
 -----------------------------------------------
@@ -146,7 +148,11 @@ already ordered by a barrier closing an inner loop's body may get another
 at the enclosing loop; a branch on a literal condition (an emitter's
 ``if True:`` scope) is divergent like any other, so a pair racing inside
 it is rejected rather than barriered (only an ``hl.if`` whose condition
-``cute/block_uniform.py`` proves the same for the whole CTA is not).
+``cute/block_uniform.py`` proves the same for the whole CTA is not); the
+chunks of a looped reduction tell which of two accesses meeting in two
+chunks runs first only through terms affine in variables of known ranges
+(``AddressMaps.apart_in_later_iterations``), so a load meeting only a
+later chunk's store through other terms is rejected.
 Known gaps (programs accepted whose nest is not the program): a store
 through a value loaded per thread or per lane (``x[base[t0] +
 tk.begin]``, a jagged tile's rows beginning at
@@ -163,6 +169,7 @@ from __future__ import annotations
 import ast
 import collections
 import dataclasses
+from itertools import starmap
 import logging
 import operator
 from typing import TYPE_CHECKING
@@ -174,6 +181,7 @@ from .... import exc
 from ...ast_extension import expr_from_string
 from ...ast_extension import statement_from_string
 from ...ast_read_writes import HELION_BLOCK_UNIFORM_ATTR
+from ...ast_read_writes import HELION_RAW_BARRIER_TENSORS_ATTR
 from ..address_maps import AddressMaps
 from ..address_maps import Load
 from ..address_maps import _tighter
@@ -211,6 +219,7 @@ from .statements import _thread_axis_reads
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+    from collections.abc import Iterator
     from collections.abc import Mapping
     from collections.abc import Sequence
 
@@ -222,12 +231,35 @@ log = logging.getLogger(LOGGER_NAME)
 _BARRIER_CALL = "cute.arch.sync_threads"
 
 
-def _is_barrier(node: ast.AST) -> bool:
+def is_barrier(node: ast.AST) -> bool:
+    """Whether ``node`` is a ``cute.arch.sync_threads()`` statement."""
     return (
         isinstance(node, ast.Expr)
         and isinstance(node.value, ast.Call)
         and ast.unparse(node.value.func) == _BARRIER_CALL
     )
+
+
+def _rely(block: _Block, positions: Sequence[int]) -> bool:
+    """Whether a barrier at one of ``positions`` in ``block`` orders a pair.
+
+    When every one of them is a load's read-after-write barrier, tagged with
+    the tensors whose stores it orders (``HELION_RAW_BARRIER_TENSORS_ATTR``),
+    the first loses its tag: it orders this pair too, so no later pass may
+    treat it as ordering only those stores.
+    """
+    if not positions:
+        return False
+    items = cast("list[ast.AST]", block.items)
+    tagged = [
+        position
+        for position in positions
+        if position in block.existing
+        and getattr(items[position], HELION_RAW_BARRIER_TENSORS_ATTR, None) is not None
+    ]
+    if len(tagged) == len(positions):
+        delattr(items[tagged[0]], HELION_RAW_BARRIER_TENSORS_ATTR)
+    return True
 
 
 def _register_arrays(nodes: Iterable[ast.AST]) -> set[str]:
@@ -246,6 +278,35 @@ def _register_arrays(nodes: Iterable[ast.AST]) -> set[str]:
                 and isinstance(child.targets[0], ast.Name)
                 and isinstance(child.value, ast.Call)
                 and ast.unparse(child.value.func) == "cute.make_rmem_tensor"
+            ):
+                names.add(child.targets[0].id)
+    return names
+
+
+def _iteration_buffers(nodes: Iterable[ast.AST]) -> set[str]:
+    """The names ``nodes`` bind to shared memory they also allocate
+    (``cute.make_tensor`` of a ``cute.arch.alloc_smem`` pointer bound among
+    them, as a rebinding's exchange buffer is): storage of one iteration of
+    the loop whose body they are, which holds nothing from one iteration to
+    the next."""
+    pointers: set[str] = set()
+    names: set[str] = set()
+    for node in nodes:
+        for child in ast.walk(node):
+            if not (
+                isinstance(child, ast.Assign)
+                and len(child.targets) == 1
+                and isinstance(child.targets[0], ast.Name)
+                and isinstance(child.value, ast.Call)
+            ):
+                continue
+            call = child.value
+            if ast.unparse(call.func) == "cute.arch.alloc_smem":
+                pointers.add(child.targets[0].id)
+            elif ast.unparse(call.func) == "cute.make_tensor" and (
+                call.args
+                and isinstance(pointer := call.args[0], ast.Name)
+                and pointer.id in pointers
             ):
                 names.add(child.targets[0].id)
     return names
@@ -431,7 +492,7 @@ def _leaves(
                 )
             continue
         if not isinstance(item, LanePlacement):
-            if _is_barrier(item):
+            if is_barrier(item):
                 block.existing.add(index)
             leaves.append(_Leaf(_analyze(-1, item, renames), here))
             continue
@@ -547,6 +608,11 @@ def add_thread_barriers(
     loop_shifts: _Shifts | None = None,
     constants: Mapping[str, int] | None = None,
     loop_headers: Sequence[ast.For] = (),
+    lane_variables: frozenset[str] = frozenset(),
+    packets_before: Sequence[ast.AST] = (),
+    packets_after: Sequence[ast.AST] = (),
+    packet_calls: Mapping[int, tuple[str, str]] | None = None,
+    chunk_shifts: _Shifts | None = None,
 ) -> None:
     """Separate with block-wide barriers the tensor accesses threads could race on.
 
@@ -556,25 +622,31 @@ def add_thread_barriers(
     statements and trip counts; ``axis_sizes`` gives the launch thread count
     along each thread axis the body may address; ``definitions`` are the
     per-thread index and mask definitions around the body (the lane setup,
-    the thread axes without a lane loop, the vec wrappers' lane bases) and
-    ``masks`` the tile masks among them; ``constants`` the values of the
-    block-size constants the loop bounds inside the body name;
+    the thread axes without a lane loop, the vec wrappers' lane bases, the
+    statements the per-thread loops among ``loop_headers`` run before the
+    body) and ``masks`` the tile masks among them; ``constants`` the values
+    of the block-size constants the loop bounds inside the body name;
     ``loop_headers`` the ``for`` statements of the device loop whose body
-    the nest is (their bounds model the loop's variables across
-    iterations) and of the loops around it (the enclosing device loops and
-    lane loops: their variables are one value each throughout the body,
-    nonnegative and below their bounds, ``AddressMaps``).  Two
-    statements accessing one tensor, at least one writing it, whose threads
-    may differ along an axis shared by several threads (the address
-    mappings of the two accesses do not force the coordinate equal,
-    ``AddressMaps.same_thread``, the indices the tile masks around each
-    access bound counting as bounded, ``AddressMaps.bounds``: a uniform
-    address, a gathered one, a
+    the nest is and of the per-thread loops between it and the nest that
+    the nest does not hold (a looped reduction's lane loop and V-loop,
+    whose targets are ``lane_variables``), whose bounds model their
+    variables across iterations, and of the loops around them (the
+    enclosing device loops and lane loops: their variables are one value
+    each throughout the body, nonnegative and below their bounds,
+    ``AddressMaps``).  Two statements accessing one tensor, at least one
+    writing it, whose threads may differ along an axis shared by several
+    threads (the address mappings of the two accesses do not force the
+    coordinate equal, ``AddressMaps.same_thread``, the indices the tile
+    masks around each access bound counting as bounded,
+    ``AddressMaps.bounds``: a uniform address, a gathered one, a
     neighbour's or a permuted element) get a barrier between them at their
     nearest common statement list unless ``_races`` proves the order
     immaterial or the recorded regions of their accesses are apart
     (``_disjoint``); a barrier
-    already there counts.  Modifies ``items`` in place: barrier statements
+    already there counts, and a load's read-after-write barrier counted on
+    loses its tag (``HELION_RAW_BARRIER_TENSORS_ATTR``), since it then
+    orders more than its load's stores.  Modifies ``items`` in
+    place: barrier statements
     are inserted among placement items, and positions among a vectorized
     loop's wrapper statements are recorded on its ``LanePlacement.barriers``.
     A pair whose barrier would sit in control flow a thread may skip, where
@@ -587,28 +659,56 @@ def add_thread_barriers(
 
     Every loop of the nest runs its body once per iteration on every thread
     with nothing between the iterations.  The device loop whose body the
-    nest is (``loop_variables`` names what it redefines per iteration, its
-    ``for`` targets, and ``loop_body`` the statement list one iteration runs:
-    ``items``, or the innermost loop's) runs its iterations one after the
-    other in the program: two statements of its body, in either emission
-    order and a statement with itself included on a tensor it both reads
-    and writes (a device loop nested in the body holds a uniform read and a
-    per-thread store of its own; its unknown effects, the tensors inside
-    calls the pass cannot see through, are not ordered against its own next
-    instance) or only stores to through a map the terms know whole (which
-    folds between the iterations when the thread and the iteration sum into
-    one index), racing as one iteration's and a later one's, need a barrier
-    after the first
-    within its iteration or before the second within its own; when none of
-    the placed ones does, one is added at the end of the body (or right
-    after the first statement, when that sits among a vectorized loop's
-    wrapper statements past the body).  Only the recorded regions of the
-    accesses exempt such a pair, when they cannot meet in any later
-    iteration (``loop_shifts`` maps the loop's begin symbols to their step,
-    ``_disjoint``), or the address mappings, when they force the thread
-    equal with the loop's variables taken as differing between the two
-    iterations; a uniform access whose address moves with the iteration
-    may still meet the previous iteration's per-thread stores.  A lane
+    nest is (``loop_variables`` names what it redefines per iteration: its
+    ``for`` targets and those of the per-thread loops between it and the
+    nest, whose iterations count as its own, run in program order inside
+    each of its iterations; ``loop_body`` is the statement list one
+    iteration runs: ``items``, or the innermost loop's) runs its iterations
+    one after the other in the program: two statements of its body, in
+    either emission order and a statement with itself included on a tensor
+    it both reads and writes (a device loop nested in the body holds a
+    uniform read and a per-thread store of its own; its unknown effects,
+    the tensors inside calls the pass cannot see through, are not ordered
+    against its own next instance) or only stores to through a map the
+    terms know whole (which folds between the iterations when the thread
+    and the iteration sum into one index), racing as one iteration's and a
+    later one's, need a barrier after the first within its iteration or
+    before the second within its own; when none of the placed ones does,
+    one is added at the end of the body (or right after the first
+    statement, when that sits among a vectorized loop's wrapper statements
+    past the body).  Only the recorded regions of the accesses exempt such
+    a pair, when they cannot meet in any later iteration (``loop_shifts``
+    maps the loop's begin symbols to their step, or to None when the next
+    iteration's begins are unrelated, as when per-thread loops make the
+    next iteration another lane of the same tile: ``_disjoint``), or the
+    address mappings, when they force the thread equal with the loop's
+    variables taken as differing between the two iterations; a uniform
+    access whose address moves with the iteration may still meet the
+    previous iteration's per-thread stores.  The per-thread loops'
+    iterations are lanes of the tile statements, though: a pair that may
+    meet in two of them within one iteration of the device loop (their
+    equal terms do not force every variable of ``lane_variables`` equal),
+    one side writing, is rejected with ``BackendUnsupported``, since no
+    barrier orders a thread's own lanes (a statement meets itself there on
+    a tensor it both reads and writes; two stores whose addresses ignore
+    the lanes are not paired).  Their packets are accesses of every element
+    of a lane's vector, paired by that rule too: those they load before the
+    body (``packets_before``) and flush after it (``packets_after``), with
+    ``packet_calls`` giving each packet call's V-loop variable and
+    per-thread base (``_packets``).  With ``chunk_shifts`` (the step of each
+    tile begin per chunk) the device loop walks the chunks of a looped
+    reduction, whose tile statements the program runs over every chunk
+    before the next one (a load of every element before a store of any): a
+    pair that may meet in two chunks (its regions are not apart and its
+    equal terms do not force the chunk equal), one side writing, is
+    rejected with ``BackendUnsupported`` too, unless the loop runs one
+    chunk (a cluster split's slice) or the program's earlier statement,
+    run in a later chunk, never reaches an element the later one reached
+    in an earlier chunk (``AddressMaps.apart_in_later_iterations``: a load
+    of ``out[t, 64:]`` beside a store of ``out[t, :n]``).  A barrier orders
+    threads, not chunks, whatever the addresses: ``out[t, 64:] = out[t,
+    :n] + 1`` stores in one chunk what the next one loads.
+    A lane
     loop's or V-loop's iterations are one tile statement's lanes, run
     together before the next statement's, on one thread whatever the thread
     count along its axis: such a pair, when one side writes and a gathered
@@ -731,7 +831,8 @@ def add_thread_barriers(
             name: count for scope in scopes for name, count in scope.counts.items()
         },
         leaves=[leaf.statement.node for leaf in leaves],
-        definitions=definitions,
+        # The flushes after the body read its definitions and define nothing.
+        definitions=[*definitions, *packets_after],
         renames=rename_groups,
         loaded=loaded_names,
         constants=constants or {},
@@ -1093,9 +1194,17 @@ def add_thread_barriers(
             }
             if tensors and not _exclusive_sides(first, second):
                 block, after, before = _common_block(first, second)
-                if any(after < barrier <= before for barrier in block.existing):
+                if _rely(
+                    block,
+                    [
+                        barrier
+                        for barrier in block.existing
+                        if after < barrier <= before
+                    ],
+                ):
                     # Ordered already, by a barrier the lowering emitted
-                    # itself (a scan's, between its shared-memory phases).
+                    # itself (a scan's, between its shared-memory phases, or
+                    # a load's read-after-write barrier).
                     continue
                 if block.divergent or after == before:
                     reject(tensors)
@@ -1202,6 +1311,41 @@ def add_thread_barriers(
             or (stores_only(statement, tensor) and invariant(model.get(tensor), set()))
         )
 
+    def shared_pairs(
+        statements: Sequence[_Statement],
+        models: Sequence[Mapping[str, list[list[sympy.Expr | None]] | None]],
+        own: Sequence[frozenset[str]],
+        symbols: set[sympy.Symbol],
+        *,
+        lane_level: bool = False,
+    ) -> Iterator[tuple[int, int, str]]:
+        """``(earlier, later, tensor)``: the positions of two of ``statements``, or of one twice, and a tensor outside ``private`` they both access, which two of their instances may meet on.
+
+        A statement meets itself on the tensors ``own`` gives at its
+        position.  Two stores whose addresses (``models``) read none of
+        ``symbols`` (what tells the instances apart) nor an unknown value
+        re-apply the same values in program order whichever instance runs
+        first, and are not paired.  ``lane_level`` leaves out the tensors
+        whose accesses across a lane loop's lanes the emitter ordered
+        (``lane_ordered``).
+        """
+        for earlier, first in enumerate(statements):
+            for later in range(earlier, len(statements)):
+                second = statements[later]
+                tensors = (first.tensors & second.tensors) - private
+                if lane_level:
+                    tensors -= first.lane_ordered & second.lane_ordered
+                if later == earlier:
+                    tensors &= own[earlier]
+                for tensor in sorted(tensors):
+                    if not (
+                        stores_only(first, tensor)
+                        and stores_only(second, tensor)
+                        and invariant(models[earlier].get(tensor), symbols)
+                        and invariant(models[later].get(tensor), symbols)
+                    ):
+                        yield earlier, later, tensor
+
     def repeated_whole(
         leaf: _Leaf, variables: frozenset[str], level_symbols: set[sympy.Symbol]
     ) -> None:
@@ -1283,50 +1427,189 @@ def add_thread_barriers(
             and _is_device_loop(loop)
             and isinstance(loop.target, ast.Name)
         } & set(maps.ranges)
-        for position, (first, mine) in enumerate(zip(inner, models, strict=True)):
-            for offset, (second, theirs) in enumerate(
-                zip(inner[position:], models[position:], strict=True)
-            ):
-                shared_tensors = (first.tensors & second.tensors) - private
-                if second is first:
-                    shared_tensors &= own_pairs(first, mine)
-                ranges = maps.pair_ranges(
-                    inner_bounds[position], inner_bounds[position + offset]
+        own = list(starmap(own_pairs, zip(inner, models, strict=True)))
+        for position, later, tensor in shared_pairs(inner, models, own, level_symbols):
+            first, second = inner[position], inner[later]
+            if not conflicting(first, second, tensor, None):
+                continue
+            if tensor in first.opaque or tensor in second.opaque:
+                equal: frozenset[sympy.Symbol] = frozenset()
+            else:
+                equal = forced_equal(
+                    models[position].get(tensor),
+                    models[later].get(tensor),
+                    maps.pair_ranges(inner_bounds[position], inner_bounds[later]),
                 )
-                for tensor in sorted(shared_tensors):
-                    if not conflicting(first, second, tensor, None):
-                        continue
-                    if tensor in first.opaque or tensor in second.opaque:
-                        equal: frozenset[sympy.Symbol] = frozenset()
-                    else:
-                        equal = forced_equal(
-                            mine.get(tensor), theirs.get(tensor), ranges
-                        )
-                    if level_symbols and level_symbols <= equal:
-                        continue
-                    if (
-                        second is first
-                        and stores_only(first, tensor)
-                        and iteration_symbols
-                        and iteration_symbols <= equal
-                    ):
-                        continue
-                    if (
-                        invariant(mine.get(tensor), level_symbols)
-                        and invariant(theirs.get(tensor), level_symbols)
-                        and stores_only(first, tensor)
-                        and stores_only(second, tensor)
-                    ):
-                        continue
-                    raise exc.BackendUnsupported(
-                        "cute",
-                        f"a loop repeated whole once per {', '.join(sorted(variables))} "
-                        f"accesses {tensor} in an order the lanes' passes interleave: "
-                        f"{ast.unparse(first.node).splitlines()[0][:80]!r} and "
-                        f"{ast.unparse(second.node).splitlines()[0][:80]!r} are not "
-                        "confined to one lane, which no barrier orders as the program "
-                        "does (the loop would have to be split)",
-                    )
+            if level_symbols and level_symbols <= equal:
+                continue
+            if (
+                second is first
+                and stores_only(first, tensor)
+                and iteration_symbols
+                and iteration_symbols <= equal
+            ):
+                continue
+            raise exc.BackendUnsupported(
+                "cute",
+                f"a loop repeated whole once per {', '.join(sorted(variables))} "
+                f"accesses {tensor} in an order the lanes' passes interleave: "
+                f"{ast.unparse(first.node).splitlines()[0][:80]!r} and "
+                f"{ast.unparse(second.node).splitlines()[0][:80]!r} are not "
+                "confined to one lane, which no barrier orders as the program "
+                "does (the loop would have to be split)",
+            )
+
+    # The per-thread loops among the device loop's (``lane_variables``: a
+    # looped reduction's lane loop and V-loop) run the lanes of the tile
+    # statements one after another on each thread, inside one iteration of
+    # the device loop, while the program runs every lane of a statement
+    # before any of the next one.  Two accesses of one tensor, one writing,
+    # that may meet in two of those lanes (their equal terms do not force
+    # every lane variable equal, with the device loop's own variables one
+    # value) are observed out of program order on whichever threads run
+    # them: a later lane's gather of an element an earlier lane stored reads
+    # the new value, and no barrier orders a thread's own lanes.  Such a
+    # pair is rejected, as across the lanes of a lane loop of the nest; a
+    # statement meets itself on a tensor it both reads and writes, and two
+    # stores whose addresses ignore the lanes (and every value loaded per
+    # lane) re-apply their values in program order.  The packets these loops
+    # load before the body and flush after it are accesses of every element
+    # of a lane's vector, in program order around the body's statements.
+    # A looped reduction's chunks (``chunked``) are the device loop's
+    # iterations, but of one tile statement too: the program runs a
+    # statement over every chunk before the next statement, so a pair that
+    # may meet in two chunks, one writing, is observed out of program order
+    # whatever the barriers (a later chunk's load of an element an earlier
+    # chunk stored, gathered or at a shifted address), and is rejected as
+    # well.
+    sequence = [
+        *(_analyze(-1, node, rename_groups) for node in packets_before),
+        *(leaf.statement for leaf in leaves),
+        *(_analyze(-1, node, rename_groups) for node in packets_after),
+    ]
+    for statement in sequence:
+        if id(statement) in address_maps:
+            continue
+        address_maps[id(statement)] = modelled(
+            statement.node, statement.node, packet_calls or {}, None, frozenset()
+        )
+        bounds[id(statement)] = {
+            canonical(tensor): maps.bounds(statement.node, ())
+            for tensor in _access_addresses(statement.node, packet_calls or {})
+        }
+
+    def candidates(
+        variables: set[str],
+    ) -> Iterator[tuple[_Statement, _Statement, str, set[str]]]:
+        """The ``shared_pairs`` of ``sequence`` the instances of ``variables``
+        (lanes, chunks) may order wrongly, the later statement first, with
+        the names varying with the variables.  A statement meets itself on a
+        tensor it reads and writes (its stores in two lanes are one tile
+        statement's), and two stores pass only when their addresses ignore
+        every value the variables define too (a value loaded per lane is
+        another value in another lane)."""
+        varying = variables | _dependent_names(
+            everything,
+            (bool(statement.reads & variables) for statement in everything),
+            masks,
+        )
+        for earlier, later, tensor in shared_pairs(
+            sequence,
+            [address_maps[id(statement)] for statement in sequence],
+            [
+                (statement.tensors_read | statement.opaque)
+                & (statement.tensors_written | statement.opaque)
+                for statement in sequence
+            ],
+            {uniform_symbol(name) for name in varying},
+            lane_level=True,
+        ):
+            yield sequence[later], sequence[earlier], tensor, varying
+
+    def iterations_of(variables: set[str]) -> set[sympy.Symbol]:
+        """The iterations of ``variables``, all of them modelled, or none."""
+        iterations = {
+            iteration_symbol(name)
+            for name in variables
+            if uniform_symbol(name) in maps.iteration_values
+        }
+        return iterations if len(iterations) == len(variables) else set()
+
+    def out_of_order(tensor: str, where: str) -> exc.BackendUnsupported:
+        return exc.BackendUnsupported(
+            "cute",
+            f"an access of {tensor} (gathered, or another lane's or chunk's "
+            f"element) may meet another access of it in {where} of a looped "
+            "reduction, which no barrier orders as the program does (its load "
+            "and store would have to run in separate sweeps)",
+        )
+
+    def later_chunks_apart(
+        first: _Statement, second: _Statement, tensor: str, varying: set[str]
+    ) -> bool:
+        """Whether ``second``'s accesses of ``tensor`` in a later chunk never
+        reach an element ``first``'s reach in an earlier one
+        (``AddressMaps.apart_in_later_iterations``)."""
+        if tensor in first.opaque or tensor in second.opaque:
+            return False
+        mine = address_maps.get(id(first), {}).get(tensor)
+        theirs = address_maps.get(id(second), {}).get(tensor)
+        if mine is None or theirs is None:
+            return False
+        ranges = maps.pair_ranges(bounds[id(first)][tensor], bounds[id(second)][tensor])
+        return all(
+            maps.apart_in_later_iterations(
+                access, other, loops=chunks, ranges=ranges, varying=varying
+            )
+            for access in mine
+            for other in theirs
+        )
+
+    lanes = {canonical(name) for name in lane_variables}
+    chunks = {canonical(name) for name in loop_variables - lane_variables}
+    if lanes:
+        lane_iterations = iterations_of(lanes)
+        for first, second, tensor, varying in candidates(lanes):
+            if not conflicting(first, second, tensor, {}):
+                continue
+            if lane_iterations and lane_iterations <= same_thread(
+                first, second, tensor, varying
+            ):
+                continue
+            raise out_of_order(
+                tensor, f"two lanes ({', '.join(sorted(lanes))}) of one chunk"
+            )
+    walks = [
+        maps.trip_count(loop)
+        for loop in loop_headers
+        if isinstance(loop.target, ast.Name) and canonical(loop.target.id) in chunks
+    ]
+    one_chunk = bool(walks) and all(count is not None and count <= 1 for count in walks)
+    if chunk_shifts is not None and not one_chunk:
+        chunk_iterations = iterations_of(chunks)
+        # A buffer each chunk allocates for itself (a rebinding's exchange
+        # through shared memory) holds nothing from one chunk to the next:
+        # the program's order over the chunks says nothing about it, and the
+        # barriers order its uses within and between them.
+        buffers = {
+            canonical(name)
+            for name in _iteration_buffers(statement.node for statement in sequence)
+        }
+        for first, second, tensor, varying in candidates(chunks):
+            if tensor in buffers or not conflicting(
+                first, second, tensor, chunk_shifts
+            ):
+                continue
+            # The two chunks' instances may be any of their lanes.
+            varying = varying | lanes
+            if chunk_iterations and chunk_iterations <= same_thread(
+                first, second, tensor, varying
+            ):
+                continue
+            # The earlier chunk runs the program's later statement first.
+            if later_chunks_apart(first, second, tensor, varying):
+                continue
+            raise out_of_order(tensor, "two chunks")
 
     # (first in iteration j, second in a later iteration, the loop, its tail,
     # whether the iterations follow each other, the tensors).  A statement
@@ -1438,12 +1721,16 @@ def add_thread_barriers(
         for block, index in _below(first.path, level):
             if block.divergent:
                 break
-            if any(barrier > index for barrier in barriers_of(block)):
+            if _rely(
+                block, [barrier for barrier in barriers_of(block) if barrier > index]
+            ):
                 return True
         for block, index in _below(second.path, level):
             if block.divergent:
                 break
-            if any(barrier <= index for barrier in barriers_of(block)):
+            if _rely(
+                block, [barrier for barrier in barriers_of(block) if barrier <= index]
+            ):
                 return True
         return False
 

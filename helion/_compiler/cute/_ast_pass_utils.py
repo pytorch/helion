@@ -491,6 +491,23 @@ def dealias_shared_nodes(body: list[ast.stmt]) -> None:
         body[index] = cast("ast.stmt", fresh(stmt))
 
 
+def statement_lists(
+    statements: list[ast.stmt], *, outer_first: bool = False
+) -> list[list[ast.stmt]]:
+    """``statements`` and every statement list nested in it (the ``body`` and
+    ``orelse`` of its statements, at any depth), each nested list before the
+    list holding it, or after it with ``outer_first``."""
+    found: list[list[ast.stmt]] = [statements] if outer_first else []
+    for stmt in statements:
+        for field in ("body", "orelse"):
+            nested = getattr(stmt, field, None)
+            if isinstance(nested, list):
+                found.extend(statement_lists(nested, outer_first=outer_first))
+    if not outer_first:
+        found.append(statements)
+    return found
+
+
 class _ReplaceNode(ast.NodeTransformer):
     def __init__(self, target: ast.AST, replacement: ast.AST) -> None:
         self.target = target

@@ -456,7 +456,6 @@ def _plan_register_tile_execution(
     from ..device_ir import RootGraphInfo
     from ..reduction_strategy import PersistentReductionStrategy
     from ..reduction_strategy import ReductionStrategy
-    from ..tile_strategy import PerThreadFlattenedTileStrategy
 
     if not isinstance(graph_info, RootGraphInfo):
         return
@@ -480,17 +479,9 @@ def _plan_register_tile_execution(
     ):
         return
 
-    def vectorized(
-        strategy: PerThreadNDTileStrategy | PerThreadFlattenedTileStrategy,
-        block_id: int,
-    ) -> bool:
-        if isinstance(strategy, PerThreadFlattenedTileStrategy):
-            return strategy._lane_var is not None
-        return block_id in strategy._lane_var_by_block
-
     _record_tile_first_plan(
         graph_info,
-        _tile_thread_axis_blocks(tile_strategy, vectorized),
+        _tile_thread_axis_blocks(tile_strategy, _has_lane_loop),
         reduction.block_index,
     )
 
@@ -538,7 +529,9 @@ def _plan_vloop_sink_reduction_execution(
     adjacent threads: the tile-first plan of ``_record_tile_first_plan``
     puts the vectorized grid blocks on the lowest thread axes, and the
     reduction combines its lanes across the interleaved tile threads (the
-    grouped shared-memory reduce of the looped emitter).
+    grouped shared-memory reduce of the looped emitter).  A one-axis grid
+    tile is a flattened strategy (a column sum over a 2-D input:
+    ``x[:, tile_n]``), whose one axis carries the vector slot of its block.
 
     Records that the knob shaped the layout, so codegen restarts with it off
     when no V-loop is sunk after all.  Keeps the default layout when the
@@ -552,6 +545,7 @@ def _plan_vloop_sink_reduction_execution(
     from ..host_function import HostFunction
     from ..reduction_strategy import LoopedReductionStrategy
     from ..reduction_strategy import ReductionStrategy
+    from ..tile_strategy import PerThreadFlattenedTileStrategy
     from ..tile_strategy import PerThreadNDTileStrategy
     from .state import cute_env_state
     from .thread_budget import MAX_THREAD_BLOCK_DIMS
@@ -586,12 +580,12 @@ def _plan_vloop_sink_reduction_execution(
         if not isinstance(strategy, ReductionStrategy)
     ]
     if not tiles or not all(
-        isinstance(strategy, PerThreadNDTileStrategy) and not strategy.mma_mode
+        (isinstance(strategy, PerThreadNDTileStrategy) and not strategy.mma_mode)
+        or isinstance(strategy, PerThreadFlattenedTileStrategy)
         for strategy in tiles
     ):
         return
     grid_strategy = tiles[0]
-    assert isinstance(grid_strategy, PerThreadNDTileStrategy)
 
     def vectorized(
         strategy: PerThreadNDTileStrategy | PerThreadFlattenedTileStrategy,
@@ -599,8 +593,8 @@ def _plan_vloop_sink_reduction_execution(
     ) -> bool:
         return (
             strategy is grid_strategy
-            and block_id in grid_strategy._lane_var_by_block
-            and grid_strategy.lane_context(block_id).vec_width > 1
+            and _has_lane_loop(strategy, block_id)
+            and strategy.lane_context(block_id).vec_width > 1
         )
 
     blocks = _tile_thread_axis_blocks(tile_strategy, vectorized)
@@ -634,6 +628,19 @@ def _plan_vloop_sink_reduction_execution(
     if _record_tile_first_plan(graph_info, blocks, reduction.block_index):
         grid_strategy.fn.cute_state.lanes.vloop_sink_shaped_code = True
         env_state.vloop_sink_reduction_layout_planned = True
+
+
+def _has_lane_loop(
+    strategy: PerThreadNDTileStrategy | PerThreadFlattenedTileStrategy,
+    block_id: int,
+) -> bool:
+    """Whether ``strategy`` runs ``block_id`` in a lane loop: a flattened
+    strategy's one lane loop, an N-D strategy's loop of that block."""
+    from ..tile_strategy import PerThreadFlattenedTileStrategy
+
+    if isinstance(strategy, PerThreadFlattenedTileStrategy):
+        return strategy._lane_var is not None
+    return block_id in strategy._lane_var_by_block
 
 
 def _tile_thread_axis_blocks(

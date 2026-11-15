@@ -177,6 +177,16 @@ def _reverse_lane_loop_iter(loop: ast.For) -> bool:
     return True
 
 
+# On a looped reduction's V-loop (``reduction_emitter.emit_lane_loop_body``):
+# each lane of the reduction's lane loop walks one vector of the thread's share
+# of a chunk, and this constexpr loop computes the vector's elements statement
+# by statement, so a load it issues before its first memory effect is one of
+# the chunk's tile loads, which the program issues before any of the chunk's
+# stores.  The loads-first lane unroll (``cute/unroll_lane_loads.py``) hoists
+# those loads too, not only the vector packets hoisted above the V-loop.
+HELION_REDUCTION_VLOOP_ATTR = "_helion_reduction_vloop"
+
+
 def _create_lane_loop(
     lane_var: str, extent: int, body: list[ast.AST], *, constexpr: bool = False
 ) -> ast.For:

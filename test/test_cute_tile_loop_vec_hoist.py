@@ -122,6 +122,16 @@ def _fp8_gemv_1dgrid_kernel(
     return out
 
 
+@helion.kernel(backend="cute", static_shapes=True)
+def _masked_double(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile(x.shape):
+        out[tile_m, tile_n] = torch.where(
+            mask[tile_m, tile_n], x[tile_m, tile_n] * 2.0, 0.0
+        )
+    return out
+
+
 @onlyBackends(["cute"])
 class TestCuteTileLoopVecHoist(TestCase):
     def test_vec_hoist_fires_at_v4_fp16(self) -> None:
@@ -189,6 +199,22 @@ class TestCuteTileLoopVecHoist(TestCase):
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
         self.assertIn("ir.VectorType.get([4]", code)
         self.assertIn("cutlass.BFloat16", code)
+
+    def test_vec_hoist_bool_mask_byte_packet(self) -> None:
+        """A bool mask loads as one integer of V bytes per lane, each element
+        a byte compared against zero."""
+        x = torch.randn(64, 1024, device=DEVICE, dtype=torch.bfloat16)
+        mask = torch.rand(64, 1024, device=DEVICE) > 0.5
+        code, out = code_and_output(
+            _masked_double,
+            (x, mask),
+            block_sizes=[1, 1024],
+            num_threads=[1, 128],
+            cute_vector_widths=[1, 8],
+        )
+        self.assertIn("cutlass.Uint64)", code)
+        self.assertIn("& 255) != cutlass.Uint8(0)", code)
+        torch.testing.assert_close(out, torch.where(mask, x * 2.0, 0.0), rtol=0, atol=0)
 
     def test_vec_hoist_fp8_matmul_both_operands(self) -> None:
         """fp8 matmul operands must vectorize through the tile-loop hoist as

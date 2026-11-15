@@ -28,9 +28,11 @@ from .... import exc
 from ...ast_extension import create
 from ...ast_extension import expr_from_string
 from ...ast_extension import statement_from_string
+from ...ast_read_writes import HELION_ACCESS_REGIONS_ATTR
 from ...ast_read_writes import HELION_BLOCK_UNIFORM_ATTR
 from ...ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from ...ast_read_writes import HELION_VEC_LANE_OF_ATTR
+from ...ast_read_writes import ReadWrites
 from ...device_function import DeviceFunction
 from ...host_function import NoCurrentFunction
 from ...tile_strategy import _clone_lane_loop_with_body
@@ -44,6 +46,7 @@ from .._ast_pass_utils import _self_addend
 from .._ast_pass_utils import assigned_name
 from .._ast_pass_utils import call_path_str
 from .._ast_pass_utils import deep_clone
+from .._ast_pass_utils import exposed_reads
 from .._ast_pass_utils import names_written
 from .._ast_pass_utils import resolve_alias
 from .._ast_pass_utils import tensor_roots_may_alias
@@ -63,8 +66,6 @@ from .markers import _is_lane_reduce_marker_assign
 from .markers import _lane_loop_extent
 from .markers import _LaneReduceMarker
 from .markers import _static_lane_loop_extent
-from .owner_guards import _clone_expr
-from .owner_guards import _clone_stmt
 from .owner_guards import _guard_stmt_with_owner
 from .owner_guards import _has_impure_inline_asm
 from .owner_guards import _has_observable_memory_write
@@ -79,6 +80,10 @@ from .owner_guards import _update_proven_uniform_names
 from .owner_guards import _update_scalar_definitions
 from .owner_guards import _update_thread_axis_names
 from .owner_guards import _validated_idempotent_store
+from .statements import _analyze
+from .statements import _depends
+from .statements import _is_device_loop
+from .statements import runs_once_outside_lane
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -283,7 +288,7 @@ def _certify_lane_running_sum(
 
     if not running_sums or any(marker.owner_lane is None for _, marker in markers):
         return None
-    body = [_clone_stmt(statement) for statement in loop.body]
+    body = [deep_clone(statement) for statement in loop.body]
     for statement in body:
         ast_rename(statement, rename_groups)
     writes = [
@@ -423,10 +428,6 @@ def _lane_invariant_tail_after_consume(
     register and tensor dependencies, with unknown effects and non-relaxed
     atomics ordered against every memory access.
     """
-    from ...ast_read_writes import ReadWrites
-    from .statements import _analyze
-    from .statements import _depends
-
     analyzed = {
         index: _analyze(index, statements[index], rename_groups)
         for index in invariant | accumulated | consumed
@@ -702,7 +703,7 @@ def _split_impure_producer(
         )
         return clone
 
-    snapshot = [_clone_stmt(stmt) for stmt in prefix]
+    snapshot = [deep_clone(stmt) for stmt in prefix]
     snapshot.extend(
         statement_from_string(f"{stash}.append({name})")
         for name, stash in stashes.items()
@@ -716,7 +717,7 @@ def _split_impure_producer(
         statement_from_string(f"{name} = {stash}[{lane_var}]")
         for name, stash in stashes.items()
     ]
-    produce.extend(_clone_stmt(stmt) for stmt in body[effect_index:marker_index])
+    produce.extend(deep_clone(stmt) for stmt in body[effect_index:marker_index])
     produce.extend(
         statement_from_string(f"{stash}.append({name})")
         for name, stash in produced_stashes.items()
@@ -754,7 +755,7 @@ def _split_impure_producer(
             definitions_before[id(stmt)],
         )
         consume.append(
-            _guard_stmt_with_owner(stmt, owners) if owners else _clone_stmt(stmt)
+            _guard_stmt_with_owner(stmt, owners) if owners else deep_clone(stmt)
         )
     if per_lane_tail:
         result.append(unrolled(consume))
@@ -1222,7 +1223,7 @@ def _split_one_lane_loop(
             # gets its own node: later passes key facts by node identity and
             # rewrite in place (the cross-sweep load fusion, for one, saw the
             # two copies at one position and kept the consume loop's reload).
-            s = deep_clone(s)
+            s = _rerun_copy(s)
         if i in varying_indices:
             lane_varying_tail.append(
                 _guard_stmt_with_owner(s, owner_exprs) if owner_exprs else s
@@ -1483,7 +1484,7 @@ def _validate_owned_lane_carry_schedule(
         return
 
     def normalize(statements: list[ast.AST]) -> list[ast.AST]:
-        result = [_clone_stmt(statement) for statement in statements]
+        result = [deep_clone(statement) for statement in statements]
         for statement in result:
             ast_rename(statement, rename_groups)
         return result
@@ -1636,7 +1637,7 @@ def _validate_renamed_lane_carries(
         not rename_groups or _has_extra_cross_lane_carry(body, lane_var, marker_indices)
     ):
         return
-    normalized = [_clone_stmt(statement) for statement in body]
+    normalized = [deep_clone(statement) for statement in body]
     for statement in normalized:
         ast_rename(statement, rename_groups)
     if _has_extra_cross_lane_carry(
@@ -1723,11 +1724,11 @@ def _lift_lane_invariant_if(
     lane_prefix = [idx for idx in range(len(prefix)) if idx not in condition_index_set]
 
     def branch_loop(field: str) -> list[ast.stmt]:
-        statements = [_clone_stmt(stmt) for stmt in getattr(branch, field)]
+        statements = [deep_clone(stmt) for stmt in getattr(branch, field)]
         if field in unlooped:
             unlooped_body = [
                 *(
-                    _clone_stmt(prefix[idx])
+                    deep_clone(prefix[idx])
                     for idx in lane_prefix
                     if idx not in lane_setup
                 ),
@@ -1737,7 +1738,7 @@ def _lift_lane_invariant_if(
                 return cast("list[ast.stmt]", unlooped_body)
             return [ast.Pass()] if field == "body" else []
         branch_body = [
-            *(_clone_stmt(prefix[idx]) for idx in lane_prefix),
+            *(deep_clone(prefix[idx]) for idx in lane_prefix),
             *statements,
         ]
         if not branch_body:
@@ -1751,13 +1752,13 @@ def _lift_lane_invariant_if(
 
     lifted_if = create(
         ast.If,
-        test=_clone_expr(branch.test),
+        test=deep_clone(branch.test),
         body=branch_loop("body"),
         orelse=branch_loop("orelse"),
     )
     if getattr(branch, HELION_BLOCK_UNIFORM_ATTR, False):
         setattr(lifted_if, HELION_BLOCK_UNIFORM_ATTR, True)
-    return [*(_clone_stmt(stmt) for stmt in condition_nodes), lifted_if]
+    return [*(deep_clone(stmt) for stmt in condition_nodes), lifted_if]
 
 
 def sink_lane_loops_into_uniform_branches(
@@ -1829,9 +1830,6 @@ def _sink_lane_loop_into_branches(
     across iterations too) and keep their effect run once instead of once
     per lane (``runs_once_outside_lane``).
     """
-    from ...ast_read_writes import ReadWrites
-    from .statements import runs_once_outside_lane
-
     if not loop.body or not isinstance(guard := loop.body[-1], ast.If):
         return None
     if not any(_find_lane_reduce_call(node) is not None for node in ast.walk(guard)):
@@ -1915,12 +1913,12 @@ def _split_staged_matmul_lane_reductions(
     ]
     if collective_indices and first_marker <= max(collective_indices):
         return None
-    transformed = [_clone_stmt(statement) for statement in body]
+    transformed: list[ast.AST] = [deep_clone(statement) for statement in body]
     prefix: list[ast.AST] = []
     if collective_indices:
         uid = _next_lane_stash_uid()
-        compute = [
-            _clone_stmt(statement) for statement in body[: max(collective_indices) + 1]
+        compute: list[ast.AST] = [
+            deep_clone(statement) for statement in body[: max(collective_indices) + 1]
         ]
         for index in collective_indices:
             statement = body[index]
@@ -2014,7 +2012,7 @@ def _split_dependent_lane_reductions(
 
         acc_var = f"{marker.result_var}_lane_acc"
         result.append(statement_from_string(f"{acc_var} = {marker.identity_expr}"))
-        acc_body = [_clone_stmt(stmt) for stmt in stage]
+        acc_body = [_rerun_copy(stmt) for stmt in stage]
         ctor = _dtype_ctor_from_identity(marker.identity_expr)
         combine_val = (
             f"{ctor}({marker.input_name})" if ctor is not None else marker.input_name
@@ -2075,9 +2073,7 @@ def _split_dependent_lane_reductions(
             thread_axes_before.get(id(stmt), thread_axis_names),
             scalar_defs_before.get(id(stmt), {}),
         )
-        cloned = _clone_stmt(stmt)
-        if owner_exprs:
-            cloned = _guard_stmt_with_owner(cloned, owner_exprs)
+        cloned = _guard_stmt_with_owner(stmt, owner_exprs)
         if lane_varying_stmt:
             varying.append(cloned)
         elif idx in after_consume:
@@ -2572,9 +2568,9 @@ def _split_lane_loop_with_register_stash(
             if not _assigns_simple_name(rederivable_before[i], marker_result_vars)
         ]
         acc_body: list[ast.AST] = []
-        acc_body.extend(_clone_stmt(s) for s in recompute_kept)
+        acc_body.extend(_rerun_copy(s) for s in recompute_kept)
         acc_body.extend(read_stash_stmts())
-        acc_body.extend(_clone_stmt(s) for s in input_stmts)
+        acc_body.extend(_rerun_copy(s) for s in input_stmts)
         ctor = _dtype_ctor_from_identity(m.identity_expr)
         combine_val = f"{ctor}({m.input_name})" if ctor is not None else m.input_name
         acc_body.append(
@@ -2596,9 +2592,9 @@ def _split_lane_loop_with_register_stash(
     consume_kept = [s for i, s in enumerate(consume_candidates) if i in keep_idx]
     if consume_kept:
         consume_body: list[ast.AST] = []
-        consume_body.extend(_clone_stmt(s) for s in recompute_kept)
+        consume_body.extend(_rerun_copy(s) for s in recompute_kept)
         consume_body.extend(read_stash_stmts())
-        consume_body.extend(_clone_stmt(s) for s in consume_kept)
+        consume_body.extend(deep_clone(s) for s in consume_kept)
         result.append(_clone_lane_loop_with_body(loop, consume_body))
     return result
 
@@ -3253,7 +3249,7 @@ def _rereduce_restored_lane_markers(
         )
     result: list[ast.AST] = [*totals, _clone_lane_loop_with_body(loop, loop_body)]
     result.extend(finalized)
-    result.extend(_clone_stmt(stmt) for stmt in rederived)
+    result.extend(deep_clone(stmt) for stmt in rederived)
     marker_dependencies = [
         (marker, _forward_live_names(body, {marker.result_var}))
         for _, marker in markers
@@ -3893,10 +3889,44 @@ def _flatten_vector_reduction_lane(
             return node
 
     flattened = [
-        Coordinates().visit(_clone_stmt(statement))
+        Coordinates().visit(deep_clone(statement))
         for statement in [*prefix, *vector_loop.body]
     ]
     return _create_lane_loop(lane_var, outer_size * vector_size, flattened)
+
+
+def _without_access_regions(statement: ast.AST) -> ast.AST:
+    """``statement``, with the access regions of its accesses dropped in
+    place: pass it a copy.
+
+    A region names the tile begins of the device loops around its access by
+    the loop instance (``access_regions.tile_begin_symbol``), and the
+    barrier pass cancels a begin two accesses share.  A copy placed in
+    another loop over the same tiles would keep the original loop's begins,
+    so ``x[..., tk.begin]`` in one loop and ``x[..., tk.begin + 1]`` in the
+    other would look apart, though they meet across iterations.  Without
+    regions the pass compares such a pair through the address maps.
+    """
+    for node in ast.walk(statement):
+        vars(node).pop(HELION_ACCESS_REGIONS_ATTR, None)
+    return statement
+
+
+def _rerun_copy(statement: ast.AST) -> ast.AST:
+    """A copy of a producer that another lane loop reruns beside the one
+    holding it.
+
+    The copy is a node of its own: later passes key facts by node identity
+    and rewrite in place.  The accesses in a loop nested in the producer
+    drop their regions (``_without_access_regions``), since the copy's loop
+    runs apart from the original's: the original's tile begins would make
+    accesses that meet across iterations look apart.
+    """
+    copy = deep_clone(statement)
+    for node in ast.walk(copy):
+        if _is_device_loop(node):
+            _without_access_regions(node)
+    return copy
 
 
 def _interchange_one_lane_loop(
@@ -3908,9 +3938,6 @@ def _interchange_one_lane_loop(
     constexpr_value: Callable[[str], int | None] | None,
     rename_groups: Mapping[str, str],
 ) -> list[ast.AST]:
-    from ...ast_read_writes import ReadWrites
-    from .._ast_pass_utils import exposed_reads
-
     body: list[ast.AST] = list(loop.body)
     # Find the single inner serial ``for`` loop that carries lane-reduce
     # markers of THIS lane (or legacy unowned markers).  A vector tile's
@@ -4055,18 +4082,25 @@ def _interchange_one_lane_loop(
 
     # Partition kept statements into lane-invariant (run once per mb iteration)
     # vs lane-varying (recomputed per lane inside the inner lane loop).
-    prefix_invariant_a = [_clone_stmt(s) for s in keep_prefix_a if not reads_lane(s)]
-    prefix_varying_a = [_clone_stmt(s) for s in keep_prefix_a if reads_lane(s)]
-    mb_head_a = [_clone_stmt(s) for s in keep_mb_a if not reads_lane(s)]
-    mb_varying_a = [_clone_stmt(s) for s in keep_mb_a if reads_lane(s)]
+    prefix_invariant_a = [_rerun_copy(s) for s in keep_prefix_a if not reads_lane(s)]
+    prefix_varying_a = [_rerun_copy(s) for s in keep_prefix_a if reads_lane(s)]
+    # Nest A's serial loop is another loop over the serial loop's tiles, at
+    # another iteration than Nest B's at any moment: its copies drop the
+    # access regions recorded in Nest B's loop (``_without_access_regions``).
+    mb_head_a = [
+        _without_access_regions(deep_clone(s)) for s in keep_mb_a if not reads_lane(s)
+    ]
+    mb_varying_a = [
+        _without_access_regions(deep_clone(s)) for s in keep_mb_a if reads_lane(s)
+    ]
 
     inner_lane_loop_a = _clone_lane_loop_with_body(
         loop, [*prefix_varying_a, *mb_varying_a]
     )
     mb_loop_a = create(
         ast.For,
-        target=_clone_expr(mb_loop.target),
-        iter=_clone_expr(mb_loop.iter),
+        target=deep_clone(mb_loop.target),
+        iter=deep_clone(mb_loop.iter),
         body=[*mb_head_a, inner_lane_loop_a],
         orelse=[],
         type_comment=None,

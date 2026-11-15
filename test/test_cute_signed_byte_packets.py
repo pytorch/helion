@@ -249,8 +249,9 @@ def test_missing_bound_proof_declines(missing: str) -> None:
         # base-alignment fact (``literal_offset_loads``).
         (torch.uint8, True),
         (torch.float4_e2m1fn_x2, True),
+        # Bool rows load as byte packets (``_CUTE_VECTOR_UNROLL_BYTE_DTYPES``).
+        (torch.bool, True),
         (torch.int64, False),
-        (torch.bool, False),
     ),
 )
 def test_alignment_cache_registration_dtype_boundary(

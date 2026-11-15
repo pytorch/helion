@@ -12,6 +12,7 @@ from .reduce_call import cooperative_column_share
 from .reduce_call import cooperative_column_slots
 from .reduce_call import use_interleaved_shared_reduce
 from .reduce_call import use_serial_block_reduce
+from .reduce_call import use_strided_warp_reduce
 
 try:
     from cutlass.base_dsl.enums import Arch
@@ -71,17 +72,25 @@ def _warp_reduce_min(value: cute.Numeric, *, threads_in_group: int) -> cute.Nume
     )
 
 
+def _native_fp32_extremum(value: cute.Numeric, threads_in_group: int) -> bool:
+    """Whether the native fp32 extrema below take ``redux.sync`` (an fp32
+    value over a whole warp on the SM100 family); elsewhere they run the
+    shuffle reduction of ``_warp_reduce_max`` / ``_warp_reduce_min``."""
+    return (
+        _REDUX_SYNC_AVAILABLE
+        and type(value) is cutlass.Float32
+        and threads_in_group == 32
+        and cutlass.base_dsl.BaseDSL._get_dsl()
+        .get_arch_enum()
+        .is_family_of(Arch.sm_100f)
+    )
+
+
 @cute.jit
 def _warp_reduce_max_native_fp32(
     value: cute.Numeric, *, threads_in_group: int
 ) -> cute.Numeric:
-    arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
-    if cutlass.const_expr(
-        _REDUX_SYNC_AVAILABLE
-        and type(value) is cutlass.Float32
-        and threads_in_group == 32
-        and arch.is_family_of(Arch.sm_100f)
-    ):
+    if cutlass.const_expr(_native_fp32_extremum(value, threads_in_group)):
         return cutlass.Float32(
             prims.redux_sync(value, prims.ReductionKind.FMAX, 0xFFFFFFFF, nan=True)
         )
@@ -92,13 +101,7 @@ def _warp_reduce_max_native_fp32(
 def _warp_reduce_min_native_fp32(
     value: cute.Numeric, *, threads_in_group: int
 ) -> cute.Numeric:
-    arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
-    if cutlass.const_expr(
-        _REDUX_SYNC_AVAILABLE
-        and type(value) is cutlass.Float32
-        and threads_in_group == 32
-        and arch.is_family_of(Arch.sm_100f)
-    ):
+    if cutlass.const_expr(_native_fp32_extremum(value, threads_in_group)):
         return cutlass.Float32(
             prims.redux_sync(value, prims.ReductionKind.FMIN, 0xFFFFFFFF, nan=True)
         )
@@ -192,6 +195,35 @@ def _cute_grouped_reduce_warp_body(
     return selected
 
 
+@cute.jit
+def _cute_grouped_reduce_warp_strided_body(
+    input_value: cute.Numeric,
+    combine: object,
+    identity: cute.Numeric,
+    *,
+    pre: cutlass.Constexpr[int],
+    group_span: cutlass.Constexpr[int],
+) -> cute.Numeric:
+    # The body above runs one masked pass per sibling, ``pre`` in all, and
+    # keeps the lane's own; a pass's stages with offset >= ``pre`` are
+    # ``_cute_strided_warp_butterfly`` over its sibling's own values.  At a
+    # stage with offset < ``pre`` the partner is a masked lane, holding the
+    # combine of 2**k identities after k stages.  Combining with it is not a
+    # no-op (a sum turns -0.0 into +0.0), so those stages stay, with the
+    # partner's value as a constant: one pass gives every sibling the bits
+    # ``pre`` passes did.
+    value = _cute_strided_warp_butterfly(
+        input_value, combine, identity, pre=pre, group_span=group_span
+    )
+    partner = identity
+    for _ in cutlass.range_constexpr(group_span.bit_length() - pre.bit_length()):
+        partner = combine(partner, partner)
+    for _ in cutlass.range_constexpr(pre.bit_length() - 1):
+        value = combine(value, partner)
+        partner = combine(partner, partner)
+    return value
+
+
 def _cute_grouped_reduce_warp(
     input_value: cute.Numeric,
     reduction_type: str,
@@ -202,7 +234,28 @@ def _cute_grouped_reduce_warp(
     group_span: int,
     fp32_redux: bool = False,
 ) -> cute.Numeric:
-    warp_op, _ = _resolve_ops(reduction_type, fp32_redux=fp32_redux)
+    """Reduce ``input_value`` over the lanes of its ``group_span``-lane group
+    that share ``lane % pre``.
+
+    The masked passes (``_cute_grouped_reduce_warp_body``) pick each lane's
+    sibling by ``lane_expr``; the partial butterfly
+    (``_cute_grouped_reduce_warp_strided_body``) pairs hardware lanes
+    (``shuffle_sync_bfly``) and ignores ``lane_expr``.  They agree because
+    the emitters' ``lane_expr`` follows the launch layout
+    (``thread_linear_index_expr``); a caller passing a remapped lane would
+    get other groups from the butterfly."""
+    warp_op, combine = _resolve_ops(reduction_type, fp32_redux=fp32_redux)
+    # Where ``redux.sync`` takes them, the native fp32 extrema keep one pass
+    # per sibling; elsewhere they are the shuffle reduction the strided body
+    # matches bit for bit.
+    if use_strided_warp_reduce(pre, group_span) and not (
+        fp32_redux
+        and reduction_type in _NATIVE_FP32_WARP_DISPATCH
+        and _native_fp32_extremum(input_value, group_span)
+    ):
+        return _cute_grouped_reduce_warp_strided_body(
+            input_value, combine, identity, pre=pre, group_span=group_span
+        )
     return _cute_grouped_reduce_warp_body(
         input_value, warp_op, identity, lane_expr, pre=pre, group_span=group_span
     )
@@ -711,17 +764,28 @@ def _cute_strided_warp_butterfly(
     identity: cute.Numeric,
     *,
     pre: cutlass.Constexpr[int],
+    group_span: cutlass.Constexpr[int] = 32,
 ) -> cute.Numeric:
-    """Fold ``value`` over the lanes of its warp that share ``lane % pre``:
-    the interleaved forms' first stage.
+    """Fold ``value`` over the lanes of its ``group_span``-lane group that
+    share ``lane % pre``.
 
-    The two-stage form reduces each sibling with a full-warp descending
-    butterfly (offsets 16 .. 1, partner second) over identity-masked lanes.
-    Its stages with offset >= ``pre`` pair two lanes of the sibling; the
-    others pair a lane with a masked one, which leaves the value alone but
-    for the sign of a zero sum.  This is the former, in the same order."""
+    The masked passes reduce each sibling with a descending butterfly over
+    the group (offsets ``group_span / 2`` .. 1, partner second), the other
+    siblings' lanes masked to the identity.  Their stages with offset >=
+    ``pre`` pair two lanes of the sibling: this runs exactly those stages, in
+    the same order.  The stages below ``pre`` pair a lane with a masked one,
+    which leaves the value alone but for the sign of a zero sum
+    (``-0.0 + 0.0`` is ``+0.0``): the warp form adds them to give the masked
+    passes' bits (``_cute_grouped_reduce_warp_strided_body``), the
+    interleaved shared forms' first stage leaves them out.  At ``pre == 1``
+    every stage pairs two lanes: over a warp this is the whole
+    ``cute.arch.warp_reduction`` that the serial and two-stage forms run,
+    which the V-loop sink's fragment reduce relies on to give their bits
+    (``_cute_grouped_reduce_shared_two_stage_fragment_body``)."""
     dtype = type(identity)
-    for shift in cutlass.range_constexpr(4, pre.bit_length() - 2, -1):
+    for shift in cutlass.range_constexpr(
+        group_span.bit_length() - 2, pre.bit_length() - 2, -1
+    ):
         value = combine(
             value,
             dtype(

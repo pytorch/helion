@@ -66,6 +66,7 @@ from ..flash_knobs import FLASH_COVERAGE_CHILD_PARENTS
 from ..pdl_release import CUTE_PDL_CAPTURE_RELEASE_CHOICES
 from ..pdl_release import CUTE_PDL_RELEASE_DEFAULT
 from ..pdl_release import CUTE_PDL_SPREAD_KEY
+from ..reduction_lanes import fit_reduction_threads
 from ..thread_budget import MAX_THREADS_PER_BLOCK
 from ..thread_budget import tile_level_axes
 from ..tile_packing import packed_grid_block
@@ -141,9 +142,7 @@ def _reduction_axes(reductions: Sequence[_Reduction], tile_threads: int) -> int:
     axes = 0
     others = tile_threads
     for reduction in reductions:
-        threads = reduction.asks
-        while threads > 1 and others * threads > MAX_THREADS_PER_BLOCK:
-            threads //= 2
+        threads = fit_reduction_threads(reduction.asks, others)
         if threads > 1:
             axes += 1
             others *= threads

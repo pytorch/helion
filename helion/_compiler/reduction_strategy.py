@@ -169,6 +169,13 @@ class PersistentReductionEmitter(ReductionEmitter["PersistentReductionStrategy"]
         """The power-of-2 bucket a hint-sized extent is compiled for."""
 
     @abc.abstractmethod
+    def plan_unpadded_extent(
+        self, fn: DeviceFunction, block_index: int, numel: int
+    ) -> bool:
+        """Whether the config runs a static extent the backend pads unpadded
+        and unmasked (before ``__init__``)."""
+
+    @abc.abstractmethod
     def plan_max_threads(self, max_threads: int) -> int:
         """Cap the backend's thread budget for this reduction."""
 
@@ -204,8 +211,10 @@ class PersistentReductionEmitter(ReductionEmitter["PersistentReductionStrategy"]
         size_hint: int,
         mask_var: str | None,
         merged_tiled_extent: bool,
+        numel: sympy.Expr,
     ) -> None:
-        """Size the synthetic lane loop, vector row or register tile."""
+        """Size the synthetic lane loop, vector row or register tile of the
+        reduction extent ``numel`` (specialized)."""
 
     @abc.abstractmethod
     def check_shared_thread_extent(self, extent: int) -> None:
@@ -822,11 +831,21 @@ class PersistentReductionStrategy(ReductionStrategy):
         # This is true when numel is a power of 2 (Triton doesn't round),
         # or when the backend uses exact RDIM sizes (e.g., Pallas).
         needs_mask = True
+        unpadded = False
         # Guard numel > 0: on PyTorch 2.9, next_power_of_2(0) returns 0
         # (the n <= 0 guard was added later), so static_rdim_size(0) == 0
         # would incorrectly skip the mask for zero-size reductions.
         if isinstance(numel, (int, sympy.Integer)) and int(numel) > 0:
             needs_mask = env.backend.static_rdim_size(int(numel)) != int(numel)
+            # The config may run a padded static extent unpadded, its
+            # threads covering exactly its elements.
+            unpadded = (
+                needs_mask
+                and emitter is not None
+                and emitter.plan_unpadded_extent(fn, block_index, int(numel))
+            )
+            if unpadded:
+                needs_mask = False
         mask_var: str | None = (
             fn.new_var(f"mask_{block_index}", dce=True) if needs_mask else None
         )
@@ -837,6 +856,8 @@ class PersistentReductionStrategy(ReductionStrategy):
             block_size_var=fn.new_var(f"_RDIM_SIZE_{block_index}"),
         )
         self._cute_hint_bucket = hint_bucket
+        # The extent runs unpadded (``plan_unpadded_extent``).
+        self._unpadded_extent = unpadded
         self.offset_vars[block_index] = "0"
         # The ``num_threads`` entry the config spells for this block (0 when
         # it leaves the count to the backend).
@@ -942,7 +963,11 @@ class PersistentReductionStrategy(ReductionStrategy):
                 )
                 if emitter is not None:
                     emitter.plan_synthetic_lanes(
-                        lane_extent, size_hint, self._mask_var, merged_tiled_extent
+                        lane_extent,
+                        size_hint,
+                        self._mask_var,
+                        merged_tiled_extent,
+                        numel,
                     )
 
     @functools.cached_property
@@ -1028,9 +1053,12 @@ class PersistentReductionStrategy(ReductionStrategy):
         if state.device_function.constexpr_arg(block_size_var):
             if isinstance(numel, sympy.Integer):
                 # Static size - issue statement immediately
-                stmt = statement_from_string(
-                    f"{block_size_var} = {backend.static_rdim_size(int(numel))}"
+                size = (
+                    int(numel)
+                    if self._unpadded_extent
+                    else backend.static_rdim_size(int(numel))
                 )
+                stmt = statement_from_string(f"{block_size_var} = {size}")
                 state.codegen.host_statements.append(stmt)
             else:
                 # Check for block size dependencies

@@ -16,10 +16,10 @@ import pytest
 import helion
 from helion._compiler.ast_read_writes import ast_rename
 from helion._compiler.cute._ast_pass_utils import assigned_name
+from helion._compiler.cute._ast_pass_utils import deep_clone
 from helion._compiler.cute.lane_loops.markers import _create_lane_loop
 from helion._compiler.cute.lane_loops.markers import _is_lane_reduce_marker_assign
 from helion._compiler.cute.lane_loops.markers import _lane_reduce_marker_expr
-from helion._compiler.cute.lane_loops.owner_guards import _clone_stmt
 from helion._compiler.cute.lane_loops.split import _certify_lane_running_sum
 from helion._compiler.cute.lane_loops.split import _validate_owned_lane_carry_schedule
 from helion._compiler.cute.lane_loops.split import split_lane_loop_reductions
@@ -361,7 +361,7 @@ def test_final_schedule_proof_rejects_corrupted_placements(fault: str) -> None:
     elif fault == "regrouped_add":
         phase1.body[position] = ast.parse("fold = fold + product * 4").body[0]
     elif fault == "duplicate_sweep":
-        result.append(_clone_stmt(phase1))
+        result.append(deep_clone(phase1))
     elif fault in ("early_finalization", "missing_finalization"):
         index = next(
             index

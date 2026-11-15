@@ -21,10 +21,10 @@ from helion._compiler.cute._ast_pass_utils import _is_proven_relocatable_assignm
 from helion._compiler.cute._ast_pass_utils import _is_proven_relocatable_call
 from helion._compiler.cute._ast_pass_utils import assigned_name
 from helion._compiler.cute._ast_pass_utils import call_path_str
+from helion._compiler.cute._ast_pass_utils import deep_clone
 from helion._compiler.cute.lane_loops.markers import _create_lane_loop
 from helion._compiler.cute.lane_loops.markers import _is_lane_reduce_marker_assign
 from helion._compiler.cute.lane_loops.markers import _lane_reduce_marker_expr
-from helion._compiler.cute.lane_loops.owner_guards import _clone_stmt
 from helion._compiler.cute.lane_loops.split import _validate_owned_lane_carry_schedule
 from helion._compiler.cute.lane_loops.split import split_lane_loop_reductions
 from helion._compiler.cute.scalar_recipe import PURE_DECODE_HELPERS
@@ -322,7 +322,7 @@ def test_existing_final_carry_validator_rejects_corrupt_staged_schedules(
     if fault == "drop":
         lowered.pop(update_index)
     elif fault == "repeat":
-        lowered.append(_clone_stmt(update))
+        lowered.append(deep_clone(update))
     elif fault == "inside":
         lowered[update_index] = _create_lane_loop("lane", 8, [update])
     else:

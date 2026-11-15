@@ -24,9 +24,8 @@ from .... import exc
 from ...ast_extension import create
 from ...ast_extension import expr_from_string
 from ...ast_extension import statement_from_string
-from ...ast_read_writes import HELION_ATOMIC_UNIFORM_LANES_ATTR
-from ...ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from .._ast_pass_utils import _is_proven_relocatable_call
+from .._ast_pass_utils import deep_clone
 from ..persistent_branch_vec import PACKET_STORE_BYTES
 from ..thread_budget import MAX_THREADS_PER_BLOCK
 from .markers import _CUTE_THREAD_VARYING_INTRINSICS
@@ -1075,12 +1074,17 @@ def _thread_axis_owner_exprs(
 
 
 def _guard_stmt_with_owner(stmt: ast.AST, predicates: list[str]) -> ast.AST:
+    """A copy of ``stmt`` that runs only where every predicate holds (an
+    unguarded copy for none)."""
     if not predicates:
-        return stmt
+        return deep_clone(stmt)
     store = _validated_owner_store(stmt)
     if store is None:
         raise exc.BackendUnsupported("cute", "owner predicate requires one store")
     predicate = " and ".join(f"({expr})" for expr in dict.fromkeys(predicates))
+    # The guarded copy keeps the statement's markers and source location
+    # (``deep_clone``), as the lane split's other copies do.
+    guarded = deep_clone(stmt)
     if _is_persistent_branch_vec_store(store):
         mask = store.args[5]
         mask_source = (
@@ -1088,19 +1092,19 @@ def _guard_stmt_with_owner(stmt: ast.AST, predicates: list[str]) -> ast.AST:
             if isinstance(mask, ast.Constant) and mask.value is None
             else ast.unparse(mask)
         )
-        guarded = _clone_stmt(stmt)
-        assert isinstance(guarded, ast.Expr)
-        guarded_store = cast("ast.Call", guarded.value)
+        # The copy's own store, which may sit under an ``if``
+        # (``_is_isolated_store_statement``).
+        guarded_store = _validated_owner_store(guarded)
+        assert guarded_store is not None
         guarded_mask = expr_from_string(
             predicate if mask_source is None else f"({mask_source}) and ({predicate})"
         )
         assert isinstance(guarded_mask, ast.expr)
         guarded_store.args[5] = guarded_mask
         return guarded
-    return statement_from_string(
-        f"if {predicate}:\n"
-        + "\n".join(f"    {line}" for line in ast.unparse(stmt).splitlines())
-    )
+    branch = cast("ast.If", statement_from_string(f"if {predicate}:\n    pass"))
+    branch.body = [cast("ast.stmt", guarded)]
+    return branch
 
 
 def _has_impure_inline_asm(stmt: ast.AST) -> bool:
@@ -1143,36 +1147,6 @@ def _has_observable_memory_write(stmt: ast.AST) -> bool:
     if ReadWrites.from_ast(stmt).inplace_writes:
         return True
     return bool(_memory_write_calls(stmt))
-
-
-def _clone_stmt(stmt: ast.AST) -> ast.AST:
-    """Return an independent copy of ``stmt`` via unparse + reparse.
-
-    ``interchange_lane_outside_serial_reductions`` emits two loop nests that
-    both re-run the shared (side-effect-free) producers. Splicing the same node
-    objects into two places in the tree breaks AST walking, so each reused
-    statement is rebuilt from its source text into a fresh ExtendedAST node.
-    The atomics keep the lane loops they are uniform along
-    (``HELION_ATOMIC_UNIFORM_LANES_ATTR``) and the lane loops inside keep
-    their lane variable (``HELION_LANE_LOOP_VAR_ATTR``) for the pins of
-    ``pin_atomics_left_in_lane_loops``.
-    """
-    clone = statement_from_string(ast.unparse(stmt))
-    for kind, attr in (
-        (ast.Call, HELION_ATOMIC_UNIFORM_LANES_ATTR),
-        (ast.For, HELION_LANE_LOOP_VAR_ATTR),
-    ):
-        copies = [node for node in ast.walk(clone) if isinstance(node, kind)]
-        originals = [node for node in ast.walk(stmt) if isinstance(node, kind)]
-        for original, copy in zip(originals, copies, strict=True):
-            value = getattr(original, attr, None)
-            if value is not None:
-                setattr(copy, attr, value)
-    return clone
-
-
-def _clone_expr(node: ast.AST) -> ast.AST:
-    return expr_from_string(ast.unparse(node))
 
 
 def _validated_idempotent_store(stmt: ast.AST) -> ast.Call | None:

@@ -91,6 +91,7 @@ from ._ast_pass_utils import loop_extent
 from ._ast_pass_utils import rename_names
 from ._ast_pass_utils import replace_call
 from ._ast_pass_utils import replace_node
+from ._ast_pass_utils import statement_lists
 from .cache_policy_loads import MASKED_PACKET_LOAD_HELPERS
 from .cache_policy_loads import CachePolicy
 from .cache_policy_loads import hint_wide_packets
@@ -1799,11 +1800,7 @@ class _Sinker:
             if match is not None:
                 call, source_fragment, pre_count, group_span, group_count = match
                 if (
-                    pre_count > 0
-                    and not pre_count & (pre_count - 1)
-                    and pre_count <= 32
-                    and group_span % 32 == 0
-                    and pre_count * self.vec_width <= group_span
+                    ReduceScope.fragment_fits(pre_count, group_span, self.vec_width)
                     and not any(
                         self.vec_var in _names_read(arg)
                         or _names_read(arg) & analysis.varying
@@ -2067,7 +2064,7 @@ def _reuse_sibling_packets(
     fragment instead of re-issuing the loads.  Loops are matched by their
     lane variable and trip count, loads by position and text.
     """
-    for container in _statement_lists(stmts):
+    for container in statement_lists(stmts, outer_first=True):
         lanes: dict[tuple[str, str], tuple[ast.For, list[ast.Assign]]] = {}
         for stmt in list(container):
             if not isinstance(stmt, ast.For) or not isinstance(stmt.target, ast.Name):
@@ -2192,17 +2189,6 @@ class _RewritePacketReads(ast.NodeTransformer):
             template = self.renames[node.value.id]
             return expr_from_string(template.format(lane=ast.unparse(node.slice)))
         return node
-
-
-def _statement_lists(stmts: list[ast.stmt]) -> list[list[ast.stmt]]:
-    """``stmts`` and every nested statement list, outermost first."""
-    result = [stmts]
-    for stmt in stmts:
-        for field in ("body", "orelse"):
-            inner = getattr(stmt, field, None)
-            if isinstance(inner, list):
-                result.extend(_statement_lists(inner))
-    return result
 
 
 _VSINK_PACKET_CACHE_ATTR = "_helion_vsink_packet_cache"
