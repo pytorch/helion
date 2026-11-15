@@ -257,6 +257,14 @@ shared: skip the board there (`run_tests.py` does so on its own).
 - If the board itself fails (an error or traceback, as opposed to refusing a
   busy GPU or reporting that none is free), stop and report it (When a tool or
   these instructions are wrong); do not fall back to picking GPUs by hand.
+  One error is a busy machine rather than a broken board: an nvidia-smi
+  error that says "(a busy machine? try again)". nvidia-smi did not
+  answer in time, could not be started for lack of processes or memory, or
+  was killed, which happens while many processes start (several test lanes
+  at once). Wait a minute and run the command again; report it only if it
+  persists once the machine is quiet. Until it answers, no GPU is known to be
+  free. Any other nvidia-smi failure (an exit status, a crash, a listing
+  without processes) is a fault to report.
 - If `gpu_board.py` or `run_tests.py` prints `SECURITY ALERT` (exit status 4),
   stop the GPU work that depends on the board and report the alert to the
   user verbatim. Do not delete or edit files on the board, and do not work

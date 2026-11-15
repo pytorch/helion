@@ -561,6 +561,14 @@ def explicit_gpus(args: argparse.Namespace) -> list[str]:
         ) from None
 
 
+def _discovery_failure(error: gpu_board.NvidiaSmiError) -> str:
+    return (
+        f"run_tests: GPU discovery failed: {error}; no tests started. Use "
+        "--lane cpu for CPU-only checks; GPU lanes require working NVIDIA "
+        "discovery"
+    )
+
+
 def acquire_gpus(
     args: argparse.Namespace,
     purpose: str,
@@ -581,12 +589,17 @@ def acquire_gpus(
     explicit = explicit_gpus(args)
     if explicit and args.no_board:
         return explicit
-    gpus = gpu_board.sample_gpus()
+    try:
+        gpus = gpu_board.sample_gpus()
+    except gpu_board.NvidiaSmiError as e:
+        # nvidia-smi is there and did not answer, after the board's retries:
+        # the GPUs' state is unknown.
+        raise SystemExit(_discovery_failure(e)) from None
     if gpus is None:
         raise SystemExit(
-            "run_tests: GPU discovery failed (nvidia-smi unavailable or failed); "
-            "no tests started. Use --lane cpu for CPU-only checks; "
-            "GPU lanes require working NVIDIA discovery"
+            "run_tests: GPU discovery failed (nvidia-smi is missing, or reports "
+            "no devices or no driver); no tests started. Use --lane cpu for "
+            "CPU-only checks; GPU lanes require working NVIDIA discovery"
         )
     if not gpus:
         raise SystemExit(
@@ -612,6 +625,7 @@ def acquire_gpus(
                 CLAIM_TTL,
                 force=args.force,
                 shared=args.shared,
+                sampled=gpus,
             )
             for gpu, why in sorted(problems.items()):
                 print(
@@ -630,6 +644,13 @@ def acquire_gpus(
             file=sys.stderr,
         )
         raise SystemExit(gpu_board.SECURITY_EXIT) from None
+    except gpu_board.NvidiaSmiError as e:
+        # The board reads the GPUs again when it picks them.
+        raise SystemExit(_discovery_failure(e)) from None
+    except gpu_board.NoSuchGpu as e:
+        # Not "board unavailable": CUDA stops reading CUDA_VISIBLE_DEVICES at
+        # a GPU that does not exist.
+        raise SystemExit(f"run_tests: {e}; no tests started") from None
     except gpu_board.GpuConflict as e:
         hint = (
             "Stop and inspect remaining processes before reusing these GPUs."
