@@ -339,6 +339,8 @@ def _stage_host(
     stage = HostFunction(definition, host.location)
     stage.compiler_state = host.compiler_state
     stage.local_types = host.local_types
+    # The next stage reads what this one materializes: not scratch.
+    stage.partial_program = True
     ir = copy.copy(host.device_ir)
     stage.device_ir = ir
     ir.host_function = stage

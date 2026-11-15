@@ -1014,6 +1014,11 @@ class ConfigSpec:
         self.cute_reduction_reloads: BlockIdSequence[CuteReductionReloadSpec] = (
             BlockIdSequence()
         )
+        # Set by DeviceIR analysis: a looped row reduction the lane jam takes
+        # (``CuteReductionLaneJamHeuristic.is_eligible``) beside a kernel-local
+        # workspace a later sweep reads back, so ``cute_scratch_forwarding``
+        # is tunable at every extent.
+        self.cute_scratch_forwarding_sites = False
         # Device-IR facts enable this only for plausible in-place 16-bit state
         # updates. Generated-AST matching is stricter and remains authoritative.
         self.cute_resident_reduction_blocks: set[int] = set()
@@ -1025,6 +1030,12 @@ class ConfigSpec:
         self.cute_register_tile_reduction_blocks: set[int] = set()
         self.cute_async_load_pipeline_enabled = False
         self.cute_bf16x2_recurrence_enabled = False
+        # Set by DeviceIR analysis: a reduction over a strided full slice
+        # beside a contiguous grid tile, the layout the strided-reduction seeds
+        # sink (``CuteStridedReductionHeuristic.strided_reduction``), so
+        # ``cute_vloop_sink`` and ``cute_lane_unroll`` are tunable at every
+        # extent.
+        self.cute_strided_reduction_sites = False
         self.cute_signed_bitfield_bf16_available = False
         # Set by DeviceIR analysis: the reductions whose ``reduction_loops``
         # slot may roll (is not pinned) along which a load reads a bool

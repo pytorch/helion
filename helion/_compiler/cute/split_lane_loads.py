@@ -53,9 +53,11 @@ from typing import TYPE_CHECKING
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ._ast_pass_utils import assigned_name
+from ._ast_pass_utils import is_constexpr_range
 from ._ast_pass_utils import loop_extent
 from .unroll_lane_loads import _MAX_UNROLLED_LANES
 from .unroll_lane_loads import _MAX_UNROLLED_STATEMENTS
+from .unroll_lane_loads import _loop_trips
 from .unroll_lane_loads import _trace_size
 
 if TYPE_CHECKING:
@@ -87,17 +89,23 @@ def _is_const_range_loop(loop: ast.For) -> tuple[str, int] | None:
     return loop.target.id, extent
 
 
-def _lane_width(stmts: list[ast.stmt]) -> int:
+def _lane_width(
+    stmts: list[ast.stmt], constexpr_values: Mapping[str, int] | None
+) -> int:
     """Elements one lane computes: the most trace-time copies a statement of
-    its compute phase gets, the product of the ``range_constexpr`` extents
-    around it (the V-loop's V in a plain lane body; 1 without one)."""
+    its compute phase gets, the product of the trips of the
+    ``range_constexpr`` loops around it (``_loop_trips``; the V-loop's V in a
+    plain lane body; 1 without one).  A range ``_loop_trips`` cannot resolve
+    counts once."""
     width = 1
     for stmt in stmts:
         nested = [
             node for node in ast.iter_child_nodes(stmt) if isinstance(node, ast.stmt)
         ]
-        extent = loop_extent(stmt, kinds=("constexpr",)) or 1
-        width = max(width, extent * _lane_width(nested))
+        extent = 1
+        if is_constexpr_range(stmt):
+            extent = _loop_trips(stmt, constexpr_values) or 1
+        width = max(width, extent * _lane_width(nested, constexpr_values))
     return width
 
 
@@ -132,7 +140,7 @@ def _try_split(
     if (
         statements is None
         or reps > _MAX_UNROLLED_LANES
-        or reps * _lane_width(rest) > _MAX_SPLIT_ELEMENTS
+        or reps * _lane_width(rest, constexpr_values) > _MAX_SPLIT_ELEMENTS
         or reps * statements > _MAX_UNROLLED_STATEMENTS
     ):
         return None

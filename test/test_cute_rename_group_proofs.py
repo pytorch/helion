@@ -507,6 +507,8 @@ def test_the_pipeline_passes_the_rename_groups_to_both_passes(
     monkeypatch.setattr(fuser_module, "fuse_two_pass_loads", stub("fuser"))
     monkeypatch.setattr(prefetch_module, "prefetch_reduction_packets", stub("prefetch"))
     state = MagicMock()
+    # Without cute_scratch_forwarding, which would look up the scratch tensors.
+    state.ctx.config = {}
     pipeline._fuse_two_pass_loads(state)
     pipeline._prefetch_reduction_packets(state)
     assert seen == {

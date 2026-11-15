@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 
     from ..runtime.config import Config
     from .device_ir import DeviceIR
+    from .scratch_tensors import ScratchTensors
     from .source_location import SourceLocation
     from .type_info import TypeInfo
 
@@ -231,6 +232,12 @@ class HostFunction:
         self.local_types: dict[str, TypeInfo] | None = None
         # Whether Backend.customize_ast rewrote the kernel body.
         self.backend_rewrote_ast = False
+        # Whether this host function compiles one stage of a larger host
+        # program, which a backend splits into several launches: the other
+        # stages may read what it allocates (``kernel_local_scratch``).
+        self.partial_program = False
+        # Its kernel-local scratch tensors (``find_kernel_local_scratch``).
+        self.scratch_tensors: ScratchTensors | None = None
 
     # Backward-compatible accessors
 

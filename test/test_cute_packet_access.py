@@ -12,9 +12,14 @@ starts producing belongs in this table.
 from __future__ import annotations
 
 import ast
+import inspect
+import typing
 
 import pytest
 
+from helion import exc
+from helion._compiler.cute.autotune.search_surface import CUTE_EVICTION_POLICIES
+from helion._compiler.cute.cache_hint_forms import L1_PRIORITY_QUALIFIERS
 from helion._compiler.cute.cache_policy_loads import CachePolicy
 from helion._compiler.cute.packet_access import PacketAccess
 from helion._compiler.cute.packet_access import call_write_roots
@@ -28,6 +33,9 @@ from helion._compiler.cute.packet_flush_names import PACKET_FLUSH_HELPER_NAMES
 from helion._compiler.cute.packet_flush_names import PACKET_FLUSH_L2_EVICT_LAST
 from helion._compiler.cute.packet_flush_names import PACKET_FLUSH_STREAMING
 from helion._compiler.cute.persistent_branch_vec import PACKET_STORE_BYTES
+
+if typing.TYPE_CHECKING:
+    import types
 
 # Grammar and table pins over the AST and the emitted strings: no GPU.
 pytestmark = pytest.mark.cpu_only
@@ -192,6 +200,10 @@ CORPUS_FORMS: list[tuple[str, tuple[object, ...] | None]] = [
     (
         f"_cute_load_v16b_if(PTR, PRED, {_vt(4, _U32)}, 'evict_last')",
         ("masked_packet", 4, _U32, "_cute_load_v16b_if", True, ()),
+    ),
+    (
+        f"_cute_load_v16b_if(PTR, PRED, {_vt(8, _U16)}, 'l1_l2_first')",
+        ("masked_packet", 8, _U16, "_cute_load_v16b_if", True, ()),
     ),
     # packet flushes
     (
@@ -501,7 +513,97 @@ def test_cache_policy_suffix_round_trip() -> None:
     assert CachePolicy(l1_priority="evict_last").vector_helper(16) is None
     assert CachePolicy(l1_priority="evict_last").masked_priority == "evict_last"
     assert CachePolicy(streaming=True).masked_priority == "cs"
-    assert CachePolicy(l2_helper="l2_last").masked_priority == ""
+    assert CachePolicy(l2_helper="l2_last").masked_priority == "l2_last"
     assert CachePolicy(l1_priority="evict_first").scalar_policy == "first"
     assert CachePolicy(streaming=True).scalar_policy == "streaming"
     assert CachePolicy(l1_priority="evict_normal").scalar_policy is None
+
+
+@pytest.mark.parametrize("spelling", ["nc_l2_first", "l2_last", "first", "cs"])
+def test_an_explicit_policy_outside_the_l1_priorities_is_refused(
+    spelling: str,
+) -> None:
+    """An explicit ``hl.load`` eviction policy is an L1 priority: an L2
+    family's name would reach the predicated packets as that family
+    (``nc_l2_first`` loading noncoherently past the read-only check)."""
+    with pytest.raises(exc.BackendUnsupported, match="L1 eviction priority"):
+        CachePolicy.explicit(spelling)
+
+
+@pytest.fixture
+def masked() -> types.ModuleType:
+    """``masked_packet_load``, whose helpers import the CuTe DSL."""
+    return pytest.importorskip("helion._compiler.cute.masked_packet_load")
+
+
+def test_masked_packet_loads_carry_the_l2_policy(masked: types.ModuleType) -> None:
+    """A predicated packet with an L2 policy family creates the policy
+    descriptor the unpredicated L2 helpers (and Triton's ``evict_first``
+    loads) carry and passes it to each of its loads; the L1 and streaming
+    hints keep their plain forms."""
+    assembly = masked._assembly(4, "l1_l2_first")
+    assert "createpolicy.fractional.L2::evict_first.b64 pol, 1.0;" in assembly
+    assert (
+        "@p ld.global.L1::evict_first.L2::cache_hint.v4.b32 {$0,$1,$2,$3}, [$4], pol;"
+        in assembly
+    )
+    assert "createpolicy.fractional.L2::evict_last" in masked._assembly(2, "l2_last")
+    assert "@p ld.global.L2::cache_hint.v2.b32" in masked._assembly(2, "l2_last")
+    wide = masked._assembly(8, "nc_l2_first")
+    assert wide.count("@p ld.global.nc.L2::cache_hint.v4.b32") == 2
+    assert wide.count("], pol;") == 2
+    # An 8-byte noncoherent packet too, which has no unpredicated helper.
+    assert "@p ld.global.nc.L2::cache_hint.v2.b32 {$0,$1}, [$2], pol;" in (
+        masked._assembly(2, "nc_l2_first")
+    )
+    assert masked._assembly(4, "cs").endswith(
+        "@p ld.global.cs.v4.b32 {$0,$1,$2,$3}, [$4]; }"
+    )
+    assert "pol" not in masked._assembly(4, "evict_last")
+
+
+def test_every_searched_masked_priority_has_a_load_form(
+    masked: types.ModuleType,
+) -> None:
+    """Every ``load_eviction_policies`` value the search offers
+    (``CachePolicy.tunable``) gives a predicated packet a load form at every
+    packet width.  An unknown priority only fails when the kernel traces, so a
+    new L2 family must reach the forms the helpers read."""
+    for value in CUTE_EVICTION_POLICIES:
+        priority = CachePolicy.tunable(value).masked_priority
+        for words in (1, 2, 4, 8, 16):
+            assert masked._assembly(words, priority).count("@p ld.global") == max(
+                1, words // 4
+            ), (value, words)
+
+
+@pytest.mark.parametrize("spelling", ["", *L1_PRIORITY_QUALIFIERS])
+def test_every_explicit_eviction_policy_has_a_masked_load_form(
+    masked: types.ModuleType, spelling: str
+) -> None:
+    """Every ``hl.load(..., eviction_policy=...)`` spelling, which
+    ``CachePolicy.explicit`` forwards as the L1 priority, loads predicated
+    packets with its PTX qualifier at every width.  ``evict_normal``,
+    ``evict_unchanged`` and ``evict_no_allocate`` had none, so a kernel whose
+    sink made such a load predicated packets raised KeyError as it traced."""
+    priority = CachePolicy.explicit(spelling).masked_priority
+    load = f"@p ld.global{L1_PRIORITY_QUALIFIERS.get(spelling, '')}."
+    for words in (1, 2, 4, 8, 16):
+        assert masked._assembly(words, priority).count(load) == max(1, words // 4), (
+            words
+        )
+
+
+def test_the_l1_priorities_are_those_cute_arch_load_takes() -> None:
+    """``L1_PRIORITY_QUALIFIERS`` holds exactly the
+    ``level1_eviction_priority`` values ``cute.arch.load`` accepts: the
+    spellings an explicit ``hl.load`` eviction policy can reach the
+    predicated packets with."""
+    cute = pytest.importorskip("cutlass.cute")
+    parameter = inspect.signature(cute.arch.load).parameters["level1_eviction_priority"]
+    (literal,) = [
+        option
+        for option in typing.get_args(parameter.annotation)
+        if option is not type(None)
+    ]
+    assert set(typing.get_args(literal)) == set(L1_PRIORITY_QUALIFIERS)
