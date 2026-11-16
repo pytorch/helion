@@ -91,11 +91,12 @@ constant float _helion_table_0[16] = {0.0f, 3.0517578125e-05f, 6.103515625e-05f,
                     auto lane_1 = _fm;
                     auto indices_1 = ((offset_1 + (tid[0] * 8)) + lane_1);
                     auto mask_1 = ((tid[0] < 2) && (indices_1 < 48));
+                    auto _clamped_indices_1 = (mask_1 ? indices_1 : offset_1);
                     auto indices_2 = (offset_2 + tid[1]);
                     auto mask_2 = ((tid[1] < _BLOCK_SIZE_2) && (indices_2 < 256));
                     auto tile_index = static_cast<int>(indices_2);
                     auto v_1 = static_cast<int>((((_fn * 2) / 8) + (offset_2 / 8)));
-                    auto words = _helion_masked(wq[((mask_1 & mask_2) ? ((indices_1 * 32) + v_1) : 0)], (mask_1 & mask_2), 0);
+                    auto words = _helion_masked(wq[(mask_2 ? ((_clamped_indices_1 * 32) + v_1) : 0)], mask_2, 0);
                     auto tile_index_1 = static_cast<int>(indices_2);
                     auto v_3 = static_cast<int>(((_fn * 2) - (((_fn * 2) / 8) * 8)));
                     auto v_5 = (v_3 * v_4);
@@ -104,7 +105,7 @@ constant float _helion_table_0[16] = {0.0f, 3.0517578125e-05f, 6.103515625e-05f,
                     auto v_8 = (v_6 & v_7);
                     auto tile_index_2 = static_cast<int>(indices_2);
                     auto v_20 = static_cast<int>((offset_2 / 16));
-                    auto load_1 = _helion_masked(s[((mask_1 & mask_2) ? ((indices_1 * 16) + v_20) : 0)], (mask_1 & mask_2), 0);
+                    auto load_1 = _helion_masked(s[(mask_2 ? ((_clamped_indices_1 * 16) + v_20) : 0)], mask_2, 0);
                     auto v_21 = static_cast<int>(load_1);
                     auto v_23 = (v_21 & v_22);
                     auto v_25 = (v_23 << v_24);
@@ -131,11 +132,12 @@ constant float _helion_table_0[16] = {0.0f, 3.0517578125e-05f, 6.103515625e-05f,
                     auto lane_1 = _fm;
                     auto indices_1 = ((offset_1 + (tid[0] * 8)) + lane_1);
                     auto mask_1 = ((tid[0] < 2) && (indices_1 < 48));
+                    auto _clamped_indices_1 = (mask_1 ? indices_1 : offset_1);
                     auto indices_2 = (offset_2 + tid[1]);
                     auto mask_2 = ((tid[1] < _BLOCK_SIZE_2) && (indices_2 < 256));
                     auto tile_index = static_cast<int>(indices_2);
                     auto v_1 = static_cast<int>((((_fn * 2) / 8) + (offset_2 / 8)));
-                    auto words = _helion_masked(wq[((mask_1 & mask_2) ? ((indices_1 * 32) + v_1) : 0)], (mask_1 & mask_2), 0);
+                    auto words = _helion_masked(wq[(mask_2 ? ((_clamped_indices_1 * 32) + v_1) : 0)], mask_2, 0);
                     auto tile_index_1 = static_cast<int>(indices_2);
                     auto v_3 = static_cast<int>((((_fn * 2) - (((_fn * 2) / 8) * 8)) + 2));
                     auto v_5 = (v_3 * v_4);
@@ -144,7 +146,7 @@ constant float _helion_table_0[16] = {0.0f, 3.0517578125e-05f, 6.103515625e-05f,
                     auto v_8 = (v_6 & v_7);
                     auto tile_index_2 = static_cast<int>(indices_2);
                     auto v_20 = static_cast<int>((offset_2 / 16));
-                    auto load_1 = _helion_masked(s[((mask_1 & mask_2) ? ((indices_1 * 16) + v_20) : 0)], (mask_1 & mask_2), 0);
+                    auto load_1 = _helion_masked(s[(mask_2 ? ((_clamped_indices_1 * 16) + v_20) : 0)], mask_2, 0);
                     auto v_21 = static_cast<int>(load_1);
                     auto v_23 = (v_21 & v_22);
                     auto v_25 = (v_23 << v_24);
@@ -171,11 +173,12 @@ constant float _helion_table_0[16] = {0.0f, 3.0517578125e-05f, 6.103515625e-05f,
                     auto lane_1 = _fm;
                     auto indices_1 = ((offset_1 + (tid[0] * 8)) + lane_1);
                     auto mask_1 = ((tid[0] < 2) && (indices_1 < 48));
+                    auto _clamped_indices_1 = (mask_1 ? indices_1 : offset_1);
                     auto indices_2 = (offset_2 + tid[1]);
                     auto mask_2 = ((tid[1] < _BLOCK_SIZE_2) && (indices_2 < 256));
                     auto tile_index = static_cast<int>(indices_2);
                     auto v_1 = static_cast<int>((((_fn * 2) / 8) + (offset_2 / 8)));
-                    auto words = _helion_masked(wq[((mask_1 & mask_2) ? ((indices_1 * 32) + v_1) : 0)], (mask_1 & mask_2), 0);
+                    auto words = _helion_masked(wq[(mask_2 ? ((_clamped_indices_1 * 32) + v_1) : 0)], mask_2, 0);
                     auto tile_index_1 = static_cast<int>(indices_2);
                     auto v_3 = static_cast<int>(((_fn * 2) - (((_fn * 2) / 8) * 8)));
                     auto v_5 = (v_3 * v_4);
@@ -184,7 +187,7 @@ constant float _helion_table_0[16] = {0.0f, 3.0517578125e-05f, 6.103515625e-05f,
                     auto v_8 = (v_6 & v_7);
                     auto tile_index_2 = static_cast<int>(indices_2);
                     auto v_20 = static_cast<int>((offset_2 / 16));
-                    auto load_1 = _helion_masked(s[((mask_1 & mask_2) ? ((indices_1 * 16) + v_20) : 0)], (mask_1 & mask_2), 0);
+                    auto load_1 = _helion_masked(s[(mask_2 ? ((_clamped_indices_1 * 16) + v_20) : 0)], mask_2, 0);
                     auto v_21 = static_cast<int>(load_1);
                     auto v_23 = (v_21 & v_22);
                     auto v_25 = (v_23 << v_24);
@@ -211,11 +214,12 @@ constant float _helion_table_0[16] = {0.0f, 3.0517578125e-05f, 6.103515625e-05f,
                     auto lane_1 = _fm;
                     auto indices_1 = ((offset_1 + (tid[0] * 8)) + lane_1);
                     auto mask_1 = ((tid[0] < 2) && (indices_1 < 48));
+                    auto _clamped_indices_1 = (mask_1 ? indices_1 : offset_1);
                     auto indices_2 = (offset_2 + tid[1]);
                     auto mask_2 = ((tid[1] < _BLOCK_SIZE_2) && (indices_2 < 256));
                     auto tile_index = static_cast<int>(indices_2);
                     auto v_1 = static_cast<int>((((_fn * 2) / 8) + (offset_2 / 8)));
-                    auto words = _helion_masked(wq[((mask_1 & mask_2) ? ((indices_1 * 32) + v_1) : 0)], (mask_1 & mask_2), 0);
+                    auto words = _helion_masked(wq[(mask_2 ? ((_clamped_indices_1 * 32) + v_1) : 0)], mask_2, 0);
                     auto tile_index_1 = static_cast<int>(indices_2);
                     auto v_3 = static_cast<int>((((_fn * 2) - (((_fn * 2) / 8) * 8)) + 2));
                     auto v_5 = (v_3 * v_4);
@@ -224,7 +228,7 @@ constant float _helion_table_0[16] = {0.0f, 3.0517578125e-05f, 6.103515625e-05f,
                     auto v_8 = (v_6 & v_7);
                     auto tile_index_2 = static_cast<int>(indices_2);
                     auto v_20 = static_cast<int>((offset_2 / 16));
-                    auto load_1 = _helion_masked(s[((mask_1 & mask_2) ? ((indices_1 * 16) + v_20) : 0)], (mask_1 & mask_2), 0);
+                    auto load_1 = _helion_masked(s[(mask_2 ? ((_clamped_indices_1 * 16) + v_20) : 0)], mask_2, 0);
                     auto v_21 = static_cast<int>(load_1);
                     auto v_23 = (v_21 & v_22);
                     auto v_25 = (v_23 << v_24);
@@ -270,11 +274,12 @@ constant float _helion_table_0[16] = {0.0f, 3.0517578125e-05f, 6.103515625e-05f,
                     auto lane_1 = _fm;
                     auto indices_1 = ((offset_1 + (tid[0] * 8)) + lane_1);
                     auto mask_1 = ((tid[0] < 2) && (indices_1 < 48));
+                    auto _clamped_indices_1 = (mask_1 ? indices_1 : offset_1);
                     auto indices_2 = (offset_2 + tid[1]);
                     auto mask_2 = ((tid[1] < _BLOCK_SIZE_2) && (indices_2 < 256));
                     auto tile_index = static_cast<int>(indices_2);
                     auto v_1 = static_cast<int>((((_fn * 2) / 8) + (offset_2 / 8)));
-                    auto words = _helion_masked(wq[((mask_1 & mask_2) ? ((indices_1 * 32) + v_1) : 0)], (mask_1 & mask_2), 0);
+                    auto words = _helion_masked(wq[(mask_2 ? ((_clamped_indices_1 * 32) + v_1) : 0)], mask_2, 0);
                     auto tile_index_1 = static_cast<int>(indices_2);
                     auto v_3 = static_cast<int>((((_fn * 2) - (((_fn * 2) / 8) * 8)) + 1));
                     auto v_5 = (v_3 * v_4);
@@ -283,7 +288,7 @@ constant float _helion_table_0[16] = {0.0f, 3.0517578125e-05f, 6.103515625e-05f,
                     auto v_8 = (v_6 & v_7);
                     auto tile_index_2 = static_cast<int>(indices_2);
                     auto v_20 = static_cast<int>((offset_2 / 16));
-                    auto load_1 = _helion_masked(s[((mask_1 & mask_2) ? ((indices_1 * 16) + v_20) : 0)], (mask_1 & mask_2), 0);
+                    auto load_1 = _helion_masked(s[(mask_2 ? ((_clamped_indices_1 * 16) + v_20) : 0)], mask_2, 0);
                     auto v_21 = static_cast<int>(load_1);
                     auto v_23 = (v_21 & v_22);
                     auto v_25 = (v_23 << v_24);
@@ -310,11 +315,12 @@ constant float _helion_table_0[16] = {0.0f, 3.0517578125e-05f, 6.103515625e-05f,
                     auto lane_1 = _fm;
                     auto indices_1 = ((offset_1 + (tid[0] * 8)) + lane_1);
                     auto mask_1 = ((tid[0] < 2) && (indices_1 < 48));
+                    auto _clamped_indices_1 = (mask_1 ? indices_1 : offset_1);
                     auto indices_2 = (offset_2 + tid[1]);
                     auto mask_2 = ((tid[1] < _BLOCK_SIZE_2) && (indices_2 < 256));
                     auto tile_index = static_cast<int>(indices_2);
                     auto v_1 = static_cast<int>((((_fn * 2) / 8) + (offset_2 / 8)));
-                    auto words = _helion_masked(wq[((mask_1 & mask_2) ? ((indices_1 * 32) + v_1) : 0)], (mask_1 & mask_2), 0);
+                    auto words = _helion_masked(wq[(mask_2 ? ((_clamped_indices_1 * 32) + v_1) : 0)], mask_2, 0);
                     auto tile_index_1 = static_cast<int>(indices_2);
                     auto v_3 = static_cast<int>((((_fn * 2) - (((_fn * 2) / 8) * 8)) + 3));
                     auto v_5 = (v_3 * v_4);
@@ -323,7 +329,7 @@ constant float _helion_table_0[16] = {0.0f, 3.0517578125e-05f, 6.103515625e-05f,
                     auto v_8 = (v_6 & v_7);
                     auto tile_index_2 = static_cast<int>(indices_2);
                     auto v_20 = static_cast<int>((offset_2 / 16));
-                    auto load_1 = _helion_masked(s[((mask_1 & mask_2) ? ((indices_1 * 16) + v_20) : 0)], (mask_1 & mask_2), 0);
+                    auto load_1 = _helion_masked(s[(mask_2 ? ((_clamped_indices_1 * 16) + v_20) : 0)], mask_2, 0);
                     auto v_21 = static_cast<int>(load_1);
                     auto v_23 = (v_21 & v_22);
                     auto v_25 = (v_23 << v_24);
@@ -350,11 +356,12 @@ constant float _helion_table_0[16] = {0.0f, 3.0517578125e-05f, 6.103515625e-05f,
                     auto lane_1 = _fm;
                     auto indices_1 = ((offset_1 + (tid[0] * 8)) + lane_1);
                     auto mask_1 = ((tid[0] < 2) && (indices_1 < 48));
+                    auto _clamped_indices_1 = (mask_1 ? indices_1 : offset_1);
                     auto indices_2 = (offset_2 + tid[1]);
                     auto mask_2 = ((tid[1] < _BLOCK_SIZE_2) && (indices_2 < 256));
                     auto tile_index = static_cast<int>(indices_2);
                     auto v_1 = static_cast<int>((((_fn * 2) / 8) + (offset_2 / 8)));
-                    auto words = _helion_masked(wq[((mask_1 & mask_2) ? ((indices_1 * 32) + v_1) : 0)], (mask_1 & mask_2), 0);
+                    auto words = _helion_masked(wq[(mask_2 ? ((_clamped_indices_1 * 32) + v_1) : 0)], mask_2, 0);
                     auto tile_index_1 = static_cast<int>(indices_2);
                     auto v_3 = static_cast<int>((((_fn * 2) - (((_fn * 2) / 8) * 8)) + 1));
                     auto v_5 = (v_3 * v_4);
@@ -363,7 +370,7 @@ constant float _helion_table_0[16] = {0.0f, 3.0517578125e-05f, 6.103515625e-05f,
                     auto v_8 = (v_6 & v_7);
                     auto tile_index_2 = static_cast<int>(indices_2);
                     auto v_20 = static_cast<int>((offset_2 / 16));
-                    auto load_1 = _helion_masked(s[((mask_1 & mask_2) ? ((indices_1 * 16) + v_20) : 0)], (mask_1 & mask_2), 0);
+                    auto load_1 = _helion_masked(s[(mask_2 ? ((_clamped_indices_1 * 16) + v_20) : 0)], mask_2, 0);
                     auto v_21 = static_cast<int>(load_1);
                     auto v_23 = (v_21 & v_22);
                     auto v_25 = (v_23 << v_24);
@@ -390,11 +397,12 @@ constant float _helion_table_0[16] = {0.0f, 3.0517578125e-05f, 6.103515625e-05f,
                     auto lane_1 = _fm;
                     auto indices_1 = ((offset_1 + (tid[0] * 8)) + lane_1);
                     auto mask_1 = ((tid[0] < 2) && (indices_1 < 48));
+                    auto _clamped_indices_1 = (mask_1 ? indices_1 : offset_1);
                     auto indices_2 = (offset_2 + tid[1]);
                     auto mask_2 = ((tid[1] < _BLOCK_SIZE_2) && (indices_2 < 256));
                     auto tile_index = static_cast<int>(indices_2);
                     auto v_1 = static_cast<int>((((_fn * 2) / 8) + (offset_2 / 8)));
-                    auto words = _helion_masked(wq[((mask_1 & mask_2) ? ((indices_1 * 32) + v_1) : 0)], (mask_1 & mask_2), 0);
+                    auto words = _helion_masked(wq[(mask_2 ? ((_clamped_indices_1 * 32) + v_1) : 0)], mask_2, 0);
                     auto tile_index_1 = static_cast<int>(indices_2);
                     auto v_3 = static_cast<int>((((_fn * 2) - (((_fn * 2) / 8) * 8)) + 3));
                     auto v_5 = (v_3 * v_4);
@@ -403,7 +411,7 @@ constant float _helion_table_0[16] = {0.0f, 3.0517578125e-05f, 6.103515625e-05f,
                     auto v_8 = (v_6 & v_7);
                     auto tile_index_2 = static_cast<int>(indices_2);
                     auto v_20 = static_cast<int>((offset_2 / 16));
-                    auto load_1 = _helion_masked(s[((mask_1 & mask_2) ? ((indices_1 * 16) + v_20) : 0)], (mask_1 & mask_2), 0);
+                    auto load_1 = _helion_masked(s[(mask_2 ? ((_clamped_indices_1 * 16) + v_20) : 0)], mask_2, 0);
                     auto v_21 = static_cast<int>(load_1);
                     auto v_23 = (v_21 & v_22);
                     auto v_25 = (v_23 << v_24);
@@ -600,9 +608,10 @@ inline auto _helion_masked(T v, bool m, O other) {
                 auto lane_2 = (_fn * 2);
                 auto indices_1 = ((offset_1 + (tid[1] * 2)) + lane_1);
                 auto mask_1 = ((tid[1] < 8) && (indices_1 < 16));
+                auto _clamped_indices_1 = (mask_1 ? indices_1 : offset_1);
                 auto indices_2 = (offset_2 + lane_2);
                 auto mask_2 = (indices_2 < 32);
-                auto load = _helion_masked(y[((mask_2 & mask_1) ? ((indices_2 * 16) + indices_1) : 0)], (mask_2 & mask_1), 0);
+                auto load = _helion_masked(y[(mask_2 ? ((indices_2 * 16) + _clamped_indices_1) : 0)], mask_2, 0);
                 auto v_0 = static_cast<float>(load);
                 auto v_2 = (v_0 * v_1);
                 auto v_3 = static_cast<half>(v_2);
@@ -618,9 +627,10 @@ inline auto _helion_masked(T v, bool m, O other) {
                 auto lane_2 = ((_fn * 2) + 2);
                 auto indices_1 = ((offset_1 + (tid[1] * 2)) + lane_1);
                 auto mask_1 = ((tid[1] < 8) && (indices_1 < 16));
+                auto _clamped_indices_1 = (mask_1 ? indices_1 : offset_1);
                 auto indices_2 = (offset_2 + lane_2);
                 auto mask_2 = (indices_2 < 32);
-                auto load = _helion_masked(y[((mask_2 & mask_1) ? ((indices_2 * 16) + indices_1) : 0)], (mask_2 & mask_1), 0);
+                auto load = _helion_masked(y[(mask_2 ? ((indices_2 * 16) + _clamped_indices_1) : 0)], mask_2, 0);
                 auto v_0 = static_cast<float>(load);
                 auto v_2 = (v_0 * v_1);
                 auto v_3 = static_cast<half>(v_2);
@@ -636,9 +646,10 @@ inline auto _helion_masked(T v, bool m, O other) {
                 auto lane_2 = (_fn * 2);
                 auto indices_1 = ((offset_1 + (tid[1] * 2)) + lane_1);
                 auto mask_1 = ((tid[1] < 8) && (indices_1 < 16));
+                auto _clamped_indices_1 = (mask_1 ? indices_1 : offset_1);
                 auto indices_2 = (offset_2 + lane_2);
                 auto mask_2 = (indices_2 < 32);
-                auto load = _helion_masked(y[((mask_2 & mask_1) ? ((indices_2 * 16) + indices_1) : 0)], (mask_2 & mask_1), 0);
+                auto load = _helion_masked(y[(mask_2 ? ((indices_2 * 16) + _clamped_indices_1) : 0)], mask_2, 0);
                 auto v_0 = static_cast<float>(load);
                 auto v_2 = (v_0 * v_1);
                 auto v_3 = static_cast<half>(v_2);
@@ -654,9 +665,10 @@ inline auto _helion_masked(T v, bool m, O other) {
                 auto lane_2 = ((_fn * 2) + 2);
                 auto indices_1 = ((offset_1 + (tid[1] * 2)) + lane_1);
                 auto mask_1 = ((tid[1] < 8) && (indices_1 < 16));
+                auto _clamped_indices_1 = (mask_1 ? indices_1 : offset_1);
                 auto indices_2 = (offset_2 + lane_2);
                 auto mask_2 = (indices_2 < 32);
-                auto load = _helion_masked(y[((mask_2 & mask_1) ? ((indices_2 * 16) + indices_1) : 0)], (mask_2 & mask_1), 0);
+                auto load = _helion_masked(y[(mask_2 ? ((indices_2 * 16) + _clamped_indices_1) : 0)], mask_2, 0);
                 auto v_0 = static_cast<float>(load);
                 auto v_2 = (v_0 * v_1);
                 auto v_3 = static_cast<half>(v_2);
@@ -691,9 +703,10 @@ inline auto _helion_masked(T v, bool m, O other) {
                 auto lane_2 = ((_fn * 2) + 1);
                 auto indices_1 = ((offset_1 + (tid[1] * 2)) + lane_1);
                 auto mask_1 = ((tid[1] < 8) && (indices_1 < 16));
+                auto _clamped_indices_1 = (mask_1 ? indices_1 : offset_1);
                 auto indices_2 = (offset_2 + lane_2);
                 auto mask_2 = (indices_2 < 32);
-                auto load = _helion_masked(y[((mask_2 & mask_1) ? ((indices_2 * 16) + indices_1) : 0)], (mask_2 & mask_1), 0);
+                auto load = _helion_masked(y[(mask_2 ? ((indices_2 * 16) + _clamped_indices_1) : 0)], mask_2, 0);
                 auto v_0 = static_cast<float>(load);
                 auto v_2 = (v_0 * v_1);
                 auto v_3 = static_cast<half>(v_2);
@@ -709,9 +722,10 @@ inline auto _helion_masked(T v, bool m, O other) {
                 auto lane_2 = ((_fn * 2) + 3);
                 auto indices_1 = ((offset_1 + (tid[1] * 2)) + lane_1);
                 auto mask_1 = ((tid[1] < 8) && (indices_1 < 16));
+                auto _clamped_indices_1 = (mask_1 ? indices_1 : offset_1);
                 auto indices_2 = (offset_2 + lane_2);
                 auto mask_2 = (indices_2 < 32);
-                auto load = _helion_masked(y[((mask_2 & mask_1) ? ((indices_2 * 16) + indices_1) : 0)], (mask_2 & mask_1), 0);
+                auto load = _helion_masked(y[(mask_2 ? ((indices_2 * 16) + _clamped_indices_1) : 0)], mask_2, 0);
                 auto v_0 = static_cast<float>(load);
                 auto v_2 = (v_0 * v_1);
                 auto v_3 = static_cast<half>(v_2);
@@ -727,9 +741,10 @@ inline auto _helion_masked(T v, bool m, O other) {
                 auto lane_2 = ((_fn * 2) + 1);
                 auto indices_1 = ((offset_1 + (tid[1] * 2)) + lane_1);
                 auto mask_1 = ((tid[1] < 8) && (indices_1 < 16));
+                auto _clamped_indices_1 = (mask_1 ? indices_1 : offset_1);
                 auto indices_2 = (offset_2 + lane_2);
                 auto mask_2 = (indices_2 < 32);
-                auto load = _helion_masked(y[((mask_2 & mask_1) ? ((indices_2 * 16) + indices_1) : 0)], (mask_2 & mask_1), 0);
+                auto load = _helion_masked(y[(mask_2 ? ((indices_2 * 16) + _clamped_indices_1) : 0)], mask_2, 0);
                 auto v_0 = static_cast<float>(load);
                 auto v_2 = (v_0 * v_1);
                 auto v_3 = static_cast<half>(v_2);
@@ -745,9 +760,10 @@ inline auto _helion_masked(T v, bool m, O other) {
                 auto lane_2 = ((_fn * 2) + 3);
                 auto indices_1 = ((offset_1 + (tid[1] * 2)) + lane_1);
                 auto mask_1 = ((tid[1] < 8) && (indices_1 < 16));
+                auto _clamped_indices_1 = (mask_1 ? indices_1 : offset_1);
                 auto indices_2 = (offset_2 + lane_2);
                 auto mask_2 = (indices_2 < 32);
-                auto load = _helion_masked(y[((mask_2 & mask_1) ? ((indices_2 * 16) + indices_1) : 0)], (mask_2 & mask_1), 0);
+                auto load = _helion_masked(y[(mask_2 ? ((indices_2 * 16) + _clamped_indices_1) : 0)], mask_2, 0);
                 auto v_0 = static_cast<float>(load);
                 auto v_2 = (v_0 * v_1);
                 auto v_3 = static_cast<half>(v_2);
@@ -885,49 +901,49 @@ inline auto _helion_masked(T v, bool m, O other) {
                 constexpr short _fi = 0;
                 int _e_m = 8 * (_fi >> 1) + _fm;
                 int _e_k = 2 * (_fn + (_fi & 1)) + _fs;
-                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[((((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)) ? (((offset_0 + _e_m) * 40) + (offset_2 + _e_k)) : 0)], (((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)), 0));
+                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[(((offset_2 + _e_k) < 40) ? (((((offset_0 + _e_m) < 13) ? (offset_0 + _e_m) : offset_0) * 40) + (offset_2 + _e_k)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             {
                 constexpr short _fi = 1;
                 int _e_m = 8 * (_fi >> 1) + _fm;
                 int _e_k = 2 * (_fn + (_fi & 1)) + _fs;
-                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[((((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)) ? (((offset_0 + _e_m) * 40) + (offset_2 + _e_k)) : 0)], (((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)), 0));
+                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[(((offset_2 + _e_k) < 40) ? (((((offset_0 + _e_m) < 13) ? (offset_0 + _e_m) : offset_0) * 40) + (offset_2 + _e_k)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             {
                 constexpr short _fi = 2;
                 int _e_m = 8 * (_fi >> 1) + _fm;
                 int _e_k = 2 * (_fn + (_fi & 1)) + _fs;
-                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[((((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)) ? (((offset_0 + _e_m) * 40) + (offset_2 + _e_k)) : 0)], (((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)), 0));
+                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[(((offset_2 + _e_k) < 40) ? (((((offset_0 + _e_m) < 13) ? (offset_0 + _e_m) : offset_0) * 40) + (offset_2 + _e_k)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             {
                 constexpr short _fi = 3;
                 int _e_m = 8 * (_fi >> 1) + _fm;
                 int _e_k = 2 * (_fn + (_fi & 1)) + _fs;
-                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[((((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)) ? (((offset_0 + _e_m) * 40) + (offset_2 + _e_k)) : 0)], (((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)), 0));
+                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[(((offset_2 + _e_k) < 40) ? (((((offset_0 + _e_m) < 13) ? (offset_0 + _e_m) : offset_0) * 40) + (offset_2 + _e_k)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             {
                 constexpr short _fi = 0;
                 int _e_k = 2 * _fm + _fs;
                 int _e_n = 8 * (_fi >> 1) + _fn + (_fi & 1);
-                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[((((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)) ? (((offset_2 + _e_k) * 20) + (offset_1 + _e_n)) : 0)], (((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)), 0));
+                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[(((offset_2 + _e_k) < 40) ? (((offset_2 + _e_k) * 20) + (((offset_1 + _e_n) < 20) ? (offset_1 + _e_n) : offset_1)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             {
                 constexpr short _fi = 1;
                 int _e_k = 2 * _fm + _fs;
                 int _e_n = 8 * (_fi >> 1) + _fn + (_fi & 1);
-                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[((((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)) ? (((offset_2 + _e_k) * 20) + (offset_1 + _e_n)) : 0)], (((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)), 0));
+                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[(((offset_2 + _e_k) < 40) ? (((offset_2 + _e_k) * 20) + (((offset_1 + _e_n) < 20) ? (offset_1 + _e_n) : offset_1)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             {
                 constexpr short _fi = 2;
                 int _e_k = 2 * _fm + _fs;
                 int _e_n = 8 * (_fi >> 1) + _fn + (_fi & 1);
-                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[((((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)) ? (((offset_2 + _e_k) * 20) + (offset_1 + _e_n)) : 0)], (((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)), 0));
+                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[(((offset_2 + _e_k) < 40) ? (((offset_2 + _e_k) * 20) + (((offset_1 + _e_n) < 20) ? (offset_1 + _e_n) : offset_1)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             {
                 constexpr short _fi = 3;
                 int _e_k = 2 * _fm + _fs;
                 int _e_n = 8 * (_fi >> 1) + _fn + (_fi & 1);
-                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[((((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)) ? (((offset_2 + _e_k) * 20) + (offset_1 + _e_n)) : 0)], (((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)), 0));
+                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[(((offset_2 + _e_k) < 40) ? (((offset_2 + _e_k) * 20) + (((offset_1 + _e_n) < 20) ? (offset_1 + _e_n) : offset_1)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             simdgroup_multiply_accumulate(acc_copy_0[0], _frag_a[0], _frag_b[0], acc_copy_0[0]);
             simdgroup_multiply_accumulate(acc_copy_0[1], _frag_a[0], _frag_b[1], acc_copy_0[1]);
@@ -942,49 +958,49 @@ inline auto _helion_masked(T v, bool m, O other) {
                 constexpr short _fi = 0;
                 int _e_m = 8 * (_fi >> 1) + _fm;
                 int _e_k = 2 * (_fn + (_fi & 1)) + _fs;
-                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[((((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)) ? (((offset_0 + _e_m) * 40) + (offset_2 + _e_k)) : 0)], (((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)), 0));
+                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[(((offset_2 + _e_k) < 40) ? (((((offset_0 + _e_m) < 13) ? (offset_0 + _e_m) : offset_0) * 40) + (offset_2 + _e_k)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             {
                 constexpr short _fi = 1;
                 int _e_m = 8 * (_fi >> 1) + _fm;
                 int _e_k = 2 * (_fn + (_fi & 1)) + _fs;
-                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[((((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)) ? (((offset_0 + _e_m) * 40) + (offset_2 + _e_k)) : 0)], (((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)), 0));
+                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[(((offset_2 + _e_k) < 40) ? (((((offset_0 + _e_m) < 13) ? (offset_0 + _e_m) : offset_0) * 40) + (offset_2 + _e_k)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             {
                 constexpr short _fi = 2;
                 int _e_m = 8 * (_fi >> 1) + _fm;
                 int _e_k = 2 * (_fn + (_fi & 1)) + _fs;
-                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[((((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)) ? (((offset_0 + _e_m) * 40) + (offset_2 + _e_k)) : 0)], (((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)), 0));
+                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[(((offset_2 + _e_k) < 40) ? (((((offset_0 + _e_m) < 13) ? (offset_0 + _e_m) : offset_0) * 40) + (offset_2 + _e_k)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             {
                 constexpr short _fi = 3;
                 int _e_m = 8 * (_fi >> 1) + _fm;
                 int _e_k = 2 * (_fn + (_fi & 1)) + _fs;
-                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[((((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)) ? (((offset_0 + _e_m) * 40) + (offset_2 + _e_k)) : 0)], (((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)), 0));
+                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[(((offset_2 + _e_k) < 40) ? (((((offset_0 + _e_m) < 13) ? (offset_0 + _e_m) : offset_0) * 40) + (offset_2 + _e_k)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             {
                 constexpr short _fi = 0;
                 int _e_k = 2 * _fm + _fs;
                 int _e_n = 8 * (_fi >> 1) + _fn + (_fi & 1);
-                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[((((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)) ? (((offset_2 + _e_k) * 20) + (offset_1 + _e_n)) : 0)], (((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)), 0));
+                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[(((offset_2 + _e_k) < 40) ? (((offset_2 + _e_k) * 20) + (((offset_1 + _e_n) < 20) ? (offset_1 + _e_n) : offset_1)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             {
                 constexpr short _fi = 1;
                 int _e_k = 2 * _fm + _fs;
                 int _e_n = 8 * (_fi >> 1) + _fn + (_fi & 1);
-                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[((((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)) ? (((offset_2 + _e_k) * 20) + (offset_1 + _e_n)) : 0)], (((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)), 0));
+                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[(((offset_2 + _e_k) < 40) ? (((offset_2 + _e_k) * 20) + (((offset_1 + _e_n) < 20) ? (offset_1 + _e_n) : offset_1)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             {
                 constexpr short _fi = 2;
                 int _e_k = 2 * _fm + _fs;
                 int _e_n = 8 * (_fi >> 1) + _fn + (_fi & 1);
-                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[((((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)) ? (((offset_2 + _e_k) * 20) + (offset_1 + _e_n)) : 0)], (((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)), 0));
+                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[(((offset_2 + _e_k) < 40) ? (((offset_2 + _e_k) * 20) + (((offset_1 + _e_n) < 20) ? (offset_1 + _e_n) : offset_1)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             {
                 constexpr short _fi = 3;
                 int _e_k = 2 * _fm + _fs;
                 int _e_n = 8 * (_fi >> 1) + _fn + (_fi & 1);
-                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[((((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)) ? (((offset_2 + _e_k) * 20) + (offset_1 + _e_n)) : 0)], (((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)), 0));
+                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[(((offset_2 + _e_k) < 40) ? (((offset_2 + _e_k) * 20) + (((offset_1 + _e_n) < 20) ? (offset_1 + _e_n) : offset_1)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             simdgroup_multiply_accumulate(acc_copy_0[0], _frag_a[0], _frag_b[0], acc_copy_0[0]);
             simdgroup_multiply_accumulate(acc_copy_0[1], _frag_a[0], _frag_b[1], acc_copy_0[1]);
@@ -1206,49 +1222,49 @@ inline auto _helion_masked(T v, bool m, O other) {
                 constexpr short _fi = 0;
                 int _e_m = 8 * (_fi >> 1) + _fm;
                 int _e_k = 2 * (_fn + (_fi & 1)) + _fs;
-                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[((((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)) ? (((offset_0 + _e_m) * 40) + (offset_2 + _e_k)) : 0)], (((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)), 0));
+                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[(((offset_2 + _e_k) < 40) ? (((((offset_0 + _e_m) < 13) ? (offset_0 + _e_m) : offset_0) * 40) + (offset_2 + _e_k)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             {
                 constexpr short _fi = 1;
                 int _e_m = 8 * (_fi >> 1) + _fm;
                 int _e_k = 2 * (_fn + (_fi & 1)) + _fs;
-                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[((((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)) ? (((offset_0 + _e_m) * 40) + (offset_2 + _e_k)) : 0)], (((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)), 0));
+                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[(((offset_2 + _e_k) < 40) ? (((((offset_0 + _e_m) < 13) ? (offset_0 + _e_m) : offset_0) * 40) + (offset_2 + _e_k)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             {
                 constexpr short _fi = 2;
                 int _e_m = 8 * (_fi >> 1) + _fm;
                 int _e_k = 2 * (_fn + (_fi & 1)) + _fs;
-                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[((((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)) ? (((offset_0 + _e_m) * 40) + (offset_2 + _e_k)) : 0)], (((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)), 0));
+                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[(((offset_2 + _e_k) < 40) ? (((((offset_0 + _e_m) < 13) ? (offset_0 + _e_m) : offset_0) * 40) + (offset_2 + _e_k)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             {
                 constexpr short _fi = 3;
                 int _e_m = 8 * (_fi >> 1) + _fm;
                 int _e_k = 2 * (_fn + (_fi & 1)) + _fs;
-                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[((((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)) ? (((offset_0 + _e_m) * 40) + (offset_2 + _e_k)) : 0)], (((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)), 0));
+                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[(((offset_2 + _e_k) < 40) ? (((((offset_0 + _e_m) < 13) ? (offset_0 + _e_m) : offset_0) * 40) + (offset_2 + _e_k)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             {
                 constexpr short _fi = 0;
                 int _e_k = 2 * _fm + _fs;
                 int _e_n = 8 * (_fi >> 1) + _fn + (_fi & 1);
-                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[((((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)) ? (((offset_2 + _e_k) * 20) + (offset_1 + _e_n)) : 0)], (((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)), 0));
+                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[(((offset_2 + _e_k) < 40) ? (((offset_2 + _e_k) * 20) + (((offset_1 + _e_n) < 20) ? (offset_1 + _e_n) : offset_1)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             {
                 constexpr short _fi = 1;
                 int _e_k = 2 * _fm + _fs;
                 int _e_n = 8 * (_fi >> 1) + _fn + (_fi & 1);
-                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[((((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)) ? (((offset_2 + _e_k) * 20) + (offset_1 + _e_n)) : 0)], (((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)), 0));
+                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[(((offset_2 + _e_k) < 40) ? (((offset_2 + _e_k) * 20) + (((offset_1 + _e_n) < 20) ? (offset_1 + _e_n) : offset_1)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             {
                 constexpr short _fi = 2;
                 int _e_k = 2 * _fm + _fs;
                 int _e_n = 8 * (_fi >> 1) + _fn + (_fi & 1);
-                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[((((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)) ? (((offset_2 + _e_k) * 20) + (offset_1 + _e_n)) : 0)], (((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)), 0));
+                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[(((offset_2 + _e_k) < 40) ? (((offset_2 + _e_k) * 20) + (((offset_1 + _e_n) < 20) ? (offset_1 + _e_n) : offset_1)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             {
                 constexpr short _fi = 3;
                 int _e_k = 2 * _fm + _fs;
                 int _e_n = 8 * (_fi >> 1) + _fn + (_fi & 1);
-                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[((((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)) ? (((offset_2 + _e_k) * 20) + (offset_1 + _e_n)) : 0)], (((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)), 0));
+                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[(((offset_2 + _e_k) < 40) ? (((offset_2 + _e_k) * 20) + (((offset_1 + _e_n) < 20) ? (offset_1 + _e_n) : offset_1)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             simdgroup_multiply_accumulate(acc_copy_0[0], _frag_a[0], _frag_b[0], acc_copy_0[0]);
             simdgroup_multiply_accumulate(acc_copy_0[1], _frag_a[0], _frag_b[1], acc_copy_0[1]);
@@ -1263,49 +1279,49 @@ inline auto _helion_masked(T v, bool m, O other) {
                 constexpr short _fi = 0;
                 int _e_m = 8 * (_fi >> 1) + _fm;
                 int _e_k = 2 * (_fn + (_fi & 1)) + _fs;
-                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[((((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)) ? (((offset_0 + _e_m) * 40) + (offset_2 + _e_k)) : 0)], (((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)), 0));
+                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[(((offset_2 + _e_k) < 40) ? (((((offset_0 + _e_m) < 13) ? (offset_0 + _e_m) : offset_0) * 40) + (offset_2 + _e_k)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             {
                 constexpr short _fi = 1;
                 int _e_m = 8 * (_fi >> 1) + _fm;
                 int _e_k = 2 * (_fn + (_fi & 1)) + _fs;
-                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[((((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)) ? (((offset_0 + _e_m) * 40) + (offset_2 + _e_k)) : 0)], (((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)), 0));
+                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[(((offset_2 + _e_k) < 40) ? (((((offset_0 + _e_m) < 13) ? (offset_0 + _e_m) : offset_0) * 40) + (offset_2 + _e_k)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             {
                 constexpr short _fi = 2;
                 int _e_m = 8 * (_fi >> 1) + _fm;
                 int _e_k = 2 * (_fn + (_fi & 1)) + _fs;
-                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[((((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)) ? (((offset_0 + _e_m) * 40) + (offset_2 + _e_k)) : 0)], (((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)), 0));
+                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[(((offset_2 + _e_k) < 40) ? (((((offset_0 + _e_m) < 13) ? (offset_0 + _e_m) : offset_0) * 40) + (offset_2 + _e_k)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             {
                 constexpr short _fi = 3;
                 int _e_m = 8 * (_fi >> 1) + _fm;
                 int _e_k = 2 * (_fn + (_fi & 1)) + _fs;
-                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[((((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)) ? (((offset_0 + _e_m) * 40) + (offset_2 + _e_k)) : 0)], (((offset_0 + _e_m) < 13) && ((offset_2 + _e_k) < 40)), 0));
+                _frag_a[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(x[(((offset_2 + _e_k) < 40) ? (((((offset_0 + _e_m) < 13) ? (offset_0 + _e_m) : offset_0) * 40) + (offset_2 + _e_k)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             {
                 constexpr short _fi = 0;
                 int _e_k = 2 * _fm + _fs;
                 int _e_n = 8 * (_fi >> 1) + _fn + (_fi & 1);
-                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[((((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)) ? (((offset_2 + _e_k) * 20) + (offset_1 + _e_n)) : 0)], (((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)), 0));
+                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[(((offset_2 + _e_k) < 40) ? (((offset_2 + _e_k) * 20) + (((offset_1 + _e_n) < 20) ? (offset_1 + _e_n) : offset_1)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             {
                 constexpr short _fi = 1;
                 int _e_k = 2 * _fm + _fs;
                 int _e_n = 8 * (_fi >> 1) + _fn + (_fi & 1);
-                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[((((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)) ? (((offset_2 + _e_k) * 20) + (offset_1 + _e_n)) : 0)], (((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)), 0));
+                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[(((offset_2 + _e_k) < 40) ? (((offset_2 + _e_k) * 20) + (((offset_1 + _e_n) < 20) ? (offset_1 + _e_n) : offset_1)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             {
                 constexpr short _fi = 2;
                 int _e_k = 2 * _fm + _fs;
                 int _e_n = 8 * (_fi >> 1) + _fn + (_fi & 1);
-                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[((((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)) ? (((offset_2 + _e_k) * 20) + (offset_1 + _e_n)) : 0)], (((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)), 0));
+                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[(((offset_2 + _e_k) < 40) ? (((offset_2 + _e_k) * 20) + (((offset_1 + _e_n) < 20) ? (offset_1 + _e_n) : offset_1)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             {
                 constexpr short _fi = 3;
                 int _e_k = 2 * _fm + _fs;
                 int _e_n = 8 * (_fi >> 1) + _fn + (_fi & 1);
-                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[((((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)) ? (((offset_2 + _e_k) * 20) + (offset_1 + _e_n)) : 0)], (((offset_2 + _e_k) < 40) && ((offset_1 + _e_n) < 20)), 0));
+                _frag_b[_fi >> 1].thread_elements()[_fi & 1] = static_cast<float>(_helion_masked(y[(((offset_2 + _e_k) < 40) ? (((offset_2 + _e_k) * 20) + (((offset_1 + _e_n) < 20) ? (offset_1 + _e_n) : offset_1)) : 0)], ((offset_2 + _e_k) < 40), 0));
             }
             simdgroup_multiply_accumulate(acc_copy_0[0], _frag_a[0], _frag_b[0], acc_copy_0[0]);
             simdgroup_multiply_accumulate(acc_copy_0[1], _frag_a[0], _frag_b[1], acc_copy_0[1]);
