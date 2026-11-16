@@ -236,6 +236,126 @@ def _claim(counter, claims, first, end):  # noqa: ANN001, ANN202
 
 
 @triton.jit
+def _group_tickets_before(  # noqa: ANN202
+    r,  # noqa: ANN001
+    k0,  # noqa: ANN001
+    k1,  # noqa: ANN001
+    k2,  # noqa: ANN001
+    k3,  # noqa: ANN001
+    A0: tl.constexpr,
+    A1: tl.constexpr,
+    A2: tl.constexpr,
+    A3: tl.constexpr,
+    O0: tl.constexpr,
+    O1: tl.constexpr,
+    O2: tl.constexpr,
+    O3: tl.constexpr,
+):
+    """The tickets of a claim group's rounds before round ``r`` (``_group_ticket``)."""
+    return (
+        A0 * tl.minimum(tl.maximum(r - O0, 0), k0)
+        + A1 * tl.minimum(tl.maximum(r - O1, 0), k1)
+        + A2 * tl.minimum(tl.maximum(r - O2, 0), k2)
+        + A3 * tl.minimum(tl.maximum(r - O3, 0), k3)
+    )
+
+
+@triton.jit
+def _group_ticket(  # noqa: ANN202
+    ticket,  # noqa: ANN001
+    n0,  # noqa: ANN001
+    n1,  # noqa: ANN001
+    n2,  # noqa: ANN001
+    n3,  # noqa: ANN001
+    A0: tl.constexpr,
+    A1: tl.constexpr,
+    A2: tl.constexpr,
+    A3: tl.constexpr,
+    O0: tl.constexpr,
+    O1: tl.constexpr,
+    O2: tl.constexpr,
+    O3: tl.constexpr,
+    end: tl.constexpr,
+):
+    """A claim group's ticket as ``root << 32 | task`` (``end`` past its last).
+
+    Root ``i`` of the group has ``n_i`` live tasks, ``A_i`` a key (its slowest
+    task axis); round ``r`` holds root ``i``'s tasks of key ``r - O_i``, the
+    roots in order, so a consumer's key comes ``O_i`` rounds after its
+    producers' (unused roots: ``n = 0``)."""
+    t = ticket.to(tl.int32)
+    k0, k1, k2, k3 = n0 // A0, n1 // A1, n2 // A2, n3 // A3
+    total = A0 * k0 + A1 * k1 + A2 * k2 + A3 * k3
+    # The round of the ticket: the last one starting at or before it.
+    lo = t * 0
+    hi = tl.maximum(tl.maximum(O0 + k0, O1 + k1), tl.maximum(O2 + k2, O3 + k3))
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        below = (
+            _group_tickets_before(mid, k0, k1, k2, k3, A0, A1, A2, A3, O0, O1, O2, O3)
+            <= t
+        )
+        lo = tl.where(below, mid, lo)
+        hi = tl.where(below, hi, mid)
+    u = t - _group_tickets_before(lo, k0, k1, k2, k3, A0, A1, A2, A3, O0, O1, O2, O3)
+    root = t * 0 + 4
+    task = t * 0
+    j = lo - O0
+    on = (j >= 0) & (j < k0)
+    hit = on & (u < A0) & (root == 4)
+    task = tl.where(hit, j * A0 + u, task)
+    root = tl.where(hit, 0, root)
+    u = tl.where(on & (root == 4), u - A0, u)
+    j = lo - O1
+    on = (j >= 0) & (j < k1)
+    hit = on & (u < A1) & (root == 4)
+    task = tl.where(hit, j * A1 + u, task)
+    root = tl.where(hit, 1, root)
+    u = tl.where(on & (root == 4), u - A1, u)
+    j = lo - O2
+    on = (j >= 0) & (j < k2)
+    hit = on & (u < A2) & (root == 4)
+    task = tl.where(hit, j * A2 + u, task)
+    root = tl.where(hit, 2, root)
+    u = tl.where(on & (root == 4), u - A2, u)
+    j = lo - O3
+    hit = (j >= 0) & (j < k3) & (u < A3) & (root == 4)
+    task = tl.where(hit, j * A3 + u, task)
+    root = tl.where(hit, 3, root)
+    coded = (root.to(tl.uint64) << 32) | task.to(tl.uint64)
+    return tl.where(t < total, coded, tl.cast(end, tl.uint64))
+
+
+@triton.jit
+def _group_claim(  # noqa: ANN202
+    counter,  # noqa: ANN001
+    first,  # noqa: ANN001
+    n0,  # noqa: ANN001
+    n1,  # noqa: ANN001
+    n2,  # noqa: ANN001
+    n3,  # noqa: ANN001
+    A0: tl.constexpr,
+    A1: tl.constexpr,
+    A2: tl.constexpr,
+    A3: tl.constexpr,
+    O0: tl.constexpr,
+    O1: tl.constexpr,
+    O2: tl.constexpr,
+    O3: tl.constexpr,
+    end: tl.constexpr,
+):
+    """A claim group's next claimed ticket (``_group_ticket``) after the
+    ``first`` static ones; the launch's last claim resets the counter."""
+    claims = n0 // A0 * A0 + n1 // A1 * A1 + n2 // A2 * A2 + n3 // A3 * A3
+    ticket = tl.atomic_add(counter, 1, sem="relaxed", scope="gpu")
+    if ticket == claims - 1:
+        tl.atomic_xchg(counter, 0, sem="relaxed", scope="gpu")
+    return _group_ticket(
+        ticket + first, n0, n1, n2, n3, A0, A1, A2, A3, O0, O1, O2, O3, end
+    )
+
+
+@triton.jit
 def _hold_after_fallback(  # noqa: ANN202
     state,  # noqa: ANN001
     started,  # noqa: ANN001

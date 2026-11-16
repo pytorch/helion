@@ -4,6 +4,7 @@ import contextlib
 import functools
 import itertools
 import os
+import re
 import tempfile
 from typing import TYPE_CHECKING
 import unittest
@@ -28,6 +29,7 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessGluon
 import helion.language as hl
 from helion.runtime import timeline
+from helion.runtime.triton import dist_utils
 from helion.runtime.triton.launcher import get_cluster_capacity
 
 if TYPE_CHECKING:
@@ -72,6 +74,61 @@ def mm_times_total(
                 acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
             # Every task reads the first root whole: one wait serves all of them.
             out[tile_m, tile_n] = acc * torch.sum(part[:])
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def live_mm_scale_mm(
+    x: torch.Tensor, y: torch.Tensor, w: torch.Tensor, rows: torch.Tensor
+) -> torch.Tensor:
+    """A matmul and a second matmul over the first ``rows[0]`` rows, between
+    them each of the first ``rows[1]`` rows scaled by its sum over every column
+    tile (rows past either bound stay zero).  Each root waits on the one before
+    key by key (the row tile, every root's slowest axis)."""
+    m, k = x.size()
+    _, n = y.size()
+    _, o = w.size()
+    h = torch.zeros([m, n], dtype=torch.float32, device=x.device)
+    h_sum = torch.zeros([n // 128, m], dtype=torch.float32, device=x.device)
+    scaled = torch.zeros([m, n], dtype=torch.bfloat16, device=x.device)
+    out = torch.zeros([m, o], dtype=torch.float32, device=x.device)
+    for tile_n, tile_m in hl.tile([n, m], block_size=[128, None]):
+        if tile_m.begin < rows[0]:
+            acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+            for tile_k in hl.tile(k):
+                acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+            h[tile_m, tile_n] = acc
+            h_sum[tile_n.id, tile_m] = torch.sum(acc, dim=1)
+    for tile_c, tile_r in hl.tile([n, m], block_size=[64, None]):
+        if tile_r.begin < rows[1]:
+            total = torch.sum(h_sum[:, tile_r], dim=0)
+            scaled[tile_r, tile_c] = (h[tile_r, tile_c] * total[:, None]).to(
+                torch.bfloat16
+            )
+    for tile_o, tile_q in hl.tile([o, m], block_size=[128, None]):
+        if tile_q.begin < rows[0]:
+            acc2 = hl.zeros([tile_q, tile_o], dtype=torch.float32)
+            for tile_j in hl.tile(n):
+                acc2 = hl.dot(scaled[tile_q, tile_j], w[tile_j, tile_o], acc=acc2)
+            out[tile_q, tile_o] = acc2
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def live_scale_by_row_sum(x: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
+    """Over the first ``rows`` rows: each row's sum by column tile, then each
+    row scaled by its total, waiting on the first root key by key (the row
+    tile, both roots' slowest axis)."""
+    m, n = x.size()
+    part = torch.zeros([n // 64, m], dtype=torch.float32, device=x.device)
+    out = torch.zeros([m, n], dtype=torch.float32, device=x.device)
+    for tile_c, tile_r in hl.tile([n, m], block_size=[64, None]):
+        if tile_r.begin < rows[0]:
+            part[tile_c.id, tile_r] = torch.sum(x[tile_r, tile_c], dim=1)
+    for tile_c, tile_r in hl.tile([n, m], block_size=[64, None]):
+        if tile_r.begin < rows[0]:
+            total = torch.sum(part[:, tile_r], dim=0)
+            out[tile_r, tile_c] = x[tile_r, tile_c] * total[:, None]
     return out
 
 
@@ -759,6 +816,35 @@ def _replay(run: object, inputs: list[tuple[torch.Tensor, ...]]) -> list[object]
         results = list(itertools.starmap(run, inputs))
     graph.replay()
     return results
+
+
+def _live_mm_scale_mm_ref(
+    x: torch.Tensor, y: torch.Tensor, w: torch.Tensor, rows: torch.Tensor
+) -> torch.Tensor:
+    """``live_mm_scale_mm`` in torch (bounds whole row tiles)."""
+    m, n = x.size(0), y.size(1)
+    live, scale_live = (min(max(int(b), 0), m) for b in rows.tolist())
+    h = torch.zeros([m, n], device=x.device)
+    h[:live] = x[:live].float() @ y.float()
+    total = h.view(m, n // 128, 128).sum(-1).sum(-1)
+    scaled = torch.zeros([m, n], device=x.device, dtype=torch.bfloat16)
+    scaled[:scale_live] = (h[:scale_live] * total[:scale_live, None]).bfloat16()
+    out = torch.zeros([m, w.size(1)], device=x.device)
+    out[:live] = scaled[:live].float() @ w.float()
+    return out
+
+
+def _group_tickets(
+    live: list[int], tasks: list[int], lags: list[int], tickets: int
+) -> list[tuple[int, int] | None]:
+    """``_group_ticket``'s (root, task) of each ticket, by enumerating rounds."""
+    keys = [n // a for n, a in zip(live, tasks, strict=True)]
+    order: list[tuple[int, int]] = []
+    for r in range(max(o + k for o, k in zip(lags, keys, strict=True))):
+        for root, (a, o, k) in enumerate(zip(tasks, lags, keys, strict=True)):
+            if 0 <= r - o < k:
+                order.extend((root, (r - o) * a + u) for u in range(a))
+    return [order[t] if t < len(order) else None for t in range(tickets)]
 
 
 def _functions(code: str) -> dict[str, str]:
@@ -1696,6 +1782,119 @@ class TestGluonRing(TestCase):
         )
         _, out = code_and_output(wide, args, **dynamic)
         torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_claim_group_interleaves_keyed_roots(self) -> None:
+        """Claimed roots each waiting on the one before key by key (their row
+        tile) claim one ticket stream (``_group_ticket``): the scaling root's
+        keys a wave of claims behind the matmul's, not after its last claim,
+        and the second matmul's after every earlier key."""
+        x = torch.randn([128 * 64, 128], device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn([128, 512], device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn([512, 512], device=DEVICE, dtype=torch.bfloat16) / 64
+        rows = torch.tensor([48 * 128, 48 * 128], device=DEVICE, dtype=torch.int32)
+        args = (x, y, w, rows)
+        bound = live_mm_scale_mm.bind(args)
+        config = helion.Config(
+            **RING,
+            block_sizes=[128, 64, 128, 128, 64],
+            cross_loop_pipeline="dynamic",
+        )
+        with self.assertLogs("helion._compiler.cross_loop_codegen", "INFO") as logs:
+            code = bound.to_triton_code(config)
+        self.assertIn("helion_dist_utils._group_claim(", code)
+        self.assertNotIn("helion_dist_utils._claim(", code)
+        # 64 row keys of 4 matmul tasks: the scaling root lags a wave of the
+        # workers' claims, the second matmul every key of the roots before it.
+        match = re.search(r"_group_claim\([^,]+, (\d+),", code)  # the workers
+        assert match is not None
+        lag = -(-int(match[1]) // 4)
+        self.assertIn(
+            "Roots [0, 1, 2] claim one interleaved ticket stream "
+            f"(key lags [0, {lag}, {lag + 64}] rounds)",
+            "\n".join(logs.output),
+        )
+        # Back to back, each launch takes exactly its live count of claims and
+        # leaves the counter reset: fewer live tasks than workers, none, every
+        # task live (a bound past the last row), and bounds varying apart, one
+        # of them negative (a root with no live task).
+        bounds = [(48, 48), (16, 16), (64, 64), (0, 0), (80, 80), (48, -1)]
+        bounds += [(-1, 48), (40, 20)]
+        inputs = [
+            (x, y, w, torch.tensor(b, device=DEVICE, dtype=torch.int32) * 128)
+            for b in bounds
+        ]
+        results = _replay(bound.compile_config(config), inputs)
+        for launch, result in zip(inputs, results, strict=True):
+            # The bf16 scaled rows round apart by an ulp under another sum order.
+            expected = _live_mm_scale_mm_ref(*launch)
+            scale = expected.abs().max().item()
+            torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2 * scale)
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_claim_group_needs_earlier_keys(self) -> None:
+        """Roots claim one stream only when each task waits on keys no later
+        than its own: with one row tile the second root waits for the whole
+        first root (a root barrier: a single-key counter would wait once before
+        the claim loop, on claims of its own group), and with tiles twice as
+        tall as the first root's each of its keys waits on a later key too.
+        With several row tiles of one height the two roots claim one stream."""
+        # More column tasks than workers: both roots are claimed.
+        sms = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+        cols = (sms + 12) * 64
+        for rows, blocks, grouped in (
+            (16, [16, 16], False),
+            (16 * 16, [16, 32], False),
+            (16 * 16, [16, 16], True),
+        ):
+            with self.subTest(rows=rows, blocks=blocks):
+                x = torch.randn([rows, cols], device=DEVICE, dtype=torch.float32)
+                live = torch.tensor([rows], device=DEVICE, dtype=torch.int32)
+                code, out = code_and_output(
+                    live_scale_by_row_sum,
+                    (x, live),
+                    **RING,
+                    block_sizes=blocks,
+                    cross_loop_pipeline="dynamic",
+                )
+                expected = x * x.sum(1, keepdim=True)
+                torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-3)
+                group_claims = "helion_dist_utils._group_claim(" in code
+                self.assertEqual(group_claims, grouped)
+                self.assertEqual("helion_dist_utils._claim(" in code, not grouped)
+
+    def test_group_ticket(self) -> None:
+        """``_group_ticket`` maps tickets to (root, task) round by round: root
+        ``i``'s key ``r - O_i`` in round ``r``, roots in order, then the end."""
+
+        @triton.jit
+        def decode(out, n0, n1, n2, n3, END: tl.constexpr):
+            t = tl.program_id(0)
+            coded = dist_utils._group_ticket(
+                t, n0, n1, n2, n3, 36, 9, 36, 4, 0, 5, 69, 74, END
+            )
+            tl.store(out + t, coded.to(tl.int64))
+
+        end = 4 << 32
+        tasks, lags = [36, 9, 36, 4], [0, 5, 69, 74]
+        for live in (
+            [576, 144, 576, 64],
+            [360, 90, 360, 40],
+            [36, 9, 36, 4],
+            [0, 18, 0, 8],
+            [0, 0, 0, 0],
+        ):
+            with self.subTest(live=live):
+                tickets = sum(live) + 7
+                out = torch.empty([tickets], device=DEVICE, dtype=torch.int64)
+                decode[(tickets,)](out, *live, END=end)
+                expected = [
+                    end if pair is None else pair[0] << 32 | pair[1]
+                    for pair in _group_tickets(live, tasks, lags, tickets)
+                ]
+                self.assertEqual(out.tolist(), expected)
 
     @skipIfRefEager("checks generated code")
     @skipUnlessGluon()
