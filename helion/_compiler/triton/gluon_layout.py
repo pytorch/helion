@@ -22,6 +22,7 @@ import functools
 import itertools
 import math
 from typing import Any
+from typing import Callable
 
 from torch.utils._pytree import tree_leaves
 from torch.utils._pytree import tree_map
@@ -138,6 +139,17 @@ def _shared(ty: Any) -> bool:
 
 def _is_auto(x: Any) -> bool:
     return _is_block(x) and isinstance(x.type.layout, AutoLayout)
+
+
+def _nbytes(x: Any) -> int:
+    """Bytes of block ``x`` in registers (a predicate takes a byte)."""
+    element = x.type.element_ty
+    bits = 64 if element.is_ptr() else element.primitive_bitwidth
+    return x.numel * max(bits, 8) // 8
+
+
+def _numel(x: Any) -> int:
+    return x.numel
 
 
 def _shape(x: Any) -> list[int]:
@@ -489,17 +501,21 @@ class HelionGluonSemantic(GluonSemantic):
         """``x`` in ``layout`` if it is auto; a concrete value keeps its own."""
         return self.convert_layout(x, layout) if _is_auto(x) else x
 
-    def _remat_ok(self, x: Any, numel: int, depth: int = 0) -> bool:
-        """Whether concrete ``x`` can be re-emitted in another layout converting only smaller values."""
+    def _remat_ok(
+        self, x: Any, limit: int, size: Callable[[Any], int] = _nbytes, depth: int = 0
+    ) -> bool:
+        """Whether concrete ``x`` can be re-emitted in another layout converting only values below
+        ``limit`` by ``size`` (bytes: a narrow value cast up converts before the cast)."""
         if not _is_block(x) or _is_auto(x):
             return True
         # A concrete value's recipe is a rematerializable op's (``_note``).
         recipe = self.meta.get(x.handle.id(), _Meta()).recipe
         if recipe is not None and depth < _REMAT_DEPTH:
             return recipe[0] in _REBUILT or all(
-                self._remat_ok(a, numel, depth + 1) for a in tree_leaves(recipe[1:3])
+                self._remat_ok(a, limit, size, depth + 1)
+                for a in tree_leaves(recipe[1:3])
             )
-        return x.numel < numel
+        return size(x) < limit
 
     def _fold_splats(self, name: str, args: tuple, kwargs: dict) -> Any:
         """As Triton's reorder-broadcast pass: an elementwise or shape op whose tensor
@@ -546,7 +562,7 @@ class HelionGluonSemantic(GluonSemantic):
             return self._adopt(self._consume(x), layout)
         if x.type.layout == layout:
             return x
-        if not self._remat_ok(x, x.numel):
+        if not self._remat_ok(x, _nbytes(x)):
             return super().convert_layout(x, layout)
         name, args, kwargs, idx = self.meta[x.handle.id()].recipe  # pyrefly: ignore [not-iterable]
         if name in _REBUILT:
@@ -567,16 +583,16 @@ class HelionGluonSemantic(GluonSemantic):
 
     def unify(self, args: Any) -> Any:
         """One layout for the concrete tensor operands of an elementwise op: the one that
-        cannot be rebuilt, else the biggest (Triton hoists converts above broadcasts),
-        else the layout more values have."""
+        cannot be rebuilt, else the biggest in bytes (Triton hoists converts above
+        broadcasts; a narrower operand converts for less), else the layout more values have."""
         blocks = [x for x in args if _is_block(x) and not _is_auto(x)]
         if len({x.type.layout for x in blocks}) <= 1:
             return args
         lead = max(
             blocks,
             key=lambda x: (
-                not self._remat_ok(x, x.numel),
-                x.numel,
+                not self._remat_ok(x, _nbytes(x)),
+                _nbytes(x),
                 self.popularity[x.type.layout],
             ),
         )
@@ -775,7 +791,9 @@ class HelionGluonSemantic(GluonSemantic):
         """A big concrete pointer tensor in a layout other than its coalesced one, rebuilt there."""
         if _is_block(ptr) and not _is_auto(ptr) and self._anchors(ptr):
             lay = self._coalesced(ptr, max_bits)
-            if lay != ptr.type.layout and self._remat_ok(ptr, ptr.numel):
+            # Only offsets rebuilt from smaller values (address math) pay for the
+            # move, not a same-shape index load narrower than its pointers.
+            if lay != ptr.type.layout and self._remat_ok(ptr, ptr.numel, _numel):
                 return self.remat(ptr, lay)
         return ptr
 
