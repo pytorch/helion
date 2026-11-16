@@ -33,12 +33,16 @@ tensor copy declines without a shape.
 
 Stages.  ``DEVICE_BODY_PROLOGUE`` runs over the context built from the
 rendered body (the launch shape still the strategies' raw inference); its
+first entry issues each atomic on the leader thread of the launch axes
+claimed after it (``guard_atomics_on_later_thread_axes``), and its other
 entries lower the collective matmuls and decide the launch shape (the
 gathered-MMA extension of the signature, the owned block dims, the bounded
-cache plan's block).  ``freeze_pass_context`` then seals the launch shape and
-the final signature into the context every ``DEVICE_BODY_PASSES`` entry
-reads; ``KERNEL_DEF_PASSES`` reads the same context after ``ast_rename``
-(``DeviceBodyContext.pass_context`` carries it across).
+cache plan's block).  ``freeze_pass_context`` then seals the launch shape, the
+block grid (after the collective lowering, which may hand the launch to a host
+wrapper with its own grid) and the final signature into the context every
+``DEVICE_BODY_PASSES`` entry reads; ``KERNEL_DEF_PASSES`` reads the same
+context after ``ast_rename`` (``DeviceBodyContext.pass_context`` carries it
+across).
 
 Every entry is ``(name, gate, run, requires, provides)``: ``gate`` reads the
 per-render state and decides whether ``run`` executes; ``run`` rewrites the
@@ -67,7 +71,6 @@ from typing import cast
 
 import sympy
 import torch
-from torch._subclasses.fake_tensor import FakeTensor
 from torch.utils._sympy.symbol import SymT
 from torch.utils._sympy.symbol import symbol_is_type
 
@@ -96,9 +99,10 @@ class PassContext:
     One context per render, compared by identity (``eq=False``).
 
     Built once by ``build_pass_context``; ``with_launch_shape`` seals the
-    launch shape the prologue decided.  The containers are the objects the
-    inline code built (``constexpr_values`` is ``DeviceBodyContext``'s dict,
-    filled here and read by the post-rename stage); no pass writes to them.
+    launch shape and block grid the prologue decided.  The containers are the
+    objects the inline code built (``constexpr_values`` is
+    ``DeviceBodyContext``'s dict, filled here and read by the post-rename
+    stage); no pass writes to them.
     """
 
     fn: DeviceFunction
@@ -140,22 +144,29 @@ class PassContext:
     reload_modes: dict[int, str]
     dynamic_trip_counts: dict[str, tuple[int, str]]
     new_var: Callable[[str], str]
-    # Launch shape (final after ``freeze_pass_context``).
+    # Launch shape and block grid (final after ``freeze_pass_context``).
     exact_thread_block_dims: tuple[int, int, int] | None
-    # ``xyz`` program ids without a cluster: the per-axis block-grid extents
-    # proven from exact runtime sizes (``None`` where unproven).
-    xyz_grid: bool
+    # Whether ``block_grid_dims`` is the launch's block grid (``xyz`` program
+    # ids without a cluster, or a static flat launch, and no host wrapper plan
+    # launching a grid of its own), with its per-axis extents proven from
+    # exact runtime sizes (``None`` where unproven; unproven everywhere until
+    # the prologue is done).
+    exact_grid: bool
     block_grid_dims: tuple[int | None, int | None, int | None]
 
     def with_launch_shape(
         self,
         exact_thread_block_dims: tuple[int, int, int] | None,
         signature_names: frozenset[str],
+        exact_grid: bool,
+        block_grid_dims: tuple[int | None, int | None, int | None],
     ) -> PassContext:
         return dataclasses.replace(
             self,
             exact_thread_block_dims=exact_thread_block_dims,
             signature_names=signature_names,
+            exact_grid=exact_grid,
+            block_grid_dims=block_grid_dims,
         )
 
 
@@ -206,8 +217,9 @@ def _collect_constexpr_values(ctx: DeviceBodyContext) -> dict[str, int]:
 
 def _tensor_dtypes_str_skip(fn: DeviceFunction, env: CompileEnvironment) -> dict:
     # ``dtype_str`` raises for dtypes the cute backend has no canonical
-    # spelling for (e.g. uint32 barrier flags, which SIMT loads treat as raw
-    # bytes); such tensors simply don't participate in load fusion.
+    # spelling for.  Such a tensor's plain ``(PTR).load()`` does not
+    # participate in load fusion; a scalar ``cute.arch.load`` names its dtype
+    # and a masked load's default gives one, so those still do.
     tensor_dtypes: dict[str, str] = {}
     for arg in fn.arguments:
         if isinstance(arg, TensorArg):
@@ -236,20 +248,29 @@ def _block_grid_dims(
     # For an exact in-place vector state-update pattern the state-load
     # pipeliner may stage future rows through a private-per-thread cp.async
     # ring; its matcher (and the proven-bounds simplifier) consume the exact
-    # grid extents proved from cache-keyed runtime size facts.
+    # grid extents proved from cache-keyed runtime size facts: the
+    # ``input_tensor_metadata`` fact keys the bound kernel on exact input
+    # sizes, so each traced size hint is the size every call it serves has
+    # (``CompileEnvironment.keyed_hint``).
     from ...program_id import XYZProgramIDs
 
+    flat_grid = _exact_flat_grid(fn)
+    if flat_grid is not None:
+        return True, (flat_grid, 1, 1)
     xyz_pid = (
         fn.pid
         if isinstance(fn.pid, XYZProgramIDs)
         and fn.cute_state.lanes.simt_cluster_n == 1
         and len(fn.pid.pid_info) <= 3
+        # A host wrapper plan may launch a grid of its own.
+        and not cute_codegen_state(fn.codegen).wrapper_plans
         else None
     )
-    xyz_grid = xyz_pid is not None
     exact_grid_extent_values: dict[sympy.Expr, int] = {}
-    ambiguous_grid_extent_expressions: set[sympy.Expr] = set()
-    if xyz_grid and "input_tensor_metadata" in env.compiler_fact_specialization_facts:
+    if (
+        xyz_pid is not None
+        and "input_tensor_metadata" in env.compiler_fact_specialization_facts
+    ):
         for argument in fn.arguments:
             if not isinstance(argument, TensorArg) or isinstance(
                 argument, TensorDescriptorArg
@@ -258,26 +279,12 @@ def _block_grid_dims(
             fake_tensor = argument.fake_value
             if env.tensor_input_source(fake_tensor) is None:
                 continue
-            runtime_tensor = env.runtime_value_for_tensor(fake_tensor)
-            if not isinstance(runtime_tensor, torch.Tensor) or isinstance(
-                runtime_tensor, FakeTensor
-            ):
-                continue
-            for dimension, size in enumerate(fake_tensor.shape):
+            for size in fake_tensor.shape:
                 if isinstance(size, int):
                     continue
-                try:
+                value = env.keyed_hint(size)
+                if value is not None:
                     expression = env.shape_env.replace(size._sympy_())
-                    value = int(runtime_tensor.size(dimension))
-                    if value != int(env.size_hint(size)):
-                        continue
-                except (RuntimeError, TypeError, ValueError):
-                    continue
-                previous = exact_grid_extent_values.get(expression)
-                if previous is not None and previous != value:
-                    ambiguous_grid_extent_expressions.add(expression)
-                    exact_grid_extent_values.pop(expression, None)
-                elif expression not in ambiguous_grid_extent_expressions:
                     exact_grid_extent_values[expression] = value
     block_grid_dims: list[int | None] = [None, None, None]
     if xyz_pid is not None:
@@ -303,7 +310,31 @@ def _block_grid_dims(
                 block_grid_dims[axis] = (extent + block_size - 1) // block_size
         for axis in range(len(xyz_pid.pid_info), 3):
             block_grid_dims[axis] = 1
-    return xyz_grid, (block_grid_dims[0], block_grid_dims[1], block_grid_dims[2])
+    return xyz_pid is not None, (
+        block_grid_dims[0],
+        block_grid_dims[1],
+        block_grid_dims[2],
+    )
+
+
+def _exact_flat_grid(fn: DeviceFunction) -> int | None:
+    """The CTA count of a flat launch whose extents are all static: the grid
+    is ``(count, 1, 1)`` and ``block_idx[0]`` is the virtual pid itself (no
+    XCD remap, no shared pid), so the per-axis pids it decomposes into are
+    the ``//`` / ``%`` arithmetic the proven-bounds pass evaluates.  A host
+    wrapper plan launches its own grid (``grid_x``), so none is proven."""
+    from ...program_id import FlatProgramIDs
+
+    pid = fn.pid
+    if (
+        type(pid) is not FlatProgramIDs
+        or fn.cute_state.lanes.simt_cluster_n != 1
+        or pid.shared_pid_var is not None
+        or fn.config.get("xcd_remap", False)
+        or cute_codegen_state(fn.codegen).wrapper_plans
+    ):
+        return None
+    return pid.static_grid_size()
 
 
 def build_pass_context(ctx: DeviceBodyContext) -> PassContext:
@@ -318,7 +349,6 @@ def build_pass_context(ctx: DeviceBodyContext) -> PassContext:
     fn = ctx.device_function
     env = CompileEnvironment.current()
     constexpr_values = _collect_constexpr_values(ctx)
-    xyz_grid, block_grid_dims = _block_grid_dims(fn, env, constexpr_values)
     return PassContext(
         fn=fn,
         env=env,
@@ -349,8 +379,10 @@ def build_pass_context(ctx: DeviceBodyContext) -> PassContext:
         dynamic_trip_counts=fn.cute_state.lanes.dynamic_reduction_trips,
         new_var=lambda name: fn.new_var(name, dce=False),
         exact_thread_block_dims=_exact_thread_block_dims(fn.tile_strategy),
-        xyz_grid=xyz_grid,
-        block_grid_dims=block_grid_dims,
+        # Sealed by ``freeze_pass_context``: the prologue's collective
+        # lowering may hand the launch to a host wrapper.
+        exact_grid=False,
+        block_grid_dims=(None, None, None),
     )
 
 
@@ -379,6 +411,8 @@ class _DeviceBodyState:
         self.sinking = False
         self.fold_sites: dict[str, set[str]] = {}
         self.folded_lanes: frozenset[str] = frozenset()
+        # ``_scratch_tensor_names``, once a step asked for them.
+        self.scratch_tensor_names: frozenset[str] | None = None
 
 
 class _KernelDefState:
@@ -439,8 +473,15 @@ def _has_exact_thread_block_dims(s: _DeviceBodyState) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Prologue: the collective lowerings and the launch shape
+# Prologue: the atomics' leader guards, the collective lowerings and the
+# launch shape
 # ---------------------------------------------------------------------------
+
+
+def _guard_atomics_on_later_thread_axes(s: _DeviceBodyState) -> None:
+    from ..atomic_ops import guard_atomics_on_later_thread_axes
+
+    guard_atomics_on_later_thread_axes(s.kernel_body, s.fn)
 
 
 def _lower_uniform_comparisons(s: _DeviceBodyState) -> None:
@@ -521,9 +562,17 @@ def _bounded_cache_prepare(s: _DeviceBodyState) -> None:
 
 
 def freeze_pass_context(s: _DeviceBodyState) -> None:
-    """Seal the launch shape and the final signature into the context."""
-    s.ctx = s.ctx.with_launch_shape(
-        s.launch_shape, frozenset(arg.arg for arg in s.args)
+    """Seal the launch shape, the block grid and the final signature into the
+    context."""
+    ctx = s.ctx
+    exact_grid, block_grid_dims = _block_grid_dims(
+        ctx.fn, ctx.env, ctx.constexpr_values
+    )
+    s.ctx = ctx.with_launch_shape(
+        s.launch_shape,
+        frozenset(arg.arg for arg in s.args),
+        exact_grid,
+        block_grid_dims,
     )
 
 
@@ -567,7 +616,45 @@ def _fuse_two_pass_loads(s: _DeviceBodyState) -> None:
         proven_disjoint_tensor_pairs=ctx.proven_disjoint_tensor_pairs,
         proven_tensor_stride_values=ctx.proven_tensor_stride_values,
         dynamic_trip_counts=ctx.dynamic_trip_counts,
+        binding_dtypes=s.fn.cute_state.uniform_cutoff_dtypes,
+        rename_groups=ctx.rename_groups,
+        forwardable_tensors=(
+            _scratch_tensor_names(s)
+            if ctx.config.get("cute_scratch_forwarding", False)
+            else frozenset()
+        ),
+        # Not where a later pass needs a sweep's own values: the split of
+        # rolled vector sums and the rolled cluster online pair.
+        carry_vector_values=not (_independent_reduction(s) or _cluster_warp_online(s)),
     )
+
+
+def _scratch_tensor_names(s: _DeviceBodyState) -> frozenset[str]:
+    """The kernel arguments that are kernel-local scratch tensors (found
+    once; the forwarding and the store drop both ask).  Not a placeholder
+    argument: the kernel also reaches its memory through objects the host
+    wrapper builds (TMA descriptors), under other names."""
+    if s.scratch_tensor_names is None:
+        from ...scratch_tensors import kernel_local_scratch
+
+        scratch = kernel_local_scratch(HostFunction.current())
+        s.scratch_tensor_names = frozenset(
+            arg.name
+            for arg in s.fn.arguments
+            if isinstance(arg, TensorArg)
+            and arg.name not in s.fn.placeholder_args
+            and scratch.holds(arg.fake_value)
+        )
+    return s.scratch_tensor_names
+
+
+def _drop_scratch_stores(s: _DeviceBodyState) -> None:
+    # After the reloads ``fuse_two_pass_loads`` serves from registers: a
+    # kernel-local scratch tensor no load reads any more has dead stores.
+    from ..drop_scratch_stores import drop_scratch_stores
+
+    if names := _scratch_tensor_names(s):
+        s.kernel_body = drop_scratch_stores(s.kernel_body, names)
 
 
 def _vectorize_branch_local_persistent_fragments(s: _DeviceBodyState) -> None:
@@ -585,6 +672,8 @@ def _vectorize_branch_local_persistent_fragments(s: _DeviceBodyState) -> None:
         proven_disjoint_tensor_pairs=s.ctx.proven_disjoint_tensor_pairs,
         proven_tensor_stride_values=s.ctx.proven_tensor_stride_values,
         wide_packet_hints=hint_wide_packets(s.ctx.config.cute_wide_packet_hints),
+        rename_groups=s.ctx.rename_groups,
+        chunked_lanes=s.fn.cute_state.lanes.chunked_reduction_lanes,
     )
 
 
@@ -622,6 +711,21 @@ def _bounded_cache_cache(s: _DeviceBodyState) -> None:
     assert request is not None
     s.kernel_body, s.private_fragments = request.cache(
         s.kernel_body, s.ctx.constexpr_values, s.ctx.rename_groups
+    )
+
+
+def _peel_vector_tails(s: _DeviceBodyState) -> None:
+    from ..peel_vector_tails import peel_vector_tails
+    from ..peel_vector_tails import tensor_facts
+    from ..smem_footprint import persistent_loop
+
+    s.kernel_body = peel_vector_tails(
+        s.kernel_body,
+        s.ctx.constexpr_values,
+        thread_block_dims=s.ctx.exact_thread_block_dims,
+        tensor_facts=tensor_facts(s.fn),
+        new_var=s.ctx.new_var,
+        persistent_loop=persistent_loop(s.fn.pid),
     )
 
 
@@ -701,6 +805,25 @@ def _hoist_lane_invariant_reductions(s: _DeviceBodyState) -> None:
         uniform_names=set(ctx.signature_names),
         float_scalar_names=set(ctx.float_scalar_names),
         thread_block_dims=ctx.exact_thread_block_dims,
+    )
+
+
+def _hoist_lane_invariant_loads(s: _DeviceBodyState) -> None:
+    # A lane-invariant scalar load (a dropout seed read from a tensor) that
+    # a lane split left in its sweep is issued once per lane, and LLVM keeps
+    # the integer arithmetic on it (the Philox key schedule) in the loop as
+    # well.  Integer loads only, so no float operand moves.
+    from ..hoist_lane_invariant_loads import hoist_lane_invariant_loads
+
+    ctx = s.ctx
+    s.kernel_body = hoist_lane_invariant_loads(
+        s.kernel_body,
+        tensor_dtypes=ctx.tensor_dtypes_str_skip,
+        proven_disjoint_tensor_pairs=ctx.proven_disjoint_tensor_pairs,
+        rename_groups=ctx.rename_groups,
+        integer_names=frozenset(ctx.constexpr_values)
+        | (ctx.param_uniform_names - ctx.float_scalar_names),
+        float_names=ctx.float_scalar_names,
     )
 
 
@@ -840,11 +963,12 @@ def _fragment_mma_dot(s: _DeviceBodyState) -> None:
 def _plan_lane_unroll(s: _DeviceBodyState) -> None:
     # ``cute_lane_unroll`` without vector-loop sinking, or with a sunk
     # nest whose lane loops the sinking pass left rolled (their loads
-    # were persistent markers, now packets): unroll the lane loops (of
-    # the grid or of a device loop) at trace time with every unrolled
-    # lane's loads (packets and scalars alike) issued before the first
-    # lane's compute.  The knob-off code is regenerated when no loop
-    # takes the unroll.
+    # were persistent markers, now packets): unroll the lane loops (of a
+    # grid or device-loop tile axis, of a looped reduction's chunk, of a
+    # persistent reduction row) at trace time with every unrolled lane's
+    # loads (packets and scalars alike) issued before the first lane's
+    # compute.  The knob-off code is regenerated when no loop takes the
+    # unroll.
     from ..fold_lane_reductions import lanes_with_sites
 
     fn = s.fn
@@ -870,11 +994,11 @@ def _wants_lane_unroll(s: _DeviceBodyState) -> bool:
 
 
 def _unroll_lane_loads(s: _DeviceBodyState) -> None:
-    # Issue all of a grid lane loop's vec loads before its first
-    # store (ptxas cannot prove the store doesn't alias the next
-    # iteration's load, so unsplit loops keep only ONE load in
-    # flight per thread; the triton backend and handwritten CuTe
-    # kernels both load the whole tile fragment first).
+    # Issue all of a lane loop's loads before its first store (ptxas
+    # cannot prove the store doesn't alias the next iteration's load,
+    # so unsplit loops keep only ONE load in flight per thread; the
+    # triton backend and handwritten CuTe kernels both load the whole
+    # tile fragment first).
     from ..unroll_lane_loads import LaneUnrollNotApplied
     from ..unroll_lane_loads import unroll_lane_loads
 
@@ -883,9 +1007,10 @@ def _unroll_lane_loads(s: _DeviceBodyState) -> None:
         s.knob_unroll,
         s.ctx.new_var,
         forced_full=s.folded_lanes,
+        constexpr_values=s.ctx.constexpr_values,
     )
     # With sinking the knob belongs to the sunk nest's lane loops
-    # (``_normalize_cute_vloop_sink``); a nest that offers none
+    # (``_normalize_cute_lane_knobs``); a nest that offers none
     # keeps its code rather than regenerating knob-off.
     if s.knob_unroll > 1 and not unrolled and not s.sinking:
         raise LaneUnrollNotApplied
@@ -905,10 +1030,21 @@ def _fold_lane_reductions(s: _DeviceBodyState) -> None:
     )
 
 
+def _stash_sibling_lane_loads(s: _DeviceBodyState) -> None:
+    from ..stash_lane_loads import stash_sibling_lane_loads
+
+    s.kernel_body = stash_sibling_lane_loads(
+        s.kernel_body,
+        s.ctx.new_var,
+        rename_groups=s.ctx.rename_groups,
+        kernel_tensors=s.ctx.tensor_arg_names,
+    )
+
+
 def _split_lane_loads(s: _DeviceBodyState) -> None:
     from ..split_lane_loads import split_lane_loads
 
-    s.kernel_body = split_lane_loads(s.kernel_body)
+    s.kernel_body = split_lane_loads(s.kernel_body, s.ctx.constexpr_values)
 
 
 def _prefetch_reduction_packets(s: _DeviceBodyState) -> None:
@@ -928,6 +1064,7 @@ def _prefetch_reduction_packets(s: _DeviceBodyState) -> None:
         reload_modes=ctx.reload_modes,
         argument_names=set(ctx.argument_names),
         proven_disjoint_tensor_pairs=ctx.proven_disjoint_tensor_pairs,
+        rename_groups=ctx.rename_groups,
     )
 
 
@@ -963,7 +1100,7 @@ def _wants_pipelined_state_loads(s: _DeviceBodyState) -> bool:
 
 
 def _pipeline_state_loads(s: _DeviceBodyState) -> None:
-    from ..memory_ops import runtime_tensor_has_specialized_alignment
+    from ..memory_ops import tensor_has_specialized_base_alignment
     from ..pipeline_state_loads import TensorMetadata
     from ..pipeline_state_loads import pipeline_state_loads
 
@@ -998,7 +1135,7 @@ def _pipeline_state_loads(s: _DeviceBodyState) -> None:
             arg.name
             for arg in fn.arguments
             if isinstance(arg, TensorArg)
-            and runtime_tensor_has_specialized_alignment(env, arg.fake_value, 4)
+            and tensor_has_specialized_base_alignment(env, arg.fake_value, 4)
         ),
         proven_tensor_size_values=ctx.proven_tensor_size_values,
         proven_disjoint_tensor_pairs=ctx.proven_disjoint_tensor_pairs,
@@ -1053,7 +1190,38 @@ def _pack_bf16_recurrences(s: _DeviceBodyState) -> None:
     )
 
 
+# The gate of ``split_rolled_vector_sums``, which matches a rolled sum's loop
+# whole: ``peel_partial_chunks`` leaves the loops it would split to it.
+_independent_reduction = _config_flag("cute_independent_reduction")
+# ``fuse_rolled_cluster_online_pair``'s knob: the pair moves a rolled sweep's
+# exponentials into the frame of a CTA's or warp's own maximum.
+_cluster_warp_online = _config_flag("cute_cluster_warp_online")
+
+
+def _peel_partial_chunks(s: _DeviceBodyState) -> None:
+    from ..peel_partial_chunks import peel_partial_chunks
+    from ..vector_reduction_packets import rolled_sums_split_after
+
+    body = s.kernel_body
+    s.kernel_body = peel_partial_chunks(
+        body,
+        s.ctx.constexpr_values,
+        # The rolled sums ``split_rolled_vector_sums`` splits, which it
+        # finds in the body the bounds proofs leave.
+        keep_whole=rolled_sums_split_after(
+            body, lambda copy: _proven_bounds(s, _proven_loop_bounds(s, copy))
+        )
+        if _independent_reduction(s)
+        else None,
+    )
+
+
 def _simplify_proven_loop_bounds(s: _DeviceBodyState) -> None:
+    s.kernel_body = _proven_loop_bounds(s, s.kernel_body)
+
+
+def _proven_loop_bounds(s: _DeviceBodyState, body: list[ast.stmt]) -> list[ast.stmt]:
+    """``body`` after ``simplify_proven_loop_bounds`` with the kernel's facts."""
     from ...program_id import FlatProgramIDs
     from ...program_id import XYZProgramIDs
     from ..proven_loop_bounds import exact_static_grid
@@ -1064,16 +1232,21 @@ def _simplify_proven_loop_bounds(s: _DeviceBodyState) -> None:
     # Ordinary collective launches use the PID strategy's grid
     # unchanged. Other launch schedulers retain architectural bounds.
     collective_grid = None
-    if (
-        fn.pid is not None
-        and type(fn.pid) in (FlatProgramIDs, XYZProgramIDs)
-        and fn.cute_state.lanes.simt_cluster_n == 1
-        and fn.cute_state.lanes.collective_mma_sites
-        and not cute_codegen_state(fn.codegen).wrapper_plans
-    ):
-        collective_grid = exact_static_grid(fn.pid.codegen_grid(), ctx.constexpr_values)
-    s.kernel_body = simplify_proven_loop_bounds(
-        s.kernel_body,
+    if fn.cute_state.lanes.collective_mma_sites:
+        if type(fn.pid) is FlatProgramIDs:
+            # The grid ``_exact_flat_grid`` proved, if any.
+            if ctx.exact_grid:
+                collective_grid = cast("tuple[int, int, int]", ctx.block_grid_dims)
+        elif (
+            type(fn.pid) is XYZProgramIDs
+            and fn.cute_state.lanes.simt_cluster_n == 1
+            and not cute_codegen_state(fn.codegen).wrapper_plans
+        ):
+            collective_grid = exact_static_grid(
+                fn.pid.codegen_grid(), ctx.constexpr_values
+            )
+    return simplify_proven_loop_bounds(
+        body,
         enabled=bool(ctx.config.config.get("cute_proven_bounds", False)),
         thread_block_dims=ctx.exact_thread_block_dims,
         constexpr_values=ctx.constexpr_values,
@@ -1081,18 +1254,41 @@ def _simplify_proven_loop_bounds(s: _DeviceBodyState) -> None:
     )
 
 
+def _merge_unproven_peels(s: _DeviceBodyState) -> None:
+    from ..peel_partial_chunks import merge_unproven_peels
+
+    s.kernel_body = merge_unproven_peels(s.kernel_body)
+
+
+def _divide_vector_bases(s: _DeviceBodyState) -> None:
+    from ..lane_invariant_division import divide_vector_bases
+
+    s.kernel_body = divide_vector_bases(
+        s.kernel_body,
+        constexpr_values=s.ctx.constexpr_values,
+        rename_groups=s.ctx.rename_groups,
+        compare_bases=s.ctx.config.config.get("cute_uniform_lane_compares") is True,
+    )
+
+
 def _simplify_proven_bounds(s: _DeviceBodyState) -> None:
+    s.kernel_body = _proven_bounds(s, s.kernel_body)
+
+
+def _proven_bounds(s: _DeviceBodyState, body: list[ast.stmt]) -> list[ast.stmt]:
+    """``body`` after ``simplify_proven_bounds`` with the kernel's facts."""
     from ..simplify_proven_bounds import simplify_proven_bounds
 
     ctx = s.ctx
-    s.kernel_body = simplify_proven_bounds(
-        s.kernel_body,
+    return simplify_proven_bounds(
+        body,
         enabled=cast("bool", ctx.config.config.get("cute_proven_bounds", False)),
-        xyz_grid=ctx.xyz_grid,
+        exact_grid=ctx.exact_grid,
         thread_block_dims=ctx.exact_thread_block_dims,
         block_grid_dims=ctx.block_grid_dims,
         constexpr_values=ctx.constexpr_values,
         proven_tensor_size_values=ctx.proven_tensor_size_values,
+        rename_groups=ctx.rename_groups,
     )
 
 
@@ -1247,6 +1443,16 @@ def _wants_exact_division_redo(s: _DeviceBodyState) -> bool:
     )
 
 
+def _cut_carried_values(s: _DeviceBodyState) -> None:
+    # ``fuse_two_pass_loads`` left each later sweep computing the V-loop
+    # values it carries; the passes since saw and rewrote those statements,
+    # and the exact division's redo copies recompute from them.  Elsewhere
+    # the sweep now reads the fragment, and what only fed the value goes.
+    from ..cut_carried_values import cut_carried_values
+
+    s.kernel_body = cut_carried_values(s.kernel_body, s.ctx.rename_groups)
+
+
 def _hoist_exact_invariant_divisions(s: _DeviceBodyState) -> None:
     # Without fast_math, hoist the divisor-only work of an fp32
     # ``x / d`` with a loop-invariant divisor as the Markstein
@@ -1271,6 +1477,27 @@ def _hoist_exact_invariant_divisions(s: _DeviceBodyState) -> None:
         tensor_dtypes=ctx.tensor_dtypes_str_skip,
         argument_names=set(ctx.signature_names),
         proven_disjoint_tensor_pairs=ctx.proven_disjoint_tensor_pairs,
+    )
+
+
+def _jam_grid_lanes(s: _DeviceBodyState) -> None:
+    # After every structural pass: the jam copies each lane's finished
+    # statements, so the lanes compute exactly what the rolled loop did.
+    from ..jam_grid_lanes import jam_grid_lanes
+
+    ctx = s.ctx
+    s.kernel_body = jam_grid_lanes(
+        s.kernel_body,
+        rename_groups=ctx.rename_groups,
+        tensors={
+            arg.name: arg.fake_value
+            for arg in ctx.fn.arguments
+            if isinstance(arg, TensorArg)
+        },
+        proven_disjoint_tensor_pairs=ctx.proven_disjoint_tensor_pairs,
+        constexpr_values=ctx.constexpr_values,
+        env=ctx.env,
+        new_var=ctx.new_var,
     )
 
 
@@ -1319,6 +1546,47 @@ def _lower_scalar_policy_loads(s: _KernelDefState) -> None:
     s.definition.body = lower_scalar_policy_loads(s.definition.body)
 
 
+def _pack_half_extremum_folds(s: _KernelDefState) -> None:
+    from ..half_extremum_folds import pack_half_extremum_folds
+
+    s.definition.body = pack_half_extremum_folds(
+        s.definition.body,
+        target_device_capability=s.ctx.target_device_capability,
+    )
+
+
+def _pair_lane_math(s: _KernelDefState) -> None:
+    from ..pair_lane_math import pair_lane_math
+
+    # After the renames: each running value is one name, so the pairing sees
+    # which lane statements are ordered by it.
+    renames = s.ctx.rename_groups
+    s.definition.body = pair_lane_math(
+        s.definition.body,
+        fast_math=s.ctx.fast_math,
+        target_device_capability=s.ctx.target_device_capability,
+        tensor_dtypes={
+            renames.get(name, name): dtype
+            for name, dtype in s.ctx.tensor_dtypes_str_skip.items()
+        },
+        constants=s.ctx.constexpr_values,
+        parameters=frozenset(
+            argument.arg
+            for argument in (
+                *s.definition.args.posonlyargs,
+                *s.definition.args.args,
+                *s.definition.args.kwonlyargs,
+            )
+        ),
+    )
+
+
+def _select_native_warp_reductions(s: _KernelDefState) -> None:
+    from ..native_warp_reduction import select_native_warp_reductions
+
+    s.definition.body = select_native_warp_reductions(s.definition.body)
+
+
 def _lower_packet_store_policy(s: _KernelDefState) -> None:
     from ..packet_store_policy import lower_packet_store_policy
 
@@ -1338,6 +1606,11 @@ def _lower_packet_store_policy(s: _KernelDefState) -> None:
     )
 
 
+def _validate_shared_arenas(s: _KernelDefState) -> None:
+    for request in s.fn.cute_state.shared_arena_requests:
+        request.validate(s.definition.body, s.ctx.rename_groups)
+
+
 # ---------------------------------------------------------------------------
 # The ordered tables (the call sequence of ``codegen_function_def``, verbatim)
 # ---------------------------------------------------------------------------
@@ -1350,6 +1623,11 @@ LAUNCH_SHAPE = "launch_shape"
 RENAMED = "renamed"
 
 DEVICE_BODY_PROLOGUE: tuple[DeviceBodyPass, ...] = (
+    DeviceBodyPass(
+        "guard_atomics_on_later_thread_axes",
+        _always,
+        _guard_atomics_on_later_thread_axes,
+    ),
     DeviceBodyPass(
         "lower_uniform_comparisons",
         _always,
@@ -1411,6 +1689,12 @@ DEVICE_BODY_PASSES: tuple[DeviceBodyPass, ...] = (
         provides=("two_pass_loads_fused",),
     ),
     DeviceBodyPass(
+        "drop_scratch_stores",
+        _config_flag("cute_scratch_forwarding"),
+        _drop_scratch_stores,
+        requires=("two_pass_loads_fused",),
+    ),
+    DeviceBodyPass(
         "vectorize_branch_local_persistent_fragments",
         _always,
         _vectorize_branch_local_persistent_fragments,
@@ -1436,6 +1720,9 @@ DEVICE_BODY_PASSES: tuple[DeviceBodyPass, ...] = (
         provides=("bounded_cache_cached", "private_fragments"),
     ),
     DeviceBodyPass(
+        "peel_vector_tails", _config_flag("cute_tail_peel"), _peel_vector_tails
+    ),
+    DeviceBodyPass(
         "vectorize_affine_tile_lanes",
         _always,
         _vectorize_affine_tile_lanes,
@@ -1456,6 +1743,7 @@ DEVICE_BODY_PASSES: tuple[DeviceBodyPass, ...] = (
         _hoist_lane_invariant_reductions,
         requires=(LAUNCH_SHAPE,),
     ),
+    DeviceBodyPass("hoist_lane_invariant_loads", _always, _hoist_lane_invariant_loads),
     DeviceBodyPass("hoist_factored_reductions", _fast_math, _hoist_factored_reductions),
     DeviceBodyPass("fuse_fp8_pair_decode", _always, _fuse_fp8_pair_decode),
     DeviceBodyPass(
@@ -1495,6 +1783,14 @@ DEVICE_BODY_PASSES: tuple[DeviceBodyPass, ...] = (
         _has_folded_lanes,
         _fold_lane_reductions,
         requires=("lane_unroll_plan", "lane_loads_unrolled"),
+    ),
+    DeviceBodyPass(
+        "stash_sibling_lane_loads",
+        # Only after the lane unroll: the passes over a split lane loop are
+        # trace-time loops by now.
+        _wants_lane_unroll,
+        _stash_sibling_lane_loads,
+        requires=("lane_loads_unrolled",),
     ),
     DeviceBodyPass(
         "split_lane_loads",
@@ -1538,11 +1834,26 @@ DEVICE_BODY_PASSES: tuple[DeviceBodyPass, ...] = (
         # Needs the proved private recurrence and the generic fp32 pairs.
         requires=(LAUNCH_SHAPE, "state_loads_pipelined", "fp32_loops_packed"),
     ),
+    DeviceBodyPass("divide_vector_bases", _always, _divide_vector_bases),
+    DeviceBodyPass(
+        "peel_partial_chunks",
+        _config_flag("cute_proven_bounds"),
+        _peel_partial_chunks,
+        provides=("partial_chunks_peeled",),
+    ),
     DeviceBodyPass(
         "simplify_proven_loop_bounds",
         _always,
         _simplify_proven_loop_bounds,
         requires=(LAUNCH_SHAPE,),
+        provides=("loop_bounds_proven",),
+    ),
+    DeviceBodyPass(
+        "merge_unproven_peels",
+        _config_flag("cute_proven_bounds"),
+        _merge_unproven_peels,
+        # Rejoins the peeled loops whose complete chunks the proof left alone.
+        requires=("partial_chunks_peeled", "loop_bounds_proven"),
     ),
     DeviceBodyPass(
         "simplify_proven_bounds",
@@ -1573,7 +1884,7 @@ DEVICE_BODY_PASSES: tuple[DeviceBodyPass, ...] = (
     ),
     DeviceBodyPass(
         "split_rolled_vector_sums",
-        _config_flag("cute_independent_reduction"),
+        _independent_reduction,
         _split_rolled_vector_sums,
         provides=("independent_sums_split",),
     ),
@@ -1625,6 +1936,20 @@ DEVICE_BODY_PASSES: tuple[DeviceBodyPass, ...] = (
             "rolled_cluster_pairs_fused",
             "scalar_epilogue_lowered",
         ),
+        provides=("exact_divisions_hoisted",),
+    ),
+    DeviceBodyPass(
+        "cut_carried_values",
+        _always,
+        _cut_carried_values,
+        requires=("exact_divisions_hoisted",),
+        provides=("carried_values_cut",),
+    ),
+    DeviceBodyPass(
+        "jam_grid_lanes",
+        _config_flag("cute_grid_lane_jam"),
+        _jam_grid_lanes,
+        requires=("exact_divisions_hoisted", "carried_values_cut"),
     ),
 )
 
@@ -1674,6 +1999,31 @@ KERNEL_DEF_PASSES: tuple[KernelDefPass, ...] = (
         "lower_packet_store_policy",
         _always,
         _lower_packet_store_policy,
+        requires=(RENAMED,),
+    ),
+    KernelDefPass(
+        "validate_shared_arenas",
+        _always,
+        _validate_shared_arenas,
+        requires=(RENAMED, "published_scalars_lowered", "register_producers_lowered"),
+    ),
+    KernelDefPass(
+        "pack_half_extremum_folds",
+        _config_flag("cute_pair_lane_math"),
+        _pack_half_extremum_folds,
+        requires=(RENAMED,),
+    ),
+    KernelDefPass(
+        "pair_lane_math",
+        _config_flag("cute_pair_lane_math"),
+        _pair_lane_math,
+        requires=(RENAMED,),
+    ),
+    KernelDefPass(
+        "select_native_warp_reductions",
+        _config_flag("cute_warp_fp32_redux"),
+        _select_native_warp_reductions,
+        # Last: every earlier pass recognizes the shuffle reductions by name.
         requires=(RENAMED,),
     ),
 )

@@ -11,9 +11,14 @@ fallback (:func:`matmul_contraction_thread_reserve`).
 
 The backend supplies the policy: the grid axes that carry no threads
 (``Backend.boundary_only_grid_block_ids``), the live thread total
-(``tile_loop_thread_count``), the packed grid axis (``packed_grid_block_id``),
-the reduction axis reservation (``reduction_axis_first``,
-``max_reduction_threads``) and the tensor-core detectors
+(``tile_loop_thread_count``), the tile loops that share thread axes
+(``tile_loop_paths``), the threads each launch axis takes
+(``thread_axis_extent_limits``) and whether a reduction lays the tiles out
+itself (``per_thread_reduction_lays_out_tiles``), the packed grid axis
+(``packed_grid_block``), the reduction axis
+reservation (``reduction_axis_first``, ``max_reduction_threads``) for the
+reductions that get a strategy (``reduction_strategy_block_ids``, through
+``constexpr_live_graph_ids``) and the tensor-core detectors
 (``per_thread_mma_candidate_loop``, ``per_thread_matmul_loop_has_mma_path``,
 ``per_thread_mma_mode``, ``per_thread_root_thread_counts``), whose core
 defaults describe a backend without a tensor-core path.  The matmul operand
@@ -24,6 +29,7 @@ facts the planner reads are :mod:`helion._compiler.matmul_utils`'s
 from __future__ import annotations
 
 import functools
+from itertools import starmap
 import operator
 from typing import TYPE_CHECKING
 
@@ -38,11 +44,14 @@ from .backend import _loop_contains_matmul
 # ``matmul_utils`` (the matmul operand facts) is imported at call time: this
 # module loads while ``compile_environment`` is still initializing.
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Iterable
     from collections.abc import Sequence
 
     from ..runtime.config import Config
     from .backend import Backend
     from .device_function import DeviceFunction
+    from .device_ir import DeviceIR
     from .device_ir import GraphInfo
     from .tile_strategy import TileStrategy
 
@@ -111,26 +120,30 @@ def matmul_contraction_reduction_block_ids() -> set[int]:
     return result
 
 
-def matmul_contraction_extents(tile_block_ids: list[int]) -> list[int]:
-    """Size hints of the matmul-contraction reduction axes (above one)
-    that are *not* one of ``tile_block_ids``, i.e. handled by a separate
-    reduction strategy, not this tile strategy."""
+def extent_size_hint(block_id: int) -> int:
+    """The size hint of block ``block_id``'s extent."""
     from .._compat import shape_env_size_hint
     from .compile_environment import CompileEnvironment
 
     env = CompileEnvironment.current()
+    numel = env.block_sizes[block_id].numel
+    if isinstance(numel, (int, sympy.Integer)):
+        return int(numel)
+    if isinstance(numel, sympy.Expr):
+        return shape_env_size_hint(env.shape_env, numel)
+    return env.size_hint(numel)
+
+
+def matmul_contraction_extents(tile_block_ids: list[int]) -> list[int]:
+    """Size hints of the matmul-contraction reduction axes (above one)
+    that are *not* one of ``tile_block_ids``, i.e. handled by a separate
+    reduction strategy, not this tile strategy."""
     tile_ids = set(tile_block_ids)
     extents: list[int] = []
     for block_id in matmul_contraction_reduction_block_ids():
         if block_id in tile_ids:
             continue
-        numel = env.block_sizes[block_id].numel
-        if isinstance(numel, (int, sympy.Integer)):
-            size_hint = int(numel)
-        elif isinstance(numel, sympy.Expr):
-            size_hint = shape_env_size_hint(env.shape_env, numel)
-        else:
-            size_hint = env.size_hint(numel)
+        size_hint = extent_size_hint(block_id)
         if size_hint > 1:
             extents.append(size_hint)
     return extents
@@ -191,6 +204,112 @@ def free_auto_thread_axis_count(fn: DeviceFunction, config: Config) -> int:
         if threads == 0:
             count += 1
     return max(count, 1)
+
+
+def fit_reduction_threads(threads: int, other_threads: int) -> int:
+    """``threads`` of a reduction, halved until they fit in one CTA beside
+    the ``other_threads`` of the tiles and reductions it runs with."""
+    while other_threads * threads > MAX_THREADS_PER_BLOCK and threads > 1:
+        threads //= 2
+    return threads
+
+
+def reductions_keep_threads(
+    reductions: Iterable[tuple[int, int]], tile_threads: int
+) -> bool:
+    """Whether one of ``reductions``, each an ``(extent, num_threads)``
+    pair, keeps several live threads beside ``tile_threads`` threads of
+    tiles, so it claims a launch thread axis
+    (``ReductionStrategy._claims_thread_axis``).
+
+    The reductions are planned after the tiles.  Each asks for its
+    ``num_threads`` (a power of two when that is 0, which halves through 2),
+    which the backend halves until the reduction fits in the CTA beside the
+    tiles (``fit_reduction_threads``, as
+    ``Backend.adjust_reduction_thread_count`` does): it is left one thread
+    when the config asks for one, when its extent is 1, or when the tiles
+    take more than half the CTA.  The planner asks it of the configured
+    tiles, and so does the CuTe autotuner's elements-per-thread shrink where
+    it follows the planner.
+    """
+    return any(
+        extent > 1 and fit_reduction_threads(requested or 2, tile_threads) > 1
+        for extent, requested in reductions
+    )
+
+
+def _reduction_surely_claims_thread_axis(
+    fn: DeviceFunction,
+    backend: Backend,
+    config: Config,
+    tile_threads: int,
+    reduction_block_ids: Iterable[int],
+    tile_paths: Sequence[Sequence[tuple[int, ...]]],
+) -> bool:
+    """Whether one of ``reduction_block_ids``, the reductions that get a
+    strategy, surely keeps several live threads under ``config``
+    (:func:`reductions_keep_threads`), so it claims the leading thread axis.
+    A conservative test: where it cannot tell, it says no.
+
+    ``tile_threads``, the threads of the configured tiles
+    (``Backend.tile_loop_thread_count``), bounds what the tiles take only on
+    a single path of nested loops (``tile_paths``, the
+    ``Backend.tile_loop_paths``): sibling loops and roots share axes, and
+    the launch widens each to its widest sibling before the reductions take
+    their share (``TileStrategyDispatch._normalize_shared_tile_thread_extents``),
+    so beside them no reduction is sure to keep its threads.
+    """
+    from .compile_environment import CompileEnvironment
+
+    # One path also stands for several loops over the same blocks, whose
+    # shared strategy the reductions' fit counts once per loop
+    # (``_loops_share_a_strategy``).
+    if len(tile_paths) > 1 or _loops_share_a_strategy(fn):
+        return False
+    if (packed := backend.packed_grid_block(config)) is not None:
+        # The packed grid axis takes ``tiles_per_block`` threads at block
+        # size 1.
+        tile_threads *= packed[1]
+    env = CompileEnvironment.current()
+    return reductions_keep_threads(
+        (
+            (
+                extent_size_hint(block_id),
+                int(
+                    env.config_spec.num_threads.config_get(
+                        config.num_threads, block_id, 0
+                    )
+                ),
+            )
+            for block_id in reduction_block_ids
+        ),
+        tile_threads,
+    )
+
+
+def _loops_share_a_strategy(fn: DeviceFunction) -> bool:
+    """Whether two loops of ``fn``, roots or device loops, run over the same
+    blocks, as loops sharing an ``hl.register_block_size`` do.  They run on
+    one strategy, which ``TileStrategyDispatch.strategies`` lists once per
+    loop, and ``Backend.adjust_reduction_thread_count`` counts every entry
+    of that list, so the reductions get a smaller share of the CTA than one
+    path of the loops suggests."""
+    from .device_ir import ForLoopGraphInfo
+    from .device_ir import ReductionLoopGraphInfo
+    from .host_function import HostFunction
+
+    blocks = [
+        tuple(block_ids)
+        for block_ids in HostFunction.current().device_ir.grid_block_ids
+    ]
+    blocks += [
+        tuple(info.block_ids)
+        for info in fn.codegen.codegen_graphs
+        if isinstance(info, ForLoopGraphInfo)
+        and not isinstance(info, ReductionLoopGraphInfo)
+        and info.block_ids
+    ]
+    return len(set(blocks)) < len(blocks)
 
 
 # -- the tensor-core contraction candidate ----------------------------------------
@@ -402,6 +521,18 @@ def tile_loop_inactive_block_ids(
     return inactive_block_ids
 
 
+def _tile_loop_path(
+    paths: Sequence[Sequence[tuple[int, ...]]], block_ids: list[int]
+) -> Sequence[tuple[int, ...]] | None:
+    """The tiles above the loop over ``block_ids`` on its path of ``paths``
+    (``Backend.tile_loop_paths``), outermost first: its root's grid tile, then
+    the device loops enclosing it.  ``None`` when no path holds the loop."""
+    for path in paths:
+        if tuple(block_ids) in path:
+            return path[: path.index(tuple(block_ids))]
+    return None
+
+
 def _graph_used_block_ids(
     fn: DeviceFunction,
     block_ids: list[int],
@@ -525,6 +656,141 @@ def _graph_used_block_ids(
 
 
 # -- the planner ---------------------------------------------------------------
+# The rules below lay out an N-D tile loop's axes; the planner applies them
+# to the loop at codegen, and the CuTe autotuner's elements-per-thread shrink
+# applies them to a config it bounds (``CuteConfigGenerationExtension``).
+
+
+def tile_loop_keeps_nd_layout(
+    device_ir: DeviceIR,
+    graphs: Sequence[GraphInfo],
+    block_ids: Sequence[int],
+    inactive_grid_block_ids: set[int],
+) -> bool:
+    """Whether :func:`plan_per_thread_loop_strategy` lays out the tile loop
+    over ``block_ids`` as an N-D tile even when its ``flatten_loops`` entry
+    asks for a flattened one: in a kernel with a device loop (one of
+    ``graphs``) or several root loops, when a block's size is not known (a
+    data-dependent bound, a registered block size two loops of different
+    sizes share) or when the loop holds a boundary-only grid block
+    (``inactive_grid_block_ids``)."""
+    from .compile_environment import CompileEnvironment
+    from .device_ir import ForLoopGraphInfo
+    from .device_ir import ReductionLoopGraphInfo
+
+    env = CompileEnvironment.current()
+    return (
+        any(
+            isinstance(graph, ForLoopGraphInfo)
+            and not isinstance(graph, ReductionLoopGraphInfo)
+            for graph in graphs
+        )
+        or any(env.block_sizes[i].size is None for i in block_ids)
+        or len(device_ir.grid_block_ids) != 1
+        or bool(inactive_grid_block_ids.intersection(block_ids))
+    )
+
+
+def demote_auto_thread_axes(
+    num_threads: list[int],
+    available_axes: int,
+    takes_axis: Callable[[int, int], bool],
+    demotable: Callable[[int], bool],
+) -> None:
+    """While more of a tile's axes take a launch thread axis
+    (``takes_axis``, given each axis's current count) than the
+    ``available_axes`` the launch leaves the tile, run the automatic axis
+    (``num_threads`` entry 0) latest in block order that ``demotable``
+    allows on one thread."""
+    while sum(starmap(takes_axis, enumerate(num_threads))) > available_axes:
+        candidates = [
+            i
+            for i, threads in enumerate(num_threads)
+            if threads == 0 and takes_axis(i, threads) and demotable(i)
+        ]
+        if not candidates:
+            return
+        num_threads[candidates[-1]] = 1
+
+
+def shrink_auto_thread_counts(
+    block_sizes: Sequence[object], num_threads: list[int], thread_limit: int
+) -> int:
+    """Shrink a tile's automatic thread counts (``num_threads`` entries 0, a
+    thread per element of the block size), the widest first, each to the
+    next divisor of its block size below, until the axes of static block
+    size take at most ``thread_limit`` threads together; returns the threads
+    they take."""
+    int_positions: list[int] = []
+    int_block_sizes: dict[int, int] = {}
+    for i, block_size in enumerate(block_sizes):
+        if isinstance(block_size, int):
+            int_positions.append(i)
+            int_block_sizes[i] = block_size
+    resolved_threads = [
+        num_threads[i] if num_threads[i] > 0 else int_block_sizes[i]
+        for i in int_positions
+    ]
+    auto_positions = {
+        pos
+        for pos, block_idx in enumerate(int_positions)
+        if num_threads[block_idx] == 0
+    }
+    static_threads = functools.reduce(operator.mul, resolved_threads, 1)
+    while static_threads > thread_limit and auto_positions:
+        shrink_idx = max(
+            (pos for pos in auto_positions if resolved_threads[pos] > 1),
+            key=lambda pos: resolved_threads[pos],
+            default=None,
+        )
+        if shrink_idx is None:
+            break
+        block_idx = int_positions[shrink_idx]
+        block_size = int_block_sizes[block_idx]
+        next_threads = _largest_divisor_at_most(
+            block_size, resolved_threads[shrink_idx] - 1
+        )
+        if next_threads == resolved_threads[shrink_idx]:
+            break
+        resolved_threads[shrink_idx] = next_threads
+        num_threads[block_idx] = next_threads
+        static_threads = functools.reduce(operator.mul, resolved_threads, 1)
+    return static_threads
+
+
+def cap_auto_thread_axes(
+    num_threads: list[int],
+    block_sizes: Sequence[object],
+    loop_order: Iterable[int],
+    first_axis: int,
+    axis_extent_limits: Sequence[int],
+    takes_axis: Callable[[int, int], bool],
+    capped: Callable[[int], bool],
+) -> None:
+    """Cap a tile's automatic thread counts at what their launch axes take.
+
+    In ``loop_order`` the axes that take a thread axis (``takes_axis``) take
+    the launch's from ``first_axis`` on; one that ``capped`` allows, whose
+    count (its block size when 0) passes its axis's limit
+    (``axis_extent_limits``, 64 threads on CUDA's z), keeps the largest
+    divisor of its block size within it and walks the rest of the tile in a
+    lane loop.  The axes past the last limit keep their counts.
+    """
+    axis = first_axis
+    for i in loop_order:
+        if not takes_axis(i, num_threads[i]):
+            continue
+        if axis >= len(axis_extent_limits):
+            break
+        limit = axis_extent_limits[axis]
+        axis += 1
+        block_size = block_sizes[i]
+        if (
+            capped(i)
+            and isinstance(block_size, int)
+            and (num_threads[i] or block_size) > limit
+        ):
+            num_threads[i] = _largest_divisor_at_most(block_size, limit)
 
 
 def plan_per_thread_loop_strategy(
@@ -536,15 +802,14 @@ def plan_per_thread_loop_strategy(
     Shared by CuTe and Metal (one element per thread, cooperative hardware
     primitives for matmul).  ``backend`` supplies the policy through
     ``boundary_only_grid_block_ids``, ``tile_loop_thread_count``,
-    ``packed_grid_block_id`` and the ``per_thread_*`` tensor-core hooks
-    (see the module docstring).
+    ``thread_axis_extent_limits``, ``packed_grid_block`` and the
+    ``per_thread_*`` tensor-core hooks (see the module docstring).
     """
     from .compile_environment import CompileEnvironment
-    from .device_ir import ForLoopGraphInfo
-    from .device_ir import ReductionLoopGraphInfo
     from .host_function import HostFunction
     from .matmul_utils import kernel_has_half_precision_matmul
     from .matmul_utils import matmul_contraction_block_ids
+    from .tile_dispatch import reduction_strategy_block_ids
     from .tile_strategy import PerThreadFlattenedTileStrategy
     from .tile_strategy import PerThreadNDTileStrategy
 
@@ -560,23 +825,12 @@ def plan_per_thread_loop_strategy(
     device_ir = HostFunction.current().device_ir
     block_size_infos = [env.block_sizes[i] for i in block_ids]
     flattened = block_size_infos[0].is_flattened(config)
-    # A registered tile can also appear in a multidimensional loop.
-    # Its permutation applies only there; a one-dimensional loop has
-    # no order to configure.
-    loop_order = (
-        env.config_spec.loop_orders.config_get(config.loop_orders, block_ids[0])
-        if len(block_ids) > 1
-        else None
+    loop_order = env.config_spec.loop_orders.config_get_for_tile(
+        config.loop_orders, block_ids
     ) or [*range(len(block_ids))]
     l2_grouping = env.config_spec.l2_groupings.config_get(
         config.l2_groupings, block_ids[0], 1
     )
-    has_device_loops = any(
-        isinstance(graph, ForLoopGraphInfo)
-        and not isinstance(graph, ReductionLoopGraphInfo)
-        for graph in fn.codegen.codegen_graphs
-    )
-    has_dynamic_shape = any(env.block_sizes[i].size is None for i in block_ids)
     grid_ids = {bid for ids in device_ir.grid_block_ids for bid in ids}
     num_threads_config = [
         int(env.config_spec.num_threads.config_get(config.num_threads, block_id, 0))
@@ -584,56 +838,13 @@ def plan_per_thread_loop_strategy(
     ]
     inactive_grid_block_ids = backend.boundary_only_grid_block_ids(fn)
 
-    def _shrink_auto_thread_counts(
-        nd_block_size: Sequence[object], thread_limit: int
-    ) -> int:
-        int_positions: list[int] = []
-        int_block_sizes: dict[int, int] = {}
-        for i, block_size in enumerate(nd_block_size):
-            if isinstance(block_size, int):
-                int_positions.append(i)
-                int_block_sizes[i] = block_size
-        resolved_threads = [
-            num_threads_config[i] if num_threads_config[i] > 0 else int_block_sizes[i]
-            for i in int_positions
-        ]
-        auto_positions = {
-            pos
-            for pos, block_idx in enumerate(int_positions)
-            if num_threads_config[block_idx] == 0
-        }
-        static_threads = functools.reduce(operator.mul, resolved_threads, 1)
-        while static_threads > thread_limit and auto_positions:
-            shrink_idx = max(
-                (pos for pos in auto_positions if resolved_threads[pos] > 1),
-                key=lambda pos: resolved_threads[pos],
-                default=None,
-            )
-            if shrink_idx is None:
-                break
-            block_idx = int_positions[shrink_idx]
-            block_size = int_block_sizes[block_idx]
-            next_threads = _largest_divisor_at_most(
-                block_size, resolved_threads[shrink_idx] - 1
-            )
-            if next_threads == resolved_threads[shrink_idx]:
-                break
-            resolved_threads[shrink_idx] = next_threads
-            num_threads_config[block_idx] = next_threads
-            static_threads = functools.reduce(operator.mul, resolved_threads, 1)
-        return static_threads
-
     total_threads = backend.tile_loop_thread_count(fn, config, inactive_grid_block_ids)
     if total_threads > MAX_THREADS_PER_BLOCK:
         for i, block_id in enumerate(block_ids):
             if num_threads_config[i] == 0 and block_id not in grid_ids:
                 num_threads_config[i] = 1
-    if (
-        has_device_loops
-        or has_dynamic_shape
-        or len(device_ir.grid_block_ids) != 1
-        or (len(block_ids) > 1 and not flattened)
-        or bool(inactive_grid_block_ids.intersection(block_ids))
+    if (len(block_ids) > 1 and not flattened) or tile_loop_keeps_nd_layout(
+        device_ir, fn.codegen.codegen_graphs, block_ids, inactive_grid_block_ids
     ):
         nd_block_size = [bs.from_config_assert(config) for bs in block_size_infos]
         original_num_threads_config = list(num_threads_config)
@@ -647,26 +858,24 @@ def plan_per_thread_loop_strategy(
         inactive_block_ids = tile_loop_inactive_block_ids(
             fn, block_ids, inactive_grid_block_ids
         )
+        reduction_block_ids = reduction_strategy_block_ids(
+            fn, backend.constexpr_live_graph_ids(fn)
+        )
         for i, block_id in enumerate(block_ids):
             if block_id in inactive_block_ids:
                 num_threads_config[i] = 1
         is_device_loop = any(bid not in grid_ids for bid in block_ids)
-        active_block_ids = device_ir.codegen_active_block_ids
+        # Only a reduction that gets a strategy claims an axis: not one on
+        # the untaken side of a branch that is constant for this config.
         reduction_axis_reserve = (
-            1
-            if any(
-                info.reduction
-                and (active_block_ids is None or info.block_id in active_block_ids)
-                for info in env.block_sizes
-            )
-            and backend.reduction_axis_first()
-            else 0
+            1 if backend.reduction_axis_first() and reduction_block_ids else 0
         )
 
         # ``cute_tiles_per_block``: the packed grid axis is a thread axis
         # of extent ``pack`` even when the body never distributes over it
         # (``PerThreadNDTileStrategy`` reactivates it); budget it here.
-        packed_block_id = backend.packed_grid_block_id(config)
+        packed = backend.packed_grid_block(config)
+        packed_block_id = None if packed is None else packed[0]
 
         def uses_thread_axis_for(
             block_id: int, block_size: object, num_threads: int
@@ -679,50 +888,34 @@ def plan_per_thread_loop_strategy(
                 return num_threads > 1
             return not (isinstance(block_size, int) and block_size == 1)
 
-        consumed_grid_axes = 0
-        if is_device_loop:
-            for grid_block_id in grid_ids:
-                grid_info = env.block_sizes[grid_block_id]
-                grid_block_size = grid_info.from_config(config)
-                grid_threads = int(
-                    env.config_spec.num_threads.config_get(
-                        config.num_threads,
-                        grid_block_id,
-                        0,
-                    )
-                )
-                if uses_thread_axis_for(
-                    grid_block_id,
-                    grid_block_size,
-                    grid_threads,
-                ):
-                    consumed_grid_axes += 1
-        available_axes = max(0, 3 - reduction_axis_reserve - consumed_grid_axes)
-
-        def current_strategy_axes() -> int:
+        def grid_thread_axes(grid_block_ids: Iterable[int]) -> int:
+            """The thread axes the configured tiles of ``grid_block_ids``
+            take: a root's grid tiles, or an enclosing device loop's."""
             return sum(
-                int(uses_thread_axis_for(block_id, block_size, threads))
-                for block_id, block_size, threads in zip(
-                    block_ids,
-                    nd_block_size,
-                    num_threads_config,
-                    strict=True,
+                uses_thread_axis_for(
+                    grid_block_id,
+                    env.block_sizes[grid_block_id].from_config(config),
+                    int(
+                        env.config_spec.num_threads.config_get(
+                            config.num_threads, grid_block_id, 0
+                        )
+                    ),
                 )
+                for grid_block_id in grid_block_ids
             )
 
-        while current_strategy_axes() > available_axes:
-            candidates = [
-                i
-                for i, (block_id, block_size, threads) in enumerate(
-                    zip(block_ids, nd_block_size, num_threads_config, strict=True)
-                )
-                if threads == 0
-                and uses_thread_axis_for(block_id, block_size, threads)
-                and (not is_device_loop or block_id not in grid_ids)
-            ]
-            if not candidates:
-                break
-            num_threads_config[candidates[-1]] = 1
+        consumed_grid_axes = grid_thread_axes(grid_ids) if is_device_loop else 0
+        available_axes = max(0, 3 - reduction_axis_reserve - consumed_grid_axes)
+
+        def takes_axis(i: int, threads: int) -> bool:
+            return uses_thread_axis_for(block_ids[i], nd_block_size[i], threads)
+
+        demote_auto_thread_axes(
+            num_threads_config,
+            available_axes,
+            takes_axis,
+            lambda i: not is_device_loop or block_ids[i] not in grid_ids,
+        )
         thread_limit = MAX_THREADS_PER_BLOCK
         if len(block_ids) > 1 and _loop_contains_matmul(fn, block_ids):
             if mma_candidate or backend.per_thread_matmul_loop_has_mma_path(
@@ -736,6 +929,10 @@ def plan_per_thread_loop_strategy(
                 # cap. Keep those auto-threaded ND tiles within 256
                 # threads and let lane loops cover the rest.
                 thread_limit = min(thread_limit, 256)
+        # Each tile the packed grid axis holds runs on threads of its own,
+        # so the auto counts fit the tile into what the pack leaves of a block.
+        if packed is not None:
+            thread_limit //= packed[1]
         if len(block_ids) > 1 and mma_candidate:
             inactive_block_ids.clear()
             num_threads_config = [
@@ -769,7 +966,12 @@ def plan_per_thread_loop_strategy(
             while per_axis_limit > 1 and per_axis_limit**free_axes > free_budget:
                 per_axis_limit //= 2
             thread_limit = max(1, per_axis_limit)
-        static_threads = _shrink_auto_thread_counts(nd_block_size, thread_limit)
+        auto_positions = {
+            i for i, threads in enumerate(num_threads_config) if threads == 0
+        }
+        static_threads = shrink_auto_thread_counts(
+            nd_block_size, num_threads_config, thread_limit
+        )
 
         # The tensor-core detectors are the backend's (``mma_mode``: the
         # dedicated MMA, flash and warp-MMA bodies suppress the synthetic lane
@@ -777,6 +979,7 @@ def plan_per_thread_loop_strategy(
         # counts of the root tile).  The core defaults describe a backend
         # without such a path, so Metal never runs them.
         mma_mode = False
+        root_threads: list[int] | None = None
         if is_device_loop:
             mma_mode = backend.per_thread_mma_mode(
                 fn, block_ids, config, block_sizes=nd_block_size
@@ -811,6 +1014,94 @@ def plan_per_thread_loop_strategy(
                     ),
                     1,
                 )
+
+        axis_extent_limits = backend.thread_axis_extent_limits()
+        if (
+            axis_extent_limits is not None
+            and any(
+                (num_threads_config[i] or nd_block_size[i]) > min(axis_extent_limits)
+                for i in auto_positions
+                if isinstance(nd_block_size[i], int)
+            )
+            and not (
+                mma_mode
+                or mma_candidate
+                or root_threads is not None
+                or backend.per_thread_reduction_lays_out_tiles(
+                    env.config_spec, config, total_threads
+                )
+            )
+        ):
+            # An automatic thread count above what its launch axis takes (64
+            # threads on CUDA's z) keeps that many threads and walks the rest
+            # of the tile in a lane loop.  The axes below the loop are counted
+            # low, so a wrong count misses a cap instead of adding one to a
+            # tile that launched before: the reduction's only when a reduction
+            # surely keeps several threads (one left a single thread claims
+            # none) and, below a device loop, the grid axes of its root (the
+            # first tile of its path; the root with the fewest when no path
+            # holds the loop) and those of the loops enclosing it (each at
+            # most the axes the grid leaves it), without the tiles no graph
+            # observes.  A sibling root's reductions only move the tiles up.
+            # A reduction that lays the tiles out itself, such as a register
+            # tile putting them below its own axis, leaves the counts uncapped.
+            # Codegen knows each tile's axis exactly where it demotes the
+            # blocks past the third one
+            # (``PerThreadNDTileStrategy._demote_blocks_beyond_thread_axes``),
+            # but the cap belongs here: what is decided before codegen reads
+            # the planned counts (sibling tiles widened to the widest on their
+            # axis, the reductions' fit beside the tiles in
+            # ``adjust_reduction_thread_count``, a shared launch's per-axis
+            # budget from ``thread_block_dims``), so they must be capped.
+            tile_paths = backend.tile_loop_paths(fn)
+            axis = 0
+            if reduction_axis_reserve and _reduction_surely_claims_thread_axis(
+                fn, backend, config, total_threads, reduction_block_ids, tile_paths
+            ):
+                axis = 1
+            if is_device_loop:
+                path = _tile_loop_path(tile_paths, block_ids)
+                for level in path[1:] if path else ():
+                    axis += min(
+                        available_axes,
+                        grid_thread_axes(
+                            set(level)
+                            - tile_loop_inactive_block_ids(
+                                fn, list(level), inactive_grid_block_ids
+                            )
+                        ),
+                    )
+                axis += min(
+                    grid_thread_axes(
+                        set(root_block_ids)
+                        - tile_loop_inactive_block_ids(
+                            fn, root_block_ids, inactive_grid_block_ids
+                        )
+                    )
+                    for root_block_ids in (
+                        [list(path[0])] if path else device_ir.grid_block_ids
+                    )
+                )
+            cap_auto_thread_axes(
+                num_threads_config,
+                nd_block_size,
+                loop_order,
+                axis,
+                axis_extent_limits,
+                takes_axis,
+                lambda i: i in auto_positions and block_ids[i] != packed_block_id,
+            )
+            static_threads = functools.reduce(
+                operator.mul,
+                (
+                    threads or block_size
+                    for block_size, threads in zip(
+                        nd_block_size, num_threads_config, strict=True
+                    )
+                    if isinstance(block_size, int)
+                ),
+                1,
+            )
 
         check_thread_limit(static_threads, context=str(tuple(nd_block_size)))
         return PerThreadNDTileStrategy(

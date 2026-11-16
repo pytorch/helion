@@ -10,8 +10,6 @@ import weakref
 import pytest
 import torch
 
-from test.cute_population_contracts import _target
-
 import helion
 from helion import exc
 from helion._compiler.cute import resident_while
@@ -21,12 +19,15 @@ from helion._testing import skipIfRefEager
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_native_compile
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_codegen import tcgen05_target as _target
 import helion.language as hl
 from helion.language import _tracing_ops
 
+pytestmark = pytest.mark.cpu_only
+
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def _while_recipe(x, limits, swap: hl.constexpr, steps: hl.constexpr):
+def _while_recipe(x, limits, steps: hl.constexpr):
     out = torch.empty_like(x)
     for row in hl.grid(x.size(0)):
         lane = hl.arange(x.size(1))
@@ -35,10 +36,7 @@ def _while_recipe(x, limits, swap: hl.constexpr, steps: hl.constexpr):
         iteration = hl.full([], 0, dtype=torch.int32)
         limit = limits[row]
         while iteration < limit:
-            if swap:
-                left, right = right, left
-            else:
-                left, right = left + right, left - right
+            left, right = left + right, left - right
             for _packet in range(steps):
                 left = torch.gather(left + 1, 0, ((lane * 3 + 1) % x.size(1)).long())
             iteration = iteration + 1
@@ -46,15 +44,32 @@ def _while_recipe(x, limits, swap: hl.constexpr, steps: hl.constexpr):
     return out
 
 
-def _bind(*, swap: bool = False):
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _while_with_branch(x, limits):
+    # The plan refuses an ``if`` in the loop's body.
+    out = torch.empty_like(x)
+    for row in hl.grid(x.size(0)):
+        lane = hl.arange(x.size(1))
+        left = x[row, lane]
+        iteration = hl.full([], 0, dtype=torch.int32)
+        limit = limits[row]
+        while iteration < limit:
+            if limit > 1:
+                left = left + 1
+            iteration = iteration + 1
+        out[row, lane] = left
+    return out
+
+
+def _bind(*, branch: bool = False):
+    kernel, constexprs = (_while_with_branch, ()) if branch else (_while_recipe, (2,))
     with mock_cuda_unavailable(), _target(), forbid_native_compile():
         return cpu_bind(
-            _while_recipe,
+            kernel,
             (
                 torch.arange(48).reshape(3, 16).float(),
                 torch.tensor([0, 1, 3], dtype=torch.int32),
-                swap,
-                2,
+                *constexprs,
             ),
         )
 
@@ -114,16 +129,18 @@ def test_two_configs_in_one_environment_plan_their_own_graph_copies() -> None:
         forbid_native_compile(),
     ):
         first = bound.to_code(first_config)
+        # Keep both passes' owners alive: reset_mock() otherwise frees the
+        # first graphs, allowing Python to reuse their ids during the next pass.
         first_graphs = {
-            id(info) for call in planner.call_args_list for info in call.args[1]
+            id(info): info for call in planner.call_args_list for info in call.args[1]
         }
         planner.reset_mock()
         second = bound.to_code(second_config)
         second_graphs = {
-            id(info) for call in planner.call_args_list for info in call.args[1]
+            id(info): info for call in planner.call_args_list for info in call.args[1]
         }
     assert first_graphs and second_graphs
-    assert first_graphs.isdisjoint(second_graphs)
+    assert first_graphs.keys().isdisjoint(second_graphs)
     memo = cute_env_state(bound.env).resident_while_plans
     assert memo
     assert not any(
@@ -138,13 +155,13 @@ def test_two_configs_in_one_environment_plan_their_own_graph_copies() -> None:
 
 @skipIfRefEager("plans the traced graphs")
 def test_refusal_is_raised_fresh_and_the_environment_is_collected() -> None:
-    bound = _bind(swap=True)
+    bound = _bind(branch=True)
     graphs = bound.host_function.device_ir.graphs
     call = _while_call(graphs)
     with bound.env:
-        with pytest.raises(exc.InvalidConfig, match="explicit initialized phi") as a:
+        with pytest.raises(exc.InvalidConfig, match="nested while/if") as a:
             resident_while_plan(call, graphs)
-        with pytest.raises(exc.InvalidConfig, match="explicit initialized phi") as b:
+        with pytest.raises(exc.InvalidConfig, match="nested while/if") as b:
             resident_while_plan(call, graphs)
     assert a.value is not b.value
     assert str(a.value) == str(b.value)

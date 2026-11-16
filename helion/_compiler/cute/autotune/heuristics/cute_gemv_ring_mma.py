@@ -29,6 +29,7 @@ from ...ring_mma_dot import RING_SPLIT_KEY
 from ...ring_mma_dot import RING_STAGES_KEY
 from ...ring_mma_dot import ring_mma_geometry_reason
 from ...ring_mma_dot import ring_mma_smem_budget
+from ..flash_surface import pdl_searched
 from ..search_surface import _cute_dot_ring_searchable
 from ..search_surface import cute_fragment_mma_fact
 from .cute import _seq_config_list
@@ -54,7 +55,7 @@ class CuteGemvRingMmaHeuristic(AutotunerHeuristic):
     """Rolled rows, whole-warp K threads, the dot through the cp.async ring on MMA fragments."""
 
     name = "cute_gemv_ring_mma"
-    priority = 44
+    priority = 45
     backend = "cute"
 
     @classmethod
@@ -141,10 +142,7 @@ class CuteGemvRingMmaHeuristic(AutotunerHeuristic):
                 RING_STAGES_KEY: stages,
                 RING_SPLIT_KEY: split,
             }
-            capability = spec.target_device_capability
-            if spec.supports_config_key("cute_pdl") and (
-                capability is not None and capability >= (9, 0)
-            ):
+            if pdl_searched(spec):
                 values["cute_pdl"] = True
             seeds.append(Config.from_dict(deepcopy(values)))
         return seeds

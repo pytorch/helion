@@ -20,6 +20,7 @@ from helion._compiler.cute.memory_ops import _cute_tile_packet_is_aligned
 from helion._compiler.cute.memory_ops import (
     register_persistent_vec_alignment_specializations,
 )
+from helion._testing.binding_state import with_binding_state
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
@@ -130,6 +131,8 @@ class _BindingFacts:
         self.input_sources = [tensor]
         self.source = LocalSource("argument")
         self.config_spec = SimpleNamespace(target_device_capability=None)
+        # The binding's own launches: dispatch checks every bound residue.
+        with_binding_state(self)
         self.runtime_input_specializations: dict[str, Any] = {}
         self.bound_runtime_input_specialization_results: dict[str, Any] = {}
 
@@ -246,8 +249,9 @@ def test_missing_bound_proof_declines(missing: str) -> None:
         # base-alignment fact (``literal_offset_loads``).
         (torch.uint8, True),
         (torch.float4_e2m1fn_x2, True),
+        # Bool rows load as byte packets (``_CUTE_VECTOR_UNROLL_BYTE_DTYPES``).
+        (torch.bool, True),
         (torch.int64, False),
-        (torch.bool, False),
     ),
 )
 def test_alignment_cache_registration_dtype_boundary(

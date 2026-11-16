@@ -77,15 +77,22 @@ class KernelCompiler:
         ``rewrite_ast=False`` skips the backend AST customizations and traces
         the kernel as written.
         """
-        hf = self.parse(fn, fake_args, constexpr_args)
-        with hf, self._compilation_context():
-            self.unroll(hf)
-            if rewrite_ast:
-                hf.backend_rewrote_ast = self.customize_ast(hf)
-            self.propagate_types(hf)
-            self.finalize_config()
-            self.lower(hf)
-        return hf
+        try:
+            hf = self.parse(fn, fake_args, constexpr_args)
+            with hf, self._compilation_context():
+                self.unroll(hf)
+                if rewrite_ast:
+                    hf.backend_rewrote_ast = self.customize_ast(hf)
+                self.propagate_types(hf)
+                # Before lowering, whose analyses ask for it.
+                self.find_kernel_local_scratch(hf)
+                self.env.check_config_values_unspecialized()
+                self.finalize_config()
+                self.lower(hf)
+                self.env.check_config_values_unspecialized()
+            return hf
+        finally:
+            self.env.clear_container_identities()
 
     def parse(
         self,
@@ -140,6 +147,12 @@ class KernelCompiler:
         """
         with measure("HostFunction.customize_ast"):
             return self.backend.customize_ast(hf)
+
+    def find_kernel_local_scratch(self, hf: HostFunction) -> None:
+        from .scratch_tensors import find_kernel_local_scratch
+
+        with measure("HostFunction.find_kernel_local_scratch"):
+            find_kernel_local_scratch(hf)
 
     def propagate_types(self, hf: HostFunction) -> None:
         from .type_propagation import propagate_types

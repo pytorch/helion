@@ -14,6 +14,7 @@ from torch.fx.experimental.proxy_tensor import make_fx
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.fuse_u32_multiply import fuse_u32_multiply
 from helion.language.inline_asm_ops import inline_asm_elementwise
+from helion.language.random_ops import _mulhi_carry
 from helion.language.random_ops import _mulhi_lo_u32
 from helion.language.random_ops import _philox_uint32x4
 
@@ -29,10 +30,12 @@ if TYPE_CHECKING:
 _MASK32 = (1 << 32) - 1
 
 
-def _trace(fn: Callable[..., object], *args: object) -> torch.fx.GraphModule:
-    # The portable RNG helper consults the backend only to choose how constants
-    # are represented on Pallas. All tracing and execution here stay on CPU.
-    env = SimpleNamespace(backend=SimpleNamespace(name="cute"))
+def _trace(
+    fn: Callable[..., object], *args: object, backend: str = "cute"
+) -> torch.fx.GraphModule:
+    # Pallas needs different constant representation and unsigned carry masks.
+    # All tracing and execution here stay on CPU.
+    env = SimpleNamespace(backend=SimpleNamespace(name=backend))
     with patch.object(CompileEnvironment, "current", return_value=env):
         return make_fx(fn)(*args)
 
@@ -159,6 +162,64 @@ def test_tensor_operands_broadcast_and_wrap_high_bits() -> None:
     torch.testing.assert_close(actual, _exact_product(a, b), rtol=0, atol=0)
 
 
+def test_explicitly_masked_carries_still_fuse() -> None:
+    a, b = _values(), _values().flip(0)
+    graph_module = _trace(_mulhi_lo_u32, a, b)
+    carries = [
+        node
+        for node in graph_module.graph.nodes
+        if node.target is torch.ops.aten.__rshift__.Scalar
+        and isinstance(node.args[0], torch.fx.Node)
+        and node.args[0].target
+        in (torch.ops.aten.mul.Tensor, torch.ops.aten.add.Tensor)
+    ]
+    assert len(carries) == 3
+    for node in carries:
+        with graph_module.graph.inserting_after(node):
+            masked = graph_module.graph.call_function(
+                torch.ops.aten.bitwise_and.Scalar, (node, 65535)
+            )
+        masked.meta = dict(node.meta)
+        node.replace_all_uses_with(masked)
+        masked.args = (node, 65535)
+    graph_module.recompile()
+    expected = _exact_product(a, b)
+    torch.testing.assert_close(graph_module(a, b), expected, rtol=0, atol=0)
+    assert fuse_u32_multiply(graph_module.graph) == 2
+    actual = _NativeMultiplyInterpreter(graph_module).run(a, b)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "backend,masked", [("triton", False), ("cute", False), ("pallas", True)]
+)
+def test_only_pallas_masks_signed_partial_product_carries(backend, masked):
+    a, b = _values(), _values().flip(0)
+    graph_module = _trace(_mulhi_lo_u32, a, b, backend=backend)
+    masks = [
+        node
+        for node in graph_module.graph.nodes
+        if node.target is torch.ops.aten.bitwise_and.Scalar
+        and isinstance(node.args[0], torch.fx.Node)
+        and node.args[0].target is torch.ops.aten.__rshift__.Scalar
+        and isinstance(node.args[0].args[0], torch.fx.Node)
+        and node.args[0].args[0].target
+        in (torch.ops.aten.mul.Tensor, torch.ops.aten.add.Tensor)
+    ]
+    assert len(masks) == (3 if masked else 0)
+    # Model the actual signed-int32 Pallas carry; native paths keep int64.
+    values = torch.tensor(
+        [0, 65535, 65536, (1 << 31) - 1, -(1 << 31), -1], dtype=torch.int32
+    )
+    carry = _trace(_mulhi_carry, values, backend=backend)
+    expected = (values >> 16) & 65535 if masked else values >> 16
+    torch.testing.assert_close(carry(values), expected, rtol=0, atol=0)
+    if not masked:
+        torch.testing.assert_close(
+            graph_module(a, b), _exact_product(a, b), rtol=0, atol=0
+        )
+
+
 def test_commuted_operations_and_alternate_shift_targets() -> None:
     a, b = _values(), _values().flip(0)
     graph_module = _trace(_mulhi_lo_u32, a, b)
@@ -252,7 +313,9 @@ def test_incorrect_high_product_does_not_block_valid_low_word() -> None:
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("mutation", ["mask", "shift", "dtype", "add_alpha"])
+@pytest.mark.parametrize(
+    "mutation", ["mask", "carry_mask", "shift", "dtype", "add_alpha"]
+)
 def test_unproved_arithmetic_is_not_rewritten(mutation: str) -> None:
     a, b = _values(), _values().flip(0)
     graph_module = _trace(_mulhi_lo_u32, a, b)
@@ -262,6 +325,23 @@ def test_unproved_arithmetic_is_not_rewritten(mutation: str) -> None:
             node for node in nodes if node.target is torch.ops.aten.bitwise_and.Scalar
         )
         target.args = (target.args[0], 65534)
+    elif mutation == "carry_mask":
+        product = next(
+            node for node in nodes if node.target is torch.ops.aten.mul.Tensor
+        )
+        shift = next(
+            node
+            for node in nodes
+            if node.target is torch.ops.aten.__rshift__.Scalar
+            and node.args[0] is product
+        )
+        with graph_module.graph.inserting_after(shift):
+            target = graph_module.graph.call_function(
+                torch.ops.aten.bitwise_and.Scalar, (shift, 65534)
+            )
+        target.meta = dict(shift.meta)
+        shift.replace_all_uses_with(target)
+        target.args = (shift, 65534)
     elif mutation == "shift":
         target = next(
             node for node in nodes if node.target is torch.ops.aten.__rshift__.Scalar

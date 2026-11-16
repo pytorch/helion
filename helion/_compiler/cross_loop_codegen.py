@@ -15,6 +15,7 @@ from torch.utils._sympy.functions import Min as SymbolicMin
 
 from .. import exc
 from .._dist_utils import _resolve_process_group
+from .._utils import indexing_uses_tensor_descriptor
 from .ast_extension import ExtendedAST
 from .ast_extension import create
 from .ast_extension import expr_from_string
@@ -877,6 +878,9 @@ _PURE_TL_CALLS = frozenset(
         "zeros",
     }
 )
+# Exact compiler-owned fill helper: scalar conversion and tensor materialization
+# have no memory, synchronization or publication effects.
+_PURE_HELION_FILL_CALLS = frozenset({"integer_full"})
 # Hoisting these from a persistent task loop saves memory traffic or a reduction.
 _HOIST_ANCHOR_CALLS = frozenset(
     {"associative_scan", "cumsum", "load", "max", "min", "reduce", "sum"}
@@ -913,6 +917,10 @@ def _is_pure_call(node: ast.Call) -> bool:
     return isinstance(func.value, ast.Name) and (
         func.value.id in ("libdevice", "tl_math")
         or (func.value.id == "tl" and func.attr in _PURE_TL_CALLS)
+        or (
+            func.value.id == "helion_triton_helpers"
+            and func.attr in _PURE_HELION_FILL_CALLS
+        )
     )
 
 
@@ -1204,8 +1212,10 @@ _DRY_PASS_PURE_HELPERS = frozenset(
         *("welford", "welford_reduce", "welford_combine"),
     }
 )
-# Helion's own Triton helpers that only reduce; ``triton_wait_signal`` spins.
-_DRY_PASS_PURE_HELION_HELPERS = frozenset({"max_propagate_nan", "min_propagate_nan"})
+# Helion's pure fills/reductions; ``triton_wait_signal`` still spins.
+_DRY_PASS_PURE_HELION_HELPERS = _PURE_HELION_FILL_CALLS | frozenset(
+    {"max_propagate_nan", "min_propagate_nan"}
+)
 # Tensor methods; descriptor methods such as ``load`` and ``store`` are skipped.
 _DRY_PASS_PURE_METHODS = frozenset(
     {"to", "reshape", "view", "trans", "permute", "broadcast_to", "expand_dims"}
@@ -1444,10 +1454,26 @@ def emit_cross_loop_schedule(
             and indexing[memory_op_index] == "tensor_descriptor"
         )
 
+    # The stores this code indexes through tensor descriptors, by their
+    # ``memory_op_facts`` slot (``TileAccess.memory_op_index``): a config that
+    # rolls a reduction numbers its slots in an order of its own.
+    descriptor_stores: set[int] = set()
+    if indexing_uses_tensor_descriptor(indexing):
+        from .device_ir import codegen_memory_op_fact_pairs
+
+        descriptor_stores = {
+            fact.indexing_index
+            for fact, config_fact in codegen_memory_op_fact_pairs(
+                device_function.codegen.codegen_graphs,
+                HostFunction.current().device_ir.root_ids,
+            )
+            if fact.kind == "store"
+            and uses_tensor_descriptor(config_fact.indexing_index)
+        }
     unpublishable_site_ids = frozenset(
         site_id
         for access in dependency_graph.accesses
-        if access.kind == "store" and uses_tensor_descriptor(access.memory_op_index)
+        if access.kind == "store" and access.memory_op_index in descriptor_stores
         for site_id in dependency_graph.site_ids_by_access[access.access_id]
     )
     publishable_site_ids = (

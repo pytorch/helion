@@ -245,6 +245,9 @@ def trace_coarse_rank_selection(
     decompositions = select_decomp_table().copy()
     decompositions.pop(torch.ops.aten.fmin.default, None)
     decompositions.pop(torch.ops.aten.fmax.default, None)
-    return make_fx(program, decomposition_table=decompositions)(
-        torch.ones((groups, registers), dtype=dtype, device="cpu")
-    )
+    # Register-program geometry is fixed by this cache key. torch.cond uses
+    # Dynamo internally; do not generalize dimensions across previous traces.
+    with torch._dynamo.config.patch(automatic_dynamic_shapes=False):
+        return make_fx(program, decomposition_table=decompositions)(
+            torch.ones((groups, registers), dtype=dtype, device="cpu")
+        )

@@ -6,13 +6,12 @@ import random
 
 import pytest
 
-from test.test_cute_collective_tf32 import _config
-from test.test_cute_collective_tf32 import _jagged_inputs
-from test.test_cute_collective_tf32 import _kernel
-
 import helion
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_collective import collective_config
+from helion._testing.cute_collective import collective_kernel
+from helion._testing.cute_collective import jagged_inputs
 from helion.autotuner.config_generation import ConfigGeneration
 
 pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
@@ -26,8 +25,8 @@ pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 def test_enabled_collective_gets_the_admitted_thread_layout(
     bm: int, bn: int, threads: list[int], compute: str
 ) -> None:
-    bound = cpu_bind(_kernel(), _jagged_inputs(batch=3, rows=137, k=64, n=64))
-    config = _config(bm, bn, 32, compute=compute, copy="async_cached")
+    bound = cpu_bind(collective_kernel(), jagged_inputs(batch=3, rows=137, k=64, n=64))
+    config = collective_config(bm, bn, 32, compute=compute, copy="async_cached")
     # A thread layout the lowering declines (the lane epilogue's default).
     config.config["num_threads"] = [0, 4, 32, 1] if bn != 32 else [0, 8, 16, 1]
     with bound.env:
@@ -40,8 +39,8 @@ def test_enabled_collective_gets_the_admitted_thread_layout(
 
 
 def test_disabled_collective_keeps_its_thread_layout() -> None:
-    bound = cpu_bind(_kernel(), _jagged_inputs(batch=3, rows=137, k=64, n=64))
-    config = _config(32, 64, 32, compute="warp", copy="async_cached")
+    bound = cpu_bind(collective_kernel(), jagged_inputs(batch=3, rows=137, k=64, n=64))
+    config = collective_config(32, 64, 32, compute="warp", copy="async_cached")
     config.config["cute_collective_mma"] = False
     config.config["num_threads"] = [0, 4, 32, 1]
     with bound.env:
@@ -52,14 +51,14 @@ def test_disabled_collective_keeps_its_thread_layout() -> None:
 
 
 def test_perturbed_collective_layout_is_repaired_and_engages() -> None:
-    bound = cpu_bind(_kernel(), _jagged_inputs(batch=3, rows=137, k=64, n=64))
+    bound = cpu_bind(collective_kernel(), jagged_inputs(batch=3, rows=137, k=64, n=64))
     with bound.env:
         generation = ConfigGeneration(bound.config_spec)
         keys = generation._key_to_flat_indices
         thread_indices = keys["num_threads"][0]
         width_indices = keys["cute_vector_widths"][0]
         flat = generation.flatten(
-            _config(32, 64, 32, compute="warp", copy="async_cached")
+            collective_config(32, 64, 32, compute="warp", copy="async_cached")
         )
         # Threads and vector widths the lowering declines; everything else is
         # the known-good collective config.
@@ -83,7 +82,9 @@ def test_random_collective_configs_never_fall_back() -> None:
     state = random.getstate()
     try:
         random.seed(3)
-        bound = cpu_bind(_kernel(), _jagged_inputs(batch=3, rows=137, k=64, n=64))
+        bound = cpu_bind(
+            collective_kernel(), jagged_inputs(batch=3, rows=137, k=64, n=64)
+        )
         with bound.env:
             generation = ConfigGeneration(bound.config_spec)
             keys = generation._key_to_flat_indices

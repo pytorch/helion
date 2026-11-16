@@ -15,6 +15,8 @@ from test.test_cute_scaled_contraction import _inputs
 
 import helion
 from helion import exc
+from helion._compat import supports_torch_compile_template_lowering
+from helion._compiler.ast_extension import unparse
 from helion._compiler.cute.autotune.heuristics.cute_block_scaled import (
     CuteBlockScaledMmaHeuristic,
 )
@@ -145,6 +147,64 @@ def test_original_and_dynamic_metadata_are_proved(
     assert (plan["m"], plan["k"], plan["n"]) == (shape[0], shape[1] * 16, shape[2])
     assert plan["lhs_row_fast"] is False and plan["rhs_row_fast"] is True
     assert "input_tensor_metadata" in bound.env.compiler_fact_specialization_facts
+
+
+@pytest.mark.skipif(
+    not supports_torch_compile_template_lowering(),
+    reason="this PyTorch build lacks Helion's Inductor template lowering",
+)
+def test_dynamic_inductor_render_runs_the_generic_contraction() -> None:
+    """Inductor runs its render of a dynamic-shape graph at every size the
+    graph accepts, without the binding's dispatch guards, so the exact sizes
+    the native plan needs are no proof there.  The render takes the generic
+    contraction, as without the knob, rather than refusing a config
+    Inductor's tuner may have chosen; a static graph's keeps the native plan."""
+    from helion._compiler._inductor.template_buffer import render_inductor_ast
+
+    bound, _ = _bind_native((128, 16, 128), static=False)
+    with cpu_target():
+
+        def render(config: helion.Config, *, symbolic: bool) -> str:
+            return unparse(
+                render_inductor_ast(bound, config, symbolic_input_layouts=symbolic)
+            )
+
+        static = render(_native_config(), symbolic=False)
+        dynamic = render(_native_config(), symbolic=True)
+        generic = render(_native_config(cute_scaled_mma=False), symbolic=True)
+    assert _wrapper_plan(static)["kind"] == "block_scaled_mma"
+    assert "block_scaled_mma" not in dynamic
+    assert dynamic == generic
+
+
+def test_an_outer_trace_binding_refuses_a_declined_native_plan() -> None:
+    """Only Inductor's render of a dynamic graph skips the binding's dispatch
+    guards.  A binding from an outer trace's FakeTensors keeps them, but its
+    hints are that trace's, so the native plan declines there: the pinned
+    config is refused, as before, not replaced by the generic contraction."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    _, args = _bind_native((128, 16, 128), static=False)
+    with FakeTensorMode(allow_non_fake_inputs=True) as mode, cpu_target():
+        fake_args = tuple(
+            mode.from_tensor(arg) if isinstance(arg, torch.Tensor) else arg
+            for arg in args
+        )
+        kernel = helion.kernel(
+            _nvfp4_w4a4_matmul_kernel.fn,
+            backend="cute",
+            static_shapes=False,
+            autotune_effort="none",
+        )
+        bound = kernel._bind_isolated(fake_args)
+    with (
+        cpu_target(),
+        pytest.raises(
+            exc.BackendUnsupported,
+            match="native block-scaled contraction proof declined",
+        ),
+    ):
+        bound.to_code(_native_config())
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])

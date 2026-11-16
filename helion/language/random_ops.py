@@ -181,6 +181,15 @@ def _convert_element_type(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return torch.ops.prims.convert_element_type.default(x, dtype)
 
 
+def _mulhi_carry(x: torch.Tensor) -> torch.Tensor:
+    carry = x >> 16
+    # Pallas narrows these unsigned partial products to signed int32. Other
+    # backends keep int64 intermediates, whose carry already fits in 16 bits.
+    if CompileEnvironment.current().backend.name == "pallas":
+        return carry & HALF_MASK16
+    return carry
+
+
 def _mulhi_lo_u32(
     a: int | torch.Tensor,
     b: torch.Tensor,
@@ -194,15 +203,15 @@ def _mulhi_lo_u32(
 
     t = a0 * b0
     w0 = t & HALF_MASK16
-    k = t >> 16
+    k = _mulhi_carry(t)
 
     t = a1 * b0 + k
     w1 = t & HALF_MASK16
-    w2 = t >> 16
+    w2 = _mulhi_carry(t)
 
     t = a0 * b1 + w1
     lo = _mask_u32(((t & HALF_MASK16) << 16) | w0)
-    hi = _mask_u32(a1 * b1 + w2 + (t >> 16))
+    hi = _mask_u32(a1 * b1 + w2 + _mulhi_carry(t))
     return hi, lo
 
 

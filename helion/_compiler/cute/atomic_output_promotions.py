@@ -337,8 +337,10 @@ def promote_cute_root_graph_host_tensors(
     promotions: dict[str, torch.dtype],
 ) -> None:
     from ...language._tracing_ops import _host_tensor
+    from ..compile_environment import CompileEnvironment
     from ..host_function import HostFunction
 
+    env = CompileEnvironment.current()
     host_fn = HostFunction.current()
     for graph_info in graph_infos:
         for node in graph_info.graph.nodes:
@@ -350,6 +352,7 @@ def promote_cute_root_graph_host_tensors(
             value = node.meta.get("val")
             if isinstance(value, torch.Tensor):
                 promoted_value = value.to(dtype=torch.float32)
+                env.register_compiler_allocation_replacement(value, promoted_value)
                 if origin := host_fn.tensor_to_origin.get(value):
                     host_fn.tensor_to_origin[promoted_value] = origin
                 node.meta["val"] = promoted_value

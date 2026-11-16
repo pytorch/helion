@@ -28,6 +28,8 @@ if TYPE_CHECKING:
 
     from torch.fx import Node
 
+    from .fragment_domain import OwnershipMask
+
 
 class FragmentSelectionEmitter(FragmentContext):
     """Selection (top-k, sort, gather) over staged fragments."""
@@ -163,7 +165,7 @@ class FragmentSelectionEmitter(FragmentContext):
 
         # Last-axis capacity is exact. Logical leading tails retain their own
         # shape/offset ownership; no data-derived column owns an output row.
-        def domain(coords: tuple[str, ...]) -> tuple[str, ...]:
+        def domain(coords: tuple[str, ...]) -> tuple[OwnershipMask, ...]:
             return source.domain((*coords[:-1], "0"))
 
         return (

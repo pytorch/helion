@@ -6,6 +6,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import sys
 import tempfile
 from typing import TYPE_CHECKING
 import unittest
@@ -18,6 +19,7 @@ from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.config_spec import SearchDimensionInfo
 from helion.autotuner.handoff import _HandoffStop
 from helion.autotuner.logger import AutotuningLogger
+from helion.autotuner.logger import _ElapsedFormatter
 from helion.autotuner.metrics import AutotuneMetrics
 from helion.autotuner.search_space_logger import DimensionStats
 from helion.autotuner.search_space_logger import SearchSpaceReport
@@ -32,6 +34,36 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 pytestmark = pytest.mark.cpu_only
+
+
+def test_elapsed_formatter_preserves_plain_messages() -> None:
+    record = logging.makeLogRecord({"msg": "compiled %s", "args": ("candidate",)})
+    assert _ElapsedFormatter(lambda: 7).format(record) == "[7s] compiled candidate"
+
+
+@pytest.mark.parametrize("with_exception", [False, True])
+def test_elapsed_formatter_preserves_diagnostics(with_exception: bool) -> None:
+    stack = "Stack (most recent call last):\n  caller requesting compilation"
+    try:
+        raise ValueError("candidate exceeds shared memory")
+    except ValueError:
+        record = logging.makeLogRecord(
+            {
+                "msg": "skipping %s",
+                "args": ("candidate",),
+                "exc_info": sys.exc_info() if with_exception else None,
+                "stack_info": stack,
+            }
+        )
+    output = _ElapsedFormatter(lambda: 11).format(record)
+    assert output.startswith("[11s] skipping candidate\n")
+    assert output.endswith(stack)
+    if with_exception:
+        assert "Traceback (most recent call last):" in output
+        assert "test_elapsed_formatter_preserves_diagnostics" in output
+        assert "ValueError: candidate exceeds shared memory\n" in output
+    else:
+        assert "ValueError" not in output
 
 
 def test_canonical_config_id_preserves_existing_ids() -> None:

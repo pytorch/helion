@@ -55,6 +55,7 @@ class AutotuneMetrics:
     selected_source_was_measured: bool = False
     search_phase_metrics: dict[str, object] | None = None
     final_selection: dict[str, object] | None = None
+    compiler_refinement: dict[str, object] | None = None
 
     def finalize(self) -> None:
         self.autotune_time = time.perf_counter() - self._start_time
@@ -91,6 +92,8 @@ class AutotuneMetrics:
             result["search_phase_metrics"] = self.search_phase_metrics
         if self.final_selection is not None:
             result["final_selection"] = self.final_selection
+        if self.compiler_refinement is not None:
+            result["compiler_refinement"] = self.compiler_refinement
         return result
 
 

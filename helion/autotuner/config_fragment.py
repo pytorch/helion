@@ -5,6 +5,7 @@ import dataclasses
 import enum
 import math
 import random
+import struct
 from typing import TYPE_CHECKING
 from typing import Iterable
 from typing import TypeAlias
@@ -12,14 +13,21 @@ from typing import TypeGuard
 from typing import cast
 
 from ..exc import InvalidConfig
+from ..runtime.config import _config_value_key
 
 if TYPE_CHECKING:
+    from collections.abc import Hashable
     from typing import Callable
 
     from . import ConfigSpec
 
 
 FragmentFingerprint: TypeAlias = tuple[str | int, ...]
+
+
+def _same_search_value(left: object, right: object) -> bool:
+    """Search choices follow compiled identity, not Python numeric equality."""
+    return _config_value_key(left) == _config_value_key(right)
 
 
 def integer_power_of_two(n: object) -> TypeGuard[int]:
@@ -364,19 +372,26 @@ class EnumFragment(ConfigSpecFragment):
         # the knob to a value off the searched surface (e.g. cute tcgen05
         # knobs on configs that opt out of tcgen05); every searched choice is
         # then a neighbor so the search can step back onto the surface.
-        return [choice for choice in self._active_choices() if choice != current]
+        return [
+            choice
+            for choice in self._active_choices()
+            if not _same_search_value(choice, current)
+        ]
 
     def differential_mutation(self, a: object, b: object, c: object) -> object:
         active_choices = self._active_choices()
-        if b == c:
-            if a not in active_choices:
+        if _same_search_value(b, c):
+            if not any(_same_search_value(a, choice) for choice in active_choices):
                 return self.random()
             return a
-        choices = [choice for choice in (b, c) if choice in active_choices]
+        choices = [
+            choice
+            for choice in (b, c)
+            if any(_same_search_value(choice, active) for active in active_choices)
+        ]
         if not choices:
             return self.random()
-        if a in choices:
-            choices.remove(a)
+        choices = [choice for choice in choices if not _same_search_value(a, choice)]
         if not choices:
             return self.random()
         return random.choice(choices)
@@ -411,10 +426,14 @@ class EnumFragment(ConfigSpecFragment):
         the searched surface (e.g. cute tcgen05 knobs on configs that opt
         out of tcgen05), and this encoding only feeds surrogate models.
         """
-        try:
-            choice_idx = self.choices.index(value)
-        except ValueError:
-            choice_idx = -1
+        choice_idx = next(
+            (
+                i
+                for i, choice in enumerate(self.choices)
+                if _same_search_value(choice, value)
+            ),
+            -1,
+        )
         return [1.0 if i == choice_idx else 0.0 for i in range(len(self.choices))]
 
 
@@ -570,11 +589,13 @@ class ListOf(ConfigSpecFragment):
                 self.inner.default(),
                 *self.inner.pattern_neighbors(self.inner.default(), radius),
             ]:
-                if value not in values:
+                if not any(_same_search_value(value, prior) for prior in values):
                     values.append(value)
             for value in values:
                 uniform = [value] * self.length
-                if uniform != current and uniform not in neighbors:
+                if not _same_search_value(uniform, current) and not any(
+                    _same_search_value(uniform, prior) for prior in neighbors
+                ):
                     neighbors.append(uniform)
         return neighbors
 
@@ -607,3 +628,149 @@ class ListOf(ConfigSpecFragment):
         for v in value:
             encoded.extend(self.inner.encode(v))
         return encoded
+
+
+_BUILTIN_TUNABLE_FRAGMENTS = (
+    BaseIntegerFragment,
+    IntegerFragment,
+    PowerOfTwoFragment,
+    BlockSizeFragment,
+    NumWarpsFragment,
+    BooleanFragment,
+    NumThreadsFragment,
+    EnumFragment,
+)
+
+_FRAGMENT_CHANGED_MESSAGE = (
+    "Config fragment changed during compilation; keep registered domains immutable."
+)
+
+
+def _fragment_domain_fields(
+    fragment: ConfigSpecFragment,
+) -> tuple[tuple[str, object], ...] | None:
+    """Declared built-in domain fields, separate from flat-layout identity.
+
+    Subclasses retain these common fields; custom extra domain state belongs
+    in their existing fingerprint() implementation.
+    """
+    if isinstance(fragment, BaseIntegerFragment):
+        return (
+            ("low", fragment.low),
+            ("high", fragment.high),
+            ("default_val", fragment.default_val),
+        )
+    if isinstance(fragment, NumThreadsFragment):
+        return (("high", fragment.high),)
+    if isinstance(fragment, BooleanFragment):
+        return ()
+    if isinstance(fragment, EnumFragment):
+        return (
+            ("choices", fragment.choices),
+            ("search_choices", fragment.search_choices),
+            ("coverage_choices", fragment.coverage_choices),
+        )
+    return None
+
+
+def _plain_builtin_fragment_fields(
+    fragment: ConfigSpecFragment,
+) -> tuple[tuple[str, object], ...] | None:
+    """Complete domain fields for exact built-ins with no extra instance state.
+
+    Unlike persistent fingerprint fields, these fields can replace object
+    equality only when they describe the whole instance. Subclasses and
+    instances with additional state retain their existing equality policy.
+    Values are neither normalized nor copied here.
+    """
+    if type(fragment) not in _BUILTIN_TUNABLE_FRAGMENTS:
+        return None
+    fields = _fragment_domain_fields(fragment)
+    assert fields is not None
+    if set(vars(fragment)) != {name for name, _ in fields}:
+        return None
+    return fields
+
+
+def _plain_builtin_fragment_key(
+    fragment: ConfigSpecFragment,
+    *,
+    resolve: Callable[[object], object] | None = None,
+    for_identity_equality: bool = False,
+) -> Hashable | None:
+    """Canonical concrete domain shared by binding, revisits and constexpr keys.
+
+    A revisit may resolve a recorded literal before registration snapshots it.
+    Other callers already have concrete fields. Extra state and subclasses
+    continue to use their own equality rather than this value key. Identity
+    equality replacement is limited to the two built-ins without value equality
+    and their original concrete domains; constexpr keys encode all plain fields.
+    """
+    if for_identity_equality and type(fragment) not in (
+        BooleanFragment,
+        NumThreadsFragment,
+    ):
+        return None
+    fields = _plain_builtin_fragment_fields(fragment)
+    if fields is None:
+        return None
+    if resolve is not None:
+        fields = tuple((name, resolve(value)) for name, value in fields)
+    if (
+        for_identity_equality
+        and type(fragment) is NumThreadsFragment
+        and type(fields[0][1]) is not int
+    ):
+        return None
+    return _immutable_fragment_key(fields)
+
+
+def _scalar_fragment_key(value: object) -> Hashable | None:
+    """Exact scalar type and value, including float zero signs and NaN bits."""
+    kind = type(value)
+    if kind in (bool, int):
+        return kind, value
+    if kind is float:
+        value = cast("float", value)
+        # hex() erases NaN signs and payloads. Keep all other encodings stable.
+        return float, struct.pack("!d", value) if math.isnan(value) else value.hex()
+    return None
+
+
+def _same_scalar(left: object, right: object) -> bool:
+    key = _scalar_fragment_key(left)
+    return key is not None and key == _scalar_fragment_key(right)
+
+
+def _immutable_fragment_key(value: object) -> Hashable | None:
+    """Encode only plain immutable metadata; never retain opaque objects."""
+    kind = type(value)
+    if value is None:
+        return (type(None),)
+    if kind in (bool, int, float):
+        return _scalar_fragment_key(value)
+    if kind is str:
+        return str, value
+    if kind in (tuple, list):
+        result: list[Hashable] = []
+        for item in cast("tuple[object, ...] | list[object]", value):
+            key = _immutable_fragment_key(item)
+            if key is None:
+                return None
+            result.append(key)
+        return kind, tuple(result)
+    if kind is dict:
+        entries: list[tuple[str | int, Hashable]] = []
+        for item, field in cast("dict[object, object]", value).items():
+            if type(item) not in (str, int):
+                return None
+            key = _immutable_fragment_key(field)
+            if key is None:
+                return None
+            entries.append((cast("str | int", item), key))
+        try:
+            entries.sort()
+        except TypeError:
+            return None
+        return dict, tuple(entries)
+    return None

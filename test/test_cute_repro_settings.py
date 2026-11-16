@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import json
 from typing import TYPE_CHECKING
 
@@ -8,34 +7,27 @@ import pytest
 import torch
 
 from test.cute_population_contracts import tcgen05_mma_support
-from test.test_cute_flatten_nested_reductions import _joint_sum
-from test.test_cute_full_slice_matmul import _matmul
 from test.test_cute_graph_cse import _softmax_pair
-from test.test_cute_materialized_fission import _se_args
-from test.test_cute_shared_rhs_grouped import _offset_mm
 
 import helion
 from helion._compiler.cute.state import cute_env_state
 from helion._testing import cpu_render_target
-from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_structural import _case
+from helion._testing.cute_structural import _host
+from helion._testing.cute_structural import _replay
+from helion._testing.cute_structural import squeeze_and_excitation_net_fwd
+from helion._testing.cute_structural_kernels import _se_args
 import helion.language as hl
 from helion.runtime.settings import Settings
-
-matmul_bf16_int4 = import_example("int4_gemm").matmul_bf16_int4
-squeeze_and_excitation_net_fwd = import_example(
-    "squeeze_and_excitation_net"
-).squeeze_and_excitation_net_fwd
 
 pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
     from collections.abc import Iterator
     from typing import Any
 
     from helion.runtime.kernel import BoundKernel
-    from helion.runtime.kernel import Kernel
 
 
 _STRUCTURAL_SETTINGS = (
@@ -64,60 +56,6 @@ def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     ):
         yield
     torch.set_num_threads(previous_threads)
-
-
-def _case(
-    setting: str,
-) -> tuple[Callable[..., Any], tuple[object, ...], str]:
-    if setting == "cute_region_fission":
-        return squeeze_and_excitation_net_fwd.fn, _se_args(), "fission"
-    if setting == "cute_full_slice_matmul_tiling":
-        return (
-            _matmul,
-            (
-                torch.empty((32, 16), dtype=torch.float16),
-                torch.empty((16, 64), dtype=torch.float16),
-            ),
-            "_helion_fullslice_k",
-        )
-    if setting == "cute_segmented_matmul_tiling":
-        return (
-            _offset_mm,
-            (
-                torch.empty((37, 16), dtype=torch.bfloat16),
-                torch.empty((16, 24), dtype=torch.bfloat16),
-                torch.tensor([0, 0, 1, 19, 37], dtype=torch.int64),
-            ),
-            "_helion_segment_group",
-        )
-    if setting == "cute_flatten_nested_reductions":
-        return (
-            _joint_sum,
-            (torch.empty((37, 69)), torch.tensor([0, 0, 1, 19, 37], dtype=torch.int64)),
-            "_helion_flat_reduction",
-        )
-    assert setting == "cute_materialize_transformed_operands"
-    return (
-        matmul_bf16_int4.fn,
-        (
-            torch.empty((16, 40), dtype=torch.bfloat16),
-            torch.empty((20, 24), dtype=torch.int8),
-        ),
-        "_helion_materialized_operand",
-    )
-
-
-def _host(bound: BoundKernel[Any]) -> str:
-    assert bound.host_function is not None
-    return ast.dump(ast.Module(body=bound.host_function.body, type_ignores=[]))
-
-
-def _replay(decorator: str, function: Callable[..., Any]) -> Kernel[Any]:
-    # Evaluate the real public decorator: config construction and Settings
-    # precedence must work without injecting missing replay-only kwargs.
-    return eval(decorator.removeprefix("@"), {"helion": helion, "torch": torch})(
-        function
-    )
 
 
 def _check_roundtrip(

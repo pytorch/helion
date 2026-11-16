@@ -201,7 +201,12 @@ def match_flat_gather_lane(
 
 
 def row_is_multiple_of(
-    node: object, multiple: int, env: CompileEnvironment, *, hints: bool = False
+    node: object,
+    multiple: int,
+    env: CompileEnvironment,
+    *,
+    hints: bool = False,
+    static: bool = False,
 ) -> bool:
     """Prove every value of integer expression ``node`` is a multiple of ``multiple``.
 
@@ -212,6 +217,9 @@ def row_is_multiple_of(
     integers.  Unknown arithmetic (a loaded tensor, a tile index) fails
     closed; it may hold any value.  ``hints`` reads every symbol's size hint
     (for a seed heuristic that registers that fact when it emits seeds).
+    ``static`` counts static ints and specialized symbols only: a pinned
+    symbol is still a kernel argument in the generated code, which proofs
+    on that code (literal factors only) cannot see into.
     """
     if multiple <= 1:
         return True
@@ -221,7 +229,7 @@ def row_is_multiple_of(
         if (constant := _static_int(value, env, hints=hints)) is not None:
             return constant % multiple == 0
         scalar = _scalar(value)
-        if not isinstance(scalar, torch.SymInt):
+        if static or not isinstance(scalar, torch.SymInt):
             return False
         # ``specialized_multiple`` trusts a symbol's hint under the
         # ``input_tensor_metadata`` fact, which keys the bound kernel on the

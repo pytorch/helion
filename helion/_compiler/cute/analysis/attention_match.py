@@ -28,6 +28,7 @@ from typing import Sequence
 
 import torch
 
+from ...utils import is_full_slice
 from ..attention_plan import ALIBI_BIAS_KIND
 from ..attention_plan import CAUSAL_MASK_KIND
 from ..attention_plan import DOCUMENT_MASK_KIND
@@ -44,10 +45,10 @@ from .match_common import FlattenedRowOffset
 from .match_common import flattened_row_offset
 from .match_common import host_tensor_name
 from .match_common import is_call
-from .match_common import is_full_slice
 from .match_common import is_neg_inf
 from .match_common import new_var_source
 from .match_common import packed_f32x2_multiply
+from .match_common import root_grid_origin_is_canonical
 from .match_common import scalar_value
 from .match_common import scale_operand
 from .match_common import unit_fixed_block
@@ -203,6 +204,7 @@ def _attention_is_block_symnode(node: torch.fx.Node, block_id: int) -> bool:
         node.op == "call_function"
         and node.target is _get_symnode
         and len(node.args) >= 1
+        and isinstance(node.args[0], str)
         and node.args[0] == f"block_size_{block_id}"
     )
 
@@ -2435,7 +2437,9 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
 
     if not _attention_flash_gate_enabled() or not _attention_flash_supported():
         return None
-    if len(device_ir.grid_block_ids) != 1:
+    if len(device_ir.grid_block_ids) != 1 or not root_grid_origin_is_canonical(
+        device_ir
+    ):
         return None
     root_grid_ids = device_ir.grid_block_ids[0]
     env = CompileEnvironment.current()

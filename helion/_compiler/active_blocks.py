@@ -7,24 +7,42 @@ from typing import TYPE_CHECKING
 import sympy
 import torch
 
+from ..language import _MEMORY_OPS
+from ..language import memory_ops
 from ..language.matmul_ops import MATMUL_FACT_ID_META
 from .compile_environment import CompileEnvironment
 from .device_ir import ForLoopGraphInfo
+from .host_function import HostFunction
+from .indexing_strategy import is_block_size_index
 from .inductor_lowering import ReductionLowering
 from .loop_dependency_checker import memory_write_target
 from .utils import compute_slice_size
+from .utils import indexed_dims
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+    from collections.abc import Iterator
     from collections.abc import Sequence
+
+    from torch.fx import Node
 
     from .device_ir import GraphInfo
 
 
 def active_block_ids(
-    graphs: Sequence[GraphInfo], root_blocks: Iterable[int], env: CompileEnvironment
+    graphs: Sequence[GraphInfo],
+    root_blocks: Iterable[int],
+    env: CompileEnvironment,
+    *,
+    include_literal_slices: bool = False,
 ) -> frozenset[int]:
-    """Keep shape/index symbols, explicit loops and actual reduction lowerings."""
+    """Keep shape/index symbols, explicit loops and actual reduction lowerings.
+
+    ``include_literal_slices`` also keeps logical memory-slice axes whose
+    extents no longer carry symbols. Projected stage codegen needs these axes;
+    other analyses retain their existing symbol-based admission policy. Memory
+    indices, rather than padded factory/result shapes, supply the extents.
+    """
     result = set(root_blocks)
 
     def visit(value: object) -> None:
@@ -47,6 +65,13 @@ def active_block_ids(
             result.update(graph.block_ids)
         for node in graph.graph.nodes:
             visit(node.meta.get("val"))
+            if include_literal_slices:
+                # Memory slices own logical axes even when their extents are
+                # literal. Read the memory operation's indices, not padded
+                # factory/result shapes that can equal an unrelated axis.
+                for extent in _memory_slice_extents(node):
+                    if (block_id := env.resolve_block_id(extent)) is not None:
+                        result.add(block_id)
             lowering = node.meta.get("lowering")
             if isinstance(lowering, ReductionLowering):
                 result.add(lowering.block_index)
@@ -59,6 +84,57 @@ def active_block_ids(
                     if block_id is not None
                 )
     return frozenset(result)
+
+
+def _memory_slice_extents(node: Node) -> Iterator[int | torch.SymInt]:
+    target = (
+        node.args[0]
+        if node.op == "call_function" and node.target is memory_ops.load
+        else memory_write_target(node)
+    )
+    if target is None or not isinstance(node.args[1], (list, tuple)):
+        return
+    tensor = torch.fx.map_arg(target, lambda n: n.meta["val"])
+    if isinstance(tensor, tuple):
+        tensor = tensor[0]
+    assert isinstance(tensor, torch.Tensor)
+    indices = torch.fx.map_arg(node.args[1], lambda n: n.meta["val"])
+    indices = [index for index in indices if index is not None]
+    for size, index in zip(tensor.shape, indices, strict=True):
+        if isinstance(index, slice):
+            yield compute_slice_size(index, size)
+
+
+def full_slice_block_ids(node: torch.fx.Node) -> set[int]:
+    """The canonical blocks whose variable sizes a host tensor dim that
+    ``node``, a memory access, slices in full (``buf[tile_m, :]`` of
+    ``buf = x.new_empty([m, block_n])``).
+
+    Such a slice indexes a reduction block that reuses the variable
+    (``CompileEnvironment.allocate_reduction_dimension``), so
+    :func:`active_block_ids` records its uses as the uses of the block whose
+    variable it is.
+    """
+    if node.op != "call_function" or node.target not in _MEMORY_OPS:
+        return set()
+    tensor, index = torch.fx.map_arg(node.args[:2], lambda arg: arg.meta["val"])
+    if isinstance(tensor, (list, tuple)):
+        # A stack tensor's ``(tensor_like, pointers)``.
+        tensor = tensor[0]
+    assert isinstance(tensor, torch.Tensor) and isinstance(index, (list, tuple))
+    if tensor not in HostFunction.current().tensor_to_origin:
+        return set()
+    env = CompileEnvironment.current()
+    blocks: set[int] = set()
+    for idx, dim in zip(index, indexed_dims(tensor.ndim, index), strict=True):
+        if isinstance(idx, slice) and dim is not None and dim < tensor.ndim:
+            extent = compute_slice_size(idx, tensor.shape[dim])
+            if (
+                is_block_size_index(extent)
+                and (block_id := env.get_block_id(extent)) is not None
+            ):
+                blocks.add(env.canonical_block_id(block_id))
+    return blocks
 
 
 def unused_block_ids(
@@ -79,19 +155,8 @@ def unused_block_ids(
             # Scalar stores have no tensor result carrying full-slice axes.
             # Match their logical extents directly: compute_shape can allocate
             # new reduction dimensions, which this liveness analysis must not do.
-            if (target := memory_write_target(node)) is not None and isinstance(
-                node.args[1], (list, tuple)
-            ):
-                tensor = torch.fx.map_arg(target, lambda n: n.meta["val"])
-                if isinstance(tensor, tuple):
-                    tensor = tensor[0]
-                assert isinstance(tensor, torch.Tensor)
-                indices = torch.fx.map_arg(node.args[1], lambda n: n.meta["val"])
-                indices = [index for index in indices if index is not None]
-                for size, index in zip(tensor.shape, indices, strict=True):
-                    if not isinstance(index, slice):
-                        continue
-                    extent = compute_slice_size(index, size)
+            if memory_write_target(node) is not None:
+                for extent in _memory_slice_extents(node):
                     # ShapeEnv can know equal extents whose expression keys differ.
                     used = set()
                     for block_id in unused:

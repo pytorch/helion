@@ -661,8 +661,11 @@ class TestRandom(RefEagerTestBase, TestCase):
 
         ref_offsets_a = torch.arange(x.numel(), device=DEVICE, dtype=torch.int64) * 3
         ref_offsets_b = ref_offsets_a + 1
-        expected_a = _triton_rand_reference(seed, ref_offsets_a).reshape_as(x)
-        expected_b = _triton_rand_reference(seed, ref_offsets_b).reshape_as(x)
+        rand_reference = (
+            philox_rand_ref if x.device.type == "cpu" else _triton_rand_reference
+        )
+        expected_a = rand_reference(seed, ref_offsets_a).reshape_as(x)
+        expected_b = rand_reference(seed, ref_offsets_b).reshape_as(x)
         _assert_bitwise_equal_float(self, a, expected_a)
         _assert_bitwise_equal_float(self, b, expected_b)
         _assert_uses_philox(self, code)
@@ -697,7 +700,10 @@ class TestRandom(RefEagerTestBase, TestCase):
         out = compiled(x, seed)
 
         ref_offsets = torch.arange(x.numel(), device=DEVICE, dtype=torch.int64)
-        r0, r1, r2, _ = _triton_rand4x_reference(seed, ref_offsets)
+        rand4x_reference = (
+            philox_rand4x_ref if x.device.type == "cpu" else _triton_rand4x_reference
+        )
+        r0, r1, r2, _ = rand4x_reference(seed, ref_offsets)
         expected_0 = ((r0 > 0.1).to(x.dtype) * x).reshape(x.shape)
         expected_1 = ((r1 > 0.2).to(x.dtype) * x).reshape(x.shape)
         expected_2 = ((r2 > 0.3).to(x.dtype) * x).reshape(x.shape)

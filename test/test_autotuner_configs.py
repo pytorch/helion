@@ -89,7 +89,8 @@ class TestAutotunerConfigs(AutotunerTestCase):
             torch.randn([8, 512, 512], device=DEVICE),
             torch.randn([8, 512, 512], device=DEVICE),
         )
-        spec = basic_kernels.add.bind(args).config_spec
+        # The target/capability mocks must not reuse a spec bound by another test.
+        spec = basic_kernels.add._bind_isolated(args).config_spec
         configs = ConfigGeneration(spec).random_population(10)
         self.assertExpectedJournal("\n".join(map(repr, configs)))
 
@@ -114,11 +115,35 @@ class TestAutotunerConfigs(AutotunerTestCase):
             torch.randn([8, 512, 512], device=DEVICE),
             torch.randn([8, 512, 512], device=DEVICE),
         )
-        spec = basic_kernels.add.bind(args).config_spec
+        # Keep this golden independent of cached binds with other target facts.
+        spec = basic_kernels.add._bind_isolated(args).config_spec
         overrides = {"range_unroll_factors": [4], "range_warp_specializes": ([True])}
         # We expect all the unroll factors to be set to 0
         configs = ConfigGeneration(spec, overrides=overrides).random_population(10)
         self.assertExpectedJournal("\n".join(map(repr, configs)))
+
+    def test_shared_kernels_are_bound_afresh_in_each_test(self):
+        """A bind of a shared kernel made before an ``AutotunerTestCase`` test
+        does not reach the test, and one the test makes does not outlive it."""
+        args = (
+            torch.randn([16, 16], device=DEVICE),
+            torch.randn([16, 16], device=DEVICE),
+        )
+        kernels = (basic_kernels.add, _get_examples_matmul())
+        bound: list[object] = []
+
+        class Probe(AutotunerTestCase):
+            def test_bind(self) -> None:
+                bound.extend(kernel.bind(args) for kernel in kernels)
+
+        before = [kernel.bind(args) for kernel in kernels]
+        result = unittest.TestResult()
+        unittest.TestSuite([Probe("test_bind")]).run(result)
+        self.assertTrue(result.wasSuccessful(), result.errors + result.failures)
+        self.assertEqual(len(bound), len(kernels))
+        for kernel, earlier, inside in zip(kernels, before, bound, strict=True):
+            self.assertIsNot(inside, earlier)
+            self.assertIsNot(kernel.bind(args), inside)
 
     @_pin_sm90
     @patch.object(_compat, "_supports_host_tensor_descriptor", lambda: False)
@@ -151,7 +176,7 @@ class TestAutotunerConfigs(AutotunerTestCase):
             torch.randn([8, 512, 512], device=DEVICE),
             torch.randn([8, 512, 512], device=DEVICE),
         )
-        spec = basic_kernels.add.bind(args).config_spec
+        spec = basic_kernels.add._bind_isolated(args).config_spec
         overrides = {"indexing": "tensor_descriptor"}
         gen = ConfigGeneration(spec, overrides=overrides)
 
@@ -285,8 +310,8 @@ class TestAutotunerConfigs(AutotunerTestCase):
             def block_size_var(self, block_idx: int) -> str:
                 return f"_BLOCK_{block_idx}"
 
-            def compact_shape(self, shapes):
-                return shapes
+            def compacted_block_ids(self) -> list[int]:
+                return []
 
         dispatch = TileStrategyDispatch.__new__(TileStrategyDispatch)
         dispatch.strategies = [DummyStrategy()]

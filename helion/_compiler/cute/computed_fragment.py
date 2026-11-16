@@ -19,7 +19,6 @@ import torch
 from torch._inductor.ir import Reduction
 from torch._inductor.virtualized import V
 from torch.fx import Node
-from torch.fx.node import map_arg
 
 from ... import exc
 from ...language import _tracing_ops
@@ -60,8 +59,16 @@ from .fragment_dot import FragmentDotEmitter
 from .fragment_expression import FragmentExpression
 from .fragment_scan import FragmentScanEmitter
 from .fragment_selection import FragmentSelectionEmitter
+from .fragment_shared_arena import SharedArenaRequest
+from .fragment_shared_arena import plan_shared_arena
+from .full_reduction_owner import fragment_store_destinations
+from .full_reduction_owner import requires_full_reduction_owner
+from .handler_ops import integer_to_float_expr
+from .handler_ops import scalar_value_dtype
 from .local_atomic import local_atomic_allocations
 from .local_atomic import prove_local_atomics
+from .matmul_utils import cute_static_k_invariant_extent
+from .native_s2f6_contract import native_s2f6_asm_matches
 from .pure_producer_regions import pure_producer_plan
 from .reduction_coordinates import captured_reduction_coordinates
 from .reduction_coordinates import free_iota_reductions
@@ -69,10 +76,15 @@ from .reduction_coordinates import independent_reduction_coordinates
 from .reduction_coordinates import owned_iota_reduction_axes
 from .reduction_coordinates import physical_capture_axes
 from .reduction_coordinates import reduction_coordinate_proof
+from .repeated_block_ids import matmul_sum_collapse_nodes
+from .repeated_block_ids import scalar_repeated_block_id
+from .scalar_lowering import scalar_lowering_context
 from .scan_analysis import additive_scan_helper
 from .scan_analysis import completed_scan_plans
 from .selection.ordered_selection import is_ordered_selection
 from .selection.ordered_selection import ordered_selection_args
+from .static_indexing import shape_only_indices
+from .static_indexing import static_tensor_index
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -81,17 +93,22 @@ if TYPE_CHECKING:
     from ..device_ir import DeviceIR
     from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
+    from .fragment_domain import OwnershipMask
 
 
 class FragmentOps(GenerateASTFromInductor):
     """Use Inductor's index expressions instead of dropping them as SIMT does."""
 
     def __init__(
-        self, compiler: FragmentCompiler, inputs: dict[str, tuple[Node, Fragment]]
+        self,
+        compiler: FragmentCompiler,
+        inputs: dict[str, tuple[Node, Fragment]],
+        input_layouts: dict[str, tuple[list[sympy.Expr], list[sympy.Expr]]],
     ) -> None:
         super().__init__(compiler.cg, {})
         self.compiler = compiler
         self.inputs = inputs
+        self.input_layouts = input_layouts
 
     def load(self, name: str, index: sympy.Expr) -> str:
         node, value = self.inputs[name]
@@ -99,9 +116,15 @@ class FragmentOps(GenerateASTFromInductor):
         if not isinstance(fake, torch.Tensor):
             return self._lift(expr_from_string(value.read(())))
         assert isinstance(fake, torch.Tensor)
-        # Inductor indexes the fake input's physical layout, including its
-        # transposes and broadcasts. Recover coordinates in that same layout.
-        strides = self.compiler.shape(fake.stride())
+        # The inner function indexes the layout saved when it was lowered.
+        # A later _mask_to can replace that input with a contiguous fake value;
+        # its logical coordinates remain the same, but its strides do not.
+        # Buffers synthesized within a multi-buffer lowering have no saved
+        # input layout; their current fake value describes that new buffer.
+        layout = self.input_layouts.get(name)
+        strides = self.compiler.shape(
+            layout[1] if layout is not None else fake.stride()
+        )
         indices = self.direct_coordinates(index, strides, value.shape)
         if indices is None:
             indices = ["0"] * len(value.shape)
@@ -184,7 +207,15 @@ class FragmentOps(GenerateASTFromInductor):
         # Fragment loads and shared buffers contain logical typed scalars.
         # The parent handler's FP8 byte decoder belongs to ordinary raw-byte
         # global loads; applying it to a typed Float8 register corrupts its bits.
-        return self._lift(self._create_cast_expr(x, dtype))
+        # An integer or a bool still becomes a float as in the pointwise
+        # lowering, where MLIR could fold an 8-bit float conversion into it.
+        x_ast = self._to_ast(x)
+        converted = integer_to_float_expr(
+            x_ast, dtype, src_dtype, self.cg.device_function
+        )
+        if converted is not None:
+            return self._lift(converted)
+        return self._lift(self._create_cast_expr(x_ast, dtype))
 
     def index_expr(self, expr: sympy.Expr, dtype: torch.dtype) -> str:
         return self._lift(
@@ -203,6 +234,20 @@ class FragmentCompiler(
     the general-purpose fragment emitters, plus the inductor-backed pointwise
     lowering of a fragment node."""
 
+    def convert(
+        self, expression: str, source: torch.dtype | None, dtype: torch.dtype
+    ) -> str:
+        """``expression``, of dtype ``source``, cast to ``dtype``: an integer
+        or a bool becomes a float as in the pointwise lowering
+        (``integer_to_float_expr``), where MLIR could fold an 8-bit float
+        conversion into it."""
+        converted = integer_to_float_expr(
+            expr_from_string(expression), dtype, source, self.cg.device_function
+        )
+        if converted is None:
+            return self.cast(expression, dtype)
+        return ast.unparse(converted)
+
     def pointwise_read(
         self,
         producer: object,
@@ -220,11 +265,7 @@ class FragmentCompiler(
 
     def pointwise(self, node: Node, values: dict[Node, object]) -> Fragment:
         lowering = cast("PointwiseLowering | ReductionLowering", node.meta["lowering"])
-        inputs: list[Node] = []
-        map_arg(
-            (node.args, {**node.kwargs, "_extra_deps": None}),
-            lambda x: inputs.append(x),
-        )
+        inputs = lowering.input_nodes(node)
         lookup: dict[str, tuple[Node, Fragment]] = {}
         for name, source in zip(lowering.input_names, inputs, strict=True):
             value = values[source]
@@ -269,7 +310,9 @@ class FragmentCompiler(
                     node.meta["location"],
                     V.set_current_node(node),
                     install_inductor_kernel_handlers(self.cg, {}),
-                    V.set_ops_handler(FragmentOps(self, lookup)),
+                    V.set_ops_handler(
+                        FragmentOps(self, lookup, lowering.input_layouts)
+                    ),
                 ):
                     indices = [
                         sympy.Symbol(f"i{i}")
@@ -596,7 +639,13 @@ class FragmentCompiler(
             physical_row=dependencies[0].physical_row if cheap else None,
         )
 
-    def graph(self, graph: torch.fx.Graph, values: dict[Node, object]) -> object:
+    def graph(
+        self,
+        graph: torch.fx.Graph,
+        values: dict[Node, object],
+        *,
+        output_indices: frozenset[int] | None = None,
+    ) -> object:
         from .producer_cache import producer_cache_candidates
 
         cache_nodes = (
@@ -633,6 +682,26 @@ class FragmentCompiler(
             node: plan for plan in plans for node in plan.reductions
         }
         uses = {node: len(node.users) for node in graph.nodes}
+        dependencies = {node: node.all_input_nodes for node in graph.nodes}
+        for node in graph.nodes:
+            if node.target is _tracing_ops._phi:
+                # This emitter's loop carries are initialized before the loop,
+                # and its two branch extractions already name one joined slot.
+                # The phi selects args[1]; args[0] is tracing bookkeeping only.
+                selected = node.args[1]
+                dependencies[node] = [selected] if isinstance(selected, Node) else []
+                for source in node.all_input_nodes:
+                    if source not in dependencies[node]:
+                        uses[source] -= 1
+        if output_indices is not None:
+            output = graph.find_nodes(op="output")[0]
+            returns = cast("list[Node]", output.args[0])
+            retained = {returns[index] for index in output_indices}
+            # An FX user is one edge even if a value occurs in several slots.
+            # Remove only the unobserved return edge, not any executable use.
+            for source in output.all_input_nodes:
+                if source not in retained:
+                    uses[source] -= 1
         regions = (
             atomic_consumer_regions(self.graphs, self.env)
             if self.df.config.get("cute_fragment_atomic_consumer_fusion", False)
@@ -646,6 +715,7 @@ class FragmentCompiler(
         self.cache_nodes = frozenset(cache_nodes)
         self.active_region = None
         self.scopes.append(values)
+        self.scope_uses.append(uses)
         try:
             for node in graph.nodes:
                 if self.warp_producer_recorder is not None:
@@ -655,6 +725,15 @@ class FragmentCompiler(
                 if node.op == "output":
                     assert region is None
                     self.flush_pending_barrier()
+                    if output_indices is not None:
+                        return [
+                            _resolve(source, values)
+                            if index in output_indices
+                            else None
+                            for index, source in enumerate(
+                                cast("list[Node]", node.args[0])
+                            )
+                        ]
                     return _resolve(node.args[0], values)
                 if (
                     node in regions
@@ -688,7 +767,7 @@ class FragmentCompiler(
                         value = values[node]
                         assert isinstance(value, Fragment)
                         values[node] = self.materialize(value)
-                for source in node.all_input_nodes:
+                for source in dependencies[node]:
                     uses[source] -= 1
                     if uses[source] == 0:
                         values.pop(source, None)
@@ -706,6 +785,7 @@ class FragmentCompiler(
             self.scan_plans, self.scan_reductions = previous_scans, previous_reductions
             self.cache_nodes, self.active_region = previous_cache_nodes, previous_region
             self.scopes.pop()
+            self.scope_uses.pop()
         raise AssertionError("graph has no output")
 
     def node(
@@ -724,6 +804,8 @@ class FragmentCompiler(
             and not self.transparent_node(node)
         ):
             self.synchronize()
+        if target is _tracing_ops._phi:
+            return _resolve(node.args[1], values)
         args = cast("tuple[object, ...]", _resolve(node.args, values))
         fake = node.meta.get("val")
         if target is _tracing_ops._host_tensor:
@@ -736,8 +818,6 @@ class FragmentCompiler(
             return fake
         if target is _tracing_ops._new_var:
             return args[0]
-        if target is _tracing_ops._phi:
-            return args[1]
         if target is operator.getitem:
             sequence, index = args
             assert isinstance(sequence, (list, tuple)) and isinstance(index, int)
@@ -822,7 +902,14 @@ class FragmentCompiler(
                     "is_pure=True)"
                 )
 
-            if node in self.lazy_opaque_producers:
+            # This exact compiler decoder reads only its two scalar inputs;
+            # unlike arbitrary "pure" ASM it cannot observe the executing lane.
+            # Keep it pointwise like the integer recipe it replaces, rather
+            # than adding a shared-memory publication that may exceed capacity.
+            native_decode = native_s2f6_asm_matches(
+                asm, constraints, dtype, _is_pure, _pack, len(fragments)
+            ) and all(operand.dtype is torch.int32 for operand in fragments)
+            if native_decode or node in self.lazy_opaque_producers:
                 return Fragment(
                     self.shape(fake.shape),
                     fake.dtype,
@@ -849,11 +936,50 @@ class FragmentCompiler(
             block_id = self.env.resolve_block_id(args[0])
             assert block_id in self.offsets
             offset = self.offsets[block_id]
+            bound = self.bounds[block_id]
             return Fragment(
                 self.shape(fake.shape),
                 fake.dtype,
-                lambda coords: self.cast(f"({offset}) + ({coords[0]})", fake.dtype),
+                lambda coords: self.convert(
+                    f"({offset}) + ({coords[0]})", self.env.index_dtype, fake.dtype
+                ),
+                logical_domain=lambda coords: (
+                    f"({offset}) + ({coords[0]}) < ({bound})",
+                ),
                 pure=True,
+            )
+        if target in (torch.ops.aten.fmin.default, torch.ops.aten.fmax.default):
+            assert isinstance(fake, torch.Tensor)
+            inputs = tuple(cast("Fragment", value) for value in args)
+            logical_inputs = tuple(value for value in inputs if value.logical_domain)
+            lowering = node.meta["lowering"]
+
+            def numeric_extremum(coords: tuple[str, ...]) -> str:
+                operands = {
+                    cast("Node", source): expr_from_string(value.broadcast(coords))
+                    for source, value in zip(node.args, inputs, strict=True)
+                }
+                context = scalar_lowering_context(self.cg, operands)
+                expression = lowering.codegen(context, node)
+                assert isinstance(expression, ast.AST)
+                return self.cast(ast.unparse(expression), fake.dtype)
+
+            return Fragment(
+                self.shape(fake.shape),
+                fake.dtype,
+                lambda coords: self.pointwise_read(
+                    node, coords, lambda: numeric_extremum(coords)
+                ),
+                dependencies=inputs,
+                logical_domain=(
+                    lambda coords: tuple(
+                        mask
+                        for value in logical_inputs
+                        for mask in value.broadcast_domain(coords)
+                    )
+                )
+                if logical_inputs
+                else None,
             )
         if isinstance(node.meta["lowering"], (PointwiseLowering, ReductionLowering)):
             return self.pointwise(node, values)
@@ -879,7 +1005,13 @@ class FragmentCompiler(
             result = Fragment(
                 shape,
                 fake.dtype,
-                lambda _: self.cast(self.scalar(value), fake.dtype),
+                lambda _: self.convert(
+                    self.scalar(value),
+                    value.dtype
+                    if isinstance(value, Fragment)
+                    else scalar_value_dtype(value),
+                    fake.dtype,
+                ),
                 dependencies=(value,) if isinstance(value, Fragment) else (),
                 logical_domain=(
                     lambda coords: tuple(
@@ -942,7 +1074,9 @@ class FragmentCompiler(
                 # A local allocation can have padded physical capacity while
                 # retaining its declared logical domain. Its initialized pad
                 # values are not necessarily neutral for this reduction.
-                masks = list(source.domain(coords)) if source.logical_domain else []
+                masks: list[OwnershipMask] = (
+                    list(source.domain(coords)) if source.logical_domain else []
+                )
                 for coord, size in zip(coords, source_fake.shape, strict=True):
                     bid = self.env.resolve_block_id(size)
                     if bid is None:
@@ -965,8 +1099,13 @@ class FragmentCompiler(
                 dependencies=(source,),
                 logical_domain=source.logical_domain,
             )
-        if target is view_ops.subscript:
-            slices = cast("list[object]", args[1])
+        tensor_index = static_tensor_index(node)
+        if target is view_ops.subscript or tensor_index is not None:
+            slices = (
+                tensor_index[1]
+                if tensor_index is not None
+                else cast("list[object]", args[1])
+            )
 
             def subscript_coordinates(coords: tuple[str, ...]) -> tuple[str, ...]:
                 result: list[str] = []
@@ -1080,7 +1219,7 @@ class FragmentCompiler(
                     return tuple(mapped)
                 return self.coordinates(self.flatten(coords, shape), source.shape)
 
-            def view_domain(coords: tuple[str, ...]) -> tuple[str, ...]:
+            def view_domain(coords: tuple[str, ...]) -> tuple[OwnershipMask, ...]:
                 if structural:
                     return source.domain(view_coordinates(coords))
                 # Indexing may pad a singleton view without preserving numel.
@@ -1299,7 +1438,14 @@ def computed_fragment_supported(
                 if resident_state(placeholders[slot].meta.get("val")):
                     carried.add(placeholders[slot])
 
-    def reads_carry(node: Node) -> bool:
+    contractions = {
+        node
+        for info in graphs
+        for node in info.graph.nodes
+        if node.target is matmul_ops.dot
+    }
+
+    def reads_any(node: Node, sources: set[Node]) -> bool:
         pending = [node]
         seen: set[Node] = set()
         while pending:
@@ -1307,7 +1453,7 @@ def computed_fragment_supported(
             if source in seen:
                 continue
             seen.add(source)
-            if source in carried:
+            if source in sources:
                 return True
             if source.target in (memory_ops.load, _tracing_ops._host_tensor):
                 continue
@@ -1318,8 +1464,9 @@ def computed_fragment_supported(
         return False
 
     # Only roots needing independent static coordinates or resident computed
-    # contractions/scans use this fallback. Explicitly tiled contractions and
-    # native collective configurations keep their existing code generation.
+    # contractions/scans use this fallback. Tiled contractions also need it
+    # when a value repeats scalar coordinates; the ordinary matmul/stack/view
+    # exemptions and native collective configuration checks still apply.
     def computed(node: Node) -> bool:
         if node.target in (
             torch.ops.aten.permute.default,
@@ -1333,6 +1480,8 @@ def computed_fragment_supported(
             torch.ops.aten.squeeze.dim,
             torch.ops.aten.squeeze.dims,
             torch.ops.prims.convert_element_type.default,
+            torch.ops.aten.slice.Tensor,
+            torch.ops.aten.select.int,
             view_ops.subscript,
         ):
             return isinstance(node.args[0], Node) and computed(node.args[0])
@@ -1353,7 +1502,13 @@ def computed_fragment_supported(
         if is_ordered_selection(node)
     ]
 
+    collapsed_nodes: set[Node] | None = None
+
     def needs_coordinates(node: Node) -> bool:
+        nonlocal collapsed_nodes
+        index = static_tensor_index(node)
+        if index is not None and not shape_only_indices(*index):
+            return True
         if is_ordered_selection(node):
             source_node = cast("Node", node.args[0])
             source = source_node.meta.get("val")
@@ -1384,6 +1539,14 @@ def computed_fragment_supported(
             return True
         if node.target is _tracing_ops._host_tensor:
             return False
+        if (
+            node.op == "call_function"
+            and scalar_repeated_block_id(env, node) is not None
+        ):
+            if collapsed_nodes is None:
+                collapsed_nodes = matmul_sum_collapse_nodes(env, graphs)
+            if node not in collapsed_nodes:
+                return True
         if node.target in (
             torch.ops.aten.view.default,
             torch.ops.aten.reshape.default,
@@ -1420,7 +1583,7 @@ def computed_fragment_supported(
             source = node.args[1]
             return isinstance(source, Node) and computed(source)
         if isinstance(node.meta.get("lowering"), ReductionLowering):
-            if any(reads_carry(source) for source in node.all_input_nodes):
+            if any(reads_any(source, carried) for source in node.all_input_nodes):
                 return True
         value = node.meta.get("val")
         if isinstance(value, torch.Tensor) and node.target in (
@@ -1442,6 +1605,12 @@ def computed_fragment_supported(
         static_k = isinstance(left.shape[-1], int) and left.shape[-1] > 1
         if bid is not None:
             static_k = env.block_sizes[bid].reduction
+        # No tile or full slice walks K: a plain static extent, or the kept
+        # extent of a range subscript that no full slice joined.
+        free_k = bid is None or (
+            bid in env.subscript_extent_block_ids
+            and bid not in env.subscript_extents_joined_by_slice
+        )
         return (
             left.dtype == right.dtype
             and left.dtype in (torch.float16, torch.bfloat16, torch.float32)
@@ -1454,8 +1623,13 @@ def computed_fragment_supported(
                 or repeated_axes(right)
                 # Resident state cannot be reconstructed from global loads for
                 # each contraction coordinate, including after a dtype cast.
-                or reads_carry(lhs)
-                or reads_carry(rhs)
+                or reads_any(lhs, carried)
+                or reads_any(rhs, carried)
+                # A computed contraction operand needs the completed earlier
+                # dot at every K coordinate, including through half casts.
+                # Scalar load recipes cannot reconstruct that producer DAG.
+                or reads_any(lhs, contractions)
+                or reads_any(rhs, contractions)
                 # Existing scalar/native half-precision recipes retain their
                 # paths when their operands have independent coordinates.
                 or (
@@ -1467,10 +1641,22 @@ def computed_fragment_supported(
                         or right.ndim > 2
                     )
                 )
+                # A computed operand along such a K has no scalar recipe
+                # unless the pair is K-invariant: the fallback needs an
+                # active K tile or plain load views.  The extent a range
+                # subscript padded to could repeat another axis here, which
+                # gave the dot this owner only at such sizes.
+                or (
+                    free_k
+                    and (computed(lhs) or computed(rhs))
+                    and cute_static_k_invariant_extent(lhs, rhs) is None
+                )
             )
         )
 
-    if not (snapshot_owned or bounded_gather_owned) and not any(
+    if not (
+        snapshot_owned or bounded_gather_owned or requires_full_reduction_owner(graphs)
+    ) and not any(
         needs_coordinates(node) for info in graphs for node in info.graph.nodes
     ):
         return False
@@ -1519,10 +1705,13 @@ def computed_fragment_supported(
         torch.ops.aten.sort.default,
         torch.ops.aten.sort.stable,
         torch.ops.aten.gather.default,
+        torch.ops.aten.fmin.default,
+        torch.ops.aten.fmax.default,
     }
     if any(
         node.op == "call_function"
         and node.target not in supported
+        and static_tensor_index(node) is None
         and not isinstance(
             node.meta.get("lowering"),
             (PointwiseLowering, SympyExprLowering, ReductionLowering),
@@ -1668,6 +1857,7 @@ def computed_fragment_supported(
                 "max",
                 "min",
                 "prod",
+                "any",
                 "argmin",
                 "argmax",
             ):
@@ -1870,6 +2060,9 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         )
     )
     state = cg.device_function.cute_state
+    full_reduction_required = requires_full_reduction_owner(
+        cg.host_function.device_ir.graphs
+    )
     if any(
         plan is not None
         for plan in (
@@ -1894,20 +2087,15 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
                 "a planned root cannot share a computed fragment schedule"
             )
         return False
-    if free_required:
+    if free_required or full_reduction_required:
         # A new complete owner changes the placement of global stores relative
         # to vector reductions. Separate destinations need a disjointness
         # proof; declining into the unowned scalar iota path would lose the
         # complete reduction. Repeated stores through one tensor retain their
         # existing ordered semantics.
         destinations = {
-            cg.device_function.tensor_arg(target.meta["val"]).name
-            for info in cg.host_function.device_ir.graphs
-            for node in info.graph.nodes
-            if node.target is memory_ops.store
-            and isinstance(target := node.args[0], Node)
-            and isinstance(target.meta.get("val"), torch.Tensor)
-            and target.meta["val"] in HostFunction.current().tensor_to_origin
+            cg.device_function.tensor_arg(tensor).name
+            for tensor in fragment_store_destinations(cg.host_function.device_ir.graphs)
         }
         disjoint = cg.device_function.proven_disjoint_tensor_pairs()
         if any(
@@ -1916,7 +2104,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             for right in destinations
             if left < right
         ):
-            if local_required or fragment_schedule_required:
+            if local_required or fragment_schedule_required or full_reduction_required:
                 raise exc.InvalidConfig(
                     "fragment store destinations require disjoint storage"
                 )
@@ -1935,6 +2123,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         if (
             local_required
             or fragment_schedule_required
+            or full_reduction_required
             or cg.device_function.config.get("cute_reduction_schedule", "scalar")
             != "scalar"
         ):
@@ -1946,7 +2135,12 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         # An explicit resident schedule owns its rectangular carries and
         # performs its own complete proof during materialization. Replacing
         # its scalar producer here erases the structure that proof consumes.
-        if local_required or free_required or fragment_schedule_required:
+        if (
+            local_required
+            or free_required
+            or fragment_schedule_required
+            or full_reduction_required
+        ):
             raise exc.InvalidConfig(
                 "resident reduction schedules cannot share a computed fragment root"
             )
@@ -1956,6 +2150,10 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         or cg.device_function.config.get("cute_collective_mma", False)
         or cg.device_function.config.get("cute_register_chain", False)
     ):
+        if full_reduction_required:
+            raise exc.InvalidConfig(
+                "unmerged full reductions require an unconflicted complete fragment root"
+            )
         if local_required:
             raise exc.InvalidConfig(
                 "CTA-local atomics require a complete fragment root"
@@ -1996,6 +2194,10 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
     )
 
     def decline() -> bool:
+        if full_reduction_required:
+            raise exc.InvalidConfig(
+                "unmerged full reductions require a supported complete fragment root"
+            )
         if free_required:
             raise exc.InvalidConfig(
                 "free iota reductions require a supported complete fragment root"
@@ -2065,7 +2267,13 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
     ):
         return decline()
     root = graphs[root.graph_id]
-    compiler = FragmentCompiler(cg, graphs)
+    from .conditional_attention_codegen import conditional_attention_compiler
+
+    compiler = (
+        conditional_attention_compiler(cg, graphs)
+        if not fragment_schedule_required
+        else None
+    ) or FragmentCompiler(cg, graphs)
     if compiler.df.config.get("cute_fragment_warp_producer_regions", False):
         from .warp_producer_regions import WarpProducerRecorder
         from .warp_producer_regions import producer_prefix
@@ -2104,6 +2312,15 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
                 ranges = [*ranges, *lowering.buffer.data.reduction_ranges]
             if any(compiler.static_extent(dim) is None for dim in ranges):
                 return decline()
+            # Captured placeholders do not invoke their producer's inner function.
+            if node.op != "call_function":
+                continue
+            inputs = lowering.input_nodes(node)
+            input_layouts = {
+                source: lowering.input_layouts[name]
+                for name, source in zip(lowering.input_names, inputs, strict=True)
+                if name in lowering.input_layouts
+            }
             for source in node.all_input_nodes:
                 value = source.meta.get("val")
                 if not isinstance(value, torch.Tensor):
@@ -2114,10 +2331,15 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
                         continue
                     return decline()
                 shape = tuple(compiler.static_extent(dim) for dim in value.shape)
-                strides = tuple(compiler.static_extent(dim) for dim in value.stride())
-                if any(dim is None for dim in (*shape, *strides)):
-                    # Ordinary lowering can retain host constexpr dimensions.
-                    # This owner requires proved capacities and coordinate strides.
+                layout = input_layouts.get(source)
+                index_strides = layout[1] if layout is not None else value.stride()
+                strides = tuple(compiler.static_extent(dim) for dim in index_strides)
+                if len(shape) != len(strides) or any(
+                    dim is None for dim in (*shape, *strides)
+                ):
+                    # Saved strides decode the inner function's index, but loads
+                    # address the current fragment shape. Their ranks must agree.
+                    # This owner also requires static capacities and strides.
                     return decline()
                 span = 1
                 for stride, size in sorted(
@@ -2155,6 +2377,46 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
     if compiler.warp_producer_recorder is not None:
         compiler.warp_producer_recorder.lower(body)
     capacity = target_facts.per_cta_smem_capacity_bytes(compiler.env.device)
+    required_owner = (
+        local_required
+        or free_required
+        or fragment_schedule_required
+        or full_reduction_required
+        or any(
+            node.target is _tracing_ops._while_loop
+            for info in graphs
+            for node in info.graph.nodes
+        )
+    )
+    if (
+        required_owner
+        and cg.statements_stack[-1] is compiler.df.body
+        and not str(compiler.df.config.get("pid_type", "flat")).startswith("persistent")
+        and not compiler.df.config.get("cute_pdl", False)
+        and not compiler.env.config_spec.has_explicit_pdl
+        and capacity
+        and compiler.smem_bytes > capacity
+        and not compiler.local_allocations
+        and compiler.warp_producer_recorder is None
+        and not compiler.wants_mma_preamble
+        and not published_scalars_required
+        and not compiler.df.config.get("cute_fragment_register_producers", False)
+    ):
+        # Only a required owner may replace an over-capacity layout with an
+        # arena. Optional owners keep their ordinary scalar fallback. Planning
+        # covers this top-level root only: nested/persistent dispatch and PDL
+        # are excluded before committing storage, not by late validation.
+        arena = plan_shared_arena(
+            compiler.buffers, compiler.buffer_interference, cast("list[ast.stmt]", body)
+        )
+        if arena is not None and arena.byte_size <= capacity:
+            compiler.shared_arena_plan = arena
+            compiler.shared_arena_name = compiler.df.new_var("fragment_arena")
+            compiler.smem_bytes = arena.byte_size
+    if not capacity and full_reduction_required:
+        raise exc.InvalidConfig(
+            "unmerged full reductions require a known shared memory capacity"
+        )
     if not capacity and any(
         node.target is _tracing_ops._while_loop
         for info in graphs
@@ -2172,16 +2434,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             "shared producer caches require a known shared memory capacity"
         )
     if capacity and compiler.smem_bytes > capacity:
-        if (
-            local_required
-            or free_required
-            or fragment_schedule_required
-            or any(
-                node.target is _tracing_ops._while_loop
-                for info in graphs
-                for node in info.graph.nodes
-            )
-        ):
+        if required_owner:
             # These roots have no other owner: the config is invalid.
             raise exc.InvalidConfig(
                 f"computed fragments need {compiler.smem_bytes} shared bytes, exceeding {capacity}"
@@ -2225,6 +2478,19 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         )
     cg.device_function.cute_state.lanes.owned_root_block_dims = (compiler.threads, 1, 1)
     compiler.emit_mma_preamble()
-    for statement in (*compiler.allocations(), *body):
+    allocations = compiler.allocations()
+    if compiler.shared_arena_plan is not None:
+        compiler.df.cute_state.shared_arena_requests.append(
+            SharedArenaRequest(
+                compiler.shared_arena_plan,
+                compiler.shared_arena_name,
+                ast.unparse(
+                    ast.Module(
+                        body=cast("list[ast.stmt]", allocations), type_ignores=[]
+                    )
+                ),
+            )
+        )
+    for statement in (*allocations, *body):
         cg.add_statement(statement)
     return True

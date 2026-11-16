@@ -5,6 +5,8 @@ from typing import Iterable
 from typing import Sequence
 from typing import cast
 
+import torch
+
 if TYPE_CHECKING:
     from ...autotuner.config_spec import BlockSizeSpec
     from ...runtime.config import Config
@@ -53,6 +55,10 @@ def is_canonical_row_reduction(env: CompileEnvironment) -> bool:
     if spec.matmul_facts:
         return False
     bs_spec = spec.block_sizes[0]
+    # An untiled registered block or a tile used with conflicting extents
+    # has no single row domain.
+    if not isinstance(env.block_sizes[bs_spec.block_id].size, (int, torch.SymInt)):
+        return False
     # M-axis must accept block_size=1 (one row per program).
     return max(bs_spec.min_size, bs_spec.autotuner_min) <= 1
 

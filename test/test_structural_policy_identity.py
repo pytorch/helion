@@ -17,6 +17,7 @@ import subprocess
 import sys
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 import helion
@@ -37,6 +38,8 @@ from helion.runtime.kernel import BoundKernel
 from helion.runtime.kernel import Kernel
 from helion.runtime.settings import Settings
 from helion.runtime.structural_policy import StructuralConfig
+
+pytestmark = pytest.mark.cpu_only
 
 FIXTURE = Path(__file__).parent / "data" / "cute_structural_policy_identity.json"
 
@@ -125,8 +128,16 @@ def test_kernel_metadata_and_cache_keys_are_frozen() -> None:
     )
     assert metadata.run_id == fixture["kernel_metadata_run_id"]
     assert metadata.to_dict() == fixture["kernel_metadata_dict"]
-    # Disk-cache and specialization-key entries (kernel.py).
-    bound = SimpleNamespace(kernel=SimpleNamespace(cute_structural_policy=policy))
+    # Disk-cache and specialization-key entries (kernel.py), for a binding
+    # whose calls hold every fact its code relies on (no call-fact key).
+    bound = SimpleNamespace(
+        kernel=SimpleNamespace(cute_structural_policy=policy),
+        env=SimpleNamespace(
+            input_alignment_limit=None,
+            dispatch_guards_enforced=True,
+            symbolic_stride_sources=(),
+        ),
+    )
     assert (
         BoundKernel.extra_cache_key(bound)  # type: ignore[arg-type]
         == f"cute_structural_policy:{policy.identity()}"
@@ -155,12 +166,16 @@ def test_structural_policy_type_hook_names_the_cute_policy() -> None:
     )
 
 
+@pytest.mark.slow
 def test_runtime_hooks_module_imports_first_and_is_not_a_codegen_module() -> None:
     # ``runtime_hooks`` imports ``helion.runtime.kernel`` at module level, so
     # it must stay out of helion's own import chain: importable as the very
     # first helion import of a fresh interpreter ...
     root = Path(__file__).resolve().parents[1]
-    environment = dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONPATH=str(root))
+    pythonpath = os.pathsep.join(
+        filter(None, (str(root), os.environ.get("PYTHONPATH")))
+    )
+    environment = dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONPATH=pythonpath)
     result = subprocess.run(
         [
             sys.executable,

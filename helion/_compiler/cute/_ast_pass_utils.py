@@ -10,7 +10,8 @@ pinned by ``test/test_cute_ast_pass_utils.py`` against the legacy copies:
   ``ast.walk``; ``is_name_assign`` / ``assigned_name`` / ``name_assignment``
   for ``NAME = value``; ``resolve_alias`` follows a rename map to its root.
 * call paths -- ``call_path`` (tuple) and ``call_path_str`` (dotted) of a
-  ``Name``/``Attribute`` chain; ``cutlass_scalar_type`` for ``cutlass.X``.
+  ``Name``/``Attribute`` chain, ``callee_name`` (its last component);
+  ``cutlass_scalar_type`` for ``cutlass.X``.
 * expressions -- ``same_expr`` (structural equality without positions),
   ``parse_expr`` / ``reparse_expr`` (plain-``ast`` expression clones; use
   ``expr_from_string`` when Helion ``ExtendedAST`` metadata is required),
@@ -19,14 +20,20 @@ pinned by ``test/test_cute_ast_pass_utils.py`` against the legacy copies:
 * loops -- ``loop_extent`` with the one canonical literal-extent predicate and
   ``is_vloop`` for ``cutlass.range_constexpr(<int>)`` V-loops;
   ``constexpr_v_loop`` keeps the looser grammar of the warp-reduce hoist and
-  the sibling V-loop merge.
+  the sibling V-loop merge; ``is_staged_loop`` / ``is_trace_time_test``
+  tell the loops and tests the DSL preprocessor stages from the ones it
+  runs as Python.
 * memory -- ``tensor_roots_may_alias`` over the passes' tensor-root facts.
 * rewrites -- ``replace_node`` (identity), ``replace_call`` (structural or
   textual match), ``substitute_names`` / ``rename_names`` / ``expand_lane``;
   every rewrite that inserts a subtree takes the caller's clone callable so
-  pass-specific markers survive.
+  pass-specific markers survive.  ``deep_clone`` copies a subtree with those
+  markers and ``dealias_shared_nodes`` gives every position of a tree its own
+  node.
 * dataflow -- ``exposed_reads`` (forward, with explicit branch/loop/define
   policies) and ``live_in`` (backward, zero-trip loops).
+* device body -- ``body_end_follows_all_tiles``: whether a statement appended
+  to a device body runs once per CTA, after all of its tiles.
 
 Do not import this module from device-helper modules that generated code
 imports (``reduce_helpers``, ``vec_utils``, ``*_runtime``): they are part of
@@ -45,7 +52,9 @@ from typing import TYPE_CHECKING
 from typing import Literal
 from typing import TypeGuard
 from typing import TypeVar
+from typing import cast
 
+from ..ast_extension import ExtendedAST
 from ..ast_extension import expr_from_string
 from ..ast_read_writes import ReadWrites
 from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
@@ -58,6 +67,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
     from collections.abc import Mapping
     from collections.abc import Sequence
+
+    from ..device_ir import DeviceIR
 
 _A = TypeVar("_A", bound=ast.AST)
 
@@ -189,6 +200,16 @@ def call_path_str(node: ast.AST) -> str | None:
     return None if path is None else ".".join(path)
 
 
+def callee_name(node: ast.AST) -> str | None:
+    """The last component of a ``Name`` / ``Attribute`` callee (``a().b``
+    included), the way the DSL preprocessor matches loops and tests."""
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Name):
+        return node.id
+    return None
+
+
 def cutlass_scalar_type(node: ast.AST) -> str | None:
     """``cutlass.Float32`` -> ``"Float32"``; None unless a two-part
     ``cutlass.<X>`` path (callers test membership in their own type sets)."""
@@ -255,6 +276,43 @@ def comparison_is_always_true(
 # Loops
 # --------------------------------------------------------------------------
 
+# The DSL preprocessor stages a ``for`` over a call of these (``range``,
+# ``cutlass.range``, ``range_dynamic``, under any prefix) as a dynamic loop
+# and unrolls every other ``for`` (``cutlass.range_constexpr``, a Python
+# iterable) while tracing; an ``if`` / ``while`` whose test calls one of
+# ``_TRACE_TIME_TESTS`` (``cutlass.const_expr(...)``) runs as Python.
+_STAGED_RANGE_CALLS = frozenset({"range", "range_dynamic"})
+_TRACE_TIME_TESTS = frozenset({"const_expr", "target_version"})
+# The register helpers of the exact fp32 division (``exact_division.py``,
+# ``device/ptx.py``), by the names generated code calls them: pure
+# arithmetic.  A pass that meets them after the exact pass
+# (``jam_grid_lanes``) copies them like any other arithmetic; the passes
+# that emit them register each name here.
+EXACT_DIVISION_HELPERS = frozenset(
+    {
+        "_cute_exact_div_bounds_f32",
+        "_cute_exact_div_fast_f32",
+        "_cute_exact_div_fast_f32x2",
+        "_cute_exact_div_redo_f32",
+    }
+)
+
+
+def is_staged_loop(node: ast.For) -> bool:
+    """Whether the DSL stages ``node`` as a dynamic loop, its body traced
+    once, rather than unrolling it while tracing (see above)."""
+    return (
+        isinstance(node.iter, ast.Call)
+        and callee_name(node.iter.func) in _STAGED_RANGE_CALLS
+    )
+
+
+def is_trace_time_test(test: ast.expr) -> bool:
+    """Whether the DSL runs an ``if`` / ``while`` on ``test`` as Python
+    while tracing (``cutlass.const_expr(...)``) rather than staging it."""
+    return isinstance(test, ast.Call) and callee_name(test.func) in _TRACE_TIME_TESTS
+
+
 LoopKind = Literal["range", "constexpr"]
 _LOOP_CALLEES: dict[str, tuple[str, ...]] = {
     "range": ("range",),
@@ -297,6 +355,16 @@ def loop_extent(
     return extent.value
 
 
+def is_constexpr_range(loop: ast.AST) -> bool:
+    """Whether ``loop`` is a ``for`` over ``cutlass.range_constexpr``, which
+    the trace unrolls whatever the spelling of its bounds."""
+    return (
+        isinstance(loop, ast.For)
+        and isinstance(loop.iter, ast.Call)
+        and call_path(loop.iter.func) == _LOOP_CALLEES["constexpr"]
+    )
+
+
 def is_vloop(node: ast.AST) -> bool:
     """``for v in cutlass.range_constexpr(<int>)`` with a literal extent."""
     return loop_extent(node, kinds=("constexpr",), minimum=None) is not None
@@ -328,6 +396,26 @@ def constexpr_v_loop(node: ast.AST) -> tuple[ast.For, int] | None:
 
 
 # --------------------------------------------------------------------------
+# Device body
+# --------------------------------------------------------------------------
+
+
+def body_end_follows_all_tiles(body: Sequence[ast.AST], device_ir: DeviceIR) -> bool:
+    """Whether every thread of every CTA reaches the end of the device
+    ``body`` once, after all of the CTA's tiles: the body has no early
+    ``return`` and the launch no grid barrier (``hl.barrier()`` phases; a
+    stage of the ordered-phase lowering is a launch of its own, with one
+    phase).  The device remainder fills (``host_remainder_fills.py``) and
+    the flush of privatized atomics (``atomic_privatization.py``) are
+    appended there."""
+    return len(device_ir.phases) <= 1 and not any(
+        isinstance(node, ast.Return)
+        for statement in body
+        for node in ast.walk(statement)
+    )
+
+
+# --------------------------------------------------------------------------
 # Memory
 # --------------------------------------------------------------------------
 
@@ -353,6 +441,94 @@ def tensor_roots_may_alias(
 # --------------------------------------------------------------------------
 # Rewrites
 # --------------------------------------------------------------------------
+
+
+# ``ExtendedAST.new`` carries these itself; every other non-field attribute
+# of a node (the ``_helion_*`` markers passes leave on loops and statements)
+# is copied by ``deep_clone``.
+_EXTENDED_AST_INTERNALS = frozenset(
+    {"_location", "_type_info", "_loop_type", "_is_kernel_call", "_root_id"}
+)
+
+
+def deep_clone(node: _A) -> _A:
+    """A fresh copy of ``node``'s whole subtree that also keeps the marker
+    attributes set on its nodes (``clone_ast`` keeps Helion's source metadata
+    but not those; ``scalar_recipe._clone`` copies fields only), so the copy
+    is indistinguishable from the original to every later pass."""
+
+    def clone_field(value: object) -> object:
+        if isinstance(value, ast.AST):
+            return deep_clone(value)
+        if isinstance(value, list):
+            return [clone_field(item) for item in value]
+        return value
+
+    fields = {name: clone_field(value) for name, value in ast.iter_fields(node)}
+    if isinstance(node, ExtendedAST):
+        result = node.new(fields)
+    else:
+        result = ast.copy_location(type(node)(**fields), node)
+    skip = set(node._fields) | set(node._attributes) | _EXTENDED_AST_INTERNALS
+    for key, value in vars(node).items():
+        if key not in skip and key not in vars(result):
+            setattr(result, key, value)
+    return cast("_A", result)
+
+
+def dealias_shared_nodes(body: list[ast.stmt]) -> None:
+    """Give every position in the tree its own node object, in place.
+
+    The passes key analyses by node identity and rewrite nodes in place, so
+    one statement object placed at two positions (say in two sweeps) would
+    share one position's facts and take both positions' rewrites.  Every
+    repeated node reached through a field or a body list is replaced by a
+    ``deep_clone``, and a body list held by two nodes by its own list; the
+    rendered text is unchanged.
+    """
+    seen: set[int] = set()
+    seen_lists: set[int] = set()
+
+    def visit(node: ast.AST) -> None:
+        for field, value in ast.iter_fields(node):
+            if isinstance(value, list):
+                if id(value) in seen_lists:
+                    value = list(value)
+                    setattr(node, field, value)
+                seen_lists.add(id(value))
+                for index, item in enumerate(value):
+                    if isinstance(item, ast.AST):
+                        value[index] = fresh(item)
+            elif isinstance(value, ast.AST):
+                setattr(node, field, fresh(value))
+
+    def fresh(node: ast.AST) -> ast.AST:
+        if id(node) in seen:
+            # The clone's subtree is new to the tree; no need to walk it.
+            return deep_clone(node)
+        seen.add(id(node))
+        visit(node)
+        return node
+
+    for index, stmt in enumerate(body):
+        body[index] = cast("ast.stmt", fresh(stmt))
+
+
+def statement_lists(
+    statements: list[ast.stmt], *, outer_first: bool = False
+) -> list[list[ast.stmt]]:
+    """``statements`` and every statement list nested in it (the ``body`` and
+    ``orelse`` of its statements, at any depth), each nested list before the
+    list holding it, or after it with ``outer_first``."""
+    found: list[list[ast.stmt]] = [statements] if outer_first else []
+    for stmt in statements:
+        for field in ("body", "orelse"):
+            nested = getattr(stmt, field, None)
+            if isinstance(nested, list):
+                found.extend(statement_lists(nested, outer_first=outer_first))
+    if not outer_first:
+        found.append(statements)
+    return found
 
 
 class _ReplaceNode(ast.NodeTransformer):
@@ -606,8 +782,11 @@ def live_in(
 
     A plain assignment (``assigned``) kills its target before adding its
     reads; an ``if`` is live-in for either arm plus its test; a ``for`` with a
-    ``Name`` target iterates its body to a fixed point (a zero-trip loop keeps
-    ``live_out`` live) and then reads its iterator; anything else only reads.
+    ``Name`` target runs its ``else`` after the last iteration (a ``break``
+    that skips it keeps what is live after the loop live at the end of its
+    body, ``_breaks_out``), iterates its body to a fixed point (a zero-trip
+    loop keeps what is live after it live) and then reads its iterator;
+    anything else only reads.
     """
     live = set(live_out)
     for statement in reversed(statements):
@@ -622,20 +801,50 @@ def live_in(
                 | set(reads(statement.test))
             )
         elif isinstance(statement, ast.For) and isinstance(statement.target, ast.Name):
-            carried = set(live)
-            while True:
-                needed = live_in(
-                    statement.body, carried, reads=reads, assigned=assigned
-                ) - {statement.target.id}
-                updated = carried | needed
-                if updated == carried:
-                    break
-                carried = updated
-            live |= carried | set(reads(statement.iter))
-            live = live_in(statement.orelse, live, reads=reads, assigned=assigned)
+            after_else = live_in(statement.orelse, live, reads=reads, assigned=assigned)
+            live = live | after_else if _breaks_out(statement) else after_else
+            live = loop_live_end(statement, live, reads=reads, assigned=assigned)
+            live |= set(reads(statement.iter))
         else:
             live.update(reads(statement))
     return live
+
+
+def _breaks_out(loop: ast.For) -> bool:
+    """Whether a ``break`` of ``loop`` may skip its ``else``: one in its body
+    outside the bodies of nested loops (a nested loop's ``else`` runs in
+    ``loop``) and of nested functions."""
+
+    def breaks(node: ast.AST) -> bool:
+        if isinstance(node, ast.Break):
+            return True
+        if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+            return any(breaks(child) for child in node.orelse)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            return False
+        return any(breaks(child) for child in ast.iter_child_nodes(node))
+
+    return any(breaks(statement) for statement in loop.body)
+
+
+def loop_live_end(
+    loop: ast.For,
+    live_after: Collection[str],
+    *,
+    reads: Callable[[ast.AST], Collection[str]] = _rw_reads,
+    assigned: Callable[[ast.AST], str | None] = assigned_name,
+) -> set[str]:
+    """Names live at the end of ``loop``'s body: live after the loop (a
+    zero-trip loop keeps them) or read by a later iteration before it writes
+    them, the fixed point over the back edge (``live_in``)."""
+    assert isinstance(loop.target, ast.Name)
+    end = set(live_after)
+    while True:
+        head = live_in(loop.body, end, reads=reads, assigned=assigned)
+        grown = end | (head - {loop.target.id})
+        if grown == end:
+            return end
+        end = grown
 
 
 # ---------------------------------------------------------------------------
@@ -697,6 +906,8 @@ _PURE_RELOCATABLE_NAMES = frozenset(
         "_cute_python_mod",
         "abs",
         "bool",
+        "cutlass.max",
+        "cutlass.min",
         "float",
         "int",
         "len",
@@ -734,6 +945,27 @@ _PURE_OPERATOR_CALLS = frozenset(
 # The CTA-local scalar reduces the relocation proofs and the chunk hoist
 # recognize (the lane-split and chunk-recurrence passes import this name).
 _CHUNK_REDUCTION_HELPERS = CTA_REDUCES
+
+
+def is_pure_operator_call(path: str) -> bool:
+    """Whether the call path ``path`` (``call_path_str``) is an ``operator``
+    function of ``_PURE_OPERATOR_CALLS``, one that computes a value from its
+    operands and does nothing else."""
+    return (
+        path.startswith("operator.") and path.rsplit(".", 1)[-1] in _PURE_OPERATOR_CALLS
+    )
+
+
+def is_cta_reduce_call(call: ast.Call) -> bool:
+    """Whether ``call`` combines a value across the threads of one CTA: a
+    scalar reduce helper (``reduce_call.CTA_REDUCES``) or the DSL's warp
+    reduction (``cute.arch.warp_reduction*``, emitted for a row reduced by
+    at most 32 threads).  These are the reduces the relocation proofs accept
+    with ``allow_reduction``."""
+    name = call_path_str(call.func)
+    return name is not None and (
+        name in CTA_REDUCES or name.startswith("cute.arch.warp_reduction")
+    )
 
 
 def _is_proven_relocatable_call(
@@ -774,6 +1006,7 @@ def _is_proven_relocatable_call(
         return True
     if name.startswith("cutlass."):
         member = name.rsplit(".", 1)[-1]
+        # Type conversions.
         return bool(member) and member[0].isupper()
     if name.startswith(("math.", "cute.math.")):
         return True
@@ -781,7 +1014,7 @@ def _is_proven_relocatable_call(
         # The MLIR vector type of a hoisted packet load: a pure type value.
         return True
     if name.startswith("operator."):
-        return name.rsplit(".", 1)[-1] in _PURE_OPERATOR_CALLS
+        return is_pure_operator_call(name)
     if name in {
         "cute.arch.block_dim",
         "cute.arch.block_idx",
@@ -817,9 +1050,7 @@ def _is_proven_relocatable_call(
         # Another backend's pure device calls (Metal's casts); the AST passes
         # also run outside a compile, in their unit tests.
         return True
-    return allow_reduction and (
-        name in _CHUNK_REDUCTION_HELPERS or name.startswith("cute.arch.warp_reduction")
-    )
+    return allow_reduction and is_cta_reduce_call(call)
 
 
 def _is_proven_relocatable_assignment(
@@ -857,6 +1088,24 @@ def _self_addend(stmt: ast.AST, target: str) -> ast.AST | None:
 
 def _canonical_name(name: str, rename_groups: dict[str, str]) -> str:
     return rename_groups.get(name, name)
+
+
+def merged_names(rename_groups: Mapping[str, str]) -> dict[str, frozenset[str]]:
+    """Each name ``rename_groups`` (``ast_rename``'s map to a shared name)
+    merges with others, with all of them: once renamed they are one
+    variable, so a write to any is a write to all."""
+    groups: dict[str, set[str]] = {}
+    for name, canonical in rename_groups.items():
+        groups.setdefault(canonical, {canonical}).add(name)
+    return {name: frozenset(group) for group in groups.values() for name in group}
+
+
+def with_merged_names(
+    names: Iterable[str], merged: Mapping[str, frozenset[str]]
+) -> set[str]:
+    """``names`` and every name ``merged`` (from ``merged_names``) merges
+    with one of them."""
+    return {alias for name in names for alias in merged.get(name, (name,))}
 
 
 def _dependency_names(body: list[ast.AST], roots: set[str]) -> set[str]:

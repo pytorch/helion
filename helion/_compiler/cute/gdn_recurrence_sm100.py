@@ -61,8 +61,9 @@ the loads overlap the setup (the other warps prefetch the first chunk's rows
 into L2 at kernel entry, a few hundred nanoseconds before that burst can
 issue), stages the raw ``g`` rows of a chunk through the same ring with
 ``cp.async`` a full ring depth ahead, and publishes
-the per-row gate vector ``exp(g_last - g_row)`` (the ordinary exact ``exp2(x *
-log2 e)`` lowering) together with the tile through the stage's full barrier.
+the per-row gate vector ``exp(g_last - g_row)`` (``exp2(x * log2 e)`` keeping
+denormals; see ``gdn_recurrence``) together with the tile through the stage's
+full barrier.
 Every computed chunk is full: only the last chunk can be ragged, and it is
 never computed, so the source kernel's ``row < seqlen`` gate mask holds for
 every row the device code touches and it carries no mask of its own.  One
@@ -1391,7 +1392,7 @@ def host_gdn_recurrence(
         stride_order=TMA_STRIDE_ORDER,
         swizzle=cuda.TensorMapSwizzle.none,
     )
-    gdn_recurrence_kernel(
+    launcher = gdn_recurrence_kernel(
         tma_desc_w,
         tma_desc_k,
         tma_desc_u,
@@ -1413,12 +1414,12 @@ def host_gdn_recurrence(
         ACC_COL,
         UPDATE_IMAGE_COL,
         TMEM_COLS,
-    ).launch(
+    )
+    launcher.launch(
         grid=((dstate + BLOCK_V - 1) // BLOCK_V, heads, batch),
         block=(THREADS_PER_WARP * gdn_cta_warps(BLOCK_V, EPI_WARPS, MMA_M), 1, 1),
         stream=stream,
         min_blocks_per_mp=1,
-        preferred_smem_carveout=100,
     )
 
 

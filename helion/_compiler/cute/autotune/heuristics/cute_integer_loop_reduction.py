@@ -23,7 +23,7 @@ KEY = "cute_integer_loop_reduction"
 class CuteIntegerLoopReductionHeuristic(AutotunerHeuristic):
     name = KEY
     backend = "cute"
-    priority = 74
+    priority = 75
 
     @classmethod
     def register_facts(

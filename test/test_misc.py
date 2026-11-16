@@ -4,7 +4,6 @@ import ast
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-import math
 import os
 from pathlib import Path
 import subprocess
@@ -639,6 +638,10 @@ class TestMisc(RefEagerTestBase, TestCase):
                     x[:4] = torch.tensor([-1.5, 1.5, -2.0, 0.0])
                     y[:4] = torch.tensor([0.5, -0.5, 0.25, -1.0])
                     x, y = x.to(dtype), y.to(dtype)
+                    # About one float16 subtest in 2000 draws a divisor that
+                    # rounds to zero, whose NaNs the exact comparison below
+                    # counts as a mismatch.
+                    y[y == 0] = 1.0
                     _, result = code_and_output(modulus, (x, y, s))
                     expected = torch.stack(
                         [
@@ -1419,6 +1422,12 @@ class TestMisc(RefEagerTestBase, TestCase):
         if _get_backend() == "triton":
             self.assertIn("tl.sort", code)
 
+    @skipIfXPU(
+        "Intel's Triton compiler fails an assertion in its "
+        "TritonIntelGPURemoveLayoutConversions pass for a scan of a sort's output "
+        "when one constant is used before and after the sort, as the sort keys' "
+        "encoding and decoding do"
+    )
     def test_torch_sort_then_cumsum(self):
         """Test that torch.sort result can be used as input to torch.cumsum.
 
@@ -1456,7 +1465,9 @@ class TestMisc(RefEagerTestBase, TestCase):
         When only values from torch.sort() are used, the compiler should
         skip generating the rank-based argsort code (which creates
         O(N^2) intermediate tensors and would exceed Triton's 1M element limit
-        for large N).
+        for large N). On Triton, 32-bit values never rank: their indices come
+        from sorting packed value/index keys. 64-bit values rank only for used
+        indices (test_triton_selection.py).
         """
 
         @helion.kernel()
@@ -1478,7 +1489,7 @@ class TestMisc(RefEagerTestBase, TestCase):
             # Argsort rank computation should NOT be present
             self.assertNotIn("tl.sum(tl.where(", code)
 
-        # Contrast: when indices ARE used, argsort code must be generated
+        # Contrast: the indices are used
         @helion.kernel()
         def sort_with_indices_kernel(
             x: torch.Tensor,
@@ -1497,8 +1508,9 @@ class TestMisc(RefEagerTestBase, TestCase):
         torch.testing.assert_close(vals2, ref_vals2)
         torch.testing.assert_close(idx2, ref_idx2)
         if _get_backend() == "triton":
-            # Argsort rank computation SHOULD be present when indices are used
-            self.assertIn("tl.sum(tl.where(", code2)
+            # Sorted value/index keys give the indices, without ranks
+            self.assertIn("tl.sort", code2)
+            self.assertNotIn("tl.sum(tl.where(", code2)
 
     def test_cumsum_does_not_alias_input(self):
         """Regression test: torch.cumsum output must not alias its input.
@@ -1724,9 +1736,10 @@ class TestMisc(RefEagerTestBase, TestCase):
         else:
             # A kernel that only streams a full head_dim slab per element is
             # pointwise; on the arches where the Triton pointwise seed is
-            # promoted (sm90/sm100) that seed is the default. Its byte budget
-            # over the 128-wide bf16 slab gives one row per CTA on the batch
-            # and head axes and 16 rows along the sequence (both arches).
+            # promoted (TritonPointwiseSeedHeuristic.PROMOTE_TARGETS) that seed
+            # is the default. Its byte budget over the 128-wide bf16 slab gives
+            # one row per CTA on the batch and head axes and 16 rows along the
+            # sequence.
             self.assertIn("triton_pointwise", config_spec.autotuner_heuristics)
             self.assertEqual(block_sizes, [1, 1, 16])
 
@@ -2185,84 +2198,6 @@ class TestHelionCutePrinter(TestCase):
                     ),
                     int(expression.subs(x, value)),
                 )
-
-
-@onlyBackends(["triton"])
-class TestHelionTritonPrinter(TestCase):
-    """Tests for the HelionTritonPrinter class."""
-
-    def test_print_ToFloat(self):
-        """Test that ToFloat expressions are printed correctly."""
-        import sympy
-        from torch.utils._sympy.functions import ToFloat
-
-        from helion._compiler.triton.printer import HelionTritonPrinter
-
-        printer = HelionTritonPrinter()
-
-        # Symbolic variable: should print "x + 0.0", not "ToFloat(x) + 0.0"
-        x = sympy.Symbol("x", integer=True)
-        self.assertEqual(printer.doprint(ToFloat(x)), "x + 0.0")
-
-        # Complex expression
-        y = sympy.Symbol("y", integer=True)
-        result = printer.doprint(ToFloat(x + y))
-        self.assertNotIn("ToFloat", result)
-        self.assertIn("0.0", result)
-
-        # Concrete integer: ToFloat(5) simplifies to 5.0
-        result = printer.doprint(ToFloat(sympy.Integer(5)))
-        self.assertNotIn("ToFloat", result)
-        self.assertEqual(float(result), 5.0)
-
-    def test_print_Float(self):
-        """Test that Float expressions are printed as raw literals."""
-        import sympy
-
-        from helion._compiler.triton.printer import HelionTritonPrinter
-
-        printer = HelionTritonPrinter()
-
-        # Non-symbolic floats should print as raw numeric literals (not tl.full)
-        for val in [math.pi, 0.0, -2.5]:
-            result = printer.doprint(sympy.Float(val))
-            self.assertNotIn("tl.full", result)
-            self.assertAlmostEqual(float(result), val)
-
-    def test_print_FloorDiv_constexpr(self):
-        """Test that FloorDiv with constexpr LHS prints as // operator.
-
-        This is required for TMA tensor descriptors which need compile-time
-        constant block shapes. When the LHS is a constexpr argument (like a
-        block size), we must emit `lhs // rhs` instead of
-        `triton_helpers.div_floor_integer(lhs, rhs)` so Triton can evaluate
-        the expression at compile time.
-        """
-        from unittest.mock import Mock
-
-        import sympy
-        from torch.utils._sympy.functions import FloorDiv
-
-        from helion._compiler.device_function import DeviceFunction
-        from helion._compiler.triton.printer import HelionTritonPrinter
-
-        printer = HelionTritonPrinter()
-
-        # LHS is constexpr -> use //
-        mock_df = Mock(_constexpr_args={"_BLOCK_SIZE_0": None})
-        with patch.object(DeviceFunction, "current", return_value=mock_df):
-            block_size = sympy.Symbol("_BLOCK_SIZE_0", integer=True)
-            expr = FloorDiv(block_size, 2)
-            result = printer.doprint(expr)
-            self.assertEqual(result, "_BLOCK_SIZE_0 // 2")
-
-        # LHS is NOT constexpr -> fallback to triton_helpers
-        mock_df = Mock(_constexpr_args={})
-        with patch.object(DeviceFunction, "current", return_value=mock_df):
-            x = sympy.Symbol("x", integer=True)
-            expr = FloorDiv(x, 2)
-            result = printer.doprint(expr)
-            self.assertIn("div_floor_integer", result)
 
 
 @onlyBackends(["triton", "cute"])

@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .base_search import normalize_autotune_seed_configs
-from .benchmark_provider import LocalBenchmarkProvider
 from .effort_profile import RANDOM_SEARCH_DEFAULTS
 from .finite_search import FiniteSearch
 
@@ -68,7 +67,5 @@ class RandomSearch(FiniteSearch):
         }
 
     def _algorithm_cache_policy(self) -> dict[str, object] | None:
-        if self._benchmark_provider_cls is not LocalBenchmarkProvider:
-            return None
         # The generated configs are a stochastic realization, not policy.
         return {"random_version": 1, "count": self.count}

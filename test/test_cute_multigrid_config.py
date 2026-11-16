@@ -116,7 +116,7 @@ def test_missing_grid_topology_retains_conservative_repair() -> None:
         # Tile-loop paths normally budget separate roots by physical axis.
         # Without them, the grid facts are the only topology; without those
         # too, the conservative product repair must still apply.
-        bound.config_spec.cute_tile_loop_paths = ()
+        bound.config_spec.cute_tile_loop_path_reductions = {}
         bound.config_spec.kernel_grid_fact = None
         result = _roundtrip(
             bound, helion.Config(block_sizes=[1024, 1024], num_threads=[128, 128])
@@ -129,7 +129,7 @@ def test_nonroot_thread_axis_remains_in_every_group() -> None:
         # Exercise the grid-fact group repair that backs kernels without
         # tile-loop paths. Axis1 has no root-owner proof there; it must
         # coexist with either root.
-        bound.config_spec.cute_tile_loop_paths = ()
+        bound.config_spec.cute_tile_loop_path_reductions = {}
         bound.config_spec.kernel_grid_fact = KernelGridFact(
             roots=(RootGridFact(0, (0,)), RootGridFact(1, (2, 3))),
             graph_to_root=(),

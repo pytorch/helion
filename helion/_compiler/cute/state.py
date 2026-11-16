@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     from .cute_mma_dag import MmaDagPlan
     from .cute_register_subblocks import RegisterSubblockPlan
     from .cute_warp_mma_gemm import CuteWarpMmaGemmMatch
+    from .dependent_phases import DependentPhasePlan
     from .device_state import CuteDeviceFunctionState
     from .device_state import CuteTcgen05MatmulPlan
     from .device_state import CuteTcgen05StoreValue
@@ -68,6 +69,7 @@ if TYPE_CHECKING:
     from .device_state import CuteVloopStoreFact
     from .device_state import CuteVloopWrapperFact
     from .device_state import Tcgen05AbStartupPrefill
+    from .device_state import Tcgen05EpiRowPrefetch
     from .direct_affine_candidate import DirectAffineCandidate
     from .direct_affine_plan import DirectAffinePlan
     from .epilogue_fanout import FanoutStore
@@ -109,6 +111,7 @@ class CuteEnvState:
         default_factory=set
     )
     fission_plan: MaterializedFissionPlan | None = None
+    dependent_phase_plan: DependentPhasePlan | None = None
     half_atomic_output_promotions: dict[str, torch.dtype] = dataclasses.field(
         default_factory=dict
     )
@@ -128,6 +131,13 @@ class CuteEnvState:
     # (``cute/register_tile_admission.py``); the persistent reduction
     # strategy then keeps its rolled lane nesting.
     register_tile_disabled: bool = False
+    # Whether the current pass laid a reduction out for ``cute_vloop_sink``
+    # (``_plan_vloop_sink_reduction_execution``): codegen's refusal of that
+    # layout (``VloopSinkLayoutRefused``) regenerates the kernel without it,
+    # ``generate_ast`` (materialized fission, for a stage) setting
+    # ``vloop_sink_reduction_layout_disabled`` meanwhile.
+    vloop_sink_reduction_layout_planned: bool = False
+    vloop_sink_reduction_layout_disabled: bool = False
     # ``resident_while_plan``'s memo for the traced graphs, which live as
     # long as the environment (``cute/resident_while.py``).
     resident_while_plans: ResidentWhileMemo = dataclasses.field(default_factory=dict)
@@ -162,6 +172,10 @@ class CuteCodegenState:
     synthetic_arange_access_positions: dict[tuple[Node, object], int] = (
         dataclasses.field(default_factory=dict)
     )
+    # ``iota node -> reduction block`` for a range on the lanes of the
+    # reduction dim of its padded size (``cute_padded_range_reduction_block``);
+    # a load or store over it masks the lanes past its length.
+    padded_range_blocks: dict[Node, int] = dataclasses.field(default_factory=dict)
     # Stack of ``(if_node_id, branch_side)`` entries describing the
     # mutually-exclusive control-flow branch the current codegen is inside.
     # ``branch_side`` is 0 for the ``if`` body and 1 for the ``else`` body of
@@ -204,6 +218,11 @@ class CuteCodegenState:
     # ``resident_while_plan``'s memo for this pass's graph copies, which die
     # with the pass (``cute/resident_while.py``).
     resident_while_plans: ResidentWhileMemo = dataclasses.field(default_factory=dict)
+    # Whether the kernel's device code holds a float of one byte (fp8, the
+    # packed fp4 pair or an e8m0 scale), so that an integer's conversion to a
+    # float adds 0.0; None until the first such conversion asks
+    # (``handler_ops.integer_to_float_expr``).
+    holds_8bit_floats: bool | None = None
 
     def declare_matmul(self) -> None:
         """A matmul lowering declared itself: ``uses_matmul`` and one more
@@ -302,6 +321,11 @@ class CuteTcgen05State:
     # renamed through casts or epilogue nodes.
     matmul_fx_node_result_vars: dict[Node, str] = dataclasses.field(
         default_factory=dict
+    )
+    # Row-vector operands the epilogue role prefetches one tile ahead
+    # (``Tcgen05EpiRowPrefetch``).
+    epi_row_prefetches: list[Tcgen05EpiRowPrefetch] = dataclasses.field(
+        default_factory=list
     )
     fragment_epilogue_plan: Tcgen05FragmentEpiloguePlan | None = None
     # Rejected proofs are stable for this per-config codegen state. Keep
@@ -465,9 +489,15 @@ class CuteLaneState:
     vloop_sink_stores: dict[str, CuteVloopStoreFact] = dataclasses.field(
         default_factory=dict
     )
-    # ``cute_vloop_sink`` kept the vectorized grid axis on thread x; when
-    # no V-loop is sunk after all, codegen restarts with the knob off.
-    vloop_sink_layout_applied: bool = False
+    # Persistent-reduction lane loops walking several V-wide chunks per
+    # thread, by lane variable: V.  The branch-local persistent vectorizer
+    # places one packet per chunk in them.
+    chunked_reduction_lanes: dict[str, int] = dataclasses.field(default_factory=dict)
+    # ``cute_vloop_sink`` shaped the code ahead of the sink (it kept the
+    # vectorized grid axis on thread x, or respelled a flattened tile's index
+    # for it); when no V-loop is sunk after all, codegen restarts with the
+    # knob off.
+    vloop_sink_shaped_code: bool = False
     # The sinking pass unrolled a lane loop itself (``cute_lane_unroll``);
     # otherwise the loads-first unroll of ``cute/unroll_lane_loads.py``
     # applies to the sunk lane loops once their packets are placed.
@@ -599,6 +629,10 @@ class CuteLaneState:
     # grid is the PID strategy's grid times this factor (``tcgen05_split_k``
     # sets it to the split as well).
     launch_grid_multiplier: int = 1
+    # A proved paired attention root groups adjacent items in one CTA. This
+    # is distinct from split-K/fused-grid expansion and never applies to a
+    # materialized multi-root phase.
+    attention_item_group: int = 1
     # SASS-level checks the launcher runs on the compiled kernel before
     # its first launch (``helion.runtime.cute.sass_check``), declared by
     # the emitters whose instruction forms the DSL's assembler has

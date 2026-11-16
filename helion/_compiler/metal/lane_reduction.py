@@ -72,6 +72,7 @@ from ..tile_strategy import _merge_carried_names
 from . import mpp_matmul
 from .backend import budget_note
 from .lane_fold import LANE_FOLD
+from .lane_fold import LANE_PUT
 from .lane_fold import LaneArrayBudget
 from .msl_reduction import SUPPORTED_REDUCTIONS
 from .reduction import reduction_combine_expr
@@ -605,7 +606,7 @@ def _emit(
             lane_body.extend(
                 (
                     stmt,
-                    statement_from_string(f"_metal_lane_put({array}, {lane}, {value})"),
+                    statement_from_string(f"{LANE_PUT}({array}, {lane}, {value})"),
                 )
             )
             kept.add(index)

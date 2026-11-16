@@ -16,6 +16,7 @@ from typing import Any
 from typing import cast
 
 import torch
+from torch._dynamo.source import AttrSource
 from torch._dynamo.source import GetItemSource
 from torch._dynamo.source import LocalSource
 from torch._inductor.codecache import PyCodeCache
@@ -388,12 +389,10 @@ def _input_specializations(
     def source_expression(source: Source) -> str:
         if isinstance(source, LocalSource):
             return source.local_name
+        if isinstance(source, AttrSource):
+            return f"{source_expression(source.base)}.{source.member}"
         assert isinstance(source, GetItemSource)
         base = source_expression(source.base)
-        value = _replay_tensor_input_source(source.base, fake_by_name)
-        if isinstance(source.index, str) and not isinstance(value, dict):
-            # Namedtuple fields are recorded as string-indexed sources.
-            return f"{base}.{source.index}"
         return f"{base}[{source.index!r}]"
 
     for key, specialization in bound.env.runtime_input_specializations.items():

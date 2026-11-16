@@ -1907,7 +1907,7 @@ def host_chain_dv2(
         stride_order=(0, 1, 2, 3),
         swizzle=cuda.TensorMapSwizzle.s128b,
     )
-    kernel_chain_dv2(
+    launcher = kernel_chain_dv2(
         tma_desc_kd,
         tma_desc_w,
         tma_desc_qd,
@@ -1922,12 +1922,12 @@ def host_chain_dv2(
         out,
         head_base,
         SCALE,
-    ).launch(
+    )
+    launcher.launch(
         grid=(num_sequences, launch_heads * 2, 1),
         block=(THREADS, 1, 1),
         stream=stream,
         min_blocks_per_mp=1,
-        preferred_smem_carveout=100,
     )
 
 

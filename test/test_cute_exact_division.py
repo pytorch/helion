@@ -20,12 +20,16 @@ against the plain render on the wave-5 input classes, and the rows kernels
 against their plain renders on hard rows under pinned and random configs with
 one and with several rows per thread -- on ragged shapes (a partial row block,
 a reduction axis the lane sweeps and reduction chunks do not divide), where
-the masked tails are what a change of code shape perturbs.
+the masked tails are what a change of code shape perturbs -- and the SASS of a
+rolled softmax's redo form, whose loads and MUFU.EX2 stay within twice the
+plain render's.
 """
 
 from __future__ import annotations
 
 import ast
+from collections import Counter
+import functools
 import random
 import re
 import textwrap
@@ -51,18 +55,26 @@ from helion._testing import skipIfNotCUDA
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_native_compile
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_codegen import with_exact_division
+from helion._testing.cute_codegen import without_ieee_division_launch
+from helion._testing.cute_sass import cute_launcher_sass
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import BackendUnsupported
 import helion.language as hl
+from helion.runtime.cute import sass_check
 
 if TYPE_CHECKING:
     from helion.runtime.kernel import BoundKernel
 
 pytest.importorskip("cutlass")
 
+# The render pins bind on CPU; ``TestExactDivisionCuda`` runs on the GPU.
+pytestmark = pytest.mark.cpu_only
+
 FAST = "_cute_exact_div_fast_f32("
 BOUNDS = "_cute_exact_div_bounds_f32("
-REDO = "if _cute_exact_div_redo_f32("
+# Either window test: of ``|x|`` or of the bits of a nonnegative dividend.
+REDO = "if _cute_exact_div_redo_"
 ANY_EXACT = "_cute_exact_div"
 HOISTED = "_helion_exdiv_"
 # Ragged shapes: a row count no row block above one divides (every
@@ -124,8 +136,7 @@ def _divide_inside_loop(x: torch.Tensor) -> torch.Tensor:
     for tile_m in hl.tile(m):
         for tile_n in hl.tile(n):
             values = x[tile_m, tile_n]
-            local_sum = torch.sum(values, dim=1, keepdim=True)
-            out[tile_m, tile_n] = values / local_sum
+            out[tile_m, tile_n] = values / (values + 1)
     return out
 
 
@@ -141,8 +152,8 @@ def _int_divs(x: torch.Tensor, d: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
 def _sum_and_store(
     x: torch.Tensor, s: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Normalize a row block, store it and accumulate its sum: codegen emits
-    the store sweep with the reduction sweep's statement objects."""
+    """Normalize a row block, store it and accumulate its sum: the reduction
+    sweep and the store sweep both compute the quotient."""
     m, n = x.size()
     out = torch.empty_like(x)
     res = torch.empty(m, dtype=torch.float32, device=x.device)
@@ -225,57 +236,71 @@ def _chained_divisions(x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
     return out
 
 
-softmax = helion.kernel(backend="cute", static_shapes=True)(_softmax)
+softmax = helion.kernel(backend="cute", static_shapes=True, cute_exact_division=True)(
+    _softmax
+)
 softmax_plain = helion.kernel(
     backend="cute", static_shapes=True, cute_exact_division=False
 )(_softmax)
-softmax_fast_math = helion.kernel(backend="cute", static_shapes=True, fast_math=True)(
-    _softmax
-)
-jsd = helion.kernel(backend="cute", static_shapes=True)(_jsd)
+softmax_fast_math = helion.kernel(
+    backend="cute", static_shapes=True, fast_math=True, cute_exact_division=True
+)(_softmax)
+jsd = helion.kernel(backend="cute", static_shapes=True, cute_exact_division=True)(_jsd)
 jsd_plain = helion.kernel(
     backend="cute", static_shapes=True, cute_exact_division=False
 )(_jsd)
-rows_div = helion.kernel(backend="cute", static_shapes=True)(_rows_div)
+rows_div = helion.kernel(backend="cute", static_shapes=True, cute_exact_division=True)(
+    _rows_div
+)
 divide_by_scale = helion.kernel(
-    backend="cute", static_shapes=True, autotune_effort="none"
+    backend="cute", static_shapes=True, autotune_effort="none", cute_exact_division=True
 )(_divide_by_scale)
 divide_by_scale_fast_math = helion.kernel(
-    backend="cute", static_shapes=True, autotune_effort="none", fast_math=True
+    backend="cute",
+    static_shapes=True,
+    autotune_effort="none",
+    fast_math=True,
+    cute_exact_division=True,
 )(_divide_by_scale)
-divide_inside_loop = helion.kernel(backend="cute", static_shapes=True)(
-    _divide_inside_loop
-)
-int_divs = helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")(
-    _int_divs
-)
-sum_and_store = helion.kernel(backend="cute", static_shapes=True)(_sum_and_store)
+divide_inside_loop = helion.kernel(
+    backend="cute", static_shapes=True, cute_exact_division=True
+)(_divide_inside_loop)
+int_divs = helion.kernel(
+    backend="cute", static_shapes=True, autotune_effort="none", cute_exact_division=True
+)(_int_divs)
+sum_and_store = helion.kernel(
+    backend="cute", static_shapes=True, cute_exact_division=True
+)(_sum_and_store)
 sum_and_store_plain = helion.kernel(
     backend="cute", static_shapes=True, cute_exact_division=False
 )(_sum_and_store)
-normalize_and_sum = helion.kernel(backend="cute", static_shapes=True)(
-    _normalize_and_sum
-)
+normalize_and_sum = helion.kernel(
+    backend="cute", static_shapes=True, cute_exact_division=True
+)(_normalize_and_sum)
 normalize_and_sum_plain = helion.kernel(
     backend="cute", static_shapes=True, cute_exact_division=False
 )(_normalize_and_sum)
-carried_alias = helion.kernel(backend="cute", static_shapes=True)(_carried_alias)
+carried_alias = helion.kernel(
+    backend="cute", static_shapes=True, cute_exact_division=True
+)(_carried_alias)
 carried_alias_plain = helion.kernel(
     backend="cute", static_shapes=True, cute_exact_division=False
 )(_carried_alias)
-carried_acc = helion.kernel(backend="cute", static_shapes=True)(_carried_acc)
+carried_acc = helion.kernel(
+    backend="cute", static_shapes=True, cute_exact_division=True
+)(_carried_acc)
 carried_acc_plain = helion.kernel(
     backend="cute", static_shapes=True, cute_exact_division=False
 )(_carried_acc)
-rolled_rows_two_sums = helion.kernel(backend="cute", static_shapes=True)(
-    _rolled_rows_two_sums
-)
+rolled_rows_two_sums = helion.kernel(
+    backend="cute", static_shapes=True, cute_exact_division=True
+)(_rolled_rows_two_sums)
 rolled_rows_two_sums_plain = helion.kernel(
     backend="cute", static_shapes=True, cute_exact_division=False
 )(_rolled_rows_two_sums)
-chained_divisions = helion.kernel(backend="cute", static_shapes=True)(
-    _chained_divisions
-)
+chained_divisions = helion.kernel(
+    backend="cute", static_shapes=True, cute_exact_division=True
+)(_chained_divisions)
 chained_divisions_plain = helion.kernel(
     backend="cute", static_shapes=True, cute_exact_division=False
 )(_chained_divisions)
@@ -285,6 +310,12 @@ ROWS_KERNELS: list[tuple[helion.Kernel, helion.Kernel]] = [
     (rolled_rows_two_sums, rolled_rows_two_sums_plain),
     (chained_divisions, chained_divisions_plain),
 ]
+# On a ragged shape a sweep whose masked selects are tested by row and packet
+# masks that guard each of its flushes, and which carries nothing, takes the
+# redo form (``_selects_guard_the_region``): chained_divisions' store sweep.
+# Every other sweep of the rows kernels accumulates its quotients and keeps
+# the plain division there.
+RAGGED_STORE_SWEEP_KERNELS = (chained_divisions,)
 
 SOFTMAX_CONFIG: dict[str, Any] = {
     # The campaign's softmax_acf shape-1 winner (rolled sweeps, 128 threads).
@@ -423,9 +454,10 @@ SEVERAL_ROWS_CONFIGS: list[dict[str, Any]] = [
 # masked zero dividend (``... if mask else cutlass.Float32(0)``) made the
 # redo fire for those threads in every row while the rest kept the
 # speculative pass, and the sum of the quotients' squares differed from the
-# plain render by 1 ulp in two rows.  Every operand a select reaches now
-# keeps the plain division; on an exact axis (no select) the same configs
-# take the redo form.
+# plain render by 1 ulp in two rows.  A dividend a select reaches now keeps
+# the plain division, unless its loop only flushes packets under the
+# select's test (a store sweep); on an exact axis (no select) the same
+# configs take the redo form.
 ONE_ROW_PACKET_CONFIGS: list[dict[str, Any]] = [
     {
         "block_sizes": [1],
@@ -525,20 +557,29 @@ def _render(kernel: helion.Kernel, args: tuple[object, ...], **config: Any) -> s
     return _kernel_body(_bind(kernel, args).to_code(helion.Config(**config)))
 
 
+@functools.cache
+def _softmax_render(plain: bool = False) -> str:
+    """The 4096x4096 softmax at ``SOFTMAX_CONFIG``, rendered once per module."""
+    x = torch.empty(4096, 4096, dtype=torch.float16)
+    return _render(softmax_plain if plain else softmax, (x,), **SOFTMAX_CONFIG)
+
+
 def _kernel_body(code: str) -> str:
     """The device function text: no module header (imports of helpers used
-    by other kernels rendered in this process can appear there) and no
-    ``# src[...]`` comments (which quote the kernel's own ``/``)."""
-    body = code.split("@cute.kernel", 1)[1]
+    by other kernels rendered in this process can appear there), no
+    ``# src[...]`` comments (which quote the kernel's own ``/``) and no IEEE
+    division compile option on the launch (the kernels here set
+    ``cute_exact_division``; the plain ones they are compared with do not)."""
+    body = without_ieee_division_launch(code.split("@cute.kernel", 1)[1])
     return "\n".join(line for line in body.splitlines() if "# src[" not in line)
 
 
 def _redo_copies(code: str) -> list[str]:
-    """The bodies of the ``if _cute_exact_div_redo_f32(...)`` statements."""
+    """The bodies of the ``if _cute_exact_div_redo_*(...)`` statements."""
     tree = ast.parse(textwrap.dedent(code))
     copies = []
     for node in ast.walk(tree):
-        if isinstance(node, ast.If) and "_cute_exact_div_redo_f32" in ast.unparse(
+        if isinstance(node, ast.If) and "_cute_exact_div_redo_" in ast.unparse(
             node.test
         ):
             copies.append("\n".join(ast.unparse(stmt) for stmt in node.body))
@@ -661,7 +702,7 @@ def test_the_setting_and_the_pass_switch_keep_the_plain_divide(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     x = torch.empty(4096, 4096, dtype=torch.float16)
-    code = _render(softmax_plain, (x,), **SOFTMAX_CONFIG)
+    code = _softmax_render(plain=True)
     assert ANY_EXACT not in code and "v_7 = v_6 / sum_1" in code
     # The knob's plain form renders exactly what the setting off renders,
     # and so does the retired guard form (repaired to plain by the config
@@ -688,7 +729,9 @@ def test_the_setting_and_the_pass_switch_keep_the_plain_divide(
     assert tuple(fragment.choices) == ("redo", "plain")  # pyrefly: ignore
     monkeypatch.setenv("HELION_DISABLE_HOIST_RECIP", "1")
     code = _render(
-        helion.kernel(backend="cute", static_shapes=True)(_softmax),
+        helion.kernel(backend="cute", static_shapes=True, cute_exact_division=True)(
+            _softmax
+        ),
         (x,),
         **SOFTMAX_CONFIG,
     )
@@ -1351,10 +1394,14 @@ def test_a_register_cache_written_from_a_select_taints_its_reloads() -> None:
 
 
 def test_a_masked_divisor_keeps_the_redo() -> None:
-    """The divisor is one value for every thread of the sweep (a row scale,
-    a row sum): a masked one (``s[tile_m]`` loaded as a masked packet for a
-    partial row block) fires the redo for all of them alike, which mixes
-    nothing, so only the dividend is held to the select rule."""
+    """The divisor is loop invariant: a partial row block loads its row
+    scale as a masked packet (``s[tile_m] if mask else 0``), one value for
+    every thread of the row either way, so the select changes nothing about
+    which threads redo.  A masked row's zero empties the admitted window,
+    and the row redoes with ``div.rn``'s infinities and NaNs.  So only the
+    dividend is held to the select rule, even in this sweep, which
+    accumulates and stores in the loop and whose select's test is no
+    conjunction of names."""
     source = (
         "_dvec = cute.arch.load(y.iterator, ir.VectorType.get([4], cutlass.Uint32.mlir_type))\n"
         "d = cutlass.Uint32(_dvec[0]).bitcast(cutlass.Float32) if m < n else cutlass.Float32(0)\n"
@@ -1546,12 +1593,11 @@ def _exact_names_defined_before_use(code: str) -> None:
 
 
 def test_statement_objects_shared_between_sweeps_are_rewritten_per_sweep() -> None:
-    """Codegen emits a reduction sweep and its rematerialized store sweep
-    with the SAME statement objects (and body list).  Each sweep is
-    rewritten in its own context -- the first loads its divisor per
-    iteration (hoist inside it), the second divides by the value loaded
-    before it (hoist above it) -- so no sweep reads the other's hoisted
-    names."""
+    """A body may hold one statement object (and body list) in two sweeps;
+    the pass de-aliases them first.  Each sweep is rewritten in its own
+    context -- the first loads its divisor per iteration (hoist inside it),
+    the second divides by the value loaded before it (hoist above it) -- so
+    no sweep reads the other's hoisted names."""
     source = """\
         acc = cutlass.Float32(0)
         for i in range(cutlass.Int32(0), cutlass.Int32(n), cutlass.Int32(16)):
@@ -1673,6 +1719,35 @@ def test_independent_reduction_keeps_its_partial_accumulators() -> None:
     assert _without_exact_additions(exact) == plain
 
 
+# The store sweep's exp read from the fragment the row-sum sweep filled
+# (``fuse_two_pass_loads`` carries a V-loop's values under the register reload
+# policies).
+CARRIED = re.compile(r"(v_\d+) = cutlass\.Float32\(_fuse_cache_\d+\[")
+
+
+def test_a_redo_copy_recomputes_the_carried_values() -> None:
+    """The redo copy recomputes the carried exp from the store sweep's own
+    statements, which every pass up to the exact division saw and rewrote
+    (``cut_carried_values`` makes the cut after it), instead of reading the
+    fragment that carries it."""
+    code = _softmax_render()
+    (carried,) = set(CARRIED.findall(code))
+    (copy,) = _redo_copies(code)
+    assert f"{carried} = cute.math.exp(" in copy
+    assert not CARRIED.search(copy)
+
+
+def test_independent_reduction_keeps_the_v_loop_values_recomputed() -> None:
+    """``split_rolled_vector_sums`` splits a V-loop's sum only as the plain
+    sweep spells it: under ``cute_independent_reduction`` no V-loop value is
+    carried, since a fragment write would stop the split and change the
+    summation order."""
+    assert CARRIED.search(_softmax_render(plain=True))
+    x = torch.empty(4096, 4096, dtype=torch.float16)
+    code = _render(softmax_plain, (x,), **INDEPENDENT_SOFTMAX_CONFIG)
+    assert "_cute_rolled_sum_" in code and not CARRIED.search(code)
+
+
 def test_several_rows_per_thread_renders_roll_back_the_lane_accumulators() -> None:
     """Every rows kernel under every several-rows config: the plain render
     nests the sweeps in a ``cutlass.range_constexpr`` lane loop, the redo
@@ -1777,6 +1852,38 @@ def _shape_id(shape: tuple[int, int]) -> str:
     return f"{shape[0]}x{shape[1]}"
 
 
+def _sass_loads_and_exponentials(
+    kernel: helion.Kernel, args: tuple[object, ...], config: dict[str, Any]
+) -> tuple[str, Counter[str]]:
+    """The render of ``kernel`` at ``config`` and how many global loads
+    (``LDG*``) and ``MUFU.EX2`` the SASS of its compiled kernel holds."""
+    bound = kernel.bind(args)
+    compiled = bound.compile_config(helion.Config(**config))
+    compiled(*args)
+    return bound.to_code(helion.Config(**config)), Counter(
+        text.split()[0]
+        for text in sass_check.instructions(cute_launcher_sass(compiled))
+        if text.startswith(("LDG", "MUFU.EX2"))
+    )
+
+
+@functools.cache
+def _ieee_kernel(plain: helion.Kernel) -> helion.Kernel:
+    return with_exact_division(plain)
+
+
+def _ieee_plain(plain: helion.Kernel, args: tuple[object, ...], **config: Any) -> Any:
+    """``plain``'s statements with one IEEE ``div.rn`` per element: the
+    kernel under ``cute_exact_division`` at the knob's plain form.  That is
+    the result the redo form must equal bit for bit; without the setting the
+    same ``/`` compiles to ``div.full``, as it does for the kernels of
+    ``test_cute_division_cuda.py``."""
+    return code_and_output(
+        _ieee_kernel(plain), args, **{**config, "cute_exact_div_form": "plain"}
+    )
+
+
+@pytest.mark.cuda
 @skipIfNotCUDA()
 @onlyBackends(["cute"])
 @instantiate_parametrized_tests
@@ -1928,7 +2035,7 @@ class TestExactDivisionCuda(TestCase):
             xh = case.to(torch.float16).to(DEVICE)
             code, out = code_and_output(softmax, (xh,), **SOFTMAX_CONFIG)
             assert REDO in code
-            code0, out0 = code_and_output(softmax_plain, (xh,), **SOFTMAX_CONFIG)
+            code0, out0 = _ieee_plain(softmax_plain, (xh,), **SOFTMAX_CONFIG)
             assert ANY_EXACT not in _kernel_body(code0)
             with self.subTest(case=name):
                 self.assertTrue(
@@ -1958,12 +2065,37 @@ class TestExactDivisionCuda(TestCase):
             args = (0.3, 2.0, student.to(DEVICE), teacher.to(DEVICE))
             code, out = code_and_output(jsd, args, **JSD_CONFIG)
             assert REDO in code and "_helion_exdiv_save_" in code
-            code0, out0 = code_and_output(jsd_plain, args, **JSD_CONFIG)
+            code0, out0 = _ieee_plain(jsd_plain, args, **JSD_CONFIG)
             assert ANY_EXACT not in _kernel_body(code0)
             with self.subTest(case=name):
                 self.assertTrue(
                     torch.equal(out.view(torch.int32), out0.view(torch.int32))
                 )
+
+    def test_the_redo_form_keeps_the_plain_loads(self) -> None:
+        """A one-trip rolled softmax over rows that take scalar loads (a row
+        stride of 1023 halves), each thread's 16 elements in one unrolled
+        lane: LLVM merges the consume sweep's reloads of the row, and the
+        exponentials they feed, with the first sweep's.  The redo form's
+        opaque bounds sit between the sweeps, so they must not pin memory
+        accesses (``exact_division._opaque_f32`` is a pure asm): its fast
+        path then issues the plain render's loads and MUFU.EX2, and its
+        redo path at most as many again.  A side-effecting asm made it
+        three times the plain render's (48 against 16 of each)."""
+        x = torch.randn(256, 1023, device=DEVICE, dtype=torch.float16)[:, :512]
+        config = {
+            **SOFTMAX_CONFIG,
+            "num_threads": [1, 32],
+            "reduction_loops": [512],
+            "cute_vector_widths": [16, 1],
+        }
+        code, redo = _sass_loads_and_exponentials(softmax, (x,), config)
+        assert REDO in code
+        code0, plain = _sass_loads_and_exponentials(softmax_plain, (x,), config)
+        assert ANY_EXACT not in _kernel_body(code0)
+        assert plain["MUFU.EX2"] and any(op.startswith("LDG") for op in plain)
+        for op, count in redo.items():
+            self.assertLessEqual(count, 2 * plain[op], (op, redo, plain))
 
     def test_configs_do_not_change_the_quotients(self) -> None:
         """The hoist fires only in the loops a config creates; every config
@@ -1992,15 +2124,15 @@ class TestExactDivisionCuda(TestCase):
                 x[tile_m, :] = x[tile_m, :] / s[tile_m][:, None]
             return x
 
-        hoisted = helion.kernel(backend="cute", static_shapes=True)(
-            _normalize_rows_in_place
-        )
+        hoisted = helion.kernel(
+            backend="cute", static_shapes=True, cute_exact_division=True
+        )(_normalize_rows_in_place)
         plain = helion.kernel(
             backend="cute", static_shapes=True, cute_exact_division=False
         )(_normalize_rows_in_place)
         x, s = _hard_rows(DEVICE, RAGGED_ROWS, 1000)
         code, out = code_and_output(hoisted, (x.clone(), s), **ROWS_CONFIG)
-        code0, out0 = code_and_output(plain, (x.clone(), s), **ROWS_CONFIG)
+        code0, out0 = _ieee_plain(plain, (x.clone(), s), **ROWS_CONFIG)
         body = _kernel_body(code)
         assert ANY_EXACT not in body and HOISTED not in body, body
         assert body == _kernel_body(code0)
@@ -2025,23 +2157,22 @@ class TestExactDivisionCuda(TestCase):
         expected[:, :block] = x[:, :block] / s[:, None]
         expected[:, block:] = x[:, block:] / t[:, None]
         self.assertTrue(torch.equal(out.view(torch.int32), expected.view(torch.int32)))
-        _code, out0 = code_and_output(carried_alias_plain, (x, s, t), **NESTED_CONFIG)
+        _code, out0 = _ieee_plain(carried_alias_plain, (x, s, t), **NESTED_CONFIG)
         self.assertTrue(torch.equal(out.view(torch.int32), out0.view(torch.int32)))
         code, out = code_and_output(carried_acc, (x, s), **NESTED_CONFIG)
         assert ANY_EXACT in _kernel_body(code)
-        _code, out0 = code_and_output(carried_acc_plain, (x, s), **NESTED_CONFIG)
+        _code, out0 = _ieee_plain(carried_acc_plain, (x, s), **NESTED_CONFIG)
         self.assertTrue(torch.equal(out.view(torch.int32), out0.view(torch.int32)))
 
-    def test_shared_sweep_statements_compile_and_match_for_the_redo_form(
+    def test_cached_dividends_compile_and_match_for_the_redo_form(
         self,
     ) -> None:
-        """The quotient feeds a store and a reduction: codegen shares the
-        statement objects between the two sweeps.  The redo render compiles
-        and matches the plain render bit for bit, hard dividends included."""
+        """The quotient feeds a store and a reduction, so both sweeps compute
+        it, the store sweep from the dividends the reduction sweep cached in
+        registers.  The redo render compiles and matches the plain render
+        bit for bit, hard dividends included."""
         x, s = _hard_rows(DEVICE, 64, 2048)
-        code0, (out0, res0) = code_and_output(
-            sum_and_store_plain, (x, s), **NESTED_CONFIG
-        )
+        code0, (out0, res0) = _ieee_plain(sum_and_store_plain, (x, s), **NESTED_CONFIG)
         assert ANY_EXACT not in _kernel_body(code0)
         self.assertTrue(
             torch.equal(out0.view(torch.int32), (x / s[:, None]).view(torch.int32))
@@ -2049,6 +2180,7 @@ class TestExactDivisionCuda(TestCase):
         code, (out, res) = code_and_output(sum_and_store, (x, s), **NESTED_CONFIG)
         body = _kernel_body(code)
         assert REDO in body
+        assert "= _fuse_cache_0[" in body
         _exact_names_defined_before_use(body)
         self.assertTrue(torch.equal(out.view(torch.int32), out0.view(torch.int32)))
         self.assertTrue(torch.equal(res.view(torch.int32), res0.view(torch.int32)))
@@ -2094,7 +2226,7 @@ class TestExactDivisionCuda(TestCase):
                 k: v for k, v in config.items() if k != "cute_exact_div_form"
             }
             try:
-                code0, out0 = code_and_output(plain, args, **plain_config)
+                code0, out0 = _ieee_plain(plain, args, **plain_config)
             except BackendUnsupported as rejection:
                 with (
                     self.subTest(config=plain_config, rejected=str(rejection)),

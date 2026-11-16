@@ -37,6 +37,8 @@ WARP_PAIR = "_cute_grouped_reduce_cluster_warp_online_pair("
 CLUSTER = "_cute_grouped_reduce_cluster("
 BLOCK = "_cute_grouped_reduce_block("
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _softmax(x: torch.Tensor) -> torch.Tensor:
     n, _m = x.size()
@@ -136,9 +138,10 @@ def test_fast_math_rolled_pair_caches_the_exponentials(register_row: bool) -> No
 @pytest.mark.parametrize("register_row", [False, True])
 def test_exact_rolled_pair_keeps_every_exponential(register_row: bool) -> None:
     """Without fast_math the warp pair exchanges once but both sweeps keep
-    their ``exp2`` as written (sweep B in the warp's own frame).  The plain
-    division form keeps the ``exp2`` count structural (the exact hoist's
-    redo copy of the write sweep would add a third)."""
+    their natural ``exp`` as written (sweep B in the warp's own frame), and
+    the pair rescales in the same base.  The plain division form keeps the
+    ``exp`` count structural (the exact hoist's redo copy of the write sweep
+    would add a third)."""
     code = _render(
         softmax_exact, cute_register_row=register_row, cute_exact_div_form="plain"
     )
@@ -147,7 +150,9 @@ def test_exact_rolled_pair_keeps_every_exponential(register_row: bool) -> None:
     assert CLUSTER not in code
     assert PAIR not in code
     assert "_pair_exp_cache" not in code
-    assert code.count("cute.math.exp2(") == 2
+    assert code.count("cute.math.exp(") == 2
+    assert "cute.math.exp2(" not in code
+    assert "scale=None, fastmath=False" in code
     assert "_rolled_pair_frame" in code
 
 
@@ -159,13 +164,31 @@ def test_knob_off_keeps_the_two_exchange_form(kernel: object) -> None:
     assert WARP_PAIR not in code
 
 
+@pytest.mark.parametrize("kernel", [rms_norm_exact, softmax_exact], ids=["sum", "max"])
+def test_warp_fp32_redux_is_searched_alike_at_every_extent(kernel: object) -> None:
+    """The masked rolled cluster seeds ``cute_warp_fp32_redux`` only on some
+    extents.  Searching the knob only where a seed set it made the
+    structural fingerprint depend on the extent, and ``autotune_multi``
+    shares configs only across the shapes of one structural fingerprint (it
+    raises ``InvalidAPIUsage`` otherwise)."""
+    fingerprints = set()
+    for width in (8192, 16384):
+        x = torch.empty((64, width), dtype=torch.float16)
+        with mock_cuda_unavailable(), _target(), forbid_native_compile():
+            spec = cpu_bind(kernel, (x,)).config_spec
+            fingerprints.add(spec.structural_fingerprint())
+    assert len(fingerprints) == 1
+
+
 def test_seeds_set_only_the_knobs_the_sweep_structure_admits() -> None:
     """Exact softmax: the pair would un-share the two sweeps' exponentials
     and the register row / scalar epilogue never act on a row-storing
     sweep, so no seed turns them on (the knobs are not searched).  Under
     fast_math the cached pair pays, so the seeds carry it.  A scalar-output
     pair (logsumexp) seeds all three; a kernel without the pair (RMS norm)
-    seeds none of them.  ``cute_warp_fp32_redux`` stays seeded throughout."""
+    seeds none of them.  ``cute_warp_fp32_redux`` is seeded where it takes a
+    row's max natively (the softmaxes and the log-sum-exp on SM100), not on
+    the RMS norm, whose sums it leaves alone."""
     exact = _seed_values(softmax_exact)
     assert exact["cute_cluster_warp_online"] == {False}
     assert True not in exact["cute_register_row"]
@@ -190,9 +213,10 @@ def test_seeds_set_only_the_knobs_the_sweep_structure_admits() -> None:
     assert rms["cute_cluster_warp_online"] == {False}
     assert True not in rms["cute_register_row"]
     assert rms["cute_scalar_epilogue"] == {False}
-    assert True in rms["cute_warp_fp32_redux"]
+    assert True not in rms["cute_warp_fp32_redux"]
 
 
+@pytest.mark.cuda
 @skipIfNotCUDA()
 @onlyBackends(["cute"])
 class TestCuteRolledClusterOnlinePairCuda(TestCase):
@@ -208,7 +232,9 @@ class TestCuteRolledClusterOnlinePairCuda(TestCase):
         self.assertEqual(code.count(PAIR), 1)
         self.assertNotIn(CLUSTER, code)
         ref = torch.nn.functional.softmax(x, dim=1)
-        torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-3, equal_nan=True)
+        # The outputs are about 2**-15: an absolute tolerance near them would
+        # pass exponentials left in a CTA's own frame.
+        torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-6, equal_nan=True)
         self.assertTrue(torch.isnan(out[5]).all())
         self.assertEqual(out[3, :8192].abs().max().item(), 0.0)
 
@@ -218,4 +244,4 @@ class TestCuteRolledClusterOnlinePairCuda(TestCase):
         code, out = code_and_output(softmax_exact, (x,), **ROLLED)
         self.assertEqual(code.count(WARP_PAIR), 1)
         ref = torch.nn.functional.softmax(x, dim=1)
-        torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-4)
+        torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-6)

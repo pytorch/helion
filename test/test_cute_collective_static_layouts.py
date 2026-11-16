@@ -85,6 +85,29 @@ def test_only_layout_guard_changes_on_complete_warp_lowering(shape):
     assert bound.to_code(config) == before
 
 
+def test_unproved_input_cannot_grant_promoted_allocation_provenance():
+    bound = _bound()
+    with bound.env:
+        original = bound.host_function.local_types["x"].fake_value
+        replacement = original.to(dtype=torch.float32)
+        bound.env.register_compiler_allocation_replacement(original, replacement)
+        assert not bound.env.tensor_storage_is_compiler_allocated(replacement)
+        assert not bound.env.tensor_storage_is_zero_filled_allocation(replacement)
+
+
+@pytest.mark.parametrize("pad", [(0, 3), (0, 0), (-1, 0)])
+def test_constant_padding_registers_fresh_storage_without_zero_fill(pad):
+    original = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    padded = torch.constant_pad_nd(original, pad)
+    assert padded.untyped_storage() != original.untyped_storage()
+    bound = _bound()
+    bound.env.register_tensor_factory_layout(
+        torch.constant_pad_nd, (original, pad), {}, padded
+    )
+    assert bound.env.tensor_storage_is_compiler_allocated(padded)
+    assert not bound.env.tensor_storage_is_zero_filled_allocation(padded)
+
+
 def test_incomplete_or_mixed_lowerings_keep_runtime_layouts():
     codegen = GenerateAST.__new__(GenerateAST)
     codegen.backend_state = CuteCodegenState()

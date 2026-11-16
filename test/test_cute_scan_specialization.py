@@ -14,11 +14,13 @@ from helion._compiler.cute.memory_ops import _persistent_vec_alignment_matrix_si
 from helion._compiler.runtime_tensor_guards import (
     _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY,
 )
+from helion._compiler.runtime_tensor_guards import _CanonicalLayoutClassifier
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessBackends
 import helion.language as hl
 from helion.language.scan_ops import _associative_scan
 from helion.runtime.kernel import BoundKernel
+from helion.runtime.kernel import _RuntimeInputSpecializationExtractor
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -52,13 +54,20 @@ def test_unrelated_grid_has_no_alias_specialization(static_shapes: bool) -> None
     bound = kernel.bind((x, y))
     # Every CuTe kernel specializes on vector-alignment facts; those depend on
     # pointer residues only, never on storage overlap.
-    assert set(bound.env.runtime_input_specializations) == {
-        _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
+    specializations = bound.env.runtime_input_specializations
+    canonical_keys = {
+        key
+        for key, spec in specializations.items()
+        if type(spec.classifier) is _CanonicalLayoutClassifier
     }
-    assert [
+    expected_keys = {_PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY, *canonical_keys}
+    assert set(specializations) == expected_keys
+    extra_keys = [
         extractor.specialization_key
         for extractor in kernel._specialize_extra[bound._base_spec_key]
-    ] == [_PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY]
+    ]
+    assert len(extra_keys) == len(expected_keys)
+    assert set(extra_keys) == expected_keys
     # This pointwise kernel does not reorder stores to an existing input, so
     # input aliasing should not create a redundant compiled variant.
     assert kernel.bind((x, x.view_as(x))) is bound
@@ -75,11 +84,29 @@ def test_explicit_specialization_schema_is_not_extended_by_unused_alias_facts() 
 
     args = (torch.empty(32, device=CPU_DEVICE), torch.empty(64, device=CPU_DEVICE))
     bound = specialized.bind(args)
-    assert _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY not in (
-        bound.env.runtime_input_specializations
-    )
+    specializations = bound.env.runtime_input_specializations
+    canonical_keys = {
+        key
+        for key, spec in specializations.items()
+        if type(spec.classifier) is _CanonicalLayoutClassifier
+    }
+    expected_keys = {_PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY, *canonical_keys}
+    assert set(specializations) == expected_keys
     extractors = specialized._specialize_extra[bound._base_spec_key]
-    assert tuple(fn(args) for fn in extractors) == (
+    runtime_extractors = [
+        fn for fn in extractors if isinstance(fn, _RuntimeInputSpecializationExtractor)
+    ]
+    assert len(extractors) == len(runtime_extractors) + 1
+    assert len(runtime_extractors) == len(expected_keys)
+    assert {fn.specialization_key for fn in runtime_extractors} == expected_keys
+    # The only additions to the explicit scalar and alignment schema are the
+    # typed canonical-layout classifiers registered for the fresh output.
+    assert tuple(
+        fn(args)
+        for fn in extractors
+        if not isinstance(fn, _RuntimeInputSpecializationExtractor)
+        or fn.specialization_key == _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
+    ) == (
         64,
         _persistent_vec_alignment_matrix_signature(args),
     )

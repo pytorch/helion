@@ -12,21 +12,33 @@ starts producing belongs in this table.
 from __future__ import annotations
 
 import ast
+import inspect
+import typing
 
 import pytest
 
+from helion import exc
+from helion._compiler.cute.autotune.search_surface import CUTE_EVICTION_POLICIES
+from helion._compiler.cute.cache_hint_forms import L1_PRIORITY_QUALIFIERS
 from helion._compiler.cute.cache_policy_loads import CachePolicy
 from helion._compiler.cute.packet_access import PacketAccess
+from helion._compiler.cute.packet_access import call_write_roots
+from helion._compiler.cute.packet_access import is_store_call
 from helion._compiler.cute.packet_access import match_packet_access
 from helion._compiler.cute.packet_access import render_masked_packet_load
 from helion._compiler.cute.packet_access import render_packet_load
+from helion._compiler.cute.packet_access import store_pointer
 from helion._compiler.cute.packet_access import vector_type_parts
 from helion._compiler.cute.packet_flush_names import PACKET_FLUSH_HELPER_NAMES
 from helion._compiler.cute.packet_flush_names import PACKET_FLUSH_L2_EVICT_LAST
 from helion._compiler.cute.packet_flush_names import PACKET_FLUSH_STREAMING
 from helion._compiler.cute.persistent_branch_vec import PACKET_STORE_BYTES
 
-# Grammar and table pins over the AST: they run on every backend row.
+if typing.TYPE_CHECKING:
+    import types
+
+# Grammar and table pins over the AST and the emitted strings: no GPU.
+pytestmark = pytest.mark.cpu_only
 
 _U16 = "cutlass.Uint16"
 _U32 = "cutlass.Uint32"
@@ -189,6 +201,10 @@ CORPUS_FORMS: list[tuple[str, tuple[object, ...] | None]] = [
         f"_cute_load_v16b_if(PTR, PRED, {_vt(4, _U32)}, 'evict_last')",
         ("masked_packet", 4, _U32, "_cute_load_v16b_if", True, ()),
     ),
+    (
+        f"_cute_load_v16b_if(PTR, PRED, {_vt(8, _U16)}, 'l1_l2_first')",
+        ("masked_packet", 8, _U16, "_cute_load_v16b_if", True, ()),
+    ),
     # packet flushes
     (
         "_cute_store_u32_vec(PTR, V)",
@@ -306,6 +322,84 @@ def test_non_calls_and_malformed_vector_types() -> None:
     assert match_packet_access(_parse("x.store(a, b)")) is None
 
 
+def _inline_asm(pure: bool) -> str:
+    return (
+        "_cute_inline_asm_elementwise(a, asm='', constraints='=f,f', "
+        f"dtype=cutlass.Float32, is_pure={pure})"
+    )
+
+
+def _iterator_roots(pointer: ast.expr) -> frozenset[str] | None:
+    """The tensors whose ``.iterator`` an address reads, None if none."""
+    roots = frozenset(
+        node.value.id
+        for node in ast.walk(pointer)
+        if isinstance(node, ast.Attribute)
+        and node.attr == "iterator"
+        and isinstance(node.value, ast.Name)
+    )
+    return roots or None
+
+
+@pytest.mark.parametrize(
+    ("source", "store", "pointer", "roots"),
+    [
+        # ``ptr.store(value)`` writes through its receiver, ``cute.arch``
+        # calls in the address included; ``cute.arch.store`` takes it first.
+        (
+            "(x.iterator + cute.arch.thread_idx()[0]).store(v)",
+            True,
+            "x.iterator + cute.arch.thread_idx()[0]",
+            frozenset({"x"}),
+        ),
+        (
+            "cute.arch.store(x.iterator + 1, v)",
+            True,
+            "x.iterator + 1",
+            frozenset({"x"}),
+        ),
+        (
+            "_cute_store_u32_vec(y.iterator + 4, values)",
+            True,
+            "y.iterator + 4",
+            frozenset({"y"}),
+        ),
+        # A write whose destination is no address operand may write memory
+        # it does not name.
+        ("cute.copy(atom, source, target)", True, None, None),
+        ("_cute_rank1_store_f32(target, v)", True, None, None),
+        # Inline asm declared pure writes nothing, impure asm and an unknown
+        # call may write anything, and a load writes nothing.
+        (
+            _inline_asm(pure=True),
+            False,
+            None,
+            frozenset(),
+        ),
+        (
+            _inline_asm(pure=False),
+            False,
+            None,
+            None,
+        ),
+        # Warp shuffles and the pure selects of ``cutlass`` write nothing.
+        ("cute.arch.shuffle_sync_bfly(value, offset=1)", False, None, frozenset()),
+        ("cutlass.select_(mask, a, b)", False, None, frozenset()),
+        ("mystery(x.iterator)", False, None, None),
+        ("(x.iterator + 1).load()", False, None, frozenset()),
+    ],
+)
+def test_the_write_recognizers(
+    source: str, store: bool, pointer: str | None, roots: frozenset[str] | None
+) -> None:
+    call = ast.parse(source, mode="eval").body
+    assert isinstance(call, ast.Call)
+    assert is_store_call(call) is store
+    address = store_pointer(call)
+    assert (None if address is None else ast.unparse(address)) == pointer
+    assert call_write_roots(call, _iterator_roots) == roots
+
+
 def test_cache_policy_of_keywords() -> None:
     plain = match_packet_access(_parse(f"cute.arch.load(PTR, {_vt(8, _U16)})"))
     assert plain is not None and plain.cache_policy() == CachePolicy.NONE
@@ -419,7 +513,97 @@ def test_cache_policy_suffix_round_trip() -> None:
     assert CachePolicy(l1_priority="evict_last").vector_helper(16) is None
     assert CachePolicy(l1_priority="evict_last").masked_priority == "evict_last"
     assert CachePolicy(streaming=True).masked_priority == "cs"
-    assert CachePolicy(l2_helper="l2_last").masked_priority == ""
+    assert CachePolicy(l2_helper="l2_last").masked_priority == "l2_last"
     assert CachePolicy(l1_priority="evict_first").scalar_policy == "first"
     assert CachePolicy(streaming=True).scalar_policy == "streaming"
     assert CachePolicy(l1_priority="evict_normal").scalar_policy is None
+
+
+@pytest.mark.parametrize("spelling", ["nc_l2_first", "l2_last", "first", "cs"])
+def test_an_explicit_policy_outside_the_l1_priorities_is_refused(
+    spelling: str,
+) -> None:
+    """An explicit ``hl.load`` eviction policy is an L1 priority: an L2
+    family's name would reach the predicated packets as that family
+    (``nc_l2_first`` loading noncoherently past the read-only check)."""
+    with pytest.raises(exc.BackendUnsupported, match="L1 eviction priority"):
+        CachePolicy.explicit(spelling)
+
+
+@pytest.fixture
+def masked() -> types.ModuleType:
+    """``masked_packet_load``, whose helpers import the CuTe DSL."""
+    return pytest.importorskip("helion._compiler.cute.masked_packet_load")
+
+
+def test_masked_packet_loads_carry_the_l2_policy(masked: types.ModuleType) -> None:
+    """A predicated packet with an L2 policy family creates the policy
+    descriptor the unpredicated L2 helpers (and Triton's ``evict_first``
+    loads) carry and passes it to each of its loads; the L1 and streaming
+    hints keep their plain forms."""
+    assembly = masked._assembly(4, "l1_l2_first")
+    assert "createpolicy.fractional.L2::evict_first.b64 pol, 1.0;" in assembly
+    assert (
+        "@p ld.global.L1::evict_first.L2::cache_hint.v4.b32 {$0,$1,$2,$3}, [$4], pol;"
+        in assembly
+    )
+    assert "createpolicy.fractional.L2::evict_last" in masked._assembly(2, "l2_last")
+    assert "@p ld.global.L2::cache_hint.v2.b32" in masked._assembly(2, "l2_last")
+    wide = masked._assembly(8, "nc_l2_first")
+    assert wide.count("@p ld.global.nc.L2::cache_hint.v4.b32") == 2
+    assert wide.count("], pol;") == 2
+    # An 8-byte noncoherent packet too, which has no unpredicated helper.
+    assert "@p ld.global.nc.L2::cache_hint.v2.b32 {$0,$1}, [$2], pol;" in (
+        masked._assembly(2, "nc_l2_first")
+    )
+    assert masked._assembly(4, "cs").endswith(
+        "@p ld.global.cs.v4.b32 {$0,$1,$2,$3}, [$4]; }"
+    )
+    assert "pol" not in masked._assembly(4, "evict_last")
+
+
+def test_every_searched_masked_priority_has_a_load_form(
+    masked: types.ModuleType,
+) -> None:
+    """Every ``load_eviction_policies`` value the search offers
+    (``CachePolicy.tunable``) gives a predicated packet a load form at every
+    packet width.  An unknown priority only fails when the kernel traces, so a
+    new L2 family must reach the forms the helpers read."""
+    for value in CUTE_EVICTION_POLICIES:
+        priority = CachePolicy.tunable(value).masked_priority
+        for words in (1, 2, 4, 8, 16):
+            assert masked._assembly(words, priority).count("@p ld.global") == max(
+                1, words // 4
+            ), (value, words)
+
+
+@pytest.mark.parametrize("spelling", ["", *L1_PRIORITY_QUALIFIERS])
+def test_every_explicit_eviction_policy_has_a_masked_load_form(
+    masked: types.ModuleType, spelling: str
+) -> None:
+    """Every ``hl.load(..., eviction_policy=...)`` spelling, which
+    ``CachePolicy.explicit`` forwards as the L1 priority, loads predicated
+    packets with its PTX qualifier at every width.  ``evict_normal``,
+    ``evict_unchanged`` and ``evict_no_allocate`` had none, so a kernel whose
+    sink made such a load predicated packets raised KeyError as it traced."""
+    priority = CachePolicy.explicit(spelling).masked_priority
+    load = f"@p ld.global{L1_PRIORITY_QUALIFIERS.get(spelling, '')}."
+    for words in (1, 2, 4, 8, 16):
+        assert masked._assembly(words, priority).count(load) == max(1, words // 4), (
+            words
+        )
+
+
+def test_the_l1_priorities_are_those_cute_arch_load_takes() -> None:
+    """``L1_PRIORITY_QUALIFIERS`` holds exactly the
+    ``level1_eviction_priority`` values ``cute.arch.load`` accepts: the
+    spellings an explicit ``hl.load`` eviction policy can reach the
+    predicated packets with."""
+    cute = pytest.importorskip("cutlass.cute")
+    parameter = inspect.signature(cute.arch.load).parameters["level1_eviction_priority"]
+    (literal,) = [
+        option
+        for option in typing.get_args(parameter.annotation)
+        if option is not type(None)
+    ]
+    assert set(typing.get_args(literal)) == set(L1_PRIORITY_QUALIFIERS)

@@ -1,4 +1,4 @@
-"""Prove ordinary dense GEMMs with a fresh multiplicative epilogue."""
+"""Prove ordinary dense GEMMs with an owned output and a multiplicative epilogue."""
 
 from __future__ import annotations
 
@@ -25,13 +25,21 @@ class DenseGemmFacts:
     These facts prove a single dense MMA and its FP32 multiplicative scales.
     They select neither orientation nor a physical tile; the frontend supplies
     any operand transposes and the output's actual layout remains authoritative.
+    ``plain_epilogue`` records an epilogue without scales: the accumulator is
+    converted and stored once.
     """
 
     block_ids: tuple[int, int, int]
     shape: tuple[int, int, int]
     input_dtype: torch.dtype
     capacity_bytes: int
+    # The stored element type: the C ring stages it.
+    output_dtype: torch.dtype
+    # B staged K-major (else N-major: each CTA's half of an N tile is one
+    # swizzled SMEM row).
+    rhs_k_major: bool
     output_column_major: bool = False
+    plain_epilogue: bool = False
 
 
 def _scale_view_supported(
@@ -60,14 +68,25 @@ def _scale_view_supported(
 
 
 def prove_dense_gemm_facts(gemm: NativeGemm | None) -> DenseGemmFacts | None:
-    base = prove_full_tile_schedule_facts(gemm)
+    # A 16-bit pair may also store FP32 (a weight gradient's accumulator);
+    # its C ring is priced at the stored width.
+    base = prove_full_tile_schedule_facts(
+        gemm, output_dtypes=(torch.float16, torch.bfloat16, torch.float32)
+    )
     if (
         base is None
         or gemm is None
         or not gemm.owns_output_ring
-        or not base.rhs_k_major
-        or not base.lhs_k_major
-        or gemm.output.dtype != torch.bfloat16
+        # The FP8 instruction reads K-major operands only; 16-bit operands
+        # may be MN-major.
+        or (
+            base.dtype == torch.float8_e4m3fn
+            and not (base.rhs_k_major and base.lhs_k_major)
+        )
+        # The FP8 instruction stores a BF16 D ring.
+        or (base.dtype == torch.float8_e4m3fn and gemm.output.dtype != torch.bfloat16)
+        # The TMA store clips at the destination's edge, not at the problem's.
+        or tuple(gemm.output.shape) != gemm.shape[:2]
     ):
         return None
     for step in gemm.chain.steps:
@@ -110,5 +129,8 @@ def prove_dense_gemm_facts(gemm: NativeGemm | None) -> DenseGemmFacts | None:
         base.shape,
         base.dtype,
         capacity,
-        gemm.candidate.output_column_major,
+        output_dtype=gemm.output.dtype,
+        output_column_major=gemm.candidate.output_column_major,
+        plain_epilogue=not gemm.chain.steps,
+        rhs_k_major=base.rhs_k_major,
     )

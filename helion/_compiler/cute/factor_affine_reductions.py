@@ -42,6 +42,8 @@ from ..ast_extension import clone_ast
 from ..ast_extension import create
 from ..ast_extension import expr_from_string
 from ..ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
+from ..fx_side_effects import is_impure_node
+from ..utils import is_full_slice
 from ._ast_pass_utils import assigned_name
 from ._ast_pass_utils import call_path_str
 from ._ast_pass_utils import loop_extent
@@ -49,7 +51,6 @@ from ._ast_pass_utils import names_read
 from ._ast_pass_utils import names_written
 from ._ast_pass_utils import rename_names
 from ._ast_pass_utils import resolve_alias
-from .fx_matcher import _is_full_slice
 from .licm_profitability import repeated_work_is_profitable
 from .scalar_recipe import PURE_HELPERS
 
@@ -158,7 +159,7 @@ def _broadcast_source(
         should_span = (dim in reduced_dims) == source_spans_reduced_dims
         if should_span:
             if (
-                not _is_full_slice(index)
+                not is_full_slice(index)
                 or source_dim >= len(source_shape)
                 or not _same_size(output_shape[dim], source_shape[source_dim])
             ):
@@ -485,7 +486,7 @@ def factor_affine_reductions(graph: torch.fx.Graph, *, fast_math: bool) -> int:
         if _rewrite_sum(graph, node):
             changed += 1
     if changed:
-        graph.eliminate_dead_code()
+        graph.eliminate_dead_code(is_impure_node=is_impure_node)
         graph.lint()
     return changed
 

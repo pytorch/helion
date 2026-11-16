@@ -108,7 +108,7 @@ class BlockScaledMmaPlan:
         names: tuple[str, ...],
         workspace_name: str,
         alpha: str,
-        size_hint: Callable[[int | torch.SymInt], int],
+        keyed_hint: Callable[[int | torch.SymInt], int | None],
     ) -> dict[str, object]:
         """The ``block_scaled_mma`` wrapper plan the launcher re-proves and binds.
 
@@ -175,11 +175,13 @@ class BlockScaledMmaPlan:
                 wrapper_plan["tma_output"] = self.tma_output
             if self.fused_scales:
                 for side, operand in (("lhs", self.lhs), ("rhs", self.rhs)):
-                    row_stride, column_stride = operand.source.scale.stride()
-                    wrapper_plan[side + "_scale_row_stride"] = size_hint(row_stride)
-                    wrapper_plan[side + "_scale_column_stride"] = size_hint(
-                        column_stride
+                    row_stride, column_stride = map(
+                        keyed_hint, operand.source.scale.stride()
                     )
+                    # plan_mxfp8 refuses scale strides the binding does not fix.
+                    assert row_stride is not None and column_stride is not None
+                    wrapper_plan[side + "_scale_row_stride"] = row_stride
+                    wrapper_plan[side + "_scale_column_stride"] = column_stride
         if alpha.isidentifier():
             wrapper_plan["scale_name"] = alpha
         else:
@@ -204,9 +206,12 @@ def _metadata_resolver(env: CompileEnvironment) -> Callable[[object], int | None
     substitutions: dict[sympy.Expr, sympy.Integer] = {}
     for tensor in env.input_sources:
         for value in (*tensor.shape, *tensor.stride()):
-            if isinstance(value, torch.SymInt):
+            if (
+                isinstance(value, torch.SymInt)
+                and (hint := env.keyed_hint(value)) is not None
+            ):
                 substitutions[env.shape_env.replace(value._sympy_())] = sympy.Integer(
-                    env.size_hint(value)
+                    hint
                 )
 
     def resolve(value: object) -> int | None:
@@ -512,7 +517,7 @@ def _plan_block_scaled(graphs: Sequence[GraphInfo]) -> BlockScaledMmaPlan | None
         env.backend_name != "cute"
         or env.config_spec.target_device_capability is None
         or env.config_spec.target_device_capability[0] != 10
-        or "input_tensor_metadata" not in env.compiler_fact_specialization_facts
+        or not env.exact_input_metadata_holds()
         or len(device_ir.root_ids) != 1
         or len(device_ir.phases) != 1
         or df.config.pid_type != "flat"
@@ -780,6 +785,12 @@ def plan_block_scaled(graphs: Sequence[GraphInfo]) -> None:
 
     plan = plan_mxfp8(graphs) or _plan_block_scaled(graphs)
     if plan is None:
+        if not CompileEnvironment.current().dispatch_guards_enforced:
+            # The calls this code serves skip the binding's dispatch guards
+            # (Inductor's render of a dynamic graph), so nothing proves its
+            # exact sizes: the generic contraction runs instead, as without
+            # the knob.
+            return
         raise exc.BackendUnsupported(
             "cute", "native block-scaled contraction proof declined"
         )
@@ -825,7 +836,7 @@ def codegen_block_scaled(cg: GenerateAST) -> bool:
             names=names,
             workspace_name=workspace_arg,
             alpha=alpha,
-            size_hint=CompileEnvironment.current().size_hint,
+            keyed_hint=CompileEnvironment.current().keyed_hint,
         )
     )
     df.placeholder_args.update((*names, workspace_arg, alpha))

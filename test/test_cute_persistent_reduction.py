@@ -25,9 +25,14 @@ from helion._compiler.cute.autotune.heuristics.cute import (
 )
 from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.lane_loops import split as lane_split
+from helion._compiler.cute.lane_loops.markers import _create_lane_loop
 from helion._compiler.cute.lane_loops.split import split_lane_loop_reductions
 from helion._compiler.cute.memory_ops import _persistent_vec_scope_safe
 from helion._compiler.cute.passes import hoist_chunk_recurrence
+from helion._compiler.cute.persistent_branch_vec import (
+    _lane_accesses_are_iteration_independent,
+)
+from helion._compiler.cute.persistent_branch_vec import _lane_offsets_separate
 from helion._compiler.device_function import _exact_thread_block_dims
 from helion._compiler.lane_loop_context import LaneLoopContext
 from helion._testing import DEVICE
@@ -1644,7 +1649,6 @@ def test_persistent_reduction_threads_do_not_consume_tile_budget() -> None:
 
 
 def test_persistent_loop_rewrites_preserve_constexpr_iterator() -> None:
-    from helion._compiler.cute.lane_loops.markers import _create_lane_loop
     from helion._compiler.cute.lane_loops.split import (
         interchange_lane_outside_serial_reductions,
     )
@@ -1719,8 +1723,6 @@ def test_lane_split_rejects_interleaved_aliasing_write(
     write_kind: str,
 ) -> None:
     from helion import exc
-    from helion._compiler.cute.lane_loops.markers import _create_lane_loop
-    from helion._compiler.cute.lane_loops.split import split_lane_loop_reductions
 
     monkeypatch.delenv("HELION_FUSER_MODE", raising=False)
     second_value = "second + reduced_0" if dependent else "second"
@@ -1748,9 +1750,107 @@ sink = reduced_0 + reduced_1
         split_lane_loop_reductions([loop])
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("element", "independent"),
+    [
+        # A chunked persistent row (two chunks of four): every lane its own
+        # element, though not affine in the lane.
+        ("lane // 4 * 64 + lane % 4", True),
+        # Lanes sharing an element.
+        ("lane // 4", False),
+        ("lane % 4 * 256", False),
+        # A lane shifted by an unknown term under ``//``, or past Int32
+        # there (the Int32 product wraps: even lanes 0, odd ones -2**31).
+        ("(base + lane) // 4 * 64 + lane % 4", False),
+        ("lane * 2147483648 // 1073741824", False),
+        # A divisor past Int32: the Int32 product wraps it to 4, so the
+        # lanes' offsets repeat 0..3.
+        (
+            "cutlass.Int32(lane) % (cutlass.Int32(65536) * cutlass.Int32(65536) + 4)",
+            False,
+        ),
+    ],
+)
+def test_lane_split_proves_in_place_lanes_independent(
+    element: str, independent: bool
+) -> None:
+    pointer = f"x.iterator + cutlass.Int32({element})"
+    loop = _create_lane_loop(
+        "lane",
+        8,
+        ast.parse(
+            f"""
+value = ({pointer}).load()
+reduced = _helion_lane_reduce(value, 'sum', cutlass.Float32(0), threads_in_group=16)
+({pointer}).store(value / reduced)
+"""
+        ).body,
+    )
+    if independent:
+        split_lane_loop_reductions([loop])
+    else:
+        with pytest.raises(
+            helion.exc.BackendUnsupported, match="potentially aliasing write"
+        ):
+            split_lane_loop_reductions([loop])
+
+
+@pytest.mark.cpu_only
+def test_lane_offsets_take_the_loops_own_lanes() -> None:
+    # ``lane % 4 + lane // 8`` is distinct on lanes 0..3 but not on 6..9 (6
+    # and 9 both give 2): the enumeration walks the lanes the loop runs, and
+    # has nothing to prove without any.
+    element = ast.parse("lane % 4 + lane // 8", mode="eval").body
+    assert _lane_offsets_separate(element, "lane", range(4), {})
+    assert not _lane_offsets_separate(element, "lane", range(6, 10), {})
+    assert _lane_offsets_separate(element, "lane", range(0), {})
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("store_offset", "colliding_step"),
+    [
+        # The load's own element, which the enumeration proves
+        # (``_lane_offsets_separate``).
+        ("", 4),
+        # 2**31 elements further along, which the modular proof takes
+        # (``_scalar_pointers_are_modularly_lane_disjoint``).
+        (" + 2147483648", 2),
+    ],
+)
+def test_lane_proofs_take_the_lanes_step(
+    store_offset: str, colliding_step: int
+) -> None:
+    # Two lanes ``step`` apart access elements ``step * 2**30`` apart: one
+    # step keeps a lane's store off the other lane's load in the Int32 index
+    # range, but four steps wrap onto the same element, and two onto the
+    # store 2**31 further along.
+    offset = "lane * 1073741824"
+    load, store = (
+        cast("ast.Call", ast.parse(code, mode="eval").body)
+        for code in (
+            f"(x.iterator + cutlass.Int32({offset})).load()",
+            f"(x.iterator + cutlass.Int32({offset}{store_offset})).store(value)",
+        )
+    )
+
+    def independent(lane_step: int) -> bool:
+        return _lane_accesses_are_iteration_independent(
+            load,
+            store,
+            lane_var="lane",
+            lane_extent=2,
+            load_definitions={},
+            store_definitions={},
+            lane_step=lane_step,
+        )
+
+    assert independent(1)
+    assert not independent(colliding_step)
+
+
 def test_dependent_lane_split_preserves_invariant_carried_update() -> None:
-    from helion._compiler.cute.lane_loops.markers import _create_lane_loop
-    from helion._compiler.cute.lane_loops.split import split_lane_loop_reductions
 
     loop = _create_lane_loop(
         "lane",
@@ -1777,8 +1877,6 @@ next_carry = carry_copy + reduced_1
 
 
 def test_lane_split_keeps_serially_carried_reduction_input_in_order() -> None:
-    from helion._compiler.cute.lane_loops.markers import _create_lane_loop
-    from helion._compiler.cute.lane_loops.split import split_lane_loop_reductions
 
     loop = _create_lane_loop(
         "lane",
@@ -1835,8 +1933,6 @@ def test_same_tensor_launch_reloads_after_interleaved_store(
 
 
 def test_lane_split_allows_proven_disjoint_interleaved_write() -> None:
-    from helion._compiler.cute.lane_loops.markers import _create_lane_loop
-    from helion._compiler.cute.lane_loops.split import split_lane_loop_reductions
 
     loop = _create_lane_loop(
         "synthetic_lane_7",
@@ -1866,8 +1962,6 @@ sink = reduced_0 + reduced_1
 def test_lane_split_exact_same_lane_state_update(
     store_shift: int,
 ) -> None:
-    from helion._compiler.cute.lane_loops.markers import _create_lane_loop
-    from helion._compiler.cute.lane_loops.split import split_lane_loop_reductions
 
     store_index = "lane_index" if store_shift == 0 else "lane_index + 1"
     loop = _create_lane_loop(
@@ -1914,8 +2008,6 @@ def test_lane_split_plain_scalar_exact_same_lane_state_update(
     pointer_expr: str,
     stride_values: dict[tuple[str, int], int],
 ) -> None:
-    from helion._compiler.cute.lane_loops.markers import _create_lane_loop
-    from helion._compiler.cute.lane_loops.split import split_lane_loop_reductions
 
     loop = _create_lane_loop(
         "synthetic_lane_7",
@@ -1945,8 +2037,6 @@ pointer.store(cutlass.BFloat16(updated))
 
 @pytest.mark.parametrize("marked", (False, True), ids=("scalar", "marked"))
 def test_lane_split_allows_row_aligned_dynamic_state_slots(marked: bool) -> None:
-    from helion._compiler.cute.lane_loops.markers import _create_lane_loop
-    from helion._compiler.cute.lane_loops.split import split_lane_loop_reductions
 
     load_pointer = (
         "state.iterator + cutlass.Int32(load_slot) * "
@@ -1998,8 +2088,6 @@ updated = cutlass.Float32(loaded) + reduced
 
 
 def test_lane_split_rejects_dynamic_rows_with_insufficient_stride() -> None:
-    from helion._compiler.cute.lane_loops.markers import _create_lane_loop
-    from helion._compiler.cute.lane_loops.split import split_lane_loop_reductions
 
     loop = _create_lane_loop(
         "synthetic_lane_7",
@@ -2166,8 +2254,6 @@ def test_lane_split_plain_scalar_same_lane_proof_fails_closed(
     write: str,
     stride_values: dict[tuple[str, int], int],
 ) -> None:
-    from helion._compiler.cute.lane_loops.markers import _create_lane_loop
-    from helion._compiler.cute.lane_loops.split import split_lane_loop_reductions
 
     loop = _create_lane_loop(
         "synthetic_lane_7",
@@ -2195,8 +2281,6 @@ updated = cutlass.Float32(loaded) + reduced
 
 
 def test_lane_split_plain_scalar_rejects_mutated_address_alias() -> None:
-    from helion._compiler.cute.lane_loops.markers import _create_lane_loop
-    from helion._compiler.cute.lane_loops.split import split_lane_loop_reductions
 
     loop = _create_lane_loop(
         "synthetic_lane_7",
@@ -2222,8 +2306,6 @@ updated = cutlass.Float32(loaded) + reduced
 
 
 def test_lane_split_plain_scalar_rejects_mutated_lane_alias() -> None:
-    from helion._compiler.cute.lane_loops.markers import _create_lane_loop
-    from helion._compiler.cute.lane_loops.split import split_lane_loop_reductions
 
     loop = _create_lane_loop(
         "synthetic_lane_7",
@@ -2261,8 +2343,6 @@ pointer.store(updated)
 def test_lane_split_plain_scalar_rejects_stale_preload_definition(
     mutation: str,
 ) -> None:
-    from helion._compiler.cute.lane_loops.markers import _create_lane_loop
-    from helion._compiler.cute.lane_loops.split import split_lane_loop_reductions
 
     source = f"""
 lane_index = lane_base + cutlass.Int32(synthetic_lane_7)
@@ -2282,8 +2362,6 @@ updated = cutlass.Float32(loaded) + reduced
 
 
 def test_lane_split_plain_scalar_rejects_captured_shifted_aliases() -> None:
-    from helion._compiler.cute.lane_loops.markers import _create_lane_loop
-    from helion._compiler.cute.lane_loops.split import split_lane_loop_reductions
 
     loop = _create_lane_loop(
         "synthetic_lane_7",
@@ -2340,8 +2418,6 @@ def test_lane_split_plain_scalar_rejects_captured_structured_writes(
     load_offset: str,
     store_offset: str,
 ) -> None:
-    from helion._compiler.cute.lane_loops.markers import _create_lane_loop
-    from helion._compiler.cute.lane_loops.split import split_lane_loop_reductions
 
     loop = _create_lane_loop(
         "synthetic_lane_7",
@@ -2368,8 +2444,6 @@ updated = cutlass.Float32(loaded) + reduced
 
 
 def test_lane_split_rejects_exact_store_before_same_lane_load() -> None:
-    from helion._compiler.cute.lane_loops.markers import _create_lane_loop
-    from helion._compiler.cute.lane_loops.split import split_lane_loop_reductions
 
     loop = _create_lane_loop(
         "synthetic_lane_7",
@@ -2400,8 +2474,6 @@ def test_lane_split_treats_later_write_as_a_backedge_barrier(
     write_kind: str,
     prove_x_y_disjoint: bool,
 ) -> None:
-    from helion._compiler.cute.lane_loops.markers import _create_lane_loop
-    from helion._compiler.cute.lane_loops.split import split_lane_loop_reductions
 
     second_value = "second + reduced_0" if dependent else "second"
     write = (

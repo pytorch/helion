@@ -9,6 +9,7 @@ import torch
 import helion
 from helion._compiler.autotuner_heuristics import compiler_seed_configs
 from helion._compiler.autotuner_heuristics import get_heuristics
+from helion._compiler.autotuner_heuristics.common import is_canonical_row_reduction
 from helion._compiler.autotuner_heuristics.tileir import TileIRChunkReductionHeuristic
 from helion._compiler.autotuner_heuristics.tileir import TileIRMatmulSeedHeuristic
 from helion._compiler.autotuner_heuristics.tileir import TileIRRowReductionHeuristic
@@ -18,6 +19,7 @@ from helion._testing import cpu_render_target
 from helion._testing import skipIfRefEager
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.registered_reduction import registered_scale_sum
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import MatmulFact
@@ -55,6 +57,10 @@ def _env(spec: ConfigSpec) -> SimpleNamespace:
         backend=TileIRBackend(),
         backend_name="tileir",
         config_spec=spec,
+        block_sizes={
+            entry.block_id: SimpleNamespace(size=entry.size_hint)
+            for entry in spec.block_sizes
+        },
         settings=Settings(backend="tileir"),
         device=torch.device("cpu"),
     )
@@ -205,6 +211,19 @@ def test_row_reduction_respects_required_persistence_and_row_floor() -> None:
     assert not TileIRRowReductionHeuristic.is_eligible(_env(spec), SimpleNamespace())
 
 
+def test_row_reduction_seed_normalizes_required_persistent_slot() -> None:
+    spec = _reduction_spec()
+    spec.reduction_loops[0].persistent_reason = "complete ownership"
+    seeds = TileIRRowReductionHeuristic.get_seed_configs(_env(spec), SimpleNamespace())
+    assert seeds
+    assert all(seed.reduction_loops == [None] for seed in seeds)
+    generation = spec.create_config_generation()
+    assert all(generation.unflatten(generation.flatten(seed)) == seed for seed in seeds)
+    legacy = helion.Config(block_sizes=[1], reduction_loops=[4096])
+    spec.normalize(legacy)
+    assert legacy.reduction_loops == [None]
+
+
 def test_small_reduction_batches_independent_groups() -> None:
     spec = _reduction_spec(width=32)
     spec.reduction_loops.clear()
@@ -325,6 +344,9 @@ def test_live_cpu_binding_recognizes_declined_but_bounded_chunk() -> None:
     assert (
         spec.reduction_kernel_fact.reductions[0].category == ReductionCategory.DECLINED
     )
+    descriptor = spec.reduction_kernel_fact.reductions[0]
+    assert descriptor.block_id == spec.block_sizes[0].block_id
+    assert descriptor.size_hint == 0  # The configured extent is not yet known.
     assert spec.autotuner_heuristics == ["tileir_chunk_reduction"]
     assert spec.compiler_seed_configs[0].block_sizes == [1024]
 
@@ -371,3 +393,29 @@ def test_live_cpu_binding_recognizes_canonical_row_reduction() -> None:
     seeds = spec.compiler_seed_configs
     assert [s.block_sizes for s in seeds] == [[1], [1]]
     assert [s.reduction_loops for s in seeds] == [[None], [4096]]
+
+
+@skipIfRefEager("requires compiler IR")
+def test_registered_knob_is_not_a_row_domain() -> None:
+    # Bind after the CPU fixture activates TileIR; module import must not
+    # require ENABLE_TILE from a caller running the default backend lane.
+    kernel = helion.kernel(
+        registered_scale_sum,
+        backend="tileir",
+        static_shapes=True,
+        autotune_effort="none",
+    )
+    bound = cpu_bind(kernel, (torch.ones(7, 11),))
+    assert bound.env.backend_name == "tileir"
+    assert len(bound.config_spec.block_sizes) == 1
+    assert len(bound.config_spec.reduction_loops) == 1
+    assert not is_canonical_row_reduction(bound.env)
+
+
+def test_conflicting_loop_extents_are_not_a_canonical_row_domain() -> None:
+    env = _env(_reduction_spec())
+    assert is_canonical_row_reduction(env)
+    # mark_alternate_size clears a reused tile's size when its loops have
+    # different extents. There is no single row domain for the canonical seed.
+    env.block_sizes[env.config_spec.block_sizes[0].block_id].size = None
+    assert not is_canonical_row_reduction(env)

@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from torch.fx import Node
 
     from .atomic_consumer_fusion import AtomicConsumerRegion
+    from .fragment_domain import OwnershipMask
 
 
 class FragmentAtomicEmitter(FragmentContext):
@@ -148,8 +149,8 @@ class FragmentAtomicEmitter(FragmentContext):
             self.emit("cute.arch.fence_acq_rel_gpu()")
             self.synchronize()
 
-        def logical_domain(coords: tuple[str, ...]) -> tuple[str, ...]:
-            masks = [
+        def logical_domain(coords: tuple[str, ...]) -> tuple[OwnershipMask, ...]:
+            masks: list[OwnershipMask] = [
                 f"({coord}) < ({self.logical_axis_extent(fake, dim, shape[dim])})"
                 for dim, coord in enumerate(coords)
             ]

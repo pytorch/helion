@@ -31,8 +31,9 @@ from benchmarks.metal.manifest import Kernel
 from benchmarks.metal.providers import mlx_available
 import pytest
 import torch
+from torch.testing._internal.common_utils import instantiate_parametrized_tests
+from torch.testing._internal.common_utils import parametrize
 
-import helion
 from helion import exc
 
 # Metal runs on macOS only: CI's Linux jobs skip the whole file.
@@ -742,14 +743,6 @@ _TINY_ROWS = {
     ],
 }
 
-#: Helion configs for the tiny-shape check where the kernel's default config
-#: is not one Metal lowers.  mamba2_chunk_scan's default num_warps=4 leaves
-#: one of its non-matmul blocks threads around the cooperative MPP matmul,
-#: which Metal rejects; the autotuner skips such configs.
-_TINY_CONFIGS = {
-    "mamba2_chunk_scan": helion.Config(block_sizes=[16, 16, 64], num_warps=2),
-}
-
 
 @_requires_mps
 class TestHarness(unittest.TestCase):
@@ -882,39 +875,35 @@ class TestHarness(unittest.TestCase):
         other = {**header, "manifest": {"version": "x", "hash": "y"}}
         self.assertTrue(harness._same_run(header, other))
 
-    def test_every_operator_matches_its_reference_at_tiny_shapes(self) -> None:
-        """Every provider, Helion at each kernel's default config (or its
-        ``_TINY_CONFIGS`` entry)."""
+    # Each operator covers distinct kernels and provider contracts.
+    # Collect them separately so compilation and cleanup have per-operator budgets.
+    @parametrize("name", tuple(_TINY_ROWS))
+    def test_operator_matches_its_reference_at_tiny_shapes(self, name: str) -> None:
+        """Every provider, Helion at each kernel's default config."""
         providers = ("torch_eager", "helion")
         if mlx_available():
             providers += ("mlx",)
-        for name, rows in _TINY_ROWS.items():
-            base = manifest.kernel(name)
-            kernel = dataclasses.replace(
-                base, rows=tuple(rows), available=len(rows), num_inputs=len(rows)
-            )
-            results = self._results()
-            with contextlib.ExitStack() as stack:
-                for helion_kernel in harness.load_op(kernel).HELION_KERNELS:
-                    stack.enter_context(
-                        patch.object(helion_kernel.settings, "autotune_effort", "none")
+        rows = _TINY_ROWS[name]
+        base = manifest.kernel(name)
+        kernel = dataclasses.replace(
+            base, rows=tuple(rows), available=len(rows), num_inputs=len(rows)
+        )
+        results = self._results()
+        with contextlib.ExitStack() as stack:
+            for helion_kernel in harness.load_op(kernel).HELION_KERNELS:
+                stack.enter_context(
+                    patch.object(helion_kernel.settings, "autotune_effort", "none")
+                )
+            for case in kernel.cases:
+                harness.run_cell(
+                    results, kernel, case, self._options(providers), "crash"
+                )
+                cell = results.cells[f"{name}/{case.index}"]
+                for provider in providers:
+                    record = cell["providers"][provider]
+                    self.assertEqual(
+                        record["status"], "ok", f"{name} {case.params} {provider}"
                     )
-                    if name in _TINY_CONFIGS:
-                        stack.enter_context(
-                            patch.object(
-                                helion_kernel, "configs", [_TINY_CONFIGS[name]]
-                            )
-                        )
-                for case in kernel.cases:
-                    harness.run_cell(
-                        results, kernel, case, self._options(providers), "crash"
-                    )
-                    cell = results.cells[f"{name}/{case.index}"]
-                    for provider in providers:
-                        record = cell["providers"][provider]
-                        self.assertEqual(
-                            record["status"], "ok", f"{name} {case.params} {provider}"
-                        )
 
     def test_helion_runs_metal_code_and_is_timed(self) -> None:
         from benchmarks.metal.ops import softmax
@@ -950,6 +939,9 @@ class TestHarness(unittest.TestCase):
             self.assertEqual(len(cell["providers"][provider]["latency"]), 2)
             self.assertEqual(len(cell["providers"][provider]["enqueue_ms"]), 2)
         self.assertEqual(len(cell["block_orders"]), 2)
+
+
+instantiate_parametrized_tests(TestHarness)
 
 
 if __name__ == "__main__":

@@ -1281,6 +1281,43 @@ class TestCrossLoopCodegenHelpers(TestCase):
             [argument.arg for argument in helper.args.args], ["weight_desc"]
         )
 
+    @pytest.mark.cpu_only
+    @skipIfNotTriton("outlined tile bodies are Triton helpers")
+    def test_outlined_tile_body_keeps_a_pass_where_its_dead_code_goes(self) -> None:
+        device_function = object.__new__(DeviceFunction)
+        device_function.arguments = []
+        device_function.wrapper_only_params = []
+        device_function.preamble = []
+        cast("Any", device_function).namespace = SimpleNamespace(
+            create_name=lambda name, _value: name
+        )
+        device_function.triton_outlined_helper_constexprs = {}
+        device_function._variable_renames = {}
+        device_function.dce_vars = ["unused"]
+        cast("Any", device_function).codegen = SimpleNamespace(module_statements=[])
+        cast("Any", device_function).helper_manager = SimpleNamespace(
+            codegen_helper_functions=list
+        )
+        environment = SimpleNamespace(backend_name="triton")
+        with mock.patch.object(CompileEnvironment, "current", return_value=environment):
+            for source, kept in (
+                # A loop whose only statement goes keeps a pass under it.
+                (
+                    "for k in range(4):\n    unused = k\ntl.store(output, 1)\n",
+                    "for k in range(4):\n    pass\ntl.store(output, 1)",
+                ),
+                # A body that goes entirely leaves a pass.
+                ("unused = 1\n", "pass"),
+            ):
+                with self.subTest(source=source):
+                    device_function.triton_outlined_helpers = []
+                    device_function.register_triton_outlined_helper(
+                        "dead_tile", ast.parse(source).body
+                    )
+                    helper = device_function.codegen_helper_functions()[0]
+                    assert isinstance(helper, ast.FunctionDef)
+                    self.assertEqual(ast.unparse(helper.body), kept)
+
 
 @helion.kernel(static_shapes=True, autotune_effort="none")
 def guarded_row_pair(
@@ -1476,8 +1513,9 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             num_warps=1,
         )
         compiled = bound.compile_config(config)
-        # The precompiler gets placeholders for the launcher-owned state.
-        self.assertTrue(_triton_compile(compiled, (x,), config, bound))
+        # The precompiler gets placeholders for the launcher-owned state
+        # (``_triton_compile`` returns the error that kept it from compiling).
+        self.assertIsNone(_triton_compile(compiled, (x,), config, bound))
 
     @skipIfRefEager("compile-only launcher arguments have no eager reference")
     def test_compile_only_launch_args_mirror_launcher_state(self) -> None:
@@ -2729,17 +2767,22 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         cache_keys: list[str | None] = []
         cubin_hashes: set[str] = set()
         bounds = []
+        config = helion.Config(
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="static",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
         for numerator, denominator in ((8, 2), (12, 3)):
             code, out = code_and_output(
                 specialized_quotient_chain,
                 (x, numerator, denominator),
-                pid_type="persistent_blocked",
-                cross_loop_pipeline="static",
-                num_sm_multiplier=1,
-                num_warps=1,
+                **config.config,
             )
             bound = specialized_quotient_chain.bind((x, numerator, denominator))
-            config, compiled = next(iter(bound._compile_cache.items()))
+            self.assertEqual(len(bound._compile_cache), 1)
+            normalized = bound._normalized_config_copy(config)
+            compiled = bound._compile_cache[normalized]
             triton_kernel = compiled.__globals__[f"_helion_{bound.kernel.name}"]
             cubin_hashes.update(
                 compiled_kernel.hash

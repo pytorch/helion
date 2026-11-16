@@ -38,6 +38,7 @@ from ..ast_extension import statement_from_string
 from ..device_function import TensorArg
 from ..device_ir import ReductionLoopGraphInfo
 from ..type_info import TensorType
+from ._ast_pass_utils import body_end_follows_all_tiles
 from .host_zero_fills import HostFillElision
 from .host_zero_fills import _assigns
 from .host_zero_fills import _combine_coverages
@@ -205,14 +206,8 @@ def append_device_remainder_fills(
     env = CompileEnvironment.current()
     fn = codegen.device_function
     fills = prove_host_remainder_fills(host, env, config)
-    if not fills:
-        return []
-    if any(argument.name.startswith("x_grid_sem") for argument in fn.arguments):
-        return []
-    if any(
-        isinstance(node, ast.Return)
-        for statement in fn.body
-        for node in ast.walk(statement)
+    if not fills or not body_end_follows_all_tiles(
+        [*fn.preamble, *fn.body], host.device_ir
     ):
         return []
     arguments = {

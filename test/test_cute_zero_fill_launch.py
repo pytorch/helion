@@ -29,6 +29,8 @@ from helion._testing import code_and_output
 from helion._testing import import_example
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_zero_fill import COLUMN_SUM_CONFIG as _COLUMN_SUM
+from helion._testing.cute_zero_fill import atomic_column_sum
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -56,17 +58,6 @@ def cpu_only() -> Iterator[None]:
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def atomic_column_sum(x: torch.Tensor) -> torch.Tensor:
-    """Column sums through atomics into a zero-filled fp32 accumulator: the
-    fill cannot be elided (no CTA writes a whole column)."""
-    m, n = x.size()
-    out = torch.zeros([n], dtype=torch.float32, device=x.device)
-    for tile_m, tile_n in hl.tile([m, n]):
-        hl.atomic_add(out, [tile_n], x[tile_m, tile_n].to(torch.float32).sum(0))
-    return out
-
-
-@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def scaled_copy(x: torch.Tensor) -> torch.Tensor:
     """A zero-filled output every element of which the grid stores: the
     dead-fill elision turns the fill into ``empty`` ahead of this pass."""
@@ -75,9 +66,6 @@ def scaled_copy(x: torch.Tensor) -> torch.Tensor:
     for tile_m, tile_n in hl.tile([m, n]):
         out[tile_m, tile_n] = x[tile_m, tile_n] * 2
     return out
-
-
-_COLUMN_SUM = {"block_sizes": [64, 64], "num_threads": [4, 64]}
 
 
 def _kernel_defs(code: str) -> dict[str, ast.FunctionDef]:

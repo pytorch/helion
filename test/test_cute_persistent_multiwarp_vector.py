@@ -12,9 +12,11 @@ the full runtime thread id like the non-synthetic cross-warp path.
 from __future__ import annotations
 
 import ast
+import inspect
 from typing import Any
 from typing import Callable
 from typing import cast
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -498,6 +500,53 @@ def test_finalize_shared_reduce_groups_leaves_other_shapes_alone() -> None:
     assert "group_count=1)" in _finalize(exact, (256, 2, 2))
 
 
+def test_finalize_shared_reduce_groups_resizes_the_vloop_sink_fragment() -> None:
+    # The V-loop sink's fragment combine keeps the emitted count of the
+    # per-lane reduces it replaces and is resized with them: the one launched
+    # group of four warps then folds its warp partials in the serial form's
+    # order, as the resized per-lane reduce does, where the emitted count
+    # would have taken the butterfly tree.
+    emitted = (
+        f"lane = {RUNTIME_LANE}\n"
+        "lane_in_group = lane % 128\n"
+        "lane_mod_pre = lane_in_group % 1\n"
+        "_cute_grouped_reduce_shared_two_stage_fragment(acc_frag, result_frag, "
+        "'sum', cutlass.Float32(0), lane, lane_in_group, lane_mod_pre, count=4, "
+        "pre=1, group_span=128, group_count=8)"
+    )
+    code = _finalize(emitted, (128, 1, 1))
+    assert f"lane = {X_LANE}" in code
+    assert "count=4, pre=1, group_span=128, group_count=1)" in code
+    pytest.importorskip("cutlass")  # reduce_helpers imports cutlass
+    from helion._compiler.cute import reduce_helpers
+
+    body_signature = inspect.signature(
+        reduce_helpers._cute_grouped_reduce_shared_two_stage_fragment_body
+    )
+    with patch.object(
+        reduce_helpers, "_cute_grouped_reduce_shared_two_stage_fragment_body"
+    ) as body:
+        for group_count in (1, 8):
+            reduce_helpers._cute_grouped_reduce_shared_two_stage_fragment(
+                None,
+                None,
+                "sum",
+                0.0,
+                0,
+                0,
+                0,
+                count=4,
+                pre=1,
+                group_span=128,
+                group_count=group_count,
+            )
+    # Bound by name, however the body's arguments are passed.
+    assert [
+        body_signature.bind(*call.args, **call.kwargs).arguments["serial"]
+        for call in body.call_args_list
+    ] == [True, False]
+
+
 @pytest.mark.parametrize(
     "dtype,threads,vec,suffix",
     [
@@ -614,13 +663,18 @@ def test_capped_row_keeps_one_warp_vector_loads(
     )
 
 
-def test_mismatched_vector_width_keeps_single_warp_lane_loop() -> None:
+def test_mismatched_vector_width_keeps_one_warp_of_chunked_packets() -> None:
     # 64 threads would give each thread 16 elements, not one V=8 vector: the
-    # established one-warp scalar lane loop is kept.
+    # lane loop keeps one warp, and its 32 elements per thread are four V=8
+    # packets 256 elements apart.
     bound, _arguments = _bind_rms_norm(256, 1024, torch.bfloat16)
     code = bound.to_code(_row_config(bound, reduction_threads=64, vec=8))
     assert "block=(32, 1, 1)" in code
-    assert "for synthetic_lane_1 in range(32):" in code
+    assert "for synthetic_lane_1 in cutlass.range_constexpr(32):" in code
+    assert "synthetic_lane_1 // 8 * 256 + synthetic_lane_1 % 8" in code
+    # Four packets of x and four of the weight; four flushes of the output.
+    assert code.count("ir.VectorType.get([8], cutlass.Uint16.mlir_type)") == 8, code
+    assert code.count("_cute_store_u16_vec(") == 4, code
     assert "threads_in_group=32" in code
     assert TWO_STAGE not in code
 

@@ -386,7 +386,6 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         if _get_backend() == "triton":
             self.assertIn("tl.atomic_add", code)
 
-    @xfailIfPallas("view-backed atomic_add targets are not supported on Pallas")
     def test_basic_atomic_add_strided_target(self):
         x_base = torch.zeros(16, device=DEVICE)
         x = x_base[::2]
@@ -4673,8 +4672,16 @@ class TestFragmentPredicatePreprocessingCPU(unittest.TestCase):
                     self.assertEqual(events, [0, 1])
         compiler = object.__new__(FragmentCompiler)
         compiler.emit = lambda source: self.fail("short mask must remain unchanged")
-        self.assertEqual(compiler.predicate(["a", "b", "c"]), "a and b and c")
+        self.assertEqual(
+            ast.dump(ast.parse(compiler.predicate(["a", "b", "c"]), mode="eval")),
+            ast.dump(ast.parse("a and b and c", mode="eval")),
+        )
 
+    # Starts an interpreter that imports torch and the CuTe DSL, which the
+    # Test Budget Rules put in the slow tier; the in-process
+    # test_private_actual_sdk_preprocessor_and_legacy_scope runs the
+    # preprocessor on pull requests.
+    @pytest.mark.slow
     def test_actual_sdk_preprocesses_reservation_masks(self):
         import importlib.util
         from pathlib import Path
@@ -8521,13 +8528,13 @@ class TestFragmentBranchLocalAtomicsCPU(unittest.TestCase):
         original = FragmentCompiler.graph
         entries, exits = [], []
 
-        def graph(compiler, graph, values):
+        def graph(compiler, graph, values, *, output_indices=None):
             info = next(info for info in compiler.graphs if info.graph is graph)
             branch = isinstance(info, (IfGraphInfo, ElseGraphInfo))
             if branch:
                 entries.append(set(compiler.pending_local_atomics))
                 self.assertFalse(compiler.pending_local_atomics)
-            result = original(compiler, graph, values)
+            result = original(compiler, graph, values, output_indices=output_indices)
             if branch:
                 exits.append(set(compiler.pending_local_atomics))
             return result
@@ -9952,6 +9959,9 @@ for index in range(thread, 32, 32):
             "readonly[0] = 1\n" + text,
             "alias = hist\n" + text,
             "alias = readonly.iterator\n" + text,
+            "alias = readonly[None]\n" + text,
+            "alias = readonly[:]\n" + text,
+            "alias = readonly[...]\n" + text,
             text.replace("scope='cta'", "scope='gpu'"),
             text.replace("sem='relaxed'", "sem='release'"),
             text.replace("cute.arch.atomic_add", "previous = cute.arch.atomic_add"),
@@ -12483,12 +12493,12 @@ class TestFragmentUniformLocalBranchEpochsCPU(unittest.TestCase):
         original = FragmentCompiler.graph
         entries = []
 
-        def graph(compiler, graph, values):
+        def graph(compiler, graph, values, *, output_indices=None):
             info = next(info for info in compiler.graphs if info.graph is graph)
             if isinstance(info, (IfGraphInfo, ElseGraphInfo)):
                 self.assertFalse(compiler.pending_local_atomics)
                 entries.append(info.graph_id)
-            return original(compiler, graph, values)
+            return original(compiler, graph, values, output_indices=output_indices)
 
         x = (torch.arange(4 * 65).reshape(4, 65) % 7 - 3).to(torch.int32)
         lengths = torch.tensor([0, 3, 7, 65], dtype=torch.int32)
@@ -12946,7 +12956,10 @@ class TestUniformRegionTreeCheckpointCPU(unittest.TestCase):
         bound = self._bound()
         tree = uniform_region_tree(bound.host_function.device_ir.graphs)
         self.assertEqual(len(tree.frames), 9)
-        self.assertEqual(len(tree.auxiliary_graph_ids), 4)
+        # The roller refuses both reduction dims ("for loop with mixed
+        # reduction dim usage"), so the device IR keeps none of the loop
+        # graphs the branch bodies rolled before the refusal.
+        self.assertEqual(tree.auxiliary_graph_ids, ())
         self.assertEqual(sum(f.role == "while_body" for f in tree.frames), 2)
         self.assertEqual(sum(f.role == "if_true" for f in tree.frames), 2)
         self.assertEqual(sum(len(f.local_targets) for f in tree.frames), 4)
@@ -12965,6 +12978,20 @@ class TestUniformRegionTreeCheckpointCPU(unittest.TestCase):
             "initialize_update_final_read_epoch_transfer_and_retirement",
             tree.requirements,
         )
+
+    def test_unreachable_reduction_loop_graphs_are_auxiliary(self):
+        # A rolled reduction's loop graphs are reached by no call, and the
+        # tree keeps them beside its frames.  The fixture's dims refuse their
+        # rolls, so its device IR holds none: append one.
+        from helion._compiler.cute.uniform_region_tree import uniform_region_tree
+        from helion._compiler.device_ir import ReductionLoopGraphInfo
+
+        graphs = list(self._bound().host_function.device_ir.graphs)
+        loop = ReductionLoopGraphInfo(
+            graph_id=len(graphs), graph=torch.fx.Graph(), node_args=[], block_ids=[0]
+        )
+        tree = uniform_region_tree([*graphs, loop])
+        self.assertEqual(tree.auxiliary_graph_ids, (loop.graph_id,))
 
     def test_reused_callee_foreign_capture_and_semantic_kwargs_decline(self):
         from helion._compiler.cute.uniform_region_tree import uniform_region_tree

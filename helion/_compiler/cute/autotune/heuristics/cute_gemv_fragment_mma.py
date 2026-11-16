@@ -24,6 +24,7 @@ from ....autotuner_heuristics.registry import AutotunerHeuristic
 from ...fragment_mma_dot import FRAGMENT_MMA_K_THREADS
 from ...fragment_mma_dot import FRAGMENT_MMA_KEY
 from ...fragment_mma_dot import FRAGMENT_MMA_ROW_THREADS
+from ..flash_surface import pdl_searched
 from ..search_surface import _cute_fragment_mma_searchable
 from ..search_surface import cute_fragment_mma_fact
 from .cute import _seq_config_list
@@ -46,7 +47,7 @@ class CuteGemvFragmentMmaHeuristic(AutotunerHeuristic):
     """Eight row threads x four K threads, 32-byte packets, the dot on MMA fragments."""
 
     name = "cute_gemv_fragment_mma"
-    priority = 43
+    priority = 44
     backend = "cute"
 
     @classmethod
@@ -155,10 +156,7 @@ class CuteGemvFragmentMmaHeuristic(AutotunerHeuristic):
                 # ptxas keeps the hoisted packets in flight only with the
                 # launch bound (without it the loads sink next to the MMAs).
                 values["cute_min_blocks_per_mp"] = 1
-            capability = spec.target_device_capability
-            if spec.supports_config_key("cute_pdl") and (
-                capability is not None and capability >= (9, 0)
-            ):
+            if pdl_searched(spec):
                 values["cute_pdl"] = True
             seeds.append(Config.from_dict(deepcopy(values)))
         return seeds

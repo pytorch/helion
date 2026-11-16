@@ -112,8 +112,9 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
 
     if has_multiple_outputs:
         assert isinstance(dtype, (tuple, list))
+        # Asm not declared pure stays even when nothing reads its results.
         inline_asm_result = state.codegen.lift(
-            inline_asm_call, dce=True, prefix="inline_asm_result"
+            inline_asm_call, dce=is_pure is True, prefix="inline_asm_result"
         )
         return [
             expr_from_string(f"{inline_asm_result.id}[{i}]") for i in range(len(dtype))

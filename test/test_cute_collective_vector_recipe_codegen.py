@@ -195,7 +195,7 @@ def test_original_mamba_vector_recipe_mutating_graphs(
             reference(*arguments),
             atol=0.01,
             rtol=0.01,
-            scale_atol_by_expected_rms=True,
+            atol_scale="rms",
         )
         torch.testing.assert_close(run(), expected, rtol=0, atol=0)
         torch.testing.assert_close(replay(), expected, rtol=0, atol=0)

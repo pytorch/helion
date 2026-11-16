@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import unittest
 
+import pytest
+
 from helion._compiler.cute.passes.pipeline import DEVICE_BODY_PASSES
 from helion._compiler.cute.passes.pipeline import DEVICE_BODY_PROLOGUE
 from helion._compiler.cute.passes.pipeline import KERNEL_DEF_PASSES
 from helion._compiler.cute.passes.pipeline import DeviceBodyPass
 from helion._compiler.cute.passes.pipeline import PassContext
 from helion._compiler.cute.passes.pipeline import _check_pass_order
+
+pytestmark = pytest.mark.cpu_only
 
 # The inline call sequence of ``DeviceFunction.codegen_function_def`` as it was
 # when the pipeline moved to its tables.  Later passes recognize the shapes
@@ -16,9 +20,11 @@ from helion._compiler.cute.passes.pipeline import _check_pass_order
 # removing an entry is a deliberate, render-checked change that updates this
 # list.  The fact derivations of the inline sequence (float scalar names,
 # constexpr values, the raw launch shape, tensor dtypes, disjoint pairs, reload
-# modes, the block-grid dims) are the ``PassContext`` built ahead of the
-# prologue; ``freeze_pass_context`` seals the launch shape the prologue decided.
+# modes) are the ``PassContext`` built ahead of the prologue;
+# ``freeze_pass_context`` seals the launch shape and the block-grid dims the
+# prologue decided.
 DEVICE_BODY_PROLOGUE_NAMES = [
+    "guard_atomics_on_later_thread_axes",
     "lower_uniform_comparisons",
     "lower_collective_matmul",
     "lower_simt_gemm",
@@ -31,16 +37,19 @@ DEVICE_BODY_PROLOGUE_NAMES = [
 DEVICE_BODY_PASS_NAMES = [
     "finalize_shared_reduce_groups",
     "fuse_two_pass_loads",
+    "drop_scratch_stores",
     "vectorize_branch_local_persistent_fragments",
     "hoist_warp_reduce_from_vloop",
     "eliminate_duplicate_cluster_maxima",
     "bounded_cache_cache",
+    "peel_vector_tails",
     "vectorize_affine_tile_lanes",
     "merge_literal_offset_loads",
     "fuse_fp4_pair_dot",
     "merge_sibling_v_loops",
     "optimize_vector_reductions",
     "hoist_lane_invariant_reductions",
+    "hoist_lane_invariant_loads",
     "hoist_factored_reductions",
     "fuse_fp8_pair_decode",
     "hoist_loop_invariant_recips",
@@ -50,6 +59,7 @@ DEVICE_BODY_PASS_NAMES = [
     "plan_lane_unroll",
     "unroll_lane_loads",
     "fold_lane_reductions",
+    "stash_sibling_lane_loads",
     "split_lane_loads",
     "prefetch_reduction_packets",
     "pipeline_inner_loads",
@@ -57,7 +67,10 @@ DEVICE_BODY_PASS_NAMES = [
     "pack_fp32_constexpr_loops",
     "hoist_packed_factored_reductions",
     "pack_bf16_recurrences",
+    "divide_vector_bases",
+    "peel_partial_chunks",
     "simplify_proven_loop_bounds",
+    "merge_unproven_peels",
     "simplify_proven_bounds",
     "fuse_cluster_online_pair",
     "lower_register_row_reduction",
@@ -71,6 +84,8 @@ DEVICE_BODY_PASS_NAMES = [
     "lower_scalar_epilogue",
     "lower_philox_packets",
     "hoist_exact_invariant_divisions",
+    "cut_carried_values",
+    "jam_grid_lanes",
 ]
 
 KERNEL_DEF_PASS_NAMES = [
@@ -81,6 +96,10 @@ KERNEL_DEF_PASS_NAMES = [
     "validate_thread_axis_accesses",
     "lower_scalar_policy_loads",
     "lower_packet_store_policy",
+    "validate_shared_arenas",
+    "pack_half_extremum_folds",
+    "pair_lane_math",
+    "select_native_warp_reductions",
 ]
 
 

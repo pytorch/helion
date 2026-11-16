@@ -9,7 +9,10 @@ cutlass, so it is never imported from here) and the role-based name sets the
 passes consume; :class:`ReduceCall` records one call of the scalar family
 (``(input, 'op', identity, lane, ...)``) and renders it back to the exact
 text the emitters write.  ``test/test_cute_reduce_call.py`` asserts the
-table against the dispatchers and ``CuteBackend.library_imports``.
+table against the dispatchers and ``CuteBackend.library_imports``.  The
+dispatchers' routing and buffer sizes are in ``reduce_routing``; the column
+reduce's whole buffer (``shared_columns_elements``), which only the emitters
+and ``smem_footprint`` count, is sized here.
 """
 
 from __future__ import annotations
@@ -17,6 +20,8 @@ from __future__ import annotations
 import ast
 import dataclasses
 import enum
+
+from .reduce_routing import cooperative_column_slots
 
 
 class ReduceScope(enum.Enum):
@@ -39,6 +44,22 @@ class ReduceScope(enum.Enum):
     @property
     def helper(self) -> str:
         return self.value
+
+    @staticmethod
+    def fragment_fits(pre: int, group_span: int, count: int) -> bool:
+        """Whether ``SHARED_TWO_STAGE_FRAGMENT`` reduces ``count`` values per
+        thread of ``pre`` interleaved siblings in groups of ``group_span``
+        threads as ``count`` calls of ``SHARED_TWO_STAGE`` would, bit for
+        bit: its warp butterfly keeps a power-of-two ``pre`` of at most 32
+        apart, the groups are whole warps, and its second stage gives each of
+        a group's ``pre * count`` slots a thread
+        (``reduce_helpers._cute_grouped_reduce_shared_two_stage_fragment_body``)."""
+        return (
+            0 < pre <= 32
+            and pre & (pre - 1) == 0
+            and group_span % 32 == 0
+            and pre * count <= group_span
+        )
 
 
 def _names(*scopes: ReduceScope) -> frozenset[str]:
@@ -82,8 +103,12 @@ FP32_REDUX_REDUCES: frozenset[str] = _names(
 )
 # Shared-memory reduces keyed on the flattened CTA thread id with
 # ``group_span`` / ``group_count`` (resized once the launch shape is known).
+# The fragment form is resized like the scalar reduces it replaces, so both
+# pick the same combine order (the serial form takes a single group).
 GROUPED_SHARED_REDUCES: frozenset[str] = _names(
-    ReduceScope.SHARED_TWO_STAGE, ReduceScope.SHARED_COLUMNS
+    ReduceScope.SHARED_TWO_STAGE,
+    ReduceScope.SHARED_COLUMNS,
+    ReduceScope.SHARED_TWO_STAGE_FRAGMENT,
 )
 
 _SCALAR_SCOPES: dict[str, ReduceScope] = {
@@ -96,6 +121,30 @@ _SCALAR_SCOPES: dict[str, ReduceScope] = {
         ReduceScope.BLOCK,
     )
 }
+
+
+def shared_columns_elements(
+    pre: int, width: int, group_span: int, group_count: int, fold: str
+) -> int:
+    """Shared-memory elements ``reduce_helpers._cute_grouped_reduce_shared_columns``
+    allocates for ``width`` columns of ``group_count`` groups under ``fold``
+    (``"serial"``, ``"warp"`` or ``"cooperative"``), which the register-tile
+    emitter and ``smem_footprint`` both size: one slot per warp
+    (``pre == 1``, any fold), per warp and sibling class (the warp fold) or
+    per thread (the serial fold) of every group, per column; the cooperative
+    fold stages one per thread too and adds its output slots
+    (``cooperative_column_slots``) per group."""
+    if pre == 1:
+        per_group = group_span // 32 * width
+    elif fold == "cooperative":
+        per_group = group_span * width + cooperative_column_slots(
+            pre, width, group_span
+        )
+    elif fold == "warp":
+        per_group = group_span // 32 * pre * width
+    else:
+        per_group = group_span * width
+    return group_count * per_group
 
 
 def runtime_lane_expr(index_type: str) -> str:

@@ -18,8 +18,10 @@ import torch
 
 from ... import _compat
 from ... import exc
+from ..ast_extension import expr_from_string
 from ..backend import Backend
 from ..backend import BackendState
+from ..backend import HandlerOpOverrides
 from ..backend import LauncherInfo
 from ..backend import log
 
@@ -33,7 +35,9 @@ if TYPE_CHECKING:
     from ...runtime.config import Config
     from ...runtime.kernel import BoundKernel
     from ..autotuner_heuristics.registry import AutotunerHeuristicType
+    from ..compile_environment import CompileEnvironment
     from ..device_function import Argument
+    from ..inductor_lowering import GenerateASTFromInductor
 
     InductorOpOverrides = OpsHandler[Any]
 
@@ -55,8 +59,31 @@ def _triton_jit_supports_do_not_specialize() -> bool:
 _warned_unavailable_options: set[str] = set()
 
 
+# Under fast_math Triton also lowers torch.sigmoid with libdevice's fast exp
+# and divide (``inductor_lowering``), and the max/min reductions and
+# torch.maximum / torch.minimum to ``tl.max`` / ``tl.maximum`` without the NaN
+# propagation torch has (``TritonBackend.reduction_expr``, ``overrides.py``);
+# the CuTe backend keeps its sigmoid and the NaN-propagating forms either way.
+_TRITON_FAST_MATH: dict[object, str] = {
+    torch.ops.aten.sigmoid.default: "sigmoid",
+    torch.ops.aten.amax.default: "max/min reductions",
+    torch.ops.aten.amin.default: "max/min reductions",
+    torch.ops.aten.maximum.default: "maximum/minimum",
+    torch.ops.aten.minimum.default: "maximum/minimum",
+}
+
+
 class TritonBackend(Backend):
     """Triton code generation backend."""
+
+    _pre_inductor_squeeze = True
+
+    def scalar_literal_expr(self, value: float | bool) -> str:
+        if isinstance(value, float) and value == 0 and math.copysign(1.0, value) < 0:
+            # Older Triton scalar_constant() replaces either zero sign with
+            # get_null_value. Use the same bitcast as tensor constants.
+            return self.inductor_op_overrides().constant(value, torch.float32)
+        return super().scalar_literal_expr(value)
 
     def supports_block_ptr_indexing(self) -> bool:
         from ..._compat import supports_block_ptr
@@ -67,6 +94,9 @@ class TritonBackend(Backend):
     @property
     def name(self) -> str:
         return "triton"
+
+    def handler_op_overrides(self) -> HandlerOpOverrides:
+        return TritonHandlerOpOverrides()
 
     def llm_prompt_profile(self) -> LlmPromptProfile:
         from ...autotuner.llm.profile import LlmPromptProfile
@@ -91,12 +121,23 @@ class TritonBackend(Backend):
         return True
 
     @property
+    def lowers_mask_select(self) -> bool:
+        return True
+
+    @property
     def merges_reduction_dims(self) -> bool:
         return True
 
     @property
     def warns_fast_math_unused(self) -> bool:
         return True
+
+    def fast_math_name(self, node: torch.fx.Node) -> str | None:
+        from ..inductor_lowering import functional_target
+
+        return _TRITON_FAST_MATH.get(functional_target(node)) or super().fast_math_name(
+            node
+        )
 
     @property
     def supports_autotune_multi(self) -> bool:
@@ -245,44 +286,25 @@ class TritonBackend(Backend):
     def finalize_ephemeral_cache(
         self, bound_kernel: BoundKernel[Any], config: Config
     ) -> None:
-        from ...runtime.config import Config
-
-        self._clear_triton_jit_cache(bound_kernel, config)
-        evict = config
-        if bound_kernel._compile_cache.pop(evict, None) is None:
-            default = bound_kernel.config_spec.default_config()
-            # pyrefly: ignore [bad-argument-type]
-            evict = Config(**(default.config | config.config))
-            bound_kernel._compile_cache.pop(evict, None)
-        bound_kernel._cache_path_map.pop(evict, None)
-
-    def _clear_triton_jit_cache(
-        self, bound_kernel: BoundKernel[Any], config: Config
-    ) -> None:
         """Clear Triton's in-memory JIT cache for the compiled kernel.
 
         After autotuning in an ephemeral cache dir, device_caches on the
         JITFunction still holds the compiled binary.  Clearing it forces
         Triton to recompile (and write to TRITON_CACHE_DIR) on the next call.
 
-        If the config was minimized by the autotuner, the lookup is retried
-        with the full config (defaults merged back in).
+        Clear every equivalent wrapper, including when the autotuner minimized
+        the winning config and rendered a new wrapper without launching it.
         """
-        from ...runtime.config import Config
-
-        compiled_fn = bound_kernel._compile_cache.get(config)
-        if compiled_fn is None:
-            default = bound_kernel.config_spec.default_config()
-            # pyrefly: ignore [bad-argument-type]
-            full_config = Config(**(default.config | config.config))
-            compiled_fn = bound_kernel._compile_cache.get(full_config)
-        if compiled_fn is None:
-            return
-        triton_jit_fn = compiled_fn.__globals__.get(
-            f"_helion_{bound_kernel.kernel.name}"
-        )
-        if triton_jit_fn is not None and hasattr(triton_jit_fn, "device_caches"):
-            triton_jit_fn.device_caches.clear()
+        for stored_config, compiled_fn in bound_kernel._matching_compiled_configs(
+            config
+        ):
+            triton_jit_fn = compiled_fn.__globals__.get(
+                f"_helion_{bound_kernel.kernel.name}"
+            )
+            if triton_jit_fn is not None and hasattr(triton_jit_fn, "device_caches"):
+                triton_jit_fn.device_caches.clear()
+            bound_kernel._compile_cache.pop(stored_config, None)
+            bound_kernel._cache_path_map.pop(stored_config, None)
 
     def compiled_cache_key(
         self, bound_kernel: BoundKernel[Any], compiled_fn: object
@@ -348,6 +370,13 @@ class TritonBackend(Backend):
 
     def where_expr(self, mask: str, true_val: str, false_val: str) -> str:
         return f"tl.where({mask}, {true_val}, {false_val})"
+
+    def mask_padded_range_lanes(
+        self, value: str, length: int, dim: int, ndim: int, identity: str
+    ) -> str | None:
+        from ..indexing_strategy import padded_lanes_mask
+
+        return self.where_expr(padded_lanes_mask(length, dim, ndim), value, identity)
 
     def minimum_expr(self, a: str, b: str) -> str:
         return f"tl.minimum({a}, {b})"
@@ -534,6 +563,8 @@ class TritonBackend(Backend):
             )
         if reduction_type == "prod":
             return f"triton_helpers.prod({input_name}, {dim})"
+        if reduction_type == "any":
+            return f"triton_helpers.any({input_name}, {dim})"
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
 
     def reduction_combine_expr(
@@ -593,8 +624,13 @@ class TritonBackend(Backend):
     def full_expr(
         self, shape_dims: list[str], value_expr: str, dtype: torch.dtype
     ) -> str:
+        full = (
+            "tl.full"
+            if dtype.is_floating_point or dtype.is_complex
+            else "helion_triton_helpers.integer_full"
+        )
         return (
-            f"tl.full([{', '.join(shape_dims)}], {value_expr}, {self.dtype_str(dtype)})"
+            f"{full}([{', '.join(shape_dims)}], {value_expr}, {self.dtype_str(dtype)})"
         )
 
     def effective_num_warps(self, config: Config) -> int:
@@ -745,9 +781,43 @@ class TritonBackend(Backend):
         out.extend(self.launcher_keyword_args(config, has_barrier=has_barrier))
         return out
 
+    def pdl_capability(self, env: CompileEnvironment) -> tuple[int, int] | None:
+        return env.ptx_capability
+
+    def pdl_instruction(self, operation: str) -> str:
+        return {
+            "wait": "tl.extra.cuda.gdc_wait()",
+            "launch_dependents": "tl.extra.cuda.gdc_launch_dependents()",
+        }[operation]
+
     @staticmethod
     def reserved_launch_param_names() -> frozenset[str]:
         return frozenset({"grid", "warmup", "num_warps", "num_stages"})
+
+
+class TritonHandlerOpOverrides(HandlerOpOverrides):
+    def div_rn(
+        self, handler: GenerateASTFromInductor, a: object, b: object
+    ) -> str | None:
+        # Triton's ``/`` is ``div.full.f32``: a reciprocal and a multiply,
+        # within 2 ulp.  ``tl.div_rn`` is ``div.rn.f32``; like ``/`` it
+        # divides in fp32 (half-precision and integer operands are promoted
+        # first) and the result stays fp32, for the consumer to cast.
+        return handler._lift(
+            expr_from_string(
+                "tl.div_rn({a}, {b})",
+                a=handler._create_cast_expr(a, torch.float32),
+                b=handler._create_cast_expr(b, torch.float32),
+            )
+        )
+
+
+class TileIRHandlerOpOverrides(TritonHandlerOpOverrides):
+    def div_rn(
+        self, handler: GenerateASTFromInductor, a: object, b: object
+    ) -> str | None:
+        # ``tl.div_rn`` was not tried on TileIR: it keeps ``/``.
+        return None
 
 
 class TileIRBackend(TritonBackend):
@@ -756,6 +826,9 @@ class TileIRBackend(TritonBackend):
     @property
     def name(self) -> str:
         return "tileir"
+
+    def handler_op_overrides(self) -> HandlerOpOverrides:
+        return TileIRHandlerOpOverrides()
 
     def llm_prompt_profile(self) -> LlmPromptProfile:
         # The prompts name this backend by its registry name.

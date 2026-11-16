@@ -19,8 +19,10 @@ from helion._compiler.cute.autotune.heuristics.cute_launch_bounds import MIN_BLO
 from helion._compiler.cute.autotune.heuristics.cute_launch_bounds import (
     register_matmul_min_blocks_coverage,
 )
+from helion._compiler.cute.pdl_release import resident_ctas_per_sm
 from helion._testing import cpu_render_target
 from helion._testing import import_example
+from helion._testing import patch_target_facts
 from helion.autotuner import LFBOTreeSearch
 from helion.autotuner.compiler_coverage import CoverageDependency
 from helion.autotuner.config_generation import ConfigGeneration
@@ -40,6 +42,7 @@ squeeze_and_excitation_net_fwd = import_example(
 ).squeeze_and_excitation_net_fwd
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Generator
     from collections.abc import Sequence
 
@@ -371,29 +374,7 @@ def test_global_zero_and_disabled_heuristics_veto_automatic_additions(
 def test_option_reaches_the_real_first_benchmark() -> None:
     bound, args = _bind()
     search = _search(bound, args)
-    search._autotune_metrics = AutotuneMetrics()
-    delivered = []
-
-    class HeldBenchmark(Exception):
-        pass
-
-    def hold(
-        members: Sequence[PopulationMember],
-        *,
-        desc: str,
-        raise_if_no_viable_config: bool = True,
-    ) -> None:
-        assert desc == "Initial population"
-        delivered.extend(deepcopy(member.config) for member in members)
-        raise HeldBenchmark
-
-    with (
-        bound.env,
-        patch.object(search, "benchmark_population", side_effect=hold),
-        pytest.raises(HeldBenchmark),
-    ):
-        random.seed(2026091469)
-        search._autotune()
+    delivered = _first_benchmark(search, bound, seed=2026091469)
     candidates = [
         entry.effective
         for entry in search.compiler_coverage_outcomes
@@ -415,13 +396,13 @@ def test_malformed_coverage_requests_cannot_count(value: object) -> None:
         bound.config_spec.create_config_generation().strict_config_pair(requested)
 
 
-def test_existing_simt_domain_and_default_are_unchanged() -> None:
+def test_simt_domain_and_default_are_independent_of_matmul_coverage() -> None:
     with patch(REGISTRATION):
         previous, _ = _bind("softmax")
     bound, _ = _bind("softmax")
     spec = bound.config_spec
     assert not spec.cute_matmul_min_blocks_search_enabled
-    assert spec._flat_fields()[MIN_BLOCKS_KEY].choices == (0, 1, 2, 3, 4, 6)
+    assert spec._flat_fields()[MIN_BLOCKS_KEY].choices == (0, 1, 2, 3, 4, 6, 8, 10)
     assert (
         spec.structural_fingerprint() == previous.config_spec.structural_fingerprint()
     )
@@ -430,6 +411,199 @@ def test_existing_simt_domain_and_default_are_unchanged() -> None:
     )
     assert spec.compiler_seed_configs == previous.config_spec.compiler_seed_configs
     assert spec.default_config() == previous.config_spec.default_config()
+
+
+@pytest.mark.parametrize(
+    ("threads", "min_blocks", "resident"), ((128, 10, 10), (256, 10, 8), (1024, 8, 2))
+)
+def test_counts_past_six_are_bounded_by_the_thread_limit(
+    threads: int, min_blocks: int, resident: int
+) -> None:
+    """The PDL release's residency estimate takes 8 or 10 resident CTAs as
+    asked where an SM holds that many blocks (ten 128-thread CTAs fit in its
+    2048 threads) and the thread limit where it does not (8 CTAs of 256
+    threads, 2 of 1024), where ptxas ignores the count."""
+    assert resident_ctas_per_sm(threads, min_blocks) == resident
+
+
+def _flat_quotient(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    flat_x = x.view(-1)
+    flat_y = y.view(-1)
+    out = torch.empty_like(flat_x)
+    for tile in hl.tile(flat_x.size(0)):
+        out[tile] = (flat_x[tile].float() / (flat_y[tile].float() + 1.0)).to(out.dtype)
+    return out
+
+
+def _tile_sum(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile(x.size()):
+        out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n]
+    return out
+
+
+def _bind_pointwise(
+    function: Callable[..., torch.Tensor],
+    shape: tuple[int, ...],
+    **settings: object,
+) -> tuple[BoundKernel, tuple[torch.Tensor, ...]]:
+    kernel = helion.kernel(
+        function,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="full",
+        **settings,
+    )
+    args = tuple(torch.empty(shape, dtype=torch.bfloat16) for _ in "xy")
+    return kernel.bind(args), args
+
+
+def _pointwise_seeds(bound: BoundKernel) -> list[helion.Config]:
+    """The compiler seeds of the register-cap pair: 128-element tiles on
+    128 threads."""
+    return [
+        seed
+        for seed in bound.config_spec.compiler_seed_configs
+        if seed.config.get("block_sizes") == [128]
+        and seed.config.get("num_threads") == [128]
+    ]
+
+
+class _HeldBenchmark(Exception):
+    pass
+
+
+def _first_benchmark(
+    search: LFBOTreeSearch, bound: BoundKernel, seed: int = 2026111001
+) -> list[helion.Config]:
+    """The configs the search hands its first benchmark, the initial
+    population, the search held there."""
+    search._autotune_metrics = AutotuneMetrics()
+    delivered: list[helion.Config] = []
+
+    def hold(
+        members: Sequence[PopulationMember],
+        *,
+        desc: str,
+        raise_if_no_viable_config: bool = True,
+    ) -> None:
+        assert desc == "Initial population"
+        delivered.extend(deepcopy(member.config) for member in members)
+        raise _HeldBenchmark
+
+    with (
+        bound.env,
+        patch.object(search, "benchmark_population", side_effect=hold),
+        pytest.raises(_HeldBenchmark),
+    ):
+        random.seed(seed)
+        search._autotune()
+    return delivered
+
+
+def test_a_flat_pointwise_tile_gets_a_ten_cta_seed_and_its_control() -> None:
+    """A one-dimensional pointwise tile, here over gsw_dHdT's bf16
+    [204, 204, 26] viewed flat, gets two compiler seeds: its default retiled
+    to one element per thread in 128-thread CTAs, at 10 resident CTAs per SM
+    and at 0.  Both reach the first benchmark, beside random draws that
+    still cover the count: no coverage group owns the field."""
+    bound, args = _bind_pointwise(_flat_quotient, (204, 204, 26))
+    witness, control = _pointwise_seeds(bound)
+    assert witness.config[MIN_BLOCKS_KEY] == 10
+    assert control.config.get(MIN_BLOCKS_KEY, 0) == 0
+    assert "_helion_cute_min_blocks_per_mp = 10" in bound.to_code(witness)
+    assert all(
+        group.key != MIN_BLOCKS_KEY
+        for group in bound.config_spec.compiler_coverage_groups
+    )
+    search = _search(bound, args)
+    delivered = _first_benchmark(search, bound)
+    seeds = {
+        config
+        for _flat, config in search.config_gen.seed_flat_config_pairs()
+        if config.config.get("block_sizes") == [128]
+        and config.config.get("num_threads") == [128]
+    }
+    assert len(seeds) == 2 and seeds <= set(delivered)
+    assert len({config.config.get(MIN_BLOCKS_KEY, 0) for config in delivered}) > 4
+
+
+def test_reductions_n_d_tiles_and_one_wave_grids_get_no_pointwise_seeds() -> None:
+    # 1184 CTAs of 128 elements fit at 8 per SM on the 148 SMs of the B200
+    # these bind for: one wave already, so the cap would add no warps.  At
+    # 1185 the cap's 10 per SM folds a second wave into the first.
+    bound, _ = _bind("softmax")
+    assert _pointwise_seeds(bound) == []
+    bound, _ = _bind_pointwise(_tile_sum, (1024, 1024))
+    assert _pointwise_seeds(bound) == []
+    bound, _ = _bind_pointwise(_flat_quotient, (1184, 128))
+    assert bound.config_spec.num_sm == 148
+    assert _pointwise_seeds(bound) == []
+    bound, _ = _bind_pointwise(_flat_quotient, (1185, 128))
+    assert len(_pointwise_seeds(bound)) == 2
+
+
+def test_a_flat_pointwise_tile_keys_its_binding_on_the_sm_count() -> None:
+    """1100 CTAs run in one wave on the 148 SMs of a B200 but not on 132, so
+    the binding without the pair keys on the SM count too: on a device with
+    fewer SMs the kernel binds again, and that binding gets the pair.  A
+    tile the seeds never reach keeps the count out of its key."""
+    bound, _ = _bind_pointwise(_flat_quotient, (1100, 128))
+    assert _pointwise_seeds(bound) == []
+    (extractor,) = bound._compiler_seed_specialization_extractors
+    device = torch.device("cuda", 0)
+    assert extractor.for_device(device) == ("config_num_sm", 148)
+    with patch_target_facts(num_sm=132):
+        assert extractor.for_device(device) == ("config_num_sm", 132)
+        bound, _ = _bind_pointwise(_flat_quotient, (1100, 128))
+    assert len(_pointwise_seeds(bound)) == 2
+    assert {
+        extractor.fact for extractor in bound._compiler_seed_specialization_extractors
+    } == {"config_num_sm"}
+    bound, _ = _bind_pointwise(_tile_sum, (1024, 1024))
+    assert bound._compiler_seed_specialization_extractors == ()
+
+
+def test_disabled_heuristics_leave_the_count_to_the_random_draws() -> None:
+    """With heuristics disabled the kernel gets neither seed, and the search
+    samples the count as it does without them: nothing freezes the field."""
+    bound, _ = _bind_pointwise(
+        _flat_quotient, (204, 204, 26), disable_autotuner_heuristics=True
+    )
+    assert _pointwise_seeds(bound) == []
+    generation = bound.config_spec.create_config_generation(
+        compiler_coverage_enabled=False
+    )
+    (index,), _ = generation._key_to_flat_indices[MIN_BLOCKS_KEY]
+    assert index not in generation.overridden_flat_indices
+    random.seed(2026111001)
+    assert len({generation.random_flat()[index] for _ in range(64)}) > 4
+
+
+def test_an_out_of_domain_count_override_leaves_the_coverage_groups_valid() -> None:
+    """A global override of the count that no automatic choice holds
+    (``cute_min_blocks_per_mp=5``) reaches the seeds through the transfer
+    every seed takes, and leaves every coverage group's witnesses valid."""
+    bound, args = _bind_pointwise(
+        _flat_quotient,
+        (204, 204, 26),
+        autotune_config_overrides={MIN_BLOCKS_KEY: 5},
+    )
+    search = _search(bound, args)
+    _first_benchmark(search, bound)
+    assert search.compiler_coverage_outcomes
+    assert not [
+        entry
+        for entry in search.compiler_coverage_outcomes
+        if entry.outcome.startswith("invalid")
+    ]
+    seeds = [config for _flat, config in search.config_gen.seed_flat_config_pairs()]
+    assert all(config.config.get(MIN_BLOCKS_KEY) == 5 for config in seeds)
+    assert any(
+        config.config.get("block_sizes") == [128]
+        and config.config.get("num_threads") == [128]
+        for config in seeds
+    )
 
 
 def test_flat_zero_preserves_public_config_and_generated_source() -> None:

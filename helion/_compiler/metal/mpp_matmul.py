@@ -65,7 +65,6 @@ import dataclasses
 import math
 import operator
 from typing import TYPE_CHECKING
-from typing import TypeGuard
 from typing import cast
 
 import torch
@@ -105,11 +104,15 @@ from .factored_dims import widened_iota
 from .free_arange import live_graphs
 from .lane_fold import BF16_CAST
 from .lane_fold import LANE_FOLD
+from .lane_fold import LANE_PUT
 from .lane_fold import MAX_LANE_COPIES
 from .lane_fold import LaneArrayBudget
 from .lane_fold import LaneJam
 from .lane_fold import const_extent
 from .lane_fold import folded_lanes
+from .lane_fold import is_lane_loop
+from .lane_fold import load_mask_other
+from .lane_fold import tl_load
 from .msl_expr import PURE_CALLS
 from .msl_reduction import REDUCTION_NAMESPACE
 from .reduction import alloc_threadgroup_buffer
@@ -123,6 +126,7 @@ if TYPE_CHECKING:
     from torch.fx.graph import Graph
 
     from ..aten_lowering import LoweringContext
+    from ..device_ir import ForLoopGraphInfo
     from ..device_ir import GraphInfo
     from ..device_ir import IfGraphInfo
     from ..generate_ast import GenerateAST
@@ -159,8 +163,14 @@ ROUND_PREAMBLE = f"""inline float {ROUND}(float v) {{
     uint r = (u & 0x7FFFFFFFu) > 0x7F800000u ? (u | 0x00400000u) : u + 0x7FFFu + ((u >> 16) & 1u);
     return as_type<float>(r & 0xFFFF0000u);
 }}"""
-BF16_CAST_PREAMBLE = f"""inline bfloat {BF16_CAST}(float v) {{
-    return as_type<bfloat>(ushort(as_type<uint>({ROUND}(v)) >> 16));
+#: A bfloat operand is already rounded: its overload returns it as is, as
+#: ``static_cast<bfloat>`` would, NaN payload included.
+BF16_CAST_PREAMBLE = f"""template <typename T>
+inline bfloat {BF16_CAST}(T v) {{
+    return as_type<bfloat>(ushort(as_type<uint>({ROUND}(float(v))) >> 16));
+}}
+inline bfloat {BF16_CAST}(bfloat v) {{
+    return v;
 }}"""
 
 #: Each matmul's (acc, lhs, rhs) argument positions; None for no acc.  The
@@ -295,6 +305,9 @@ class _View:
     dims: tuple[_Dim, _Dim]
     #: The tensor dims the op's two dims read.
     positions: tuple[int, int]
+    #: Their strides, compile-time facts: the descriptor's transpose flag
+    #: and the view's unit-stride dim depend on them.
+    strides: tuple[int, int]
     #: ``(tensor dim, index)`` of every other dim, each a uniform integer.
     outer: tuple[tuple[int, Node | int], ...]
     #: ``(tensor dim, block)`` of a batched matmul's batch tile, whose one
@@ -455,9 +468,9 @@ class _Graphs:
         return self.infos[gid]
 
     def if_branch(self, gid: object) -> tuple[IfGraphInfo, list[tuple[int | str, ...]]]:
-        """An if branch graph's info and its ``branches_outputs``: per output
-        of the ``_if``, its slot in each branch graph's output, or the name an
-        else branch leaves as it was."""
+        """An if branch graph's info and its ``branches_outputs``: per
+        variable the ``_if`` gives back, its slot in each branch graph's
+        output, or its name for the branch that leaves it as it was."""
         from ..device_ir import IfGraphInfo
 
         info = self.info(gid)
@@ -682,10 +695,6 @@ def _view(
         raise _NotAView("an MPP view whose subscript does not index every tensor dim")
     if tensor.dtype not in _DTYPES:
         raise _unsupported(f"an MPP operand of dtype {tensor.dtype}")
-    if not all(isinstance(x, int) for x in (*tensor.shape, *tensor.stride())):
-        # The descriptor's transpose flag and the view's unit-stride dim are
-        # compile-time facts.
-        raise _NotAView("an MPP view of a tensor with symbolic sizes or strides")
     positions: list[int] = []
     outer: list[tuple[int, Node | int]] = []
     batch_dim: tuple[int, int] | None = None
@@ -712,7 +721,16 @@ def _view(
             outer.append((b, 0))
         else:
             raise _NotAView("an MPP view whose batch index is not the batch tile")
-    if 1 not in (tensor.stride(positions[0]), tensor.stride(positions[1])):
+    # The matrix dims' strides decide the descriptor's transpose flag and the
+    # view's unit-stride dim, so they must be compile-time facts.  A symbolic
+    # size, or an outer dim's stride, only moves the handle's base or bounds
+    # its extents, which the view reads at run time (_view_args).
+    env = CompileEnvironment.current()
+    known = [env.known_stride(tensor, p) for p in positions]
+    if None in known:
+        raise _NotAView("an MPP view whose matrix dims have run-time strides")
+    strides = cast("list[int]", known)
+    if 1 not in strides:
         raise _NotAView("an MPP view without a unit stride")
     first = rank - 2
     value_dims = [
@@ -726,11 +744,17 @@ def _view(
     if transposed:
         value_dims.reverse()
         positions.reverse()
+        strides.reverse()
     view_dims = (value_dims[0], value_dims[1])
     if tuple((d.block_id, d.factor) for d in view_dims) != dims:
         raise _unsupported("an MPP view whose dims are not the matmul's blocks")
     return _View(
-        tensor, view_dims, (positions[0], positions[1]), tuple(outer), batch_dim
+        tensor,
+        view_dims,
+        (positions[0], positions[1]),
+        (strides[0], strides[1]),
+        tuple(outer),
+        batch_dim,
     )
 
 
@@ -1073,10 +1097,13 @@ def _static_tile(block: int) -> int | None:
     """The block's tile when no config changes it: a ``:`` slice's length
     rounded up to a power of two, a fixed block size, or 1 over an extent of
     1; None otherwise."""
+    from .backend import static_extent
+
     env = CompileEnvironment.current()
     info = env.block_sizes[block]
     if info.reduction:
-        return next_power_of_2(info.size) if isinstance(info.size, int) else None
+        extent = static_extent(info.size)
+        return next_power_of_2(extent) if extent is not None else None
     source = info.block_size_source
     if isinstance(source, FixedBlockSizeSource):
         return source.value if isinstance(source.value, int) else None
@@ -1126,14 +1153,13 @@ def _dot_admissible(matmul: Node, dot_ks: set[int]) -> bool:
 def _matmul_derived(node: Node, graphs: _Graphs) -> bool:
     """Whether a matmul's result reaches ``node``: through its producers,
     each placeholder's value from the enclosing graph, each loop-carried
-    placeholder's carried-back value and each for loop's output value in its
-    body, up to loads and shape reads.
+    placeholder's carried-back value, each for loop's output value in its
+    body and each ``if`` result's branch output, or the outer value a branch
+    passes through, up to loads and shape reads.
 
     Unlike :func:`_producers`, which stops at a carried placeholder (a staged
     operand's positional check needs only its first-iteration value), this
-    follows every value an operand can hold.  It has no ``_if`` output edge:
-    an ``if`` output that reaches an ``hl.dot`` operand fails in the
-    frontend's masked-value pass (``node_masking.getitem_masked_value``)."""
+    follows every value an operand can hold."""
     work = [node]
     seen: set[Node] = set()
     while work:
@@ -1165,8 +1191,28 @@ def _matmul_derived(node: Node, graphs: _Graphs) -> bool:
             if isinstance(value, Node):
                 work.append(value)
             continue
+        if isinstance(flow, Node) and flow.target is _tracing_ops._if:
+            value = _if_result(flow, cast("int", n.args[1]), graphs)
+            if value is not None:
+                work.append(value)
+            continue
         work += n.all_input_nodes
     return False
+
+
+def _if_result(if_node: Node, index: int, graphs: _Graphs) -> Node | None:
+    """The value result ``index`` of ``if_node`` takes: a branch output, or
+    for a variable only the other branch writes, the outer value this branch
+    passes through (``IfGraphInfo.result_source``); None for a value that is
+    not a node."""
+    info, _ = graphs.if_branch(if_node.args[1])
+    source = info.result_source(if_node, index)
+    if not isinstance(source, tuple):
+        return source
+    graph_id, slot = source
+    (output,) = graphs.info(graph_id).graph.find_nodes(op="output")
+    value = _seq(output.args[0])[slot]
+    return value if isinstance(value, Node) else None
 
 
 def _plan_group(gid: int, matmul: Node, k_loop_block: int, graphs: _Graphs) -> MppGroup:
@@ -1574,7 +1620,12 @@ def _stage_in_float(group: MppGroup, plan: MppPlan, graphs: _Graphs) -> None:
             or operand.hoist is not None
             or operand.elements is not None
             or operand.dtype != torch.bfloat16
-            or (in_for and _reloaded(node, graphs.info(loop.args[0]).graph, graphs))
+            or (
+                in_for
+                and _reloaded(
+                    node, cast("ForLoopGraphInfo", graphs.info(loop.args[0])), graphs
+                )
+            )
         ):
             continue
         if not in_for or group.k_factor != 1:
@@ -1732,18 +1783,28 @@ def _enclosing_loop(graph: Graph, graphs: _Graphs) -> Node | None:
         graph = owner.graph
 
 
-def _reloaded(node: Node, body: Graph, graphs: _Graphs) -> bool:
-    """Whether every value *node* is computed from is a load inside *body*
-    or a constant fill.  A load ends its path: its index and mask decide
-    where it reads, not whether the loop reloads it."""
+def _reloaded(node: Node, loop: ForLoopGraphInfo, graphs: _Graphs) -> bool:
+    """Whether every value *node* is computed from is a load inside *loop*'s
+    body, a constant fill, or the index of a tile *loop* iterates beside such
+    a load (the nibble a dequantized weight element takes from its loaded
+    word is ``tile_k.index % 8``; the index alone may repeat its values every
+    iteration).  A load ends its path: its index and mask decide where it
+    reads, not whether the loop reloads it."""
     work, seen = [node], {node}
+    loaded = indexed = False
     while work:
         n = graphs.origin(work.pop())
         if n.op != "call_function":
             return False
         if n.target is load:
-            if not graphs.within(n.graph, body):
+            if not graphs.within(n.graph, loop.graph):
                 return False
+            loaded = True
+            continue
+        if n.target is tile_index:
+            if _block(n.meta["val"].size(0)) not in loop.block_ids:
+                return False
+            indexed = True
             continue
         if n.target is full:
             value = n.args[1]
@@ -1762,7 +1823,7 @@ def _reloaded(node: Node, body: Graph, graphs: _Graphs) -> bool:
             if i not in seen:
                 seen.add(i)
                 work.append(i)
-    return True
+    return loaded or not indexed
 
 
 def _launch_constant(val: object) -> bool:
@@ -2400,17 +2461,21 @@ def _check_uniform(node: Node, graphs: _Graphs) -> None:
 
 def _live_exit(node: Node, output: Node, graphs: _Graphs) -> bool:
     """Whether a getitem of the graph's owner reads one of ``output``'s slots
-    that hold ``node``.  An if graph outputs every name it writes, so a slot
-    no getitem reads is dead."""
+    that hold ``node``.  A branch graph also outputs the variables local to
+    it, which the ``_if`` does not give back, so their slots are dead."""
     owner = graphs.owner(output)
     if owner is None:
         return True
     slots = {i for i, v in enumerate(_seq(output.args[0])) if v is node}
     if owner.target is _tracing_ops._if:
+        info, _ = graphs.if_branch(owner.args[1])
         gid = graphs.graph_id[output.graph]
-        _, branches = graphs.if_branch(gid)
-        side = 0 if gid == owner.args[1] else 1
-        slots = {i for i, pair in enumerate(branches) if pair[side] in slots}
+        live = {(gid, slot) for slot in slots}
+        return any(
+            u.target is operator.getitem
+            and info.result_source(owner, cast("int", u.args[1])) in live
+            for u in owner.users
+        )
     return any(u.target is operator.getitem and u.args[1] in slots for u in owner.users)
 
 
@@ -2482,7 +2547,7 @@ def _plan() -> MppPlan:
 def _transposed(operand: _Operand) -> bool:
     """A staged tile is written row-major."""
     view = operand.view
-    return view is not None and view.tensor.stride(view.positions[1]) != 1
+    return view is not None and view.strides[1] != 1
 
 
 def _sides(group: MppGroup) -> tuple[tuple[_Operand, tuple[int, int], int], ...]:
@@ -2885,11 +2950,16 @@ def _group_blocks(group: MppGroup) -> set[int]:
     index tiles included.  The planner admits a seed, an update's operands,
     an epilogue's and a store's only over the group's own blocks or as 0-d
     values, so threads that differ on any other block hold the same element
-    of every value the group stages or reads per element."""
+    of every value the group stages or reads per element.  A loaded host
+    tensor's dims are host extents, not blocks; only its load's are."""
     nodes = {group.matmul, *(n for n in _operands(group.matmul) if n is not None)}
     blocks: set[int] = set()
     for n in nodes:
         for v in (n, *n.all_input_nodes):
+            if v.target is _tracing_ops._host_tensor:
+                # An extent that equals a reduction dim's size would
+                # resolve to that block.
+                continue
             val = v.meta.get("val")
             sizes = val.size() if isinstance(val, torch.Tensor) else (val,)
             # _block maps only ints and SymInts; a float kernel argument's
@@ -2925,7 +2995,7 @@ def _view_args(
     list[str],
     list[tuple[int, str | None]],
     list[bool],
-    list[tuple[str, int, int, str | None]],
+    list[tuple[str, str, str, str | None]],
 ]:
     """``tensor, (origin, extent, size, stride) per dim`` for ``_helion_mpp_run``,
     the anchors through which :class:`_Copies` reads a base or a bound,
@@ -2941,24 +3011,38 @@ def _view_args(
     computed and at the load itself; each anchor names that statement's
     target.
     """
+    from .backend import static_extent
+
     fn = cg.device_function
     t = view.tensor
     value_anchor = value.id if isinstance(value, ast.Name) else None
+
+    def size_of(i: int) -> tuple[int | None, str]:
+        """Dim *i*'s size as an int (None: symbolic, read at run time) and
+        as text."""
+        size = static_extent(t.size(i))
+        return size, str(size) if size is not None else fn.literal_expr(t.size(i))
+
+    def stride_text(i: int) -> str:
+        # Read at run time unless the kernel fixes it.
+        return fn.tensor_stride(t, i).name
+
     parts = [fn.tensor_arg(t).name]
     anchors: list[tuple[int, str | None]] = []
     always_live: list[bool] = []
-    for dim, i in zip(view.dims, view.positions, strict=True):
-        size, stride = int(t.size(i)), int(t.stride(i))
+    for dim, i, stride in zip(view.dims, view.positions, view.strides, strict=True):
+        size, size_expr = size_of(i)
         if dim.full:
-            parts += ["0", str(size), str(size), str(stride)]
+            parts += ["0", size_expr, size_expr, str(stride)]
             always_live.append(True)
             continue
         if dim.factor != 1:
             always_live.append(True)
             # A widened hl.arange covers [c * begin, c * end) of K, and the
             # load's lowering (factored_dims._check_extent) proved the dim is
-            # c x the loop's end: the view's extent, the dim's size, is the
-            # live K.
+            # c x the loop's end, a literal: the view's extent, the dim's
+            # size, is the live K.
+            assert size is not None
             info = cg.active_device_loops[dim.block_id][-1].block_id_to_info[
                 dim.block_id
             ]
@@ -2981,8 +3065,12 @@ def _view_args(
             # from the same base.  Rows and columns past M's and N's loop ends
             # are computed but never stored: the element loop re-runs the
             # store's mask.
+            # Only an end every call the kernel serves matches: a literal K
+            # can match a dynamic loop end in the first call alone.
             if dim.block_id == k_block and not (
-                base is None and info is not None and info.is_end_matching(size)
+                base is None
+                and info is not None
+                and info.is_end_matching_keyed(t.size(i))
             ):
                 assert info is not None and info.end_var_name is not None
                 extent = (
@@ -2994,38 +3082,48 @@ def _view_args(
                     anchors.append((len(parts) + 1, _anchor(dim.index)))
                 always_live.append(False)
             else:
-                extent = str(size)
+                extent = size_expr
                 always_live.append(base is None)
         else:
             always_live.append(False)
             origin = "0" if dim.base is None else _expr(dim.base)
             if dim.bound is None:
-                extent = str(size)
-            elif isinstance(dim.bound, int):
-                # Clamped here: the walker prints a literal extent with no min.
+                extent = size_expr
+            elif isinstance(dim.bound, int) and size is not None:
+                # Clamped here: the walker prints a literal extent beside a
+                # literal size with no min.
                 extent = str(max(0, min(dim.bound, size)))
+            elif isinstance(dim.bound, int):
+                # The walker clamps an extent beside a symbolic size to it.
+                extent = str(max(0, dim.bound))
             else:
                 extent = _expr(dim.bound)
             if dim.base is not None:
                 anchors.append((len(parts), _anchor(dim.index)))
             if isinstance(dim.bound, Node):
                 anchors.append((len(parts) + 1, _anchor(dim.mask)))
-        parts += [origin, extent, str(size), str(stride)]
-    outer: list[tuple[str, int, int, str | None]] = []
+        parts += [origin, extent, size_expr, str(stride)]
+    outer: list[tuple[str, str, str, str | None]] = []
     for i, x in view.outer:
-        size, stride = int(t.size(i)), int(t.stride(i))
         if isinstance(x, int):
             # A negative literal counts from the end, as the Scalar load reads it.
-            outer.append((str(x + size if x < 0 else x), size, stride, None))
+            size, size_expr = size_of(i)
+            if x < 0:
+                if size is None:
+                    raise _unsupported(
+                        "an MPP view indexed from the end of a symbolic dim"
+                    )
+                x += size
+            outer.append((str(x), size_expr, stride_text(i), None))
             continue
         val = x.meta["val"]
         # A SymInt prints as the Scalar load prints its index.
         expr = fn.literal_expr(val) if isinstance(val, torch.SymInt) else _expr(x)
-        outer.append((expr, size, stride, value_anchor))
+        outer.append((expr, size_of(i)[1], stride_text(i), value_anchor))
     if view.batch is not None:
         i, block = view.batch
         # The batch block holds one index (_check_batch): its tile's offset.
-        outer.append((cg.offset_var(block), int(t.size(i)), int(t.stride(i)), None))
+        outer.append((cg.offset_var(block), size_of(i)[1], stride_text(i), None))
     return parts, anchors, always_live, outer
 
 
@@ -3220,7 +3318,7 @@ def _codegen_matmul(
     tile_dims: list[str] = []
     parts: list[list[str]] = []
     anchors: list[tuple[int, str | None]] = []
-    outers: list[list[tuple[str, int, int, str | None]]] = []
+    outers: list[list[tuple[str, str, str, str | None]]] = []
     pos = 2
     for (operand, blocks, k_pos), value, fx_value in zip(
         _sides(group), values, _operands(node)[1:], strict=True
@@ -3258,8 +3356,7 @@ def _codegen_matmul(
             # Each handle is rebased at its tile in 64 bits, so every offset
             # MPP computes inside it (in int32) is below the tile's span; the
             # outer dims are folded into the base.
-            strides = [view.tensor.stride(p) for p in view.positions]
-            span = 1 + sum((b - 1) * s for b, s in zip(tile, strides, strict=True))
+            span = 1 + sum((b - 1) * s for b, s in zip(tile, view.strides, strict=True))
             if span >= 2**31:
                 raise _unsupported(
                     f"an MPP view whose tile spans {span} elements (MPP tensor "
@@ -4115,7 +4212,7 @@ def _defines(s: ast.AST) -> set[str]:
 def _loaded(s: ast.AST) -> set[str]:
     """The names the pointers of a statement's ``tl.load`` calls read."""
     return set().union(
-        *(names_read(load.args[0]) for node in ast.walk(s) if (load := _tl_load(node)))
+        *(names_read(load.args[0]) for node in ast.walk(s) if (load := tl_load(node)))
     )
 
 
@@ -4270,40 +4367,6 @@ def _distribute_lane_loop(
     return out
 
 
-def _is_lane_loop(s: ast.stmt) -> TypeGuard[ast.For]:
-    # slice_lane_*: a persistent reduction's lanes over a ':' K.
-    return (
-        isinstance(s, ast.For)
-        and isinstance(s.target, ast.Name)
-        and s.target.id.startswith(("lane_", "slice_lane_"))
-        and _call_name(s.iter) == "range"
-    )
-
-
-def _tl_load(node: ast.AST) -> ast.Call | None:
-    if (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "tl"
-        and node.func.attr == "load"
-    ):
-        return node
-    return None
-
-
-def _load_mask_other(load: ast.Call) -> tuple[ast.expr, ast.expr] | None:
-    """The mask and fill value of ``tl.load(ptr, mask, other=...)``, or None
-    for an unmasked load."""
-    mask = load.args[1]
-    if isinstance(mask, ast.Constant) and mask.value is None:
-        return None
-    other = load.args[2] if len(load.args) > 2 else None
-    other = next((k.value for k in load.keywords if k.arg == "other"), other)
-    assert other is not None
-    return mask, other
-
-
 def _loads_first_all(
     stmts: list[ast.stmt],
     split: list[ast.For],
@@ -4336,7 +4399,7 @@ def _loads_first_all(
                 out += _loads_first(s, coop, tensor_dtypes, tg_buffers, names)
                 continue
             if isinstance(s, (ast.For, ast.While, ast.If)) and not _is_elements(s):
-                inner = in_lane or _is_lane_loop(s)
+                inner = in_lane or is_lane_loop(s)
                 s.body = walk(s.body, inner)
                 s.orelse = walk(s.orelse, inner)
             out.append(s)
@@ -4389,7 +4452,7 @@ def _loads_first(
     decls: list[ast.stmt] = []
     for i, s in enumerate(body):
         assigned = _assigned(s)
-        if assigned is None or (load := _tl_load(assigned[1])) is None:
+        if assigned is None or (load := tl_load(assigned[1])) is None:
             continue
         # Helion spells every load's pointer ``<tensor> + <offset>``.
         ptr = load.args[0]
@@ -4412,7 +4475,7 @@ def _loads_first(
                     f"{DTYPE_TO_METAL[tensor_dtypes[tensor]]!r}, {lanes})"
                 )
             )
-    loads = sum(1 for s in body for node in ast.walk(s) if _tl_load(node))
+    loads = sum(1 for s in body for node in ast.walk(s) if tl_load(node))
     if not moved or len(moved) < loads:
         return [loop]
     first: list[ast.stmt] = []
@@ -4425,17 +4488,18 @@ def _loads_first(
             continue
         array = moved[i]
         name, value = cast("tuple[str, ast.expr]", _assigned(s))
-        load = cast("ast.Call", _tl_load(value))
+        load = cast("ast.Call", tl_load(value))
         first += [
             s,
-            statement_from_string(f"_metal_lane_put({array}, {lane}, {name})"),
+            statement_from_string(f"{LANE_PUT}({array}, {lane}, {name})"),
         ]
         read = f"_metal_lane_get({array}, {lane})"
-        masked = _load_mask_other(load)
+        masked = load_mask_other(load)
         if masked is None:
             second.append(statement_from_string(f"{name} = {read}"))
             continue
         mask, other = masked
+        assert other is not None
         # The array holds ``mask ? x : other``; the select keeps the load's
         # own MSL type.
         second.append(
@@ -4730,19 +4794,19 @@ def _run_lane_loops_once(
         for s in ss:
             if isinstance(s, ast.For) and _call_name(s.iter) != ELEMENTS:
                 s.body = splice(s.body, uniform and replicas.uniform(s.iter))
-                if _is_lane_loop(s) and any(_is_coop_stmt(x, coop) for x in s.body):
+                if is_lane_loop(s) and any(_is_coop_stmt(x, coop) for x in s.body):
                     lane = cast("ast.Name", s.target).id
                     if not any(lane in names_read(x) for x in s.body):
                         out.extend(s.body)
                     elif _split_schedulable(s, coop):
                         parts = _split_lane_loop(s, lane, coop)
-                        split.extend(p for p in parts if _is_lane_loop(p))
+                        split.extend(p for p in parts if is_lane_loop(p))
                         out += parts
                     elif (
                         distributed := _distribute_lane_loop(s, lane, coop)
                     ) is not None:
                         out += [
-                            replicas.spread(x) if uniform and _is_lane_loop(x) else x
+                            replicas.spread(x) if uniform and is_lane_loop(x) else x
                             for x in distributed
                         ]
                     else:

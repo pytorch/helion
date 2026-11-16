@@ -87,7 +87,9 @@ SCHEDULER = {
     "tcgen05_strategy": "role_local_with_scheduler",
     "tcgen05_warp_spec_scheduler_warps": 1,
 }
-C_INPUT_AB3 = {"tcgen05_warp_spec_c_input_warps": 1, "tcgen05_ab_stages": 3}
+# Six AB stages beside the producer warp's rings overflow the arena of the
+# 128x128x64 tile (three to five fit there).
+C_INPUT_AB6 = {"tcgen05_warp_spec_c_input_warps": 1, "tcgen05_ab_stages": 6}
 # The flat one-CTA split-K pipeline's config (``test_cute_tcgen05_split_k``).
 FLAT_SPLIT = {
     "block_sizes": [128, 128, 64],
@@ -98,7 +100,7 @@ FLAT_SPLIT = {
     TCGEN05_SPLIT_K_CONFIG_KEY: 2,
 }
 SPLIT_STRICT = "requires the flat one-CTA tcgen05 TMA pipeline over a plain rank-2 GEMM"
-AB3_STRICT = "incompatible with a productive aux producer warp"
+PRODUCER_STRICT = "incompatible with a productive aux producer warp"
 
 
 def fp32_out_single(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -285,9 +287,7 @@ class Refusal:
 
 
 HOIST_STRICT = "aux_fragment_hoist=True requires an exact-shape auxiliary operand"
-EXACT_AUX_STRICT = (
-    "requires an exact-shape rank-2 auxiliary operand of the output's dtype"
-)
+EXACT_AUX_STRICT = "requires an exact-shape rank-2 auxiliary operand"
 
 CORPUS: list[Refusal] = [
     # ``validate_strategy_invariants``: tcgen05_cluster_n=2 without cluster_m=2
@@ -363,17 +363,6 @@ CORPUS: list[Refusal] = [
         lambda: bind(residual_single),
         base_config(EPI_TMA, CTA_PAIR),
         "is not validated on the bm=128 CtaGroup.TWO epilogue tile",
-    ),
-    Refusal(
-        "epi_tma_dtype_mismatch",
-        lambda: bind_args(
-            residual_aux,
-            fp16(4096, 1024),
-            fp16(1024, 1024),
-            torch.empty((4096, 1024), dtype=torch.float32),
-        ),
-        base_config(EPI_TMA),
-        EXACT_AUX_STRICT,
     ),
     Refusal(
         "epi_tma_strided_aux",
@@ -491,25 +480,48 @@ CORPUS: list[Refusal] = [
         FLAT_SPLIT,
         SPLIT_STRICT,
     ),
-    # ``_normalize_aux_producer_ab_stages``: the C-input warp, or the store
-    # warp staging the auxiliary ring through TMA, beside three AB stages on
-    # a kernel with an exact-shape auxiliary operand of the output's dtype.
+    # ``epi_warp_groups_refusal``: the role-local epilogue that runs the
+    # groups exists only on a persistent pid type.
     Refusal(
-        "ab_stages_3_with_a_c_input_warp",
+        "epi_warp_groups_on_a_flat_pid",
+        lambda: bind(plain_single),
+        base_config({GROUPS: 2}, pid_type="flat"),
+        "epilogue warp groups require a persistent pid type",
+    ),
+    # ``_normalize_aux_producer_ab_stages``: the C-input warp, or the store
+    # warp staging the auxiliary ring through TMA, beside six AB stages on a
+    # kernel with an exact-shape auxiliary operand (the arena model,
+    # ``aux_producer_ring_fits``).
+    Refusal(
+        "ab_stages_6_with_a_c_input_warp",
         lambda: bind(residual_single),
-        base_config(SCHEDULER, C_INPUT_AB3),
-        AB3_STRICT,
+        base_config(SCHEDULER, C_INPUT_AB6),
+        PRODUCER_STRICT,
     ),
     Refusal(
-        "ab_stages_3_with_the_store_warp_aux_ring",
+        "ab_stages_6_with_the_store_warp_aux_ring",
         lambda: bind(residual_single),
         base_config(
             SCHEDULER,
             {TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: "tma"},
             tcgen05_warp_spec_store_warps=1,
-            tcgen05_ab_stages=3,
+            tcgen05_ab_stages=6,
         ),
-        AB3_STRICT,
+        PRODUCER_STRICT,
+    ),
+    # The exact-shape fact counts an auxiliary operand of any dtype (an
+    # FP32 residual of an FP16 output too), so the strict pass refuses its
+    # producer warp before codegen.
+    Refusal(
+        "ab_stages_6_with_a_c_input_warp_and_an_fp32_residual",
+        lambda: bind_args(
+            residual_aux,
+            fp16(4096, 1024),
+            fp16(1024, 1024),
+            torch.empty(4096, 1024, dtype=torch.float32),
+        ),
+        base_config(SCHEDULER, C_INPUT_AB6),
+        PRODUCER_STRICT,
     ),
 ]
 
@@ -523,6 +535,18 @@ def test_strict_normalizer_refuses_before_codegen(refusal: Refusal) -> None:
     # The explicit path reports the normalizer's refusal: codegen never ran.
     with pytest.raises(InvalidConfig, match=refusal.strict):
         bound.to_code(config)
+
+
+def test_producer_rings_that_fit_are_admitted() -> None:
+    # The control of the ``ab_stages_6_*`` entries: three AB stages beside
+    # the C-input warp's rings fit the arena and pass the strict pass.
+    bound = bind(residual_single)
+    config = helion.Config(
+        **base_config(
+            SCHEDULER, {"tcgen05_warp_spec_c_input_warps": 1, "tcgen05_ab_stages": 3}
+        )
+    )
+    bound.config_spec.normalized_config(config)
 
 
 def test_split_k_within_the_k_tiles_is_admitted() -> None:
@@ -610,33 +634,11 @@ LIVE: list[tuple[str, Callable[[], Any], dict[str, Any], type[Exception], str]] 
         r"tcgen05_cluster_n=2 requires tcgen05_cluster_m=2 with use_2cta=True \(bm=256\)",
     ),
     (
-        "epi_warp_groups_on_a_flat_pid",
-        lambda: bind(plain_single),
-        base_config({GROUPS: 2}, pid_type="flat"),
-        InvalidConfig,
-        "epi_warp_groups=2 needs the standard role-local TMA-store epilogue",
-    ),
-    (
         "prefetch_ring_on_a_flat_pid",
         lambda: bind(residual_single),
         base_config(PRE, {PREFETCH: 1}, pid_type="flat"),
         InvalidConfig,
         "need the standard static-full role-local TMA-store epilogue",
-    ),
-    # The bind-time exact-shape fact counts auxiliary operands of the
-    # output's dtype only; the pipeline's AB-depth gate also sees an fp32
-    # residual's descriptors.
-    (
-        "ab_stages_3_with_a_c_input_warp_and_an_fp32_residual",
-        lambda: bind_args(
-            residual_aux,
-            fp16(4096, 1024),
-            fp16(1024, 1024),
-            torch.empty(4096, 1024, dtype=torch.float32),
-        ),
-        base_config(SCHEDULER, C_INPUT_AB3),
-        BackendUnsupported,
-        AB3_STRICT,
     ),
     (
         "sched_stage_count_with_a_residual_shared_loop",

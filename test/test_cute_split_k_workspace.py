@@ -1791,3 +1791,42 @@ def test_split_k_workspace_fallback_keeps_fp32_and_resets_graph(shape):
     b.zero_()
     result = replay()
     torch.testing.assert_close(result, torch.zeros_like(result), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("atomic", [False, True])
+def test_workspace_launches_preserve_compile_options(atomic: bool) -> None:
+    kernel = helion.kernel(
+        matmul_split_k.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        cute_promote_half_atomic_outputs=False,
+    )
+    bound = _bind(kernel, (*_args((128, 32768, 256)), lambda acc, tile: acc))
+    source = bound.to_code(
+        helion.Config(
+            block_sizes=[128, 64, 128],
+            split_k=16,
+            cute_split_k_workspace=True,
+            cute_split_k_stages=6,
+            cute_split_k_atomic_epilogue=atomic,
+            advanced_controls_file="compile-controls.txt",
+        )
+    )
+    trees = [ast.parse(code) for code in [source, *_embedded_sources(source)]]
+    launches = [
+        node
+        for tree in trees
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_launcher"
+    ]
+    assert len(launches) == 2
+    for launch in launches:
+        options = [
+            ast.literal_eval(keyword.value)
+            for keyword in launch.keywords
+            if keyword.arg == "cute_compile_options"
+        ]
+        assert options == ["--ptxas-options='--apply-controls compile-controls.txt'"]

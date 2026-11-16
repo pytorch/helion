@@ -13,7 +13,12 @@ picks ``entry`` while the launch grid is known to fit in one wave of
 resident CTAs and ``last_wave`` past it or when the host sizes the grid at
 runtime (``passes.pdl._implicit_pdl_release``).  The placement follows
 the grid, so the search leaves it at ``auto``; the explicit values serve
-pins, seeds and users.  The tcgen05 GEMM kernels, whose lowering waits in
+pins, seeds and users. Proved paired capture overlap can explicitly request
+``loader_tail``: the audited loader releases four logical pages before its
+end, with an unconditional release after the loop for short/empty ranges.
+Ordinary search keeps release at ``auto`` and capture overlap disabled.
+Its dependency waits and capture-storage proof are unchanged.
+The tcgen05 GEMM kernels, whose lowering waits in
 its warp roles and releases after the MMA warp's last MMA, take the same
 placements: ``entry`` and ``last_wave`` add the (guarded) release right
 after each of those waits, ``exit`` and ``none`` keep the late release
@@ -36,13 +41,18 @@ on one SM, its density on an idle device, which an early launch then cannot
 exceed: the CTAs beyond the idle SMs wait for the primary's to retire and
 take their SMs one each.  The pad is one more static allocation of the
 kernel body kept live by ``_helion_pdl_spread_keep`` (the DSL drops a dead
-one), so the launch's dynamic shared memory grows by it whatever the
-helpers the body calls allocate on their own.
+one), sized against what the body allocates as ``smem_footprint`` bounds
+it: its own allocations and the buffers of the shared-memory reduces it
+calls (``spread_pad_bytes`` says which bound).  Other device helpers that
+allocate on their own are not seen; they only raise the total, and the
+slack each CTA keeps covers small ones.
 """
 
 from __future__ import annotations
 
 import ast
+
+from .target_facts import DEFAULT_MAX_SMEM_PER_BLOCK
 
 CUTE_PDL_RELEASE_CHOICES: tuple[str, ...] = (
     "auto",
@@ -50,8 +60,14 @@ CUTE_PDL_RELEASE_CHOICES: tuple[str, ...] = (
     "none",
     "exit",
     "last_wave",
+    "loader_tail",
 )
 CUTE_PDL_RELEASE_DEFAULT = CUTE_PDL_RELEASE_CHOICES[0]
+CUTE_PDL_CAPTURE_RELEASE_CHOICES: tuple[str, ...] = (
+    CUTE_PDL_RELEASE_DEFAULT,
+    "entry",
+    "loader_tail",
+)
 # The hardware limits every target with ``griddepcontrol`` (sm_90 and up)
 # shares: resident CTAs per SM and, when the device cannot be queried, the
 # resident threads per SM (H100, B200).
@@ -89,18 +105,16 @@ def resident_ctas_per_sm(
 
 
 CUTE_PDL_SPREAD_KEY = "cute_pdl_spread"
-# Shared memory per SM and the opt-in maximum per block of the sm_90 / sm_100
-# parts (228 KiB and 227 KiB), the defaults when the device cannot be
-# queried, and the slice of an SM's shared memory the system reserves for
-# every resident CTA.
+# Shared memory per SM of the sm_90 / sm_100 parts (228 KiB), the default
+# when the device cannot be queried, and the slice of an SM's shared memory
+# the system reserves for every resident CTA.
 DEFAULT_SMEM_PER_SM = 233472
-DEFAULT_MAX_SMEM_PER_BLOCK = 232448
 SMEM_RESERVED_PER_CTA = 1024
 # Shared allocations are laid out in 128-byte units, and every resident CTA
-# of a padded kernel keeps one 1 KB unit of slack beyond its footprint: the
-# alignment padding of the body's allocations and the allocations the
-# runtime helpers make on their own (neither counted in the footprint) must
-# not cost a resident CTA at the density the pad targets.
+# of a padded kernel keeps one 1 KB unit of slack beyond its footprint and
+# the alignment padding ahead of the body's allocations: the pad's own
+# alignment and the allocations of the device helpers ``smem_footprint``
+# does not model must not cost a resident CTA at the density the pad targets.
 SMEM_ALLOCATION_UNIT = 128
 SPREAD_SLACK_PER_CTA = 1024
 # The pad allocation's variable and the helper that keeps it live.
@@ -111,39 +125,59 @@ SPREAD_KEEP_HELPER = "_helion_pdl_spread_keep"
 def spread_pad_bytes(
     ctas: int,
     num_sm: int,
-    own_smem_bytes: int,
+    own_low: int,
+    own_high: int,
     *,
+    own_padding: int = 0,
     smem_per_sm: int = DEFAULT_SMEM_PER_SM,
     max_smem_per_block: int = DEFAULT_MAX_SMEM_PER_BLOCK,
 ) -> int | None:
-    """The shared memory to add to a kernel using ``own_smem_bytes`` (a lower
-    bound: what its body allocates itself) so that at most
-    ``ceil(ctas / num_sm)`` of its CTAs are resident per SM, or ``None``
-    when its own allocation already enforces that density or no pad within
-    the per-block maximum can.
+    """The shared memory to add to a kernel whose body keeps between
+    ``own_low`` and ``own_high`` bytes (``smem_footprint``'s bounds, the
+    buffers of the reduce helpers it calls included; the compiler may drop
+    what the lower bound leaves out) so that at most ``ceil(ctas / num_sm)``
+    of its CTAs are resident per SM, or ``None`` when its own allocation
+    already enforces that density or no pad within the per-block maximum can.
 
     The footprint is the smallest one at which ``cap + 1`` CTAs no longer fit
     in an SM's shared memory, each CTA counting its system-reserved slice:
-    ``(cap + 1) * (footprint + reserved) > smem_per_sm``, while ``cap`` of
-    them still fit with ``SPREAD_SLACK_PER_CTA`` to spare each, the footprint
-    rounded up to the allocation unit (past a cap of 14 on a 228 KiB SM no
-    footprint leaves that slack and the pad is declined: the alignment
-    padding or a helper's allocation would otherwise cost a resident CTA).
-    The pad is the footprint less what the body allocates; the helpers the
-    body calls may allocate more, which only raises the total (the launch
-    requests the kernel's whole static allocation), never below the
-    footprint.
+    ``(cap + 1) * (footprint + reserved) > smem_per_sm``.  With one CTA per
+    SM the pad is the footprint less ``own_low``: the padded kernel reaches
+    the footprint even when the compiler drops every allocation the lower
+    bound leaves out.  When those allocations are live it overshoots the
+    footprint by them, which costs L1 carve-out and room for a dependent
+    launch's early CTAs, though no resident CTA of its own (``own_low``
+    leaves out whatever the walk cannot show the compiler keeps on every
+    block, ``smem_footprint``).  With more CTAs per SM a pad that large
+    would cost resident CTAs when those allocations are live, so the pad is
+    the footprint less ``own_high``, and a kernel whose compiler drops
+    allocations stays below the footprint, with more CTAs per SM.
+
+    The pad is declined unless ``cap`` CTAs fit with ``SPREAD_SLACK_PER_CTA``
+    to spare each, laid out with the alignment padding ahead of the body's
+    allocations (``own_padding``) and rounded up to the allocation unit
+    (past a cap of 14 on a 228 KiB SM no footprint leaves that slack), and
+    ``own_high`` plus the pad stays within the per-block maximum with the
+    padding ahead of each (the pad's own ``SMEM_ALLOCATION_UNIT`` alignment
+    included).  The allocations ``own_high`` leaves out (helpers
+    ``smem_footprint`` does not model) only raise the total.
     """
-    if ctas <= 0 or num_sm <= 0 or own_smem_bytes < 0:
+    if ctas <= 0 or num_sm <= 0 or not 0 <= own_low <= own_high:
         return None
     cap = -(-ctas // num_sm)
     footprint = smem_per_sm // (cap + 1) - SMEM_RESERVED_PER_CTA + 1
-    if footprint <= own_smem_bytes or footprint > max_smem_per_block:
+    own = own_low if cap == 1 else own_high
+    if footprint <= own or footprint > max_smem_per_block:
         return None
-    allocated = -(-footprint // SMEM_ALLOCATION_UNIT) * SMEM_ALLOCATION_UNIT
+    allocated = (
+        -(-(footprint + own_padding) // SMEM_ALLOCATION_UNIT) * SMEM_ALLOCATION_UNIT
+    )
     if cap * (allocated + SMEM_RESERVED_PER_CTA + SPREAD_SLACK_PER_CTA) > smem_per_sm:
         return None
-    return footprint - own_smem_bytes
+    pad = footprint - own
+    if own_high + own_padding + pad + SMEM_ALLOCATION_UNIT - 1 > max_smem_per_block:
+        return None
+    return pad
 
 
 _WAIT_CALL = "cute.arch.griddepcontrol_wait()"
@@ -200,20 +234,39 @@ def generic_release_rendered(source: str) -> bool:
     the release once picked a CLC-persistent kernel 7% behind in the
     catalogue's regime.  The autotuner's final selection asks this of a
     finalist's rendered source (``CuteBackend.finalist_preference``).
+    The audited capture wrapper's conditional EARLY wait has the same entry
+    release ordering; its metadata identifies the exact mode parameter.
     """
     try:
         module = ast.parse(source)
     except SyntaxError:
         return False
+    capture_waits: dict[str, str] = {}
     for node in module.body:
         if (
             isinstance(node, ast.Assign)
             and len(node.targets) == 1
             and isinstance(node.targets[0], ast.Attribute)
             and node.targets[0].attr == "_helion_cute_wrapper_plans"
-            and "'use_pdl': True" in ast.unparse(node.value)
         ):
-            return False
+            if "'use_pdl': True" in ast.unparse(node.value):
+                return False
+            if not isinstance(node.targets[0].value, ast.Name):
+                continue
+            try:
+                plans = ast.literal_eval(node.value)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(plans, list):
+                continue
+            for plan in plans:
+                if (
+                    isinstance(plan, dict)
+                    and plan.get("kind") == "helion_paged_attention"
+                    and plan.get("capture_pdl_contract") == "paired-output-stores-v1"
+                    and isinstance(mode := plan.get("capture_pdl_mode_param"), str)
+                ):
+                    capture_waits[node.targets[0].value.id] = mode
     kernels = [
         node
         for node in module.body
@@ -222,7 +275,12 @@ def generic_release_rendered(source: str) -> bool:
         and not node.name.startswith(ZERO_FILL_KERNEL_PREFIX)
     ]
     for kernel in kernels:
-        waits = [i for i, statement in enumerate(kernel.body) if _is_wait(statement)]
+        waits = [
+            i
+            for i, statement in enumerate(kernel.body)
+            if _is_wait(statement)
+            or _is_capture_wait(statement, capture_waits.get(kernel.name))
+        ]
         if not waits:
             continue
         index = waits[0]
@@ -262,6 +320,26 @@ def generic_release_rendered(source: str) -> bool:
         ):
             return True
     return False
+
+
+def _is_capture_wait(statement: ast.stmt, mode: str | None) -> bool:
+    """Recognize only the audited wrapper's EARLY branch, not arbitrary waits."""
+    return (
+        mode is not None
+        and isinstance(statement, ast.If)
+        and not statement.orelse
+        and len(statement.body) == 1
+        and _is_wait(statement.body[0])
+        and isinstance(statement.test, ast.Compare)
+        and isinstance(statement.test.left, ast.Name)
+        and statement.test.left.id == mode
+        and len(statement.test.ops) == 1
+        and isinstance(statement.test.ops[0], ast.Eq)
+        and len(statement.test.comparators) == 1
+        and isinstance(statement.test.comparators[0], ast.Constant)
+        and type(statement.test.comparators[0].value) is int
+        and statement.test.comparators[0].value == 0
+    )
 
 
 def spread_rendered(source: str) -> bool:

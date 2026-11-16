@@ -13,11 +13,56 @@ from helion._compiler.cute.autotune.config_generation_ext import (
 from helion._compiler.cute.cute_flash import flash_structural_leaf_from_config
 from helion.autotuner import LFBOPatternSearch
 from helion.autotuner.base_search import PopulationMember
+from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.search_space_logger import canonical_config_id
+from helion.autotuner.search_surface import ConfigGenerationExtension
 from helion.exc import InvalidConfig
 
 pytestmark = pytest.mark.cpu_only
+
+
+def _generic_generation() -> ConfigGeneration:
+    # Exercise the generic completion implementation before any backend adds
+    # its own conditional policy. Only this method's flat surface is needed.
+    generation = ConfigGeneration.__new__(ConfigGeneration)
+    generation.flat_spec = [EnumFragment((0, 1)), EnumFragment((False, True))]
+    generation.overridden_flat_indices = set()
+    generation.extension = ConfigGenerationExtension(generation)
+    return generation
+
+
+def test_default_conditional_extension_preserves_request_identity():
+    generation = _generic_generation()
+    base, requested = [0, False], [1, False]
+    assert generation.conditional_neighbor(base, requested) is requested
+    assert base == [0, False]
+    assert requested == [1, False]
+
+
+@pytest.mark.parametrize("refusal", (None, "override", "caller_pin", "search_choice"))
+def test_generic_conditional_completion_is_atomic_and_preserves_pins(refusal):
+    generation = _generic_generation()
+    base, requested = [0, False], [0, True]
+    generation.extension.conditional_neighbor_updates = Mock(
+        return_value={0: 1, 1: False}
+    )
+    if refusal == "override":
+        generation.overridden_flat_indices = {0}
+    elif refusal == "search_choice":
+        generation.flat_spec[0] = EnumFragment((0, 1), search_choices=(0,))
+    frozen = (0,) if refusal == "caller_pin" else ()
+    result = generation.conditional_neighbor(base, requested, frozen_indices=frozen)
+    generation.extension.conditional_neighbor_updates.assert_called_once_with(
+        base, requested
+    )
+    if refusal is None:
+        assert result == [1, False]
+        assert result is not requested
+    else:
+        assert result is requested
+    assert base == [0, False]
+    assert requested == [0, True]
 
 
 class _Fragment:
@@ -50,6 +95,9 @@ class _ConditionalGeneration:
             ),
             create_config_generation=lambda **kwargs: self,
         )
+
+    def conditional_neighbor(self, base, requested, *, frozen_indices=()):
+        return requested
 
     def _flat_coordinate_identities(self):
         return [(key, None) for key in self.keys]
@@ -162,6 +210,11 @@ def test_coordinate_limit_counts_invalid_and_normalized_alias_requests():
         "incumbent_alias",
         "candidate",
     ]
+    assert [item.requested_flat_values for item in full] == [
+        ["16/8", "invalid", 2],
+        ["16/8", "alias", 2],
+        ["16/8", False, 2],
+    ]
     assert (
         generation.coordinate_neighbor_projections(base, radius=2, limit=2) == full[:2]
     )
@@ -195,3 +248,32 @@ def test_optional_proposal_recording_preserves_default_random_draws(tree):
     assert plain_state == observed_state
     assert len(recorded) == 19
     assert observed == [flat for flat in recorded if flat != base]
+
+
+def test_owned_coordinate_records_coupled_proposal(monkeypatch):
+    forwarded = []
+
+    def coupled(self, base, requested, *, frozen_indices=()):
+        forwarded.append(tuple(frozen_indices))
+        result = [*requested]
+        if requested[1] is False and base[1] is True:
+            result[0] = "16/6"
+        return result
+
+    monkeypatch.setattr(_ConditionalGeneration, "conditional_neighbor", coupled)
+    monkeypatch.setattr(
+        CuteConfigGenerationExtension,
+        "flash_owned_coordinate_indices",
+        lambda self, config: [2],
+    )
+    _search, parent, children, ledger = _run(limit=2)
+    assert ledger["attempts"][0]["owned_coordinate_indices"] == [2]
+    assert forwarded and all(indices == (2,) for indices in forwarded)
+    assert parent is not None
+    assert parent.config["cute_flash_e2e_schedule"] == "16/8"
+    assert len(children) == 1
+    assert children[0].config["cute_flash_e2e_schedule"] == "16/6"
+    assert children[0].config["cute_flash_packed_reduce"] is False
+    assert ledger["attempts"][0]["novel_config_ids"] == [
+        canonical_config_id(children[0].config)
+    ]

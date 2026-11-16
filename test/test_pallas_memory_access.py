@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+import helion
 from helion import Config
 from helion._compiler.device_function import DeviceFunction
 from helion._compiler.pallas.codegen import _loop_offset_alignment
@@ -23,6 +24,9 @@ from helion._compiler.pallas.tensorcore_plan import OneHotScatterPlan
 from helion._compiler.pallas.tensorcore_plan import select_tensorcore_plan
 from helion._compiler.pallas.tracing_ops import _annotate_provable_sublane_alignment
 from helion._compiler.tile_strategy import LoopDimInfo
+from helion._testing import DEVICE
+from helion._testing import onlyBackends
+import helion.language as hl
 from helion.language import memory_ops
 from helion.language.atomic_ops import atomic_add
 
@@ -30,6 +34,92 @@ pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from helion._compiler.inductor_lowering import CodegenState
+
+
+@helion.kernel(static_shapes=False, autotune_effort="none")
+def _store_broadcast_tail(out, values, kind: hl.constexpr):
+    axis = 1 if kind == "indexed" else 0
+    for tile in hl.tile(out.size(axis)):
+        if kind == "indexed":
+            out[0, tile] = 3.0
+        elif kind == "scalar":
+            out[tile, :] = 3.0
+        else:
+            out[tile, :] = values[None, :]
+    return out
+
+
+@onlyBackends(["pallas"])
+@pytest.mark.parametrize("kind", ["scalar", "vector", "indexed"])
+def test_stores_broadcast_to_runtime_clamped_refs(kind):
+    values = torch.arange(8, dtype=torch.float32, device=DEVICE)
+    initial_shape = (1, 4) if kind == "indexed" else (4, 8)
+    initial = torch.empty(initial_shape, device=DEVICE)
+    bound = _store_broadcast_tail.bind((initial, values, kind))
+    compiled = bound.compile_config(Config(block_sizes=[128]))
+    # Reuse the same generated program across short refs, a singleton, and a
+    # full tile. The full tile also respects Mosaic's memory tiling.
+    for size in (4, 1, 128, 4):
+        shape = (1, size) if kind == "indexed" else (size, 8)
+        out = torch.full(shape, float("nan"), device=DEVICE)
+        actual = compiled(out, values, kind)
+        expected = (
+            values.expand_as(out) if kind == "vector" else torch.full_like(out, 3.0)
+        )
+        assert actual is out
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@helion.kernel(static_shapes=False, autotune_effort="none")
+def _dynamic_clamped_memory(x, out, operation: hl.constexpr):
+    for tile in hl.tile(x.size(0)):
+        value = hl.full([tile], 1.0, dtype=torch.float32)
+        if operation == "load":
+            out[tile] = x[tile] + value
+        elif operation == "add":
+            previous = hl.atomic_add(out, [tile], value)
+            x[tile] = previous + value
+        elif operation == "add_scalar":
+            previous = hl.atomic_add(out, [tile], 1.0)
+            x[tile] = previous + value
+        elif operation == "cas_scalar":
+            previous = hl.atomic_cas(out, [tile], 0.0, 1.0)
+            x[tile] = previous + value
+        else:
+            expected = hl.full([tile], 0.0, dtype=torch.float32)
+            previous = hl.atomic_cas(out, [tile], expected, value)
+            x[tile] = previous + value
+    return out
+
+
+@onlyBackends(["pallas"])
+@pytest.mark.parametrize(
+    "operation", ["load", "add", "cas", "add_scalar", "cas_scalar"]
+)
+def test_dynamic_clamped_loads_and_atomics(operation):
+    x = torch.arange(128, dtype=torch.float32, device=DEVICE)
+    out = torch.zeros_like(x)
+    compiled = _dynamic_clamped_memory.bind((x, out, operation)).compile_config(
+        Config(block_sizes=[128])
+    )
+    # One generated program must handle full, partial, and singleton refs,
+    # including a return to the partial shape after changing the launcher key.
+    for size in (128, 65, 1, 65):
+        x = torch.arange(size, dtype=torch.float32, device=DEVICE)
+        out = x.clone()
+        # Materialize an independent oracle before the output is donated.
+        # A lazy TPU clone can still refer to the donated device buffer.
+        before = out.cpu().clone()
+        actual = compiled(x, out, operation)
+        expected = (
+            torch.where(before == 0, 1.0, before)
+            if operation in ("cas", "cas_scalar")
+            else before + 1
+        )
+        assert actual is out
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+        if operation != "load":
+            torch.testing.assert_close(x.cpu(), before + 1, rtol=0, atol=0)
 
 
 def _placeholder(

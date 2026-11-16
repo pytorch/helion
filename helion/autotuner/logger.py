@@ -116,7 +116,7 @@ class _ElapsedFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:  # type: ignore[override]
         elapsed = self._elapsed_fn()
-        return f"[{elapsed}s] {record.getMessage()}"
+        return f"[{elapsed}s] {super().format(record)}"
 
 
 class AutotuningLogger:
@@ -236,6 +236,13 @@ class AutotuningLogger:
                 self._trace_algorithm,
                 config_id=canonical_config_id(config),
                 config=config.config,
+            )
+
+    @_logging_errors()
+    def record_compiler_refinement(self, transcript: dict[str, object]) -> None:
+        if self._trace_sink is not None:
+            self._trace_sink.record(
+                "compiler_refinement", self._trace_algorithm, transcript=transcript
             )
 
     @_logging_errors()

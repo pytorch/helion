@@ -403,6 +403,17 @@ def supports_host_tensor_descriptor() -> bool:
     return _supports_host_tensor_descriptor()
 
 
+def tensor_descriptor_supports_dtype(dtype: torch.dtype) -> bool:
+    """Whether a Triton tensor descriptor can address elements of ``dtype``.
+
+    Triton types a bool tensor's pointer as ``*i1``, and
+    ``make_tensor_descriptor`` takes the element size from the pointer's bit
+    width in whole bytes: zero, which fails its 16-byte block check ("128 * 0
+    = 0 bytes").
+    """
+    return dtype is not torch.bool
+
+
 def supports_block_ptr() -> bool:
     """Whether ``indexing="block_ptr"`` can be lowered by the installed Triton."""
     # call private func we can patch in testing

@@ -32,6 +32,7 @@ import helion
 from helion._compiler.cute.strategies import TCGEN05_PERSISTENT_GRID_CAP_DEFAULT
 from helion._compiler.cute.tcgen05_config import surface
 from helion._testing import cpu_render_target
+from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_dense_tcgen05 import atomic_output_mm
 from helion._testing.cute_dense_tcgen05 import cpu_codegen_target
@@ -51,6 +52,8 @@ if TYPE_CHECKING:
     from helion.runtime.kernel import BoundKernel
 
 
+# Every kernel here binds on CPU (``cpu_render_target`` / ``cpu_codegen_target``).
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 SAMPLES = 64
 BF16 = torch.bfloat16
 F16 = torch.float16
@@ -148,15 +151,9 @@ KERNELS: dict[str, Callable[[], BoundKernel]] = {
         _make_plain_gemm(),
         (torch.empty(2048, 4096, dtype=F16).T, torch.empty(2048, 2048, dtype=F16)),
     ),
-}
-
-# Known gap, documented rather than hidden: a rowvec-bias GEMM whose
-# repaired ``tcgen05_aux_load_mode="epi_tma"`` sample keeps ``tcgen05_ab_stages``
-# above the ring's AB-stage limit (``_normalize_epi_tma`` refuses it strictly)
-# and whose ``_fix_ab_stages_search_config`` demotes 3 -> 2 only on the
-# second repair.  The strict xfail below fails loudly when the admission moves
-# into the fix pass; the entry then moves from ``GAPS`` to ``KERNELS``.
-GAPS: dict[str, Callable[[], BoundKernel]] = {
+    # A rowvec-bias GEMM whose repaired ``epi_tma`` sample used to keep
+    # ``tcgen05_ab_stages`` above the ring's limit until a second repair: the
+    # search projections now run to a fixed point.
     "bias_gemm_2048x4096x2048": _b200(
         _bias_gemm,
         lambda: (
@@ -256,15 +253,4 @@ def _check_fixed_point(bind: Callable[[], BoundKernel]) -> list[str]:
 @pytest.mark.parametrize("name", sorted(KERNELS))
 def test_repair_is_a_fixed_point_of_strict_normalization(name: str) -> None:
     failures = _check_fixed_point(KERNELS[name])
-    assert not failures, "\n".join(failures[:12])
-
-
-@pytest.mark.parametrize("name", sorted(GAPS))
-@pytest.mark.xfail(
-    reason="epi_tma AB-stage admission and the ab=3 demotion run outside the "
-    "fix pass (see GAPS)",
-    strict=True,
-)
-def test_known_gaps(name: str) -> None:
-    failures = _check_fixed_point(GAPS[name])
     assert not failures, "\n".join(failures[:12])

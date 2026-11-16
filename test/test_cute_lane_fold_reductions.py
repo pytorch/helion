@@ -270,8 +270,8 @@ def test_two_lanes_fold_into_one_reduction_per_trip(_cpu_only, unroll: int) -> N
 def test_online_softmax_lanes_fuse_into_one_pass(_cpu_only, fast_math: bool) -> None:
     """max then sum of exp(x - max): one lane loop over the packets (per-lane
     max, per-lane sum against the lane's frame), the lane sums rescaled to the
-    global frame after the cross-thread max.  Both exponential spellings:
-    ``exp2((x - m) * c)`` and fast-math ``exp2(fma(x, c, -m * c))``."""
+    global frame after the cross-thread max.  Both exponential spellings: the
+    natural ``exp(x - m)`` and fast-math ``exp2(fma(x, c, -m * c))``."""
     kernel = helion.kernel(
         online_softmax_rows,
         backend="cute",
@@ -293,7 +293,9 @@ def test_online_softmax_lanes_fuse_into_one_pass(_cpu_only, fast_math: bool) -> 
         r"_pair_root\w* = cutlass\.Float32\(0\) if _helion_vfold_acc_0 == cutlass\.Float32\(float\('-inf'\)\) else _helion_vfold_acc_0",
         loop,
     )
-    assert loop.count("* cute.math.exp2(") == 8  # one rescale per lane
+    # one rescale per lane, in the exponentials' own base
+    rescale = "* cute.math.exp2(" if fast_math else "* cute.math.exp("
+    assert loop.count(rescale) == 8
     if fast_math:
         assert "fastmath=True)" in loop.split("_pair_frame")[2]
     # the per-lane frame feeds the lane's exponentials, the global one the online update
@@ -510,7 +512,7 @@ def test_online_pair_zeroes_the_rescaled_term_of_an_empty_lane(_cpu_only) -> Non
     guarded = re.findall(
         r"cutlass\.Float32\(0\) if (_fold_parts_\w*)\[(\d+)\] == "
         r"cutlass\.Float32\(float\('-inf'\)\) else (_fold_parts_\w*)\[(\d+)\] \* "
-        r"cute\.math\.exp2\(",
+        r"cute\.math\.exp\(",
         loop,
     )
     assert len(guarded) == 8

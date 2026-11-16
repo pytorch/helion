@@ -30,8 +30,12 @@ import random
 from typing import TYPE_CHECKING
 from typing import Any
 
+import numpy as np
+
 from .differential_evolution import DifferentialEvolutionSearch
 from .effort_profile import DIFFERENTIAL_EVOLUTION_DEFAULTS
+from .surrogate_pattern_search import HAS_ML_DEPS
+from .surrogate_pattern_search import SKLEARN_INSTALL_HINT
 from helion._dist_utils import sync_seed
 
 if TYPE_CHECKING:
@@ -41,16 +45,6 @@ if TYPE_CHECKING:
     from .config_generation import Config
     from .config_generation import FlatConfig
     from .pattern_search import InitialPopulationStrategy
-
-try:
-    import numpy as np  # type: ignore[import-not-found]
-    from sklearn.ensemble import RandomForestRegressor  # type: ignore[import-not-found]
-
-    HAS_ML_DEPS = True
-except ImportError:
-    HAS_ML_DEPS = False
-    np = None  # type: ignore[assignment]
-    RandomForestRegressor = None  # type: ignore[assignment,misc]
 
 
 class DESurrogateHybrid(DifferentialEvolutionSearch):
@@ -104,8 +98,7 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
     ) -> None:
         if not HAS_ML_DEPS:
             raise ImportError(
-                "DESurrogateHybrid requires numpy and scikit-learn. "
-                "Install them with: pip install helion[surrogate]"
+                f"DESurrogateHybrid requires scikit-learn. {SKLEARN_INSTALL_HINT}"
             )
 
         # Initialize parent with early stopping and initial population strategy parameters
@@ -293,11 +286,13 @@ class DESurrogateHybrid(DifferentialEvolutionSearch):
             if len(X) < 10:
                 return
 
-            X_array = np.array(X)  # type: ignore[union-attr]
-            y_array = np.array(y)  # type: ignore[union-attr]
+            X_array = np.array(X)
+            y_array = np.array(y)
 
             # Fit Random Forest
-            surrogate = RandomForestRegressor(  # type: ignore[misc]
+            from sklearn.ensemble import RandomForestRegressor
+
+            surrogate = RandomForestRegressor(
                 n_estimators=self.n_estimators,
                 max_depth=15,
                 min_samples_split=5,
