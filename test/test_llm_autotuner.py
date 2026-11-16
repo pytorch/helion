@@ -1718,6 +1718,10 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                 pass
 
         class FakeLLMSearch:
+            # (the config a stage's kernel was measured under, when it returns
+            # a simpler one)
+            _selected_config_measured_as: Config | None = None
+
             def __init__(self, kernel, args, **kwargs) -> None:
                 self.kernel = kernel
                 self.args = args
@@ -1741,6 +1745,10 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                 return Config(num_warps=4)
 
         class FakeLFBOSearch:
+            # (the config a stage's kernel was measured under, when it returns
+            # a simpler one)
+            _selected_config_measured_as: Config | None = None
+
             def __init__(
                 self,
                 kernel,
@@ -1808,9 +1816,16 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
             search._benchmark_provider_cls = FakeBenchmarkProvider
             search._prepare()
             self.assertIsInstance(search.benchmark_provider, FakeBenchmarkProvider)
+            # (stage 2 returns a simpler config of the kernel it measured)
+            measured = Config(num_warps=8, num_stages=2)
+            FakeLFBOSearch._selected_config_measured_as = measured
             best = search._autotune()
 
         self.assertEqual(best["num_warps"], 8)
+        # The hybrid's own "selected" record names the config stage 2 timed.
+        self.assertIs(search._selected_config_measured_as, measured)
+        # The LLM stage's config only seeds stage 2: it is not simplified.
+        self.assertIs(llm_instances[0]._simplifies_selected_config, False)
         self.assertEqual(llm_instances[0].kwargs["max_rounds"], 2)
         self.assertTrue(llm_instances[0].skip_cache)
         self.assertEqual(
@@ -1879,6 +1894,10 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                 return []
 
         class FakeLLMSearch:
+            # (the config a stage's kernel was measured under, when it returns
+            # a simpler one)
+            _selected_config_measured_as: Config | None = None
+
             def __init__(self, kernel, args, **kwargs) -> None:
                 self.kernel = kernel
                 self.args = args
@@ -1900,6 +1919,10 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                 return Config(num_warps=4)
 
         class FakeLFBOSearch:
+            # (the config a stage's kernel was measured under, when it returns
+            # a simpler one)
+            _selected_config_measured_as: Config | None = None
+
             def __init__(
                 self,
                 kernel,
@@ -2009,6 +2032,10 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                 raise AssertionError("LLM seed stage should be skipped")
 
         class FakeLFBOSearch:
+            # (the config a stage's kernel was measured under, when it returns
+            # a simpler one)
+            _selected_config_measured_as: Config | None = None
+
             def __init__(self, kernel, args, **kwargs) -> None:
                 self.kwargs = kwargs
                 self.best_perf_so_far = 0.4

@@ -10,11 +10,18 @@ from one kernel, and one member holds each kernel
 (``PopulationBasedSearch._kernel_holder``): it is the one a re-timing times,
 once however many configs of the kernel a population holds, and every other
 config of the kernel has its reading.
+
+The second section covers the config such a search returns
+(``Backend.simplified_selected_config``).
 """
 
 from __future__ import annotations
 
 from contextlib import nullcontext
+import dataclasses
+import functools
+import json
+import logging
 import random
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -27,19 +34,30 @@ import pytest
 import helion
 from helion._compiler.backend import Backend
 from helion._compiler.cute.backend import CuteBackend
+from helion._testing.search_harness import mock_kernel
 from helion.autotuner import LFBOTreeSearch
 from helion.autotuner import PatternSearch
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.benchmark_provider import BenchmarkProvider
+from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.benchmark_provider import MultiShapeBenchmarkProvider
+from helion.autotuner.handoff import _active_handoff
 from helion.autotuner.llm_search import LLMGuidedSearch
+from helion.autotuner.logger import AutotuneLogEntry
+from helion.autotuner.logger import AutotuningLogger
 from helion.autotuner.metrics import AutotuneMetrics
 from helion.autotuner.pattern_search import InitialPopulationStrategy
+from helion.autotuner.search_space_logger import canonical_config_id
+from helion.runtime.settings import Settings
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
+    from pathlib import Path
+
+    from helion.autotuner.base_search import _AutotunableKernel
+    from helion.autotuner.handoff import _HandoffSession
 
 pytestmark = pytest.mark.cpu_only
 
@@ -1623,3 +1641,608 @@ def test_finishing_round_takes_dead_resets_without_a_timing() -> None:
     assert timed == [[[2, 5, 7], [1, 5, 7]]]
     assert result.flat_values == [2, 4, 6]
     assert result.perfs == [10.0 * 1.01]
+
+
+# --- The config a search that drops aliases returns --------------------------
+#
+# Such a search times a kernel under the first config that produced its
+# source.  After the selection the backend may propose simpler configs of the
+# same kernel (``Backend.simplified_selected_config``); the search takes one
+# that passes its config filters and renders to the selection's source.
+
+
+def _measured(perf: float, num_warps: int, source: str | None) -> PopulationMember:
+    """The member a search measured: a kernel whose generated source the
+    stand-in backends hash to ``source``."""
+    member = _member(perf, num_warps)
+    member.fn = SimpleNamespace(source_hash=source)  # type: ignore[assignment]
+    return member
+
+
+def _selection_search(
+    *,
+    collapse: bool = True,
+    hashes: dict[int, str | None],
+    simplified: helion.Config,
+) -> tuple[PopulationBasedSearch, Mock]:
+    """``_harness_selection_search`` for a test that hands the search its
+    measured member itself (``_measured``) and watches the backend's hook,
+    which proposes ``simplified`` for any selection; returns the search and
+    the hook."""
+    search, _compile_config = _harness_selection_search(
+        None, proposals=[simplified], hashes=hashes, collapse=collapse
+    )
+    search.log = Mock(trace_enabled=False)
+    search.config_gen = SimpleNamespace(flatten=lambda config: (config.num_warps,))  # type: ignore[assignment]
+    return search, search.config_spec.backend.simplified_selected_config
+
+
+def test_search_returns_a_simpler_config_of_the_selected_source() -> None:
+    selected = _measured(5.0, 1, "a")
+    selected.compile_time = 1.5
+    simpler = helion.Config(num_warps=2)
+    search, _hook = _selection_search(hashes={2: "a"}, simplified=simpler)
+    search._selected_member = selected
+
+    assert search._simplified_selected_config(selected.config) is simpler
+    # One render: the proposal's.  The selection is the kernel that was
+    # measured, not a second render of its config.
+    assert search.kernel.compile_config.call_count == 1  # type: ignore[attr-defined]
+    # The returned config is linked to the kernel that was measured: the
+    # member is the selected one under the returned config.
+    linked = search._selected_member
+    assert linked is not selected
+    assert linked == dataclasses.replace(selected, config=simpler, flat_values=(2,))
+    assert linked.perfs is not selected.perfs
+
+    # Without a selected member the benchmarked history gives the kernel.
+    search, _hook = _selection_search(hashes={2: "a"}, simplified=simpler)
+    search._benchmarked_members = SimpleNamespace(get=lambda config: selected)  # type: ignore[assignment]
+    assert search._simplified_selected_config(selected.config) is simpler
+    assert search._selected_member.fn is selected.fn
+
+    # A selection the search holds no measured kernel for stays as it is.
+    search, hook = _selection_search(hashes={2: "a"}, simplified=simpler)
+    assert search._simplified_selected_config(selected.config) is selected.config
+    hook.assert_not_called()
+
+
+@pytest.mark.parametrize("other", ["b", None])
+def test_search_keeps_the_selection_when_the_simpler_config_is_other_code(
+    other: str | None,
+) -> None:
+    selected = _measured(5.0, 1, "a")
+    search, hook = _selection_search(
+        hashes={2: other}, simplified=helion.Config(num_warps=2)
+    )
+    search._selected_member = selected
+
+    # Another source, or a render without a source hash, is not the kernel.
+    assert search._simplified_selected_config(selected.config) is selected.config
+    assert hook.call_count == 1
+    assert search._selected_member is selected
+    search.log.assert_not_called()  # type: ignore[attr-defined]
+
+    # Nor can anything stand for a measured kernel without a source hash.
+    search._selected_member = _measured(5.0, 1, None)
+    assert search._simplified_selected_config(selected.config) is selected.config
+    assert hook.call_count == 1
+
+
+def test_final_selection_record_names_the_returned_and_the_measured_config() -> None:
+    """The final selection's record is written before the selection is
+    simplified.  ``selected_config_id`` names the config the search returns,
+    as it does for a search that returns its selection, and
+    ``measured_config_id`` the config the kernel was timed under, which is
+    the one the record's rows are keyed by."""
+    selected = _measured(5.0, 1, "a")
+    simpler = helion.Config(num_warps=2)
+    measured_id = canonical_config_id(selected.config)
+
+    def record() -> dict[str, object]:
+        return {"selected_config_id": measured_id, "rows": [{"config_id": measured_id}]}
+
+    search, _hook = _selection_search(hashes={2: "a"}, simplified=simpler)
+    search._selected_member = selected
+    search._autotune_metrics.final_selection = record()
+    assert search._simplified_selected_config(selected.config) is simpler
+    assert search._autotune_metrics.final_selection == {
+        **record(),
+        "selected_config_id": canonical_config_id(simpler),
+        "measured_config_id": measured_id,
+    }
+
+    # A selection that stays as it is leaves the record as it was.
+    search, _hook = _selection_search(hashes={2: "b"}, simplified=simpler)
+    search._selected_member = selected
+    search._autotune_metrics.final_selection = record()
+    assert search._simplified_selected_config(selected.config) is selected.config
+    assert search._autotune_metrics.final_selection == record()
+
+
+def test_a_run_without_a_final_selection_record_computes_no_config_ids() -> None:
+    """A search without a final-selection record has no ids to update, so the
+    step does not compute any: a config whose canonical id cannot be
+    computed (a custom tunable whose value is a dict with tuple keys) is
+    simplified like any other instead of failing a search that succeeded."""
+    selected = _measured(5.0, 1, "a")
+    selected.config.config["custom"] = {(1, 2): 3}
+    simpler = helion.Config(num_warps=2)
+    with pytest.raises(TypeError):
+        canonical_config_id(selected.config)
+    search, _hook = _selection_search(hashes={2: "a"}, simplified=simpler)
+    search._selected_member = selected
+    assert search._autotune_metrics.final_selection is None
+
+    assert search._simplified_selected_config(selected.config) is simpler
+
+
+@pytest.mark.parametrize("simplifies", [True, False, "minimized"])
+def test_trace_selected_event_names_the_returned_and_the_measured_config(
+    simplifies: bool | str, tmp_path: Path
+) -> None:
+    """The trace's trial rows are keyed by the configs that were timed.  Its
+    "selected" event names the config the search returns; where that is a
+    simpler config of the measured kernel, which no trial row carries, the
+    event also names the measured config, so the event still joins a trial
+    row.  The measured config is the one the search timed the kernel under,
+    also where its selection is itself a config that was never timed (the
+    finishing phase ends on a minimized config of the kernel)."""
+    selected = helion.Config(num_warps=1)
+    simpler = helion.Config(num_warps=2)
+    minimized = helion.Config(num_warps=5)
+    settings = Settings(
+        autotune_log_level=logging.CRITICAL,
+        autotune_log=str(tmp_path / "run"),
+        autotune_log_details=True,
+    )
+    search, _compile_config = _harness_selection_search(
+        selected,
+        proposals=[simpler],
+        hashes={1: "a", 2: "a" if simplifies else "b", 5: "a"},
+    )
+    search.log = AutotuningLogger(settings)
+    search.benchmark_provider = Mock()
+    timed = search._selected_member
+    assert timed is not None
+    if simplifies == "minimized":
+        # The search timed the kernel under ``selected`` and ends on a
+        # minimized config of it, which holds the same compiled function.
+        search._kernels[id(timed.fn)] = timed
+        search._selected_member = dataclasses.replace(timed, config=minimized)
+
+    def run_search() -> helion.Config:
+        config_id = search.log.register_config(selected)
+        assert config_id is not None
+        search.log.record_autotune_entry(
+            AutotuneLogEntry(0, "ok", 1.0, None, config_id, selected)
+        )
+        return selected
+
+    def run_and_end_on_the_minimized_config() -> helion.Config:
+        run_search()
+        return minimized
+
+    with (
+        patch.object(search, "_prepare"),
+        patch.object(
+            search,
+            "_autotune",
+            side_effect=(
+                run_and_end_on_the_minimized_config
+                if simplifies == "minimized"
+                else run_search
+            ),
+        ),
+        patch.object(search, "_finalize_autotune_metrics"),
+    ):
+        returned = search.autotune()
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "run.trace.jsonl").read_text().splitlines()
+    ]
+    (trial,) = [row for row in rows if row["event"] == "trial"]
+    (event,) = [row for row in rows if row["event"] == "selected"]
+    assert trial["config_id"] == canonical_config_id(selected)
+    if simplifies:
+        assert returned is simpler
+        assert event["config_id"] == canonical_config_id(simpler)
+        assert event["measured_config_id"] == trial["config_id"]
+    else:
+        assert returned is selected
+        assert event["config_id"] == trial["config_id"]
+        assert "measured_config_id" not in event
+
+
+def test_search_takes_only_a_config_it_was_asked_about() -> None:
+    """The returned config is the measured kernel because the search
+    rendered it.  A backend that answers with a config it did not ask about
+    (one composed from accepted parts, say) gets the selection back."""
+    selected = _measured(5.0, 1, "a")
+    asked = helion.Config(num_warps=2)
+    unasked = helion.Config(num_warps=3)
+    search, hook = _selection_search(hashes={2: "a", 3: "a"}, simplified=asked)
+    hook.side_effect = lambda config_spec, config, same_source: (
+        unasked if same_source(asked) else config
+    )
+    search._selected_member = selected
+
+    assert search._simplified_selected_config(selected.config) is selected.config
+    assert search._selected_member is selected
+    (warning,) = search.log.warning.call_args_list  # type: ignore[attr-defined]
+    assert "without asking" in warning.args[0]
+
+
+@pytest.mark.parametrize(
+    "condition",
+    ["no_collapse", "overrides", "multi_shape", "distributed", "handoff", "seed_stage"],
+)
+def test_search_does_not_simplify_outside_a_plain_collapsing_search(
+    condition: str,
+) -> None:
+    """One render does not speak for every shape of a multi-shape search or
+    for every rank of a distributed one: their providers report no aliases,
+    so the search drops none and does not simplify what it returns.  Nor
+    does a search inside ``find_handoff``: its session confirms the configs
+    that were measured, and a returned config no measurement carries would
+    be confirmed as one more finalist of the same kernel.  And a search
+    whose config only seeds another search (the LLM stage of the LLM-seeded
+    hybrid) spends no renders on a config the next stage times again."""
+    selected = _measured(5.0, 1, "a")
+    search, hook = _selection_search(
+        collapse=condition != "no_collapse",
+        hashes={2: "a"},
+        simplified=helion.Config(num_warps=2),
+    )
+    search._selected_member = selected
+    if condition == "overrides":
+        search.settings.autotune_config_overrides = {"num_warps": 1}
+    if condition == "seed_stage":
+        search._simplifies_selected_config = False
+    if condition == "multi_shape":
+        search.benchmark_provider = MultiShapeBenchmarkProvider.__new__(
+            MultiShapeBenchmarkProvider
+        )
+    if condition == "distributed":
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.config_spec = SimpleNamespace(  # type: ignore[assignment]
+            backend=SimpleNamespace(
+                should_deduplicate_generated_sources=lambda config_spec: True
+            )
+        )
+        search.benchmark_provider = provider
+
+    session = _active_handoff.set(
+        cast("_HandoffSession", object()) if condition == "handoff" else None
+    )
+    try:
+        with patch(
+            "helion.autotuner.benchmark_provider.dist.is_initialized",
+            return_value=condition == "distributed",
+        ):
+            returned = search._simplified_selected_config(selected.config)
+    finally:
+        _active_handoff.reset(session)
+    assert returned is selected.config
+    hook.assert_not_called()
+
+
+def _harness_selection_search(
+    selected: helion.Config | None,
+    *,
+    proposals: list[helion.Config] | None = None,
+    hashes: dict[int, str | None] | Callable[[helion.Config], str],
+    config_filter: Callable[[helion.Config], helion.Config | None] | None = None,
+    viable: Callable[[helion.Config], bool] = lambda config: True,
+    collapse: bool = True,
+) -> tuple[PopulationBasedSearch, Mock]:
+    """A search built on the stand-in kernel of the search harness whose
+    backend drops source aliases and proposes ``proposals`` in order for any
+    selection (the first that ``same_source`` accepts is returned), or, with
+    no ``proposals``, what the CuTe backend proposes; its kernel renders a
+    config to the given hash (by ``num_warps``, or as the function says), or
+    raises where ``hashes`` has none.  The search holds the member it
+    measured ``selected`` under, that config's kernel (with ``None`` the
+    test hands it one itself).  The backend's hook is a ``Mock``.  Returns
+    the search and the kernel's ``compile_config``, which has rendered
+    nothing yet."""
+
+    def render(config: helion.Config, allow_print: bool) -> SimpleNamespace:
+        if callable(hashes):
+            return SimpleNamespace(source_hash=hashes(config))
+        if config.num_warps not in hashes:
+            raise RuntimeError(f"cannot render num_warps={config.num_warps}")
+        return SimpleNamespace(source_hash=hashes[config.num_warps])
+
+    compile_config = Mock(side_effect=render)
+    settings = Settings(
+        autotune_log_level=logging.CRITICAL, autotune_config_filter=config_filter
+    )
+    kernel = mock_kernel(
+        settings, compile_config=compile_config, get_cached_path=lambda config: None
+    )
+    backend = kernel.config_spec.backend
+    backend.collapses_generated_source_aliases = lambda config_spec: collapse
+    backend.autotune_config_is_viable = lambda config_spec, config: viable(config)
+    backend.generated_source_hash = lambda fn: fn.source_hash
+    if proposals is None:
+        hook = functools.partial(CuteBackend.simplified_selected_config, CuteBackend())
+    else:
+
+        def hook(
+            config_spec: object,
+            config: helion.Config,
+            same_source: Callable[[helion.Config], bool],
+        ) -> helion.Config:
+            return next(
+                (proposal for proposal in proposals if same_source(proposal)), config
+            )
+
+    backend.simplified_selected_config = Mock(side_effect=hook)
+    search = PopulationBasedSearch(cast("_AutotunableKernel", kernel), ())
+    search._autotune_metrics = AutotuneMetrics()  # as ``autotune`` sets it
+    search.benchmark_provider = _provider()  # type: ignore[assignment]
+    search.config_gen = SimpleNamespace(flatten=lambda config: ())  # type: ignore[assignment]
+    if selected is not None:
+        search._selected_member = PopulationMember(
+            render(selected, False), [5.0], (), selected, status="ok"
+        )
+    return search, compile_config
+
+
+def _rendered(compile_config: Mock) -> list[int]:
+    return [call.args[0].num_warps for call in compile_config.call_args_list]
+
+
+def _rendered_policies(compile_config: Mock) -> list[list[str]]:
+    return [
+        call.args[0].config["load_eviction_policies"]
+        for call in compile_config.call_args_list
+    ]
+
+
+def _live_slots(*slots: int) -> Callable[[helion.Config], str]:
+    """A render whose code depends on the load-eviction policies of the
+    given slots only."""
+    return lambda config: repr(
+        [config.config["load_eviction_policies"][slot] for slot in slots]
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "passes",
+        "rejected",
+        "rewritten",
+        "rewritten_in_place",
+        "not_viable",
+        "second_passes",
+    ],
+)
+def test_a_proposed_config_passes_the_config_filters_before_it_is_compiled(
+    case: str,
+) -> None:
+    """``autotune_config_filter`` runs on every candidate config before it is
+    compiled, and the backend's viability check with it.  A config proposed
+    in place of the selection is such a candidate: one the filter drops or
+    rewrites (into another config, or by editing the one it is given, which
+    is a copy: the proposal stays as the backend made it), or the backend
+    rules out, is neither rendered nor returned, and the search goes on to
+    the next proposal or keeps its selection."""
+    selected = helion.Config(num_warps=1)
+    simpler = helion.Config(num_warps=2)
+    second = helion.Config(num_warps=3)
+    seen: list[int] = []
+
+    def config_filter(config: helion.Config) -> helion.Config | None:
+        seen.append(config.num_warps)
+        if config.num_warps == 2 and case in ("rejected", "second_passes"):
+            return None
+        if config.num_warps == 2 and case == "rewritten":
+            return helion.Config(num_warps=4)
+        if config.num_warps == 2 and case == "rewritten_in_place":
+            config.config["num_warps"] = 4
+        return config
+
+    search, compile_config = _harness_selection_search(
+        selected,
+        proposals=[simpler, second] if case == "second_passes" else [simpler],
+        hashes={1: "a", 2: "a", 3: "a", 4: "a"},
+        config_filter=config_filter,
+        viable=lambda config: not (case == "not_viable" and config.num_warps == 2),
+    )
+
+    returned = search._simplified_selected_config(selected)
+
+    assert returned is {"passes": simpler, "second_passes": second}.get(case, selected)
+    assert simpler.num_warps == 2
+    # The filter saw every proposal the search asked about ...
+    assert seen == ([2, 3] if case == "second_passes" else [2])
+    # ... and only one that passed it unchanged was compiled.
+    assert _rendered(compile_config) == {
+        "passes": [2],
+        "second_passes": [3],
+    }.get(case, [])
+
+
+def test_a_dropped_proposal_takes_no_trial_row() -> None:
+    """A candidate of the search that the config filters drop gets a
+    ``"filtered"`` trial row in the trace.  A proposal is rendered after
+    the search and is no candidate of it: dropped or taken, it adds no row,
+    so the trace's rows stay the search's candidates."""
+    selected = helion.Config(num_warps=1)
+    dropped = helion.Config(num_warps=2)
+    taken = helion.Config(num_warps=3)
+    search, _compile_config = _harness_selection_search(
+        selected,
+        proposals=[dropped, taken],
+        hashes={1: "a", 2: "a", 3: "a"},
+        config_filter=lambda config: None if config.num_warps == 2 else config,
+    )
+    search.log = Mock(trace_enabled=True)
+
+    assert search._simplified_selected_config(selected) is taken
+    search.log.record_trace_entry.assert_not_called()
+    # ... while a candidate of the search that the filter drops gets its row.
+    search._apply_config_filter([dropped])
+    (entry,), _kwargs = search.log.record_trace_entry.call_args
+    assert entry.status == "filtered"
+
+
+@pytest.mark.parametrize("rewrite", ["in_place", "copy"])
+def test_a_filter_that_rewrites_a_proposal_does_not_change_what_is_returned(
+    rewrite: str,
+) -> None:
+    """A config filter forces the first load policy to ``"last"``, by
+    editing the config it is given or by returning another one.  The
+    selection sets both policies and the code depends on both.  A proposal
+    the filter rewrites is not the config that was proposed: it is not
+    rendered in the proposal's name, so the search does not return
+    ``["", "last"]``, a config that was never rendered and is other code."""
+
+    def config_filter(config: helion.Config) -> helion.Config | None:
+        policies = config.config["load_eviction_policies"]
+        if rewrite == "copy":
+            return helion.Config(load_eviction_policies=["last", *policies[1:]])
+        policies[0] = "last"
+        return config
+
+    selected = helion.Config(load_eviction_policies=["last", "last"])
+    search, compile_config = _harness_selection_search(
+        selected, hashes=_live_slots(0, 1), config_filter=config_filter
+    )
+
+    returned = search._simplified_selected_config(selected)
+
+    assert returned is selected
+    # Rendered: the one proposal the filter left as it was, which is other
+    # code.
+    assert _rendered_policies(compile_config) == [["last", ""]]
+
+
+def test_no_render_starts_once_the_budget_is_used_up() -> None:
+    """Each render is compile work under ``autotune_budget_seconds``, checked
+    before every one of them, as a search checks it before every candidate.
+    Three policies of which the code depends on the first: the budget runs
+    out after three renders, so the last reset is not tried, and the search
+    returns the config it had verified until then."""
+    selected = helion.Config(load_eviction_policies=["last", "last", "last"])
+    search, compile_config = _harness_selection_search(selected, hashes=_live_slots(0))
+
+    with patch.object(
+        search,
+        "_autotune_budget_exceeded",
+        side_effect=lambda: compile_config.call_count >= 3,
+    ) as exceeded:
+        returned = search._simplified_selected_config(selected)
+
+    assert _rendered_policies(compile_config) == [
+        ["", "", ""],
+        ["", "last", "last"],
+        ["last", "", "last"],
+    ]
+    assert returned.config["load_eviction_policies"] == ["last", "", "last"]
+    # One check before each render, and one that stopped the fourth.
+    assert exceeded.call_count == 4
+
+    # A budget that is used up when the search ends: no render at all.
+    search, compile_config = _harness_selection_search(selected, hashes=_live_slots(0))
+    with patch.object(search, "_autotune_budget_exceeded", return_value=True):
+        assert search._simplified_selected_config(selected) is selected
+    compile_config.assert_not_called()
+
+
+@pytest.mark.parametrize("ignore_errors", [False, True])
+def test_a_failed_render_is_no_kernel(ignore_errors: bool) -> None:
+    """The proposals are rendered after the search has selected its config.
+    One that fails to compile is not the selected kernel, as a search
+    candidate that fails to compile is no candidate: that proposal is not
+    taken and the next one is still tried.  The failure is logged as a
+    candidate's is (a warning; nothing under ``autotune_ignore_errors``),
+    and ``autotune`` completes."""
+    selected = helion.Config(num_warps=1)
+    simpler = helion.Config(num_warps=2)
+    later = helion.Config(num_warps=3)
+    search, compile_config = _harness_selection_search(
+        selected, proposals=[simpler, later], hashes={1: "a", 3: "a"}
+    )
+    search.settings.autotune_ignore_errors = ignore_errors
+    search.log = Mock(trace_enabled=False)
+
+    returned = search._simplified_selected_config(selected)
+
+    # The proposal after the failing one is still tried, and taken.
+    assert returned is later
+    assert _rendered(compile_config) == [2, 3]
+    if ignore_errors:
+        search.log.warning.assert_not_called()
+        search.log.debug.assert_not_called()
+    else:
+        (warning,) = search.log.warning.call_args_list
+        assert warning.args[0].startswith(
+            f"Not taking {simpler} in place of the selected config"
+        )
+        assert warning.kwargs == {"exc_info": True}
+
+    # The whole autotune: a render that raises does not abort it.
+    search, compile_config = _harness_selection_search(
+        selected, proposals=[simpler], hashes={1: "a"}
+    )
+    search.benchmark_provider = Mock()
+    search._autotune_metrics = AutotuneMetrics()
+    with (
+        patch.object(search, "_prepare"),
+        patch.object(search, "_autotune", return_value=selected),
+        patch.object(search, "_finalize_autotune_metrics"),
+    ):
+        assert search.autotune() is selected
+    assert _rendered(compile_config) == [2]
+
+
+def test_backends_without_dead_settings_return_the_selected_config() -> None:
+    selected = helion.Config(num_warps=1)
+    refuse = Mock(side_effect=AssertionError("no render"))
+    spec = SimpleNamespace(cute_flash_search_enabled=False)
+    # The default hook, and CuTe for a config without a load policy.
+    assert Backend.simplified_selected_config(
+        CuteBackend(), spec, selected, refuse
+    ) is (  # type: ignore[arg-type]
+        selected
+    )
+    assert CuteBackend().simplified_selected_config(spec, selected, refuse) is selected  # type: ignore[arg-type]
+    unset = helion.Config(load_eviction_policies=["", ""])
+    assert CuteBackend().simplified_selected_config(spec, unset, refuse) is unset  # type: ignore[arg-type]
+
+
+def test_autotune_returns_the_simplified_selection() -> None:
+    settings = Settings(autotune_log_level=logging.CRITICAL)
+    search = object.__new__(PopulationBasedSearch)
+    search.settings = settings
+    search.log = AutotuningLogger(settings)
+    search.kernel = Mock()
+    search.kernel.format_kernel_decorator.return_value = "@helion.kernel(...)"
+    search.kernel.get_cached_path.return_value = None
+    search.args = ()
+    search._autotune_metrics = AutotuneMetrics()
+    search._search_space_tracker = None
+    search.benchmark_provider = Mock()
+    search._fallback_excluded_configs = set()  # type: ignore[assignment]
+    selected = helion.Config(num_warps=4)
+    simpler = helion.Config(num_warps=8)
+
+    with (
+        patch.object(search, "_prepare"),
+        patch.object(search, "_autotune", return_value=selected),
+        patch.object(
+            search, "_simplified_selected_config", return_value=simpler
+        ) as simplify,
+        patch.object(search, "_finalize_autotune_metrics") as finalize,
+    ):
+        returned = search.autotune()
+
+    # The search returns, records and caches the simpler config.
+    assert returned is simpler
+    simplify.assert_called_once_with(selected)
+    finalize.assert_called_once_with(simpler)

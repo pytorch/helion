@@ -82,6 +82,7 @@ from .compiler_refinement import compiler_refinement_candidates
 from .compiler_refinement import compiler_refinement_policy
 from .compiler_refinement import same_refinement_value
 from .effort_profile import get_effort_profile
+from .handoff import _active_handoff
 from .handoff import _HandoffStop
 from .handoff import _observe_handoff
 from .handoff import _refresh_handoff
@@ -89,6 +90,8 @@ from .input_banks import InputBankError
 from .input_banks import InputBankMemoryError
 from .logger import AutotuneLogEntry
 from .logger import AutotuningLogger
+from .logger import capture_output
+from .logger import log_candidate_compile_failure
 from .metrics import AutotuneMetrics
 from .metrics import KernelMetadata
 from .metrics import _run_post_autotune_hooks
@@ -99,6 +102,7 @@ from helion._dist_utils import is_master_rank
 from helion._dist_utils import sync_object
 
 if TYPE_CHECKING:
+    from collections.abc import Hashable
     from collections.abc import Iterable
     from collections.abc import Iterator
     from collections.abc import Mapping
@@ -488,6 +492,15 @@ class BaseSearch(BaseAutotuner):
 
     # Snapshot the timing policy for all queued measurements in this search.
     _input_bank_count: int = 1
+    # The config the search timed the returned kernel under, where it returns
+    # a simpler config of that kernel (``_simplified_selected_config``): the
+    # trace's trial rows are keyed by this one.
+    _selected_config_measured_as: Config | None = None
+    # Whether the search returns a simpler config of its selection where it
+    # knows one. Off for a search whose config only seeds another search
+    # (the LLM stage of the LLM-seeded hybrid): the renders that find the
+    # simpler config would be spent on a config the next stage times again.
+    _simplifies_selected_config: bool = True
 
     def __init__(
         self,
@@ -1041,9 +1054,13 @@ class BaseSearch(BaseAutotuner):
         )
 
     def _apply_config_filter(
-        self, configs: list[Config]
+        self, configs: list[Config], *, record_trace: bool = True
     ) -> tuple[list[Config], list[int]]:
-        """Apply backend and user filters, returning configs and source indices."""
+        """Apply backend and user filters, returning configs and source indices.
+
+        A config the filters drop is a search candidate that was not tried,
+        and the trace gets a ``"filtered"`` trial row for it (not without
+        ``record_trace``)."""
         config_filter = self.settings.autotune_config_filter
         filtered: list[Config | None] = []
         for config in configs:
@@ -1054,6 +1071,7 @@ class BaseSearch(BaseAutotuner):
         for config, result in zip(configs, filtered, strict=True):
             if (
                 result is None
+                and record_trace
                 and self.log.trace_enabled
                 and (config_id := self.log.register_config(config)) is not None
             ):
@@ -1193,7 +1211,9 @@ class BaseSearch(BaseAutotuner):
         """
         with self.log.autotune_tracing(type(self).__name__):
             config = self._autotune_with_logging(skip_cache=skip_cache)
-            self.log.record_selected_config(config)
+            self.log.record_selected_config(
+                config, measured_as=self._selected_config_measured_as
+            )
             return config
 
     def _autotune_with_logging(self, *, skip_cache: bool) -> Config:
@@ -1256,6 +1276,7 @@ class BaseSearch(BaseAutotuner):
                             raise exc.NoConfigFound
                         if not self.args.defer_selected_log:
                             self.benchmark_provider.log_selected(best)
+                    best = self._simplified_selected_config(best)
                 except exc.NoConfigFound as error:
                     # Every candidate dropped by the worker's compile deadline
                     # is a deadline (or host) problem, not a kernel without a
@@ -1538,6 +1559,11 @@ class BaseSearch(BaseAutotuner):
             NotImplementedError: If the method is not implemented.
         """
         raise NotImplementedError
+
+    def _simplified_selected_config(self, best: Config) -> Config:
+        """The config the search returns for its selection ``best``: the same
+        one, unless the search knows a simpler config of the same kernel."""
+        return best
 
     def _autotune_seed_configs(self) -> Sequence[Config]:
         """Return user-provided autotune seed configs normalized from settings."""
@@ -2463,6 +2489,145 @@ class PopulationBasedSearch(BaseSearch):
                 self._record_best_member_for_config(
                     self._pinned_finalist_members, kernel.config, kernel
                 )
+
+    def _simplified_selected_config(self, best: Config) -> Config:
+        """``best``, or a simpler config of the same kernel that the backend
+        proposes (``Backend.simplified_selected_config``; CuTe: without the
+        load-eviction policies the generated code does not depend on), where
+        the search drops source aliases.
+
+        Such a search times a kernel under the first config that produced
+        its source, so the selection can carry settings that leave no trace
+        in the code.  The backend proposes simpler configs and each is
+        rendered here in process; one is taken only when its generated
+        source hash is that of the kernel the search measured for its
+        selection (the compiled function of the member it holds for
+        ``best``), so the returned config is the measured kernel.
+
+        A proposal is a candidate config like any other, and the rules for
+        one are applied in one place each, to every proposal:
+
+        - It passes the user's ``autotune_config_filter`` and the backend's
+          viability check before it is compiled and stands for the selection
+          only as it was proposed.  The filters see a copy, and the config
+          they return has to be the proposal: a filter that rewrites its
+          argument, in place or into another config, has asked for other
+          code than the one that was proposed.
+        - Every render is compile work, which ``autotune_budget_seconds``
+          covers: none starts once the budget is used up, and the proposals
+          accepted until then stand.
+        - A render that fails is no kernel: that proposal is not taken.  The
+          failure is never raised and is handled as the search handles a
+          candidate that fails to compile: the compiler's output is
+          captured, and the failure is logged by its classification, not at
+          all under ``autotune_ignore_errors``.
+
+        The search returns only a config this step accepted: a backend that
+        answers with one it did not ask about gets the selection back.  Not
+        for a multi-shape search or in a process with torch.distributed
+        initialized (one render does not speak for every shape or rank;
+        neither drops aliases, ``_collapses_source_aliases``), not under
+        user overrides (their values stay as given), not inside
+        ``find_handoff``, whose session confirms the configs that were
+        measured, and not in a search whose config only seeds another
+        search (``_simplifies_selected_config``).
+        """
+        if (
+            not self._simplifies_selected_config
+            or not self._collapses_source_aliases()
+            or self.settings.autotune_config_overrides
+            or _active_handoff.get() is not None
+        ):
+            return best
+        backend = self.config_spec.backend
+        # The kernel that was measured: the member the search holds for its
+        # selection.
+        searched = self._selected_member
+        if searched is None or _config_key(searched.config) != _config_key(best):
+            searched = self._benchmarked_members.get(best)
+        if searched is None:
+            return best
+        selected = backend.generated_source_hash(searched.fn)
+        if selected is None:
+            return best
+        accepted: set[Hashable] = set()
+
+        def renders_selected_source(candidate: Config) -> bool:
+            if self._autotune_budget_exceeded():
+                return False
+            try:
+                with capture_output():
+                    compiled = self.kernel.compile_config(candidate, allow_print=False)
+            except Exception as error:
+                # As for a search candidate that fails to compile: no kernel.
+                log_candidate_compile_failure(
+                    self.log,
+                    self.settings,
+                    backend,
+                    error,
+                    f"Not taking {candidate} in place of the selected config: "
+                    "rendering it to compare the generated sources failed",
+                )
+                return False
+            return backend.generated_source_hash(compiled) == selected
+
+        def same_source(candidate: Config) -> bool:
+            # The filters get a copy, so what they return is compared with
+            # the proposal as the backend made it.
+            key = _config_key(candidate)
+            # (a proposal is no candidate of the search: one the filters
+            # drop takes no "filtered" trial row)
+            passing, _indices = self._apply_config_filter(
+                [_stored_config(candidate.config)], record_trace=False
+            )
+            if (
+                not passing
+                or _config_key(passing[0]) != key
+                or not renders_selected_source(candidate)
+            ):
+                return False
+            accepted.add(key)
+            return True
+
+        simplified = backend.simplified_selected_config(
+            self.config_spec, best, same_source
+        )
+        if _config_key(simplified) == _config_key(best):
+            return best
+        if _config_key(simplified) not in accepted:
+            self.log.warning(
+                "Keeping the selected config as it is: the backend proposed "
+                f"{simplified} in its place without asking whether it "
+                "renders to the selected code"
+            )
+            return best
+        self.log(
+            "Returning a simpler config with the selected config's generated "
+            f"code: {simplified} (selected as {best})"
+        )
+        # The run's records name the returned config and keep the ones the
+        # kernel was measured under. The trace's trial rows are keyed by the
+        # configs the search timed: the kernel's is the config that holds it
+        # (the selection itself can be a config that was never timed: the
+        # finishing phase ends on a minimized one). The final selection's
+        # rows are keyed by the configs it timed, the selection among them.
+        holder = self._kernels.get(id(searched.fn))
+        self._selected_config_measured_as = best if holder is None else holder.config
+        selection = self._autotune_metrics.final_selection
+        if selection is not None:
+            # (only a run with the record computes the ids)
+            measured_id = canonical_config_id(best)
+            if selection.get("selected_config_id") == measured_id:
+                selection["measured_config_id"] = measured_id
+                selection["selected_config_id"] = canonical_config_id(simplified)
+        # The returned config stays linked to the measured kernel.
+        self._selected_member = dataclasses.replace(
+            searched,
+            config=simplified,
+            flat_values=self.config_gen.flatten(simplified),
+            perfs=[*searched.perfs],
+        )
+        return simplified
 
     @property
     def best(self) -> PopulationMember:

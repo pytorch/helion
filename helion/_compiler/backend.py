@@ -1356,6 +1356,35 @@ class Backend(abc.ABC):
         """
         return False
 
+    def simplified_selected_config(
+        self,
+        config_spec: ConfigSpec,
+        config: Config,
+        same_source: Callable[[Config], bool],
+    ) -> Config:
+        """A simpler config with the generated source of the selected one.
+
+        Called once after a search that drops source aliases
+        (``collapses_generated_source_aliases``) has selected ``config``.
+        Such a search times a kernel under the first config that produced
+        it, which may carry settings the code does not depend on.
+        ``same_source(candidate)`` says whether ``candidate`` may stand for
+        the selection: it passes the search's config filters as it is and
+        renders to the generated source of the kernel the search measured
+        (``False`` also once the autotune budget is used up, and for a
+        render that fails).  A backend resets settings of its choice that
+        can be inert and keeps each reset ``same_source`` accepts, so the
+        returned config, and a pin made from it, does not carry those
+        settings where the code does not depend on them.  It returns
+        ``config`` or a config ``same_source`` accepted: the search takes no
+        other.  It is no minimal config: a setting the backend does not try
+        stays as selected, whether the code depends on it or not (CuTe tries
+        ``load_eviction_policies`` only: each try is a render in the
+        autotuning process, and those policies are the setting a selection
+        most often carries without effect).  The default returns ``config``.
+        """
+        return config
+
     def classify_autotune_exception(self, err: BaseException) -> str | None:
         """Classify an exception that occurred during autotuning.
 

@@ -1563,6 +1563,10 @@ class TestMultiShapeBestOfK(unittest.TestCase):
 
 
 class _StageSearch:
+    # (the config a stage's kernel was measured under, when it returns
+    # a simpler one)
+    _selected_config_measured_as: Config | None = None
+
     def __init__(self, config: Config | None, perf: float, tested: int) -> None:
         self.config = config
         self.best_perf_so_far = perf

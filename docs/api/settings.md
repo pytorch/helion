@@ -251,7 +251,11 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
    This flag also appends ``<autotune_log>.trace.jsonl`` with timestamped search
    stages, config evaluations, rebenchmarks, selection, and exact LLM prompts
-   and responses. Recording is disabled by default; set
+   and responses. The ``selected`` event names the returned config; where a
+   search returns a simpler config of the kernel it measured (CuTe: without
+   load-eviction policies the code does not depend on), no trial row carries
+   that config's id and the event's ``measured_config_id`` names the config
+   the kernel was timed under. Recording is disabled by default; set
    ``HELION_AUTOTUNE_LOG=/tmp/run`` and ``HELION_AUTOTUNE_LOG_DETAILS=1`` before
    importing the kernel. Each trace uses a per-search ``run_id``, distinct from
    the identity used by the CSV and metadata.

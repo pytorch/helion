@@ -3069,6 +3069,46 @@ class CuteBackend(Backend):
         # source quarantine); every other search drops the aliases.
         return not config_spec.cute_flash_search_enabled
 
+    def simplified_selected_config(
+        self,
+        config_spec: ConfigSpec,
+        config: Config,
+        same_source: Callable[[Config], bool],
+    ) -> Config:
+        # A ``load_eviction_policies`` slot is dead when the selected layout
+        # serves its load from registers, or when its packet width has no
+        # hinted load: the policy leaves no trace in the code.  Which slots
+        # those are is decided by the lane passes after codegen, so it is
+        # read off renders: every policy reset at once first (one render when
+        # all are dead), else slot by slot, keeping each reset that leaves
+        # the source as it is.  What is returned is a config ``same_source``
+        # accepted, as it was asked about, or ``config`` itself.
+        policies = config.config.get("load_eviction_policies")
+        if not isinstance(policies, list) or not any(policies):
+            return config
+
+        def with_policies(values: list[object]) -> Config:
+            return config.from_dict(
+                {**config.config, "load_eviction_policies": [*values]}
+            )
+
+        cleared = with_policies([""] * len(policies))
+        if same_source(cleared):
+            return cleared
+        accepted = config
+        live = list(policies)
+        for index, policy in enumerate(policies):
+            trial = [*live]
+            trial[index] = ""
+            # ``cleared`` is answered: the last set policy stays.
+            if policy == "" or not any(trial):
+                continue
+            candidate = with_policies(trial)
+            if same_source(candidate):
+                live = trial
+                accepted = candidate
+        return accepted
+
     def classify_autotune_exception(self, err: BaseException) -> str | None:
         # Exceptions raised from inside the cute/cutlass DSL during compile or
         # launch are expected when an invalid config is tried; treat them as

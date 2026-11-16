@@ -297,6 +297,9 @@ class LLMSeededSearch(BaseSearch):
             f"with {self.llm_configs_per_round} configs/round"
         )
         llm_search = self._make_llm_search()
+        # Its config seeds stage 2, which times it again and simplifies what
+        # it selects itself.
+        llm_search._simplifies_selected_config = False
         llm_start = time.perf_counter()
         try:
             llm_seed_config = llm_search.autotune(skip_cache=True)
@@ -424,6 +427,12 @@ class LLMSeededSearch(BaseSearch):
             second_stage_wall_time,
         )
         if best_config is not None:
+            # Stage 2 also says which config its kernel was measured under
+            # (it can return a simpler config of it), so this search's
+            # "selected" trace event joins the stage's trial rows.
+            self._selected_config_measured_as = (
+                second_stage_search._selected_config_measured_as
+            )
             return best_config
         if llm_seed_config is not None:
             return llm_seed_config
