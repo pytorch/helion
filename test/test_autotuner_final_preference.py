@@ -20,7 +20,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_vloop_sink_kernels import col_reduce_sum_static
 from test.cute_population_contracts import tcgen05_mma_support
 from test.test_cute_pdl import _COLUMN_SUM
 from test.test_cute_tcgen05_fixed_chain import _bind_gemm
@@ -34,6 +33,7 @@ from helion._compiler.triton.backend import TritonBackend
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_vloop_sink_kernels import col_reduce_sum_static
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.runtime.settings import Settings
 
