@@ -882,6 +882,29 @@ def shard_of_whole_rows(x: torch.Tensor, shard: hl.constexpr) -> torch.Tensor:
     static_shapes=True,
     autotune_effort="none",
 )
+def row_block_beside_whole_rows(x: torch.Tensor) -> torch.Tensor:
+    rows, splits, width = x.shape
+    y = torch.empty_like(x)
+    peaks = torch.empty((splits, rows), dtype=x.dtype, device=x.device)
+    out = torch.empty((rows // 4, splits, width), dtype=x.dtype, device=x.device)
+
+    for tile_row, tile_split in hl.tile([rows, splits], block_size=[1, 1]):
+        values = x[tile_row.begin, tile_split.begin, :]
+        y[tile_row.begin, tile_split.begin, :] = values * 2
+        peaks[tile_split.begin, tile_row.begin + hl.arange(1)] = torch.amax(
+            values[None, :], dim=1
+        )
+    for tile_block, tile_split in hl.tile([rows // 4, splits], block_size=[1, 1]):
+        block = y[tile_block.begin * 4 + hl.arange(4), tile_split.begin, :]
+        peak = torch.amax(peaks[tile_split.begin, :], dim=0)
+        out[tile_block.begin, tile_split.begin, :] = torch.sum(block, dim=0) + peak
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
 def keyed_rows_beside_whole_read(x: torch.Tensor) -> torch.Tensor:
     rows, width = x.shape
     totals = torch.empty((2, width), dtype=x.dtype, device=x.device)
@@ -3394,8 +3417,10 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         )
 
         torch.testing.assert_close(out, (x + 1) * 2)
-        self.assertIn("tile_dependency_root_barrier_wait", code)
-        self.assertNotIn("tile_dependency_readiness_wait", code)
+        # The 32-wide consumer's last tile reads past the 5 producer tiles of
+        # its row; clipped, it waits for the row's producers.
+        self.assertIn("tile_dependency_readiness_wait", code)
+        self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -4160,6 +4185,31 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 num_warps=1,
             )
             torch.testing.assert_close(out, (x * 5).sum(dim=0)[2:])
+            self.assertIn("tl.cast(8, tl.uint32)", code, pipeline)
+            self.assertNotIn("tile_dependency_root_barrier", code, pipeline)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_row_block_beside_whole_rows_waits_per_split(self) -> None:
+        # The consumer reads a block of four rows of its split and every row's
+        # peak: projecting the rows out of the block's (row // 4) items leaves
+        # one key per split, which all of the split's rows publish.
+        x = torch.arange(8 * 4 * 64, device=DEVICE, dtype=torch.float32).reshape(
+            8, 4, 64
+        )
+        expected = (x * 2).reshape(2, 4, 4, 64).sum(dim=1) + x.amax(dim=(0, 2))[
+            None, :, None
+        ]
+        for pipeline in ("static", "dynamic"):
+            code, out = code_and_output(
+                row_block_beside_whole_rows,
+                (x,),
+                pid_type="persistent_blocked",
+                cross_loop_pipeline=pipeline,
+                num_sm_multiplier=1,
+                num_warps=1,
+            )
+            torch.testing.assert_close(out, expected)
             self.assertIn("tl.cast(8, tl.uint32)", code, pipeline)
             self.assertNotIn("tile_dependency_root_barrier", code, pipeline)
 

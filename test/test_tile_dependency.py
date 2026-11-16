@@ -8,6 +8,7 @@ import pickle
 from typing import Literal
 from unittest import mock
 
+import pytest
 import sympy
 import torch
 from torch.utils._sympy.functions import FloorDiv
@@ -2638,6 +2639,35 @@ class TestTileDependency(TestCase):
         assert composed is not None
         self.assertEqual(_materialize(composed), (frozenset(),) * 9)
 
+    @pytest.mark.cpu_only
+    def test_composition_through_a_range_past_the_whole_axis(self) -> None:
+        """A key's items reach past the 9 tasks of their axis (a masked tile over
+        the end): clipped, they are the whole axis, and compose as [0, 9) does."""
+        keys = CoordinateDomain.scalar(4, axis=0, kind="event")
+        tasks = CoordinateDomain(
+            (5, 6), ((5, sympy.Integer(9)), (6, sympy.Integer(4))), identity=0
+        )
+        ordinals = CoordinateDomain.scalar(36, axis=7, kind="site", identity=1)
+        key, c, j = (coordinate_axis_symbol(axis) for axis in (0, 5, 6))
+        items = CoordinateRelation(
+            keys,
+            tasks,
+            (
+                _CoordinateRelationPiece(
+                    ((0, 0, 4, 1),), ((5, 0, 10, 1), (6, key, key + 1, 1))
+                ),
+            ),
+        )
+        order = CoordinateRelation.point_map(
+            tasks, ordinals, ((((5, 0, 9, 1), (6, 0, 4, 1)), (9 * j + c,)),)
+        )
+        composed = items.then(order)
+        assert composed is not None
+        self.assertEqual(
+            _materialize(composed),
+            tuple(frozenset(range(9 * k, 9 * k + 9)) for k in range(4)),
+        )
+
     def test_coarsened_arrival_count_matches_bounded_publication_support(self) -> None:
         producers = CoordinateDomain.scalar(9, axis=1, kind="site")
         fine_keys = CoordinateDomain.scalar(8, axis=0, kind="site")
@@ -3088,6 +3118,37 @@ class TestTileDependency(TestCase):
             _materialize(owners.keys_by_item)[:4],
             (frozenset((0,)), frozenset((0,)), frozenset((1,)), frozenset((1,))),
         )
+
+    @pytest.mark.cpu_only
+    def test_project_source_unions_block_mappings(self) -> None:
+        """Projecting x out of f(x) = r + (s * x + b) // w gives one range while a
+        step of x moves f by at most one, also once sympy moves a multiple of w
+        out of the floor."""
+        x, y = coordinate_axis_symbol(11), coordinate_axis_symbol(10)
+        kept = CoordinateDomain((10,), ((10, sympy.Integer(4)),), identity=0)
+
+        def projected(begin: sympy.Expr, x_bounds: tuple[int, int, int]):
+            source = CoordinateDomain(
+                (10, 11), ((10, sympy.Integer(4)), (11, sympy.Integer(16))), identity=0
+            )
+            relation = CoordinateRelation.point_map(
+                source,
+                CoordinateDomain.scalar(64, axis=20, kind="site", identity=1),
+                ((((10, 0, 4, 1), (11, *x_bounds)), (begin,)),),
+            )
+            result = relation.project_source(kept)
+            return None if result is None else result.pieces[0].target_ranges[0][1:]
+
+        # (x + 4 y) // 4 arrives as y + x // 4: x in [0, 16) covers [y, y + 4).
+        self.assertEqual(projected(FloorDiv(x + 4 * y, 4), (0, 16, 1)), (y, y + 4, 1))
+        # Steps of x move f by s * step / w: at most one is one range.
+        self.assertEqual(projected(FloorDiv(2 * x + 1, 4), (0, 16, 2)), (0, 8, 1))
+        self.assertEqual(projected(FloorDiv(x, 2), (0, 16, 2)), (0, 8, 1))
+        # A step that skips a value of f (3 x // 2) leaves gaps: no range.
+        self.assertIsNone(projected(FloorDiv(3 * x, 2), (0, 16, 1)))
+        # Bounds past the axis's 16 values cover only the values inside it.
+        self.assertEqual(projected(FloorDiv(x, 4), (0, 20, 1)), (0, 4, 1))
+        self.assertEqual(projected(x, (-4, 20, 1)), (0, 16, 1))
 
     def test_symbolic_layout_and_relation_parameters_survive(self) -> None:
         extent = sympy.Symbol("extent", integer=True, positive=True)
