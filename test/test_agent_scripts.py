@@ -1488,6 +1488,23 @@ def test_multi_gpu_claim_and_visibility_survive_serial_reruns(
     assert gpu_board.load_claims(gpu_board.BoardDir(board)) == []
 
 
+def test_python_without_pytest_stops_before_any_job(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_tests, "LOGS_DIR", tmp_path / "logs")
+    monkeypatch.setattr(
+        run_tests, "PYTEST_MODULES", ("pytest", "helion_no_such_module")
+    )
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("a Python without a module pytest needs must stop before any job")
+
+    monkeypatch.setattr(run_tests.Runner, "run", unexpected)
+    with pytest.raises(SystemExit) as stop:
+        run_tests.main(["--backend", "triton", "--lane", "cpu"])
+    assert str(stop.value).startswith(
+        f"run_tests: {sys.executable} cannot import helion_no_such_module:"
+    )
+
+
 def test_multi_gpu_refuses_one_busy_device_before_starting_jobs(
     board, tmp_path, monkeypatch
 ):
@@ -2353,10 +2370,9 @@ def test_main_cleared_pyargs_still_rejects_missing_paths(tmp_path, monkeypatch, 
 
 def test_review_cpu_examples_build_only_cpu_jobs(tmp_path, monkeypatch):
     prompt = _load("autoreview").build_review_prompt(False)
+    runner = f"{shlex.quote(sys.executable)} scripts/run_tests.py "
     examples = [
-        shlex.split(line)[1:]
-        for line in prompt.splitlines()
-        if line.startswith("scripts/run_tests.py ")
+        shlex.split(line)[2:] for line in prompt.splitlines() if line.startswith(runner)
     ]
     assert len(examples) == 2
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")

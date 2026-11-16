@@ -14,7 +14,8 @@ Usage:
 
 Either reviewer is enough: when only one of the claude and codex CLIs is
 installed, the review runs with that one and prints a warning that the agent
-must pass on to the user. With neither installed it fails.
+must pass on to the user. With neither installed it fails. It also warns when
+its Python cannot import pytest: the reviewers run tests with that Python.
 
 When the review finds nothing (LGTM), the script prints the line that records
 it in the reviewed commits' messages, naming the reviewers that ran:
@@ -45,6 +46,7 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import wait
 from contextlib import contextmanager
 from datetime import datetime
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -141,10 +143,11 @@ CuTe, pass --lane cpu to run_tests.py. For the CPU Pallas interpreter, use
 Metal CPU-only codegen and host tests also use run_tests.py: pass --backend metal
 without --lane, select cpu_only and not cuda, and use -n 0. Native Metal/MPS
 checks require CI; do not substitute plain pytest for the repository runner.
+Run the runner with {python}, this review's Python interpreter.
 Put runner options before test paths and pytest options after --, for example:
 ```
-scripts/run_tests.py --backend triton,cute --lane cpu test/test_agent_scripts.py -- -n 2
-scripts/run_tests.py --backend pallas-interpret test/test_pallas_memory_access.py -- -n 0
+{python} scripts/run_tests.py --backend triton,cute --lane cpu test/test_agent_scripts.py -- -n 2
+{python} scripts/run_tests.py --backend pallas-interpret test/test_pallas_memory_access.py -- -n 0
 ```
 Leave checks needing another GPU to the author.
 An `autoreview passed: ...` line or a `stack-info:` trailer in a commit message
@@ -249,7 +252,8 @@ def build_review_prompt(head: bool, review_args: list[str] | None = None) -> str
         )
     else:
         prefix = PROMPT_HEAD_PREFIX if head else PROMPT_DIFF_PREFIX
-    return f"{prefix}\n\n{PROMPT_REVIEW_BODY}"
+    body = PROMPT_REVIEW_BODY.format(python=shlex.quote(sys.executable))
+    return f"{prefix}\n\n{body}"
 
 
 def subprocess_env() -> dict[str, str]:
@@ -640,20 +644,20 @@ def run_codex_review(
     time, so a read-only codex cannot run any Python that imports Helion.
 
     ``no_sandbox=True`` is a trust-the-model escape hatch for hosts where
-    Codex's sandbox cannot run (no bubblewrap): it switches Codex to
+    Codex's sandbox cannot run: it switches Codex to
     ``-s danger-full-access``, so a misbehaving model could modify the repo.
-    With ``meta`` it also passes ``--dangerously-disable-linux-sandbox``, a
-    flag of Meta's Codex launcher (which sandboxes Codex itself); upstream
-    Codex does not know it. Use only when the sandbox cannot run.
+    With ``meta`` it also disables the launcher's platform sandbox.
     """
     cmd = ["codex"]
     if meta:
         # Flags of Meta's launcher, not of upstream Codex.
         cmd.append("--dangerously-enable-internet-mode")
         if no_sandbox:
-            # The launcher's own sandbox needs bubblewrap too (`sandbox
-            # launcher failed because bubblewrap is unavailable`).
-            cmd.append("--dangerously-disable-linux-sandbox")
+            cmd.append(
+                "--dangerously-disable-osx-sandbox"
+                if sys.platform == "darwin"
+                else "--dangerously-disable-linux-sandbox"
+            )
     cmd += [
         "-c",
         f'model_reasoning_effort="{effort}"',
@@ -751,6 +755,24 @@ def missing_reviewer_warning(missing: str, used: str) -> str:
         f"WARNING: the {missing} CLI is not installed, so only {used} reviewed "
         "this change. Tell the user that this review ran with one reviewer "
         f"(install {missing} for the second opinion)."
+    )
+
+
+# Keep in sync with scripts/run_tests.py.
+PYTEST_MODULES = ("pytest", "pytest_timeout")
+
+
+def missing_pytest_warning() -> str | None:
+    """A warning when this Python cannot import ``PYTEST_MODULES``."""
+    missing = [
+        name for name in PYTEST_MODULES if importlib.util.find_spec(name) is None
+    ]
+    if not missing:
+        return None
+    return (
+        f"WARNING: {sys.executable} cannot import {', '.join(missing)}, and the "
+        "reviewers run tests with it: run this script with the Python of the "
+        "environment Helion is installed in."
     )
 
 
@@ -897,7 +919,7 @@ def _main() -> int:
         action="store_true",
         help=(
             "Run codex without its sandbox (-s danger-full-access; with --meta "
-            "also --dangerously-disable-linux-sandbox for Meta's launcher). "
+            "also disables Meta's launcher sandbox). "
             "For hosts where the sandbox cannot run, such as without bubblewrap."
         ),
     )
@@ -972,7 +994,7 @@ def _main() -> int:
     # Either reviewer is enough; a missing one is warned about, not fatal.
     use_claude = shutil.which("claude") is not None
     use_codex = not args.no_codex and shutil.which("codex") is not None
-    warning = None
+    warnings = []
     if not use_claude and not use_codex:
         reason = (
             "the claude CLI is not installed and --no-codex was given"
@@ -984,9 +1006,11 @@ def _main() -> int:
     if not use_claude:
         if args.fix:
             parser.error("--fix needs the claude CLI, which is not installed")
-        warning = missing_reviewer_warning("claude", "Codex")
+        warnings.append(missing_reviewer_warning("claude", "Codex"))
     elif not use_codex and not args.no_codex:
-        warning = missing_reviewer_warning("codex", "Claude")
+        warnings.append(missing_reviewer_warning("codex", "Claude"))
+    if (pytest_warning := missing_pytest_warning()) is not None:
+        warnings.append(pytest_warning)
 
     review_prompt = build_review_prompt(args.head, args.review_args)
     # Include PID so two near-simultaneous runs don't share log_dir.
@@ -997,7 +1021,7 @@ def _main() -> int:
     spinner = Spinner()
     spinner.start()
     spinner.log(f"logs: {log_dir.relative_to(REPO_ROOT)}")
-    if warning:
+    for warning in warnings:
         spinner.log(f"autoreview.py: {warning}")
 
     claude = ClaudeSession(
@@ -1074,7 +1098,7 @@ def _main() -> int:
                 f"\nresume session: claude "
                 f"{meta_flag}{model_flag}--resume {claude.session_id}\n"
             )
-        if warning:
+        for warning in warnings:
             # Repeated after the review, where it cannot scroll out of sight.
             sys.stderr.write(f"\nautoreview.py: {warning}\n")
 

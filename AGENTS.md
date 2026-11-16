@@ -22,6 +22,11 @@ lives here; step-by-step procedures live in the skills under `.agents/skills/`.
   in the tree. Both accept paths.
 - Run tests: `pytest <filename>`; a subset: `pytest <filename> -k name_substring`.
   The lanes CI runs, sharded across GPUs: `scripts/run_tests.py` (see Testing).
+- Run `scripts/run_tests.py`, `scripts/shard_durations.py` and
+  `scripts/autoreview.py` with Helion's environment Python: activate it or
+  use its absolute path. Worktrees have no `.venv` of their own. The scripts'
+  `#!/usr/bin/env python3` selects the first `python3` on `PATH`, which may
+  lack the test dependencies.
 - Build docs: `make -C docs html` (writes HTML under `site/`)
 
 ## Coding Style & Naming Conventions

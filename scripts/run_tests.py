@@ -60,6 +60,7 @@ import contextlib
 from dataclasses import dataclass
 from dataclasses import field
 from datetime import datetime
+import importlib.util
 import inspect
 import os
 from pathlib import Path
@@ -1218,13 +1219,13 @@ def pytest_uses_pyargs(paths: Sequence[str], extra: Sequence[str]) -> bool:
             else None,
             "invocation_dir": REPO_ROOT,
         }
-        # pytest 9.2 added this keyword and wrapped config values; earlier
-        # supported pytest versions return plain strings/lists instead.
+        # pytest 9 added override_ini and wrapped config values.
         if "override_ini" in inspect.signature(determine_setup).parameters:
             setup["override_ini"] = []
         try:
             config = determine_setup(**setup)[2]
-        except UsageError as error:
+        # Unreadable -c files raise OSError, including missing files before 9.2.
+        except (UsageError, OSError) as error:
             raise SystemExit(f"run_tests: invalid pytest options: {error}") from error
         addopts = config.get("addopts", "")
         addopts = getattr(addopts, "value", addopts)
@@ -1256,8 +1257,23 @@ def record_runner_error(run_dir: Path, runners: Sequence[Runner]) -> Iterator[No
         raise
 
 
+# Every job needs pytest and the plugin providing --timeout.
+PYTEST_MODULES = ("pytest", "pytest_timeout")
+
+
+def missing_pytest_modules() -> list[str]:
+    return [name for name in PYTEST_MODULES if importlib.util.find_spec(name) is None]
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    missing = missing_pytest_modules()
+    if missing:
+        raise SystemExit(
+            f"run_tests: {sys.executable} cannot import {', '.join(missing)}: run "
+            "this script with the Python of the environment Helion is installed in "
+            "(activate it, or call its python by path)"
+        )
     paths = list(args.paths)
     pyargs = None
     for selector in paths:
